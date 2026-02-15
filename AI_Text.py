@@ -182,38 +182,37 @@ def generate_text(network, tp, start_str, length=15, window_size=3, temp=1.0):
 def main():
     # 语料库（长文本）
     text = "君不见黄河之水天上来奔流到海不复回君不见高堂明镜悲白发朝如青丝暮成雪人生得意须尽欢莫使金樽空对月"
-    
+
     # 记忆窗口
     window_size = 3
     tp = TextProcessor(text)
     dataset = tp.prepare_data(text, window_size)
-    
+
     # 构建网络：[输入, 128, 词表大小]
     input_dim = window_size * tp.vocab_size
     net = build_network([input_dim, 128, tp.vocab_size])
 
+    print(f"词表大小: {tp.vocab_size} | 窗口大小: {window_size}")
+    print("--- 正在强化记忆训练 ---")
+
+    # 训练
+    train_text_ai(net, dataset, epochs=150, lr=0.005)
     # 保存 (Pickle)
     save_network_pickle(net, "model.pkl")
-    
+
     # 彻底删除原对象
     del net
-    
+
     # 加载 (Pickle)
     loaded_net = load_network_pickle("model.pkl")
-    
+
     if loaded_net:
-        print(f"词表大小: {tp.vocab_size} | 窗口大小: {window_size}")
-        print("--- 正在强化记忆训练 ---")
-        
-        # 训练
-        train_text_ai(net, dataset, epochs=150, lr=0.005)
-        
         # 多种温度生成对比
         print("\n--- 预测结果展示 ---")
         start_key = "君不见"
         
         for t in [0.2, 0.7, 1.2]:
-            result = generate_text(net, tp, start_key, length=20, window_size=window_size, temp=t)
+            result = generate_text(loaded_net, tp, start_key, length=20, window_size=window_size, temp=t)
             print(f"温度 {t:.1f} (控制创造力): {result}")
     
 if __name__ == "__main__":
