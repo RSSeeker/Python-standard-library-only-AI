@@ -214,6 +214,18 @@ def main():
         for t in [0.2, 0.7, 1.2]:
             result = generate_text(loaded_net, tp, start_key, length=20, window_size=window_size, temp=t)
             print(f"温度 {t:.1f} (控制创造力): {result}")
-    
+'''
+提供以下函数：
+build_network(layer_sizes)
+forward(network, inputs, temperature=1.0)
+softmax(logits, temperature=1.0)
+train_text_ai(network, train_data, epochs=100, lr=0.01)
+TextProcessor.encode_one_hot(self, char)
+TextProcessor.prepare_data(self, text, window_size)
+generate_text(network, tp, start_str, length=15, window_size=3, temp=1.0)
+sample_index(probs)
+save_network_pickle(network, filename)
+load_network_pickle(filename)
+'''
 if __name__ == "__main__":
     main()
