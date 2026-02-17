@@ -151,7 +151,7 @@ def main():
 提供以下函数:
 build_network(layer_sizes)
 forward(network, inputs)
-train(network, data, epochs, ...)
+train(network, data, epochs, lr=1e-3, batch_size=2, patience=50)
 save_network_pickle(network, filename)
 load_network_pickle(filename)
 """
