@@ -2724,91 +2724,62 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
 
 if __name__ == "__main__":
 
-    # ==================== 回归示例 ====================
+    # ==================== 回归示例（高层 API） ====================
     print("=" * 60)
-    print("回归任务: y = x^2 / 5 的近似")
+    print("回归任务: y = x^2 / 5 的近似（make_regressor + fit）")
     print("=" * 60)
 
     random.seed(42)
 
-    reg_data = [
-        ((0.2, 0.4, 0.6, 0.8, 1.0), (0.04, 0.08)),
-        ((0.4, 0.6, 0.8, 1.0, 1.2), (0.16, 0.24)),
-        ((0.6, 0.8, 1.0, 1.2, 1.4), (0.36, 0.48)),
-        ((0.1, 0.3, 0.5, 0.7, 0.9), (0.01, 0.02)),
-        ((0.3, 0.5, 0.7, 0.9, 1.1), (0.09, 0.18)),
+    x_reg = [
+        [0.2, 0.4, 0.6, 0.8, 1.0],
+        [0.4, 0.6, 0.8, 1.0, 1.2],
+        [0.6, 0.8, 1.0, 1.2, 1.4],
+        [0.1, 0.3, 0.5, 0.7, 0.9],
+        [0.3, 0.5, 0.7, 0.9, 1.1],
     ]
+    y_reg = [[0.04, 0.08], [0.16, 0.24], [0.36, 0.48], [0.01, 0.02], [0.09, 0.18]]
 
-    train_data, val_data, test_data = split_data(reg_data, val_ratio=0.2, test_ratio=0.2)
+    model_reg = make_regressor(input_dim=5, output_dim=2,
+                               hidden_layers=(6, 6, 6, 6, 5, 4, 3), lr=0.01)
+    model_reg.summary()
 
-    model_reg = MLP([5, 6, 6, 6, 6, 5, 4, 3, 2])
-    optimizer_reg = Adam(model_reg, lr=0.01)
-
-    print(f"模型: {model_reg}")
-    print(f"训练集: {len(train_data)} 样本 | 验证集: {len(val_data)} 样本 | 测试集: {len(test_data)} 样本")
-
-    history = train(
-        model=model_reg,
-        loss_fn=mse_loss,
-        optimizer=optimizer_reg,
-        data=train_data,
-        epochs=2000,
-        batch_size=2,
-        patience=50,
-        val_data=val_data,
-    )
+    model_reg.fit(x_reg, y_reg, epochs=2000, batch_size=2, patience=50, val_split=0.2)
 
     print("\n--- 回归测试结果 ---")
-    for x, y in test_data:
-        pred = model_reg.forward(list(x))
-        print(f"  输入: {x}  目标: {y}  预测: {[round(p, 6) for p in pred]}")
+    for i in range(len(x_reg)):
+        pred = model_reg.predict(x_reg[i])
+        print(f"  输入: {tuple(x_reg[i])}  目标: {tuple(y_reg[i])}"
+              f"  预测: {[round(p, 6) for p in pred]}")
 
-    # ==================== 分类示例 ====================
+    # 保留原始 reg_data 供后续底层示例使用
+    reg_data = list(zip(x_reg, y_reg))
+    train_data, _, test_data = split_data(reg_data, val_ratio=0.2, test_ratio=0.2)
+
+    # ==================== 分类示例（高层 API） ====================
     print("\n" + "=" * 60)
-    print("分类任务: Softmax + Cross Entropy")
+    print("分类任务: Softmax + Cross Entropy（make_classifier + fit）")
     print("=" * 60)
 
-    class_data = [
-        ((0.1, 0.2, 0.3), 0),
-        ((0.4, 0.5, 0.6), 1),
-        ((0.7, 0.8, 0.9), 2),
-        ((0.15, 0.25, 0.35), 0),
-        ((0.45, 0.55, 0.65), 1),
-        ((0.75, 0.85, 0.95), 2),
+    x_cls = [
+        [0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9],
+        [0.15, 0.25, 0.35], [0.45, 0.55, 0.65], [0.75, 0.85, 0.95],
     ]
+    y_cls = [0, 1, 2, 0, 1, 2]
 
-    def ce_loss_fn(pred, target_idx):
-        return cross_entropy_loss(pred, target_idx)
+    model_cls = make_classifier(input_dim=3, num_classes=3,
+                                hidden_layers=(8, 8), lr=0.01)
+    model_cls.summary()
 
-    cls_train, cls_val, cls_test = split_data(class_data, val_ratio=0.2, test_ratio=0.2)
-
-    model_cls = MLP([3, 8, 8, 3], activations=["leaky_relu", "leaky_relu", "softmax"])
-    optimizer_cls = Adam(model_cls, lr=0.01)
-
-    print(f"模型: {model_cls}")
-    print(f"训练集: {len(cls_train)} 样本 | 验证集: {len(cls_val)} 样本 | 测试集: {len(cls_test)} 样本")
-
-    cls_history = train(
-        model=model_cls,
-        loss_fn=ce_loss_fn,
-        optimizer=optimizer_cls,
-        data=cls_train,
-        epochs=2000,
-        batch_size=2,
-        patience=50,
-        val_data=cls_val,
-    )
+    model_cls.fit(x_cls, y_cls, epochs=2000, batch_size=2, patience=50, val_split=0.2)
 
     print("\n--- 分类测试结果 ---")
-    correct = 0
-    for x, y_idx in cls_test:
-        pred = model_cls.forward(list(x))
-        pred_idx = pred.index(max(pred))
-        status = "✓" if pred_idx == y_idx else "✗"
-        print(f"  输入: {x}  预测: {pred_idx}  实际: {y_idx}  {status}")
-        if pred_idx == y_idx:
-            correct += 1
-    print(f"  准确率: {correct}/{len(cls_test)} = {correct/len(cls_test)*100:.1f}%")
+    acc = model_cls.score(x_cls, y_cls)
+    for i in range(len(x_cls)):
+        pred_idx = model_cls.predict_classes(x_cls[i])
+        status = "✓" if pred_idx == y_cls[i] else "✗"
+        print(f"  输入: {tuple(x_cls[i])}  预测: {pred_idx}  实际: {y_cls[i]}  {status}")
+    print(f"  准确率: {acc:.1%}")
 
     # ==================== CNN 示例 ====================
     print("\n" + "=" * 60)
@@ -3101,19 +3072,18 @@ if __name__ == "__main__":
         pred = lstm_out_b[0] + sum(lstm_out_w[0][i] * outputs[-1][i] for i in range(4))
         print(f"  序列: {seq}  预测: {pred:.4f}  目标: {target}")
 
-    # ==================== 保存 / 加载 ====================
+    # ==================== 保存 / 加载（高层 API） ====================
     print("\n" + "=" * 60)
-    print("模型保存 & 加载")
+    print("模型保存 & 加载（Model.save / Model.load）")
     print("=" * 60)
 
-    save_model(model_cls, "classification_model.json")
-    loaded_model = load_model("classification_model.json")
+    model_cls.save("classification_model.json")
+    loaded_model = Model.load("classification_model.json")
 
     print("加载后的模型测试:")
-    for x, y_idx in cls_test:
-        pred = loaded_model.forward(list(x))
-        pred_idx = pred.index(max(pred))
-        print(f"  预测: {pred_idx}  实际: {y_idx}  {'✓' if pred_idx == y_idx else '✗'}")
+    for i in range(len(x_cls)):
+        pred_idx = loaded_model.predict_classes(x_cls[i])
+        print(f"  预测: {pred_idx}  实际: {y_cls[i]}  {'✓' if pred_idx == y_cls[i] else '✗'}")
 
     # ==================== GRU 示例 ====================
     print("\n" + "=" * 60)
@@ -3258,51 +3228,42 @@ if __name__ == "__main__":
         pred = model_drop.layers[3].forward(x)
         print(f"  输入: {x}  预测: {[round(p, 4) for p in pred]}  目标: {y}")
 
-    # ==================== Gradient Clipping + LR Scheduler 示例 ====================
+    # ==================== Gradient Clipping + LR Scheduler（高层 API） ====================
     print("\n" + "=" * 60)
-    print("Gradient Clipping + StepLR 示例")
+    print("Gradient Clipping + StepLR（高层 API）")
     print("=" * 60)
 
     random.seed(42)
-    model_gc = MLP([5, 8, 8, 4, 2])
-    opt_gc = Adam(model_gc, lr=0.01)
-    scheduler = StepLR(opt_gc, step_size=100, gamma=0.5)
 
-    # 使用 DataLoader
-    loader = DataLoader(train_data, batch_size=2, shuffle=True)
+    model_gc = make_regressor(input_dim=5, output_dim=2,
+                              hidden_layers=(8, 8, 4), lr=0.01)
+    scheduler = StepLR(model_gc.optimizer, step_size=100, gamma=0.5)
 
-    for epoch in range(1, 301):
-        total_loss = 0.0
-        for batch in loader:
-            all_grad_w, all_grad_b = [], []
-            for x, y in batch:
-                pred = model_gc.forward(list(x))
-                loss, grad = mse_loss(pred, list(y))
-                total_loss += loss
-                delta = grad
-                gw_list, gb_list = [], []
-                for layer in reversed(model_gc.layers):
-                    gw, gb, delta = layer.backward(delta)
-                    gw_list.append(gw); gb_list.append(gb)
-                all_grad_w.append(list(reversed(gw_list)))
-                all_grad_b.append(list(reversed(gb_list)))
+    model_gc.fit(x_reg, y_reg, epochs=300, batch_size=2, patience=0,
+                 lr_scheduler=scheduler, grad_clip=1.0)
 
-            # 平均梯度 + 裁剪 + 更新
-            avg_grads = []
-            for i in range(len(model_gc.layers)):
-                gw = [[sum(b[i][j][k] for b in all_grad_w) / len(batch)
-                       for k in range(model_gc.layers[i].fan_in)]
-                      for j in range(model_gc.layers[i].fan_out)]
-                gb = [sum(b[i][j] for b in all_grad_b) / len(batch)
-                      for j in range(model_gc.layers[i].fan_out)]
-                avg_grads.append((gw, gb))
+    print(f"  最终 Loss: {model_gc.history['train_loss'][-1][1]:.6f}  |  LR: {model_gc.optimizer.lr:.6f}")
+    r2 = model_gc.score(x_reg, y_reg)
+    print(f"  回归 R²: {r2:.4f}")
 
-            clip_grad_by_norm(avg_grads, max_norm=1.0)
-            opt_gc.step(avg_grads)
+    # ==================== quick_train 一行训练 ====================
+    print("\n" + "=" * 60)
+    print("quick_train: 一行代码训练")
+    print("=" * 60)
 
-        scheduler.step(epoch)
-        if epoch % 100 == 0:
-            print(f"  Epoch {epoch} | Loss: {total_loss / len(train_data):.6f} | LR: {opt_gc.lr:.6f}")
+    random.seed(42)
+
+    # 一行回归
+    qm_reg = quick_train(x_reg, y_reg, task='regression',
+                        hidden_layers=(16, 8), epochs=300, patience=20)
+    r2 = qm_reg.score(x_reg, y_reg)
+    print(f"  回归 R² = {r2:.4f}")
+
+    # 一行分类
+    qm_cls = quick_train(x_cls, y_cls, task='classification',
+                         hidden_layers=(16,), epochs=300, patience=20)
+    acc2 = qm_cls.score(x_cls, y_cls)
+    print(f"  分类准确率 = {acc2:.1%}")
 
     # ==================== Transformer 示例 ====================
     print("\n" + "=" * 60)
