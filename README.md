@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **Zero Dependencies**: 仅依赖 `math`、`random`、`json` 等标准库
+- **零第三方依赖**: 仅依赖 `math`、`random`、`json` 等标准库
 - **全栈组件**: 从全连接层到 CNN、RNN/LSTM/GRU、Transformer 一应俱全
 - **双模式 API**: 底层精细控制 + 高层 sklearn 风格封装
 - **完整的训练管线**: Early Stopping、梯度裁剪、学习率调度、模型保存/加载
