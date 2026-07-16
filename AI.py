@@ -212,8 +212,17 @@ class Conv2d:
         # 前向缓存
         self.x_col = None
         self.x_shape = None
-        self.h_out = None
-        self.w_out = None
+
+        self.zero_grad()
+
+    def zero_grad(self):
+        """初始化/清零梯度缓冲区（保留前向缓存 h_out/w_out 供 backward 使用）"""
+        self.grad_w = [
+            [[[0.0] * self.kw for _ in range(self.kh)]
+             for _ in range(self.in_channels)]
+            for _ in range(self.out_channels)
+        ]
+        self.grad_b = [0.0] * self.out_channels
 
     # ---------- 辅助 ----------
     def _img_shape(self, H, W):
@@ -330,13 +339,8 @@ class Conv2d:
                     flat.append(dout[oc][oh][ow])
             dout_flat.append(flat)
 
-        # grad_w: dW = dout_flat × col^T
-        # 即: grad_w[oc][ic][kh][kw] = sum over ho,wo: dout[oc][oh][ow] * col_row[oh*wo]
-        self.grad_w = [
-            [[[0.0] * self.kw for _ in range(self.kh)]
-             for _ in range(self.in_channels)]
-            for _ in range(self.out_channels)
-        ]
+        # grad_w: dW = dout_flat × col^T（累积到内部梯度缓冲区）
+        # 即: grad_w[oc][ic][kh][kw] += sum over ho,wo: dout[oc][oh][ow] * col_row[oh*wo]
         for oc in range(self.out_channels):
             for ic in range(self.in_channels):
                 for kh in range(self.kh):
@@ -345,9 +349,10 @@ class Conv2d:
                         s = 0.0
                         for i in range(ho * wo):
                             s += dout_flat[oc][i] * self.x_col[row][i]
-                        self.grad_w[oc][ic][kh][kw] = s
+                        self.grad_w[oc][ic][kh][kw] += s
 
-        self.grad_b = [sum(dout_flat[oc]) for oc in range(self.out_channels)]
+        for oc in range(self.out_channels):
+            self.grad_b[oc] += sum(dout_flat[oc])
 
         # dx: col2im  dcol = W_flat^T × dout_flat  (C*kh*kw, ho*wo)
         dcol = [[0.0] * (ho * wo) for _ in range(len(self.x_col))]
@@ -417,7 +422,7 @@ class MaxPool2d:
                     kh, kw = self.mask[c][oh][ow]
                     ih = oh * self.sh + kh
                     iw = ow * self.sw + kw
-                    dx[c][ih][iw] = dout[c][oh][ow]
+                    dx[c][ih][iw] += dout[c][oh][ow]
         return dx
 
 
@@ -514,8 +519,11 @@ class BatchNorm1d:
 
         for j in range(d):
             self.running_mean[j] = (1 - self.momentum) * self.running_mean[j] + self.momentum * self.mean[j]
+            # n=1 时无偏估计无定义，使用有偏估计作为 fallback
             if self.n > 1:
                 self.running_var[j] = (1 - self.momentum) * self.running_var[j] + self.momentum * self.var[j] * self.n / (self.n - 1)
+            else:
+                self.running_var[j] = (1 - self.momentum) * self.running_var[j] + self.momentum * self.var[j]
 
         self.inv_std = [1.0 / math.sqrt(self.var[j] + self.eps) for j in range(d)]
         self.x_hat = [
@@ -611,10 +619,20 @@ class RNNCell:
         # Adam 状态
         self._init_adam()
 
+        # 梯度缓冲区（由 zero_grad 初始化）
+        self.zero_grad()
+
         # 缓存
         self.x = None
         self.h_prev = None
         self.z = None  # 激活前
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        self.grad_W_ih = [[0.0] * self.input_size for _ in range(self.hidden_size)]
+        self.grad_W_hh = [[0.0] * self.hidden_size for _ in range(self.hidden_size)]
+        self.grad_b_ih = [0.0] * self.hidden_size
+        self.grad_b_hh = [0.0] * self.hidden_size
 
     def _init_adam(self):
         def zeros(shape):
@@ -675,10 +693,13 @@ class RNNCell:
             dh_prev[i] = s
 
         # 累积梯度
-        self.grad_W_ih = [[dz[j] * self.x[i] for i in range(self.input_size)] for j in range(self.hidden_size)]
-        self.grad_W_hh = [[dz[j] * self.h_prev[i] for i in range(self.hidden_size)] for j in range(self.hidden_size)]
-        self.grad_b_ih = list(dz)
-        self.grad_b_hh = list(dz)
+        for j in range(self.hidden_size):
+            self.grad_b_ih[j] += dz[j]
+            self.grad_b_hh[j] += dz[j]
+            for i in range(self.input_size):
+                self.grad_W_ih[j][i] += dz[j] * self.x[i]
+            for i in range(self.hidden_size):
+                self.grad_W_hh[j][i] += dz[j] * self.h_prev[i]
 
         return dx, dh_prev
 
@@ -705,12 +726,24 @@ class LSTMCell:
 
         self._init_adam()
 
+        # 梯度缓冲区（由 zero_grad 初始化）
+        self.zero_grad()
+
         # 缓存
         self.x = None
         self.h_prev = None
         self.c_prev = None
         self.i = self.f = self.g = self.o = None  # gates
         self.c = None  # cell state
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        hs = self.hidden_size
+        gate_size = 4 * hs
+        self.grad_W_ih = [[0.0] * self.input_size for _ in range(gate_size)]
+        self.grad_W_hh = [[0.0] * hs for _ in range(gate_size)]
+        self.grad_b_ih = [0.0] * gate_size
+        self.grad_b_hh = [0.0] * gate_size
 
     def _init_adam(self):
         gate_size = 4 * self.hidden_size
@@ -792,10 +825,13 @@ class LSTMCell:
         d_gates = di + df + dg + do  # (4*hidden_size,)
 
         # 累积梯度
-        self.grad_W_ih = [[d_gates[j] * self.x[i] for i in range(self.input_size)] for j in range(4 * hs)]
-        self.grad_W_hh = [[d_gates[j] * self.h_prev[i] for i in range(hs)] for j in range(4 * hs)]
-        self.grad_b_ih = list(d_gates)
-        self.grad_b_hh = list(d_gates)
+        for j in range(4 * hs):
+            self.grad_b_ih[j] += d_gates[j]
+            self.grad_b_hh[j] += d_gates[j]
+            for i in range(self.input_size):
+                self.grad_W_ih[j][i] += d_gates[j] * self.x[i]
+            for i in range(hs):
+                self.grad_W_hh[j][i] += d_gates[j] * self.h_prev[i]
 
         # dx
         dx = [0.0] * self.input_size
@@ -954,12 +990,23 @@ class GRUCell:
 
         self._init_adam()
 
+        # 梯度缓冲区（由 zero_grad 初始化）
+        self.zero_grad()
+
         # 缓存
         self.x = self.h_prev = None
         self.z = self.r = self.n = None             # 三组门预激活值
         self.z_a = self.r_a = None                   # sigmoid(z), sigmoid(r)
         self.n_val = None                            # tanh(n_ih + r_a * n_hh)
         self.n_ih = self.n_hh = None                 # n 的 ih 和 hh 分量（分离存储用于反向）
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        hs = self.hidden_size
+        self.grad_W_ih = [[0.0] * self.input_size for _ in range(3 * hs)]
+        self.grad_W_hh = [[0.0] * hs for _ in range(3 * hs)]
+        self.grad_b_ih = [0.0] * (3 * hs)
+        self.grad_b_hh = [0.0] * (3 * hs)
 
     def _init_adam(self):
         hs = self.hidden_size
@@ -1021,57 +1068,54 @@ class GRUCell:
         d_n_hh = [dn_pre[j] * self.r_a[j] for j in range(hs)]
         dr_a_from_n = [dn_pre[j] * self.n_hh[j] for j in range(hs)]
 
-        # r_a = sigmoid(r)
-        dr_a = [dz_a[j] * 0.0 + dr_a_from_n[j] for j in range(hs)]  # r_a 不受 z 直接影响
-        dr = [dr_a[j] * self.r_a[j] * (1 - self.r_a[j]) for j in range(hs)]
+        # r_a = sigmoid(r)：r_a 不受 z 直接影响，梯度仅来自 n
+        dr = [dr_a_from_n[j] * self.r_a[j] * (1 - self.r_a[j]) for j in range(hs)]
 
         # z_a = sigmoid(z)
         dz = [dz_a[j] * self.z_a[j] * (1 - self.z_a[j]) for j in range(hs)]
 
         # 累积参数梯度
-        self.grad_W_ih = [[0.0] * self.input_size for _ in range(3 * hs)]
-        self.grad_W_hh = [[0.0] * hs for _ in range(3 * hs)]
-        self.grad_b_ih = [0.0] * (3 * hs)
-        self.grad_b_hh = [0.0] * (3 * hs)
-
         # 更新门 z: rows [0:hs]
         for j in range(hs):
-            self.grad_b_ih[j] = dz[j]
-            self.grad_b_hh[j] = dz[j]
+            self.grad_b_ih[j] += dz[j]
+            self.grad_b_hh[j] += dz[j]
             for i in range(self.input_size):
-                self.grad_W_ih[j][i] = dz[j] * self.x[i]
+                self.grad_W_ih[j][i] += dz[j] * self.x[i]
             for i in range(hs):
-                self.grad_W_hh[j][i] = dz[j] * self.h_prev[i]
+                self.grad_W_hh[j][i] += dz[j] * self.h_prev[i]
 
         # 重置门 r: rows [hs:2*hs]
         for j in range(hs):
             rj = hs + j
-            self.grad_b_ih[rj] = dr[j]
-            self.grad_b_hh[rj] = dr[j]
+            self.grad_b_ih[rj] += dr[j]
+            self.grad_b_hh[rj] += dr[j]
             for i in range(self.input_size):
-                self.grad_W_ih[rj][i] = dr[j] * self.x[i]
+                self.grad_W_ih[rj][i] += dr[j] * self.x[i]
             for i in range(hs):
-                self.grad_W_hh[rj][i] = dr[j] * self.h_prev[i]
+                self.grad_W_hh[rj][i] += dr[j] * self.h_prev[i]
 
         # 新门 n: rows [2*hs:3*hs]
         for j in range(hs):
             nj = 2 * hs + j
-            self.grad_b_ih[nj] = d_n_ih[j]
-            self.grad_b_hh[nj] = d_n_hh[j]
+            self.grad_b_ih[nj] += d_n_ih[j]
+            self.grad_b_hh[nj] += d_n_hh[j]
             for i in range(self.input_size):
-                self.grad_W_ih[nj][i] = d_n_ih[j] * self.x[i]
+                self.grad_W_ih[nj][i] += d_n_ih[j] * self.x[i]
             for i in range(hs):
-                self.grad_W_hh[nj][i] = d_n_hh[j] * self.h_prev[i]
+                self.grad_W_hh[nj][i] += d_n_hh[j] * self.h_prev[i]
 
         # dx 和 dh_prev 通过三个门权重反传
+        # 注: dx 经过 n_ih (W_ih_n)，dh_prev 经过 n_hh (W_hh_n)，需用不同的 n-门梯度分量
         d_all_gates = [0.0] * (3 * hs)
         for j in range(hs):
             d_all_gates[j] = dz[j]
             d_all_gates[hs + j] = dr[j]
-            d_all_gates[2 * hs + j] = d_n_ih[j]
+            d_all_gates[2 * hs + j] = d_n_ih[j]       # dx 走 n_ih 路径
         dx = [sum(self.W_ih[j][i] * d_all_gates[j] for j in range(3 * hs)) for i in range(self.input_size)]
 
         # dh_prev: 直接路径 h = (1-z)*n + z*h_prev → dh * z  + 通过三个门 hh 权重反传
+        for j in range(hs):
+            d_all_gates[2 * hs + j] = d_n_hh[j]       # dh_prev 走 n_hh 路径（含 r_a 因子）
         dh_prev = [dh_prev_direct[i] + sum(self.W_hh[j][i] * d_all_gates[j] for j in range(3 * hs)) for i in range(hs)]
 
         return dx, dh_prev
@@ -1138,6 +1182,7 @@ class MultiHeadAttention:
         self.b_o = [0.0] * d_model
 
         self._init_adam()
+        self.zero_grad()
 
         # 缓存
         self.x = None       # (seq_len, d_model)
@@ -1146,6 +1191,18 @@ class MultiHeadAttention:
         self.attn_weights = None   # List[(seq_len, seq_len)] × num_heads
         self.head_out = None       # List[(seq_len, d_k)] × num_heads
         self.concat = None         # (seq_len, d_model)
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        d = self.d_model
+        def zeros_2d(r, c):
+            return [[0.0] * c for _ in range(r)]
+        self.grads = {
+            "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
+            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
+            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
+        }
 
     def _init_adam(self):
         d = self.d_model
@@ -1325,11 +1382,17 @@ class MultiHeadAttention:
         dx_seq = [[dx_q[t][j] + dx_k[t][j] + dx_v[t][j] for j in range(d_model)]
                    for t in range(seq_len)]
 
-        # 6. 存储梯度
-        self.grads = {
-            "W_q": grad_W_q, "W_k": grad_W_k, "W_v": grad_W_v, "W_o": grad_W_o,
-            "b_q": grad_b_q, "b_k": grad_b_k, "b_v": grad_b_v, "b_o": grad_b_o,
-        }
+        # 6. 累积梯度
+        for i in range(self.d_model):
+            for j in range(self.d_model):
+                self.grads["W_q"][i][j] += grad_W_q[i][j]
+                self.grads["W_k"][i][j] += grad_W_k[i][j]
+                self.grads["W_v"][i][j] += grad_W_v[i][j]
+                self.grads["W_o"][i][j] += grad_W_o[i][j]
+            self.grads["b_q"][i] += grad_b_q[i]
+            self.grads["b_k"][i] += grad_b_k[i]
+            self.grads["b_v"][i] += grad_b_v[i]
+            self.grads["b_o"][i] += grad_b_o[i]
         return dx_seq
 
 
@@ -1348,6 +1411,7 @@ class FeedForward:
         self.b2 = [0.0] * d_model
 
         self._init_adam()
+        self.zero_grad()
         self.x = self.h = None  # 缓存
 
     def _init_adam(self):
@@ -1357,6 +1421,15 @@ class FeedForward:
         self.m_W2 = z2(self.d_model, self.d_ff); self.v_W2 = z2(self.d_model, self.d_ff)
         self.m_b1 = [0.0] * self.d_ff; self.v_b1 = [0.0] * self.d_ff
         self.m_b2 = [0.0] * self.d_model; self.v_b2 = [0.0] * self.d_model
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        self.grads = {
+            "W1": [[0.0] * self.d_model for _ in range(self.d_ff)],
+            "b1": [0.0] * self.d_ff,
+            "W2": [[0.0] * self.d_ff for _ in range(self.d_model)],
+            "b2": [0.0] * self.d_model,
+        }
 
     def forward(self, x_seq):
         """x_seq: (seq_len, d_model)"""
@@ -1378,8 +1451,8 @@ class FeedForward:
         """dout_seq: (seq_len, d_model) → dx_seq: (seq_len, d_model)"""
         seq_len = self.seq_len
 
-        # dout → W2
-        grad_W2 = _matmul(_transpose(self.h), dout_seq)  # (d_ff, d_model)
+        # dout → W2:  dW2 = dout^T @ h  (d_model, seq_len) @ (seq_len, d_ff) = (d_model, d_ff)
+        grad_W2 = _matmul(_transpose(dout_seq), self.h)
         grad_b2 = [sum(dout_seq[t][j] for t in range(seq_len)) for j in range(self.d_model)]
 
         # d_h = dout @ W2
@@ -1391,17 +1464,22 @@ class FeedForward:
                 if self.h[t][j] <= 0:
                     dh[t][j] = 0.0
 
-        # W1 backward
-        grad_W1 = _matmul(_transpose(self.x), dh)  # (d_model, d_ff)
+        # W1 backward: dW1 = dh^T @ x  (d_ff, seq_len) @ (seq_len, d_model) = (d_ff, d_model)
+        grad_W1 = _matmul(_transpose(dh), self.x)
         grad_b1 = [sum(dh[t][j] for t in range(seq_len)) for j in range(self.d_ff)]
 
         # dx = dh @ W1
         dx_seq = _matmul(dh, self.W1)
 
-        self.grads = {
-            "W1": grad_W1, "W2": grad_W2,
-            "b1": grad_b1, "b2": grad_b2,
-        }
+        # 累积梯度
+        for i in range(self.d_ff):
+            for j in range(self.d_model):
+                self.grads["W1"][i][j] += grad_W1[i][j]
+            self.grads["b1"][i] += grad_b1[i]
+        for i in range(self.d_model):
+            for j in range(self.d_ff):
+                self.grads["W2"][i][j] += grad_W2[i][j]
+            self.grads["b2"][i] += grad_b2[i]
         return dx_seq
 
 
@@ -1416,21 +1494,49 @@ class TransformerEncoderLayer:
         self.dropout1 = Dropout(dropout)
         self.dropout2 = Dropout(dropout)
 
-        # 缓存残差
+        self.zero_grad()
+
+        # 缓存残差 及 逐 token dropout mask
         self.x = self.res1 = self.res2 = None
+        self.dropout1_masks = self.dropout2_masks = None
+
+    def zero_grad(self):
+        """初始化/清零 LayerNorm 梯度、同时重置子模块梯度"""
+        d = self.self_attn.d_model
+        self.grads = {
+            "ln1_gamma": [0.0] * d, "ln1_beta": [0.0] * d,
+            "ln2_gamma": [0.0] * d, "ln2_beta": [0.0] * d,
+        }
+        self.self_attn.zero_grad()
+        self.ffn.zero_grad()
 
     def forward(self, x_seq):
         self.x = x_seq
-        # Self-Attention + Dropout
+        d_model = self.self_attn.d_model
+        # Self-Attention + Dropout1（逐 token 存储 mask）
         attn_out = self.self_attn.forward(x_seq)
-        attn_out = [self.dropout1.forward(a) for a in attn_out]
+        self.dropout1_masks = []
+        attn_dropped = []
+        for a in attn_out:
+            dropped = self.dropout1.forward(a)
+            attn_dropped.append(dropped)
+            self.dropout1_masks.append(list(self.dropout1.mask))
+        attn_out = attn_dropped
         # Residual + LN1
-        self.res1 = [[x_seq[t][j] + attn_out[t][j] for j in range(self.self_attn.d_model)]
+        self.res1 = [[x_seq[t][j] + attn_out[t][j] for j in range(d_model)]
                       for t in range(len(x_seq))]
         ln1_out = [self.ln1.forward(v) for v in self.res1]
-        # FFN
+        # FFN + Dropout2（逐 token 存储 mask）
         ffn_out = self.ffn.forward(ln1_out)
-        self.res2 = [[ln1_out[t][j] + ffn_out[t][j] for j in range(self.ffn.d_model)]
+        self.dropout2_masks = []
+        ffn_dropped = []
+        for f in ffn_out:
+            dropped = self.dropout2.forward(f)
+            ffn_dropped.append(dropped)
+            self.dropout2_masks.append(list(self.dropout2.mask))
+        ffn_out = ffn_dropped
+        # Residual + LN2
+        self.res2 = [[ln1_out[t][j] + ffn_out[t][j] for j in range(d_model)]
                       for t in range(len(x_seq))]
         return [self.ln2.forward(v) for v in self.res2]
 
@@ -1449,6 +1555,10 @@ class TransformerEncoderLayer:
                 g_ln2_beta[j] += gb[j]
         # Residual 2 的梯度分叉: 一路给 FFN，一路直通
         d_ffn = list(d_res2)
+        # Dropout2 backward（逐 token 应用存储的 mask）
+        if self.dropout2_masks is not None:
+            d_ffn = [[d_ffn[t][j] * self.dropout2_masks[t][j]
+                      for j in range(d_model)] for t in range(seq_len)]
         # FFN backward
         d_ln1 = self.ffn.backward(d_ffn)
         for t in range(seq_len):
@@ -1463,19 +1573,24 @@ class TransformerEncoderLayer:
             for j in range(d_model):
                 g_ln1_gamma[j] += gg[j]
                 g_ln1_beta[j] += gb[j]
-        # Residual 1
+        # Residual 1: 注意力分支 和 直通分支
         d_attn = list(d_res1)
         d_x = list(d_res1)
+        # Dropout1 backward（逐 token 应用存储的 mask）
+        if self.dropout1_masks is not None:
+            d_attn = [[d_attn[t][j] * self.dropout1_masks[t][j]
+                       for j in range(d_model)] for t in range(seq_len)]
         # Self-Attn backward
         d_attn_out = self.self_attn.backward(d_attn)
         for t in range(seq_len):
             for j in range(d_model):
                 d_x[t][j] += d_attn_out[t][j]
 
-        self.grads = {
-            "ln1_gamma": g_ln1_gamma, "ln1_beta": g_ln1_beta,
-            "ln2_gamma": g_ln2_gamma, "ln2_beta": g_ln2_beta,
-        }
+        for j in range(d_model):
+            self.grads["ln1_gamma"][j] += g_ln1_gamma[j]
+            self.grads["ln1_beta"][j] += g_ln1_beta[j]
+            self.grads["ln2_gamma"][j] += g_ln2_gamma[j]
+            self.grads["ln2_beta"][j] += g_ln2_beta[j]
         return d_x
 
 
@@ -1488,6 +1603,11 @@ class TransformerEncoder:
             TransformerEncoderLayer(d_model, num_heads, d_ff, dropout)
             for _ in range(num_layers)
         ]
+
+    def zero_grad(self):
+        """重置所有层的梯度"""
+        for layer in self.layers:
+            layer.zero_grad()
 
     def forward(self, x_seq):
         for layer in self.layers:
@@ -1536,6 +1656,7 @@ class Embedding:
         std = math.sqrt(2.0 / vocab_size)
         self.weight = [[random.gauss(0, std) for _ in range(embed_dim)] for _ in range(vocab_size)]
         self._init_adam()
+        self.zero_grad()
         self.indices = None  # 缓存查询的索引列表
 
     def _init_adam(self):
@@ -1547,9 +1668,12 @@ class Embedding:
         self.indices = indices
         return [list(self.weight[idx]) for idx in indices]
 
+    def zero_grad(self):
+        """初始化/清零梯度缓冲区"""
+        self.grad_weight = [[0.0] * self.embed_dim for _ in range(self.vocab_size)]
+
     def backward(self, dout_seq):
         """dout_seq: (seq_len, embed_dim) → 返回 None（无输入梯度），内部累积 grad_weight"""
-        self.grad_weight = [[0.0] * self.embed_dim for _ in range(self.vocab_size)]
         for t, idx in enumerate(self.indices):
             for j in range(self.embed_dim):
                 self.grad_weight[idx][j] += dout_seq[t][j]
@@ -1578,7 +1702,14 @@ class ResidualBlock:
 
 
 class Sequential:
-    """通用顺序容器，混合 Layer, Dropout, LayerNorm, Embedding 等"""
+    """通用顺序容器，混合 Layer, Dropout, LayerNorm, Embedding 等。
+
+    返回协议约定：
+      每个 module.backward(delta) 的返回值必须是以下两种之一：
+        - 非元组 (list): 直接作为上一层 delta（如 Dropout、Embedding）
+        - 元组 (..., delta): 末尾元素为上一层 delta（如 Layer、LayerNorm）
+      即：若返回元组则取其最后一维为 dx；否则整体作为 dx。
+    """
 
     def __init__(self, *modules):
         self.modules = list(modules)
@@ -1805,9 +1936,10 @@ class CosineAnnealingLR:
         self.initial_lr = optimizer.lr
 
     def step(self, epoch: int):
-        if epoch <= self.T_max:
-            self.optimizer.lr = self.eta_min + (self.initial_lr - self.eta_min) * (
-                1 + math.cos(math.pi * epoch / self.T_max)) / 2
+        # 支持周期重启：epoch 每 T_max 后重新开始余弦退火周期
+        progress = ((epoch - 1) % self.T_max) / self.T_max
+        self.optimizer.lr = self.eta_min + 0.5 * (self.initial_lr - self.eta_min) * (
+            1 + math.cos(math.pi * progress))
 
 
 # ============================================================================
@@ -2861,6 +2993,7 @@ if __name__ == "__main__":
         random.shuffle(imgs)
         total_loss = 0.0
         for img, label in imgs:
+            conv.zero_grad()
             pred = cnn_forward(img)
             loss, grad = cross_entropy_loss(pred, label)
             total_loss += loss
@@ -2931,6 +3064,7 @@ if __name__ == "__main__":
             dh = [d_pred * out_w[0][i] for i in range(4)]
 
             # BPTT: 逐时间步反向传播，累积 RNN 权重梯度
+            rnn.cells[0].zero_grad()
             hs_list = outputs  # 所有时间步的 hidden state
             grad_W_ih_sum, grad_W_hh_sum = None, None
             grad_b_ih_sum, grad_b_hh_sum = None, None
@@ -3008,6 +3142,7 @@ if __name__ == "__main__":
             dh = [d_pred * lstm_out_w[0][i] for i in range(4)]
 
             # BPTT: 逐时间步反向传播，累积 LSTM 权重梯度
+            lstm.cells[0].zero_grad()
             # 重新前向收集所有中间 cell state
             cs_list = []
             h_cur = [0.0] * 4
@@ -3112,6 +3247,7 @@ if __name__ == "__main__":
             grad_out_b = [d_pred]
 
             # BPTT for GRU
+            gru.cells[0].zero_grad()
             dh = [d_pred * gru_out_w[0][i] for i in range(4)]
             grad_W_ih_sum, grad_W_hh_sum = None, None
             grad_b_ih_sum, grad_b_hh_sum = None, None
@@ -3319,6 +3455,7 @@ if __name__ == "__main__":
             d_pooled = [sum(cls_w[j][i] * d_logits[j] for j in range(2)) / len(x)
                         for i in range(d_model)]
             d_encoder = [d_pooled for _ in range(len(x))]
+            encoder.zero_grad()
             d_x = encoder.backward(d_encoder)
 
             # 更新 (SGD 简化)
