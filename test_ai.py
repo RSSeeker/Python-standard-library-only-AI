@@ -1,89 +1,794 @@
+"""
+全栈神经网络工具箱 — 完整测试套件（pytest）
+覆盖：Layer / MLP / Conv2d / MaxPool2d / Dropout / BatchNorm1d / LayerNorm
+       RNNCell / LSTMCell / GRUCell / RNN / LSTM / GRU
+       Embedding / ResidualBlock / Sequential
+       MultiHeadAttention / TransformerEncoderLayer / TransformerEncoder / PositionalEncoding
+       mse_loss / cross_entropy_loss
+       Adam / SGD / SGDMomentum / RMSprop
+       clip_grad_by_norm / clip_grad_by_value
+       StepLR / ExponentialLR / CosineAnnealingLR
+       split_data / DataLoader
+       TextProcessor / sample_index / generate_text / generate_text_with_mlp
+       train / evaluate / save_model / load_model
+"""
+
 import pytest
-import os
 import math
-from AI import Point, build_network, forward, save_network_pickle, load_network_pickle, train
+import random
+import os
+import json
+from AI import (
+    Layer, MLP,
+    Conv2d, MaxPool2d, Flatten,
+    Dropout, BatchNorm1d, LayerNorm,
+    RNNCell, LSTMCell, GRUCell,
+    RNN, LSTM, GRU,
+    MultiHeadAttention, FeedForward,
+    TransformerEncoderLayer, TransformerEncoder, PositionalEncoding,
+    Embedding, ResidualBlock, Sequential,
+    mse_loss, cross_entropy_loss,
+    Adam, SGD, SGDMomentum, RMSprop,
+    clip_grad_by_norm, clip_grad_by_value,
+    StepLR, ExponentialLR, CosineAnnealingLR,
+    split_data, DataLoader,
+    TextProcessor, sample_index,
+    generate_text_with_mlp,
+    train, evaluate, save_model, load_model,
+    _softmax_with_temp,
+)
 
-# --- 1. 神经元逻辑测试 ---
 
-def test_leaky_relu():
-    """验证 LeakyReLU 激活函数在正负值下的表现"""
-    # 模拟一个简单的神经元
-    p = Point(weight_list=[2.0], bias=0.5, location=(1, 0))
-    # 正数输入: 2.0 * 1.0 + 0.5 = 2.5
-    assert p.activation([1.0]) == 2.5
-    # 负数输入: 2.0 * (-1.0) + 0.5 = -1.5 -> LeakyReLU: -1.5 * 0.01 = -0.015
-    assert p.activation([-1.0]) == pytest.approx(-0.015)
+# ========================== 1. Layer（激活函数 + 前向/反向） ==========================
 
-def test_derivative():
-    """验证导数计算是否正确"""
-    p = Point(weight_list=[1.0], bias=0.0, location=(1, 0), is_output=False)
-    p.activation([1.0]) # z > 0
-    assert p.derivative() == 1.0
-    p.activation([-1.0]) # z < 0
-    assert p.derivative() == 0.01
+class TestLayer:
+    def test_leaky_relu_positive(self):
+        """LeakyReLU: 正数输入经过线性变换后仍为正（z>0 恒等）"""
+        layer = Layer(1, 1, activation="leaky_relu")
+        layer.weights = [[2.0]]
+        layer.biases = [0.5]
+        out = layer.forward([1.0])
+        # z = 2*1+0.5 = 2.5, leaky_relu(z) = 2.5
+        assert out[0] == 2.5
 
-# --- 2. 网络构建与前向传播测试 ---
+    def test_leaky_relu_negative(self):
+        """LeakyReLU: 负数输入乘以 0.01"""
+        layer = Layer(1, 1, activation="leaky_relu")
+        layer.weights = [[2.0]]
+        layer.biases = [0.5]
+        out = layer.forward([-1.0])
+        # z = 2*(-1)+0.5 = -1.5, leaky_relu = -1.5*0.01 = -0.015
+        assert out[0] == pytest.approx(-0.015)
 
-def test_network_shapes():
-    """验证 build_network 生成的层数和神经元数量"""
-    layer_sizes = [5, 10, 2]
-    net = build_network(layer_sizes)
-    assert len(net) == 3
-    assert len(net[0]) == 5
-    assert len(net[1]) == 10
-    assert len(net[2]) == 2
-    # 验证权重连接：第二层神经元的权重列表长度应等于第一层的数量
-    assert len(net[1][0].weight_list) == 5
+    def test_relu(self):
+        """ReLU: 负数归零，正数原样输出"""
+        layer = Layer(2, 2, activation="relu")
+        # 手工设置权重和偏置使 z1=3, z2=-2
+        layer.weights = [[1.0, 0.0], [0.0, 1.0]]
+        layer.biases = [0.0, 0.0]
+        out = layer.forward([3.0, -2.0])
+        assert out[0] == 3.0
+        assert out[1] == 0.0
 
-def test_forward_output_range():
-    """验证前向传播输出的维度是否正确"""
-    net = build_network([3, 4, 1])
-    output = forward(net, [0.5, 0.1, -0.2])
-    assert isinstance(output, list)
-    assert len(output) == 1
+    def test_softmax_sums_to_one(self):
+        """Softmax: 输出的概率之和应为 1"""
+        layer = Layer(3, 3, activation="softmax")
+        layer.weights = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        layer.biases = [0.0, 0.0, 0.0]
+        out = layer.forward([1.0, 2.0, 3.0])
+        assert sum(out) == pytest.approx(1.0, abs=1e-6)
+        # 较大的 logits 应有较高的概率
+        assert out[2] > out[1] > out[0]
 
-# --- 3. 模型持久化测试 ---
+    def test_linear(self):
+        """Linear: 不应用任何激活函数"""
+        layer = Layer(3, 2, activation="linear")
+        out = layer.forward([1.0, 0.5, -0.5])
+        assert len(out) == 2
 
-def test_save_load_consistency(tmp_path):
-    """验证模型保存后再加载，其权重和偏置保持不变"""
-    net = build_network([2, 3, 1])
-    file_path = tmp_path / "model.pkl"
-    
-    # 修改一个特定的权重以便后续验证
-    net[1][0].weight_list[0] = 0.12345
-    net[1][0].bias = 0.6789
-    
-    save_network_pickle(net, str(file_path))
-    loaded_net = load_network_pickle(str(file_path))
-    
-    assert loaded_net[1][0].weight_list[0] == 0.12345
-    assert loaded_net[1][0].bias == 0.6789
-    assert len(loaded_net) == len(net)
+    def test_unknown_activation_raises(self):
+        """不合法的激活函数名称应抛出 ValueError"""
+        with pytest.raises(ValueError):
+            Layer(1, 1, activation="sigmoid")
 
-# --- 4. 训练流程测试 ---
+    def test_backward_shapes(self):
+        """反向传播: 返回梯度形状与权重和偏置一致"""
+        layer = Layer(3, 2, activation="leaky_relu")
+        layer.forward([1.0, 0.5, -0.3])
+        gw, gb, next_delta = layer.backward([0.1, -0.2])
+        assert len(gw) == 2
+        assert len(gw[0]) == 3
+        assert len(gb) == 2
+        assert len(next_delta) == 3
 
-def test_train_loss_reduction():
-    """冒烟测试：确保训练过程可以跑通，且对于简单规律 Loss 能够下降"""
-    net = build_network([1, 4, 1])
-    # 简单的线性关系：y = 2x
-    data = {
-        (0.1,): (0.2,),
-        (0.5,): (1.0,),
-        (0.9,): (1.8,)
-    }
-    
-    # 记录训练前的 Loss
-    def get_mse(n, d):
-        total = 0
-        for x, y in d.items():
-            p = forward(n, list(x))
-            total += sum((a - b)**2 for a, b in zip(p, y))
-        return total / len(d)
-    
-    initial_loss = get_mse(net, data)
-    # 进行短期高强度训练
-    train(net, data, epochs=50, lr=0.1, batch_size=1)
-    final_loss = get_mse(net, data)
-    
-    # 验证训练后 Loss 有所改善
-    assert final_loss < initial_loss
+
+# ========================== 2. MLP ==========================
+
+class TestMLP:
+    def test_mlp_build_shapes(self):
+        """MLP: 按 layer_sizes 构建正确层数"""
+        model = MLP([5, 10, 3])
+        assert len(model.layers) == 2
+        assert model.layers[0].fan_in == 5 and model.layers[0].fan_out == 10
+        assert model.layers[1].fan_in == 10 and model.layers[1].fan_out == 3
+
+    def test_mlp_forward_output_size(self):
+        """MLP: 前向传播输出维度正确"""
+        model = MLP([4, 8, 2])
+        out = model.forward([0.1, 0.2, 0.3, 0.4])
+        assert len(out) == 2
+
+    def test_mlp_custom_activations(self):
+        """MLP: 支持自定义每层激活函数"""
+        model = MLP([3, 5, 2], activations=["relu", "softmax"])
+        out = model.forward([0.5, 0.1, -0.2])
+        assert sum(out) == pytest.approx(1.0, abs=1e-6)
+
+    def test_mlp_repr(self):
+        model = MLP([3, 4, 1])
+        assert "MLP" in repr(model)
+
+
+# ========================== 3. Conv2d ==========================
+
+class TestConv2d:
+    def test_conv2d_output_shape_no_padding(self):
+        """Conv2d: 无 padding 时输出尺寸正确"""
+        conv = Conv2d(in_channels=1, out_channels=2, kernel_size=3)
+        # 输入: (1, 5, 5) -> (2, 3, 3)
+        x = [[[1.0] * 5 for _ in range(5)]]
+        out = conv.forward(x)
+        assert len(out) == 2  # out_channels
+        assert len(out[0]) == 3  # height
+        assert len(out[0][0]) == 3  # width
+
+    def test_conv2d_output_shape_with_padding(self):
+        """Conv2d: padding=1 时保持空间尺寸 (stride=1, kernel=3)"""
+        conv = Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1)
+        x = [[[1.0] * 5 for _ in range(5)]]
+        out = conv.forward(x)
+        assert len(out[0]) == 5
+        assert len(out[0][0]) == 5
+
+    def test_conv2d_stride(self):
+        """Conv2d: stride=2 时输出减半"""
+        conv = Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=2)
+        x = [[[1.0] * 7 for _ in range(7)]]
+        out = conv.forward(x)
+        # (7 - 3) // 2 + 1 = 3
+        assert len(out[0]) == 3
+
+
+# ========================== 4. MaxPool2d ==========================
+
+class TestMaxPool2d:
+    def test_maxpool_output_shape(self):
+        """MaxPool2d: 2x2 pool, stride=2 时输出尺寸正确"""
+        pool = MaxPool2d(kernel_size=2)
+        x = [[[1.0, 2.0, 3.0, 4.0],
+              [5.0, 6.0, 7.0, 8.0],
+              [9.0, 10.0, 11.0, 12.0],
+              [13.0, 14.0, 15.0, 16.0]]]
+        out = pool.forward(x)
+        assert len(out) == 1
+        assert len(out[0]) == 2
+        assert out[0][0][0] == 6.0  # max of top-left 2x2
+
+
+# ========================== 5. Flatten ==========================
+
+class TestFlatten:
+    def test_flatten(self):
+        flat = Flatten()
+        x = [[[1.0, 2.0], [3.0, 4.0]],
+              [[5.0, 6.0], [7.0, 8.0]]]
+        out = flat.forward(x)
+        assert len(out) == 8
+        assert out == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+
+# ========================== 6. Dropout ==========================
+
+class TestDropout:
+    def test_dropout_train_mode(self):
+        """Dropout: 训练模式下部分神经元被置零"""
+        random.seed(42)
+        dp = Dropout(p=0.5)
+        x = [1.0] * 100
+        out = dp.forward(x)
+        # 大约一半被置零
+        zeros = sum(1 for v in out if v == 0.0)
+        assert 30 <= zeros <= 70
+
+    def test_dropout_eval_mode(self):
+        """Dropout: 评估模式下所有神经元保持不变"""
+        dp = Dropout(p=0.5)
+        dp.training = False
+        x = [1.0] * 10
+        out = dp.forward(x)
+        assert out == x
+
+
+# ========================== 7. BatchNorm1d / LayerNorm ==========================
+
+class TestBatchNorm:
+    def test_batchnorm_output_shape(self):
+        bn = BatchNorm1d(num_features=4)
+        x = [1.0, 2.0, 3.0, 4.0]
+        out = bn.forward(x)
+        assert len(out) == 4
+
+    def test_batchnorm_eval_mode(self):
+        bn = BatchNorm1d(num_features=3)
+        bn.training = False
+        x = [0.5, -0.2, 0.8]
+        out = bn.forward(x)
+        assert len(out) == 3
+
+
+class TestLayerNorm:
+    def test_layernorm_stats(self):
+        """LayerNorm: 输出的均值接近 0，标准差接近 1"""
+        ln = LayerNorm(num_features=5)
+        x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        out = ln.forward(x)
+        mean = sum(out) / len(out)
+        std = math.sqrt(sum((v - mean) ** 2 for v in out) / len(out))
+        assert mean == pytest.approx(0.0, abs=1e-4)
+        assert std == pytest.approx(1.0, abs=1e-3)
+
+
+# ========================== 8. RNNCell / LSTMCell / GRUCell ==========================
+
+class TestRNNCell:
+    def test_rnn_cell_forward(self):
+        cell = RNNCell(input_size=3, hidden_size=2)
+        h = cell.forward([0.1, 0.2, 0.3])
+        assert len(h) == 2
+
+    def test_rnn_cell_with_hidden(self):
+        cell = RNNCell(input_size=2, hidden_size=3)
+        h = cell.forward([0.5, -0.3], h_prev=[0.1, -0.1, 0.2])
+        assert len(h) == 3
+
+
+class TestLSTMCell:
+    def test_lstm_cell_forward(self):
+        cell = LSTMCell(input_size=3, hidden_size=2)
+        h, c = cell.forward([0.1, 0.2, 0.3])
+        assert len(h) == 2
+        assert len(c) == 2
+
+
+class TestGRUCell:
+    def test_gru_cell_forward(self):
+        cell = GRUCell(input_size=3, hidden_size=2)
+        h = cell.forward([0.1, 0.2, 0.3])
+        assert len(h) == 2
+
+
+# ========================== 9. RNN / LSTM / GRU（多层序列） ==========================
+
+class TestRNN:
+    def test_rnn_output_shape(self):
+        rnn = RNN(input_size=3, hidden_size=4, num_layers=2)
+        seq = [[0.1, 0.2, 0.3] for _ in range(5)]
+        out, _ = rnn.forward(seq)
+        assert len(out) == 5
+        assert len(out[0]) == 4
+
+
+class TestLSTM:
+    def test_lstm_output_shape(self):
+        lstm = LSTM(input_size=3, hidden_size=4, num_layers=1)
+        seq = [[0.1, 0.2, 0.3] for _ in range(3)]
+        out, _ = lstm.forward(seq)
+        assert len(out) == 3
+        assert len(out[0]) == 4
+
+
+class TestGRU:
+    def test_gru_output_shape(self):
+        gru = GRU(input_size=2, hidden_size=3, num_layers=1)
+        seq = [[0.5, -0.2] for _ in range(4)]
+        out, _ = gru.forward(seq)
+        assert len(out) == 4
+        assert len(out[0]) == 3
+
+
+# ========================== 10. Embedding ==========================
+
+class TestEmbedding:
+    def test_embedding_lookup(self):
+        random.seed(42)
+        emb = Embedding(vocab_size=10, embed_dim=4)
+        vecs = emb.forward([3])
+        assert len(vecs) == 1
+        assert len(vecs[0]) == 4
+        # 同一索引应返回相同向量
+        assert emb.forward([3])[0] == vecs[0]
+
+
+# ========================== 11. ResidualBlock / Sequential ==========================
+
+class TestResidualBlock:
+    def test_residual_output_shape(self):
+        sublayer = Layer(4, 4, activation="leaky_relu")
+        block = ResidualBlock(sublayer)
+        out = block.forward([0.1, 0.2, -0.1, 0.5])
+        assert len(out) == 4
+
+
+class TestSequential:
+    def test_sequential(self):
+        seq = Sequential(
+            Layer(3, 5, activation="leaky_relu"),
+            Layer(5, 2, activation="linear"),
+        )
+        out = seq.forward([0.1, 0.2, 0.3])
+        assert len(out) == 2
+
+
+# ========================== 12. Transfomer 组件 ==========================
+
+class TestTransformer:
+    def test_multihead_attention_shapes(self):
+        random.seed(42)
+        mha = MultiHeadAttention(d_model=8, num_heads=2)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        out = mha.forward(seq)
+        assert len(out) == 4
+        assert len(out[0]) == 8
+
+    def test_feedforward_shapes(self):
+        random.seed(42)
+        ff = FeedForward(d_model=8, d_ff=32)
+        # FeedForward works on sequences: (seq_len, d_model)
+        x = [[random.gauss(0, 1) for _ in range(8)] for _ in range(3)]
+        out = ff.forward(x)
+        assert len(out) == 3
+        assert len(out[0]) == 8
+
+    def test_positional_encoding(self):
+        random.seed(42)
+        pe = PositionalEncoding(d_model=8, max_len=20)
+        x = [[random.gauss(0, 1) for _ in range(8)] for _ in range(5)]
+        out = pe.forward(x)
+        assert len(out) == 5
+        assert len(out[0]) == 8
+        # 加入位置编码后值应该有所变化
+        assert out[0] != x[0]
+
+    def test_transformer_encoder_layer(self):
+        random.seed(42)
+        enc = TransformerEncoderLayer(d_model=8, num_heads=2, d_ff=32)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        out = enc.forward(seq)
+        assert len(out) == 4
+        assert len(out[0]) == 8
+
+    def test_transformer_encoder(self):
+        random.seed(42)
+        encoder = TransformerEncoder(
+            d_model=8, num_heads=2, d_ff=32, num_layers=2
+        )
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(3)]
+        out = encoder.forward(seq)
+        assert len(out) == 3
+        assert len(out[0]) == 8
+
+
+# ========================== 13. 损失函数 ==========================
+
+class TestLossFunctions:
+    def test_mse_loss_perfect(self):
+        """MSE: 预测完全等于目标时损失为 0"""
+        pred = [1.0, 2.0, 3.0]
+        target = [1.0, 2.0, 3.0]
+        loss, grad = mse_loss(pred, target)
+        assert loss == 0.0
+        assert grad == [0.0, 0.0, 0.0]
+
+    def test_mse_loss_nonzero(self):
+        pred = [0.0, 1.0]
+        target = [1.0, 0.0]
+        loss, _ = mse_loss(pred, target)
+        assert loss > 0
+
+    def test_cross_entropy_loss_correct(self):
+        """CrossEntropy: 对正确类别高概率时损失接近 0"""
+        pred = [0.01, 0.98, 0.01]  # 类别 1 概率极高
+        loss, grad = cross_entropy_loss(pred, 1)
+        assert loss < 0.1
+
+    def test_cross_entropy_loss_wrong(self):
+        """CrossEntropy: 对正确类别低概率时损失较大"""
+        pred = [0.01, 0.01, 0.98]  # 类别 2 概率极高，但 target=1
+        loss, grad = cross_entropy_loss(pred, 1)
+        assert loss > 2.0
+
+
+# ========================== 14. 优化器 ==========================
+
+class TestOptimizers:
+    def test_adam_step(self):
+        """Adam: 一步更新后权重应变化"""
+        model = MLP([2, 3, 1])
+        orig_w = model.layers[0].weights[0][0]
+        opt = Adam(model, lr=0.1)
+
+        model.forward([0.5, -0.3])
+        delta = [0.5]
+        grads = []
+        for layer in reversed(model.layers):
+            gw, gb, delta = layer.backward(delta)
+            grads.append((gw, gb))
+        grads.reverse()
+
+        opt.step(grads)
+        assert model.layers[0].weights[0][0] != orig_w
+
+    def test_sgd_step(self):
+        model = MLP([2, 1])
+        orig_w = model.layers[0].weights[0][0]
+        opt = SGD(model, lr=0.5)
+
+        model.forward([0.5, 0.5])
+        delta = [0.5]
+        grads = []
+        for layer in reversed(model.layers):
+            gw, gb, delta = layer.backward(delta)
+            grads.append((gw, gb))
+        grads.reverse()
+
+        opt.step(grads)
+        assert model.layers[0].weights[0][0] != orig_w
+
+    def test_rmsprop_step(self):
+        model = MLP([2, 1])
+        orig_w = model.layers[0].weights[0][0]
+        opt = RMSprop(model, lr=0.1)
+
+        model.forward([0.5, -0.2])
+        delta = [0.5]
+        grads = []
+        for layer in reversed(model.layers):
+            gw, gb, delta = layer.backward(delta)
+            grads.append((gw, gb))
+        grads.reverse()
+
+        opt.step(grads)
+        assert model.layers[0].weights[0][0] != orig_w
+
+
+# ========================== 15. 梯度裁剪 ==========================
+
+class TestGradientClipping:
+    def test_clip_by_norm(self):
+        grads = [([[100.0, 100.0]], [100.0])]
+        total_norm = clip_grad_by_norm(grads, max_norm=1.0)
+        assert total_norm > 0
+        assert grads[0][0][0][0] < 100.0
+
+    def test_clip_by_value(self):
+        grads = [([[100.0, -100.0]], [50.0])]
+        clip_grad_by_value(grads, clip_val=1.0)
+        assert abs(grads[0][0][0][0]) <= 1.0
+        assert abs(grads[0][1][0]) <= 1.0
+
+
+# ========================== 16. 学习率调度器 ==========================
+
+class TestLRSchedulers:
+    def test_step_lr(self):
+        model = MLP([1, 1])
+        opt = Adam(model, lr=0.1)
+        scheduler = StepLR(opt, step_size=3, gamma=0.5)
+
+        for e in range(1, 7):
+            scheduler.step(e)
+        assert opt.lr < 0.1
+
+    def test_exponential_lr(self):
+        model = MLP([1, 1])
+        opt = Adam(model, lr=0.1)
+        scheduler = ExponentialLR(opt, gamma=0.5)
+
+        scheduler.step(1)
+        assert opt.lr < 0.1
+
+    def test_cosine_annealing(self):
+        model = MLP([1, 1])
+        opt = Adam(model, lr=0.1)
+        scheduler = CosineAnnealingLR(opt, T_max=10, eta_min=0.001)
+
+        scheduler.step(5)
+        assert 0.001 < opt.lr < 0.1
+        scheduler.step(10)
+        assert opt.lr == pytest.approx(0.001, abs=0.01)
+
+
+# ========================== 17. 数据工具 ==========================
+
+class TestDataUtils:
+    def test_split_data(self):
+        data = [(f"sample_{i}", i) for i in range(100)]
+        train, val, test = split_data(data, val_ratio=0.2, test_ratio=0.1)
+        assert len(train) == 70  # 100 * 0.7
+        assert len(val) == 20
+        assert len(test) == 10
+
+    def test_dataloader(self):
+        data = [(f"x{i}", f"y{i}") for i in range(10)]
+        loader = DataLoader(data, batch_size=3)
+        batches = list(loader)
+        assert len(batches) == 4
+        assert len(batches[0]) == 3
+        assert len(batches[-1]) == 1  # 最后一个 batch 只有 1 个
+
+
+# ========================== 18. 文本处理 ==========================
+
+class TestTextProcessing:
+    def test_text_processor_vocab(self):
+        tp = TextProcessor("abcabc")
+        assert tp.vocab_size == 3
+        assert set(tp.chars) == {"a", "b", "c"}
+
+    def test_one_hot_encoding(self):
+        tp = TextProcessor("abc")
+        vec = tp.encode_one_hot("b")
+        assert sum(vec) == 1.0
+        assert vec[tp.char_to_idx["b"]] == 1.0
+
+    def test_encode_indices(self):
+        tp = TextProcessor("abc")
+        indices = tp.encode_indices("cab")
+        assert indices == [
+            tp.char_to_idx["c"],
+            tp.char_to_idx["a"],
+            tp.char_to_idx["b"],
+        ]
+
+    def test_decode_indices(self):
+        tp = TextProcessor("abc")
+        s = tp.decode_indices([1, 0, 2])
+        assert s == "bac"
+
+    def test_prepare_data(self):
+        tp = TextProcessor("abca")
+        data = tp.prepare_data("abca", window_size=2)
+        # "abc" + "a": 窗口 "ab" -> 预测 "c"; 窗口 "bc" -> 预测 "a"
+        assert len(data) == 2
+
+    def test_prepare_index_data(self):
+        tp = TextProcessor("abca")
+        data = tp.prepare_index_data("abca", window_size=2)
+        assert len(data) == 2
+        assert isinstance(data[0][0], list)  # indices list
+        assert isinstance(data[0][1], int)  # target_idx
+
+
+class TestSoftmaxTemp:
+    def test_temperature(self):
+        logits = [1.0, 2.0, 3.0]
+        # temp=1 正常分布
+        p1 = _softmax_with_temp(logits, temperature=1.0)
+        # temp 很小 -> 接近 one-hot
+        p2 = _softmax_with_temp(logits, temperature=0.1)
+        assert p2[2] > p1[2]  # 温度低，高 logit 概率更突出
+
+
+class TestSampleIndex:
+    def test_sample_index(self):
+        random.seed(42)
+        probs = [1.0, 0.0, 0.0]
+        idx = sample_index(probs)
+        assert idx == 0  # 概率全在第一个
+
+
+class TestTextGeneration:
+    def test_generate_text_with_mlp(self):
+        random.seed(42)
+        tp = TextProcessor("你好世界")
+        # 训练一个简单模型
+        text = "你好世界" * 10
+        window_size = 2
+        dataset = tp.prepare_data(text, window_size)
+
+        input_dim = window_size * tp.vocab_size
+        model = MLP([input_dim, 16, tp.vocab_size], activations=["leaky_relu", "softmax"])
+        opt = Adam(model, lr=0.05)
+
+        for _ in range(50):
+            random.shuffle(dataset)
+            for x, y in dataset:
+                probs = model.forward(x)
+                loss = -sum(y[j] * math.log(max(probs[j], 1e-15)) for j in range(len(y)))
+                delta = [probs[j] - y[j] for j in range(len(y))]
+                grads = []
+                for layer in reversed(model.layers):
+                    gw, gb, delta = layer.backward(delta)
+                    grads.append((gw, gb))
+                grads.reverse()
+                opt.step(grads)
+
+        result = generate_text_with_mlp(model, tp, "你好", length=5, window_size=window_size, temp=0.3)
+        assert result.startswith("你好")
+        assert len(result) == 7  # "你好" + 5 chars
+
+
+# ========================== 19. 训练 / 评估 ==========================
+
+class TestTrainingPipeline:
+    def test_train_regression(self):
+        """完整训练流程: 回归任务 Loss 应下降"""
+        random.seed(42)
+
+        # y = 2*x1 - 3*x2 + 1
+        data = []
+        for _ in range(200):
+            x1 = random.uniform(-2, 2)
+            x2 = random.uniform(-2, 2)
+            y = 2 * x1 - 3 * x2 + 1
+            data.append(([x1, x2], [y]))
+
+        train_d, val_d, test_d = split_data(data, val_ratio=0.15, test_ratio=0.15)
+
+        model = MLP([2, 8, 1], activations=["leaky_relu", "linear"])
+        opt = Adam(model, lr=0.02)
+
+        # 定义 loss_fn 包装
+        def loss_fn(pred, target):
+            return mse_loss(pred, target)
+
+        history = train(model, loss_fn, opt, train_d, epochs=300,
+                        batch_size=16, val_data=val_d, verbose=False)
+
+        # 验证最终训练 Loss 比初始低
+        assert history["train_loss"][-1][1] < history["train_loss"][0][1]
+
+    def test_train_classification(self):
+        """分类任务: 准确率应较高"""
+        random.seed(42)
+
+        # 二分类: 两簇高斯点
+        data = []
+        for _ in range(100):
+            data.append(([random.gauss(-1, 0.5), random.gauss(-1, 0.5)], 0))
+        for _ in range(100):
+            data.append(([random.gauss(1, 0.5), random.gauss(1, 0.5)], 1))
+
+        train_d, val_d, test_d = split_data(data, val_ratio=0.2, test_ratio=0.2)
+
+        model = MLP([2, 16, 2], activations=["leaky_relu", "softmax"])
+        opt = Adam(model, lr=0.03)
+
+        def loss_fn(pred, target):
+            return cross_entropy_loss(pred, target)
+
+        history = train(model, loss_fn, opt, train_d, epochs=200,
+                        batch_size=16, val_data=val_d, verbose=False)
+
+        # 测试集准确率
+        correct = 0
+        for x, y in test_d:
+            probs = model.forward(x)
+            if probs.index(max(probs)) == y:
+                correct += 1
+        acc = correct / len(test_d)
+        assert acc > 0.7
+
+    def test_evaluate(self):
+        model = MLP([1, 1], activations=["linear"])
+        data = [([0.5], [1.0]), ([1.0], [2.0])]
+
+        def loss_fn(pred, target):
+            return mse_loss(pred, target)
+
+        val_loss = evaluate(model, loss_fn, data)
+        assert val_loss >= 0
+
+
+# ========================== 20. 模型保存 / 加载 ==========================
+
+class TestModelPersistence:
+    def test_save_load_roundtrip(self, tmp_path):
+        """模型保存后加载，权重应一致"""
+        random.seed(42)
+        model = MLP([3, 5, 2], activations=["leaky_relu", "softmax"])
+
+        # 记录原始权重
+        orig_weights = [[row[:] for row in layer.weights] for layer in model.layers]
+        orig_biases = [layer.biases[:] for layer in model.layers]
+
+        filepath = str(tmp_path / "model.json")
+        save_model(model, filepath)
+        loaded = load_model(filepath)
+
+        # 验证每层权重
+        for i, layer in enumerate(loaded.layers):
+            for j in range(layer.fan_out):
+                assert layer.weights[j] == pytest.approx(orig_weights[i][j])
+                assert layer.biases[j] == pytest.approx(orig_biases[i][j])
+
+    def test_load_model_forward(self, tmp_path):
+        """加载的模型可以正常前向传播"""
+        random.seed(42)
+        model = MLP([3, 4, 2])
+        out_before = model.forward([0.1, 0.2, 0.3])
+
+        filepath = str(tmp_path / "model.json")
+        save_model(model, filepath)
+        loaded = load_model(filepath)
+        out_after = loaded.forward([0.1, 0.2, 0.3])
+
+        assert out_after == pytest.approx(out_before)
+
+    def test_save_load_activations(self, tmp_path):
+        """保存不同激活函数的模型，加载后激活函数类型正确"""
+        random.seed(42)
+        for acts in [["relu", "softmax"], ["leaky_relu", "linear"]]:
+            model = MLP([3, 5, 2], activations=acts)
+            filepath = str(tmp_path / f"model_{acts[0]}.json")
+            save_model(model, filepath)
+            loaded = load_model(filepath)
+            # 验证最后一层 softmax 输出和为 1
+            if acts[-1] == "softmax":
+                out = loaded.forward([0.5, -0.2, 0.8])
+                assert sum(out) == pytest.approx(1.0, abs=1e-5)
+
+
+# ========================== 21. 边界 / 回归测试 ==========================
+
+class TestEdgeCases:
+    def test_single_layer_mlp(self):
+        """单层 MLP（无隐藏层）"""
+        model = MLP([3, 1], activations=["linear"])
+        out = model.forward([1.0, 2.0, 3.0])
+        assert len(out) == 1
+
+    def test_deep_mlp(self):
+        """深层 MLP"""
+        model = MLP([10, 32, 32, 16, 5], activations=["relu"] * 3 + ["softmax"])
+        out = model.forward([0.0] * 10)
+        assert len(out) == 5
+        assert sum(out) == pytest.approx(1.0, abs=1e-5)
+
+    def test_zero_input(self):
+        """全零输入不会报错"""
+        model = MLP([5, 10, 3])
+        out = model.forward([0.0] * 5)
+        assert len(out) == 3
+
+    def test_large_number_of_layers(self):
+        """10 层网络可以正常前向传播"""
+        model = MLP([8] + [16] * 9 + [4],
+                    activations=["relu"] * 9 + ["softmax"])
+        out = model.forward([0.0] * 8)
+        assert len(out) == 4
+
+    def test_random_weight_initialization(self):
+        """相同 random.seed 应产生相同的初始化"""
+        random.seed(123)
+        m1 = MLP([3, 5, 2])
+        random.seed(123)
+        m2 = MLP([3, 5, 2])
+        for l1, l2 in zip(m1.layers, m2.layers):
+            for j in range(l1.fan_out):
+                assert l1.weights[j] == l2.weights[j]
+                assert l1.biases[j] == l2.biases[j]
+
+    @pytest.mark.parametrize("shape", [
+        ([2, 3, 1]),
+        ([5, 10, 10, 2]),
+        ([1, 8, 1]),
+    ])
+    def test_various_shapes(self, shape):
+        model = MLP(shape, activations=["relu"] * (len(shape) - 2) + ["linear"])
+        out = model.forward([1.0] * shape[0])
+        assert len(out) == shape[-1]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])
