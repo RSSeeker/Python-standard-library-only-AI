@@ -36,6 +36,8 @@ from AI import (
     generate_text_with_mlp,
     train, evaluate, save_model, load_model,
     _softmax_with_temp,
+    # 新增高层 API
+    Model, make_classifier, make_regressor, quick_train,
 )
 
 
@@ -788,6 +790,387 @@ class TestEdgeCases:
         model = MLP(shape, activations=["relu"] * (len(shape) - 2) + ["linear"])
         out = model.forward([1.0] * shape[0])
         assert len(out) == shape[-1]
+
+
+# ========================== 22. 高层 API: Model 类 ==========================
+
+class TestModelHighLevel:
+    """测试 sklearn 风格 Model 封装"""
+
+    def test_model_creation_regression(self):
+        """Model: 回归任务自动推断"""
+        mlp = MLP([3, 8, 1], activations=["leaky_relu", "linear"])
+        model = Model(mlp)
+        assert model.task == "regression"
+        assert model._loss_name in ("mse",)
+
+    def test_model_creation_classification(self):
+        """Model: 分类任务自动推断"""
+        mlp = MLP([3, 8, 3], activations=["leaky_relu", "softmax"])
+        model = Model(mlp)
+        assert model.task == "classification"
+        assert model._loss_name in ("cross_entropy", "ce")
+
+    def test_model_creation_explicit(self):
+        """Model: 显式指定参数"""
+        mlp = MLP([4, 8, 2])
+        model = Model(mlp, loss_fn="mse", optimizer="sgd", lr=0.05, task="regression")
+        assert model.lr == 0.05
+        assert isinstance(model.optimizer, SGD)
+        assert model.task == "regression"
+
+    def test_model_creation_custom_loss(self):
+        """Model: 自定义损失函数"""
+        mlp = MLP([2, 4, 1])
+        def custom_loss(pred, target):
+            loss = sum(abs(p - t) for p, t in zip(pred, target))
+            grad = [(1 if p > t else -1) for p, t in zip(pred, target)]
+            return loss, grad
+        model = Model(mlp, loss_fn=custom_loss)
+        assert model._loss_name == "custom"
+
+    def test_forward_single(self):
+        """Model.forward: 单样本"""
+        random.seed(42)
+        mlp = MLP([3, 4, 2])
+        model = Model(mlp)
+        out = model.forward([0.1, 0.2, 0.3])
+        assert len(out) == 2
+
+    def test_predict_single(self):
+        """Model.predict: 单样本"""
+        random.seed(42)
+        mlp = MLP([2, 4, 1])
+        model = Model(mlp)
+        out = model.predict([0.5, -0.3])
+        assert isinstance(out, list)
+        assert len(out) == 1
+
+    def test_predict_batch(self):
+        """Model.predict: 多样本批量"""
+        random.seed(42)
+        mlp = MLP([2, 4, 1])
+        model = Model(mlp)
+        x = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+        out = model.predict(x)
+        assert isinstance(out, list)
+        assert len(out) == 3
+        assert len(out[0]) == 1
+
+    def test_predict_classes(self):
+        """Model.predict_classes: 分类"""
+        random.seed(42)
+        mlp = MLP([2, 8, 3], activations=["leaky_relu", "softmax"])
+        model = Model(mlp)
+        cls = model.predict_classes([0.5, -0.3])
+        assert isinstance(cls, int)
+        assert 0 <= cls <= 2
+
+    def test_predict_classes_batch(self):
+        """Model.predict_classes: 批量分类"""
+        random.seed(42)
+        mlp = MLP([2, 8, 3], activations=["leaky_relu", "softmax"])
+        model = Model(mlp)
+        classes = model.predict_classes([[0.1, 0.2], [0.3, 0.4]])
+        assert isinstance(classes, list)
+        assert len(classes) == 2
+
+    def test_fit_regression(self):
+        """Model.fit: 回归训练 Loss 下降"""
+        random.seed(42)
+        x = [[random.uniform(-2, 2) for _ in range(3)] for _ in range(150)]
+        y = [[2 * xi[0] - xi[1] + 0.5 * xi[2]] for xi in x]
+
+        mlp = MLP([3, 16, 8, 1], activations=["leaky_relu", "leaky_relu", "linear"])
+        model = Model(mlp, loss_fn="mse", optimizer="adam", lr=0.02)
+        history = model.fit(x, y, epochs=200, batch_size=16, val_split=0.0,
+                           patience=0, verbose=False)
+        assert history["train_loss"][-1][1] < history["train_loss"][0][1]
+
+    def test_fit_classification(self):
+        """Model.fit: 分类训练 + 准确率"""
+        random.seed(42)
+        # 二分类: 两簇高斯数据
+        x, y_true = [], []
+        for _ in range(100):
+            x.append([random.gauss(-1, 0.5), random.gauss(-1, 0.5)])
+            y_true.append(0)
+        for _ in range(100):
+            x.append([random.gauss(1, 0.5), random.gauss(1, 0.5)])
+            y_true.append(1)
+
+        model = make_classifier(2, 2, hidden_layers=(16,), lr=0.03)
+        history = model.fit(x, y_true, epochs=200, batch_size=16,
+                           val_split=0.2, patience=0, verbose=False)
+        acc = model.score(x, y_true)
+        assert acc > 0.7
+
+    def test_evaluate_method(self):
+        """Model.evaluate: 计算损失"""
+        random.seed(42)
+        mlp = MLP([2, 4, 1])
+        model = Model(mlp, loss_fn="mse")
+        x = [[0.1, 0.2], [0.3, 0.4]]
+        y = [[0.5], [0.7]]
+        loss = model.evaluate(x, y)
+        assert loss >= 0
+
+    def test_score_classification(self):
+        """Model.score: 分类准确率"""
+        random.seed(42)
+        x = [[0.0, 0.0], [1.0, 1.0], [0.0, 0.1], [0.9, 1.1]]
+        y = [0, 1, 0, 1]
+        model = make_classifier(2, 2, hidden_layers=(8,), lr=0.05)
+        model.fit(x, y, epochs=300, batch_size=4, val_split=0.0,
+                 patience=0, verbose=False)
+        acc = model.score(x, y)
+        assert 0.0 <= acc <= 1.0
+
+    def test_score_regression(self):
+        """Model.score: 回归 R²"""
+        random.seed(42)
+        x = [[i] for i in range(20)]
+        y = [[2 * i + 1] for i in range(20)]
+        model = make_regressor(1, 1, hidden_layers=(8,), lr=0.05)
+        model.fit(x, y, epochs=300, batch_size=8, val_split=0.0,
+                 patience=0, verbose=False)
+        r2 = model.score(x, y)
+        assert r2 > 0.5  # 应能较好拟合线性关系
+
+    def test_fit_with_data_format(self):
+        """Model.fit: 元组列表格式 (data=...)"""
+        random.seed(42)
+        data = [([0.1, 0.2], [0.3]), ([0.4, 0.5], [0.9])]
+        mlp = MLP([2, 4, 1])
+        model = Model(mlp, loss_fn="mse", optimizer="adam", lr=0.01)
+        history = model.fit(data=data, epochs=50, batch_size=2,
+                           val_split=0.0, patience=0, verbose=False)
+        assert len(history["train_loss"]) > 0
+
+    def test_fit_with_val_data(self):
+        """Model.fit: 自定义验证集"""
+        random.seed(42)
+        x_train = [[random.uniform(-1, 1) for _ in range(2)] for _ in range(80)]
+        y_train = [[xi[0] + xi[1]] for xi in x_train]
+        x_val = [[random.uniform(-1, 1) for _ in range(2)] for _ in range(20)]
+        y_val = [[xi[0] + xi[1]] for xi in x_val]
+
+        mlp = MLP([2, 8, 1])
+        model = Model(mlp, loss_fn="mse", optimizer="adam", lr=0.02)
+        history = model.fit(x_train, y_train, epochs=100, batch_size=16,
+                           val_data=(x_val, y_val), patience=0, verbose=False)
+        assert "val_loss" in history
+        assert len(history["val_loss"]) > 0
+
+    def test_fit_grad_clip(self):
+        """Model.fit: 梯度裁剪不报错"""
+        random.seed(42)
+        x = [[random.uniform(-2, 2) for _ in range(2)] for _ in range(50)]
+        y = [[xi[0] - xi[1]] for xi in x]
+        mlp = MLP([2, 8, 1])
+        model = Model(mlp, loss_fn="mse", lr=0.01)
+        history = model.fit(x, y, epochs=50, batch_size=8,
+                           val_split=0.0, patience=0, grad_clip=1.0, verbose=False)
+        assert len(history["train_loss"]) > 0
+
+    def test_fit_lr_scheduler(self):
+        """Model.fit: 学习率调度"""
+        random.seed(42)
+        x = [[random.uniform(-2, 2) for _ in range(2)] for _ in range(50)]
+        y = [[xi[0] - xi[1]] for xi in x]
+        model = make_regressor(2, 1, hidden_layers=(8,), lr=0.05)
+        scheduler = StepLR(model.optimizer, step_size=30, gamma=0.5)
+        history = model.fit(x, y, epochs=100, batch_size=8, val_split=0.0,
+                           patience=0, verbose=False, lr_scheduler=scheduler)
+        assert model.optimizer.lr < 0.05  # 调度器生效
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """Model.save / Model.load: 保存加载往返"""
+        random.seed(42)
+        mlp = MLP([3, 5, 2], activations=["leaky_relu", "softmax"])
+        orig = Model(mlp, loss_fn="cross_entropy", lr=0.01)
+        out_before = orig.predict([0.1, 0.2, 0.3])
+
+        f = str(tmp_path / "model.json")
+        orig.save(f)
+        loaded = Model.load(f, loss_fn="cross_entropy", lr=0.01)
+        out_after = loaded.predict([0.1, 0.2, 0.3])
+        assert out_after == pytest.approx(out_before)
+
+    def test_summary(self, capsys):
+        """Model.summary: 不报错"""
+        mlp = MLP([4, 8, 2])
+        model = Model(mlp)
+        model.summary()
+        captured = capsys.readouterr()
+        assert "Model" in captured.out
+
+    def test_early_stopping(self):
+        """Model.fit: early stopping 生效"""
+        random.seed(42)
+        x = [[random.uniform(-2, 2) for _ in range(2)] for _ in range(200)]
+        y = [[xi[0] - 2 * xi[1] + 0.5] for xi in x]
+
+        model = make_regressor(2, 1, hidden_layers=(16,), lr=0.02)
+        history = model.fit(x, y, epochs=500, batch_size=16, val_split=0.2,
+                           patience=5, verbose=False)
+        last_epoch = history["train_loss"][-1][0]
+        assert last_epoch < 500  # 提前停止了
+
+    def test_optimizer_string_aliases(self):
+        """Model: 各种优化器字符串别名"""
+        random.seed(42)
+        mlp = MLP([2, 4, 1])
+        for opt_name in ["adam", "sgd", "sgd_momentum", "rmsprop"]:
+            model = Model(mlp, optimizer=opt_name, lr=0.01)
+            assert model.optimizer is not None
+
+    def test_invalid_loss_raises(self):
+        """Model: 非法 loss_fn 抛出 ValueError"""
+        mlp = MLP([2, 4, 1])
+        with pytest.raises(ValueError):
+            Model(mlp, loss_fn="invalid_loss")
+
+    def test_invalid_optimizer_raises(self):
+        """Model: 非法 optimizer 抛出 ValueError"""
+        mlp = MLP([2, 4, 1])
+        with pytest.raises(ValueError):
+            Model(mlp, optimizer="invalid_opt")
+
+    def test_invalid_model_type_raises(self):
+        """Model: 非 MLP 类型抛出 TypeError"""
+        with pytest.raises(TypeError):
+            Model("not_a_model")
+
+
+# ========================== 23. 工厂函数: make_classifier / make_regressor / quick_train ==========================
+
+class TestFactories:
+    """测试工厂函数"""
+
+    def test_make_classifier(self):
+        """make_classifier: 创建分类模型"""
+        model = make_classifier(input_dim=5, num_classes=3,
+                               hidden_layers=(10,), lr=0.01)
+        assert model.task == "classification"
+        assert len(model.model.layers) == 2
+        assert model.model.layers[-1].fan_out == 3
+
+    def test_make_regressor(self):
+        """make_regressor: 创建回归模型"""
+        model = make_regressor(input_dim=5, output_dim=2,
+                              hidden_layers=(10,), lr=0.01)
+        assert model.task == "regression"
+        assert len(model.model.layers) == 2
+        assert model.model.layers[-1].fan_out == 2
+
+    def test_make_regressor_default_output(self):
+        """make_regressor: 默认 output_dim=1"""
+        model = make_regressor(input_dim=4, hidden_layers=(8,))
+        assert model.model.layers[-1].fan_out == 1
+
+    def test_quick_train_regression(self):
+        """quick_train: 回归任务"""
+        random.seed(42)
+        x = [[i, i + 1] for i in range(50)]
+        y = [2 * xi[0] + xi[1] + 1 for xi in x]
+        model = quick_train(x, y, task="regression", hidden_layers=(16,),
+                           epochs=200, batch_size=8, verbose=False)
+        r2 = model.score(x, y)
+        assert r2 > 0.5
+
+    def test_quick_train_classification(self):
+        """quick_train: 分类任务"""
+        random.seed(42)
+        x = [[random.gauss(-1, 0.3), random.gauss(-1, 0.3)] for _ in range(50)] + \
+            [[random.gauss(1, 0.3), random.gauss(1, 0.3)] for _ in range(50)]
+        y = [0] * 50 + [1] * 50
+        model = quick_train(x, y, task="classification", hidden_layers=(8,),
+                           epochs=100, batch_size=16, verbose=False)
+        acc = model.score(x, y)
+        assert acc > 0.7
+
+    def test_quick_train_multi_output_regression(self):
+        """quick_train: 多输出回归"""
+        random.seed(42)
+        x = [[i, i + 1] for i in range(30)]
+        y = [[xi[0] + xi[1], xi[0] - xi[1]] for xi in x]
+        model = quick_train(x, y, task="regression", hidden_layers=(8,),
+                           epochs=100, batch_size=8, verbose=False)
+        pred = model.predict(x[:5])
+        assert len(pred) == 5
+        assert len(pred[0]) == 2
+
+    def test_make_classifier_optimizer_kwargs(self):
+        """make_classifier: 传递优化器参数"""
+        model = make_classifier(4, 2, hidden_layers=(8,),
+                               optimizer="sgd", opt_kwargs={"weight_decay": 1e-4})
+        assert hasattr(model.optimizer, "weight_decay")
+        assert model.optimizer.weight_decay == 1e-4
+
+
+# ========================== 24. 端到端工作流测试 ==========================
+
+class TestEndToEnd:
+    """完整工作流测试"""
+
+    def test_full_regression_workflow(self):
+        """完整回归流程: 创建 → 训练 → 预测 → 评分 → 保存 → 加载 → 验证"""
+        random.seed(42)
+        # 合成数据
+        n = 200
+        x = [[random.uniform(-3, 3) for _ in range(3)] for _ in range(n)]
+        y = [[3 * xi[0] - 2 * xi[1] + 1.5 * xi[2] + 0.5] for xi in x]
+
+        # 创建 + 训练
+        model = make_regressor(3, 1, hidden_layers=(16, 8), lr=0.02,
+                              optimizer="adam")
+        history = model.fit(x, y, epochs=200, batch_size=16, val_split=0.2,
+                           patience=0, verbose=False)
+
+        # 预测
+        pred = model.predict(x[:5])
+        assert len(pred) == 5
+
+        # 评分
+        r2 = model.score(x, y)
+        assert r2 > 0.8  # 简单线性关系，应拟合很好
+
+    def test_full_classification_workflow(self):
+        """完整分类流程"""
+        random.seed(42)
+        # 二分类高斯数据
+        n = 200
+        x, y_true = [], []
+        for _ in range(n // 2):
+            x.append([random.gauss(-1.5, 0.6), random.gauss(-1.5, 0.6)])
+            y_true.append(0)
+        for _ in range(n // 2):
+            x.append([random.gauss(1.5, 0.6), random.gauss(1.5, 0.6)])
+            y_true.append(1)
+
+        model = make_classifier(2, 2, hidden_layers=(16, 8), lr=0.03)
+        history = model.fit(x, y_true, epochs=200, batch_size=16, val_split=0.2,
+                           patience=0, verbose=False)
+
+        # 预测类别
+        classes = model.predict_classes(x[:5])
+        assert len(classes) == 5
+
+        # 准确率
+        acc = model.score(x, y_true)
+        assert acc > 0.85
+
+        # summary 不报错
+        model.summary()
+
+    def test_model_repr(self):
+        """Model.__repr__"""
+        mlp = MLP([3, 8, 2], activations=["leaky_relu", "softmax"])
+        model = Model(mlp)
+        r = repr(model)
+        assert "classification" in r
+        assert "Adam" in r
 
 
 if __name__ == "__main__":

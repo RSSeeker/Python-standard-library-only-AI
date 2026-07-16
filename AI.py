@@ -2304,6 +2304,421 @@ def compare_with_pytorch():
 
 
 # ============================================================================
+#  High-Level API: Model 封装（sklearn 风格） + 工厂函数
+# ============================================================================
+
+def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
+    """内部工具：对 MLP 执行反向传播，返回每层的 (grad_w, grad_b) 列表"""
+    delta = loss_grad
+    grads = []
+    for layer in reversed(model.layers):
+        gw, gb, delta = layer.backward(delta)
+        grads.append((gw, gb))
+    grads.reverse()
+    return grads
+
+
+class Model:
+    """
+    高层封装：将模型、损失函数、优化器打包为 sklearn 风格 API。
+
+    ── 快速开始 ──────────────────────────────────────────────
+        # 一行创建并训练
+        model = quick_train(x, y, task='classification', epochs=200)
+        print(model.score(x_test, y_test))
+
+        # 工厂函数
+        model = make_classifier(input_dim=10, num_classes=5, hidden_layers=(64, 32))
+        model = make_regressor(input_dim=5, output_dim=2, hidden_layers=(64, 32))
+
+        # 手动创建
+        model = Model(MLP([5, 16, 8, 2]), loss_fn='mse', optimizer='adam', lr=0.01)
+        history = model.fit(x, y, epochs=300, batch_size=8, patience=30)
+        pred = model.predict(x_test)
+
+        # 保存 / 加载
+        model.save("model.json")
+        model2 = Model.load("model.json")
+    ──────────────────────────────────────────────────────────
+    """
+
+    _OPTIMIZER_MAP = {
+        'adam': Adam,
+        'sgd': SGD,
+        'sgd_momentum': SGDMomentum,
+        'rmsprop': RMSprop,
+    }
+
+    _LOSS_MAP = {
+        'mse': mse_loss,
+        'cross_entropy': cross_entropy_loss,
+        'ce': cross_entropy_loss,
+    }
+
+    def __init__(self, model, loss_fn=None, optimizer=None, lr=0.01,
+                 opt_kwargs=None, task='auto'):
+        """
+        model:       MLP 实例（必传）
+        loss_fn:     'mse' / 'cross_entropy' / 'ce' / callable(pred, target) -> (loss, grad)
+        optimizer:   'adam' / 'sgd' / 'sgd_momentum' / 'rmsprop' / 优化器实例
+        lr:          学习率（optimizer 为字符串时生效）
+        opt_kwargs:  dict，传给优化器构造函数的额外参数（如 weight_decay）
+        task:        'regression' / 'classification' / 'auto'（自动推断）
+        """
+        if not isinstance(model, MLP):
+            raise TypeError(f"model 必须是 MLP 实例，当前类型: {type(model).__name__}")
+
+        self.model = model
+        self.lr = lr
+        self.opt_kwargs = opt_kwargs or {}
+
+        # 自动推断任务类型
+        if task == 'auto':
+            last_layer = model.layers[-1]
+            self.task = 'classification' if last_layer.act_fn == last_layer._softmax else 'regression'
+        else:
+            self.task = task
+
+        # 损失函数
+        if loss_fn is None:
+            loss_fn = 'cross_entropy' if self.task == 'classification' else 'mse'
+        if isinstance(loss_fn, str):
+            key = loss_fn.lower()
+            if key not in self._LOSS_MAP:
+                raise ValueError(f"未知损失函数: {loss_fn}，可选 {list(self._LOSS_MAP.keys())}")
+            self._loss_name = key
+            self.loss_fn = self._LOSS_MAP[key]
+        else:
+            self._loss_name = 'custom'
+            self.loss_fn = loss_fn
+
+        # 构建带 target 规范化的损失函数
+        if self._loss_name in ('mse',):
+            def _wrap_loss(pred, target):
+                if not isinstance(target, (list, tuple)):
+                    target = [target]
+                return self.loss_fn(pred, target)
+            self._loss = _wrap_loss
+        else:
+            self._loss = self.loss_fn  # CE 需要 int, custom 原样
+
+        # 优化器
+        if optimizer is None:
+            optimizer = 'adam'
+        if isinstance(optimizer, str):
+            key = optimizer.lower()
+            if key not in self._OPTIMIZER_MAP:
+                raise ValueError(f"未知优化器: {optimizer}，可选 {list(self._OPTIMIZER_MAP.keys())}")
+            self.optimizer = self._OPTIMIZER_MAP[key](model, lr=lr, **self.opt_kwargs)
+        else:
+            self.optimizer = optimizer
+
+        self.history = {'train_loss': [], 'val_loss': []}
+        self._is_trained = False
+
+    # ── 核心操作 ─────────────────────────────────────────────
+
+    def forward(self, x):
+        """前向传播：接受单样本 list，返回输出 list"""
+        return self.model.forward(x if isinstance(x, list) else list(x))
+
+    def backward(self, loss_grad):
+        """反向传播：返回 [(gw, gb), ...] 梯度列表（逐层）"""
+        return _mlp_backward(self.model, loss_grad)
+
+    def _forward_backward(self, x, y_target):
+        """单样本前向 + 反向，返回 (loss, grads)"""
+        pred = self.forward(x)
+        loss, grad = self._loss(pred, y_target)
+        grads = self.backward(grad)
+        return loss, grads
+
+    # ── 训练 ─────────────────────────────────────────────────
+
+    def fit(self, x=None, y=None, data=None, epochs=100, batch_size=32,
+            val_split=0.1, val_data=None, patience=50, verbose=True,
+            shuffle=True, lr_scheduler=None, grad_clip=None):
+        """
+        训练模型。
+
+        数据传入方式（二选一）：
+            model.fit(x=[[1,2],[3,4]], y=[0, 1])        ← 分开传
+            model.fit(data=[([1,2],0), ([3,4],1)])       ← 元组列表
+            (data 优先级高于 x/y)
+
+        epochs:       训练轮数
+        batch_size:   批次大小（设为 -1 = 全批量）
+        val_split:    验证集比例（仅 val_data 未提供时从训练集切分）
+        val_data:     自定义验证集 [(x,y),...] 或 (x_arr, y_arr)
+        patience:     Early stopping 耐心值（0 = 不使用）
+        verbose:      打印进度
+        shuffle:      每轮打乱数据
+        lr_scheduler: StepLR/ExponentialLR/CosineAnnealingLR 实例
+        grad_clip:    float，梯度范数裁剪阈值（None = 不裁剪）
+        """
+        # === 规范化数据 ===
+        if data is not None:
+            dataset = [(list(x_i), y_i) for x_i, y_i in data]
+        elif x is not None and y is not None:
+            dataset = [(list(x_i), y_i) for x_i, y_i in zip(x, y)]
+        else:
+            raise ValueError("请提供 data 或 (x, y)")
+
+        # === 验证集 ===
+        if val_data is not None:
+            if isinstance(val_data, (list, tuple)) and len(val_data) == 2 and \
+               isinstance(val_data[0], list) and isinstance(val_data[1], list):
+                # (x_arr, y_arr) 格式
+                val_set = [(list(vx), vy) for vx, vy in zip(val_data[0], val_data[1])]
+            else:
+                val_set = [(list(vx), vy) for vx, vy in val_data]
+        elif val_split > 0:
+            n_val = max(1, int(len(dataset) * val_split))
+            random.shuffle(dataset)
+            val_set = dataset[:n_val]
+            dataset = dataset[n_val:]
+        else:
+            val_set = None
+
+        if batch_size <= 0:
+            batch_size = len(dataset)
+
+        self.history = {'train_loss': [], 'val_loss': []}
+        best_val_loss = float('inf')
+        no_improve = 0
+
+        for epoch in range(1, epochs + 1):
+            if shuffle:
+                random.shuffle(dataset)
+
+            train_loss = 0.0
+            for b in range(0, len(dataset), batch_size):
+                batch = dataset[b:b + batch_size]
+                all_gw, all_gb = [], []
+
+                # 逐样本前向 + 反向
+                for xi, yi in batch:
+                    pred = self.forward(xi)
+                    loss, grad = self._loss(pred, yi)
+                    train_loss += loss
+
+                    gw_list, gb_list = [], []
+                    delta = grad
+                    for layer in reversed(self.model.layers):
+                        gw, gb, delta = layer.backward(delta)
+                        gw_list.append(gw)
+                        gb_list.append(gb)
+                    all_gw.append(list(reversed(gw_list)))
+                    all_gb.append(list(reversed(gb_list)))
+
+                # 平均梯度
+                B = len(batch)
+                avg_grads = []
+                for i in range(len(self.model.layers)):
+                    fan_out = self.model.layers[i].fan_out
+                    fan_in = self.model.layers[i].fan_in
+                    gw = [[sum(s[i][j][k] for s in all_gw) / B for k in range(fan_in)]
+                          for j in range(fan_out)]
+                    gb = [sum(s[i][j] for s in all_gb) / B for j in range(fan_out)]
+                    avg_grads.append((gw, gb))
+
+                # 梯度裁剪
+                if grad_clip is not None:
+                    clip_grad_by_norm(avg_grads, max_norm=grad_clip)
+
+                self.optimizer.step(avg_grads)
+
+            train_loss /= len(dataset)
+            self.history['train_loss'].append((epoch, train_loss))
+
+            # 验证
+            val_loss = None
+            if val_set:
+                val_loss = self.evaluate(data=val_set)
+                self.history['val_loss'].append((epoch, val_loss))
+
+                if patience > 0:
+                    if val_loss < best_val_loss - 1e-12:
+                        best_val_loss = val_loss
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+                    if no_improve >= patience:
+                        if verbose:
+                            print(f"Early stopping at epoch {epoch}")
+                        break
+
+            # 学习率调度
+            if lr_scheduler is not None:
+                lr_scheduler.step(epoch)
+
+            # 打印
+            if verbose and epoch % max(1, epochs // 10) == 0:
+                parts = [f"Epoch {epoch}/{epochs}", f"loss={train_loss:.6f}"]
+                if val_loss is not None:
+                    parts.append(f"val_loss={val_loss:.6f}")
+                print(" | ".join(parts))
+
+        self._is_trained = True
+        return self.history
+
+    # ── 推理 ─────────────────────────────────────────────────
+
+    def predict(self, x):
+        """预测：单样本返回 list，多样本返回 list[list]"""
+        if len(x) > 0 and isinstance(x[0], (list, tuple)):
+            return [self.forward(list(xi)) for xi in x]
+        return self.forward(list(x))
+
+    def predict_classes(self, x):
+        """分类任务专用：返回预测类别索引（单样本 int / 多样本 list[int]）"""
+        probs = self.predict(x)
+        if isinstance(probs[0], list):
+            return [max(range(len(p)), key=lambda i: p[i]) for p in probs]
+        return max(range(len(probs)), key=lambda i: probs[i])
+
+    # ── 评估 ─────────────────────────────────────────────────
+
+    def evaluate(self, x=None, y=None, data=None):
+        """计算平均损失"""
+        if data is not None:
+            dataset = [(list(xi), yi) for xi, yi in data]
+        elif x is not None and y is not None:
+            dataset = [(list(xi), yi) for xi, yi in zip(x, y)]
+        else:
+            raise ValueError("请提供 data 或 (x, y)")
+
+        total = 0.0
+        for xi, yi in dataset:
+            pred = self.forward(xi)
+            loss, _ = self._loss(pred, yi)
+            total += loss
+        return total / len(dataset)
+
+    def score(self, x, y):
+        """分类：准确率 | 回归：R² 决定系数"""
+        if self.task == 'classification':
+            preds = self.predict_classes(x)
+            correct = sum(1 for p, t in zip(preds, y) if p == t)
+            return correct / len(y)
+        else:
+            preds = self.predict(x)
+            # 展平
+            y_flat = [(yi if not isinstance(yi, (list, tuple)) else yi[0]) for yi in y]
+            p_flat = [(pi if not isinstance(pi, (list, tuple)) else pi[0]) for pi in preds]
+            ss_res = sum((yf - pf) ** 2 for yf, pf in zip(y_flat, p_flat))
+            y_mean = sum(y_flat) / len(y_flat)
+            ss_tot = sum((yf - y_mean) ** 2 for yf in y_flat)
+            return 1 - ss_res / max(ss_tot, 1e-15)
+
+    # ── 持久化 ───────────────────────────────────────────────
+
+    def save(self, filepath):
+        """保存模型到 JSON 文件"""
+        save_model(self.model, filepath)
+
+    @staticmethod
+    def load(filepath, loss_fn=None, optimizer='adam', lr=0.01):
+        """从 JSON 加载，返回 Model 实例"""
+        mlp = load_model(filepath)
+        return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr)
+
+    # ── 信息 ─────────────────────────────────────────────────
+
+    def summary(self):
+        """打印模型结构摘要"""
+        print(f"{'='*50}")
+        print(f"  Model ({self.task})")
+        print(f"  Loss: {self._loss_name}  |  Optimizer: {type(self.optimizer).__name__}(lr={self.lr})")
+        print(f"  {'='*50}")
+        total = 0
+        for i, layer in enumerate(self.model.layers):
+            if layer.act_fn == layer._leaky_relu:
+                act = 'LeakyReLU'
+            elif layer.act_fn == layer._relu:
+                act = 'ReLU'
+            elif layer.act_fn == layer._softmax:
+                act = 'Softmax'
+            else:
+                act = 'Linear'
+            params = layer.fan_in * layer.fan_out + layer.fan_out
+            total += params
+            print(f"  [{i}] Linear({layer.fan_in} → {layer.fan_out}) + {act}   [{params:,}]")
+        print(f"  {'='*50}")
+        print(f"  Total params: {total:,}")
+
+    def __repr__(self):
+        return f"Model(task={self.task}, loss={self._loss_name}, " \
+               f"optimizer={type(self.optimizer).__name__}, lr={self.lr})"
+
+
+# ── 工厂函数 ─────────────────────────────────────────────────
+
+def make_classifier(input_dim, num_classes, hidden_layers=(32,),
+                    act='leaky_relu', lr=0.01, optimizer='adam',
+                    opt_kwargs=None):
+    """
+    快速创建分类模型（Softmax + CrossEntropy）。
+
+    用法:
+        model = make_classifier(input_dim=10, num_classes=5, hidden_layers=(64, 32))
+        model.fit(x, y, epochs=200)
+        print(model.score(x_test, y_test))  # 准确率
+    """
+    sizes = [input_dim] + list(hidden_layers) + [num_classes]
+    activations = [act] * (len(sizes) - 2) + ['softmax']
+    mlp = MLP(sizes, activations=activations)
+    return Model(mlp, loss_fn='cross_entropy', optimizer=optimizer,
+                 lr=lr, opt_kwargs=opt_kwargs, task='classification')
+
+
+def make_regressor(input_dim, output_dim=1, hidden_layers=(32,),
+                   act='leaky_relu', lr=0.01, optimizer='adam',
+                   opt_kwargs=None):
+    """
+    快速创建回归模型（MSE）。
+
+    用法:
+        model = make_regressor(input_dim=5, output_dim=2, hidden_layers=(64, 32))
+        model.fit(x, y, epochs=300)
+        print(model.score(x_test, y_test))  # R²
+    """
+    sizes = [input_dim] + list(hidden_layers) + [output_dim]
+    activations = [act] * (len(sizes) - 2) + ['linear']
+    mlp = MLP(sizes, activations=activations)
+    return Model(mlp, loss_fn='mse', optimizer=optimizer,
+                 lr=lr, opt_kwargs=opt_kwargs, task='regression')
+
+
+def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
+                batch_size=32, lr=0.01, val_split=0.1, patience=30,
+                optimizer='adam', verbose=True):
+    """
+    一行代码训练并返回模型。
+
+    用法:
+        model = quick_train(x, y, task='classification', epochs=300)
+        model = quick_train(x, y, task='regression', hidden_layers=(64, 32, 16))
+    """
+    input_dim = len(x[0])
+
+    if task == 'classification':
+        num_classes = len(set(y))
+        model = make_classifier(input_dim, num_classes,
+                                hidden_layers=hidden_layers, lr=lr,
+                                optimizer=optimizer)
+    else:
+        output_dim = len(y[0]) if isinstance(y[0], (list, tuple)) else 1
+        model = make_regressor(input_dim, output_dim,
+                               hidden_layers=hidden_layers, lr=lr,
+                               optimizer=optimizer)
+
+    model.fit(x, y, epochs=epochs, batch_size=batch_size,
+              val_split=val_split, patience=patience, verbose=verbose)
+    return model
+
+
+# ============================================================================
 #  Main: 回归 + 分类 + CNN 完整示例
 # ============================================================================
 
