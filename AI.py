@@ -17,8 +17,6 @@
 
 import sys
 import io
-# 修复 Windows 控制台中文乱码问题
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import math
 import random
@@ -1483,6 +1481,17 @@ class FeedForward:
         return dx_seq
 
 
+def _sgd_apply(param, grad, lr):
+    """就地 SGD 更新参数: 支持 1D / 2D 列表（param 与 grad 结构一致）"""
+    if grad and isinstance(grad[0], (list, tuple)):
+        for i in range(len(param)):
+            for j in range(len(param[i])):
+                param[i][j] -= lr * grad[i][j]
+    else:
+        for i in range(len(param)):
+            param[i] -= lr * grad[i]
+
+
 class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
@@ -1593,6 +1602,25 @@ class TransformerEncoderLayer:
             self.grads["ln2_beta"][j] += g_ln2_beta[j]
         return d_x
 
+    def sgd_step(self, lr: float):
+        """用累积的梯度做一次 SGD 参数更新（self_attn / ffn / LayerNorm）"""
+        attn = self.self_attn
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _sgd_apply(getattr(attn, name), attn.grads[name], lr)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            _sgd_apply(getattr(attn, name), attn.grads[name], lr)
+
+        ffn = self.ffn
+        _sgd_apply(ffn.W1, ffn.grads["W1"], lr)
+        _sgd_apply(ffn.b1, ffn.grads["b1"], lr)
+        _sgd_apply(ffn.W2, ffn.grads["W2"], lr)
+        _sgd_apply(ffn.b2, ffn.grads["b2"], lr)
+
+        _sgd_apply(self.ln1.gamma, self.grads["ln1_gamma"], lr)
+        _sgd_apply(self.ln1.beta, self.grads["ln1_beta"], lr)
+        _sgd_apply(self.ln2.gamma, self.grads["ln2_gamma"], lr)
+        _sgd_apply(self.ln2.beta, self.grads["ln2_beta"], lr)
+
 
 class TransformerEncoder:
     """堆叠多个 TransformerEncoderLayer"""
@@ -1618,6 +1646,11 @@ class TransformerEncoder:
         for layer in reversed(self.layers):
             dout_seq = layer.backward(dout_seq)
         return dout_seq
+
+    def sgd_step(self, lr: float):
+        """对每一层做一次 SGD 参数更新"""
+        for layer in self.layers:
+            layer.sgd_step(lr)
 
 
 class PositionalEncoding:
@@ -2856,6 +2889,9 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
 
 if __name__ == "__main__":
 
+    # 修复 Windows 控制台中文乱码问题（仅直接运行时生效，避免干扰 pytest 等工具）
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
     # ==================== 回归示例（高层 API） ====================
     print("=" * 60)
     print("回归任务: y = x^2 / 5 的近似（make_regressor + fit）")
@@ -3458,12 +3494,13 @@ if __name__ == "__main__":
             encoder.zero_grad()
             d_x = encoder.backward(d_encoder)
 
-            # 更新 (SGD 简化)
+            # 更新 (SGD 简化): 分类头 + Transformer encoder 参数
             lr = 0.01
             for j in range(2):
                 cls_b[j] -= lr * grad_cls_b[j]
                 for i in range(d_model):
                     cls_w[j][i] -= lr * grad_cls_w[j][i]
+            encoder.sgd_step(lr)
 
         if epoch % 50 == 0:
             print(f"  Epoch {epoch} | Loss: {total_loss / len(trans_data):.6f}")
