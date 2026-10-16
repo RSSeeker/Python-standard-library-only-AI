@@ -1574,9 +1574,15 @@ class TransformerEncoderLayer:
         d_model = self.self_attn.d_model
 
         # LN2 backward（逐 token）
+        # 注意：LayerNorm 只保存「最后一次 forward」的单槽缓存，而 forward 里
+        # ln2 是对每个 token 各调一次（见上面的 [self.ln2.forward(v) for v in self.res2]），
+        # 缓存里只剩最后一个 token。因此这里必须先把该 token 的前向缓存重放回去，
+        # 否则 token 0..T-2 会用最后一个 token 的 mean/var 反传 —— 梯度整体是错的
+        # （seq_len=1 时恰好正确，所以只在小序列上看不出来）。
         d_res2 = []
         g_ln2_gamma = [0.0] * d_model; g_ln2_beta = [0.0] * d_model
         for t in range(seq_len):
+            self.ln2.forward(self.res2[t])          # 重放缓存
             gg, gb, dx = self.ln2.backward(dout_seq[t])
             d_res2.append(dx)
             for j in range(d_model):
@@ -1593,10 +1599,11 @@ class TransformerEncoderLayer:
         for t in range(seq_len):
             for j in range(d_model):
                 d_ln1[t][j] += d_res2[t][j]
-        # LN1 backward（逐 token）
+        # LN1 backward（逐 token）：同样要重放该 token 的缓存（原因见上面的 LN2）
         d_res1 = []
         g_ln1_gamma = [0.0] * d_model; g_ln1_beta = [0.0] * d_model
         for t in range(seq_len):
+            self.ln1.forward(self.res1[t])          # 重放缓存
             gg, gb, dx = self.ln1.backward(d_ln1[t])
             d_res1.append(dx)
             for j in range(d_model):

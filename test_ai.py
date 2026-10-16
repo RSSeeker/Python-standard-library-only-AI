@@ -1609,6 +1609,105 @@ class TestBatchNormTraining:
         assert dx == dx_ref
 
 
+class TestTransformerEncoderGradients:
+    """TransformerEncoderLayer 的数值梯度校验
+
+    回归点（真实 bug）：LayerNorm 只有「最后一次 forward」的单槽缓存，而
+    TransformerEncoderLayer.forward 是逐 token 调 self.ln1/self.ln2.forward 的，
+    缓存里只剩最后一个 token；backward 又逐 token 调 ln.backward，于是
+    token 0..T-2 全部拿最后一个 token 的 mean/var 反传 —— seq_len>1 时整条
+    反传链（d_x、attn/ffn/ln 全部梯度）都是错的，且 seq_len=1 时恰好正确，
+    所以只在小序列上完全看不出来。
+    """
+
+    @staticmethod
+    def _build(seq_len, d_model=8, heads=2, d_ff=16, seed=7):
+        random.seed(seed)
+        layer = TransformerEncoderLayer(d_model, heads, d_ff, dropout=0.0)
+        x = [[random.uniform(-1, 1) for _ in range(d_model)] for _ in range(seq_len)]
+        coef = [[random.uniform(-1, 1) for _ in range(d_model)] for _ in range(seq_len)]
+        return layer, x, coef
+
+    @staticmethod
+    def _loss(layer, x, coef):
+        out = layer.forward([list(r) for r in x])
+        return sum(coef[t][j] * out[t][j] for t in range(len(out)) for j in range(len(out[0])))
+
+    @pytest.mark.parametrize("seq_len", [1, 2, 4])
+    def test_input_gradient_matches_numeric(self, seq_len):
+        layer, x, coef = self._build(seq_len)
+        layer.forward([list(r) for r in x])          # 建立前向缓存
+        layer.zero_grad()
+        dx = layer.backward([list(r) for r in coef])
+
+        eps = 1e-6
+        d = len(x[0])
+        for t in range(seq_len):
+            for j in range(d):
+                old = x[t][j]
+                x[t][j] = old + eps
+                lp = self._loss(layer, x, coef)
+                x[t][j] = old - eps
+                lm = self._loss(layer, x, coef)
+                x[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(num - dx[t][j]) < 1e-5, \
+                    f"seq_len={seq_len} d_x[{t}][{j}]: 解析 {dx[t][j]} vs 数值 {num}"
+
+    @pytest.mark.parametrize("which", ["ln1_gamma", "ln2_gamma"])
+    def test_layernorm_param_gradient_matches_numeric(self, which):
+        seq_len = 4
+        layer, x, coef = self._build(seq_len)
+        layer.forward([list(r) for r in x])
+        layer.zero_grad()
+        layer.backward([list(r) for r in coef])
+        analytic = list(layer.grads[which])
+
+        eps = 1e-6
+        ln = layer.ln1 if which.startswith("ln1") else layer.ln2
+        for j in range(len(analytic)):
+            old = ln.gamma[j]
+            ln.gamma[j] = old + eps
+            lp = self._loss(layer, x, coef)
+            ln.gamma[j] = old - eps
+            lm = self._loss(layer, x, coef)
+            ln.gamma[j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(num - analytic[j]) < 1e-5, \
+                f"{which}[{j}]: 解析 {analytic[j]} vs 数值 {num}"
+
+    def test_encoder_stack_gradient_matches_numeric(self):
+        """多层 TransformerEncoder 也要过数值校验（上游多层时更容易暴露）"""
+        random.seed(11)
+        d_model = 8
+        enc = TransformerEncoder(num_layers=2, d_model=d_model, num_heads=2,
+                                 d_ff=16, dropout=0.0)
+        seq_len = 3
+        x = [[random.uniform(-1, 1) for _ in range(d_model)] for _ in range(seq_len)]
+        coef = [[random.uniform(-1, 1) for _ in range(d_model)] for _ in range(seq_len)]
+
+        def loss():
+            out = enc.forward([list(r) for r in x])
+            return sum(coef[t][j] * out[t][j] for t in range(seq_len) for j in range(d_model))
+
+        enc.forward([list(r) for r in x])
+        enc.zero_grad()
+        dx = enc.backward([list(r) for r in coef])
+
+        eps = 1e-6
+        for t in range(seq_len):
+            for j in range(d_model):
+                old = x[t][j]
+                x[t][j] = old + eps
+                lp = loss()
+                x[t][j] = old - eps
+                lm = loss()
+                x[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(num - dx[t][j]) < 1e-5, \
+                    f"Encoder d_x[{t}][{j}]: 解析 {dx[t][j]} vs 数值 {num}"
+
+
 class TestConv2dGradients:
     """Conv2d 的数值梯度校验（此前只有输出形状测试）"""
 

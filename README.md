@@ -277,11 +277,12 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-171 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+177 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
 | `TestLayerNumericalGradients` | `Layer` / `MLP` 的 `grad_w / grad_b`、反向传播链（`dL/dx`）vs 数值梯度；含 softmax+CE 联合梯度约定 |
+| `TestTransformerEncoderGradients` | `TransformerEncoderLayer` / `TransformerEncoder` 的 `d_x` 与 LayerNorm 参数梯度 vs 数值梯度（**seq_len>1 必须测**，见下方实现说明） |
 | `TestAttentionGradients` | `MultiHeadAttention` 的 `W_q/W_k/W_v/W_o` 解析梯度 vs 数值梯度 |
 | `TestConv2dGradients` | `Conv2d` 的 `grad_w / grad_b / dx` vs 数值梯度（含 padding 与 stride=2） |
 | `TestBatchNormTraining` | `BatchNorm1d` 训练路径的 `dx / gamma / beta` vs 数值梯度，并与朴素实现逐位一致 |
@@ -296,6 +297,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 - **训练循环在反向传播时直接累加梯度**，不再保存 batch 内每个样本的完整梯度（省掉一个 O(batch × 参数量) 的中间结构）。
 - **BPTT 复用 `step_cache`**，不必对每个时间步重跑一次前向。
 - **数值精度**：Python 3.12+ 的 `sum()` 对浮点使用补偿求和（Neumaier），所以用 `sum()` 改写过的热点与朴素累加循环相比结果可能**末位不同（通常更精确）**；`BatchNorm1d`、四个优化器、注意力内层循环、RNN 缓存这几处则是逐位一致的。
+- **`TransformerEncoderLayer` 的反向必须先重放 LayerNorm 缓存**：`LayerNorm` 只保存「最后一次 forward」的单槽缓存，而 `TransformerEncoderLayer.forward` 是逐 token 调 `ln1/ln2.forward` 的（缓存里只剩最后一个 token），反向又逐 token 调 `ln.backward`。若不先 `self.ln1.forward(self.res1[t])` 重放该 token 的缓存，token `0..T-2` 会用最后一个 token 的 `mean/var` 反传，**`seq_len>1` 时整条反传链都是错的**（`seq_len=1` 时恰好正确，所以在小序列上看不出来）。该 bug 由数值梯度检查发现并修复，`TestTransformerEncoderGradients` 用 `seq_len ∈ {1,2,4}` 与多层 Encoder 把它钉住。
 
 ## C 移植（已独立成库）
 
@@ -325,7 +327,7 @@ gcc -std=c17 -O2 -Wall -Wextra -o compare_python compare_python.c ai.c tensor.c 
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 171 个单元测试
+├── test_ai.py       # 177 个单元测试
 └── README.md
 ```
 
