@@ -18,6 +18,7 @@ import math
 import random
 import os
 import json
+import copy
 from AI import (
     Layer, MLP,
     Conv2d, MaxPool2d, Flatten,
@@ -1171,6 +1172,471 @@ class TestEndToEnd:
         r = repr(model)
         assert "classification" in r
         assert "Adam" in r
+
+
+# ========================== 23. 回归测试：本次修复 ==========================
+
+class TestValDataFormats:
+    """val_data 的三种写法都应被正确解析（含 2 个样本的结构歧义场景）"""
+
+    @staticmethod
+    def _model(n_in=2, n_out=1):
+        random.seed(42)
+        mlp = MLP([n_in, 4, n_out], activations=["leaky_relu", "linear"])
+        return Model(mlp, loss_fn="mse", optimizer="adam", lr=0.01, task="regression")
+
+    def test_list_of_two_pairs(self):
+        """list 写法的 2 个样本对不能被误判成并行数组"""
+        got = self._model()._normalize_val_data([[[0.1, 0.2], 1.0], [[0.3, 0.4], 2.0]])
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_tuple_of_two_pairs(self):
+        got = self._model()._normalize_val_data((([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)))
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_parallel_arrays_tuple(self):
+        got = self._model()._normalize_val_data(([[0.1, 0.2], [0.3, 0.4]], [1.0, 2.0]))
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_parallel_arrays_list_with_scalar_targets(self):
+        got = self._model()._normalize_val_data([[[0.1, 0.2], [0.3, 0.4]], [1.0, 2.0]])
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_dict_form(self):
+        got = self._model()._normalize_val_data(
+            {"x": [[0.1, 0.2], [0.3, 0.4]], "y": [1.0, 2.0]}
+        )
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_json_style_nested_list(self):
+        """json.loads 得到的验证集（全是 list）不应被误判"""
+        got = self._model()._normalize_val_data(
+            json.loads('[[[0.1,0.2],1.0],[[0.3,0.4],2.0]]')
+        )
+        assert got == [([0.1, 0.2], 1.0), ([0.3, 0.4], 2.0)]
+
+    def test_multi_output_two_pairs_not_scrambled(self):
+        """多输出 + 2 个样本：旧实现会把 x1 配 x2、y1 配 y2"""
+        got = self._model(n_in=2, n_out=2)._normalize_val_data(
+            [[[0.1, 0.2], [1.0, 2.0]], [[0.3, 0.4], [3.0, 4.0]]]
+        )
+        assert got == [([0.1, 0.2], [1.0, 2.0]), ([0.3, 0.4], [3.0, 4.0])]
+
+    def test_wrong_feature_dim_raises(self):
+        with pytest.raises(ValueError, match="特征维度"):
+            self._model(n_in=3)._normalize_val_data(([[0.1, 0.2]], [1.0]))
+
+    def test_wrong_target_dim_raises(self):
+        with pytest.raises(ValueError, match="target 维度"):
+            self._model(n_in=2, n_out=3)._normalize_val_data(([[0.1, 0.2]], [[1.0, 2.0]]))
+
+    def test_bad_format_raises(self):
+        with pytest.raises(ValueError, match="无法识别"):
+            self._model()._normalize_val_data([1.0, 2.0, 3.0])
+
+    def test_empty_val_data_means_no_validation(self):
+        assert self._model()._normalize_val_data([]) == []
+
+    def test_fit_with_list_pairs_records_val_loss(self):
+        """端到端：list 写法的样本对能正常走完 fit 并记录 val_loss"""
+        random.seed(42)
+        x = [[random.uniform(-1, 1) for _ in range(2)] for _ in range(40)]
+        y = [[xi[0] + xi[1]] for xi in x]
+        history = self._model().fit(
+            x, y, epochs=20, batch_size=8, patience=0, verbose=False,
+            val_data=[[[0.1, 0.2], [0.3]], [[0.4, 0.5], [0.9]]],
+        )
+        assert len(history["val_loss"]) == 20
+
+
+class TestCrossEntropyTargets:
+    """CE 的 target 规范化：索引 / one-hot / 浮点标签都能用，非法输入要明确报错"""
+
+    @staticmethod
+    def _model(n_out=3):
+        random.seed(42)
+        mlp = MLP([2, 4, n_out], activations=["leaky_relu", "softmax"])
+        return Model(mlp, loss_fn="cross_entropy", optimizer="adam",
+                     lr=0.01, task="classification")
+
+    def _run(self, y, n_out=3):
+        self._model(n_out).fit([[0.1, 0.2], [0.3, 0.4]], y, epochs=1,
+                               batch_size=2, patience=0, verbose=False)
+
+    def test_int_labels(self):
+        self._run([0, 1])
+
+    def test_one_hot_labels(self):
+        self._run([[1, 0, 0], [0, 1, 0]])
+
+    def test_float_labels(self):
+        self._run([0.0, 1.0])
+
+    def test_length_one_list_labels(self):
+        self._run([[0], [1]])
+
+    def test_index_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="越界"):
+            self._run([5, 1])
+
+    def test_non_integer_float_raises(self):
+        with pytest.raises(ValueError, match="整数类别索引"):
+            self._run([0.5, 1.0])
+
+    def test_wrong_length_one_hot_raises(self):
+        with pytest.raises(ValueError, match="不一致"):
+            self._run([[1, 0], [0, 1]])
+
+    def test_score_accepts_one_hot_labels(self):
+        """score 也要能吃 one-hot 标签（否则会静默返回 0 准确率）"""
+        random.seed(42)
+        x = [[0.0, 0.0], [1.0, 1.0], [0.0, 0.1], [0.9, 1.1]]
+        y = [0, 1, 0, 1]
+        model = make_classifier(2, 2, hidden_layers=(8,), lr=0.05)
+        model.fit(x, y, epochs=300, batch_size=4, val_split=0.0,
+                  patience=0, verbose=False)
+        one_hot = [[1.0, 0.0] if yi == 0 else [0.0, 1.0] for yi in y]
+        assert model.score(x, one_hot) == model.score(x, y)
+
+    def test_softmax_with_mse_raises(self):
+        """softmax 与 mse 组合会静默产生错误梯度，必须直接报错"""
+        random.seed(42)
+        mlp = MLP([2, 4, 3], activations=["leaky_relu", "softmax"])
+        with pytest.raises(ValueError, match="softmax"):
+            Model(mlp, loss_fn="mse")
+
+    def test_softmax_with_custom_ce_callable_allowed(self):
+        """自定义 callable 无法判断内部实现，不应被误拦"""
+        random.seed(42)
+        mlp = MLP([2, 4, 3], activations=["leaky_relu", "softmax"])
+        model = Model(mlp, loss_fn=cross_entropy_loss)
+        assert model._loss_name == "custom"
+
+
+class TestMseLossShapeCheck:
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="mse_loss"):
+            mse_loss([1.0, 2.0, 3.0], [2.0, 2.0])
+
+    def test_matched_length_ok(self):
+        loss, grad = mse_loss([1.0, 2.0], [2.0, 2.0])
+        assert loss == pytest.approx(0.5)
+        assert grad == pytest.approx([-1.0, 0.0])
+
+
+class TestActivationName:
+    def test_recorded(self):
+        for act in ("leaky_relu", "relu", "softmax", "linear"):
+            assert Layer(3, 2, activation=act).activation_name == act
+
+    def test_unknown_activation_raises(self):
+        with pytest.raises(ValueError):
+            Layer(1, 1, activation="sigmoid")
+
+    def test_save_load_keeps_activation(self, tmp_path):
+        random.seed(42)
+        mlp = MLP([3, 5, 2], activations=["relu", "softmax"])
+        f = str(tmp_path / "act_model.json")
+        save_model(mlp, f)
+        loaded = load_model(f)
+        assert [l.activation_name for l in loaded.layers] == ["relu", "softmax"]
+
+
+class TestAttentionGradients:
+    """数值梯度校验：MHA 的 W_q/W_k/W_v/W_o 解析梯度必须与数值梯度一致
+
+    回归点：W_q/W_k/W_v 的梯度曾整体转置（矩阵是方阵，所以既不报错也不易察觉，
+    但会让 Transformer 一直朝错误方向更新）。
+    """
+
+    def _check(self):
+        random.seed(42)
+        mha = MultiHeadAttention(d_model=4, num_heads=2)
+        seq = [[0.1, 0.2, 0.3, 0.4],
+               [0.5, 0.6, 0.7, 0.8],
+               [0.9, 1.0, 1.1, 1.2]]
+
+        def loss():
+            out = mha.forward(seq)
+            return 0.5 * sum(v * v for row in out for v in row)
+
+        mha.zero_grad()
+        out = mha.forward(seq)
+        mha.backward([list(row) for row in out])
+
+        eps = 1e-6
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            mat = getattr(mha, name)
+            for a in range(4):
+                for b in range(4):
+                    old = mat[a][b]
+                    mat[a][b] = old + eps
+                    lp = loss()
+                    mat[a][b] = old - eps
+                    lm = loss()
+                    mat[a][b] = old
+                    numeric = (lp - lm) / (2 * eps)
+                    analytic = mha.grads[name][a][b]
+                    assert abs(numeric - analytic) < 1e-5, \
+                        f"{name}[{a}][{b}] 解析梯度 {analytic} 与数值梯度 {numeric} 不一致"
+
+    def test_weight_gradients_match_numeric(self):
+        self._check()
+
+
+# ========================== 24. BatchNorm 训练路径 / Conv2d 梯度 / BPTT 缓存 ==========================
+
+class TestBatchNormTraining:
+    """BatchNorm1d 的训练路径：forward_batch + backward（此前只有推理模式的形状测试）"""
+
+    @staticmethod
+    def _setup(n=6, d=4, seed=1):
+        random.seed(seed)
+        bn = BatchNorm1d(d)
+        xb = [[random.gauss(0, 1) for _ in range(d)] for _ in range(n)]
+        w = [random.gauss(0, 1) for _ in range(d)]
+        return bn, xb, w
+
+    @staticmethod
+    def _loss(bn, xb, w):
+        """L = sum_{i,j} w_j * out_ij，因此 dL/dout_ij = w_j"""
+        out = bn.forward_batch(xb)
+        return sum(wi * o for row in out for wi, o in zip(w, row))
+
+    def test_forward_batch_normalizes_columns(self):
+        bn, xb, _ = self._setup(n=64, d=4)
+        out = bn.forward_batch(xb)
+        assert len(out) == 64
+        assert len(out[0]) == 4
+        for j in range(4):
+            col = [row[j] for row in out]
+            assert sum(col) / len(col) == pytest.approx(0.0, abs=1e-9)
+            assert sum(v * v for v in col) / len(col) == pytest.approx(1.0, abs=1e-3)
+
+    def test_forward_batch_updates_running_stats(self):
+        bn, xb, _ = self._setup(n=8, d=4)
+        batch_mean = [sum(row[j] for row in xb) / 8 for j in range(4)]
+        bn.forward_batch(xb)
+        # momentum=0.1 且 running_mean 初值为 0
+        for j in range(4):
+            assert bn.running_mean[j] == pytest.approx(0.1 * batch_mean[j])
+
+    def test_backward_dx_matches_numeric(self):
+        """dx 必须等于数值梯度（覆盖 s1/s2 的批量统计反向）"""
+        bn, xb, w = self._setup(n=5, d=3)
+        bn.forward_batch(xb)
+        dout = [[w[j] for j in range(3)] for _ in range(5)]
+        dx, _, _ = bn.backward(dout)
+
+        eps = 1e-6
+        worst = 0.0
+        for i in range(5):
+            for j in range(3):
+                old = xb[i][j]
+                xb[i][j] = old + eps
+                lp = self._loss(bn, xb, w)
+                xb[i][j] = old - eps
+                lm = self._loss(bn, xb, w)
+                xb[i][j] = old
+                worst = max(worst, abs((lp - lm) / (2 * eps) - dx[i][j]))
+        assert worst < 1e-4, f"dx 与数值梯度最大偏差 {worst}"
+
+    def test_backward_gamma_beta_match_numeric(self):
+        bn, xb, w = self._setup(n=5, d=3)
+        bn.forward_batch(xb)
+        dout = [[w[j] for j in range(3)] for _ in range(5)]
+        _, gg, gb = bn.backward(dout)
+
+        eps = 1e-6
+        for j in range(3):
+            old = bn.gamma[j]
+            bn.gamma[j] = old + eps
+            lp = self._loss(bn, xb, w)
+            bn.gamma[j] = old - eps
+            lm = self._loss(bn, xb, w)
+            bn.gamma[j] = old
+            assert (lp - lm) / (2 * eps) == pytest.approx(gg[j], abs=1e-5)
+
+            old = bn.beta[j]
+            bn.beta[j] = old + eps
+            lp = self._loss(bn, xb, w)
+            bn.beta[j] = old - eps
+            lm = self._loss(bn, xb, w)
+            bn.beta[j] = old
+            assert (lp - lm) / (2 * eps) == pytest.approx(gb[j], abs=1e-5)
+
+    def test_backward_matches_naive_reference(self):
+        """与朴素实现（s1/s2 对每个 (i,j) 都重算一遍）逐位一致
+
+        回归点：s1/s2 曾被写在 i 循环里，复杂度 O(n^2*d)；优化后提到 j 循环外，
+        这里用原始写法做参考，保证两者输出完全相同。
+        """
+        bn, xb, _ = self._setup(n=6, d=4)
+        random.seed(12)
+        dout = [[random.gauss(0, 1) for _ in range(4)] for _ in range(6)]
+        bn.forward_batch(xb)
+        dx, gg, gb = bn.backward(dout)
+
+        n, d = bn.n, bn.d
+        gamma, x_hat, inv_std = bn.gamma, bn.x_hat, bn.inv_std
+        gg_ref = [sum(dout[i][j] * x_hat[i][j] for i in range(n)) for j in range(d)]
+        gb_ref = [sum(dout[i][j] for i in range(n)) for j in range(d)]
+        dx_hat = [[dout[i][j] * gamma[j] for j in range(d)] for i in range(n)]
+        dx_ref = []
+        for i in range(n):
+            row = []
+            for j in range(d):
+                s1 = sum(dx_hat[k][j] for k in range(n))
+                s2 = sum(dx_hat[k][j] * x_hat[k][j] for k in range(n))
+                row.append(inv_std[j] * (n * dx_hat[i][j] - s1 - x_hat[i][j] * s2) / n)
+            dx_ref.append(row)
+
+        assert gg == gg_ref
+        assert gb == gb_ref
+        assert dx == dx_ref
+
+
+class TestConv2dGradients:
+    """Conv2d 的数值梯度校验（此前只有输出形状测试）"""
+
+    @staticmethod
+    def _setup(C, OC, K, H, W, stride, pad, seed):
+        random.seed(seed)
+        conv = Conv2d(C, OC, K, stride=stride, padding=pad)
+        x = [[[random.gauss(0, 1) for _ in range(W)] for _ in range(H)] for _ in range(C)]
+        return conv, x
+
+    def _check(self, C, OC, K, H, W, stride, pad, seed=3):
+        conv, x = self._setup(C, OC, K, H, W, stride, pad, seed)
+        out = conv.forward(x)
+        ho, wo = len(out[0]), len(out[0][0])
+        random.seed(seed + 1)
+        coef = [[[random.gauss(0, 1) for _ in range(wo)] for _ in range(ho)]
+                for _ in range(OC)]
+
+        def L():
+            o = conv.forward(x)
+            return sum(coef[c][i][j] * o[c][i][j]
+                       for c in range(OC) for i in range(ho) for j in range(wo))
+
+        conv.zero_grad()
+        dx = conv.backward(coef)
+
+        eps = 1e-6
+        worst_w = worst_b = worst_x = 0.0
+        for oc in range(OC):
+            for ic in range(C):
+                for kh in range(conv.kh):
+                    for kw in range(conv.kw):
+                        old = conv.weights[oc][ic][kh][kw]
+                        conv.weights[oc][ic][kh][kw] = old + eps
+                        lp = L()
+                        conv.weights[oc][ic][kh][kw] = old - eps
+                        lm = L()
+                        conv.weights[oc][ic][kh][kw] = old
+                        worst_w = max(worst_w,
+                                      abs((lp - lm) / (2 * eps) - conv.grad_w[oc][ic][kh][kw]))
+        for oc in range(OC):
+            old = conv.biases[oc]
+            conv.biases[oc] = old + eps
+            lp = L()
+            conv.biases[oc] = old - eps
+            lm = L()
+            conv.biases[oc] = old
+            worst_b = max(worst_b, abs((lp - lm) / (2 * eps) - conv.grad_b[oc]))
+        for c in range(C):
+            for i in range(H):
+                for j in range(W):
+                    old = x[c][i][j]
+                    x[c][i][j] = old + eps
+                    lp = L()
+                    x[c][i][j] = old - eps
+                    lm = L()
+                    x[c][i][j] = old
+                    worst_x = max(worst_x, abs((lp - lm) / (2 * eps) - dx[c][i][j]))
+        return worst_w, worst_b, worst_x
+
+    def test_gradients_match_numeric_no_padding(self):
+        w, b, x = self._check(1, 2, 2, 5, 5, stride=1, pad=0)
+        assert w < 1e-5 and b < 1e-5 and x < 1e-5, f"grad_w={w} grad_b={b} dx={x}"
+
+    def test_gradients_match_numeric_padding_stride2(self):
+        w, b, x = self._check(2, 2, 3, 6, 6, stride=2, pad=1, seed=7)
+        assert w < 1e-5 and b < 1e-5 and x < 1e-5, f"grad_w={w} grad_b={b} dx={x}"
+
+
+class TestStepCache:
+    """RNN/LSTM/GRU 的 step_cache / restore_cache（BPTT 复用前向缓存）"""
+
+    @staticmethod
+    def _net(kind, T=4, inp=3, hs=4, seed=2):
+        random.seed(seed)
+        cls = {"RNN": RNN, "LSTM": LSTM, "GRU": GRU}[kind]
+        net = cls(inp, hs, 1)
+        seq = [[random.gauss(0, 1) for _ in range(inp)] for _ in range(T)]
+        return net, seq
+
+    @pytest.mark.parametrize("kind", ["RNN", "LSTM", "GRU"])
+    def test_step_cache_shape(self, kind):
+        net, seq = self._net(kind)
+        net.forward(seq)
+        assert len(net.step_cache) == len(seq)
+        assert all(len(step) == net.num_layers for step in net.step_cache)
+
+    @pytest.mark.parametrize("kind", ["RNN", "LSTM", "GRU"])
+    def test_restore_cache_equals_reforward(self, kind):
+        """restore_cache + backward 必须与「重新 forward + backward」逐位一致
+
+        这条同时锁住 _CACHE_FIELDS：将来给 cell 新增前向缓存字段却忘记登记，
+        恢复出来的 backward 就会与重新前向的结果不一致，这里会失败。
+        """
+        net, seq = self._net(kind)
+        net.forward(seq)
+        cell = net.cells[0]
+        dh = [0.1 * (i + 1) for i in range(net.hidden_size)]
+
+        for t in range(len(seq)):
+            snap = net.step_cache[t][0]
+            args = snap[:3] if kind == "LSTM" else snap[:2]
+
+            cell.zero_grad()
+            cell.restore_cache(snap)
+            res_a = cell.backward(dh)
+            grads_a = copy.deepcopy(cell.get_grads())
+
+            cell.zero_grad()
+            cell.forward(*args)
+            res_b = cell.backward(dh)
+            grads_b = copy.deepcopy(cell.get_grads())
+
+            assert res_a == res_b, f"{kind} t={t} 返回值不一致"
+            assert grads_a == grads_b, f"{kind} t={t} 梯度不一致"
+
+    @pytest.mark.parametrize("kind", ["RNN", "LSTM", "GRU"])
+    def test_full_bptt_equivalence(self, kind):
+        """整段 BPTT：用缓存恢复 vs 逐步重新前向，累积梯度必须一致"""
+        net, seq = self._net(kind, T=5)
+        net.forward(seq)
+        cell = net.cells[0]
+        hs = net.hidden_size
+        dh0 = [0.1] * hs
+
+        def run(use_cache):
+            cell.zero_grad()
+            dh_cur, dc_cur = dh0, [0.0] * hs
+            for t in reversed(range(len(seq))):
+                snap = net.step_cache[t][0]
+                if use_cache:
+                    cell.restore_cache(snap)
+                else:
+                    cell.forward(*(snap[:3] if kind == "LSTM" else snap[:2]))
+                if kind == "LSTM":
+                    _, dh_cur, dc_cur = cell.backward(dh_cur, dc_cur)
+                else:
+                    _, dh_cur = cell.backward(dh_cur)
+            return copy.deepcopy(cell.get_grads())
+
+        assert run(True) == run(False)
 
 
 if __name__ == "__main__":
