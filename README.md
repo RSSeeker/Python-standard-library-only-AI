@@ -297,26 +297,28 @@ CI（GitHub Actions）执行 flake8 + pytest。
 - **BPTT 复用 `step_cache`**，不必对每个时间步重跑一次前向。
 - **数值精度**：Python 3.12+ 的 `sum()` 对浮点使用补偿求和（Neumaier），所以用 `sum()` 改写过的热点与朴素累加循环相比结果可能**末位不同（通常更精确）**；`BatchNorm1d`、四个优化器、注意力内层循环、RNN 缓存这几处则是逐位一致的。
 
-## C 移植（可选）
+## C 移植（已独立成库）
 
-`c/` 目录下是核心数值路径的 C 移植（纯 C17 + libm，零第三方依赖，和本项目的定位一致）：
+C 移植已移出本仓库，现在是一个独立项目：**`D:\vscode\AI_C\c\`**（对应仓库
+[C-standard-library-only-AI](https://github.com/RSSeeker/C-standard-library-only-AI) 的 `c/` 目录）。
+纯 C17 + libm，零第三方依赖，和本项目定位一致。
 
-- **已实现**：全连接层与激活、MLP、MSE/交叉熵、Adam/SGD/Momentum/RMSprop、
-  批量训练 + 验证集切分 + Early Stopping + 梯度裁剪、预测/准确率/R²、权重存取
-- **数值等价性已验证**：给定相同初始权重，C 侧的前向传播与梯度累加和 Python 版
+已完成的验证（在那个项目里可复现）：
+
+- **数值等价性**：给定相同初始权重，C 侧的前向传播与梯度累加和本 Python 版
   **逐位一致**（差异 0.000e+00），5 步 Adam 后差 1 ULP
 - **训练循环零分配**：预热后 `trainer_fit` 期间的 `malloc` 次数为 0（用 `--wrap` 统计验证）
-- **性能**：MLP[64,256,128,8]、1000 样本 × 5 轮，C 约 1.3 s vs Python 约 77 s（**约 58–68 倍**）
+- **性能**：MLP[64,256,128,8]、1000 样本 × 5 轮，C 约 1.3 s vs Python 约 77 s（约 58–68 倍）
+
+跨语言比对靠两个脚本，它们通过环境变量 `AI_PY_DIR`（默认为与本项目同级的
+`Python-standard-library-only-AI-main`）找到本仓库的 `AI.py`：
 
 ```bash
-cd c
-gcc -std=c17 -O2 -Wall -Wextra -o demo demo.c ai.c -lm && ./demo
-python ../tools/c_reference.py reference.txt     # 导出 Python 参考数据
-gcc -std=c17 -O2 -Wall -Wextra -o compare_python compare_python.c ai.c -lm
-./compare_python reference.txt                   # 逐项比对，验证数值一致
+cd D:\vscode\AI_C\c
+python tools/c_reference.py reference.txt     # 用 Python 版导出参考数据
+gcc -std=c17 -O2 -Wall -Wextra -o compare_python compare_python.c ai.c tensor.c -lm
+./compare_python reference.txt                # C 侧重算并逐项比对
 ```
-
-详细的移植范围、未移植模块的难度评估与设计说明见 [c/README.md](c/README.md)。
 
 ## 文件结构
 
@@ -324,12 +326,7 @@ gcc -std=c17 -O2 -Wall -Wextra -o compare_python compare_python.c ai.c -lm
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
 ├── test_ai.py       # 171 个单元测试
-├── c/               # C 移植（核心数值路径，含等价性/零分配验证）
-│   ├── ai.h / ai.c
-│   ├── demo.c / bench.c / compare_python.c / check_noalloc.c
-│   └── README.md
-├── tools/           # C 移植的配套脚本（参考数据导出、对等基准）
-│   ├── c_reference.py
-│   └── c_bench.py
 └── README.md
 ```
+
+> C 移植见 `D:\vscode\AI_C\c\`（独立项目，不在本仓库内）。
