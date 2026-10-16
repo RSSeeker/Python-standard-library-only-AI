@@ -167,6 +167,68 @@ class MLP:
             params.append((layer.weights, layer.biases))
         return params
 
+    # ── 参数量与模型瘦身（与 C 引擎 c_model.cpp 的实现语义一致） ──
+
+    def param_count(self):
+        """可训练参数总数（权重 + 偏置）"""
+        return sum(l.fan_in * l.fan_out + l.fan_out for l in self.layers)
+
+    def sparsity(self):
+        """权重中恰好为 0 的比例（剪枝后用来看稀疏度）"""
+        total = sum(l.fan_in * l.fan_out for l in self.layers)
+        if total == 0:
+            return 0.0
+        zeros = sum(1 for l in self.layers for row in l.weights for w in row if w == 0.0)
+        return zeros / total
+
+    def prune_magnitude(self, threshold):
+        """幅度剪枝：把 |w| < threshold 的权重置 0，返回被剪掉的个数"""
+        if threshold <= 0:
+            return 0
+        pruned = 0
+        for l in self.layers:
+            for j in range(l.fan_out):
+                row = l.weights[j]
+                for i in range(l.fan_in):
+                    if abs(row[i]) < threshold:
+                        row[i] = 0.0
+                        pruned += 1
+        return pruned
+
+    def quantize_weights(self, bits):
+        """权重定点量化：按全局 min/max 均匀分档，返回量化步长（bits 需在 2..24）"""
+        if not (2 <= bits <= 24):
+            return -1.0
+        vals = [w for l in self.layers for row in l.weights for w in row]
+        if not vals:
+            return -1.0
+        lo, hi = min(vals), max(vals)
+        if hi <= lo:
+            return -1.0
+        step = (hi - lo) / ((1 << bits) - 1)
+        for l in self.layers:
+            for j in range(l.fan_out):
+                row = l.weights[j]
+                for i in range(l.fan_in):
+                    row[i] = lo + round((row[i] - lo) / step) * step
+        return step
+
+    def merge_weights(self, other, w_self=0.5, w_other=0.5):
+        """权重线性合并：self = w_self*self + w_other*other（结构必须一致）
+
+        做 K 折权重平均时各折必须从同一初值出发，否则隐藏单元排列不同，
+        直接平均会得到无意义的模型（这一点在 C 引擎的 CLI 里踩过）。
+        """
+        if self.layer_sizes != other.layer_sizes:
+            raise ValueError(f"结构不一致: {self.layer_sizes} vs {other.layer_sizes}")
+        for la, lb in zip(self.layers, other.layers):
+            for j in range(la.fan_out):
+                ra, rb = la.weights[j], lb.weights[j]
+                for i in range(la.fan_in):
+                    ra[i] = w_self * ra[i] + w_other * rb[i]
+                la.biases[j] = w_self * la.biases[j] + w_other * lb.biases[j]
+        return self
+
     def __repr__(self):
         return f"MLP({self.layer_sizes})"
 
@@ -2758,7 +2820,8 @@ class Model:
 
     def fit(self, x=None, y=None, data=None, epochs=100, batch_size=32,
             val_split=0.1, val_data=None, patience=50, verbose=True,
-            shuffle=True, lr_scheduler=None, grad_clip=None):
+            shuffle=True, lr_scheduler=None, grad_clip=None,
+            early_stop_metric='val'):
         """
         训练模型。
 
@@ -2859,9 +2922,19 @@ class Model:
                 val_loss = self.evaluate(data=val_set)
                 self.history['val_loss'].append((epoch, val_loss))
 
-                if patience > 0:
-                    if val_loss < best_val_loss - 1e-12:
-                        best_val_loss = val_loss
+            # 早停判据：默认盯验证损失（需要验证集）；
+            # early_stop_metric='train' 时改盯训练损失，此时不依赖验证集
+            # （与 C 引擎 FitConfig.early_stop_on_train 同一语义）
+            if patience > 0:
+                if early_stop_metric == 'train':
+                    monitored = train_loss
+                elif val_set:
+                    monitored = val_loss
+                else:
+                    monitored = None
+                if monitored is not None:
+                    if monitored < best_val_loss - 1e-12:
+                        best_val_loss = monitored
                         no_improve = 0
                     else:
                         no_improve += 1
@@ -2985,6 +3058,40 @@ class Model:
 
 
 # ── 工厂函数 ─────────────────────────────────────────────────
+
+def distill(teacher, student, x, y, epochs=400, batch_size=16,
+            val_split=0.1, patience=50, verbose=True):
+    """蒸馏：让 student 去拟合 teacher 的输出（软目标）
+
+    与 C 引擎 ai_cli 的 distill 子命令同一套做法：先用教师生成软目标，再训练学生。
+    返回 (student, 与教师的一致率)。分类按类别一致率算，回归按误差 <= 1e-2 判定。
+
+    用法:
+        teacher = make_regressor(1, 1, hidden_layers=(16, 16)); teacher.fit(x, y)
+        student = make_regressor(1, 1, hidden_layers=(4,))
+        student, agree = distill(teacher, student, x, y)
+    """
+    cls = getattr(teacher, 'task', 'regression') == 'classification'
+    if cls:
+        soft_y = teacher.predict_classes(x)          # list[int]
+        student.fit(x, soft_y, epochs=epochs, batch_size=batch_size,
+                    val_split=val_split, patience=patience, verbose=False)
+        agree = sum(1 for xi, yi in zip(x, soft_y)
+                    if student.predict_classes([xi])[0] == yi)
+    else:
+        soft_y = teacher.predict(x)                  # 多样本 -> list[list]
+        student.fit(x, soft_y, epochs=epochs, batch_size=batch_size,
+                    val_split=val_split, patience=patience, verbose=False)
+        agree = sum(1 for xi, yi in zip(x, soft_y)
+                    if max(abs(a - b) for a, b in
+                           zip(student.predict([xi])[0], yi)) <= 1e-2)
+
+    rate = agree / len(x) if x else 0.0
+    if verbose:
+        print(f"蒸馏完成: 教师 {teacher.model.param_count()} 参数 -> "
+              f"学生 {student.model.param_count()} 参数，与教师一致率 {rate * 100:.1f}%")
+    return student, rate
+
 
 def make_classifier(input_dim, num_classes, hidden_layers=(32,),
                     act='leaky_relu', lr=0.01, optimizer='adam',

@@ -39,6 +39,7 @@ from AI import (
     _softmax_with_temp,
     # 新增高层 API
     Model, make_classifier, make_regressor, quick_train,
+    distill,
 )
 
 
@@ -2087,3 +2088,107 @@ class TestCellGradSemantics:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+# ========================== 26. 模型瘦身 / 早停判据 / 蒸馏 ==========================
+
+class TestModelSlimming:
+    """对应 C 引擎 c_model.cpp 与 ai_cli 的同一套语义"""
+
+    @staticmethod
+    def _mlp():
+        random.seed(11)
+        return MLP([3, 5, 2], activations=["leaky_relu", "linear"])
+
+    def test_param_count(self):
+        m = self._mlp()
+        assert m.param_count() == (3 * 5 + 5) + (5 * 2 + 2)   # 37
+
+    def test_sparsity_starts_zero_and_full_prune(self):
+        m = self._mlp()
+        assert m.sparsity() == 0.0
+        pruned = m.prune_magnitude(1e9)          # 阈值极大 -> 全剪
+        assert pruned == 3 * 5 + 5 * 2
+        assert m.sparsity() == 1.0
+
+    def test_prune_keeps_large_weights(self):
+        m = self._mlp()
+        m.layers[0].weights[0][0] = 5.0
+        m.prune_magnitude(0.001)
+        assert m.layers[0].weights[0][0] == 5.0
+
+    def test_prune_zero_threshold_is_noop(self):
+        m = self._mlp()
+        assert m.prune_magnitude(0.0) == 0
+        assert m.sparsity() == 0.0
+
+    def test_quantize_lands_on_grid(self):
+        m = self._mlp()
+        step = m.quantize_weights(8)
+        assert step > 0
+        vals = [w for l in m.layers for row in l.weights for w in row]
+        lo = min(vals)
+        for v in vals:
+            k = (v - lo) / step
+            assert k == pytest.approx(round(k), abs=1e-9)
+
+    def test_quantize_invalid_bits(self):
+        m = self._mlp()
+        assert m.quantize_weights(1) == -1.0
+        assert m.quantize_weights(64) == -1.0
+
+    def test_merge_weights_halfway(self):
+        a = self._mlp()
+        b = self._mlp()
+        a.layers[0].weights[0][0] = 0.0
+        b.layers[0].weights[0][0] = 2.0
+        a.merge_weights(b, 0.5, 0.5)
+        assert a.layers[0].weights[0][0] == pytest.approx(1.0)
+
+    def test_merge_weights_shape_mismatch_raises(self):
+        a = self._mlp()
+        with pytest.raises(ValueError):
+            a.merge_weights(MLP([4, 5, 2]), 0.5, 0.5)
+
+
+class TestEarlyStopMetric:
+    @staticmethod
+    def _data():
+        random.seed(7)
+        xs = [[-1 + 2 * i / 29] for i in range(30)]
+        ys = [[2 * x[0] + 1] for x in xs]
+        return xs, ys
+
+    def test_train_metric_stops_without_val_set(self):
+        """没有验证集时 patience 也必须生效（early_stop_metric='train'）"""
+        xs, ys = self._data()
+        m = make_regressor(1, 1, hidden_layers=(8,), lr=0.05)
+        m.fit(xs, ys, epochs=500, batch_size=8, val_split=0.0, patience=20,
+              verbose=False, early_stop_metric="train")
+        assert m.history["train_loss"][-1][0] < 500
+
+    def test_default_val_metric_unchanged(self):
+        xs, ys = self._data()
+        m = make_regressor(1, 1, hidden_layers=(8,), lr=0.05)
+        m.fit(xs, ys, epochs=150, batch_size=8, val_split=0.1, patience=50, verbose=False)
+        assert m.history["train_loss"][-1][0] <= 150
+
+    def test_no_val_no_early_stop_by_default(self):
+        """默认判据下、没有验证集时不应早停（保持原行为）"""
+        xs, ys = self._data()
+        m = make_regressor(1, 1, hidden_layers=(8,), lr=0.05)
+        m.fit(xs, ys, epochs=60, batch_size=8, val_split=0.0, patience=5, verbose=False)
+        assert m.history["train_loss"][-1][0] == 60
+
+
+class TestDistillApi:
+    def test_distill_regression_smaller_student(self):
+        random.seed(9)
+        xs = [[-1 + 2 * i / 29, 0.5 * (-1 + 2 * i / 29)] for i in range(30)]
+        ys = [[a * a + b] for a, b in xs]
+        teacher = make_regressor(2, 1, hidden_layers=(16, 16), lr=0.03)
+        teacher.fit(xs, ys, epochs=400, val_split=0.1, verbose=False)
+        student = make_regressor(2, 1, hidden_layers=(4,), lr=0.03)
+        out, rate = distill(teacher, student, xs, ys, epochs=300, batch_size=8, verbose=False)
+        assert out is student
+        assert 0.0 <= rate <= 1.0
+        assert student.model.param_count() < teacher.model.param_count()
