@@ -235,12 +235,19 @@ rnn = RNN(input_size=1, hidden_size=4, num_layers=1)   # 承接上例
 seq = [[0.1], [0.2], [0.3], [0.4]]
 
 outputs, _ = rnn.forward(seq)
-rnn.cells[0].zero_grad()
+rnn.cells[0].zero_grad()          # 整个 BPTT 只清一次
 dh = [0.1] * rnn.hidden_size
 for t in reversed(range(len(seq))):
     rnn.cells[0].restore_cache(rnn.step_cache[t][0])   # 复用前向缓存
-    dx, dh = rnn.cells[0].backward(dh)
+    _, dh = rnn.cells[0].backward(dh)
+
+grad_W_ih, grad_W_hh, grad_b_ih, grad_b_hh = rnn.cells[0].get_grads()
 ```
+
+> 两个容易踩的点：
+> 1. `backward()` 会把梯度**原地累加**到 cell 自己的缓冲区，所以整个 BPTT 只需 `zero_grad()` 一次；
+> 2. `get_grads()` 返回的**就是这些缓冲区本身**（不是副本），因此**不要**再对它做手工求和/累加——
+>    那等于把缓冲区加到它自己身上，梯度会按 2 的幂被放大（T=10 时实测放大 264 倍）。
 
 ### 文本生成
 

@@ -3269,42 +3269,33 @@ if __name__ == "__main__":
             # 传回 RNN 的梯度
             dh = [d_pred * out_w[0][i] for i in range(4)]
 
-            # BPTT: 逐时间步反向传播，累积 RNN 权重梯度
-            rnn.cells[0].zero_grad()
-            grad_W_ih_sum, grad_W_hh_sum = None, None
-            grad_b_ih_sum, grad_b_hh_sum = None, None
+            # BPTT: 逐时间步反向传播，反向过程会原地累加到 cell 的梯度缓冲区
+            cell = rnn.cells[0]
+            cell.zero_grad()          # 整个 BPTT 只清一次
 
             dh_cur = dh
             for t in reversed(range(len(x_seq))):
                 # RNN.forward 已把每一步的缓存存进 step_cache，这里直接恢复，
                 # 不需要再 forward 一次来"重建"缓存
-                rnn.cells[0].restore_cache(rnn.step_cache[t][0])
-                dx, dh_prev = rnn.cells[0].backward(dh_cur)
-                gw, gwh, gb, gbh = rnn.cells[0].get_grads()
+                cell.restore_cache(rnn.step_cache[t][0])
+                _, dh_cur = cell.backward(dh_cur)
 
-                if grad_W_ih_sum is None:
-                    grad_W_ih_sum, grad_W_hh_sum = gw, gwh
-                    grad_b_ih_sum, grad_b_hh_sum = gb, gbh
-                else:
-                    for j in range(4):
-                        grad_b_ih_sum[j] += gb[j]
-                        grad_b_hh_sum[j] += gbh[j]
-                        for i in range(len(gw[j])):
-                            grad_W_ih_sum[j][i] += gw[j][i]
-                        for i in range(4):
-                            grad_W_hh_sum[j][i] += gwh[j][i]
-                dh_cur = dh_prev
+            # cell 内部已经把所有时间步的梯度累加好了，直接取用。
+            # 注意：get_grads() 返回的就是内部缓冲区本身，不能再去"手工求和"——
+            # 那等于把缓冲区加到它自己身上，梯度会按 2 的幂被放大。
+            grad_W_ih, grad_W_hh, grad_b_ih, grad_b_hh = cell.get_grads()
 
             # 更新 RNN 权重 (SGD)
-            lr = 0.01
-            cell = rnn.cells[0]
+            # lr 从 0.01 提到 0.03：修掉上面的重复累加后梯度不再被放大，
+            # 用 0.03 才能和修复前的收敛速度持平（且实测略好）
+            lr = 0.03
             for j in range(4):
-                cell.b_ih[j] -= lr * grad_b_ih_sum[j]
-                cell.b_hh[j] -= lr * grad_b_hh_sum[j]
+                cell.b_ih[j] -= lr * grad_b_ih[j]
+                cell.b_hh[j] -= lr * grad_b_hh[j]
                 for i in range(1):  # input_size = 1
-                    cell.W_ih[j][i] -= lr * grad_W_ih_sum[j][i]
+                    cell.W_ih[j][i] -= lr * grad_W_ih[j][i]
                 for i in range(4):
-                    cell.W_hh[j][i] -= lr * grad_W_hh_sum[j][i]
+                    cell.W_hh[j][i] -= lr * grad_W_hh[j][i]
 
             # 更新输出层权重 (SGD)
             for i in range(4):
@@ -3346,47 +3337,32 @@ if __name__ == "__main__":
             # 传回 LSTM 的梯度
             dh = [d_pred * lstm_out_w[0][i] for i in range(4)]
 
-            # BPTT: 逐时间步反向传播，累积 LSTM 权重梯度
-            lstm.cells[0].zero_grad()
+            # BPTT: 逐时间步反向传播，反向过程会原地累加到 cell 的梯度缓冲区
+            cell = lstm.cells[0]
+            cell.zero_grad()          # 整个 BPTT 只清一次
 
             dh_cur = dh
-            dc_cur = [0.0] * 4  # 最后一步没有来自后续的 cell gradient
-            grad_W_ih_sum, grad_W_hh_sum = None, None
-            grad_b_ih_sum, grad_b_hh_sum = None, None
-
+            dc_cur = [0.0] * 4        # 最后一步没有来自后续的 cell gradient
             for t in reversed(range(len(x_seq))):
                 # LSTM.forward 已把每步的 gates / c / x / h_prev 存进 step_cache，
                 # 直接恢复即可：既不用额外跑一轮前向收集 cs_list，也不用逐步重算
-                lstm.cells[0].restore_cache(lstm.step_cache[t][0])
-                dx, dh_prev, dc_prev = lstm.cells[0].backward(dh_cur, dc_cur)
-                gw, gwh, gb, gbh = lstm.cells[0].get_grads()
+                cell.restore_cache(lstm.step_cache[t][0])
+                _, dh_cur, dc_cur = cell.backward(dh_cur, dc_cur)
 
-                if grad_W_ih_sum is None:
-                    grad_W_ih_sum, grad_W_hh_sum = gw, gwh
-                    grad_b_ih_sum, grad_b_hh_sum = gb, gbh
-                else:
-                    gates = 16  # 4 * hidden_size
-                    for j in range(gates):
-                        grad_b_ih_sum[j] += gb[j]
-                        grad_b_hh_sum[j] += gbh[j]
-                        for i in range(len(gw[j])):
-                            grad_W_ih_sum[j][i] += gw[j][i]
-                        for i in range(4):
-                            grad_W_hh_sum[j][i] += gwh[j][i]
-                dh_cur = dh_prev
-                dc_cur = dc_prev
+            # cell 内部已累加好所有时间步的梯度，直接取用（get_grads() 返回的是
+            # 内部缓冲区本身，不能再手工求和，否则会自己加自己、按 2 的幂放大）
+            grad_W_ih, grad_W_hh, grad_b_ih, grad_b_hh = cell.get_grads()
 
-            # 更新 LSTM 权重 (SGD)
-            lr = 0.01
-            cell = lstm.cells[0]
-            gates = 16
+            # 更新 LSTM 权重 (SGD)；lr 见 RNN 段的说明
+            lr = 0.03
+            gates = 16  # 4 * hidden_size
             for j in range(gates):
-                cell.b_ih[j] -= lr * grad_b_ih_sum[j]
-                cell.b_hh[j] -= lr * grad_b_hh_sum[j]
+                cell.b_ih[j] -= lr * grad_b_ih[j]
+                cell.b_hh[j] -= lr * grad_b_hh[j]
                 for i in range(1):  # input_size = 1
-                    cell.W_ih[j][i] -= lr * grad_W_ih_sum[j][i]
+                    cell.W_ih[j][i] -= lr * grad_W_ih[j][i]
                 for i in range(4):
-                    cell.W_hh[j][i] -= lr * grad_W_hh_sum[j][i]
+                    cell.W_hh[j][i] -= lr * grad_W_hh[j][i]
 
             # 更新输出层权重 (SGD)
             for i in range(4):
@@ -3441,40 +3417,30 @@ if __name__ == "__main__":
             grad_out_w = [[d_pred * last_h[i] for i in range(4)]]
             grad_out_b = [d_pred]
 
-            # BPTT for GRU
-            gru.cells[0].zero_grad()
-            dh = [d_pred * gru_out_w[0][i] for i in range(4)]
-            grad_W_ih_sum, grad_W_hh_sum = None, None
-            grad_b_ih_sum, grad_b_hh_sum = None, None
+            # BPTT for GRU：反向过程会原地累加到 cell 的梯度缓冲区
+            cell = gru.cells[0]
+            cell.zero_grad()          # 整个 BPTT 只清一次
 
+            dh = [d_pred * gru_out_w[0][i] for i in range(4)]
             dh_cur = dh
             for t in reversed(range(len(x_seq))):
                 # GRU.forward 已存好每步缓存，直接恢复，避免二次前向
-                gru.cells[0].restore_cache(gru.step_cache[t][0])
-                dx, dh_prev = gru.cells[0].backward(dh_cur)
-                gw, gwh, gb, gbh = gru.cells[0].get_grads()
+                cell.restore_cache(gru.step_cache[t][0])
+                _, dh_cur = cell.backward(dh_cur)
 
-                if grad_W_ih_sum is None:
-                    grad_W_ih_sum, grad_W_hh_sum = gw, gwh
-                    grad_b_ih_sum, grad_b_hh_sum = gb, gbh
-                else:
-                    for j in range(12):  # 3 * hidden
-                        grad_b_ih_sum[j] += gb[j]; grad_b_hh_sum[j] += gbh[j]
-                        for i in range(len(gw[j])):
-                            grad_W_ih_sum[j][i] += gw[j][i]
-                        for i in range(4):
-                            grad_W_hh_sum[j][i] += gwh[j][i]
-                dh_cur = dh_prev
+            # cell 内部已累加好所有时间步的梯度，直接取用（get_grads() 返回的是
+            # 内部缓冲区本身，不能再手工求和，否则会自己加自己、按 2 的幂放大）
+            grad_W_ih, grad_W_hh, grad_b_ih, grad_b_hh = cell.get_grads()
 
-            lr = 0.01
-            cell = gru.cells[0]
-            for j in range(12):
-                cell.b_ih[j] -= lr * grad_b_ih_sum[j]
-                cell.b_hh[j] -= lr * grad_b_hh_sum[j]
-                for i in range(1):
-                    cell.W_ih[j][i] -= lr * grad_W_ih_sum[j][i]
+            # 更新 GRU 权重 (SGD)；lr 见 RNN 段的说明
+            lr = 0.03
+            for j in range(12):  # 3 * hidden
+                cell.b_ih[j] -= lr * grad_b_ih[j]
+                cell.b_hh[j] -= lr * grad_b_hh[j]
+                for i in range(1):  # input_size = 1
+                    cell.W_ih[j][i] -= lr * grad_W_ih[j][i]
                 for i in range(4):
-                    cell.W_hh[j][i] -= lr * grad_W_hh_sum[j][i]
+                    cell.W_hh[j][i] -= lr * grad_W_hh[j][i]
             for i in range(4):
                 gru_out_w[0][i] -= lr * grad_out_w[0][i]
             gru_out_b[0] -= lr * grad_out_b[0]

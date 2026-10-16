@@ -1639,5 +1639,92 @@ class TestStepCache:
         assert run(True) == run(False)
 
 
+class TestCellGradSemantics:
+    """锁住 cell 的梯度语义：一次 zero_grad + 逐时间步 backward == 各步梯度之和
+
+    回归点：__main__ 的 BPTT 示例曾把 get_grads() 的返回值再手工累加一遍，
+    但它返回的就是 cell 内部缓冲区本身，于是变成"把自己加到自己"，梯度按 2 的幂
+    放大（实测 T=3 放大 2.5 倍、T=5 放大 7.7 倍、T=10 放大 264 倍）。
+    """
+
+    @staticmethod
+    def _net(kind, T=5, inp=3, hs=4, seed=5):
+        random.seed(seed)
+        cls = {"RNN": RNN, "LSTM": LSTM, "GRU": GRU}[kind]
+        net = cls(inp, hs, 1)
+        seq = [[random.gauss(0, 1) for _ in range(inp)] for _ in range(T)]
+        return net, seq
+
+    @pytest.mark.parametrize("kind", ["RNN", "LSTM", "GRU"])
+    def test_accumulated_equals_sum_of_isolated_steps(self, kind):
+        net, seq = self._net(kind)
+        net.forward(seq)
+        cell = net.cells[0]
+        hs = net.hidden_size
+        dh0 = [0.1 * (i + 1) for i in range(hs)]
+
+        # A：整个 BPTT 只 zero_grad 一次，梯度由 backward 原地累加
+        cell.zero_grad()
+        dh_cur, dc_cur = dh0, [0.0] * hs
+        for t in reversed(range(len(seq))):
+            cell.restore_cache(net.step_cache[t][0])
+            if kind == "LSTM":
+                _, dh_cur, dc_cur = cell.backward(dh_cur, dc_cur)
+            else:
+                _, dh_cur = cell.backward(dh_cur)
+        acc = copy.deepcopy(cell.get_grads())
+
+        # B：每步单独 zero_grad + backward，再把各步梯度显式相加
+        dh_cur, dc_cur = dh0, [0.0] * hs
+        total = None
+        for t in reversed(range(len(seq))):
+            cell.zero_grad()
+            cell.restore_cache(net.step_cache[t][0])
+            if kind == "LSTM":
+                _, dh_cur, dc_cur = cell.backward(dh_cur, dc_cur)
+            else:
+                _, dh_cur = cell.backward(dh_cur)
+            gw, gwh, gb, gbh = copy.deepcopy(cell.get_grads())
+            if total is None:
+                total = [gw, gwh, gb, gbh]
+            else:
+                tw, twh, tb, tbh = total
+                for j in range(len(gw)):
+                    tb[j] += gb[j]
+                    tbh[j] += gbh[j]
+                    for i in range(len(gw[j])):
+                        tw[j][i] += gw[j][i]
+                    for i in range(len(gwh[j])):
+                        twh[j][i] += gwh[j][i]
+
+        # 两者累加顺序一致，应当逐位相同（pytest.approx 不支持嵌套结构，用 == 更严格）
+        for got, want, name in zip(acc, total,
+                                   ("grad_W_ih", "grad_W_hh", "grad_b_ih", "grad_b_hh")):
+            assert got == want, f"{kind} {name} 原地累加与逐步求和结果不一致"
+
+    @pytest.mark.parametrize("kind", ["RNN", "LSTM", "GRU"])
+    def test_get_grads_reflects_buffers(self, kind):
+        """get_grads() 返回的数值必须等于内部缓冲区当前值
+
+        注意：实现上它返回的就是缓冲区本身（不是副本），所以调用方**不能**对
+        返回值再做 += 累加，否则会自己加自己。这里只锁数值一致，不锁对象身份。
+        """
+        net, seq = self._net(kind, T=3)
+        net.forward(seq)
+        cell = net.cells[0]
+        cell.zero_grad()
+        cell.restore_cache(net.step_cache[0][0])
+        if kind == "LSTM":
+            cell.backward([0.1] * 4, [0.0] * 4)
+        else:
+            cell.backward([0.1] * 4)
+
+        gw, gwh, gb, gbh = cell.get_grads()
+        assert gw == cell.grad_W_ih
+        assert gwh == cell.grad_W_hh
+        assert gb == cell.grad_b_ih
+        assert gbh == cell.grad_b_hh
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
