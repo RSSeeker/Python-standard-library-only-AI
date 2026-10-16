@@ -7,3 +7,9 @@ __pycache__/
 .DS_Store
 classification_model.json
 model.json
+
+# C 移植的构建产物
+*.o
+*.exe
+*.out
+c/reference.txt
