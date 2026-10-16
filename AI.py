@@ -122,16 +122,13 @@ class Layer:
         """delta: 本层输出的梯度，返回上一层需要的 delta"""
         d_act = self.act_deriv(self.z)
 
-        # 标量提到内层循环外：每个元素只做一次乘法
-        grad_w = []
-        for j in range(self.fan_out):
-            s = delta[j] * d_act[j]
-            grad_w.append([s * xi for xi in self.input])
-        grad_b = [delta[j] * d_act[j] for j in range(self.fan_out)]
+        # delta * d_act 同时是 grad_b 与回传给上一层的权重向量，只算一次
+        w = [delta[j] * d_act[j] for j in range(self.fan_out)]
+        grad_w = [[s * xi for xi in self.input] for s in w]
+        grad_b = list(w)
 
         # 传给上一层的 delta = W^T · (delta * d_act)
         # zip(*W) 在 C 层完成转置，再用 map(mul) 做点积，比双重索引的 genexpr 快约 1.9 倍
-        w = [delta[j] * d_act[j] for j in range(self.fan_out)]
         next_delta = [sum(map(_mul, col, w)) for col in zip(*self.weights)]
 
         return grad_w, grad_b, next_delta
@@ -1024,7 +1021,7 @@ class GRUCell(_StepCacheMixin):
 
         # 缓存
         self.x = self.h_prev = None
-        self.z = self.r = self.n = None             # 三组门预激活值
+        self.z = self.r = None                      # 两组门预激活值（n 门无预激活变量）
         self.z_a = self.r_a = None                   # sigmoid(z), sigmoid(r)
         self.n_val = None                            # tanh(n_ih + r_a * n_hh)
         self.n_ih = self.n_hh = None                 # n 的 ih 和 hh 分量（分离存储用于反向）
@@ -1751,7 +1748,11 @@ class ResidualBlock:
         return [x[i] + out[i] for i in range(len(x))]
 
     def backward(self, dout):
-        d_sublayer = self.sublayer.backward(dout)
+        # sublayer 的 backward 返回值有两种约定（同 Sequential）：
+        #   元组 (..., delta) 取其末位；list 则整体就是 delta。
+        # Layer / LayerNorm 返回元组，Dropout / Embedding / 注意力等返回 list。
+        result = self.sublayer.backward(dout)
+        d_sublayer = result[-1] if isinstance(result, tuple) else result
         if isinstance(dout, list) and isinstance(dout[0], list):
             return [[dout[t][j] + d_sublayer[t][j] for j in range(len(dout[0]))] for t in range(len(dout))]
         return [dout[i] + d_sublayer[i] for i in range(len(dout))]
@@ -2145,27 +2146,11 @@ def sample_index(probs: list) -> int:
 
 def generate_text(network, tp: TextProcessor, start_str: str,
                   length: int = 15, window_size: int = 3, temp: float = 1.0) -> str:
-    """自回归文本生成：给定起始字符串，逐字预测后续内容"""
-    generated = start_str
-    for _ in range(length):
-        # 截取最后 window_size 个字符作为上下文
-        context = generated[-window_size:]
-        if len(context) < window_size:
-            context = context.rjust(window_size, tp.chars[0])
+    """自回归文本生成（network 只需提供 forward）
 
-        # 拼接 one-hot 编码
-        test_vec = []
-        for c in context:
-            test_vec.extend(tp.encode_one_hot(c))
-
-        # 前向传播得到概率分布
-        probs = network.forward(test_vec)
-        probs = _softmax_with_temp(probs, temp)
-
-        # 随机采样下一个字符
-        next_idx = sample_index(probs)
-        generated += tp.idx_to_char[next_idx]
-    return generated
+    与 generate_text_with_mlp 是同一实现，保留这个名字只为兼容旧调用。
+    """
+    return generate_text_with_mlp(network, tp, start_str, length, window_size, temp)
 
 
 def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
@@ -2938,13 +2923,18 @@ class Model:
             return correct / len(y)
         else:
             preds = self.predict(x)
-            # 展平
-            y_flat = [(yi if not isinstance(yi, (list, tuple)) else yi[0]) for yi in y]
-            p_flat = [(pi if not isinstance(pi, (list, tuple)) else pi[0]) for pi in preds]
-            ss_res = sum((yf - pf) ** 2 for yf, pf in zip(y_flat, p_flat))
-            y_mean = sum(y_flat) / len(y_flat)
-            ss_tot = sum((yf - y_mean) ** 2 for yf in y_flat)
-            return 1 - ss_res / max(ss_tot, 1e-15)
+            # 多输出回归：对每个输出维度分别算 R² 再取平均（单输出时与原来完全一致，
+            # 原来是只取第 0 维、静默忽略其余维度）
+            n_out = len(preds[0]) if preds and isinstance(preds[0], (list, tuple)) else 1
+            scores = []
+            for d in range(n_out):
+                y_d = [(yi if not isinstance(yi, (list, tuple)) else yi[d]) for yi in y]
+                p_d = [(pi if not isinstance(pi, (list, tuple)) else pi[d]) for pi in preds]
+                ss_res = sum((a - b) ** 2 for a, b in zip(y_d, p_d))
+                y_mean = sum(y_d) / len(y_d)
+                ss_tot = sum((a - y_mean) ** 2 for a in y_d)
+                scores.append(1 - ss_res / max(ss_tot, 1e-15))
+            return sum(scores) / len(scores)
 
     # ── 持久化 ───────────────────────────────────────────────
 

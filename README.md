@@ -53,7 +53,7 @@ history = model.fit(x_train, y_train, epochs=300, batch_size=2, patience=30,
                     lr_scheduler=StepLR(model.optimizer, step_size=50, gamma=0.5),
                     grad_clip=1.0)
 pred = model.predict(x_train)
-score = model.score(x_train, y_train)   # 分类=准确率 / 回归=R²
+score = model.score(x_train, y_train)   # 分类=准确率 / 回归=R²（多输出时对各输出维度取平均）
 
 # 保存 & 加载
 model.save("model.json")
@@ -180,8 +180,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | 组件 | 说明 |
 |------|------|
 | `TextProcessor` | 字符级词表、one-hot 编码、滑动窗口 |
-| `generate_text(network, tp, start, length)` | 自回归文本生成（配合 RNN 等序列模型） |
-| `generate_text_with_mlp(model, tp, start, length, window_size, temp)` | 自回归文本生成（配合 MLP + 滑动窗口） |
+| `generate_text(network, tp, start, length)` | 自回归文本生成（`generate_text_with_mlp` 的别名，保留以兼容旧调用） |
+| `generate_text_with_mlp(model, tp, start, length, window_size, temp)` | 自回归文本生成（滑动窗口上下文，只需 `forward`） |
 | `_softmax_with_temp(logits, temperature)` | 带温度的 Softmax |
 | `sample_index(probs)` | 随机采样 |
 
@@ -277,7 +277,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-164 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+171 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -302,6 +302,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py         # 神经网络工具箱（所有代码）
-├── test_ai.py    # 164 个单元测试
+├── test_ai.py    # 171 个单元测试
 └── README.md
 ```

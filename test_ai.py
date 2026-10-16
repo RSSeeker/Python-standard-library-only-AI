@@ -34,7 +34,7 @@ from AI import (
     StepLR, ExponentialLR, CosineAnnealingLR,
     split_data, DataLoader,
     TextProcessor, sample_index,
-    generate_text_with_mlp,
+    generate_text, generate_text_with_mlp,
     train, evaluate, save_model, load_model,
     _softmax_with_temp,
     # 新增高层 API
@@ -320,6 +320,64 @@ class TestResidualBlock:
         block = ResidualBlock(sublayer)
         out = block.forward([0.1, 0.2, -0.1, 0.5])
         assert len(out) == 4
+
+    def test_backward_with_layer_sublayer(self):
+        """sublayer 是 Layer（backward 返回 3 元组）时必须取其末位
+
+        回归点：ResidualBlock.backward 曾把返回值直接当 2D 列表索引，
+        sublayer=Layer/LayerNorm 时会 TypeError（只有 sublayer 返回 list 才能跑通）。
+        """
+        random.seed(41)
+        block = ResidualBlock(Layer(4, 4, activation="leaky_relu"))
+        x = [random.gauss(0, 1) for _ in range(4)]
+        dout = [random.gauss(0, 1) for _ in range(4)]
+        block.forward(x)
+        dx = block.backward(dout)
+        assert len(dx) == 4
+
+        # 数值校验：残差块输出 = x + F(x)，故 dL/dx = dout + dL/dF
+        def loss():
+            return sum(d * v for d, v in zip(dout, block.forward(x)))
+
+        eps = 1e-6
+        for i in range(4):
+            old = x[i]
+            x[i] = old + eps
+            lp = loss()
+            x[i] = old - eps
+            lm = loss()
+            x[i] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(num - dx[i]) < 1e-6, f"dx[{i}]: 解析 {dx[i]} vs 数值 {num}"
+
+    def test_backward_with_layernorm_sublayer(self):
+        """LayerNorm 也返回元组，同样要覆盖"""
+        random.seed(42)
+        block = ResidualBlock(LayerNorm(4))
+        x = [random.gauss(0, 1) for _ in range(4)]
+        block.forward(x)
+        dx = block.backward([0.1, -0.2, 0.3, -0.4])
+        assert len(dx) == 4
+
+    def test_backward_with_sequential_sublayer(self):
+        """Sequential 返回 list（非元组），走另一条分支"""
+        random.seed(43)
+        block = ResidualBlock(Sequential(Layer(4, 4, activation="leaky_relu"), Dropout(0.0)))
+        x = [random.gauss(0, 1) for _ in range(4)]
+        block.forward(x)
+        dx = block.backward([0.1, -0.2, 0.3, -0.4])
+        assert len(dx) == 4
+
+    def test_backward_2d_with_attention_sublayer(self):
+        """2D（序列）分支"""
+        random.seed(44)
+        block = ResidualBlock(MultiHeadAttention(d_model=4, num_heads=2))
+        seq = [[random.gauss(0, 1) for _ in range(4)] for _ in range(3)]
+        block.forward(seq)
+        dout = [[random.gauss(0, 1) for _ in range(4)] for _ in range(3)]
+        dx = block.backward(dout)
+        assert len(dx) == 3
+        assert len(dx[0]) == 4
 
 
 class TestSequential:
@@ -619,6 +677,19 @@ class TestTextGeneration:
         result = generate_text_with_mlp(model, tp, "你好", length=5, window_size=window_size, temp=0.3)
         assert result.startswith("你好")
         assert len(result) == 7  # "你好" + 5 chars
+
+    def test_generate_text_is_alias_of_mlp_variant(self):
+        """generate_text 与 generate_text_with_mlp 是同一实现（前者只是转发）"""
+        random.seed(61)
+        text = "君不见黄河之水天上来奔流到海不复回"
+        tp = TextProcessor(text)
+        model = MLP([tp.vocab_size * 3, 16, tp.vocab_size],
+                    activations=["leaky_relu", "softmax"])
+        random.seed(62)
+        a = generate_text(model, tp, "君不见", length=6, window_size=3, temp=0.8)
+        random.seed(62)
+        b = generate_text_with_mlp(model, tp, "君不见", length=6, window_size=3, temp=0.8)
+        assert a == b
 
 
 # ========================== 19. 训练 / 评估 ==========================
@@ -1164,6 +1235,48 @@ class TestEndToEnd:
 
         # summary 不报错
         model.summary()
+
+    def test_score_multi_output_regression(self):
+        """多输出回归的 R² 要对所有输出维度取平均
+
+        回归点：原来只取 preds[i][0] / y[i][0]，其余维度被静默忽略。
+        """
+        random.seed(51)
+        n = 30
+        x = [[random.uniform(-1, 1), random.uniform(-1, 1)] for _ in range(n)]
+        y = [[xi[0], random.uniform(-3, 3)] for xi in x]      # 第 1 维是噪声，学不动
+        model = make_regressor(2, 2, hidden_layers=(16, 16), lr=0.03)
+        model.fit(x, y, epochs=400, patience=100, verbose=False)
+
+        preds = model.predict(x)
+
+        def r2_dim(d):
+            ys = [yi[d] for yi in y]
+            ps = [p[d] for p in preds]
+            ym = sum(ys) / len(ys)
+            ss_res = sum((a - b) ** 2 for a, b in zip(ys, ps))
+            ss_tot = sum((a - ym) ** 2 for a in ys)
+            return 1 - ss_res / max(ss_tot, 1e-15)
+
+        score = model.score(x, y)
+        assert score == pytest.approx((r2_dim(0) + r2_dim(1)) / 2, abs=1e-9)
+        assert abs(score - r2_dim(0)) > 1e-6, "不应再只反映第 0 维"
+
+    def test_score_single_output_unchanged(self):
+        """单输出回归的 R² 仍与原来一致"""
+        random.seed(52)
+        x = [[i] for i in range(20)]
+        y = [[2 * i + 1] for i in range(20)]
+        model = make_regressor(1, 1, hidden_layers=(8,), lr=0.05)
+        model.fit(x, y, epochs=300, batch_size=8, val_split=0.0,
+                  patience=0, verbose=False)
+        preds = model.predict(x)
+        ys = [yi[0] for yi in y]
+        ps = [p[0] for p in preds]
+        ym = sum(ys) / len(ys)
+        expected = 1 - sum((a - b) ** 2 for a, b in zip(ys, ps)) / \
+            sum((a - ym) ** 2 for a in ys)
+        assert model.score(x, y) == pytest.approx(expected, abs=1e-12)
 
     def test_model_repr(self):
         """Model.__repr__"""
