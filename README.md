@@ -313,5 +313,3 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ├── test_ai.py       # 177 个单元测试
 └── README.md
 ```
-
-> C 移植见 `D:\vscode\AI_C\c\`（独立项目，不在本仓库内）。
