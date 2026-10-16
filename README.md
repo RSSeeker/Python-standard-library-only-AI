@@ -305,37 +305,6 @@ python test_ai.py     # 等价于 pytest test_ai.py
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
-## 实现说明（性能与数值精度）
-
-- **热点路径走 C 层**：`Layer` / `_matmul` / `Conv2d` / 注意力内部用 `sum(map(operator.mul, ...))`、`zip(*B)` 转置替代逐元素索引的 Python 循环；优化器把不随循环变化的量（如 `beta ** step_count`）提到循环外。
-- **训练循环在反向传播时直接累加梯度**，不再保存 batch 内每个样本的完整梯度（省掉一个 O(batch × 参数量) 的中间结构）。
-- **BPTT 复用 `step_cache`**，不必对每个时间步重跑一次前向。
-- **数值精度**：Python 3.12+ 的 `sum()` 对浮点使用补偿求和（Neumaier），所以用 `sum()` 改写过的热点与朴素累加循环相比结果可能**末位不同（通常更精确）**；`BatchNorm1d`、四个优化器、注意力内层循环、RNN 缓存这几处则是逐位一致的。
-- **`TransformerEncoderLayer` 的反向必须先重放 LayerNorm 缓存**：`LayerNorm` 只保存「最后一次 forward」的单槽缓存，而 `TransformerEncoderLayer.forward` 是逐 token 调 `ln1/ln2.forward` 的（缓存里只剩最后一个 token），反向又逐 token 调 `ln.backward`。若不先 `self.ln1.forward(self.res1[t])` 重放该 token 的缓存，token `0..T-2` 会用最后一个 token 的 `mean/var` 反传，**`seq_len>1` 时整条反传链都是错的**（`seq_len=1` 时恰好正确，所以在小序列上看不出来）。该 bug 由数值梯度检查发现并修复，`TestTransformerEncoderGradients` 用 `seq_len ∈ {1,2,4}` 与多层 Encoder 把它钉住。
-
-## C 移植（已独立成库）
-
-C 移植已移出本仓库，现在是一个独立项目：**`D:\vscode\AI_C\c\`**（对应仓库
-[C-standard-library-only-AI](https://github.com/RSSeeker/C-standard-library-only-AI) 的 `c/` 目录）。
-纯 C17 + libm，零第三方依赖，和本项目定位一致。
-
-已完成的验证（在那个项目里可复现）：
-
-- **数值等价性**：给定相同初始权重，C 侧的前向传播与梯度累加和本 Python 版
-  **逐位一致**（差异 0.000e+00），5 步 Adam 后差 1 ULP
-- **训练循环零分配**：预热后 `trainer_fit` 期间的 `malloc` 次数为 0（用 `--wrap` 统计验证）
-- **性能**：MLP[64,256,128,8]、1000 样本 × 5 轮，C 约 1.3 s vs Python 约 77 s（约 58–68 倍）
-
-跨语言比对靠两个脚本，它们通过环境变量 `AI_PY_DIR`（默认为与本项目同级的
-`Python-standard-library-only-AI-main`）找到本仓库的 `AI.py`：
-
-```bash
-cd D:\vscode\AI_C\c
-python tools/c_reference.py reference.txt     # 用 Python 版导出参考数据
-gcc -std=c17 -O2 -Wall -Wextra -o compare_python compare_python.c ai.c tensor.c -lm
-./compare_python reference.txt                # C 侧重算并逐项比对
-```
-
 ## 文件结构
 
 ```
