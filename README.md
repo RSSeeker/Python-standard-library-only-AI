@@ -277,14 +277,15 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-152 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+164 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
+| `TestLayerNumericalGradients` | `Layer` / `MLP` 的 `grad_w / grad_b`、反向传播链（`dL/dx`）vs 数值梯度；含 softmax+CE 联合梯度约定 |
 | `TestAttentionGradients` | `MultiHeadAttention` 的 `W_q/W_k/W_v/W_o` 解析梯度 vs 数值梯度 |
 | `TestConv2dGradients` | `Conv2d` 的 `grad_w / grad_b / dx` vs 数值梯度（含 padding 与 stride=2） |
 | `TestBatchNormTraining` | `BatchNorm1d` 训练路径的 `dx / gamma / beta` vs 数值梯度，并与朴素实现逐位一致 |
-| `TestStepCache` | `restore_cache` 与「重新前向」逐位一致；整段 BPTT 累积梯度一致 |
+| `TestStepCache` / `TestCellGradSemantics` | `restore_cache` 与「重新前向」逐位一致；一次 `zero_grad` + 逐步 backward == 各步梯度之和 |
 | `TestValDataFormats` / `TestCrossEntropyTargets` | `val_data` 三种写法、CE 的 target 规范化 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
@@ -301,6 +302,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py         # 神经网络工具箱（所有代码）
-├── test_ai.py    # 152 个单元测试
+├── test_ai.py    # 164 个单元测试
 └── README.md
 ```

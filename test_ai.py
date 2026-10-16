@@ -1639,6 +1639,153 @@ class TestStepCache:
         assert run(True) == run(False)
 
 
+class TestLayerNumericalGradients:
+    """Layer / MLP 的有限差分梯度校验
+
+    Layer.backward 是训练循环里调用最频繁的路径（此前只有形状与 delta 检查），
+    这里用中心差分把 grad_w / grad_b / 反向传播链全部钉住。
+    实测误差量级 ~1e-9，容差取 1e-6 留足余量（relu 在 0 附近不可导，需要余量）。
+    """
+
+    EPS = 1e-6
+    TOL = 1e-6
+
+    @pytest.mark.parametrize("act", ["leaky_relu", "relu", "linear"])
+    def test_layer_gradients_match_numeric(self, act):
+        for trial in range(4):
+            random.seed(100 + trial)
+            fan_in, fan_out = 4, 3
+            layer = Layer(fan_in, fan_out, activation=act)
+            x = [random.gauss(0, 1) for _ in range(fan_in)]
+            target = [random.gauss(0, 1) for _ in range(fan_out)]
+
+            def loss():
+                return mse_loss(layer.forward(x), target)[0]
+
+            _, delta = mse_loss(layer.forward(x), target)
+            gw, gb, _ = layer.backward(delta)
+
+            eps = self.EPS
+            for j in range(fan_out):
+                for i in range(fan_in):
+                    old = layer.weights[j][i]
+                    layer.weights[j][i] = old + eps
+                    lp = loss()
+                    layer.weights[j][i] = old - eps
+                    lm = loss()
+                    layer.weights[j][i] = old
+                    num = (lp - lm) / (2 * eps)
+                    assert abs(num - gw[j][i]) < self.TOL, \
+                        f"{act} trial={trial} grad_w[{j}][{i}]: 解析 {gw[j][i]} vs 数值 {num}"
+
+                old = layer.biases[j]
+                layer.biases[j] = old + eps
+                lp = loss()
+                layer.biases[j] = old - eps
+                lm = loss()
+                layer.biases[j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(num - gb[j]) < self.TOL, \
+                    f"{act} trial={trial} grad_b[{j}]: 解析 {gb[j]} vs 数值 {num}"
+
+    def test_mlp_gradients_match_numeric(self):
+        """整网所有层的权重与偏置（经 Model.backward -> _mlp_backward）"""
+        random.seed(31)
+        mlp = MLP([4, 5, 3], activations=["leaky_relu", "linear"])
+        model = Model(mlp, loss_fn="mse", optimizer="adam", lr=0.01, task="regression")
+        x = [random.gauss(0, 1) for _ in range(4)]
+        target = [random.gauss(0, 1) for _ in range(3)]
+
+        def loss():
+            return model._loss(model.forward(x), target)[0]
+
+        _, g = model._loss(model.forward(x), target)
+        grads = model.backward(g)
+
+        eps = self.EPS
+        for li, layer in enumerate(mlp.layers):
+            for j in range(layer.fan_out):
+                for i in range(layer.fan_in):
+                    old = layer.weights[j][i]
+                    layer.weights[j][i] = old + eps
+                    lp = loss()
+                    layer.weights[j][i] = old - eps
+                    lm = loss()
+                    layer.weights[j][i] = old
+                    num = (lp - lm) / (2 * eps)
+                    assert abs(num - grads[li][0][j][i]) < self.TOL, \
+                        f"第 {li} 层 grad_w[{j}][{i}]"
+
+                old = layer.biases[j]
+                layer.biases[j] = old + eps
+                lp = loss()
+                layer.biases[j] = old - eps
+                lm = loss()
+                layer.biases[j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(num - grads[li][1][j]) < self.TOL, f"第 {li} 层 grad_b[{j}]"
+
+    def test_input_gradient_matches_numeric(self):
+        """反向传播链传回的 delta 是否正确：校验损失对输入 x 的梯度"""
+        random.seed(32)
+        mlp = MLP([4, 5, 3], activations=["leaky_relu", "linear"])
+        model = Model(mlp, loss_fn="mse", optimizer="adam", lr=0.01, task="regression")
+        x = [random.gauss(0, 1) for _ in range(4)]
+        target = [random.gauss(0, 1) for _ in range(3)]
+
+        def loss():
+            return model._loss(model.forward(x), target)[0]
+
+        _, delta = model._loss(model.forward(x), target)
+        for layer in reversed(mlp.layers):
+            _, _, delta = layer.backward(delta)      # 逐层往回传，最后 delta 即 dL/dx
+
+        eps = self.EPS
+        for i in range(4):
+            old = x[i]
+            x[i] = old + eps
+            lp = loss()
+            x[i] = old - eps
+            lm = loss()
+            x[i] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(num - delta[i]) < self.TOL, f"dL/dx[{i}]: 解析 {delta[i]} vs 数值 {num}"
+
+    def test_softmax_ce_gradient_matches_numeric(self):
+        """softmax + cross_entropy 的联合梯度约定
+
+        Layer._softmax_deriv 恒返回 1，只有在与 CE 搭配时才正确（CE 已直接返回
+        softmax+CE 的联合梯度）。这条测试把这个约定钉住：谁把 _softmax_deriv
+        改成真正的 Jacobian、却没有同步改 CE，这里就会失败。
+        """
+        random.seed(33)
+        mlp = MLP([4, 5, 3], activations=["leaky_relu", "softmax"])
+        model = Model(mlp, loss_fn="cross_entropy", optimizer="adam",
+                      lr=0.01, task="classification")
+        x = [random.gauss(0, 1) for _ in range(4)]
+        y = 1
+
+        def loss():
+            return model._loss(model.forward(x), y)[0]
+
+        _, g = model._loss(model.forward(x), y)
+        grads = model.backward(g)
+
+        eps = self.EPS
+        for li, layer in enumerate(mlp.layers):
+            for j in range(layer.fan_out):
+                for i in range(layer.fan_in):
+                    old = layer.weights[j][i]
+                    layer.weights[j][i] = old + eps
+                    lp = loss()
+                    layer.weights[j][i] = old - eps
+                    lm = loss()
+                    layer.weights[j][i] = old
+                    num = (lp - lm) / (2 * eps)
+                    assert abs(num - grads[li][0][j][i]) < self.TOL, \
+                        f"第 {li} 层 grad_w[{j}][{i}]（softmax+CE）"
+
+
 class TestCellGradSemantics:
     """锁住 cell 的梯度语义：一次 zero_grad + 逐时间步 backward == 各步梯度之和
 
