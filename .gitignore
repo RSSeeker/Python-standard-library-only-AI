@@ -6,3 +6,4 @@ __pycache__/
 *.png
 .DS_Store
 classification_model.json
+model.json
