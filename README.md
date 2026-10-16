@@ -60,6 +60,20 @@ model.save("model.json")
 model2 = Model.load("model.json")
 ```
 
+### 模型瘦身与蒸馏
+
+| 方法 / 函数 | 说明 |
+|------------|------|
+| MLP.param_count() | 可训练参数总数 |
+| MLP.sparsity() | 权重中为 0 的比例 |
+| MLP.prune_magnitude(threshold) | 幅度剪枝：\|w\| < 阈值置 0，返回剪掉个数 |
+| MLP.quantize_weights(bits) | 全局 min/max 均匀分档定点量化，返回步长 |
+| MLP.merge_weights(other, w1, w2) | 权重线性合并（K 折权重平均用，**各折需同初值**） |
+| distill(teacher, student, x, y) | 蒸馏：用教师输出当软目标训练学生，返回一致率 |
+
+it() 新增 early_stop_metric='val'|'train'：默认盯验证损失；
+选 'train' 时盯训练损失，**且不依赖验证集**（原来没有验证集时 patience 完全不生效）。
+
 ### 工厂函数
 
 | 函数 | 说明 |
@@ -277,7 +291,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-177 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+189 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
