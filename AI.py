@@ -572,6 +572,9 @@ class Dropout:
     """
 
     def __init__(self, p: float = 0.5):
+        # p 越界会产生除零（p=1）、全零（p>1）或放大（p<0），必须早失败
+        if not isinstance(p, (int, float)) or not (0.0 <= p < 1.0):
+            raise ValueError(f"Dropout: p 必须在 [0, 1) 内，收到 {p!r}")
         self.p = p
         self.mask = None
         self.training = True
@@ -654,6 +657,10 @@ class BatchNorm1d:
 
         gamma, beta = self.gamma, self.beta
         return [[g * xh + b for g, xh, b in zip(gamma, xh_row, beta)] for xh_row in self.x_hat]
+
+    # backward 返回 (dx, grad_gamma, grad_beta)，delta 在**第 0 位**，
+    # 与 Layer/LayerNorm 的「末位是 delta」不同；Sequential/ResidualBlock 靠这个属性取
+    delta_index = 0
 
     def train(self):
         """训练模式：forward 收到 batch 时使用 batch 统计量"""
@@ -1996,6 +2003,20 @@ class ResidualBlock:
     def forward(self, x):
         self.x = x
         out = self.sublayer.forward(x)
+        # 形状不符时下面的逐元素相加会静默丢掉多余分量（或抛 IndexError），必须早失败
+        if isinstance(x, list) and x and isinstance(x[0], list):
+            if (len(out) != len(x)
+                    or any(len(out[t]) != len(x[t]) for t in range(len(x)))):
+                raise ValueError(
+                    f"ResidualBlock.forward: 子层输出形状与输入不一致"
+                    f"（输入 {len(x)}×{len(x[0])}，输出 {len(out)}"
+                    f"×{len(out[0]) if out else 0}），残差相加要求形状相同"
+                )
+        elif len(out) != len(x):
+            raise ValueError(
+                f"ResidualBlock.forward: 子层输出长度 {len(out)} 与输入长度 {len(x)} 不一致，"
+                f"残差相加要求形状相同（是否是子层改了维度？）"
+            )
         if isinstance(x, list) and isinstance(x[0], list):
             return [[x[t][j] + out[t][j] for j in range(len(x[0]))] for t in range(len(x))]
         return [x[i] + out[i] for i in range(len(x))]
@@ -2005,7 +2026,9 @@ class ResidualBlock:
         #   元组 (..., delta) 取其末位；list 则整体就是 delta。
         # Layer / LayerNorm 返回元组，Dropout / Embedding / 注意力等返回 list。
         result = self.sublayer.backward(dout)
-        d_sublayer = result[-1] if isinstance(result, tuple) else result
+        # 各模块的 delta 位置不一定相同（BatchNorm 放在第 0 位），用 delta_index 约定
+        d_sublayer = (result[getattr(self.sublayer, "delta_index", -1)]
+                      if isinstance(result, tuple) else result)
         if isinstance(dout, list) and isinstance(dout[0], list):
             return [[dout[t][j] + d_sublayer[t][j] for j in range(len(dout[0]))] for t in range(len(dout))]
         return [dout[i] + d_sublayer[i] for i in range(len(dout))]
@@ -2047,7 +2070,9 @@ class Sequential:
         for m in reversed(self.modules):
             result = m.backward(delta)
             if result is not None:
-                delta = result[-1] if isinstance(result, tuple) else result
+                # delta_index 默认 -1（末位），BatchNorm1d 声明为 0
+                delta = (result[getattr(m, "delta_index", -1)]
+                         if isinstance(result, tuple) else result)
         return delta
 
 
@@ -2102,6 +2127,22 @@ def cross_entropy_loss(pred: List[float], target_idx):
                     for t, p in zip(target_idx, pred))
         grad = [ssum * float(p) - float(t) for p, t in zip(pred, target_idx)]
         return loss, grad
+    if isinstance(target_idx, float):
+        if not target_idx.is_integer():
+            raise ValueError(f"cross_entropy_loss: 类别索引必须是整数，收到 {target_idx}")
+        target_idx = int(target_idx)
+    if not isinstance(target_idx, int):
+        try:
+            target_idx = operator.index(target_idx)
+        except TypeError:
+            raise TypeError(
+                f"cross_entropy_loss: 目标必须是类别索引或向量，收到 {target_idx!r}"
+            )
+    # 负数索引在 Python 里会回绕成最后一个类，必须拦掉
+    if not 0 <= target_idx < len(pred):
+        raise ValueError(
+            f"cross_entropy_loss: 类别索引 {target_idx} 越界（pred 长度 {len(pred)}）"
+        )
     p = max(pred[target_idx], eps)
     loss = -math.log(p)
     # softmax + CE 的梯度 = pred - one_hot(target)
@@ -2255,6 +2296,9 @@ class RMSprop:
 # ============================================================================
 
 def clip_grad_by_norm(all_grads, max_norm: float):
+    if max_norm is None or max_norm <= 0:
+        # 负阈值会把所有梯度乘上负数，等于整体翻转符号
+        raise ValueError(f"clip_grad_by_norm: max_norm 必须 > 0，收到 {max_norm!r}")
     """按范数裁剪梯度，防止梯度爆炸（适用于 RNN/LSTM/GRU）"""
     total_sq = 0.0
     for gw, gb in all_grads:
@@ -2275,6 +2319,8 @@ def clip_grad_by_norm(all_grads, max_norm: float):
 
 
 def clip_grad_by_value(all_grads, clip_val: float):
+    if clip_val is None or clip_val < 0:
+        raise ValueError(f"clip_grad_by_value: clip_val 必须 >= 0，收到 {clip_val!r}")
     """按值裁剪梯度"""
     for gw, gb in all_grads:
         for j in range(len(gw)):
@@ -3116,6 +3162,13 @@ class Model:
         # 也要落到同一个守卫里，否则两条路径行为不一致
         _is_mse = (self._loss_name == 'mse') or (self.loss_fn is mse_loss) \
             or (getattr(self.loss_fn, 'func', None) is mse_loss)
+        if self._loss_name in ('cross_entropy', 'ce') and last_act != "softmax":
+            raise ValueError(
+                f"输出层激活是 {last_act!r}，但 loss_fn='{self._loss_name}'："
+                "内置交叉熵假设 pred 是 softmax 概率，并直接使用 softmax+CE 的联合梯度，"
+                "与非 softmax 输出层不匹配（算出的 loss 与梯度不自洽）。"
+                "请把输出层激活设为 'softmax'，或改用自定义 loss_fn。"
+            )
         if last_act == "softmax" and _is_mse:
             raise ValueError(
                 "输出层使用 softmax 时不能搭配 mse 损失："

@@ -2285,7 +2285,8 @@ class TestLossContracts:
         assert l1 == l2 and g1 == g2
 
     def test_model_ce_passes_soft_labels_through(self):
-        md = Model(MLP([3, 3], activations=["leaky_relu", "softmax"]),
+        # 注意 MLP([3, 3]) 只有一层，activations 也只需 1 个
+        md = Model(MLP([3, 3], activations=["softmax"]),
                    loss_fn="cross_entropy")
         pred, tgt = [0.2, 0.3, 0.5], [0.1, 0.2, 0.7]
         assert md._loss(pred, tgt)[0] == pytest.approx(cross_entropy_loss(pred, tgt)[0])
