@@ -115,18 +115,25 @@ class Layer:
         # 维度不符时 map 会静默截断（少算或多算），必须早失败
         if len(x) != self.fan_in:
             hint = ""
-            if isinstance(x[0], (list, tuple)):
+            if x and isinstance(x[0], (list, tuple)):
                 hint = "（输入看起来是图像/批量，请先用 Flatten 展平）"
             raise ValueError(
                 f"Layer.forward: 输入长度 {len(x)} 与本层 fan_in={self.fan_in} 不一致"
                 f"（本层 fan_out={self.fan_out}，激活={getattr(self, 'activation_name', '?')}"
                 f"，is_output={getattr(self, 'is_output', '?')}）{hint}"
             )
-        if len(self.weights) != self.fan_out:
-            raise ValueError(
-                f"Layer.forward: 本层权重行数 {len(self.weights)} != fan_out={self.fan_out}，"
-                f"模型可能已损坏（请检查加载的文件）"
-            )
+        # 权重形状只在对象被替换后检查一次（Adam 只改元素、不换行对象），
+        # 避免每次前向都做 O(fan_out) 的遍历
+        if self.__dict__.get("_w_checked_for") is not self.weights:
+            bad = (len(self.weights) != self.fan_out
+                   or any(len(row) != self.fan_in for row in self.weights))
+            if bad:
+                raise ValueError(
+                    f"Layer.forward: 权重形状应为 {self.fan_out}×{self.fan_in}，"
+                    f"实际 {len(self.weights)} 行（首行 {len(self.weights[0]) if self.weights else 0} 列），"
+                    f"模型可能已损坏（请检查加载的文件）"
+                )
+            self.__dict__["_w_checked_for"] = self.weights
         self.input = x
         # sum(map(mul, row, x)) 走 C 层的 map/sum，比 sum(w*xi for ...) 快约 1.8 倍
         W, b = self.weights, self.biases
@@ -668,6 +675,10 @@ class BatchNorm1d:
                 )
             if any(len(row) != self.d for row in x):
                 raise ValueError("BatchNorm1d.forward: batch 内各样本长度不一致")
+        elif len(x) != self.d:
+            raise ValueError(
+                f"BatchNorm1d.forward: 样本维度 {len(x)} 与本层 {self.d} 不一致"
+            )
         if x and isinstance(x[0], (list, tuple)):
             if self.training:
                 return self.forward_batch(x)
@@ -1977,6 +1988,20 @@ class Sequential:
     def __init__(self, *modules):
         self.modules = list(modules)
 
+    def train(self):
+        """切到训练模式（转发给实现了 train() 的子模块）"""
+        for m in self.modules:
+            if hasattr(m, "train"):
+                m.train()
+        return self
+
+    def eval(self):
+        """切到推理模式（关闭内部的 Dropout，否则推理结果随机）"""
+        for m in self.modules:
+            if hasattr(m, "eval"):
+                m.eval()
+        return self
+
     def forward(self, x):
         for m in self.modules:
             x = m.forward(x)
@@ -2406,16 +2431,20 @@ def generate_text(network, tp: TextProcessor, start_str: str,
 def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
                            length: int = 15, window_size: int = 3,
                            temp: float = 1.0) -> str:
-    """使用 nn_all_in_one MLP 模型进行自回归文本生成"""
+    """使用 nn_all_in_one MLP 模型进行自回归文本生成
+
+    start_str 里的字符必须都在词表内，否则抛 ValueError（不再静默编码成全 0）。
+    上下文不足 window_size 时用**零向量**占位，不引入词表里的假字符。
+    """
     generated = start_str
     for _ in range(length):
         context = generated[-window_size:]
-        if len(context) < window_size:
-            # 填充字符必须确定在词表内：空格在中文语料里常不存在，
-            # 会让填充位编码成全 0 向量。优先用词表首字符。
-            pad = tp.chars[0] if getattr(tp, "chars", None) else " "
-            context = pad * (window_size - len(context)) + context
         test_vec = []
+        pad = window_size - len(context)
+        if pad > 0:
+            # 用零向量占位：原先用 tp.chars[0] 填充，可能是换行/生僻字，
+            # 且空格在中文语料里常不在词表，都会引入不存在的字符
+            test_vec.extend([0.0] * (tp.vocab_size * pad))
         for c in context:
             test_vec.extend(tp.encode_one_hot(c, strict=True))
         logits = model.forward(test_vec)
@@ -2643,6 +2672,10 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
                 f"load_model: 第 {i} 层 weights 实际形状与声明不符"
                 f"（应为 {exp_out} 行 × {exp_in} 列）"
             )
+        if len(ld["biases"]) != exp_out:
+            raise ValueError(
+                f"load_model: 第 {i} 层 biases 长度 {len(ld['biases'])} != fan_out={exp_out}"
+            )
 
     model = MLP(layer_sizes, activations=activations)
     for i, layer in enumerate(model.layers):
@@ -2715,12 +2748,28 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 重建 CNN 层
+    # 重建 CNN 层（先校验形状，坏文件在加载期就报错）
     conv_layers = []
-    for cd in data["conv"]:
+    for k, cd in enumerate(data["conv"]):
         conv = Conv2d(cd["in_channels"], cd["out_channels"],
                        cd["kernel_size"], cd["stride"], cd["padding"])
-        conv.weights = cd["weights"]
+        oc, ic, kh, kw = conv.out_channels, conv.in_channels, conv.kh, conv.kw
+        cw = cd["weights"]
+        shape_ok = (len(cw) == oc
+                    and all(len(ch) == ic for ch in cw)
+                    and all(len(row) == kw for ch in cw for m in ch for row in m)
+                    and all(len(m) == kh for ch in cw for m in ch))
+        if not shape_ok:
+            raise ValueError(
+                f"load_conv_model: 第 {k} 个 Conv2d 的 weights 形状与超参数不符"
+                f"（应为 {oc}×{ic}×{kh}×{kw}）"
+            )
+        if len(cd["biases"]) != oc:
+            raise ValueError(
+                f"load_conv_model: 第 {k} 个 Conv2d 的 biases 长度 "
+                f"{len(cd['biases'])} != out_channels={oc}"
+            )
+        conv.weights = cw
         conv.biases = cd["biases"]
         conv_layers.append(conv)
 
@@ -2743,6 +2792,10 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
         w = ld["weights"]
         if len(w) != exp_out or any(len(row) != exp_in for row in w):
             raise ValueError(f"load_conv_model: 第 {i} 层 weights 实际形状与声明不符")
+        if len(ld["biases"]) != exp_out:
+            raise ValueError(
+                f"load_conv_model: 第 {i} 层 biases 长度 {len(ld['biases'])} != fan_out={exp_out}"
+            )
 
     activations = []
     legacy = any("activation" not in ld for ld in saved_layers)
@@ -2980,17 +3033,18 @@ class Model:
             def _wrap_ce_loss(pred, target):
                 idx = target
                 if isinstance(target, (list, tuple)):
-                    if len(target) == 1:
-                        idx = target[0]
-                    elif len(target) == num_classes:
-                        # one-hot / 概率分布：直通给 cross_entropy_loss 的向量分支，
-                        # 保留软标签（cross_entropy_loss 会校验长度、非负与梯度）
+                    if len(target) == num_classes:
+                        # 1 类分类器：[1.0] 是唯一的 one-hot，也必须按软标签走，
+                        # 否则会被当成索引 1 而越界
+                        if num_classes == 1:
+                            return self.loss_fn(pred, [float(target[0])])
                         return self.loss_fn(pred, target)
-                    else:
+                    if len(target) != 1:
                         raise ValueError(
                             f"cross_entropy 的 target 长度 {len(target)} 与模型输出维度 "
                             f"{num_classes} 不一致（应传类别索引、one-hot 或长度 1 的列表）"
                         )
+                    idx = target[0]
                 if isinstance(idx, float):
                     if not idx.is_integer():
                         raise ValueError(
@@ -3172,9 +3226,16 @@ class Model:
             val_set = self._normalize_val_data(val_data)
         elif val_split > 0:
             n_val = max(1, int(len(dataset) * val_split))
-            random.shuffle(dataset)
-            val_set = dataset[:n_val]
-            dataset = dataset[n_val:]
+            # 至少要留 1 个训练样本：样本数很少时 max(1,...) 会把训练集切空，
+            # 随后 train_loss /= len(dataset) 抛 ZeroDivisionError
+            if n_val >= len(dataset):
+                n_val = len(dataset) - 1
+            if n_val <= 0:
+                val_set = None
+            else:
+                random.shuffle(dataset)
+                val_set = dataset[:n_val]
+                dataset = dataset[n_val:]
         else:
             val_set = None
 
@@ -3361,6 +3422,12 @@ class Model:
             saved = getattr(mlp, "saved_task", None)
             if saved in ('regression', 'classification'):
                 task = saved
+        # 输出层是 softmax 时只能是分类（softmax + mse 会触发守卫）。
+        # 文件里记录的 task 若与激活矛盾，以激活为准，避免自己写出的文件反而加载失败。
+        last_act = getattr(mlp.layers[-1], "activation_name", None)
+        if last_act == "softmax" and task != 'classification':
+            print("提示: 输出层是 softmax，按分类加载（文件里的 task 与输出层激活矛盾）")
+            task = 'classification'
         return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
 
     # ── 信息 ─────────────────────────────────────────────────
@@ -3478,6 +3545,10 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
         model = quick_train(x, y, task='classification', epochs=300)
         model = quick_train(x, y, task='regression', hidden_layers=(64, 32, 16))
     """
+    if not x:
+        raise ValueError("quick_train: x 不能为空")
+    if not y:
+        raise ValueError("quick_train: y 不能为空")
     input_dim = len(x[0])
 
     if task == 'classification':
@@ -3486,11 +3557,16 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
         if not y:
             raise ValueError("quick_train: 分类任务的 y 不能为空")
         if isinstance(y[0], (list, tuple)):
-            # 类数 = one-hot 向量长度。用 len(set(标签)) 会漏掉"本批没出现的类"，
-            # 模型输出维度偏小，缺失的类永远预测不出来
+            # 类数 = 向量长度（用 len(set(标签)) 会漏掉本批没出现的类）
             num_classes = len(y[0])
-            y = [max(range(len(row)), key=lambda j: row[j]) for row in y]
+            if len({isinstance(v, (list, tuple)) for v in y}) > 1:
+                raise ValueError("quick_train: y 中不能混用向量标签与整数标签")
+            # 概率 / one-hot 向量原样保留：Model 的 CE 路径会把等长向量直通给
+            # cross_entropy_loss 的软标签分支，argmax 硬化会丢掉软标签信息
+            y = [list(row) for row in y]
         else:
+            if any(isinstance(v, (list, tuple)) for v in y):
+                raise ValueError("quick_train: y 中不能混用向量标签与整数标签")
             # 整数标签：类数 = max+1（不能用 len(set(y))：标签 [0,2] 会越界）。
             # 注意不能直接 int(v)：那会把 1.5 静默截成 1、把 -0.5 截成 0，
             # 让非法标签混进训练集。
