@@ -71,7 +71,7 @@ model2 = Model.load("model.json")
 | MLP.merge_weights(other, w1, w2) | 权重线性合并（K 折权重平均用，**各折需同初值**） |
 | distill(teacher, student, x, y) | 蒸馏：用教师输出当软目标训练学生，返回一致率 |
 
-it() 新增 early_stop_metric='val'|'train'：默认盯验证损失；
+`fit()` 新增 `early_stop_metric='val'|'train'`：默认盯验证损失；
 选 'train' 时盯训练损失，**且不依赖验证集**（原来没有验证集时 patience 完全不生效）。
 
 ### 工厂函数
@@ -119,12 +119,32 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Conv2d` | 二维卷积层 |
 | `MaxPool2d` | 二维最大池化 |
 | `Flatten` | 展平（CNN → MLP） |
-| `Dropout` | Dropout 正则化 |
-| `BatchNorm1d` | 批归一化（训练用 `forward_batch(batch)`，推理用 `forward(x)`） |
+| `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
+| `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `LayerNorm` | 层归一化 |
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
-| `Sequential` | 层序列容器 |
+| `Sequential` | 层序列容器（不含 train/eval，内部的 Dropout 需自行切换） |
+| `MultiHeadAttention` | 多头注意力（`dropout` 参数**尚未实现**，注意力内不做 dropout） |
+
+### 训练 / 推理模式
+
+含随机性的组件默认都是**训练模式**，所以推理前必须显式切换，否则同一输入两次结果不同：
+
+```python
+model.eval()      # 之后预测结果确定
+model.forward(x)
+model.train()     # 回到训练
+```
+
+| 组件 | 说明 |
+|------|------|
+| `Dropout` | `train()` / `eval()`；`eval()` 时原样透传 |
+| `TransformerEncoderLayer` / `TransformerEncoder` | `train()` / `eval()` 会转发到内部两个 Dropout |
+| `BatchNorm1d` | `train()` / `eval()`；`forward` 按模式自动选 batch / running 统计量 |
+| `MLP` / `Model` | **不含 Dropout**，`quick_train`、`make_classifier` 的返回值无需 `eval()` |
+
+> `Sequential` 目前没有 train/eval，把 Dropout 放进 `Sequential` 时需要自行对子模块调用。
 
 ### 循环神经网络
 
@@ -157,15 +177,18 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 | 函数 | 说明 |
 |------|------|
-| `mse_loss(pred, target)` | 均方误差（长度不一致会报错，不再静默截断） |
-| `cross_entropy_loss(pred, target_idx)` | 交叉熵 |
+| `mse_loss(pred, target)` | 均方误差；`target` 可以是序列或单个标量（`y=0.5` 也行），长度不一致会报错 |
+| `cross_entropy_loss(pred, target)` | 交叉熵；`target` 可以是类别索引、one-hot 或概率向量（软标签） |
 
 > 搭配约束：`softmax` 输出层的反向使用的是 **softmax + cross_entropy 的联合梯度**，
 > 因此只能与 `cross_entropy` 搭配。`Model(loss_fn='mse')` + softmax 输出层会**直接报错**，
 > 而不是静默用错误梯度训练；需要 MSE 时请把输出层激活设为 `linear`。
 >
-> `Model` 的 CE 路径会自动规范化 target：类别索引、`[0.0, 1.0]` 这类浮点标签、
-> one-hot / 概率分布、长度为 1 的列表都可以直接传。
+> `Model` 的 CE 路径会自动规范化 target：整数索引、`[0.0, 1.0]` 这类浮点标签、
+> 长度为 1 的列表会被转成类别索引；**长度等于类数的 one-hot / 概率向量会原样直通**
+> 给 `cross_entropy_loss` 的软标签分支，因此 label smoothing / 蒸馏的软目标不会被
+> argmax 硬化。软标签的联合梯度按 `Σt·p − t` 计算（全 0 目标得到全 0 梯度）。
+> 该守卫对 `loss_fn='mse'`、`loss_fn=mse_loss` 与 `functools.partial(mse_loss)` 都生效。
 
 ### 工具函数
 
@@ -175,8 +198,13 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `DataLoader` | 批量迭代器 |
 | `train(model, loss_fn, optimizer, data, ...)` | 底层训练循环（Early Stopping + 验证集） |
 | `evaluate(model, loss_fn, data)` | 计算平均损失 |
-| `save_model(model, path)` / `load_model(path)` | MLP 的 JSON 持久化 |
-| `save_conv_model(conv, fc, path)` / `load_conv_model(path)` | CNN + MLP 的 JSON 持久化 |
+| `save_model(model, path, task=None)` / `load_model(path, default_output_activation=None)` | MLP 的 JSON 持久化；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
+| `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上 |
+| `Model.save(path)` / `Model.load(path, task='auto', default_output_activation=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task |
+
+> 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
+> （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
+> 会被当成回归模型，请显式传 `default_output_activation='softmax'`。
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
 | `clip_grad_by_value(grads, clip_val)` | 梯度值裁剪 |
 | `compare_with_pytorch()` | 与 PyTorch 逐层数值对齐（可选，装了 torch 才跑） |
@@ -291,7 +319,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-189 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+211 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -310,6 +338,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 177 个单元测试
+├── test_ai.py       # 211 个单元测试
 └── README.md
 ```

@@ -1332,6 +1332,11 @@ class MultiHeadAttention:
     """
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
+        """dropout: **目前未实现**（注意力权重上不做 dropout，参数保留仅为接口兼容）。
+
+        TransformerEncoderLayer 的 dropout1/dropout2 仍然工作，所以 eval() 依然有意义；
+        但这里传大于 0 的值不会带来任何正则化效果。
+        """
         assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
@@ -1847,6 +1852,11 @@ class PositionalEncoding:
     """正弦/余弦位置编码，加到输入序列上"""
 
     def __init__(self, d_model: int, max_len: int = 5000):
+        """max_len: **初始预计算的行数（容量），不是长度上限**。
+
+        forward 遇到更长序列时会按需扩展编码表（`_ensure_len`），不会截断。
+        调大它可以提前分配、省掉运行期扩展。
+        """
         self.d_model = d_model
         self.pe = [[0.0] * d_model for _ in range(max_len)]
         for pos in range(max_len):
@@ -2522,7 +2532,12 @@ def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
 
 
 def save_model(model, filepath: str, task: str = None):
-    """将 MLP 模型保存为 JSON 文件"""
+    """将 MLP 模型保存为 JSON 文件
+
+    task: 可选，"regression" / "classification"。会写进文件，供旧格式（没有逐层
+          activation 记录）加载时判断输出层该用 linear 还是 softmax。
+    每层还会写入 activation 字段，因此新格式文件不依赖 task 也能正确还原。
+    """
     data = {
         "type": "MLP",
         "layer_sizes": model.layer_sizes,
@@ -3118,6 +3133,7 @@ class Model:
         shuffle:      每轮打乱数据
         lr_scheduler: StepLR/ExponentialLR/CosineAnnealingLR 实例
         grad_clip:    float，梯度范数裁剪阈值（None = 不裁剪）
+            early_stop_metric: 'val'（默认，盯验证损失）或 'train'（盯训练损失，且不依赖验证集）
         """
         # === 规范化数据 ===
         if data is not None:
@@ -3441,6 +3457,10 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
                 optimizer='adam', verbose=True):
     """
     一行代码训练并返回模型。
+
+    task='classification' 时 y 可以是整数类别索引（允许非连续，如 [0, 2]），
+    也可以是 one-hot / 概率向量——类数按向量长度或 max+1 推断，不会因为
+    某个类在本批数据里没出现而少建输出单元。小数标签与负索引会直接报错。
 
     用法:
         model = quick_train(x, y, task='classification', epochs=300)
