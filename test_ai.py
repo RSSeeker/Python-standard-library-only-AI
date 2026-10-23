@@ -36,6 +36,7 @@ from AI import (
     TextProcessor, sample_index,
     generate_text, generate_text_with_mlp,
     train, evaluate, save_model, load_model,
+    save_conv_model, load_conv_model,
     _softmax_with_temp,
     # 新增高层 API
     Model, make_classifier, make_regressor, quick_train,
@@ -207,7 +208,7 @@ class TestDropout:
     def test_dropout_eval_mode(self):
         """Dropout: 评估模式下所有神经元保持不变"""
         dp = Dropout(p=0.5)
-        dp.training = False
+        dp.eval()
         x = [1.0] * 10
         out = dp.forward(x)
         assert out == x
@@ -224,7 +225,7 @@ class TestBatchNorm:
 
     def test_batchnorm_eval_mode(self):
         bn = BatchNorm1d(num_features=3)
-        bn.training = False
+        bn.eval()
         x = [0.5, -0.2, 0.8]
         out = bn.forward(x)
         assert len(out) == 3
@@ -2192,3 +2193,222 @@ class TestDistillApi:
         assert out is student
         assert 0.0 <= rate <= 1.0
         assert student.model.param_count() < teacher.model.param_count()
+
+
+# ========================== 21. 训练/推理模式（train/eval） ==========================
+
+class TestTrainEvalMode:
+    """Dropout / BatchNorm / Transformer 的模式切换契约"""
+
+    def test_dropout_eval_is_deterministic(self):
+        random.seed(0)
+        dp = Dropout(0.5)
+        x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        dp.train()
+        assert dp.forward(x) is not x          # 训练模式返回新列表
+        assert any(m == 0.0 for m in dp.mask) or any(m != 1.0 for m in dp.mask)
+        dp.eval()
+        a, b = dp.forward(x), dp.forward(x)
+        assert a == b == x                     # 推理模式：原样透传且确定
+        assert dp.mask == [1.0] * len(x)
+
+    def test_transformer_encoder_eval_propagates(self):
+        random.seed(1)
+        enc = TransformerEncoder(4, 1, 8, num_layers=2, dropout=0.5)
+        seq = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
+        enc.train()
+        assert all(l.dropout1.training for l in enc.layers)
+        enc.eval()
+        assert all(not l.dropout1.training and not l.dropout2.training for l in enc.layers)
+        assert enc.forward(seq) == enc.forward(seq)
+
+    def test_batchnorm_forward_dispatch(self):
+        bn = BatchNorm1d(3)
+        batch = [[1.0, 2.0, 3.0], [3.0, 4.0, 5.0], [5.0, 6.0, 7.0]]
+        bn.train()
+        out_train = bn.forward(batch)          # 训练 + batch -> batch 统计量
+        bn.eval()
+        out_eval = bn.forward(batch)           # 推理 + batch -> running 统计量
+        assert len(out_train) == len(out_eval) == 3
+        assert out_train != out_eval
+        assert len(bn.forward([1.0, 2.0, 3.0])) == 3   # 单样本路径仍可用
+
+    def test_batchnorm_rejects_bad_input(self):
+        bn = BatchNorm1d(3)
+        with pytest.raises(ValueError):
+            bn.forward([])
+        with pytest.raises(ValueError):
+            bn.forward([[1.0, 2.0, 3.0], [1.0]])
+
+
+# ========================== 22. 损失函数契约 ==========================
+
+class TestLossContracts:
+
+    @staticmethod
+    def _sm(z):
+        mx = max(z)
+        e = [math.exp(v - mx) for v in z]
+        s = sum(e)
+        return [v / s for v in e]
+
+    def test_ce_vector_gradient_matches_numeric(self):
+        """软标签的联合梯度是 s*p - t（s=Σt），不是 p - t"""
+        z0 = [0.3, -0.5, 1.1]
+        for tgt in ([0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.7, 0.2, 0.1], [0.0, 1.0, 0.0]):
+            _, grad = cross_entropy_loss(self._sm(z0), tgt)
+            num = []
+            eps = 1e-6
+            for k in range(3):
+                zp = list(z0); zp[k] += eps
+                zm = list(z0); zm[k] -= eps
+                lp, _ = cross_entropy_loss(self._sm(zp), tgt)
+                lm, _ = cross_entropy_loss(self._sm(zm), tgt)
+                num.append((lp - lm) / (2 * eps))
+            for a, b in zip(grad, num):
+                assert abs(a - b) < 1e-7
+
+    def test_ce_all_zero_target_has_zero_grad(self):
+        loss, grad = cross_entropy_loss([0.2, 0.3, 0.5], [0, 0, 0])
+        assert loss == 0.0
+        assert all(abs(g) < 1e-15 for g in grad)
+
+    def test_ce_rejects_negative_and_bad_length(self):
+        with pytest.raises(ValueError):
+            cross_entropy_loss([0.5, 0.5], [-0.1, 1.1])
+        with pytest.raises(ValueError):
+            cross_entropy_loss([0.5, 0.5], [1.0, 0.0, 0.0])
+
+    def test_mse_accepts_scalar(self):
+        l1, g1 = mse_loss([0.5], 1.0)
+        l2, g2 = mse_loss([0.5], [1.0])
+        assert l1 == l2 and g1 == g2
+
+    def test_model_ce_passes_soft_labels_through(self):
+        md = Model(MLP([3, 3], activations=["leaky_relu", "softmax"]),
+                   loss_fn="cross_entropy")
+        pred, tgt = [0.2, 0.3, 0.5], [0.1, 0.2, 0.7]
+        assert md._loss(pred, tgt)[0] == pytest.approx(cross_entropy_loss(pred, tgt)[0])
+        # 全 0 目标不再被当成类 0
+        assert md._loss(pred, [0, 0, 0])[0] == 0.0
+
+    def test_softmax_mse_guard_catches_function_object(self):
+        import functools
+        with pytest.raises(ValueError):
+            Model(MLP([2, 3], activations=["softmax"]), loss_fn=mse_loss)
+        with pytest.raises(ValueError):
+            Model(MLP([2, 3], activations=["softmax"]), loss_fn=functools.partial(mse_loss))
+        with pytest.raises(ValueError):
+            Model(MLP([2, 3], activations=["softmax"]), loss_fn="mse")
+
+    def test_train_guard_catches_function_object(self):
+        import functools
+        m = MLP([2, 3], activations=["softmax"])
+        with pytest.raises(ValueError):
+            train(m, functools.partial(mse_loss), Adam(m, lr=0.01),
+                  [([0.1, 0.2], [0, 0, 1])], epochs=1, batch_size=1,
+                  patience=0, verbose=False)
+
+
+# ========================== 23. 持久化兼容与校验 ==========================
+
+class TestPersistenceCompat:
+
+    @staticmethod
+    def _save_cls(path, legacy=False, drop_task=False):
+        m = make_classifier(3, 3, hidden_layers=(4,), lr=0.01)
+        m.fit([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+              [0, 1, 2], epochs=3, verbose=False)
+        m.save(str(path))
+        d = json.load(open(path, encoding="utf-8"))
+        if legacy:
+            for ld in d["layers"]:
+                ld.pop("activation", None)
+        if drop_task:
+            d.pop("task", None)
+        json.dump(d, open(path, "w", encoding="utf-8"))
+        return d
+
+    def test_legacy_without_task_or_activation_defaults_to_regression(self, tmp_path):
+        p = tmp_path / "m.json"
+        self._save_cls(p, legacy=True, drop_task=True)
+        assert Model.load(str(p)).task == "regression"          # 文档写明的保守回退
+        assert Model.load(str(p), default_output_activation="softmax").task == "classification"
+
+    def test_task_field_is_used_when_no_activation(self, tmp_path):
+        p = tmp_path / "m2.json"
+        self._save_cls(p, legacy=True, drop_task=False)
+        assert Model.load(str(p)).task == "classification"
+
+    def test_conv_legacy_output_activation(self, tmp_path):
+        p = tmp_path / "c.json"
+        save_conv_model([Conv2d(1, 2, 3, 1, 1)], MLP([8, 4, 3], activations=["relu", "softmax"]), str(p))
+        _, m = load_conv_model(str(p))
+        assert [l.activation_name for l in m.layers] == ["relu", "softmax"]
+        d = json.load(open(p, encoding="utf-8"))
+        for ld in d["mlp"]["layers"]:
+            ld.pop("activation", None)
+        json.dump(d, open(p, "w", encoding="utf-8"))
+        _, m2 = load_conv_model(str(p), default_output_activation="softmax")
+        assert m2.layers[-1].activation_name == "softmax"
+
+    def test_load_model_rejects_fewer_layers(self, tmp_path):
+        p = tmp_path / "few.json"
+        d = self._save_cls(p)
+        d["layers"] = d["layers"][:1]
+        json.dump(d, open(p, "w", encoding="utf-8"))
+        with pytest.raises(ValueError):
+            load_model(str(p))
+
+    def test_load_model_rejects_truncated_weights(self, tmp_path):
+        p = tmp_path / "badw.json"
+        d = self._save_cls(p)
+        d["layers"][0]["weights"] = [row[:1] for row in d["layers"][0]["weights"]]
+        json.dump(d, open(p, "w", encoding="utf-8"))
+        with pytest.raises(ValueError):
+            load_model(str(p))
+
+
+# ========================== 24. strict 与输入校验 ==========================
+
+class TestStrictAndValidation:
+
+    def test_prepare_data_is_strict(self):
+        tp = TextProcessor("abc")
+        with pytest.raises(ValueError):
+            tp.prepare_data("aXbc", 3)
+        with pytest.raises(ValueError):
+            tp.prepare_index_data("aXbc", 3)
+        assert len(tp.prepare_index_data("abcabc", 2)) == 4
+
+    def test_layer_dimension_error_mentions_flatten(self):
+        l = Layer(3, 2, "linear")
+        with pytest.raises(ValueError, match="fan_in"):
+            l.forward([1.0, 2.0])
+        with pytest.raises(ValueError, match="Flatten"):
+            l.forward([[1.0, 2.0, 3.0]])
+
+    def test_positional_encoding_grows(self):
+        pe_small = PositionalEncoding(4, max_len=3)
+        out = pe_small.forward([[0.1] * 4] * 10)
+        assert len(out) == 10
+        pe_big = PositionalEncoding(4, max_len=10)
+        assert out == pe_big.forward([[0.1] * 4] * 10)
+
+    def test_quick_train_one_hot_counts_all_classes(self):
+        x = [[0, 0], [0, 1], [1, 0], [1, 1]]
+        y = [[1, 0, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0]]   # 类 2 在本批缺失
+        m = quick_train(x, y, task="classification", epochs=2, verbose=False)
+        assert m.model.layer_sizes[-1] == 3
+
+    def test_quick_train_accepts_noncontiguous_int_labels(self):
+        x = [[0.0], [1.0], [2.0], [3.0]]
+        m = quick_train(x, [0, 2, 0, 2], task="classification", epochs=2, verbose=False)
+        assert m.model.layer_sizes[-1] == 3
+
+    def test_quick_train_rejects_non_integer_labels(self):
+        x = [[0.0], [1.0]]
+        with pytest.raises(ValueError):
+            quick_train(x, [0.0, 1.5], task="classification", epochs=1, verbose=False)
+        with pytest.raises(ValueError):
+            quick_train(x, [-0.5, 1.0], task="classification", epochs=1, verbose=False)
