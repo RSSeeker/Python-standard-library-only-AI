@@ -114,8 +114,18 @@ class Layer:
     def forward(self, x):
         # 维度不符时 map 会静默截断（少算或多算），必须早失败
         if len(x) != self.fan_in:
+            hint = ""
+            if isinstance(x[0], (list, tuple)):
+                hint = "（输入看起来是图像/批量，请先用 Flatten 展平）"
             raise ValueError(
-                f"Layer.forward: 输入维度 {len(x)} 与本层 fan_in={self.fan_in} 不一致"
+                f"Layer.forward: 输入长度 {len(x)} 与本层 fan_in={self.fan_in} 不一致"
+                f"（本层 fan_out={self.fan_out}，激活={getattr(self, 'activation_name', '?')}"
+                f"，is_output={getattr(self, 'is_output', '?')}）{hint}"
+            )
+        if len(self.weights) != self.fan_out:
+            raise ValueError(
+                f"Layer.forward: 本层权重行数 {len(self.weights)} != fan_out={self.fan_out}，"
+                f"模型可能已损坏（请检查加载的文件）"
             )
         self.input = x
         # sum(map(mul, row, x)) 走 C 层的 map/sum，比 sum(w*xi for ...) 快约 1.8 倍
@@ -637,6 +647,15 @@ class BatchNorm1d:
 
     def forward(self, x):
         """推理：单样本；训练模式下若传入 batch 则自动走 forward_batch"""
+        if x is None or len(x) == 0:
+            raise ValueError("BatchNorm1d.forward: 输入不能为空")
+        if isinstance(x[0], (list, tuple)):
+            if len(x[0]) != self.d:
+                raise ValueError(
+                    f"BatchNorm1d.forward: 特征维度 {len(x[0])} 与本层 {self.d} 不一致"
+                )
+            if any(len(row) != self.d for row in x):
+                raise ValueError("BatchNorm1d.forward: batch 内各样本长度不一致")
         if x and isinstance(x[0], (list, tuple)):
             if self.training:
                 return self.forward_batch(x)
@@ -2316,12 +2335,19 @@ class TextProcessor:
         return data
 
     def prepare_index_data(self, text: str, window_size: int) -> list:
-        """滑动窗口生成 (indices_list, target_idx) 数据集（配合 Embedding 使用）"""
+        """滑动窗口生成 (indices_list, target_idx) 数据集（配合 Embedding 使用）
+
+        与 prepare_data 一致：词表外字符直接报错，不再静默映射成索引 0。
+        """
         data = []
         for i in range(len(text) - window_size):
-            inp = self.encode_indices(text[i:i + window_size])
-            target = self.char_to_idx[text[i + window_size]]
-            data.append((inp, target))
+            inp = self.encode_indices(text[i:i + window_size], strict=True)
+            target_char = text[i + window_size]
+            if target_char not in self.char_to_idx:
+                raise ValueError(
+                    f"prepare_index_data: 目标字符 {target_char!r} 不在词表中"
+                )
+            data.append((inp, self.char_to_idx[target_char]))
         return data
 
 
@@ -2363,11 +2389,13 @@ def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
     for _ in range(length):
         context = generated[-window_size:]
         if len(context) < window_size:
-            # 原先用 tp.chars[0] 填充，可能是换行/空白/生僻字，改为空格
-            context = context.rjust(window_size)
+            # 填充字符必须确定在词表内：空格在中文语料里常不存在，
+            # 会让填充位编码成全 0 向量。优先用词表首字符。
+            pad = tp.chars[0] if getattr(tp, "chars", None) else " "
+            context = pad * (window_size - len(context)) + context
         test_vec = []
         for c in context:
-            test_vec.extend(tp.encode_one_hot(c))
+            test_vec.extend(tp.encode_one_hot(c, strict=True))
         logits = model.forward(test_vec)
         probs = _softmax_with_temp(logits, temp)
         next_idx = sample_index(probs)
@@ -2393,7 +2421,9 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
     last_act = getattr(last, "activation_name", None)
     if last_act is None and last.act_fn == last._softmax:
         last_act = "softmax"
-    if last_act == "softmax" and loss_fn is mse_loss:
+    # 与 Model 的守卫保持一致：传函数对象或 functools.partial 包装都要拦住
+    _is_mse = (loss_fn is mse_loss) or (getattr(loss_fn, 'func', None) is mse_loss)
+    if last_act == "softmax" and _is_mse:
         raise ValueError(
             "输出层使用 softmax 时不能搭配 mse_loss：softmax 的反向用的是 "
             "softmax+cross_entropy 的联合梯度。请改用 cross_entropy_loss，"
@@ -2532,9 +2562,15 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
     """从 JSON 文件加载 MLP 模型
 
     default_output_activation:
-        仅对**旧格式**（没有逐层 activation 记录）生效。
-        旧文件无法判断输出层原本是 softmax 还是 linear，默认回退成 "linear"，
-        会让分类器被当成回归器。已知原模型是分类器时，传 "softmax" 即可还原。
+        只对**旧格式**（没有逐层 activation 记录）生效；带 activation 的文件会忽略它。
+        旧文件无法判断输出层原本是 softmax 还是 linear，回退优先级为：
+            显式传入的参数  >  文件里记录的 task（== "classification" 时用 softmax）
+            >  "linear"
+        也就是说：不传参数时，一个没有 activation、也没有 task 的旧分类器
+        会被当成 linear 输出，从而被上层判定为回归模型——这种情况请显式传 "softmax"。
+
+    加载后会校验层数与每层形状（含 weights 实际行列数）是否与 layer_sizes 自洽，
+    不一致直接抛 ValueError，不会带着坏权重返回。
     """
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -2559,22 +2595,35 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
             else:
                 activations.append("leaky_relu")
 
-    model = MLP(data["layer_sizes"], activations=activations)
-
-    # 校验存档与 layer_sizes 是否自洽：多余层会被静默忽略、缺层会 IndexError
+    # 先校验、后构造：层数偏少时若先造 MLP，会在内部抛裸 IndexError 而非可读信息
+    layer_sizes = data["layer_sizes"]
     saved = data["layers"]
-    if len(saved) != len(model.layers):
+    expect = len(layer_sizes) - 1
+    if len(saved) != expect:
         raise ValueError(
-            f"load_model: 文件里有 {len(saved)} 层，但 layer_sizes 需要 {len(model.layers)} 层"
+            f"load_model: 文件里有 {len(saved)} 层，但 layer_sizes={layer_sizes} 需要 {expect} 层"
         )
-    for i, (layer, ld) in enumerate(zip(model.layers, saved)):
-        if ld["fan_in"] != layer.fan_in or ld["fan_out"] != layer.fan_out:
+    for i, ld in enumerate(saved):
+        exp_in, exp_out = layer_sizes[i], layer_sizes[i + 1]
+        if ld["fan_in"] != exp_in or ld["fan_out"] != exp_out:
             raise ValueError(
-                f"load_model: 第 {i} 层权重形状 {ld['fan_in']}x{ld['fan_out']} "
-                f"与 layer_sizes 推出的 {layer.fan_in}x{layer.fan_out} 不一致"
+                f"load_model: 第 {i} 层声明形状 {ld['fan_in']}x{ld['fan_out']}，"
+                f"与 layer_sizes 推出的 {exp_in}x{exp_out} 不一致"
             )
-        layer.weights = ld["weights"]
-        layer.biases = ld["biases"]
+        w = ld["weights"]
+        if len(w) != exp_out or any(len(row) != exp_in for row in w):
+            raise ValueError(
+                f"load_model: 第 {i} 层 weights 实际形状与声明不符"
+                f"（应为 {exp_out} 行 × {exp_in} 列）"
+            )
+
+    model = MLP(layer_sizes, activations=activations)
+    for i, layer in enumerate(model.layers):
+        layer.weights = saved[i]["weights"]
+        layer.biases = saved[i]["biases"]
+
+    # 供 Model.load 判断 task 用（MLP 本身没有 task 概念）
+    model.saved_task = data.get("task")
 
     print(f"模型已从 {filepath} 加载")
     return model
@@ -2629,8 +2678,13 @@ def save_conv_model(conv_layers, fc_model, filepath: str):
     print(f"CNN+MLP 模型已保存到: {filepath}")
 
 
-def load_conv_model(filepath: str):
-    """加载 CNN + MLP 组合模型"""
+def load_conv_model(filepath: str, default_output_activation: Optional[str] = None):
+    """加载 CNN + MLP 组合模型
+
+    default_output_activation:
+        只对旧格式（mlp.layers 里没有 activation）生效；旧文件无法判断输出层
+        原本是否是 softmax，不传时按 linear 处理，分类头会退化成回归输出。
+    """
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -2643,16 +2697,40 @@ def load_conv_model(filepath: str):
         conv.biases = cd["biases"]
         conv_layers.append(conv)
 
-    # 重建 MLP（带激活函数）
+    # 重建 MLP（带激活函数）：先校验结构，再构造
     layer_sizes = data["mlp"]["layer_sizes"]
     saved_layers = data["mlp"]["layers"]
+    expect = len(layer_sizes) - 1
+    if len(saved_layers) != expect:
+        raise ValueError(
+            f"load_conv_model: 文件里有 {len(saved_layers)} 层，"
+            f"但 mlp.layer_sizes={layer_sizes} 需要 {expect} 层"
+        )
+    for i, ld in enumerate(saved_layers):
+        exp_in, exp_out = layer_sizes[i], layer_sizes[i + 1]
+        if ld["fan_in"] != exp_in or ld["fan_out"] != exp_out:
+            raise ValueError(
+                f"load_conv_model: 第 {i} 层声明形状 {ld['fan_in']}x{ld['fan_out']}，"
+                f"与 mlp.layer_sizes 推出的 {exp_in}x{exp_out} 不一致"
+            )
+        w = ld["weights"]
+        if len(w) != exp_out or any(len(row) != exp_in for row in w):
+            raise ValueError(f"load_conv_model: 第 {i} 层 weights 实际形状与声明不符")
+
     activations = []
+    legacy = any("activation" not in ld for ld in saved_layers)
     for i, ld in enumerate(saved_layers):
         if "activation" in ld:
             activations.append(ld["activation"])
+        elif i == len(saved_layers) - 1:
+            activations.append(default_output_activation or "linear")
         else:
-            # 旧格式没有记录激活：按位置推断，与 MLP 默认保持兼容
-            activations.append("linear" if i == len(layer_sizes) - 2 else "leaky_relu")
+            activations.append("leaky_relu")
+    if legacy:
+        print("提示: 该文件是旧格式（没有激活记录），隐层按 leaky_relu、"
+              f"输出层按 {activations[-1]} 处理；分类头请用 "
+              "default_output_activation='softmax' 重新加载")
+
     model = MLP(layer_sizes, activations=activations)
     for i, layer in enumerate(model.layers):
         layer.weights = saved_layers[i]["weights"]
@@ -2867,7 +2945,9 @@ class Model:
                 return self.loss_fn(pred, target)
             self._loss = _wrap_loss
         elif self._loss_name in ('cross_entropy', 'ce'):
-            # CE 只接受「类别索引」，这里把标量 / float / one-hot / 概率分布统一规范化
+            # 标量 / float / 长度 1 的列表归一化成类别索引；
+            # 长度等于类数的 one-hot / 概率向量直接交给 CE 的软标签分支，
+            # 不再 argmax 硬化（否则软目标、label smoothing、蒸馏信息全被丢弃）
             num_classes = model.layers[-1].fan_out
 
             def _wrap_ce_loss(pred, target):
@@ -2876,8 +2956,9 @@ class Model:
                     if len(target) == 1:
                         idx = target[0]
                     elif len(target) == num_classes:
-                        # one-hot / 概率分布 → 取概率最大的类别
-                        idx = max(range(len(target)), key=lambda i: target[i])
+                        # one-hot / 概率分布：直通给 cross_entropy_loss 的向量分支，
+                        # 保留软标签（cross_entropy_loss 会校验长度、非负与梯度）
+                        return self.loss_fn(pred, target)
                     else:
                         raise ValueError(
                             f"cross_entropy 的 target 长度 {len(target)} 与模型输出维度 "
@@ -3237,10 +3318,22 @@ class Model:
         save_model(self.model, filepath, task=self.task)
 
     @staticmethod
-    def load(filepath, loss_fn=None, optimizer='adam', lr=0.01):
-        """从 JSON 加载，返回 Model 实例"""
-        mlp = load_model(filepath)
-        return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr)
+    def load(filepath, loss_fn=None, optimizer='adam', lr=0.01,
+             task='auto', default_output_activation=None):
+        """从 JSON 加载，返回 Model 实例
+
+        default_output_activation:
+            仅对旧格式（无逐层 activation）文件生效，用来还原旧的 softmax 分类器；
+            不传时其输出层会退回 linear，从而被当成回归模型。
+        task:
+            'auto'（默认）时优先采用文件中记录的 task，其次按输出层激活推断。
+        """
+        mlp = load_model(filepath, default_output_activation=default_output_activation)
+        if task == 'auto':
+            saved = getattr(mlp, "saved_task", None)
+            if saved in ('regression', 'classification'):
+                task = saved
+        return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
 
     # ── 信息 ─────────────────────────────────────────────────
 
@@ -3366,12 +3459,21 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
             num_classes = len(y[0])
             y = [max(range(len(row)), key=lambda j: row[j]) for row in y]
         else:
-            # 整数标签：类数 = max+1（不能用 len(set(y))：标签 [0,2] 会越界）
-            y = [int(v) for v in y]
-            lo, hi = min(y), max(y)
-            if lo < 0:
-                raise ValueError(f"quick_train: 类别索引不能为负（发现 {lo}）")
-            num_classes = hi + 1
+            # 整数标签：类数 = max+1（不能用 len(set(y))：标签 [0,2] 会越界）。
+            # 注意不能直接 int(v)：那会把 1.5 静默截成 1、把 -0.5 截成 0，
+            # 让非法标签混进训练集。
+            labels = []
+            for v in y:
+                fv = float(v)
+                if not fv.is_integer():
+                    raise ValueError(
+                        f"quick_train: 分类标签必须是整数类别索引，收到 {v!r}"
+                    )
+                if fv < 0:
+                    raise ValueError(f"quick_train: 类别索引不能为负（发现 {fv}）")
+                labels.append(int(fv))
+            y = labels
+            num_classes = max(y) + 1
         model = make_classifier(input_dim, num_classes,
                                 hidden_layers=hidden_layers, lr=lr,
                                 optimizer=optimizer)
