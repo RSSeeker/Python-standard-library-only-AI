@@ -1990,9 +1990,15 @@ def cross_entropy_loss(pred: List[float], target_idx):
                 f"cross_entropy_loss: target 长度 {len(target_idx)} != pred 长度 {len(pred)}，"
                 f"请对齐维度（原先 zip 会静默截断）"
             )
+        if any(float(t) < 0.0 for t in target_idx):
+            raise ValueError("cross_entropy_loss: 目标向量不能含负值")
+        # softmax+CE 对任意非负软标签的联合梯度是 s*p - t（s = Σt）。
+        # 只在 Σt == 1 时才退化成 p - t；全 0 目标应得到全 0 梯度，
+        # 原先写成 p - t 会让 loss=0 却有非零梯度。
+        ssum = sum(float(t) for t in target_idx)
         loss = -sum(float(t) * math.log(max(float(p), eps))
                     for t, p in zip(target_idx, pred))
-        grad = [float(p) - float(t) for p, t in zip(pred, target_idx)]
+        grad = [ssum * float(p) - float(t) for p, t in zip(pred, target_idx)]
         return loss, grad
     p = max(pred[target_idx], eps)
     loss = -math.log(p)
@@ -2908,7 +2914,11 @@ class Model:
         last_act = getattr(last_layer, "activation_name", None)
         if last_act is None and last_layer.act_fn == last_layer._softmax:
             last_act = "softmax"  # 兼容没有 activation_name 属性的旧对象
-        if last_act == "softmax" and self._loss_name == 'mse':
+        # 传函数对象（loss_fn=mse_loss）时 _loss_name 是 'custom'，
+        # 也要落到同一个守卫里，否则两条路径行为不一致
+        _is_mse = (self._loss_name == 'mse') or (self.loss_fn is mse_loss) \
+            or (getattr(self.loss_fn, 'func', None) is mse_loss)
+        if last_act == "softmax" and _is_mse:
             raise ValueError(
                 "输出层使用 softmax 时不能搭配 mse 损失："
                 "softmax 的反向用的是 softmax+cross_entropy 的联合梯度，"
@@ -3348,9 +3358,20 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
     if task == 'classification':
         # 标签既可以是类别索引 int，也可以是 one-hot / 概率向量；
         # 后者直接 set(y) 会抛 unhashable，这里统一转成索引
-        if y and isinstance(y[0], (list, tuple)):
+        if not y:
+            raise ValueError("quick_train: 分类任务的 y 不能为空")
+        if isinstance(y[0], (list, tuple)):
+            # 类数 = one-hot 向量长度。用 len(set(标签)) 会漏掉"本批没出现的类"，
+            # 模型输出维度偏小，缺失的类永远预测不出来
+            num_classes = len(y[0])
             y = [max(range(len(row)), key=lambda j: row[j]) for row in y]
-        num_classes = len(set(y))
+        else:
+            # 整数标签：类数 = max+1（不能用 len(set(y))：标签 [0,2] 会越界）
+            y = [int(v) for v in y]
+            lo, hi = min(y), max(y)
+            if lo < 0:
+                raise ValueError(f"quick_train: 类别索引不能为负（发现 {lo}）")
+            num_classes = hi + 1
         model = make_classifier(input_dim, num_classes,
                                 hidden_layers=hidden_layers, lr=lr,
                                 optimizer=optimizer)
@@ -3825,7 +3846,7 @@ if __name__ == "__main__":
             print(f"  Epoch {epoch} | Loss: {total_loss / len(train_data):.6f}")
 
     # 推理时关 Dropout
-    dropout1.training = dropout2.training = dropout3.training = False
+    dropout1.eval(); dropout2.eval(); dropout3.eval()   # 推理模式：关闭 dropout
     for x, y in test_data:
         x = model_drop.layers[0].forward(list(x))
         x = dropout1.forward(x)
@@ -3898,6 +3919,8 @@ if __name__ == "__main__":
         ([[0.8, 0.9, 0.2, 0.1], [0.2, 0.8, 0.9, 0.1], [0.7, 0.1, 0.5, 0.4]], 1),
     ]
 
+    encoder.train()   # 显式声明训练模式（dropout 生效）
+
     for epoch in range(1, 201):
         random.shuffle(trans_data)
         total_loss = 0.0
@@ -3942,6 +3965,7 @@ if __name__ == "__main__":
         if epoch % 50 == 0:
             print(f"  Epoch {epoch} | Loss: {total_loss / len(trans_data):.6f}")
 
+    encoder.eval()    # 推理前必须关闭 dropout，否则同一输入两次结果不同
     print("Transformer 测试:")
     for x_seq, label in trans_data:
         x = pos_enc.forward(x_seq)
