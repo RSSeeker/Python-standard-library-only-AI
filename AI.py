@@ -631,6 +631,7 @@ class BatchNorm1d:
     def forward_batch(self, x_batch):
         """x_batch: List[List[float]]  (batch_size, d)"""
         self.x_batch = x_batch
+        self._cache_mode = 'train'      # backward 需要知道该用 batch 还是 running 统计量
         n = self.n = len(x_batch)
         d = self.d
 
@@ -683,9 +684,13 @@ class BatchNorm1d:
             if self.training:
                 return self.forward_batch(x)
             # eval + batch：逐列用 running stats（原实现会退回单样本路径并 TypeError）
+            self._cache_mode = 'eval'
+            self.x_batch = [list(row) for row in x]
             return [[self.gamma[j] * ((row[j] - self.running_mean[j]) /
                     math.sqrt(self.running_var[j] + self.eps)) + self.beta[j]
                      for j in range(self.d)] for row in x]
+        self._cache_mode = 'eval'
+        self.x_batch = [list(x)]
         out = [0.0] * self.d
         for j in range(self.d):
             xh = (x[j] - self.running_mean[j]) / math.sqrt(self.running_var[j] + self.eps)
@@ -693,8 +698,39 @@ class BatchNorm1d:
         return out
 
     def backward(self, dout_batch):
-        """返回 (dx_batch, grad_gamma, grad_beta)"""
-        n, d = self.n, self.d
+        """返回 (dx_batch, grad_gamma, grad_beta)
+
+        按**上一次前向的模式**求导：
+          训练模式（forward_batch）-> 用 batch 统计量的导数
+          推理模式（eval / 单样本）-> 用 running 统计量的导数
+        原先无条件套 batch 统计量，eval 之后反传会得到完全错误的 dx
+        （实测差 4.3 倍），单样本前向后反传还会抛 TypeError。
+        """
+        if getattr(self, "_cache_mode", None) is None or self.x_batch is None:
+            raise RuntimeError("BatchNorm1d.backward: 必须先调用 forward 或 forward_batch")
+        if dout_batch and not isinstance(dout_batch[0], (list, tuple)):
+            dout_batch = [dout_batch]          # 单样本 -> 当成 batch=1
+        n, d = len(dout_batch), self.d
+        if any(len(row) != d for row in dout_batch):
+            raise ValueError("BatchNorm1d.backward: dout 的维度与本层特征数不一致")
+
+        if self._cache_mode == 'eval':
+            xs = self.x_batch
+            if len(xs) != n:
+                raise ValueError(
+                    f"BatchNorm1d.backward: dout 有 {n} 个样本，"
+                    f"但上一次前向是 {len(xs)} 个"
+                )
+            inv = [1.0 / math.sqrt(v + self.eps) for v in self.running_var]
+            xhat = [[(x[j] - self.running_mean[j]) * inv[j] for j in range(d)] for x in xs]
+            grad_gamma = [sum(dout_batch[i][j] * xhat[i][j] for i in range(n))
+                          for j in range(d)]
+            grad_beta = [sum(dout_batch[i][j] for i in range(n)) for j in range(d)]
+            dx_batch = [[self.gamma[j] * inv[j] * dout_batch[i][j] for j in range(d)]
+                        for i in range(n)]
+            return dx_batch, grad_gamma, grad_beta
+
+        n = self.n
 
         # 先转置成列，再交给 C 层的 sum/map（求和顺序不变，结果逐位一致）
         dout_t = list(zip(*dout_batch))
@@ -3363,9 +3399,15 @@ class Model:
         if data is not None:
             dataset = [(list(xi), yi) for xi, yi in data]
         elif x is not None and y is not None:
+            if len(x) != len(y):
+                raise ValueError(
+                    f"evaluate: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致"
+                )
             dataset = [(list(xi), yi) for xi, yi in zip(x, y)]
         else:
             raise ValueError("请提供 data 或 (x, y)")
+        if not dataset:
+            raise ValueError("evaluate: 数据集为空")
 
         total = 0.0
         for xi, yi in dataset:
@@ -3376,6 +3418,12 @@ class Model:
 
     def score(self, x, y):
         """分类：准确率 | 回归：R² 决定系数"""
+        if len(x) != len(y):
+            raise ValueError(
+                f"score: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致"
+            )
+        if not x:
+            raise ValueError("score: 数据集为空")
         if self.task == 'classification':
             preds = self.predict_classes(x)
             # y 可能是类别索引，也可能是 one-hot / 概率分布，统一取 argmax 后再比
@@ -3390,6 +3438,11 @@ class Model:
             # 多输出回归：对每个输出维度分别算 R² 再取平均（单输出时与原来完全一致，
             # 原来是只取第 0 维、静默忽略其余维度）
             n_out = len(preds[0]) if preds and isinstance(preds[0], (list, tuple)) else 1
+            if n_out > 1 and not isinstance(y[0], (list, tuple)):
+                raise ValueError(
+                    f"score: 模型是 {n_out} 维输出，但 y 是标量；"
+                    f"请传同维度的目标（多输出不能只对一个维度打分）"
+                )
             scores = []
             for d in range(n_out):
                 y_d = [(yi if not isinstance(yi, (list, tuple)) else yi[d]) for yi in y]
@@ -3397,7 +3450,12 @@ class Model:
                 ss_res = sum((a - b) ** 2 for a, b in zip(y_d, p_d))
                 y_mean = sum(y_d) / len(y_d)
                 ss_tot = sum((a - y_mean) ** 2 for a in y_d)
-                scores.append(1 - ss_res / max(ss_tot, 1e-15))
+                if ss_tot == 0.0:
+                    # 目标恒定：完全预测对是 1，否则 0（原先 max(ss_tot,1e-15)
+                    # 会给出 -1e15 量级的荒谬值）
+                    scores.append(1.0 if ss_res == 0.0 else 0.0)
+                else:
+                    scores.append(1 - ss_res / ss_tot)
             return sum(scores) / len(scores)
 
     # ── 持久化 ───────────────────────────────────────────────
