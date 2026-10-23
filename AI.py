@@ -775,6 +775,11 @@ class LayerNorm:
         self.m_beta = [0.0] * self.d; self.v_beta = [0.0] * self.d
 
     def forward(self, x):
+        # 多出的特征会被静默丢弃，而 mean/var 仍是按全长算的，必须早失败
+        if len(x) != self.d:
+            raise ValueError(
+                f"LayerNorm.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致"
+            )
         self.x = x
         self.mean = sum(x) / self.d
         self.var = sum((xi - self.mean) ** 2 for xi in x) / self.d
@@ -1945,6 +1950,12 @@ class PositionalEncoding:
 
     def forward(self, x_seq):
         """x_seq: (seq_len, d_model) → x_seq + PE（超过 max_len 时自动扩展）"""
+        for t, row in enumerate(x_seq):
+            if len(row) != self.d_model:
+                raise ValueError(
+                    f"PositionalEncoding.forward: 第 {t} 个 token 的维度 {len(row)} "
+                    f"与 d_model={self.d_model} 不一致"
+                )
         self._ensure_len(len(x_seq))
         return [[x_seq[t][j] + self.pe[t][j] for j in range(self.d_model)]
                 for t in range(len(x_seq))]
@@ -2088,6 +2099,8 @@ def mse_loss(pred: List[float], target):
     """
     if not isinstance(target, (list, tuple)):
         target = [target]
+    if len(pred) == 0:
+        raise ValueError("mse_loss: pred 不能为空")
     if len(pred) != len(target):
         # 不能靠 zip 静默截断：分母用的是 len(pred)，截断后会得到一个"看起来正常"的错值
         raise ValueError(
@@ -2568,6 +2581,10 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 
     # 复制一份再打乱，避免修改调用者传入的列表顺序
     data = list(data)
+    if batch_size is None or batch_size <= 0:
+        # 与 Model.fit 一致：-1 / 0 表示整批（原先 range(0,n,-1) 是空循环，
+        # 会静默「训练 0 步、loss 0」）
+        batch_size = len(data)
 
     for epoch in range(1, epochs + 1):
         # ---- 训练 ----
@@ -2619,16 +2636,19 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
             val_loss = evaluate(model, loss_fn, val_data)
             history["val_loss"].append((epoch, val_loss))
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                no_improve = 0
-            else:
-                no_improve += 1
+            if patience > 0:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    no_improve = 0
+                else:
+                    no_improve += 1
 
-            if no_improve >= patience:
-                if verbose:
-                    print(f"\nEarly stopping at epoch {epoch}")
-                break
+                # patience=0 表示**关闭**早停（与 Model.fit 一致）；
+                # 原先 0 >= 0 会立刻 break，patience=0 反而变成「只训 1 轮」
+                if no_improve >= patience:
+                    if verbose:
+                        print(f"\nEarly stopping at epoch {epoch}")
+                    break
 
         if verbose and epoch % 100 == 0:
             if val_loss is not None:
@@ -2640,6 +2660,8 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 
 
 def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
+    if not data:
+        raise ValueError("evaluate: 数据集为空")
     total = 0.0
     for x, y in data:
         pred = model.forward(x)
@@ -3293,6 +3315,8 @@ class Model:
         # === 规范化数据 ===
         if data is not None:
             dataset = [(list(x_i), y_i) for x_i, y_i in data]
+            if not dataset:
+                raise ValueError("fit: 训练集为空")
         elif x is not None and y is not None:
             # 训练集同样要校验：zip 会静默截断到较短的一方
             if len(x) != len(y):
@@ -3321,10 +3345,14 @@ class Model:
                 n_val = len(dataset) - 1
             if n_val <= 0:
                 val_set = None
-            else:
+            elif shuffle:
                 random.shuffle(dataset)
                 val_set = dataset[:n_val]
                 dataset = dataset[n_val:]
+            else:
+                # shuffle=False 时不能为了切验证集而打乱训练顺序：取尾部当验证集
+                val_set = dataset[-n_val:]
+                dataset = dataset[:-n_val]
         else:
             val_set = None
 
