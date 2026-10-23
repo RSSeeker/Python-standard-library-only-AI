@@ -637,8 +637,13 @@ class BatchNorm1d:
 
     def forward(self, x):
         """推理：单样本；训练模式下若传入 batch 则自动走 forward_batch"""
-        if self.training and x and isinstance(x[0], (list, tuple)):
-            return self.forward_batch(x)
+        if x and isinstance(x[0], (list, tuple)):
+            if self.training:
+                return self.forward_batch(x)
+            # eval + batch：逐列用 running stats（原实现会退回单样本路径并 TypeError）
+            return [[self.gamma[j] * ((row[j] - self.running_mean[j]) /
+                    math.sqrt(self.running_var[j] + self.eps)) + self.beta[j]
+                     for j in range(self.d)] for row in x]
         out = [0.0] * self.d
         for j in range(self.d):
             xh = (x[j] - self.running_mean[j]) / math.sqrt(self.running_var[j] + self.eps)
@@ -1980,6 +1985,11 @@ def cross_entropy_loss(pred: List[float], target_idx):
     """
     eps = 1e-15
     if isinstance(target_idx, (list, tuple)):
+        if len(target_idx) != len(pred):
+            raise ValueError(
+                f"cross_entropy_loss: target 长度 {len(target_idx)} != pred 长度 {len(pred)}，"
+                f"请对齐维度（原先 zip 会静默截断）"
+            )
         loss = -sum(float(t) * math.log(max(float(p), eps))
                     for t, p in zip(target_idx, pred))
         grad = [float(p) - float(t) for p, t in zip(pred, target_idx)]
