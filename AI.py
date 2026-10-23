@@ -15,6 +15,7 @@
 ================================================================================
 """
 
+import json
 import sys
 import io
 
@@ -2274,15 +2275,24 @@ class TextProcessor:
         self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
         self.vocab_size = len(self.chars)
 
-    def encode_one_hot(self, char: str) -> list:
-        """将单个字符编码为 one-hot 向量"""
+    def encode_one_hot(self, char: str, strict: bool = False) -> list:
+        """将单个字符编码为 one-hot 向量
+
+        strict=True 时遇到词表外字符会报错，避免静默产出全 0 向量污染训练数据。
+        """
         vec = [0.0] * self.vocab_size
         if char in self.char_to_idx:
             vec[self.char_to_idx[char]] = 1.0
+        elif strict:
+            raise ValueError(f"encode_one_hot: 字符 {char!r} 不在词表中")
         return vec
 
-    def encode_indices(self, text: str) -> list:
-        """将字符串编码为索引列表"""
+    def encode_indices(self, text: str, strict: bool = False) -> list:
+        """将字符串编码为索引列表（strict=True 时未知字符报错，而非静默映射成 0）"""
+        if strict:
+            unknown = [c for c in text if c not in self.char_to_idx]
+            if unknown:
+                raise ValueError(f"encode_indices: 字符 {unknown[:3]!r} 不在词表中")
         return [self.char_to_idx.get(c, 0) for c in text]
 
     def decode_indices(self, indices: list) -> str:
@@ -2298,8 +2308,8 @@ class TextProcessor:
             # 拼接窗口内所有字符的 one-hot 编码
             inp_vec = []
             for c in inp_chars:
-                inp_vec.extend(self.encode_one_hot(c))
-            target_vec = self.encode_one_hot(target_char)
+                inp_vec.extend(self.encode_one_hot(c, strict=True))
+            target_vec = self.encode_one_hot(target_char, strict=True)
             data.append((inp_vec, target_vec))
         return data
 
@@ -2477,7 +2487,6 @@ def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
 #  模型保存 / 加载 (JSON)
 # ============================================================================
 
-import json
 
 
 def save_model(model, filepath: str):
