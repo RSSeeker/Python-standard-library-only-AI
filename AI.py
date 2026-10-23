@@ -124,20 +124,6 @@ class Layer:
         self.a = self.act_fn(self.z)
         return self.a
 
-    def _transposed_weights(self):
-        """缓存的 W^T 列视图。
-
-        weights 的行对象在训练中是原地更新的（Adam 只改元素、不换行对象），
-        所以按 self.weights 的**对象身份**判断缓存是否还有效：
-        load_model 之类整体替换 weights 时身份变化，自动重建。
-        """
-        wt = self.__dict__.get("_W_T")
-        if wt is None or self.__dict__.get("_W_T_src") is not self.weights:
-            wt = list(zip(*self.weights))
-            self.__dict__["_W_T"] = wt
-            self.__dict__["_W_T_src"] = self.weights
-        return wt
-
     def backward(self, delta):
         """delta: 本层输出的梯度，返回上一层需要的 delta"""
         d_act = self.act_deriv(self.z)
@@ -149,7 +135,7 @@ class Layer:
 
         # 传给上一层的 delta = W^T · (delta * d_act)
         # zip(*W) 在 C 层完成转置，再用 map(mul) 做点积，比双重索引的 genexpr 快约 1.9 倍
-        next_delta = [sum(map(_mul, col, w)) for col in self._transposed_weights()]
+        next_delta = [sum(map(_mul, col, w)) for col in zip(*self.weights)]
 
         return grad_w, grad_b, next_delta
 
@@ -2489,13 +2475,13 @@ def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
 
 
 
-def save_model(model, filepath: str):
+def save_model(model, filepath: str, task: str = None):
     """将 MLP 模型保存为 JSON 文件"""
     data = {
         "type": "MLP",
         "layer_sizes": model.layer_sizes,
         # task 用于加载时判断是分类器还是回归器（旧文件没有该字段）
-        "task": getattr(model, "task", None),
+        "task": task,
         "layers": []
     }
     for layer in model.layers:
@@ -2549,7 +2535,11 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
         else:
             # 旧版兼容：最后一层按调用方指定回退，其余按隐层处理
             if i == n_layers - 1:
-                activations.append(default_output_activation or "linear")
+                # 旧文件没有逐层 activation：优先用调用方指定，其次用 task 推断
+                fallback = default_output_activation
+                if fallback is None and data.get("task") == "classification":
+                    fallback = "softmax"
+                activations.append(fallback or "linear")
             else:
                 activations.append("leaky_relu")
 
@@ -3224,7 +3214,7 @@ class Model:
 
     def save(self, filepath):
         """保存模型到 JSON 文件"""
-        save_model(self.model, filepath)
+        save_model(self.model, filepath, task=self.task)
 
     @staticmethod
     def load(filepath, loss_fn=None, optimizer='adam', lr=0.01):
