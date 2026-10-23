@@ -111,12 +111,31 @@ class Layer:
 
     # ---------- 前向 / 反向 ----------
     def forward(self, x):
+        # 维度不符时 map 会静默截断（少算或多算），必须早失败
+        if len(x) != self.fan_in:
+            raise ValueError(
+                f"Layer.forward: 输入维度 {len(x)} 与本层 fan_in={self.fan_in} 不一致"
+            )
         self.input = x
         # sum(map(mul, row, x)) 走 C 层的 map/sum，比 sum(w*xi for ...) 快约 1.8 倍
         W, b = self.weights, self.biases
         self.z = [sum(map(_mul, W[j], x)) + b[j] for j in range(self.fan_out)]
         self.a = self.act_fn(self.z)
         return self.a
+
+    def _transposed_weights(self):
+        """缓存的 W^T 列视图。
+
+        weights 的行对象在训练中是原地更新的（Adam 只改元素、不换行对象），
+        所以按 self.weights 的**对象身份**判断缓存是否还有效：
+        load_model 之类整体替换 weights 时身份变化，自动重建。
+        """
+        wt = self.__dict__.get("_W_T")
+        if wt is None or self.__dict__.get("_W_T_src") is not self.weights:
+            wt = list(zip(*self.weights))
+            self.__dict__["_W_T"] = wt
+            self.__dict__["_W_T_src"] = self.weights
+        return wt
 
     def backward(self, delta):
         """delta: 本层输出的梯度，返回上一层需要的 delta"""
@@ -129,7 +148,7 @@ class Layer:
 
         # 传给上一层的 delta = W^T · (delta * d_act)
         # zip(*W) 在 C 层完成转置，再用 map(mul) 做点积，比双重索引的 genexpr 快约 1.9 倍
-        next_delta = [sum(map(_mul, col, w)) for col in zip(*self.weights)]
+        next_delta = [sum(map(_mul, col, w)) for col in self._transposed_weights()]
 
         return grad_w, grad_b, next_delta
 
@@ -289,6 +308,13 @@ class Conv2d:
     def _img_shape(self, H, W):
         ho = (H + 2 * self.ph - self.kh) // self.sh + 1
         wo = (W + 2 * self.pw - self.kw) // self.sw + 1
+        # 输入比卷积核还小时 ho/wo 会是 0 或负数，原实现返回空输出而不报错
+        if ho <= 0 or wo <= 0:
+            raise ValueError(
+                f"Conv2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}、"
+                f"padding {self.ph}/{self.pw}、stride {self.sh}/{self.sw} "
+                f"得到输出 {ho}x{wo}，必须都 > 0"
+            )
         return ho, wo
 
     def _pad(self, x):
@@ -313,14 +339,16 @@ class Conv2d:
         col = [[0.0] * col_cols for _ in range(col_rows)]
 
         for c in range(C):
+            ch = x_padded[c]                      # 局部化，省掉每元素的二次索引
             for kh in range(self.kh):
                 for kw in range(self.kw):
                     row = c * self.kh * self.kw + kh * self.kw + kw
+                    dst = col[row]
                     for oh in range(ho):
+                        src = ch[oh * self.sh + kh]
+                        off = oh * wo
                         for ow in range(wo):
-                            ih = oh * self.sh + kh
-                            iw = ow * self.sw + kw
-                            col[row][oh * wo + ow] = x_padded[c][ih][iw]
+                            dst[off + ow] = src[ow * self.sw + kw]
         return col
 
     def _col2im(self, dcol, x_padded_shape, ho, wo):
@@ -447,6 +475,11 @@ class MaxPool2d:
         self.x_shape = (C, H, W)
         ho = (H - self.kh) // self.sh + 1
         wo = (W - self.kw) // self.sw + 1
+        if ho <= 0 or wo <= 0:
+            raise ValueError(
+                f"MaxPool2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}、"
+                f"stride {self.sh}/{self.sw} 得到输出 {ho}x{wo}，必须都 > 0"
+            )
         self.mask = [[[(0, 0)] * wo for _ in range(ho)] for _ in range(C)]
 
         out = [[[0.0] * wo for _ in range(ho)] for _ in range(C)]
@@ -527,11 +560,26 @@ class Dropout:
         self.mask = None
         self.training = True
 
+    def train(self):
+        """切到训练模式（dropout 生效）"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """切到推理模式（dropout 关闭，输出确定）
+
+        默认是训练模式，所以在推理前必须显式调用 eval()，
+        否则同一输入的两次预测结果会不同。
+        """
+        self.training = False
+        return self
+
     def forward(self, x):
         if self.training:
             scale = 1.0 / (1.0 - self.p)
             self.mask = [scale if random.random() > self.p else 0.0 for _ in x]
-            return [x[i] * self.mask[i] for i in range(len(x))]
+            # 用 zip 一次遍历，省掉 range 索引（数值与逐元素乘法完全一致）
+            return [xi * m for xi, m in zip(x, self.mask)]
         self.mask = [1.0] * len(x)
         return x
 
@@ -590,8 +638,20 @@ class BatchNorm1d:
         gamma, beta = self.gamma, self.beta
         return [[g * xh + b for g, xh, b in zip(gamma, xh_row, beta)] for xh_row in self.x_hat]
 
+    def train(self):
+        """训练模式：forward 收到 batch 时使用 batch 统计量"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：forward 一律使用 running_mean / running_var"""
+        self.training = False
+        return self
+
     def forward(self, x):
-        """推理：单样本"""
+        """推理：单样本；训练模式下若传入 batch 则自动走 forward_batch"""
+        if self.training and x and isinstance(x[0], (list, tuple)):
+            return self.forward_batch(x)
         out = [0.0] * self.d
         for j in range(self.d):
             xh = (x[j] - self.running_mean[j]) / math.sqrt(self.running_var[j] + self.eps)
@@ -602,15 +662,20 @@ class BatchNorm1d:
         """返回 (dx_batch, grad_gamma, grad_beta)"""
         n, d = self.n, self.d
 
-        grad_gamma = [sum(dout_batch[i][j] * self.x_hat[i][j] for i in range(n)) for j in range(d)]
-        grad_beta = [sum(dout_batch[i][j] for i in range(n)) for j in range(d)]
+        # 先转置成列，再交给 C 层的 sum/map（求和顺序不变，结果逐位一致）
+        dout_t = list(zip(*dout_batch))
+        xhat_t = list(zip(*self.x_hat))
+
+        grad_gamma = [sum(map(_mul, dt, xt)) for dt, xt in zip(dout_t, xhat_t)]
+        grad_beta = [sum(c) for c in dout_t]
 
         dx_hat = [[dout_batch[i][j] * self.gamma[j] for j in range(d)] for i in range(n)]
 
         # s1/s2 只依赖 j，必须提到 i 循环外面：
         # 原来写在 i 循环里，每个 (i, j) 都重算一遍长度为 n 的和 → O(n²·d)
-        s1 = [sum(dx_hat[k][j] for k in range(n)) for j in range(d)]
-        s2 = [sum(dx_hat[k][j] * self.x_hat[k][j] for k in range(n)) for j in range(d)]
+        dx_hat_t = list(zip(*dx_hat))
+        s1 = [sum(c) for c in dx_hat_t]
+        s2 = [sum(map(_mul, c, xt)) for c, xt in zip(dx_hat_t, xhat_t)]
 
         dx_batch = [
             [self.inv_std[j] * (n * dx_hat[i][j] - s1[j] - self.x_hat[i][j] * s2[j]) / n
@@ -1311,7 +1376,8 @@ class MultiHeadAttention:
 
     def forward(self, x_seq):
         """x_seq: List[List[float]]  (seq_len, d_model)"""
-        self.x = x_seq
+        # 复制一份，避免调用者之后原地修改 x_seq 污染反向传播缓存
+        self.x = [list(row) for row in x_seq]
         self.seq_len = len(x_seq)
         d_k = self.d_k
         h = self.num_heads
@@ -1591,6 +1657,18 @@ class TransformerEncoderLayer:
         self.x = self.res1 = self.res2 = None
         self.dropout1_masks = self.dropout2_masks = None
 
+    def train(self):
+        """训练模式：两个 Dropout 都生效"""
+        self.dropout1.train()
+        self.dropout2.train()
+        return self
+
+    def eval(self):
+        """推理模式：关闭 Dropout，保证同一输入输出确定"""
+        self.dropout1.eval()
+        self.dropout2.eval()
+        return self
+
     def zero_grad(self):
         """初始化/清零 LayerNorm 梯度、同时重置子模块梯度"""
         d = self.self_attn.d_model
@@ -1726,6 +1804,18 @@ class TransformerEncoder:
         for layer in self.layers:
             layer.zero_grad()
 
+    def train(self):
+        """训练模式（转发给每一层）"""
+        for layer in self.layers:
+            layer.train()
+        return self
+
+    def eval(self):
+        """推理模式（转发给每一层，关闭 Dropout）"""
+        for layer in self.layers:
+            layer.eval()
+        return self
+
     def forward(self, x_seq):
         for layer in self.layers:
             x_seq = layer.forward(x_seq)
@@ -1755,11 +1845,22 @@ class PositionalEncoding:
                 if i + 1 < d_model:
                     self.pe[pos][i + 1] = math.cos(pos * div)
 
+    def _ensure_len(self, n: int):
+        """按需把位置编码表扩展到 n 行（原实现超过 max_len 会静默截断）"""
+        for pos in range(len(self.pe), n):
+            row = [0.0] * self.d_model
+            for i in range(0, self.d_model, 2):
+                div = math.exp(i * -math.log(10000.0) / self.d_model)
+                row[i] = math.sin(pos * div)
+                if i + 1 < self.d_model:
+                    row[i + 1] = math.cos(pos * div)
+            self.pe.append(row)
+
     def forward(self, x_seq):
-        """x_seq: (seq_len, d_model) → x_seq + PE"""
-        seq_len = min(len(x_seq), len(self.pe))
+        """x_seq: (seq_len, d_model) → x_seq + PE（超过 max_len 时自动扩展）"""
+        self._ensure_len(len(x_seq))
         return [[x_seq[t][j] + self.pe[t][j] for j in range(self.d_model)]
-                for t in range(seq_len)]
+                for t in range(len(x_seq))]
 
     def backward(self, dout_seq):
         return dout_seq  # 无参数，直通
@@ -1777,13 +1878,8 @@ class Embedding:
         self.embed_dim = embed_dim
         std = math.sqrt(2.0 / vocab_size)
         self.weight = [[random.gauss(0, std) for _ in range(embed_dim)] for _ in range(vocab_size)]
-        self._init_adam()
         self.zero_grad()
         self.indices = None  # 缓存查询的索引列表
-
-    def _init_adam(self):
-        self.m_w = [[0.0] * self.embed_dim for _ in range(self.vocab_size)]
-        self.v_w = [[0.0] * self.embed_dim for _ in range(self.vocab_size)]
 
     def forward(self, indices):
         """indices: List[int] → List[List[float]] (seq_len, embed_dim)"""
@@ -1800,6 +1896,14 @@ class Embedding:
             for j in range(self.embed_dim):
                 self.grad_weight[idx][j] += dout_seq[t][j]
         return None
+
+    def sgd_step(self, lr: float):
+        """对词向量做一次 SGD 更新（原实现只累积梯度、权重永远不变）"""
+        for idx, row in enumerate(self.grad_weight):
+            wrow = self.weight[idx]
+            for j in range(self.embed_dim):
+                wrow[j] -= lr * row[j]
+        self.zero_grad()
 
 
 class ResidualBlock:
@@ -1857,8 +1961,14 @@ class Sequential:
 #  Loss Functions
 # ============================================================================
 
-def mse_loss(pred: List[float], target: List[float]):
-    """MSE 损失 + 对 pred 的梯度"""
+def mse_loss(pred: List[float], target):
+    """MSE 损失 + 对 pred 的梯度
+
+    target 可以是序列，也可以是单个标量（单输出回归传 y=0.5 也行，
+    与 Model._wrap_loss 的行为保持一致）。
+    """
+    if not isinstance(target, (list, tuple)):
+        target = [target]
     if len(pred) != len(target):
         # 不能靠 zip 静默截断：分母用的是 len(pred)，截断后会得到一个"看起来正常"的错值
         raise ValueError(
@@ -1871,12 +1981,22 @@ def mse_loss(pred: List[float], target: List[float]):
     return loss, grad
 
 
-def cross_entropy_loss(pred: List[float], target_idx: int):
+def cross_entropy_loss(pred: List[float], target_idx):
     """
     pred: softmax 输出 (概率分布)
-    target_idx: 正确类别的索引
+    target_idx: 正确类别的索引 (int)，或 one-hot / 概率向量 (list)
+
+    两种目标都支持：
+        索引     -> loss = -log(pred[idx])，梯度 = pred - one_hot(idx)
+        向量     -> loss = -Σ t·log(pred)，梯度 = pred - t
+    后者用于 TextProcessor.prepare_data 产出的 one-hot 标签。
     """
     eps = 1e-15
+    if isinstance(target_idx, (list, tuple)):
+        loss = -sum(float(t) * math.log(max(float(p), eps))
+                    for t, p in zip(target_idx, pred))
+        grad = [float(p) - float(t) for p, t in zip(pred, target_idx)]
+        return loss, grad
     p = max(pred[target_idx], eps)
     loss = -math.log(p)
     # softmax + CE 的梯度 = pred - one_hot(target)
@@ -2106,9 +2226,10 @@ class CosineAnnealingLR:
 
 def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int = 42):
     """将数据拆分为 train / val / test"""
-    random.seed(seed)
+    # 用局部 Random 实例，避免 random.seed() 污染全局随机状态
+    rng = random.Random(seed)
     items = list(data)
-    random.shuffle(items)
+    rng.shuffle(items)
 
     n = len(items)
     n_test = int(n * test_ratio)
@@ -2230,7 +2351,8 @@ def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
     for _ in range(length):
         context = generated[-window_size:]
         if len(context) < window_size:
-            context = context.rjust(window_size, tp.chars[0])
+            # 原先用 tp.chars[0] 填充，可能是换行/空白/生僻字，改为空格
+            context = context.rjust(window_size)
         test_vec = []
         for c in context:
             test_vec.extend(tp.encode_one_hot(c))
@@ -2250,10 +2372,27 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
           val_data: Optional[list] = None, verbose: bool = True):
     """
     loss_fn: 接受 (pred, target) -> (loss, grad)
+
+    注意：与 Model 一样，softmax 输出层不能搭配 mse 损失——_softmax_deriv 返回全 1
+    依赖 softmax+cross_entropy 的联合梯度，配 mse 会静默产生错误梯度。
     """
+    # S3: 把 Model 里的 softmax/mse 校验下沉到这里，避免绕过 Model 直接训练时训歪
+    last = model.layers[-1]
+    last_act = getattr(last, "activation_name", None)
+    if last_act is None and last.act_fn == last._softmax:
+        last_act = "softmax"
+    if last_act == "softmax" and loss_fn is mse_loss:
+        raise ValueError(
+            "输出层使用 softmax 时不能搭配 mse_loss：softmax 的反向用的是 "
+            "softmax+cross_entropy 的联合梯度。请改用 cross_entropy_loss，"
+            "或把输出层激活改成 'linear'。"
+        )
     best_val_loss = float("inf")
     no_improve = 0
     history = {"train_loss": [], "val_loss": []}
+
+    # 复制一份再打乱，避免修改调用者传入的列表顺序
+    data = list(data)
 
     for epoch in range(1, epochs + 1):
         # ---- 训练 ----
@@ -2346,6 +2485,8 @@ def save_model(model, filepath: str):
     data = {
         "type": "MLP",
         "layer_sizes": model.layer_sizes,
+        # task 用于加载时判断是分类器还是回归器（旧文件没有该字段）
+        "task": getattr(model, "task", None),
         "layers": []
     }
     for layer in model.layers:
@@ -2376,8 +2517,14 @@ def save_model(model, filepath: str):
     print(f"模型已保存到: {filepath}")
 
 
-def load_model(filepath: str) -> MLP:
-    """从 JSON 文件加载 MLP 模型"""
+def load_model(filepath: str, default_output_activation: Optional[str] = None) -> MLP:
+    """从 JSON 文件加载 MLP 模型
+
+    default_output_activation:
+        仅对**旧格式**（没有逐层 activation 记录）生效。
+        旧文件无法判断输出层原本是 softmax 还是 linear，默认回退成 "linear"，
+        会让分类器被当成回归器。已知原模型是分类器时，传 "softmax" 即可还原。
+    """
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -2386,21 +2533,33 @@ def load_model(filepath: str) -> MLP:
 
     # 从保存的数据中读取各层激活函数，兼容旧版（无 activation 字段）
     activations = []
-    for ld in data["layers"]:
+    n_layers = len(data["layers"])
+    for i, ld in enumerate(data["layers"]):
         if "activation" in ld:
             activations.append(ld["activation"])
         else:
-            # 旧版兼容：根据 is_output 推断
-            if ld["fan_out"] == data["layer_sizes"][-1] and ld["fan_out"] > 1:
-                activations.append("linear")  # 保守默认，用户可手动设为 softmax
+            # 旧版兼容：最后一层按调用方指定回退，其余按隐层处理
+            if i == n_layers - 1:
+                activations.append(default_output_activation or "linear")
             else:
                 activations.append("leaky_relu")
 
     model = MLP(data["layer_sizes"], activations=activations)
 
-    for i, layer in enumerate(model.layers):
-        layer.weights = data["layers"][i]["weights"]
-        layer.biases = data["layers"][i]["biases"]
+    # 校验存档与 layer_sizes 是否自洽：多余层会被静默忽略、缺层会 IndexError
+    saved = data["layers"]
+    if len(saved) != len(model.layers):
+        raise ValueError(
+            f"load_model: 文件里有 {len(saved)} 层，但 layer_sizes 需要 {len(model.layers)} 层"
+        )
+    for i, (layer, ld) in enumerate(zip(model.layers, saved)):
+        if ld["fan_in"] != layer.fan_in or ld["fan_out"] != layer.fan_out:
+            raise ValueError(
+                f"load_model: 第 {i} 层权重形状 {ld['fan_in']}x{ld['fan_out']} "
+                f"与 layer_sizes 推出的 {layer.fan_in}x{layer.fan_out} 不一致"
+            )
+        layer.weights = ld["weights"]
+        layer.biases = ld["biases"]
 
     print(f"模型已从 {filepath} 加载")
     return model
@@ -2430,10 +2589,22 @@ def save_conv_model(conv_layers, fc_model, filepath: str):
             })
 
     for layer in fc_model.layers:
+        # 与 save_model 一致：必须记录激活函数，否则 softmax 分类头
+        # 重新加载后会退回 MLP 默认的 linear，静默变成回归器
+        act_name = getattr(layer, "activation_name", None)
+        if act_name is None:
+            act_name = "linear"
+            if layer.act_fn == layer._leaky_relu:
+                act_name = "leaky_relu"
+            elif layer.act_fn == layer._relu:
+                act_name = "relu"
+            elif layer.act_fn == layer._softmax:
+                act_name = "softmax"
         data["mlp"]["layers"].append({
             "fan_in": layer.fan_in,
             "fan_out": layer.fan_out,
             "is_output": layer.is_output,
+            "activation": act_name,
             "weights": layer.weights,
             "biases": layer.biases,
         })
@@ -2457,12 +2628,20 @@ def load_conv_model(filepath: str):
         conv.biases = cd["biases"]
         conv_layers.append(conv)
 
-    # 重建 MLP
+    # 重建 MLP（带激活函数）
     layer_sizes = data["mlp"]["layer_sizes"]
-    model = MLP(layer_sizes)
+    saved_layers = data["mlp"]["layers"]
+    activations = []
+    for i, ld in enumerate(saved_layers):
+        if "activation" in ld:
+            activations.append(ld["activation"])
+        else:
+            # 旧格式没有记录激活：按位置推断，与 MLP 默认保持兼容
+            activations.append("linear" if i == len(layer_sizes) - 2 else "leaky_relu")
+    model = MLP(layer_sizes, activations=activations)
     for i, layer in enumerate(model.layers):
-        layer.weights = data["mlp"]["layers"][i]["weights"]
-        layer.biases = data["mlp"]["layers"][i]["biases"]
+        layer.weights = saved_layers[i]["weights"]
+        layer.biases = saved_layers[i]["biases"]
 
     print(f"CNN+MLP 模型已从 {filepath} 加载")
     return conv_layers, model
@@ -2844,6 +3023,18 @@ class Model:
         if data is not None:
             dataset = [(list(x_i), y_i) for x_i, y_i in data]
         elif x is not None and y is not None:
+            # 训练集同样要校验：zip 会静默截断到较短的一方
+            if len(x) != len(y):
+                raise ValueError(
+                    f"fit: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致"
+                )
+            if len(x) == 0:
+                raise ValueError("fit: 训练集为空")
+            n_in = self.model.layers[0].fan_in
+            if len(x[0]) != n_in:
+                raise ValueError(
+                    f"fit: 训练样本特征维度 {len(x[0])} 与模型输入维度 {n_in} 不一致"
+                )
             dataset = [(list(x_i), y_i) for x_i, y_i in zip(x, y)]
         else:
             raise ValueError("请提供 data 或 (x, y)")
@@ -2918,6 +3109,10 @@ class Model:
 
             # 验证
             val_loss = None
+            if not val_set and verbose and patience > 0 and \
+                    early_stop_metric != 'train' and epoch == 1:
+                print("提示: 没有验证集，early_stop_metric='val' 不会触发早停"
+                      "（可用 val_split 或 early_stop_metric='train'）")
             if val_set:
                 val_loss = self.evaluate(data=val_set)
                 self.history['val_loss'].append((epoch, val_loss))
@@ -3142,6 +3337,10 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
     input_dim = len(x[0])
 
     if task == 'classification':
+        # 标签既可以是类别索引 int，也可以是 one-hot / 概率向量；
+        # 后者直接 set(y) 会抛 unhashable，这里统一转成索引
+        if y and isinstance(y[0], (list, tuple)):
+            y = [max(range(len(row)), key=lambda j: row[j]) for row in y]
         num_classes = len(set(y))
         model = make_classifier(input_dim, num_classes,
                                 hidden_layers=hidden_layers, lr=lr,
