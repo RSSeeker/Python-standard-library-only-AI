@@ -272,6 +272,12 @@ class Conv2d:
         self.padding = (padding, padding) if isinstance(padding, int) else padding
         self.kh, self.kw = self.kernel_size
         self.sh, self.sw = self.stride
+        if self.kh <= 0 or self.kw <= 0:
+            raise ValueError(f"Conv2d: kernel_size 必须为正，收到 {self.kernel_size}")
+        if self.sh <= 0 or self.sw <= 0:
+            raise ValueError(f"Conv2d: stride 必须为正，收到 {self.stride}")
+        if min(self.padding) < 0:
+            raise ValueError(f"Conv2d: padding 不能为负，收到 {self.padding}")
         self.ph, self.pw = self.padding
 
         # He 初始化
@@ -405,6 +411,10 @@ class Conv2d:
     # ---------- 前向 / 反向 ----------
     def forward(self, x):
         """x: (C, H, W) -> 输出 (out_channels, Ho, Wo)"""
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"Conv2d.forward: 输入通道 {len(x)} != in_channels={self.in_channels}"
+            )
         C, H, W = len(x), len(x[0]), len(x[0][0])
         ho, wo = self._img_shape(H, W)
         self.h_out, self.w_out = ho, wo
@@ -994,7 +1004,9 @@ class LSTMCell(_StepCacheMixin):
         self.v_b_hh = [0.0] * gate_size
 
     def _sigmoid(self, x):
-        return [1.0 / (1.0 + math.exp(-xi)) for xi in x]
+        # 分支写法：xi<0 时用 exp(xi)/(1+exp(xi))，避免 math.exp(-xi) 在大负数上溢出
+        return [1.0 / (1.0 + math.exp(-xi)) if xi >= 0
+            else math.exp(xi) / (1.0 + math.exp(xi)) for xi in x]
 
     def forward(self, x, h_prev=None, c_prev=None):
         """x: (input_size,) -> h: (hidden_size,), c: (hidden_size,)"""
@@ -1174,7 +1186,9 @@ def _matmul(A, B):
     """矩阵乘法 A(m×n) × B(n×p) → (m×p)，纯 Python 实现"""
     m, n = len(A), len(A[0])
     n2, p = len(B), len(B[0])
-    assert n == n2, f"维度不匹配: ({m},{n}) × ({n2},{p})"
+    if n != n2:
+        # 不能用 assert：python -O 会把它去掉，错误形状会被静默截断
+        raise ValueError(f"_matmul: 维度不匹配 ({m},{n}) × ({n2},{p})")
     # 先把 B 转置一次，让每一列成为元组，再用 C 层的 map(mul) / sum 做点积：
     # 与逐个元素 += 的三重循环结果完全一致，但快约 1.6 倍
     Bt = list(zip(*B))
@@ -1255,7 +1269,9 @@ class GRUCell(_StepCacheMixin):
         self.m_b_hh = [0.0] * (3 * hs); self.v_b_hh = [0.0] * (3 * hs)
 
     def _sigmoid(self, x):
-        return [1.0 / (1.0 + math.exp(-xi)) for xi in x]
+        # 分支写法：xi<0 时用 exp(xi)/(1+exp(xi))，避免 math.exp(-xi) 在大负数上溢出
+        return [1.0 / (1.0 + math.exp(-xi)) if xi >= 0
+            else math.exp(xi) / (1.0 + math.exp(xi)) for xi in x]
 
     def forward(self, x, h_prev=None):
         hs = self.hidden_size
@@ -1408,7 +1424,10 @@ class MultiHeadAttention:
         TransformerEncoderLayer 的 dropout1/dropout2 仍然工作，所以 eval() 依然有意义；
         但这里传大于 0 的值不会带来任何正则化效果。
         """
-        assert d_model % num_heads == 0
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"MultiHeadAttention: d_model={d_model} 必须能被 num_heads={num_heads} 整除"
+            )
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
@@ -1981,6 +2000,13 @@ class Embedding:
 
     def forward(self, indices):
         """indices: List[int] → List[List[float]] (seq_len, embed_dim)"""
+        # 负数索引会静默回绕到词表末尾，必须拦掉
+        for t, idx in enumerate(indices):
+            if not isinstance(idx, int) or not 0 <= idx < self.vocab_size:
+                raise ValueError(
+                    f"Embedding.forward: 第 {t} 个索引 {idx!r} 越界"
+                    f"（词表大小 {self.vocab_size}）"
+                )
         self.indices = indices
         return [list(self.weight[idx]) for idx in indices]
 
@@ -2346,6 +2372,8 @@ class StepLR:
     """每 step_size 个 epoch 将 lr 乘以 gamma"""
 
     def __init__(self, optimizer, step_size: int = 30, gamma: float = 0.1):
+        if step_size is None or step_size <= 0:
+            raise ValueError(f"StepLR: step_size 必须 >= 1，收到 {step_size!r}")
         self.optimizer = optimizer
         self.step_size = step_size
         self.gamma = gamma
@@ -2372,6 +2400,8 @@ class CosineAnnealingLR:
     """余弦退火学习率调度"""
 
     def __init__(self, optimizer, T_max: int, eta_min: float = 0.0):
+        if T_max is None or T_max <= 0:
+            raise ValueError(f"CosineAnnealingLR: T_max 必须 >= 1，收到 {T_max!r}")
         self.optimizer = optimizer
         self.T_max = T_max
         self.eta_min = eta_min
@@ -2379,7 +2409,10 @@ class CosineAnnealingLR:
 
     def step(self, epoch: int):
         # 支持周期重启：epoch 每 T_max 后重新开始余弦退火周期
-        progress = ((epoch - 1) % self.T_max) / self.T_max
+        # 分母用 T_max-1，使每个周期**最后一轮**正好到达 eta_min；
+        # 原先除以 T_max，最低只到 eta_min + 0.0488*(initial-eta_min)，永远够不着
+        denom = max(self.T_max - 1, 1)
+        progress = ((epoch - 1) % self.T_max) / denom
         self.optimizer.lr = self.eta_min + 0.5 * (self.initial_lr - self.eta_min) * (
             1 + math.cos(math.pi * progress))
 
@@ -2390,6 +2423,12 @@ class CosineAnnealingLR:
 
 def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int = 42):
     """将数据拆分为 train / val / test"""
+    if not (0.0 <= val_ratio < 1.0) or not (0.0 <= test_ratio < 1.0) \
+            or val_ratio + test_ratio >= 1.0:
+        raise ValueError(
+            f"split_data: 比例非法（val_ratio={val_ratio}, test_ratio={test_ratio}）；"
+            f"要求各自在 [0,1) 内且之和 < 1"
+        )
     # 用局部 Random 实例，避免 random.seed() 污染全局随机状态
     rng = random.Random(seed)
     items = list(data)
@@ -2410,6 +2449,8 @@ class DataLoader:
     """简易数据加载器：按 batch 迭代，支持 shuffle"""
 
     def __init__(self, dataset: list, batch_size: int = 32, shuffle: bool = True):
+        if batch_size is None or batch_size <= 0:
+            raise ValueError(f"DataLoader: batch_size 必须 >= 1，收到 {batch_size!r}")
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -2542,7 +2583,13 @@ def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
             test_vec.extend([0.0] * (tp.vocab_size * pad))
         for c in context:
             test_vec.extend(tp.encode_one_hot(c, strict=True))
-        logits = model.forward(test_vec)
+        out = model.forward(test_vec)
+        # 文本模型的输出层常常已经是 softmax 概率（make_classifier 就是），
+        # 再套一次 softmax 会把分布压平：temp=1 时 [0.7,0.2,0.1] -> [0.46,0.28,0.25]。
+        # 这里按「是否已是合法概率分布」自动区分，概率输出先取 log 还原成 logits。
+        is_prob = (all(0.0 <= v <= 1.0 for v in out)
+                   and abs(sum(out) - 1.0) < 1e-6)
+        logits = [math.log(max(v, 1e-12)) for v in out] if is_prob else out
         probs = _softmax_with_temp(logits, temp)
         next_idx = sample_index(probs)
         generated += tp.idx_to_char[next_idx]
@@ -2737,6 +2784,13 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
 
     if data.get("type") != "MLP":
         raise ValueError(f"不支持的类型: {data.get('type')}")
+    for _k in ("layer_sizes", "layers"):
+        if _k not in data:
+            raise ValueError(f"load_model: 文件缺少必需字段 {_k!r}")
+    for _i, _ld in enumerate(data["layers"]):
+        for _k in ("fan_in", "fan_out", "weights", "biases"):
+            if _k not in _ld:
+                raise ValueError(f"load_model: 第 {_i} 层缺少字段 {_k!r}")
 
     # 从保存的数据中读取各层激活函数，兼容旧版（无 activation 字段）
     activations = []
@@ -2803,7 +2857,13 @@ def save_conv_model(conv_layers, fc_model, filepath: str):
             "layers": []
         }
     }
-    for conv in conv_layers:
+    for k, conv in enumerate(conv_layers):
+        if not isinstance(conv, Conv2d):
+            # 原先静默跳过：MaxPool2d 之类的模块会悄悄从存档里消失，拓扑被改变
+            raise ValueError(
+                f"save_conv_model: 第 {k} 个模块是 {type(conv).__name__}，"
+                f"目前只支持 Conv2d（其余模块无法序列化，静默跳过会丢失拓扑）"
+            )
         if isinstance(conv, Conv2d):
             data["conv"].append({
                 "cls": "Conv2d",
@@ -2851,6 +2911,16 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
     """
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    for _k in ("conv", "mlp"):
+        if _k not in data:
+            raise ValueError(f"load_conv_model: 文件缺少必需字段 {_k!r}（不是 CNN_MLP 存档？）")
+    if "layer_sizes" not in data["mlp"] or "layers" not in data["mlp"]:
+        raise ValueError("load_conv_model: mlp 缺少 layer_sizes 或 layers 字段")
+    for _i, _ld in enumerate(data["mlp"]["layers"]):
+        for _k in ("fan_in", "fan_out", "weights", "biases"):
+            if _k not in _ld:
+                raise ValueError(f"load_conv_model: 第 {_i} 层缺少字段 {_k!r}")
 
     # 重建 CNN 层（先校验形状，坏文件在加载期就报错）
     conv_layers = []
@@ -3614,11 +3684,14 @@ def distill(teacher, student, x, y, epochs=400, batch_size=16,
     """
     cls = getattr(teacher, 'task', 'regression') == 'classification'
     if cls:
-        soft_y = teacher.predict_classes(x)          # list[int]
+        # 用教师的**软输出**（概率分布）当目标：argmax 硬标签会丢掉教师的不确定性，
+        # 与 README 里「用教师输出当软目标」的描述也不一致
+        soft_y = teacher.predict(x)                   # list[list] 概率分布
         student.fit(x, soft_y, epochs=epochs, batch_size=batch_size,
                     val_split=val_split, patience=patience, verbose=False)
         agree = sum(1 for xi, yi in zip(x, soft_y)
-                    if student.predict_classes([xi])[0] == yi)
+                    if student.predict_classes([xi])[0]
+                    == max(range(len(yi)), key=lambda i: yi[i]))
     else:
         soft_y = teacher.predict(x)                  # 多样本 -> list[list]
         student.fit(x, soft_y, epochs=epochs, batch_size=batch_size,
