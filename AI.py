@@ -335,6 +335,19 @@ class Conv2d:
         col_cols = ho * wo
         col = [[0.0] * col_cols for _ in range(col_rows)]
 
+        if self.sh == 1 and self.sw == 1:
+            # stride=1 时每一行就是被卷积核在宽度方向上的连续切片，
+            # 直接切片赋值（每个位置的值与逐元素写法完全相同）
+            for c in range(C):
+                ch = x_padded[c]
+                for kh in range(self.kh):
+                    for kw in range(self.kw):
+                        row = c * self.kh * self.kw + kh * self.kw + kw
+                        dst = col[row]
+                        for oh in range(ho):
+                            dst[oh * wo:(oh + 1) * wo] = ch[oh + kh][kw:kw + wo]
+            return col
+
         for c in range(C):
             ch = x_padded[c]                      # 局部化，省掉每元素的二次索引
             for kh in range(self.kh):
@@ -442,9 +455,8 @@ class Conv2d:
             w_flat = self._flatten_weights(oc)
             for row in range(len(w_flat)):
                 w = w_flat[row]
-                drow = dcol[row]
-                for i in range(ho * wo):
-                    drow[i] += w * d[i]
+                # 累加顺序仍是「外层 oc、内层逐元素」，与原写法逐位一致
+                dcol[row] = [a + w * b for a, b in zip(dcol[row], d)]
 
         dx_padded = self._col2im(dcol, (C, H + 2 * self.ph, W + 2 * self.pw), ho, wo)
 
