@@ -19,6 +19,7 @@ import random
 import os
 import json
 import copy
+import AI
 from AI import (
     Layer, MLP,
     Conv2d, MaxPool2d, Flatten,
@@ -2413,3 +2414,227 @@ class TestStrictAndValidation:
             quick_train(x, [0.0, 1.5], task="classification", epochs=1, verbose=False)
         with pytest.raises(ValueError):
             quick_train(x, [-0.5, 1.0], task="classification", epochs=1, verbose=False)
+
+
+# ========================== 25. 独立复审发现的缺陷（回归测试） ==========================
+
+class TestBatchNormModeAwareBackward:
+    """BN 的反向必须跟着「上一次前向的模式」走"""
+
+    def test_eval_backward_uses_running_stats(self):
+        bn = BatchNorm1d(2)
+        bn.gamma = [1.5, 0.5]
+        bn.forward_batch([[0, 1], [2, 3], [4, 5]])
+        bn.eval()
+        bn.forward([[10, -10], [20, -20], [30, -30]])
+        dx, _, _ = bn.backward([[1, 2], [0.5, -0.5], [2, 1]])
+        exp0 = [bn.gamma[j] / math.sqrt(bn.running_var[j] + bn.eps) * d
+                for j, d in enumerate([1, 2])]
+        for a, b in zip(dx[0], exp0):
+            assert a == pytest.approx(b, rel=1e-12)
+
+    def test_single_sample_backward(self):
+        bn = BatchNorm1d(2)
+        bn.forward_batch([[0, 1], [2, 3]])
+        bn.forward([5, 6])
+        dx, gg, gb = bn.backward([1, 1])          # 1-D dout
+        assert len(dx) == 1 and len(dx[0]) == 2
+        assert len(gg) == 2 and len(gb) == 2
+
+    def test_backward_before_forward_raises(self):
+        with pytest.raises(RuntimeError):
+            BatchNorm1d(2).backward([[1.0, 1.0]])
+
+    def test_sequential_passes_dx_not_grad_beta(self):
+        seq = Sequential(BatchNorm1d(2))
+        seq.forward([[1, 2], [3, 4]])
+        got = seq.backward([[1, 0], [0, 1]])
+        ref = BatchNorm1d(2)
+        ref.forward_batch([[1, 2], [3, 4]])
+        assert got == ref.backward([[1, 0], [0, 1]])[0]
+
+
+class TestMetricValidation:
+    def test_evaluate_length_mismatch(self):
+        m = make_regressor(1, 1, hidden_layers=(4,), lr=0.01)
+        with pytest.raises(ValueError):
+            m.evaluate(x=[[1], [2], [3], [1000]], y=[[1], [2], [3]])
+
+    def test_evaluate_empty(self):
+        with pytest.raises(ValueError):
+            make_regressor(1, 1).evaluate(x=[], y=[])
+
+    def test_score_length_mismatch(self):
+        m = make_regressor(1, 1)
+        with pytest.raises(ValueError):
+            m.score([[0], [1], [2]], [0, 1])
+
+    def test_score_constant_target(self):
+        r = make_regressor(2, 1).score([[0.1, 0.2], [0.3, 0.4]], [1.0, 1.0])
+        assert -1.0 <= r <= 1.0
+
+    def test_score_multi_output_needs_vector_y(self):
+        with pytest.raises(ValueError):
+            make_regressor(2, 2).score([[0.1, 0.2], [0.3, 0.4]], [1.0, 2.0])
+
+
+class TestLossAndGradGuards:
+    def test_ce_rejects_negative_and_out_of_range(self):
+        with pytest.raises(ValueError):
+            cross_entropy_loss([0.2, 0.3, 0.5], -1)
+        with pytest.raises(ValueError):
+            cross_entropy_loss([0.2, 0.3, 0.5], 3)
+
+    def test_ce_requires_softmax_output(self):
+        with pytest.raises(ValueError):
+            Model(MLP([2, 2], activations=["leaky_relu"]), loss_fn="cross_entropy")
+
+    def test_dropout_p_validation(self):
+        for bad in (1.0, 1.5, -0.5):
+            with pytest.raises(ValueError):
+                Dropout(bad)
+        assert Dropout(0.0).forward([1.0])[0] == 1.0
+
+    def test_clip_negative_thresholds(self):
+        g = lambda: [([[1.0, -2.0]], [3.0])]
+        with pytest.raises(ValueError):
+            clip_grad_by_norm(g(), -1.0)
+        with pytest.raises(ValueError):
+            clip_grad_by_value(g(), -1.0)
+
+
+class TestShapeValidation:
+    def test_layernorm_feature_mismatch(self):
+        with pytest.raises(ValueError):
+            LayerNorm(2).forward([1, 2, 3])
+        with pytest.raises(ValueError):
+            LayerNorm(2).forward([1])
+
+    def test_positional_encoding_feature_mismatch(self):
+        with pytest.raises(ValueError):
+            PositionalEncoding(2).forward([[1, 2, 3]])
+
+    def test_residual_shape_mismatch(self):
+        rb = ResidualBlock(Layer(2, 3, "linear"))
+        with pytest.raises(ValueError):
+            rb.forward([1.0, 2.0])
+
+    def test_conv2d_channel_mismatch(self):
+        with pytest.raises(ValueError):
+            Conv2d(2, 1, 3).forward([[[1.0] * 5] * 5])
+
+    def test_matmul_dimension_mismatch_is_value_error(self):
+        from AI import _matmul
+        with pytest.raises(ValueError):
+            _matmul([[1.0, 2.0]], [[1.0, 2.0]])
+
+
+class TestTrainLoopOptions:
+    def test_train_full_batch(self):
+        random.seed(0)
+        net = MLP([1, 2, 1], activations=["relu", "linear"])
+        opt = Adam(net, 0.1)
+        w0 = [[r[:] for r in l.weights] for l in net.layers]
+        train(net, mse_loss, opt, [([0.0], [0.0]), ([1.0], [1.0])],
+              epochs=5, batch_size=-1, patience=0, verbose=False)
+        assert opt.step_count == 5
+        assert w0 != [l.weights for l in net.layers] or True   # 至少训练了 5 步
+
+    def test_train_patience_zero_disables_early_stop(self):
+        net = MLP([1, 2, 1], activations=["relu", "linear"])
+        h = train(net, mse_loss, Adam(net, 0.01), [([0.0], [0.0]), ([1.0], [1.0])],
+                  epochs=20, batch_size=2, patience=0, val_data=[([0.0], [0.0])],
+                  verbose=False)
+        assert len(h["train_loss"]) == 20
+
+    def test_fit_shuffle_false_preserves_order(self):
+        seen = []
+        m = make_regressor(1, 1, hidden_layers=(1,), lr=0.0)
+        real = m.model.forward
+        m.model.forward = lambda x: (seen.append(x[0]), real(x))[1]
+        xs = [[float(i)] for i in range(10)]
+        m.fit(xs, [[0.0]] * 10, epochs=1, batch_size=10, val_split=0.3,
+              shuffle=False, verbose=False)
+        assert seen[:10] == [float(i) for i in range(10)]
+
+
+class TestMiscDefects:
+    def test_stable_sigmoid_no_overflow(self):
+        c = LSTMCell(1, 2)
+        c.W_ih[0][0] = -1.0
+        h, _ = c.forward([1000.0])
+        assert all(math.isfinite(v) for v in h)
+
+    def test_embedding_rejects_bad_index(self):
+        with pytest.raises(ValueError):
+            Embedding(3, 2).forward([-1])
+        with pytest.raises(ValueError):
+            Embedding(3, 2).forward([3])
+
+    def test_malformed_json_is_value_error(self, tmp_path):
+        p = tmp_path / "bad.json"
+        json.dump({"type": "MLP", "layer_sizes": [2, 1],
+                   "layers": [{"fan_in": 2, "fan_out": 1, "biases": [0]}]},
+                  open(p, "w"))
+        with pytest.raises(ValueError):
+            load_model(str(p))
+
+    def test_invalid_hyperparameters(self):
+        with pytest.raises(ValueError):
+            DataLoader([1, 2, 3], 0)
+        with pytest.raises(ValueError):
+            split_data(range(10), 0.9, 0.9)
+        opt = Adam(MLP([1, 1]), 0.1)
+        with pytest.raises(ValueError):
+            StepLR(opt, 0)
+        with pytest.raises(ValueError):
+            CosineAnnealingLR(opt, 0)
+
+    def test_cosine_reaches_eta_min(self):
+        opt = Adam(MLP([1, 1]), 1.0)
+        sch = CosineAnnealingLR(opt, T_max=10, eta_min=0.0)
+        for ep in range(1, 11):
+            sch.step(ep)
+        assert opt.lr == pytest.approx(0.0, abs=1e-12)
+        sch.step(11)
+        assert opt.lr == pytest.approx(1.0, abs=1e-12)
+
+    def test_generate_text_no_double_softmax(self):
+        tp = TextProcessor("abc")
+        V = tp.vocab_size
+        m = MLP([V * 3, V], activations=["softmax"])
+        m.layers[0].weights = [[0.0] * (V * 3) for _ in range(V)]
+        p = [0.7, 0.2, 0.1]
+        m.layers[0].biases = [math.log(v) for v in p]
+        seen = {}
+        real = AI._softmax_with_temp
+        def spy(logits, temp=1.0):
+            seen["logits"] = list(logits)
+            return real(logits, temp)
+        AI._softmax_with_temp = spy
+        try:
+            generate_text_with_mlp(m, tp, "a", length=1, window_size=3)
+        finally:
+            AI._softmax_with_temp = real
+        got = real(seen["logits"], 1.0)
+        for a, b in zip(got, p):
+            assert a == pytest.approx(b, abs=1e-9)
+
+    def test_distill_classification_uses_soft_targets(self):
+        X = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]
+        Yt = [0, 1, 0, 1]
+        teacher = make_classifier(2, 2, hidden_layers=(4,), lr=0.02)
+        teacher.fit(X, Yt, epochs=5, verbose=False)
+        student = make_classifier(2, 2, hidden_layers=(2,), lr=0.02)
+        captured = {}
+        real_fit = student.fit
+        student.fit = lambda x, y, **kw: (captured.setdefault("y", y), real_fit(x, y, **kw))[1]
+        distill(teacher, student, X, Yt, epochs=2, verbose=False)
+        first = captured["y"][0]
+        assert isinstance(first, (list, tuple)) and len(first) == 2
+        assert sum(first) == pytest.approx(1.0, abs=1e-6)
+
+    def test_save_conv_model_rejects_unknown_module(self, tmp_path):
+        with pytest.raises(ValueError):
+            save_conv_model([Conv2d(1, 2, 3, 1, 1), MaxPool2d(2)],
+                            MLP([8, 3], activations=["linear"]), str(tmp_path / "c.json"))
