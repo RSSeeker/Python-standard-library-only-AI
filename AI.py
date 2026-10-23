@@ -142,7 +142,12 @@ class Layer:
         return self.a
 
     def backward(self, delta):
-        """delta: 本层输出的梯度，返回上一层需要的 delta"""
+        """delta: 本层输出的梯度
+
+        返回 **(grad_w, grad_b, next_delta)** —— 三元组，最后一个元素才是传给
+        上一层的 delta。容器（`Sequential` / `ResidualBlock`）通过模块的
+        `delta_index` 属性决定取哪一项（默认 -1；`BatchNorm1d` 的 dx 在第 0 位）。
+        """
         d_act = self.act_deriv(self.z)
 
         # delta * d_act 同时是 grad_b 与回传给上一层的权重向量，只算一次
@@ -3362,7 +3367,7 @@ class Model:
     def fit(self, x=None, y=None, data=None, epochs=100, batch_size=32,
             val_split=0.1, val_data=None, patience=50, verbose=True,
             shuffle=True, lr_scheduler=None, grad_clip=None,
-            early_stop_metric='val'):
+            early_stop_metric='val', restore_best_weights=False):
         """
         训练模型。
 
@@ -3381,6 +3386,8 @@ class Model:
         lr_scheduler: StepLR/ExponentialLR/CosineAnnealingLR 实例
         grad_clip:    float，梯度范数裁剪阈值（None = 不裁剪）
             early_stop_metric: 'val'（默认，盯验证损失）或 'train'（盯训练损失，且不依赖验证集）
+            restore_best_weights: True 时在训练结束后回滚到「被监控指标最好」的那一轮权重
+                （早停只在指标变差时停止，**不会自动回滚**；需要最优权重时打开这个开关）
         """
         # === 规范化数据 ===
         if data is not None:
@@ -3432,6 +3439,7 @@ class Model:
         self.history = {'train_loss': [], 'val_loss': []}
         best_val_loss = float('inf')
         no_improve = 0
+        best_snapshot = None      # restore_best_weights 用的最优权重快照
 
         for epoch in range(1, epochs + 1):
             if shuffle:
@@ -3496,23 +3504,29 @@ class Model:
             # 早停判据：默认盯验证损失（需要验证集）；
             # early_stop_metric='train' 时改盯训练损失，此时不依赖验证集
             # （与 C 引擎 FitConfig.early_stop_on_train 同一语义）
-            if patience > 0:
-                if early_stop_metric == 'train':
-                    monitored = train_loss
-                elif val_set:
-                    monitored = val_loss
+            # 被监控指标：'train' 用训练损失，否则用验证损失（没有验证集则不监控）。
+            # 注意：快照与「是否早停」解耦——patience=0 只关闭早停，不关闭最优权重回滚。
+            if early_stop_metric == 'train':
+                monitored = train_loss
+            elif val_set:
+                monitored = val_loss
+            else:
+                monitored = None
+            if monitored is not None:
+                if monitored < best_val_loss - 1e-12:
+                    best_val_loss = monitored
+                    no_improve = 0
+                    if restore_best_weights:
+                        best_snapshot = [
+                            ([row[:] for row in l.weights], l.biases[:])
+                            for l in self.model.layers
+                        ]
                 else:
-                    monitored = None
-                if monitored is not None:
-                    if monitored < best_val_loss - 1e-12:
-                        best_val_loss = monitored
-                        no_improve = 0
-                    else:
-                        no_improve += 1
-                    if no_improve >= patience:
-                        if verbose:
-                            print(f"Early stopping at epoch {epoch}")
-                        break
+                    no_improve += 1
+                if patience > 0 and no_improve >= patience:
+                    if verbose:
+                        print(f"Early stopping at epoch {epoch}")
+                    break
 
             # 学习率调度
             if lr_scheduler is not None:
@@ -3524,6 +3538,15 @@ class Model:
                 if val_loss is not None:
                     parts.append(f"val_loss={val_loss:.6f}")
                 print(" | ".join(parts))
+
+        if restore_best_weights and best_snapshot is not None:
+            # 回滚到被监控指标最好的那一轮（早停本身不会回滚权重）
+            for layer, (w, b) in zip(self.model.layers, best_snapshot):
+                for j in range(layer.fan_out):
+                    layer.weights[j][:] = w[j]
+                layer.biases[:] = b
+            if verbose:
+                print(f"已回滚到最优权重（monitored={best_val_loss:.6f}）")
 
         self._is_trained = True
         return self.history

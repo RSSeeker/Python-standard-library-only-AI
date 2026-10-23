@@ -2638,3 +2638,30 @@ class TestMiscDefects:
         with pytest.raises(ValueError):
             save_conv_model([Conv2d(1, 2, 3, 1, 1), MaxPool2d(2)],
                             MLP([8, 3], activations=["linear"]), str(tmp_path / "c.json"))
+
+class TestRestoreBestWeights:
+    def test_restore_beats_last_epoch(self):
+        xs = [[float(i)] for i in range(10)]
+        ys = [[v[0]] for v in xs]
+
+        def run(restore):
+            random.seed(7)
+            m = make_regressor(1, 1, hidden_layers=(2,), lr=0.3)
+            m.fit(xs, ys, epochs=40, batch_size=2, val_split=0.3, patience=0,
+                  shuffle=True, verbose=False, restore_best_weights=restore)
+            w = [[row[:] for row in l.weights] for l in m.model.layers]
+            loss = sum(mse_loss(m.predict([x])[0], y)[0] for x, y in zip(xs, ys)) / len(xs)
+            return w, loss
+
+        w1, l1 = run(False)
+        w2, l2 = run(True)
+        assert w1 != w2                      # 确实回滚了权重
+        assert l2 <= l1                      # 回滚后不差于末轮
+
+    def test_layer_backward_returns_triple(self):
+        l = Layer(3, 2, "linear")
+        l.forward([0.1, 0.2, 0.3])
+        out = l.backward([1.0, -1.0])
+        assert isinstance(out, tuple) and len(out) == 3
+        gw, gb, delta = out
+        assert len(gw) == 2 and len(gb) == 2 and len(delta) == 3
