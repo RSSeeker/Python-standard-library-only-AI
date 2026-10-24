@@ -16,17 +16,17 @@
 """
 
 # 目录（按文件顺序）
-#    1. 激活函数 ----------
-#    2. 前向 / 反向 ----------
-#    3. 辅助 ----------
-#    4. 训练 ----
-#    5. 验证 ----
-#    6. 设定相同随机种子 & 初始化 ----------
-#    7. PyTorch 模型 ---
-#    8. 我们的模型 ---
-#    9. 前向对齐 ----------
-#   10. 反向对齐 ----------
-#   11. 应用梯度更新权重 (SGD) ---
+#  1. 激活函数
+#  2. 前向 / 反向
+#  3. 辅助
+#  4. 训练
+#  5. 验证
+#  6. 设定相同随机种子 & 初始化
+#  7. PyTorch 模型
+#  8. 我们的模型
+#  9. 前向对齐
+#  10. 反向对齐
+#  11. 应用梯度更新权重 (SGD)
 
 
 import json
@@ -94,7 +94,7 @@ class Layer:
         self.activation_name = activation
 
 #============================================================================
-#  激活函数 ----------
+#  激活函数
 #============================================================================
     def _linear(self, z):
         return z
@@ -127,7 +127,7 @@ class Layer:
         return [1.0] * len(z)
 
 #============================================================================
-#  前向 / 反向 ----------
+#  前向 / 反向
 #============================================================================
     def forward(self, x):
         # 维度不符时 map 会静默截断（少算或多算），必须早失败
@@ -230,7 +230,7 @@ class MLP:
             params.append((layer.weights, layer.biases))
         return params
 
-    # ── 参数量与模型瘦身（与 C 引擎 c_model.cpp 的实现语义一致） ──
+# ── 参数量与模型瘦身（与 C 引擎 c_model.cpp 的实现语义一致）
 
     def param_count(self):
         """可训练参数总数（权重 + 偏置）"""
@@ -355,7 +355,7 @@ class Conv2d:
         self.grad_b = [0.0] * self.out_channels
 
 #============================================================================
-#  辅助 ----------
+#  辅助
 #============================================================================
     def _img_shape(self, H, W):
         ho = (H + 2 * self.ph - self.kh) // self.sh + 1
@@ -451,7 +451,7 @@ class Conv2d:
         return dx
 
 #============================================================================
-#  前向 / 反向 ----------
+#  前向 / 反向
 #============================================================================
     def forward(self, x):
         """x: (C, H, W) -> 输出 (out_channels, Ho, Wo)"""
@@ -2726,7 +2726,7 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 
     for epoch in range(1, epochs + 1):
 #============================================================================
-#  训练 ----
+#  训练
 #============================================================================
         random.shuffle(data)
         train_loss = 0.0
@@ -2771,7 +2771,7 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
         history["train_loss"].append((epoch, train_loss))
 
 #============================================================================
-#  验证 ----
+#  验证
 #============================================================================
         val_loss = None
         if val_data:
@@ -3139,7 +3139,7 @@ def compare_with_pytorch():
     print("=" * 60)
 
 #============================================================================
-#  设定相同随机种子 & 初始化 ----------
+#  设定相同随机种子 & 初始化
 #============================================================================
     torch.manual_seed(42)
     random.seed(42)
@@ -3149,7 +3149,7 @@ def compare_with_pytorch():
     output_dim = 2
 
 #============================================================================
-#  PyTorch 模型 ---
+#  PyTorch 模型
 #============================================================================
     pt_model = nn.Sequential(
         nn.Linear(input_dim, hidden_dim, bias=True),
@@ -3160,7 +3160,7 @@ def compare_with_pytorch():
     )
 
 #============================================================================
-#  我们的模型 ---
+#  我们的模型
 #============================================================================
     our_model = MLP([input_dim, hidden_dim, hidden_dim, output_dim],
                     activations=["leaky_relu", "leaky_relu", "linear"])
@@ -3177,7 +3177,7 @@ def compare_with_pytorch():
                 our_layer.biases[j] = float(b[j])
 
 #============================================================================
-#  前向对齐 ----------
+#  前向对齐
 #============================================================================
     x_np = [random.uniform(-1, 1) for _ in range(input_dim)]
     x_pt = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)  # (1, input_dim)
@@ -3193,7 +3193,7 @@ def compare_with_pytorch():
     print(f"前向 |Δ| 总和: {fwd_diff:.2e}  {'✓ 通过' if fwd_diff < 1e-5 else '✗ 偏差较大'}")
 
 #============================================================================
-#  反向对齐 ----------
+#  反向对齐
 #============================================================================
     target_np = [random.uniform(-1, 1) for _ in range(output_dim)]
     target_pt = torch.tensor(target_np, dtype=torch.float32).unsqueeze(0)
@@ -3436,7 +3436,7 @@ class Model:
         self.history = {'train_loss': [], 'val_loss': []}
         self._is_trained = False
 
-    # ── 核心操作 ─────────────────────────────────────────────
+# ── 核心操作
 
     def forward(self, x):
         """前向传播：接受单样本 list，返回输出 list"""
@@ -3446,7 +3446,7 @@ class Model:
         """反向传播：返回 [(gw, gb), ...] 梯度列表（逐层）"""
         return _mlp_backward(self.model, loss_grad)
 
-    # ── 训练 ─────────────────────────────────────────────────
+# ── 训练
 
     def _normalize_val_data(self, val_data):
         """把 val_data 规范化为 [(x, y), ...]，并做维度校验。
@@ -3721,7 +3721,7 @@ class Model:
         self._is_trained = epochs > 0
         return self.history
 
-    # ── 推理 ─────────────────────────────────────────────────
+# ── 推理
 
     def predict(self, x):
         """预测：单样本返回 list，多样本返回 list[list]"""
@@ -3736,7 +3736,7 @@ class Model:
             return [max(range(len(p)), key=lambda i: p[i]) for p in probs]
         return max(range(len(probs)), key=lambda i: probs[i])
 
-    # ── 评估 ─────────────────────────────────────────────────
+# ── 评估
 
     def evaluate(self, x=None, y=None, data=None):
         """计算平均损失"""
@@ -3810,7 +3810,7 @@ class Model:
                     scores.append(1 - ss_res / ss_tot)
             return sum(scores) / len(scores)
 
-    # ── 持久化 ───────────────────────────────────────────────
+# ── 持久化
 
     def save(self, filepath):
         """保存模型到 JSON 文件"""
@@ -3840,7 +3840,7 @@ class Model:
             task = 'classification'
         return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
 
-    # ── 信息 ─────────────────────────────────────────────────
+# ── 信息
 
     def summary(self):
         """打印模型结构摘要"""
@@ -3869,7 +3869,7 @@ class Model:
                f"optimizer={type(self.optimizer).__name__}, lr={self.lr})"
 
 
-# ── 工厂函数 ─────────────────────────────────────────────────
+# ── 工厂函数
 
 def distill(teacher, student, x, y, epochs=400, batch_size=16,
             val_split=0.1, patience=50, verbose=True):
@@ -4132,7 +4132,7 @@ if __name__ == "__main__":
         _ = conv.backward(delta)
 
 #============================================================================
-#  应用梯度更新权重 (SGD) ---
+#  应用梯度更新权重 (SGD)
 #============================================================================
         cnn_lr = 0.01
         # 更新 Conv2d 权重
