@@ -167,11 +167,22 @@ class MLP:
 
     def __init__(self, layer_sizes: List[int],
                  activations: Optional[List[str]] = None):
+        if len(layer_sizes) < 2:
+            raise ValueError(f"MLP: layer_sizes 至少需要 2 个维度（输入+输出），收到 {layer_sizes}")
+        if any(d <= 0 for d in layer_sizes):
+            raise ValueError(f"MLP: 每一维都必须 >= 1，收到 {layer_sizes}")
         self.layer_sizes = layer_sizes
 
         if activations is None:
             activations = ["leaky_relu"] * (len(layer_sizes) - 2)
             activations.append("linear")
+
+        # 必须在默认填充之后校验：否则 activations=None 时这里就 len(None) 崩了
+        if len(activations) != len(layer_sizes) - 1:
+            raise ValueError(
+                f"MLP: 需要 {len(layer_sizes) - 1} 个激活函数（层数 = 维度数-1），"
+                f"收到 {len(activations)} 个"
+            )
 
         self.layers = []
         for i in range(1, len(layer_sizes)):
@@ -2433,8 +2444,11 @@ class CosineAnnealingLR:
         # 支持周期重启：epoch 每 T_max 后重新开始余弦退火周期
         # 分母用 T_max-1，使每个周期**最后一轮**正好到达 eta_min；
         # 原先除以 T_max，最低只到 eta_min + 0.0488*(initial-eta_min)，永远够不着
-        denom = max(self.T_max - 1, 1)
-        progress = ((epoch - 1) % self.T_max) / denom
+        # T_max=1 时每一轮都是一个完整周期的末尾：直接落在 eta_min
+        if self.T_max == 1:
+            progress = 1.0
+        else:
+            progress = ((epoch - 1) % self.T_max) / (self.T_max - 1)
         self.optimizer.lr = self.eta_min + 0.5 * (self.initial_lr - self.eta_min) * (
             1 + math.cos(math.pi * progress))
 
@@ -2659,6 +2673,8 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 
     # 复制一份再打乱，避免修改调用者传入的列表顺序
     data = list(data)
+    if not data:
+        raise ValueError("train: 数据集为空（train_loss /= len(data) 会除零）")
     if batch_size is None or batch_size <= 0:
         # 与 Model.fit 一致：-1 / 0 表示整批（原先 range(0,n,-1) 是空循环，
         # 会静默「训练 0 步、loss 0」）
@@ -3493,6 +3509,10 @@ class Model:
                 "请重建优化器，否则会更新错误对象的参数"
             )
 
+        if early_stop_metric not in ('val', 'train'):
+            raise ValueError(
+                f"fit: early_stop_metric 只能是 'val' 或 'train'，收到 {early_stop_metric!r}"
+            )
         if not isinstance(val_split, (int, float)) or not (0.0 <= val_split < 1.0):
             raise ValueError(
                 f"fit: val_split 必须在 [0, 1) 内，收到 {val_split!r}"
@@ -3636,7 +3656,8 @@ class Model:
             if verbose:
                 print(f"已回滚到最优权重（monitored={best_val_loss:.6f}）")
 
-        self._is_trained = True
+        # epochs=0 时什么都没训练，不能标记为已训练
+        self._is_trained = epochs > 0
         return self.history
 
     # ── 推理 ─────────────────────────────────────────────────
