@@ -2599,6 +2599,12 @@ def _softmax_with_temp(logits: list, temperature: float = 1.0) -> list:
 def sample_index(probs: list) -> int:
     if not probs:
         raise ValueError("sample_index: 概率分布不能为空")
+    total = sum(probs)
+    if not (total > 0):
+        raise ValueError("sample_index: 概率之和必须 > 0")
+    if abs(total - 1.0) > 1e-9:
+        # 未归一化的输入会让采样区间对不上（例如 [0.2,0.3] 有 50% 概率返回末尾索引）
+        probs = [p / total for p in probs]
     """根据概率分布进行随机采样（不依赖 numpy）"""
     r = random.random()
     cumulative = 0.0
@@ -2615,6 +2621,8 @@ def generate_text(network, tp: TextProcessor, start_str: str,
 
     与 generate_text_with_mlp 是同一实现，保留这个名字只为兼容旧调用。
     """
+    if not isinstance(length, int) or length < 0:
+        raise ValueError(f"generate_text: length 必须 >= 0，收到 {length!r}")
     return generate_text_with_mlp(network, tp, start_str, length, window_size, temp)
 
 
@@ -3696,6 +3704,10 @@ class Model:
 
     def evaluate(self, x=None, y=None, data=None):
         """计算平均损失"""
+        if x and not isinstance(x[0], (list, tuple)):
+            raise ValueError(
+                "evaluate: x 必须是样本列表（每个样本是一个序列）；单个样本请写成 [x]"
+            )
         if data is not None:
             dataset = [(list(xi), yi) for xi, yi in data]
         elif x is not None and y is not None:
@@ -3718,6 +3730,10 @@ class Model:
 
     def score(self, x, y):
         """分类：准确率 | 回归：R² 决定系数"""
+        if x and not isinstance(x[0], (list, tuple)):
+            raise ValueError(
+                "score: x 必须是样本列表（每个样本是一个序列）；单个样本请写成 [x]"
+            )
         if len(x) != len(y):
             raise ValueError(
                 f"score: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致"
