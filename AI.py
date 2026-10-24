@@ -497,6 +497,12 @@ class MaxPool2d:
         )
         self.kh, self.kw = self.kernel_size
         self.sh, self.sw = self.stride
+        # Conv2d 有同样的校验，MaxPool2d 原先没有：kernel=0 会返回全 -inf（内层循环不执行），
+        # stride=0 会除零
+        if self.kh <= 0 or self.kw <= 0:
+            raise ValueError(f"MaxPool2d: kernel_size 必须为正，收到 {self.kernel_size}")
+        if self.sh <= 0 or self.sw <= 0:
+            raise ValueError(f"MaxPool2d: stride 必须为正，收到 {self.stride}")
         self.mask = None
         self.x_shape = None
 
@@ -2146,8 +2152,12 @@ def mse_loss(pred: List[float], target):
             f"请对齐维度（单输出回归请传 y=[value]，多输出请传 y=[v1, v2, ...]）"
         )
     n = len(pred)
-    loss = sum((p - t) ** 2 for p, t in zip(pred, target)) / n
-    grad = [2 * (p - t) / n for p, t in zip(pred, target)]
+    # 用乘法而不是 `** 2`：CPython 的 float pow 在 |差值| >~1.34e154 时会抛
+    # OverflowError（而 mse_loss([1e308],[-1e308]) 又返回 inf，行为不一致）；
+    # 乘法按 IEEE 溢出成 inf，语义统一
+    diffs = [p - t for p, t in zip(pred, target)]
+    loss = sum(d * d for d in diffs) / n
+    grad = [2 * d / n for d in diffs]
     return loss, grad
 
 
@@ -2548,6 +2558,8 @@ class TextProcessor:
 
 def _softmax_with_temp(logits: list, temperature: float = 1.0) -> list:
     """带温度参数的 Softmax：T 越小越保守，T 越大越随机"""
+    if not isinstance(temperature, (int, float)) or temperature <= 0:
+        raise ValueError(f"_softmax_with_temp: temperature 必须 > 0，收到 {temperature!r}")
     if temperature != 1.0:
         logits = [x / temperature for x in logits]
     mx = max(logits)
@@ -2557,6 +2569,8 @@ def _softmax_with_temp(logits: list, temperature: float = 1.0) -> list:
 
 
 def sample_index(probs: list) -> int:
+    if not probs:
+        raise ValueError("sample_index: 概率分布不能为空")
     """根据概率分布进行随机采样（不依赖 numpy）"""
     r = random.random()
     cumulative = 0.0
@@ -2596,6 +2610,11 @@ def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
         for c in context:
             test_vec.extend(tp.encode_one_hot(c, strict=True))
         out = model.forward(test_vec)
+        if len(out) != tp.vocab_size:
+            raise ValueError(
+                f"generate_text_with_mlp: 模型输出维度 {len(out)} 与词表大小 "
+                f"{tp.vocab_size} 不一致（采样会越界或永远采样不到部分字符）"
+            )
         # 文本模型的输出层常常已经是 softmax 概率（make_classifier 就是），
         # 再套一次 softmax 会把分布压平：temp=1 时 [0.7,0.2,0.1] -> [0.46,0.28,0.25]。
         # 这里按「是否已是合法概率分布」自动区分，概率输出先取 log 还原成 logits。
@@ -2772,8 +2791,16 @@ def save_model(model, filepath: str, task: str = None):
         }
         data["layers"].append(layer_data)
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            # allow_nan=False：否则会写出 RFC-4627 不合法的 NaN / Infinity 字面量，
+            # 严格 JSON 解析器（以及大多数其它语言）读不了
+            json.dump(data, f, indent=2, ensure_ascii=False, allow_nan=False)
+    except ValueError as e:
+        raise ValueError(
+            f"save_model: 权重里含 NaN / Inf，无法写出合法 JSON（{e}）；"
+            "训练可能发散了"
+        ) from None
     print(f"模型已保存到: {filepath}")
 
 
@@ -2847,10 +2874,22 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
                 f"load_model: 第 {i} 层 weights 实际形状与声明不符"
                 f"（应为 {exp_out} 行 × {exp_in} 列）"
             )
-        if len(ld["biases"]) != exp_out:
+        # 值类型也要校验：JSON 里可能是字符串，读进来不会报错，等到 forward 才
+        # TypeError: can't multiply sequence by non-int of type 'float'
+        for row in w:
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(
+                        f"load_model: 第 {i} 层 weights 含非数值 {v!r}（应为数字）"
+                    )
+        b = ld["biases"]
+        if len(b) != exp_out:
             raise ValueError(
-                f"load_model: 第 {i} 层 biases 长度 {len(ld['biases'])} != fan_out={exp_out}"
+                f"load_model: 第 {i} 层 biases 长度 {len(b)} != fan_out={exp_out}"
             )
+        for v in b:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"load_model: 第 {i} 层 biases 含非数值 {v!r}")
 
     model = MLP(layer_sizes, activations=activations)
     for i, layer in enumerate(model.layers):

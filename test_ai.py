@@ -2665,3 +2665,80 @@ class TestRestoreBestWeights:
         assert isinstance(out, tuple) and len(out) == 3
         gw, gb, delta = out
         assert len(gw) == 2 and len(gb) == 2 and len(delta) == 3
+
+class TestRobustnessGuards:
+    """独立鲁棒性审计发现的校验缺口（F1-F9）"""
+
+    def test_model_rejects_foreign_optimizer(self):
+        a = MLP([2, 3, 2]); b = MLP([2, 3, 2])
+        with pytest.raises(ValueError):
+            Model(b, loss_fn="mse", optimizer=Adam(a, lr=0.1))
+        Model(MLP([2, 3, 2]), loss_fn="mse", optimizer="adam")   # 字符串正常
+
+    def test_single_class_classification_rejected(self):
+        with pytest.raises(ValueError):
+            quick_train([[0.1], [0.2]], [0, 0], task="classification", epochs=2, verbose=False)
+        with pytest.raises(ValueError):
+            make_classifier(2, 1)
+
+    def test_batchnorm_forward_batch_validates_shape(self):
+        with pytest.raises(ValueError):
+            BatchNorm1d(2).forward_batch([])
+        with pytest.raises(ValueError):
+            BatchNorm1d(2).forward_batch([[1, 2, 999], [3, 4, 999]])
+        with pytest.raises(ValueError):
+            BatchNorm1d(2).forward_batch([[1, 2], [3]])
+        assert len(BatchNorm1d(2).forward_batch([[1, 2], [3, 4]])) == 2
+
+    def test_load_model_rejects_zero_layer(self, tmp_path):
+        p = tmp_path / "zero.json"
+        json.dump({"type": "MLP", "layer_sizes": [2], "task": "regression", "layers": []},
+                  open(p, "w"))
+        with pytest.raises(ValueError):
+            load_model(str(p))
+
+    def test_fit_rejects_bad_val_split(self):
+        m = make_regressor(1, 1, hidden_layers=(2,))
+        X = [[float(i)] for i in range(10)]
+        for bad in (1.0, 1.5, -0.1):
+            with pytest.raises(ValueError):
+                m.fit(X, X, epochs=1, batch_size=2, val_split=bad, verbose=False)
+
+    def test_mse_overflow_yields_inf(self):
+        assert mse_loss([1e200], [0.0])[0] == float("inf")
+
+    def test_maxpool_validates_kernel_and_stride(self):
+        with pytest.raises(ValueError):
+            MaxPool2d(0, stride=1)
+        with pytest.raises(ValueError):
+            MaxPool2d(2, stride=0)
+        assert MaxPool2d(2).forward([[[1.0, 2.0], [3.0, 4.0]]])[0][0][0] == 4.0
+
+    def test_save_model_rejects_nan(self, tmp_path):
+        m = MLP([2, 1])
+        m.layers[0].weights[0][0] = float("nan")
+        with pytest.raises(ValueError):
+            save_model(m, str(tmp_path / "nan.json"))
+
+    def test_load_model_rejects_non_numeric_weights(self, tmp_path):
+        p = tmp_path / "str.json"
+        json.dump({"type": "MLP", "layer_sizes": [2, 1], "task": None,
+                   "layers": [{"fan_in": 2, "fan_out": 1, "activation": "linear",
+                                "weights": [["1.0", "2.0"]], "biases": [0.0]}]},
+                  open(p, "w"))
+        with pytest.raises(ValueError):
+            load_model(str(p))
+
+    def test_text_contract_guards(self):
+        with pytest.raises(ValueError):
+            AI._softmax_with_temp([1.0, 2.0], 0)
+        with pytest.raises(ValueError):
+            sample_index([])
+        tp = TextProcessor("abc")
+
+        class Bad:
+            def forward(self, x):
+                return [0.0, 0.0, 0.0, 1.0]      # 4 != vocab 3
+
+        with pytest.raises(ValueError):
+            generate_text_with_mlp(Bad(), tp, "a", length=1)
