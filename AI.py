@@ -79,7 +79,9 @@ class Layer:
         # 记录激活函数名字符串（save_model 持久化 / 激活与损失的搭配校验用）
         self.activation_name = activation
 
-    # ---------- 激活函数 ----------
+#============================================================================
+#  激活函数 ----------
+#============================================================================
     def _linear(self, z):
         return z
 
@@ -110,7 +112,9 @@ class Layer:
         # 无需再乘 softmax 的 Jacobian。若搭配 mse_loss 使用 softmax，梯度会错误。
         return [1.0] * len(z)
 
-    # ---------- 前向 / 反向 ----------
+#============================================================================
+#  前向 / 反向 ----------
+#============================================================================
     def forward(self, x):
         # 维度不符时 map 会静默截断（少算或多算），必须早失败
         if len(x) != self.fan_in:
@@ -336,7 +340,9 @@ class Conv2d:
         ]
         self.grad_b = [0.0] * self.out_channels
 
-    # ---------- 辅助 ----------
+#============================================================================
+#  辅助 ----------
+#============================================================================
     def _img_shape(self, H, W):
         ho = (H + 2 * self.ph - self.kh) // self.sh + 1
         wo = (W + 2 * self.pw - self.kw) // self.sw + 1
@@ -430,7 +436,9 @@ class Conv2d:
                     dx[c][h][w] = dx_padded[c][h + self.ph][w + self.pw]
         return dx
 
-    # ---------- 前向 / 反向 ----------
+#============================================================================
+#  前向 / 反向 ----------
+#============================================================================
     def forward(self, x):
         """x: (C, H, W) -> 输出 (out_channels, Ho, Wo)"""
         if len(x) != self.in_channels:
@@ -2703,7 +2711,9 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
         batch_size = len(data)
 
     for epoch in range(1, epochs + 1):
-        # ---- 训练 ----
+#============================================================================
+#  训练 ----
+#============================================================================
         random.shuffle(data)
         train_loss = 0.0
 
@@ -2746,7 +2756,9 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
         train_loss /= len(data)
         history["train_loss"].append((epoch, train_loss))
 
-        # ---- 验证 ----
+#============================================================================
+#  验证 ----
+#============================================================================
         val_loss = None
         if val_data:
             val_loss = evaluate(model, loss_fn, val_data)
@@ -3112,7 +3124,9 @@ def compare_with_pytorch():
     print("PyTorch 数值对齐验证")
     print("=" * 60)
 
-    # ---------- 设定相同随机种子 & 初始化 ----------
+#============================================================================
+#  设定相同随机种子 & 初始化 ----------
+#============================================================================
     torch.manual_seed(42)
     random.seed(42)
 
@@ -3120,7 +3134,9 @@ def compare_with_pytorch():
     hidden_dim = 6
     output_dim = 2
 
-    # --- PyTorch 模型 ---
+#============================================================================
+#  PyTorch 模型 ---
+#============================================================================
     pt_model = nn.Sequential(
         nn.Linear(input_dim, hidden_dim, bias=True),
         nn.LeakyReLU(0.01),
@@ -3129,7 +3145,9 @@ def compare_with_pytorch():
         nn.Linear(hidden_dim, output_dim, bias=True),
     )
 
-    # --- 我们的模型 ---
+#============================================================================
+#  我们的模型 ---
+#============================================================================
     our_model = MLP([input_dim, hidden_dim, hidden_dim, output_dim],
                     activations=["leaky_relu", "leaky_relu", "linear"])
 
@@ -3144,7 +3162,9 @@ def compare_with_pytorch():
                 our_layer.weights[j] = w[j].tolist()
                 our_layer.biases[j] = float(b[j])
 
-    # ---------- 前向对齐 ----------
+#============================================================================
+#  前向对齐 ----------
+#============================================================================
     x_np = [random.uniform(-1, 1) for _ in range(input_dim)]
     x_pt = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)  # (1, input_dim)
 
@@ -3158,7 +3178,9 @@ def compare_with_pytorch():
     fwd_diff = sum(abs(a - b) for a, b in zip(our_out, pt_out))
     print(f"前向 |Δ| 总和: {fwd_diff:.2e}  {'✓ 通过' if fwd_diff < 1e-5 else '✗ 偏差较大'}")
 
-    # ---------- 反向对齐 ----------
+#============================================================================
+#  反向对齐 ----------
+#============================================================================
     target_np = [random.uniform(-1, 1) for _ in range(output_dim)]
     target_pt = torch.tensor(target_np, dtype=torch.float32).unsqueeze(0)
 
@@ -4095,7 +4117,9 @@ if __name__ == "__main__":
         delta = pool.backward(delta)
         _ = conv.backward(delta)
 
-        # --- 应用梯度更新权重 (SGD) ---
+#============================================================================
+#  应用梯度更新权重 (SGD) ---
+#============================================================================
         cnn_lr = 0.01
         # 更新 Conv2d 权重
         for oc in range(conv.out_channels):
