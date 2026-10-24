@@ -148,6 +148,12 @@ class Layer:
         上一层的 delta。容器（`Sequential` / `ResidualBlock`）通过模块的
         `delta_index` 属性决定取哪一项（默认 -1；`BatchNorm1d` 的 dx 在第 0 位）。
         """
+        if self.z is None:
+            raise RuntimeError("Layer.backward: 必须先调用 forward()（没有缓存的 z）")
+        if len(delta) != self.fan_out:
+            raise ValueError(
+                f"Layer.backward: delta 长度 {len(delta)} 与本层输出维度 {self.fan_out} 不一致"
+            )
         d_act = self.act_deriv(self.z)
 
         # delta * d_act 同时是 grad_b 与回传给上一层的权重向量，只算一次
@@ -827,6 +833,12 @@ class LayerNorm:
         return [self.gamma[j] * self.x_hat[j] + self.beta[j] for j in range(self.d)]
 
     def backward(self, dout):
+        if self.x_hat is None:
+            raise RuntimeError("LayerNorm.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"LayerNorm.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致"
+            )
         d = self.d
         grad_gamma = [dout[j] * self.x_hat[j] for j in range(d)]
         grad_beta = list(dout)
@@ -2541,6 +2553,8 @@ class TextProcessor:
 
     def prepare_data(self, text: str, window_size: int) -> list:
         """滑动窗口生成 (input_vec, target_vec) 数据集"""
+        if not isinstance(window_size, int) or window_size < 1:
+            raise ValueError(f"prepare_data: window_size 必须 >= 1，收到 {window_size!r}")
         data = []
         for i in range(len(text) - window_size):
             inp_chars = text[i:i + window_size]
@@ -3486,6 +3500,9 @@ class Model:
                 raise ValueError("fit: 训练集为空")
         elif x is not None and y is not None:
             # 训练集同样要校验：zip 会静默截断到较短的一方
+            # 标量 y（如 y=0.5）广播到每个样本，与 train(data=[(x, 0.5)]) 的语义一致
+            if isinstance(y, (int, float)) and not isinstance(y, bool):
+                y = [y] * len(x)
             if len(x) != len(y):
                 raise ValueError(
                     f"fit: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致"
@@ -3541,7 +3558,7 @@ class Model:
         else:
             val_set = None
 
-        if batch_size <= 0:
+        if batch_size is None or batch_size <= 0:
             batch_size = len(dataset)
 
         self.history = {'train_loss': [], 'val_loss': []}
