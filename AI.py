@@ -648,6 +648,13 @@ class BatchNorm1d:
 
     def forward_batch(self, x_batch):
         """x_batch: List[List[float]]  (batch_size, d)"""
+        # zip(*x_batch) 会截断到最短行、多余特征被静默丢弃并污染 running 统计量
+        if not x_batch:
+            raise ValueError("BatchNorm1d.forward_batch: batch 不能为空")
+        if any(len(row) != self.d for row in x_batch):
+            raise ValueError(
+                f"BatchNorm1d.forward_batch: 每个样本的特征维度都必须是 {self.d}"
+            )
         self.x_batch = x_batch
         self._cache_mode = 'train'      # backward 需要知道该用 batch 还是 running 统计量
         n = self.n = len(x_batch)
@@ -2817,6 +2824,11 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
     # 先校验、后构造：层数偏少时若先造 MLP，会在内部抛裸 IndexError 而非可读信息
     layer_sizes = data["layer_sizes"]
     saved = data["layers"]
+    if len(layer_sizes) < 2:
+        raise ValueError(
+            f"load_model: layer_sizes={layer_sizes} 至少需要 2 个维度（输入+输出）；"
+            "0 层的模型没有任何投影，等于恒等映射"
+        )
     expect = len(layer_sizes) - 1
     if len(saved) != expect:
         raise ValueError(
@@ -2955,6 +2967,10 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
     # 重建 MLP（带激活函数）：先校验结构，再构造
     layer_sizes = data["mlp"]["layer_sizes"]
     saved_layers = data["mlp"]["layers"]
+    if len(layer_sizes) < 2:
+        raise ValueError(
+            f"load_conv_model: mlp.layer_sizes={layer_sizes} 至少需要 2 个维度"
+        )
     expect = len(layer_sizes) - 1
     if len(saved_layers) != expect:
         raise ValueError(
@@ -3171,6 +3187,8 @@ class Model:
         """
         if not isinstance(model, MLP):
             raise TypeError(f"model 必须是 MLP 实例，当前类型: {type(model).__name__}")
+        if len(model.layers) == 0:
+            raise ValueError("Model: model 至少要有 1 层（MLP 的层数 = 维度数-1）")
 
         self.model = model
         self.lr = lr
@@ -3182,6 +3200,14 @@ class Model:
             self.task = 'classification' if last_layer.act_fn == last_layer._softmax else 'regression'
         else:
             self.task = task
+
+        # 单类分类：softmax 只有 1 个单元时输出恒为 1，CE 的 loss 与梯度恒为 0，
+        # 模型永远学不到东西，但 score 会报 100% —— 必须拒绝（sklearn 同样报错）
+        if self.task == 'classification' and model.layers[-1].fan_out < 2:
+            raise ValueError(
+                f"分类模型的输出维度必须 >= 2（当前 {model.layers[-1].fan_out}）；"
+                "单类 softmax 的交叉熵恒为 0，模型无法学习"
+            )
 
         # 损失函数
         if loss_fn is None:
@@ -3283,6 +3309,15 @@ class Model:
                 raise ValueError(f"未知优化器: {optimizer}，可选 {list(self._OPTIMIZER_MAP.keys())}")
             self.optimizer = self._OPTIMIZER_MAP[key](model, lr=lr, **self.opt_kwargs)
         else:
+            # 优化器实例必须绑定到同一个模型：否则 fit 会更新**别人的**参数，
+            # 本模型的 loss 从头到尾不变（静默训练错对象，最隐蔽的一类错误）
+            owner = getattr(optimizer, 'model', None)
+            if owner is not None and owner is not model:
+                raise ValueError(
+                    "Model: 传入的优化器绑定的不是这个 model（例如 Adam(A) 传给了 Model(B)）。"
+                    "优化器只更新自己持有的 model 参数，这样训练会静默地改错对象；"
+                    "请传字符串（如 'adam'）或为本 model 新建优化器。"
+                )
             self.optimizer = optimizer
 
         self.history = {'train_loss': [], 'val_loss': []}
@@ -3410,6 +3445,20 @@ class Model:
             dataset = [(list(x_i), y_i) for x_i, y_i in zip(x, y)]
         else:
             raise ValueError("请提供 data 或 (x, y)")
+
+        # 复校验：optimizer.model 可能在构造之后被替换，step 前再确认一次
+        _owner = getattr(self.optimizer, 'model', None)
+        if _owner is not None and _owner is not self.model:
+            raise ValueError(
+                "fit: 当前优化器绑定的不是 self.model（被替换过？）；"
+                "请重建优化器，否则会更新错误对象的参数"
+            )
+
+        if not isinstance(val_split, (int, float)) or not (0.0 <= val_split < 1.0):
+            raise ValueError(
+                f"fit: val_split 必须在 [0, 1) 内，收到 {val_split!r}"
+                "（与 split_data 的校验保持一致；原实现会把 >=1 静默钳成 n-1）"
+            )
 
         # === 验证集 ===
         if val_data is not None:
