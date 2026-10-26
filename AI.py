@@ -1813,7 +1813,9 @@ class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        # 注意力层内部**没有实现** dropout（见 MultiHeadAttention 的 docstring），
+        # 传进去只会让人误以为注意力权重被正则化；正则化由下面的 dropout1/2 负责
+        self.self_attn = MultiHeadAttention(d_model, num_heads, 0.0)
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
         self.ln2 = LayerNorm(d_model)
@@ -2233,6 +2235,9 @@ def cross_entropy_loss(pred: List[float], target_idx):
                     for t, p in zip(target_idx, pred))
         grad = [ssum * float(p) - float(t) for p, t in zip(pred, target_idx)]
         return loss, grad
+    # bool 是 int 的子类，会静默变成索引 0/1
+    if isinstance(target_idx, bool):
+        raise TypeError(f"cross_entropy_loss: 类别索引不能是 bool，收到 {target_idx!r}")
     if isinstance(target_idx, float):
         if not target_idx.is_integer():
             raise ValueError(f"cross_entropy_loss: 类别索引必须是整数，收到 {target_idx}")
@@ -2402,10 +2407,10 @@ class RMSprop:
 # ============================================================================
 
 def clip_grad_by_norm(all_grads, max_norm: float):
+    """按范数裁剪梯度，防止梯度爆炸（适用于 RNN/LSTM/GRU）"""
     if max_norm is None or max_norm <= 0:
         # 负阈值会把所有梯度乘上负数，等于整体翻转符号
         raise ValueError(f"clip_grad_by_norm: max_norm 必须 > 0，收到 {max_norm!r}")
-    """按范数裁剪梯度，防止梯度爆炸（适用于 RNN/LSTM/GRU）"""
     total_sq = 0.0
     for gw, gb in all_grads:
         for row in gw:
@@ -2425,9 +2430,9 @@ def clip_grad_by_norm(all_grads, max_norm: float):
 
 
 def clip_grad_by_value(all_grads, clip_val: float):
+    """按值裁剪梯度"""
     if clip_val is None or clip_val < 0:
         raise ValueError(f"clip_grad_by_value: clip_val 必须 >= 0，收到 {clip_val!r}")
-    """按值裁剪梯度"""
     for gw, gb in all_grads:
         for j in range(len(gw)):
             for i in range(len(gw[j])):
@@ -2478,6 +2483,9 @@ class CosineAnnealingLR:
         # 支持周期重启：epoch 每 T_max 后重新开始余弦退火周期
         # 分母用 T_max-1，使每个周期**最后一轮**正好到达 eta_min；
         # 原先除以 T_max，最低只到 eta_min + 0.0488*(initial-eta_min)，永远够不着
+        # epoch 从 1 开始计数（Model.fit 就是这么调的）；单独传 0/负数时按 1 处理，
+        # 否则 ((-1) % T_max) 会绕到周期末尾，第一步就落到 eta_min
+        epoch = max(int(epoch), 1)
         # T_max=1 时每一轮都是一个完整周期的末尾：直接落在 eta_min
         if self.T_max == 1:
             progress = 1.0
@@ -2562,7 +2570,12 @@ class TextProcessor:
         return vec
 
     def encode_indices(self, text: str, strict: bool = False) -> list:
-        """将字符串编码为索引列表（strict=True 时未知字符报错，而非静默映射成 0）"""
+        """将字符串编码为索引列表（strict=True 时未知字符报错，而非静默映射成 0）
+
+        strict=False（默认）时未知字符会被**静默映射到索引 0**：训练数据里若有
+        词表外字符会被当成第 0 个字符来学。训练/评估路径应显式传 strict=True
+        （TextProcessor.prepare_index_data 内部就是这么做的）。
+        """
         if strict:
             unknown = [c for c in text if c not in self.char_to_idx]
             if unknown:
@@ -2619,6 +2632,7 @@ def _softmax_with_temp(logits: list, temperature: float = 1.0) -> list:
 
 
 def sample_index(probs: list) -> int:
+    """根据概率分布进行随机采样（不依赖 numpy）"""
     if not probs:
         raise ValueError("sample_index: 概率分布不能为空")
     total = sum(probs)
@@ -2627,7 +2641,6 @@ def sample_index(probs: list) -> int:
     if abs(total - 1.0) > 1e-9:
         # 未归一化的输入会让采样区间对不上（例如 [0.2,0.3] 有 50% 概率返回末尾索引）
         probs = [p / total for p in probs]
-    """根据概率分布进行随机采样（不依赖 numpy）"""
     r = random.random()
     cumulative = 0.0
     for i, p in enumerate(probs):
@@ -2968,7 +2981,14 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
 
 
 def save_conv_model(conv_layers, fc_model, filepath: str):
-    """保存 CNN + MLP 组合模型"""
+    """保存 CNN + MLP 组合模型
+
+    限制（加载方必须知道）：
+      - 只接受 Conv2d 作为卷积层，其它模块（MaxPool2d / Flatten 等）会直接抛
+        ValueError —— 它们是**无参数**的，存档里不保留其超参数；
+      - 因此 load_conv_model 只能恢复 Conv2d 与 MLP，加载方要按自己的结构
+        重新构造 pool / flatten（顺序与参数须与保存时一致）。
+    """
     data = {
         "type": "CNN_MLP",
         "conv": [],

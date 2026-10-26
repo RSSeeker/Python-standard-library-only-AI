@@ -326,7 +326,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-252 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+257 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -345,6 +345,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 252 个单元测试
+├── test_ai.py       # 257 个单元测试
 └── README.md
 ```

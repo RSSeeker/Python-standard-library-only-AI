@@ -2742,3 +2742,30 @@ class TestRobustnessGuards:
 
         with pytest.raises(ValueError):
             generate_text_with_mlp(Bad(), tp, "a", length=1)
+
+class TestAuditRound3:
+    """第三轮外部评审确认的问题（bool 索引、docstring 位置、step(0)）"""
+
+    def test_ce_rejects_bool_index(self):
+        with pytest.raises(TypeError):
+            cross_entropy_loss([0.2, 0.3, 0.5], True)
+        with pytest.raises(TypeError):
+            cross_entropy_loss([0.2, 0.3, 0.5], False)
+
+    def test_clip_and_sample_docstrings_present(self):
+        assert clip_grad_by_norm.__doc__ and "范数" in clip_grad_by_norm.__doc__
+        assert clip_grad_by_value.__doc__ and "值" in clip_grad_by_value.__doc__
+        assert sample_index.__doc__ and "采样" in sample_index.__doc__
+
+    def test_cosine_step_zero_uses_initial_lr(self):
+        m = make_regressor(1, 1)
+        initial = m.optimizer.lr
+        sch = CosineAnnealingLR(m.optimizer, T_max=10, eta_min=0.0)
+        sch.step(0)                      # 非法 epoch 按 1 处理
+        assert m.optimizer.lr == pytest.approx(initial, rel=1e-12)
+
+    def test_save_conv_model_docstring_mentions_restriction(self):
+        assert "Conv2d" in (save_conv_model.__doc__ or "")
+
+    def test_encode_indices_documents_lenient_default(self):
+        assert "strict" in (TextProcessor.encode_indices.__doc__ or "")
