@@ -1487,6 +1487,13 @@ class MultiHeadAttention:
         TransformerEncoderLayer 的 dropout1/dropout2 仍然工作，所以 eval() 依然有意义；
         但这里传大于 0 的值不会带来任何正则化效果。
         """
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
+        self.dropout = dropout
+        self.training = True
+        # 每次 forward 在 head==0 时重建；反向只读这两个列表
+        self.attn_dropped = None    # 实际参与 attn@V 的权重（含 dropout 缩放）
+        self.attn_masks = None      # 对应掩码，反向时用来清零梯度
         if d_model % num_heads != 0:
             raise ValueError(
                 f"MultiHeadAttention: d_model={d_model} 必须能被 num_heads={num_heads} 整除"
@@ -1542,6 +1549,16 @@ class MultiHeadAttention:
         self.m_b_k = [0.0] * d; self.v_b_k = [0.0] * d
         self.m_b_v = [0.0] * d; self.v_b_v = [0.0] * d
         self.m_b_o = [0.0] * d; self.v_b_o = [0.0] * d
+
+    def train(self):
+        """训练模式：注意力权重 dropout 生效"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：关闭 dropout（与 Dropout 的约定一致）"""
+        self.training = False
+        return self
 
     def forward(self, x_seq):
         """x_seq: List[List[float]]  (seq_len, d_model)"""
@@ -1642,11 +1659,11 @@ class MultiHeadAttention:
             K_h = self.K[head]
             d_out = d_head_out[head]
 
-            # dV = attn^T @ d_out  (seq_len, d_k)
             dV = _matmul(_transpose(attn), d_out)
 
             # d_attn = d_out @ V^T  (seq_len, seq_len)
             d_attn = _matmul(d_out, _transpose(V_h))
+
 
             # softmax backward: d_scores[t][j] = attn[t][j] * (d_attn[t][j] - sum_i attn[t][i] * d_attn[t][i])
             # 行内点积只依赖 t，必须提到 j 循环外面（原来每个 (t, j) 都重算一遍 → O(seq²) 冗余）
