@@ -2526,17 +2526,20 @@ def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int 
 class DataLoader:
     """简易数据加载器：按 batch 迭代，支持 shuffle"""
 
-    def __init__(self, dataset: list, batch_size: int = 32, shuffle: bool = True):
+    def __init__(self, dataset: list, batch_size: int = 32, shuffle: bool = True,
+                 seed=None):
         if batch_size is None or batch_size <= 0:
             raise ValueError(f"DataLoader: batch_size 必须 >= 1，收到 {batch_size!r}")
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
+        # 用局部 RNG：全局 random.shuffle 会推进调用方的随机状态，破坏可复现性
+        self._rng = random.Random(seed)
 
     def __iter__(self):
         items = list(self.dataset)
         if self.shuffle:
-            random.shuffle(items)
+            self._rng.shuffle(items)
         for b in range(0, len(items), self.batch_size):
             yield items[b:b + self.batch_size]
 
