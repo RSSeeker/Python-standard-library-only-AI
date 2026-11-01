@@ -2906,3 +2906,80 @@ class TestCausalLM:
         with pytest.raises(ValueError):
             AI.CausalLM(3, num_layers=0)
 
+
+class TestAttentionDropout:
+    """多头的注意力权重 dropout：mask 缩放、eval 关闭、反向与固定 mask 的差分一致"""
+
+    def _mha(self, dropout, seed=11):
+        random.seed(seed)
+        return AI.MultiHeadAttention(2, 1, dropout=dropout)
+
+    def test_mask_values_and_scaling(self):
+        m = self._mha(0.5)
+        m.forward([[0.3, -0.2], [0.7, 0.4], [-0.5, 0.9]])
+        mask = m.attn_masks[0]
+        assert mask is not None
+        vals = {v for row in mask for v in row}
+        assert vals <= {0.0, 2.0}                  # 只可能是「丢弃」或 1/(1-p)=2
+        for t in range(3):
+            for j in range(3):
+                assert m.attn_dropped[0][t][j] == m.attn_weights[0][t][j] * mask[t][j]
+
+    def test_eval_disables_dropout(self):
+        m = self._mha(0.5)
+        m.eval()
+        a = m.forward([[0.3, -0.2], [0.7, 0.4]])
+        b = m.forward([[0.3, -0.2], [0.7, 0.4]])
+        assert a == b
+        assert all(x is None for x in m.attn_masks)
+
+    def test_training_forward_is_stochastic(self):
+        m = self._mha(0.5)
+        x = [[0.3, -0.2], [0.7, 0.4], [-0.5, 0.9]]
+        assert m.forward(x) != m.forward(x)
+
+    def test_zero_dropout_matches_eval(self):
+        m = self._mha(0.0)
+        x = [[0.3, -0.2], [0.7, 0.4]]
+        out_train = m.forward(x)
+        m.eval()
+        assert out_train == m.forward(x)
+        assert all(x is None for x in m.attn_masks)
+
+    def test_backward_matches_fixed_mask(self):
+        """固定 mask 后 W_v 的解析梯度必须与数值差分一致（曾在这里失败过）"""
+        m = self._mha(0.5)
+        x = [[0.3, -0.2], [0.7, 0.4], [-0.5, 0.9]]
+        coef = [[0.4, -0.6], [0.9, 0.2], [-0.3, 0.8]]
+
+        def loss():
+            m.rng = random.Random(99)              # 每次重建同一组 mask
+            out = m.forward(x)
+            return sum(coef[t][j] * out[t][j] for t in range(3) for j in range(2))
+
+        loss()                                     # 建缓存
+        m.zero_grad()
+        loss()
+        m.backward(coef)
+        anal = [row[:] for row in m.grads["W_v"]]
+
+        eps = 1e-6
+        for i in range(2):
+            for j in range(2):
+                orig = m.W_v[i][j]
+                m.W_v[i][j] = orig + eps
+                lp = loss()
+                m.W_v[i][j] = orig - eps
+                lm = loss()
+                m.W_v[i][j] = orig
+                num = (lp - lm) / (2 * eps)
+                assert abs(anal[i][j] - num) <= 1e-5 * max(1.0, abs(num))
+
+    def test_encoder_layer_forwards_dropout_to_attention(self):
+        layer = AI.TransformerEncoderLayer(8, 2, 16, dropout=0.25)
+        assert layer.self_attn.dropout == 0.25
+        layer.eval()
+        assert layer.self_attn.training is False
+        layer.train()
+        assert layer.self_attn.training is True
+

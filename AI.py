@@ -1483,23 +1483,23 @@ class MultiHeadAttention:
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  causal: bool = False):
-        """dropout: **目前未实现**（注意力权重上不做 dropout，参数保留仅为接口兼容）。
+        """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
-        TransformerEncoderLayer 的 dropout1/dropout2 仍然工作，所以 eval() 依然有意义；
-        但这里传大于 0 的值不会带来任何正则化效果。
+        实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
+        权重以 1/(1-p) 的概率保留并放大，推理时不缩放。反向要乘同一个 mask。
 
         causal: 为 True 时加因果掩码——位置 t 只能看到 0..t，看不到未来。
-        这是自回归语言模型（GPT 式）的必要条件；默认 False 保持双向注意力，
-        与原有行为逐位一致。
+        这是自回归语言模型（GPT 式）的必要条件；默认 False 保持双向注意力。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
         self.dropout = dropout
         self.causal = bool(causal)
         self.training = True
-        # 每次 forward 在 head==0 时重建；反向只读这两个列表
-        self.attn_dropped = None    # 实际参与 attn@V 的权重（含 dropout 缩放）
-        self.attn_masks = None      # 对应掩码，反向时用来清零梯度
+        self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
+        # 每次 forward 重建；反向只读这几个列表
+        self.attn_dropped = []       # 实际参与 attn@V 的权重（含 dropout 缩放）
+        self.attn_masks = []         # 对应掩码；None 表示本次没做 dropout
         if d_model % num_heads != 0:
             raise ValueError(
                 f"MultiHeadAttention: d_model={d_model} 必须能被 num_heads={num_heads} 整除"
@@ -1601,6 +1601,8 @@ class MultiHeadAttention:
         # 各头分别计算注意力
         scale = 1.0 / math.sqrt(d_k)
         self.attn_weights = []
+        self.attn_dropped = []
+        self.attn_masks = []
         self.head_out = []
         self.concat = [[0.0] * self.d_model for _ in range(self.seq_len)]
 
@@ -1620,13 +1622,27 @@ class MultiHeadAttention:
                     for j in range(t + 1, self.seq_len):
                         row[j] = float("-inf")
 
-            # softmax per row
+            # softmax per row：attn 是「干净」权重，反向的 softmax 雅可比必须用它
             attn = [_softmax_row(row) for row in scores]
 
-            # output = attn @ V  (seq_len, d_k)
-            out = _matmul(attn, v_h)
+            # 注意力权重 dropout（训练模式且 p>0）：mask 已含 1/(1-p) 缩放。
+            # 反向时梯度要乘同一个 mask——被丢掉的连接对 dV/dK/dQ 的贡献为 0。
+            mask = None
+            used = attn
+            if self.training and self.dropout > 0.0:
+                keep = 1.0 - self.dropout
+                inv = 1.0 / keep
+                mask = [[inv if self.rng.random() < keep else 0.0
+                         for _ in range(self.seq_len)] for _ in range(self.seq_len)]
+                used = [[attn[t][j] * mask[t][j] for j in range(self.seq_len)]
+                        for t in range(self.seq_len)]
 
-            self.attn_weights.append(attn)
+            # output = attn_dropped @ V  (seq_len, d_k)
+            out = _matmul(used, v_h)
+
+            self.attn_weights.append(attn)   # 干净权重（softmax 反向用）
+            self.attn_dropped.append(used)   # 实际参与 attn@V 的权重
+            self.attn_masks.append(mask)     # None = 本次没做 dropout
             self.head_out.append(out)
 
             # 拼回 d_model
@@ -1668,16 +1684,24 @@ class MultiHeadAttention:
         # 3. 各头分别反向传播
         dQ_list, dK_list, dV_list = [], [], []
         for head in range(h):
-            attn = self.attn_weights[head]
+            attn = self.attn_weights[head]          # 干净权重（softmax 输出）
+            attn_used = self.attn_dropped[head]     # 实际参与 attn@V 的权重
+            mask = self.attn_masks[head]
             V_h = self.V[head]
             Q_h = self.Q[head]
             K_h = self.K[head]
             d_out = d_head_out[head]
 
-            dV = _matmul(_transpose(attn), d_out)
+            dV = _matmul(_transpose(attn_used), d_out)
 
             # d_attn = d_out @ V^T  (seq_len, seq_len)
             d_attn = _matmul(d_out, _transpose(V_h))
+            if mask is not None:
+                # dropout 的直通：d(attn_dropped) → d(attn_clean) 逐元素乘 mask
+                for t in range(seq_len):
+                    row_d, row_m = d_attn[t], mask[t]
+                    for j in range(seq_len):
+                        row_d[j] *= row_m[j]
 
 
             # softmax backward: d_scores[t][j] = attn[t][j] * (d_attn[t][j] - sum_i attn[t][i] * d_attn[t][i])
@@ -1846,10 +1870,9 @@ class TransformerEncoderLayer:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
                  causal: bool = False):
-        # 注意力层内部**没有实现** dropout（见 MultiHeadAttention 的 docstring），
-        # 传进去只会让人误以为注意力权重被正则化；正则化由下面的 dropout1/2 负责
-        # causal=True 时自注意力加因果掩码（自回归语言模型用）
-        self.self_attn = MultiHeadAttention(d_model, num_heads, 0.0, causal=causal)
+        # causal=True 时自注意力加因果掩码（自回归语言模型用）；
+        # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, causal=causal)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -1864,13 +1887,15 @@ class TransformerEncoderLayer:
         self.dropout1_masks = self.dropout2_masks = None
 
     def train(self):
-        """训练模式：两个 Dropout 都生效"""
+        """训练模式：注意力权重 dropout 与两个 Dropout 都生效"""
+        self.self_attn.train()
         self.dropout1.train()
         self.dropout2.train()
         return self
 
     def eval(self):
-        """推理模式：关闭 Dropout，保证同一输入输出确定"""
+        """推理模式：关闭全部 dropout，保证同一输入输出确定"""
+        self.self_attn.eval()
         self.dropout1.eval()
         self.dropout2.eval()
         return self

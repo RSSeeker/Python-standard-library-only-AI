@@ -9,7 +9,7 @@
 - **双模式 API**: 底层精细控制 + 高层 sklearn 风格封装
 - **完整的训练管线**: Early Stopping、梯度裁剪、学习率调度、模型保存/加载
 - **反向传播有数值梯度测试守着**: `Layer` / `MultiHeadAttention` / `Conv2d` / `BatchNorm1d` 的解析梯度都与数值梯度逐项比对
-- **因果注意力 / LLM**: `MultiHeadAttention(causal=True)` 因果掩码 + `CausalLM`（GPT 式字符级语言模型，训练与生成全部纯标准库）
+- **因果注意力 / LLM**: `MultiHeadAttention(causal=True)` 因果掩码 + `CausalLM`（GPT 式字符级语言模型，训练与生成全部纯标准库）；注意力权重 dropout 同样实现了反向
 
 ## 快速开始
 
@@ -126,7 +126,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
 | `Sequential` | 层序列容器（不含 train/eval，内部的 Dropout 需自行切换） |
-| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码（`dropout` 参数**尚未实现**，注意力内不做 dropout） |
+| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码；`dropout>0` 时对注意力权重做 inverted dropout（`eval()` 关闭） |
 
 > **早停与权重回滚**：`fit(patience=...)` 在指标不再改善时停止训练，但**不会自动回滚**
 > 到最优那一轮；需要最优权重时传 `restore_best_weights=True`。
@@ -148,7 +148,8 @@ model.train()     # 回到训练
 | 组件 | 说明 |
 |------|------|
 | `Dropout` | `train()` / `eval()`；`eval()` 时原样透传 |
-| `TransformerEncoderLayer` / `TransformerEncoder` | `train()` / `eval()` 会转发到内部两个 Dropout |
+| `TransformerEncoderLayer` / `TransformerEncoder` | `train()` / `eval()` 会转发到内部两个 Dropout **和注意力的权重 dropout** |
+| `MultiHeadAttention` | `train()` / `eval()` 只控制注意力权重 dropout（不看模式的数学本身） |
 | `BatchNorm1d` | `train()` / `eval()`；`forward` 按模式自动选 batch / running 统计量 |
 | `MLP` / `Model` | **不含 Dropout**，`quick_train`、`make_classifier` 的返回值无需 `eval()` |
 
@@ -166,7 +167,7 @@ model.train()     # 回到训练
 
 | 组件 | 说明 |
 |------|------|
-| `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`） |
+| `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`dropout>0` → 注意力权重 dropout） |
 | `FeedForward` | 前馈网络 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal=True` 会传给每一层） |
@@ -350,7 +351,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-267 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+273 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -363,6 +364,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestValDataFormats` / `TestCrossEntropyTargets` | `val_data` 三种写法、CE 的 target 规范化 |
 | `TestCausalMask` | 因果掩码的**因果性**（改未来 token 不改过去输出）、掩码权重精确为 0、`W_v` 梯度 vs 数值梯度 |
 | `TestCausalLM` | 小语料过拟合（loss → <0.05）、贪心续写接上周期、前缀 logits 与未来无关、生成可复现、非法输入 |
+| `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -371,6 +373,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 267 个单元测试
+├── test_ai.py       # 273 个单元测试
 └── README.md
 ```
