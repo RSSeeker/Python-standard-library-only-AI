@@ -2769,3 +2769,140 @@ class TestAuditRound3:
 
     def test_encode_indices_documents_lenient_default(self):
         assert "strict" in (TextProcessor.encode_indices.__doc__ or "")
+
+
+# ========================== 20. 因果掩码 / CausalLM ==========================
+
+class TestCausalMask:
+    def test_causal_hides_future_tokens(self):
+        """因果掩码：改最后一个 token，前两个位置的输出必须逐位不变"""
+        random.seed(11)
+        m = MultiHeadAttention(4, 1, causal=True)
+        x1 = [[0.1, 0.2, 0.3, 0.4], [0.5, -0.1, 0.2, 0.0], [0.9, 0.8, -0.7, 0.6]]
+        o1 = m.forward(x1)
+        x2 = [list(r) for r in x1]
+        x2[2] = [9.0, -9.0, 9.0, -9.0]
+        o2 = m.forward(x2)
+        assert o1[:2] == o2[:2]
+        assert o1[2] != o2[2]
+
+    def test_causal_attention_weights_masked(self):
+        """被屏蔽的位置权重精确为 0，每行和仍为 1"""
+        random.seed(12)
+        m = MultiHeadAttention(4, 1, causal=True)
+        m.forward([[0.1, 0.2, 0.3, 0.4], [0.5, -0.1, 0.2, 0.0], [0.9, 0.8, -0.7, 0.6]])
+        attn = m.attn_weights[0]
+        for t in range(3):
+            assert all(attn[t][j] == 0.0 for j in range(t + 1, 3))
+            assert sum(attn[t]) == pytest.approx(1.0, rel=0, abs=1e-12)
+
+    def test_non_causal_mixes_future(self):
+        """对照组：causal=False 时未来 token 会影响过去位置（证明掩码确实在起作用）"""
+        random.seed(11)
+        m = MultiHeadAttention(4, 1, causal=False)
+        x1 = [[0.1, 0.2, 0.3, 0.4], [0.5, -0.1, 0.2, 0.0], [0.9, 0.8, -0.7, 0.6]]
+        o1 = m.forward(x1)
+        x2 = [list(r) for r in x1]
+        x2[2] = [9.0, -9.0, 9.0, -9.0]
+        o2 = m.forward(x2)
+        assert o1[0] != o2[0]
+
+    def test_causal_backward_matches_finite_difference(self):
+        """因果掩码下 W_v 的解析梯度与中心差分一致（mask 位置梯度应自然为 0）"""
+        random.seed(13)
+        m = MultiHeadAttention(2, 1, causal=True)
+        xs = [[0.3, -0.2], [0.7, 0.4], [-0.5, 0.9]]
+        coef = [[0.4, -0.6], [0.9, 0.2], [-0.3, 0.8]]
+
+        def loss():
+            out = m.forward(xs)
+            return sum(coef[t][j] * out[t][j] for t in range(3) for j in range(2))
+
+        m.zero_grad()
+        m.forward(xs)
+        m.backward([[coef[t][j] for j in range(2)] for t in range(3)])
+        anal = [row[:] for row in m.grads["W_v"]]
+        eps = 1e-6
+        for i in range(2):
+            for j in range(2):
+                orig = m.W_v[i][j]
+                m.W_v[i][j] = orig + eps
+                lp = loss()
+                m.W_v[i][j] = orig - eps
+                lm = loss()
+                m.W_v[i][j] = orig
+                num = (lp - lm) / (2 * eps)
+                assert anal[i][j] == pytest.approx(num, rel=1e-6, abs=1e-8)
+
+    def test_single_token_causal(self):
+        """长度 1 时掩码不改变结果：注意力权重为 1"""
+        random.seed(14)
+        m = MultiHeadAttention(4, 2, causal=True)
+        m.forward([[0.5, -0.5, 1.0, 0.0]])
+        assert m.attn_weights[0][0] == [1.0]
+
+    def test_encoder_propagates_causal_flag(self):
+        """TransformerEncoder(causal=True) 必须把标志传给每一层"""
+        enc = AI.TransformerEncoder(4, 2, 8, num_layers=2, causal=True)
+        assert enc.causal is True
+        assert all(layer.self_attn.causal for layer in enc.layers)
+        enc2 = AI.TransformerEncoder(4, 2, 8, num_layers=2)
+        assert enc2.causal is False
+        assert not any(layer.self_attn.causal for layer in enc2.layers)
+
+
+class TestCausalLM:
+    def test_learns_cyclic_pattern(self):
+        """在 0,1,2 循环序列上过拟合：loss 掉到接近 0，贪心续写能接上周期"""
+        lm = AI.CausalLM(vocab_size=3, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=1, max_len=32)
+        hist = lm.fit([[0, 1, 2] * 5], epochs=80, lr=0.01, shuffle=False)
+        assert hist[0] > hist[-1]
+        assert hist[-1] < 0.05
+        out = lm.generate([0], max_new_tokens=6, temperature=1e-6)
+        assert out == [0, 1, 2, 0, 1, 2, 0]
+
+    def test_prefix_logits_ignore_future(self):
+        """位置 t 的 logits 与 t 之后的 token 无关（LLM 的因果性保证）"""
+        random.seed(21)
+        lm = AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16)
+        lm.eval()
+        ids = [0, 1, 2, 3, 0]
+        logits1 = lm.forward(ids)
+        ids2 = list(ids)
+        ids2[4] = 1
+        logits2 = lm.forward(ids2)
+        assert logits1[:4] == logits2[:4]
+
+    def test_generate_deterministic_with_seed(self):
+        """同一 rng 种子的两次生成必须完全相同"""
+        random.seed(22)
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16)
+        a = lm.generate([0, 1], max_new_tokens=5, temperature=1.0, rng=random.Random(3))
+        b = lm.generate([0, 1], max_new_tokens=5, temperature=1.0, rng=random.Random(3))
+        assert a == b
+
+    def test_rejects_invalid_input(self):
+        lm = AI.CausalLM(vocab_size=3, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        with pytest.raises(ValueError):
+            lm.forward([])
+        with pytest.raises(ValueError):
+            lm.forward([0] * 9)
+        with pytest.raises(ValueError):
+            lm.generate([0], temperature=0.0)
+        with pytest.raises(ValueError):
+            lm.fit([[1]])                      # 单 token 无法构造目标
+        with pytest.raises(ValueError):
+            lm.fit([[0, 1]], epochs=-1)
+        with pytest.raises(ValueError):
+            lm.evaluate([])
+        with pytest.raises(ValueError):
+            AI.CausalLM(0)
+        with pytest.raises(ValueError):
+            AI.CausalLM(3, max_len=0)
+        with pytest.raises(ValueError):
+            AI.CausalLM(3, num_layers=0)
+

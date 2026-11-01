@@ -1481,15 +1481,21 @@ class MultiHeadAttention:
     输出: (seq_len, d_model)
     """
 
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
+                 causal: bool = False):
         """dropout: **目前未实现**（注意力权重上不做 dropout，参数保留仅为接口兼容）。
 
         TransformerEncoderLayer 的 dropout1/dropout2 仍然工作，所以 eval() 依然有意义；
         但这里传大于 0 的值不会带来任何正则化效果。
+
+        causal: 为 True 时加因果掩码——位置 t 只能看到 0..t，看不到未来。
+        这是自回归语言模型（GPT 式）的必要条件；默认 False 保持双向注意力，
+        与原有行为逐位一致。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
         self.dropout = dropout
+        self.causal = bool(causal)
         self.training = True
         # 每次 forward 在 head==0 时重建；反向只读这两个列表
         self.attn_dropped = None    # 实际参与 attn@V 的权重（含 dropout 缩放）
@@ -1604,6 +1610,15 @@ class MultiHeadAttention:
             # scores = Q @ K^T / sqrt(d_k)  (seq_len, seq_len)
             k_t = _transpose(k_h)  # (d_k, seq_len)
             scores = [[v * scale for v in row] for row in _matmul(q_h, k_t)]
+
+            # 因果掩码：位置 t 只能看到 j <= t。屏蔽位置置 -inf，
+            # softmax 后权重恰为 0；反向的 d_scores = attn * (...) 在那些位置
+            # 也自动为 0，所以 backward 不需要任何额外分支。
+            if self.causal:
+                for t in range(self.seq_len):
+                    row = scores[t]
+                    for j in range(t + 1, self.seq_len):
+                        row[j] = float("-inf")
 
             # softmax per row
             attn = [_softmax_row(row) for row in scores]
@@ -1829,10 +1844,13 @@ def _sgd_apply(param, grad, lr):
 class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
+                 causal: bool = False):
         # 注意力层内部**没有实现** dropout（见 MultiHeadAttention 的 docstring），
         # 传进去只会让人误以为注意力权重被正则化；正则化由下面的 dropout1/2 负责
-        self.self_attn = MultiHeadAttention(d_model, num_heads, 0.0)
+        # causal=True 时自注意力加因果掩码（自回归语言模型用）
+        self.self_attn = MultiHeadAttention(d_model, num_heads, 0.0, causal=causal)
+        self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
         self.ln2 = LayerNorm(d_model)
@@ -1981,9 +1999,11 @@ class TransformerEncoder:
     """堆叠多个 TransformerEncoderLayer"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
-                 num_layers: int = 6, dropout: float = 0.1):
+                 num_layers: int = 6, dropout: float = 0.1, causal: bool = False):
+        """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
+        self.causal = bool(causal)
         self.layers = [
-            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout)
+            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout, causal=causal)
             for _ in range(num_layers)
         ]
 
@@ -2110,6 +2130,292 @@ class Embedding:
             for j in range(self.embed_dim):
                 wrow[j] -= lr * row[j]
         self.zero_grad()
+
+
+# 因果语言模型 (CausalLM)：causal mask 的直接用途。
+# 它组合 Embedding + PositionalEncoding + TransformerEncoder(causal=True)，
+# 所以紧跟在 Embedding 之后定义（三个依赖类都在上面）。
+
+def _zeros_like(p):
+    """按参数结构生成同形状的零数组（Adam 的一阶/二阶矩用）"""
+    if p and isinstance(p[0], (list, tuple)):
+        return [[0.0] * len(row) for row in p]
+    return [0.0] * len(p)
+
+
+def _adam_apply(param, grad, m, v, t, lr, b1=0.9, b2=0.999, eps=1e-8):
+    """就地 Adam 更新；param / grad / m / v 结构一致（1D 或 2D 列表）"""
+    c1 = 1.0 - b1 ** t
+    c2 = 1.0 - b2 ** t
+    if param and isinstance(param[0], (list, tuple)):
+        for i in range(len(param)):
+            pi, gi, mi, vi = param[i], grad[i], m[i], v[i]
+            for j in range(len(pi)):
+                g = gi[j]
+                mi[j] = b1 * mi[j] + (1.0 - b1) * g
+                vi[j] = b2 * vi[j] + (1.0 - b2) * g * g
+                pi[j] -= lr * (mi[j] / c1) / (math.sqrt(vi[j] / c2) + eps)
+    else:
+        for i in range(len(param)):
+            g = grad[i]
+            m[i] = b1 * m[i] + (1.0 - b1) * g
+            v[i] = b2 * v[i] + (1.0 - b2) * g * g
+            param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
+class CausalLM:
+    """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头
+
+    关键在 `MultiHeadAttention(causal=True)`：位置 t 只能看到 0..t，
+    因此**一次前向就能并行算出所有位置的「下一个 token」预测**，
+    不需要 RNN 那样串行递推 —— 这正是 LLM 预训练的做法。
+
+    训练目标：给定 ids，位置 t 的 logits 与 ids[t+1] 做交叉熵。
+    参数：Adam（内部实现，超参 0.9/0.999/1e-8）。
+
+    用法::
+
+        lm = CausalLM(vocab_size=3, d_model=16, num_heads=2, num_layers=1)
+        lm.fit([[0, 1, 2, 0, 1, 2]], epochs=60, lr=0.01)
+        lm.generate([0], max_new_tokens=6)
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
+                 d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
+                 dropout: float = 0.0):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"CausalLM: max_len 必须 >= 1，收到 {max_len!r}")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"CausalLM: num_layers 必须 >= 1，收到 {num_layers!r}")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+
+        self.embedding = Embedding(vocab_size, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
+                                          dropout, causal=True)
+
+        std = math.sqrt(2.0 / d_model)
+        self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
+        self.b_out = [0.0] * vocab_size
+        self.zero_grad()
+        self.step_count = 0
+        self._adam_m = {}
+        self._adam_v = {}
+        self.h = None    # 最近一次 forward 的编码器输出（反向要用）
+
+    def train(self):
+        """训练模式（Dropout 生效）"""
+        self.encoder.train()
+        return self
+
+    def eval(self):
+        """推理模式（关闭 Dropout，同一输入输出确定）"""
+        self.encoder.eval()
+        return self
+
+    def zero_grad(self):
+        """清零全部梯度（词向量、各层、输出头）"""
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.grads = {
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0] * self.vocab_size,
+        }
+
+    def _named_params(self):
+        """产出 (名字, 参数, 梯度)；名字让 Adam 的一阶/二阶矩跨步保持
+
+        必须在 `zero_grad()` 之后调用：各子模块的 grads 是重建成的新列表，
+        直接持有旧引用会更新到过期的缓冲区上。
+        """
+        yield "emb.weight", self.embedding.weight, self.embedding.grad_weight
+        for li, layer in enumerate(self.encoder.layers):
+            attn = layer.self_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"L{li}.attn.{k}", getattr(attn, k), attn.grads[k]
+            ffn = layer.ffn
+            for k in ("W1", "b1", "W2", "b2"):
+                yield f"L{li}.ffn.{k}", getattr(ffn, k), ffn.grads[k]
+            yield f"L{li}.ln1.gamma", layer.ln1.gamma, layer.grads["ln1_gamma"]
+            yield f"L{li}.ln1.beta", layer.ln1.beta, layer.grads["ln1_beta"]
+            yield f"L{li}.ln2.gamma", layer.ln2.gamma, layer.grads["ln2_gamma"]
+            yield f"L{li}.ln2.beta", layer.ln2.beta, layer.grads["ln2_beta"]
+        yield "out.W", self.W_out, self.grads["W_out"]
+        yield "out.b", self.b_out, self.grads["b_out"]
+
+    def forward(self, ids):
+        """ids: List[int] → logits (seq_len, vocab_size)（未经 softmax）"""
+        if not ids:
+            raise ValueError("CausalLM.forward: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"CausalLM.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}"
+            )
+        emb = self.embedding.forward(ids)
+        x = self.pos.forward(emb)
+        h = self.encoder.forward(x)
+        self.h = h
+        logits = _matmul(h, _transpose(self.W_out))
+        for t in range(len(h)):
+            for v in range(self.vocab_size):
+                logits[t][v] += self.b_out[v]
+        return logits
+
+    def _loss_and_backward(self, ids):
+        """单条序列的交叉熵（对预测位置取平均），并累积全部梯度；返回 loss"""
+        if len(ids) < 2:
+            raise ValueError("CausalLM: 序列至少要有 2 个 token 才能训练（输入 + 目标）")
+        n = len(ids) - 1
+        logits = self.forward(ids[:-1])
+        d_logits = []
+        loss = 0.0
+        for t in range(n):
+            probs = _softmax_row(logits[t])
+            target = ids[t + 1]
+            p = probs[target]
+            loss += -math.log(p if p > 1e-12 else 1e-12)
+            row = list(probs)
+            row[target] -= 1.0
+            d_logits.append(row)
+        loss /= n
+        inv = 1.0 / n
+        d_logits = [[v * inv for v in row] for row in d_logits]
+
+        h = self.h
+        seq_len = len(h)
+        # 输出头反向: grad_W_out[v][j] = sum_t d_logits[t][v] * h[t][j]
+        for v in range(self.vocab_size):
+            g_row = self.grads["W_out"][v]
+            gb = 0.0
+            for t in range(seq_len):
+                d = d_logits[t][v]
+                gb += d
+                ht = h[t]
+                for j in range(self.d_model):
+                    g_row[j] += d * ht[j]
+            self.grads["b_out"][v] += gb
+        # d_h[t][j] = sum_v d_logits[t][v] * W_out[v][j]
+        dh = [[0.0] * self.d_model for _ in range(seq_len)]
+        for t in range(seq_len):
+            dl = d_logits[t]
+            for j in range(self.d_model):
+                s = 0.0
+                for v in range(self.vocab_size):
+                    s += dl[v] * self.W_out[v][j]
+                dh[t][j] = s
+        d_seq = self.encoder.backward(dh)
+        self.embedding.backward(d_seq)   # 位置编码无参数，直通
+        return loss
+
+    def adam_step(self, lr: float):
+        """对全部参数做一次 Adam 更新（梯度已由 `_loss_and_backward` 累积）"""
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, sequences, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干条 token 序列上做 teacher-forcing 训练，返回每个 epoch 的平均 loss
+
+        sequences: List[List[int]]，每条至少 2 个 token。
+        每个序列单独一步：前向 → 交叉熵 → 反向 → Adam。
+        """
+        seqs = [list(s) for s in sequences]
+        if not seqs:
+            raise ValueError("CausalLM.fit: sequences 不能为空")
+        for s in seqs:
+            if len(s) < 2:
+                raise ValueError("CausalLM.fit: 每条序列至少 2 个 token")
+        if epochs < 0:
+            raise ValueError(f"CausalLM.fit: epochs 不能为负，收到 {epochs!r}")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        self.train()
+        for ep in range(int(epochs)):
+            order = list(range(len(seqs)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                self.zero_grad()
+                total += self._loss_and_backward(seqs[i])
+                self.adam_step(lr)
+            avg = total / len(seqs)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def evaluate(self, sequences):
+        """不更新参数的交叉熵（eval 模式，按预测位置总数平均）"""
+        seqs = [list(s) for s in sequences]
+        if not seqs:
+            raise ValueError("CausalLM.evaluate: sequences 不能为空")
+        was_training = self.encoder.layers[0].self_attn.training
+        self.eval()
+        try:
+            total = 0.0
+            count = 0
+            for s in seqs:
+                if len(s) < 2:
+                    raise ValueError("CausalLM.evaluate: 每条序列至少 2 个 token")
+                logits = self.forward(s[:-1])
+                for t in range(len(s) - 1):
+                    probs = _softmax_row(logits[t])
+                    p = probs[s[t + 1]]
+                    total += -math.log(p if p > 1e-12 else 1e-12)
+                    count += 1
+            return total / count
+        finally:
+            if was_training:
+                self.train()
+
+    def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
+                 top_k: int = 0, rng=None):
+        """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
+
+        temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
+        """
+        if max_new_tokens < 0:
+            raise ValueError(f"CausalLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
+        if temperature <= 0:
+            raise ValueError(f"CausalLM.generate: temperature 必须 > 0，收到 {temperature!r}")
+        ids = list(prompt_ids)
+        if not ids:
+            raise ValueError("CausalLM.generate: prompt_ids 不能为空")
+        rng = rng or random
+        self.eval()
+        for _ in range(int(max_new_tokens)):
+            window = ids[-self.max_len:]
+            logits = self.forward(window)[-1]
+            if top_k and top_k < self.vocab_size:
+                order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
+                keep = set(order[:int(top_k)])
+                logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+            probs = _softmax_row([v / temperature for v in logits])
+            # 累积分布采样（不依赖 random.choices，可注入 rng 复现）
+            u = rng.random()
+            acc = 0.0
+            pick = self.vocab_size - 1
+            for v, p in enumerate(probs):
+                acc += p
+                if u < acc:
+                    pick = v
+                    break
+            ids.append(pick)
+        return ids
 
 
 class ResidualBlock:
@@ -4640,6 +4946,22 @@ if __name__ == "__main__":
         probs = _softmax_row(logits)
         pred = 1 if probs[1] > probs[0] else 0
         print(f"  预测: {pred}  实际: {label}  {'✓' if pred == label else '✗'}  probs={[round(p, 3) for p in probs]}")
+
+    # ==================== 因果语言模型示例（causal mask → LLM） ====================
+    print("\n" + "=" * 60)
+    print("因果语言模型: causal mask 让每个位置只能看到左侧（GPT 式预训练）")
+    print("=" * 60)
+
+    random.seed(42)
+    lm = CausalLM(vocab_size=3, d_model=16, num_heads=2, d_ff=32,
+                  num_layers=1, max_len=32)
+    lm_ids = [0, 1, 2] * 5
+    hist = lm.fit([lm_ids], epochs=120, lr=0.01, shuffle=False)
+    print(f"  语料: 012 循环 ×5 | loss {hist[0]:.4f} → {hist[-1]:.4f}")
+    lm_prompt = [0]
+    lm_out = lm.generate(lm_prompt, max_new_tokens=8, temperature=1e-6)
+    print(f"  前缀 {''.join(map(str, lm_prompt))} → 续写 "
+          f"{''.join(map(str, lm_out))}  （期望 012012012…）")
 
     # ==================== 文本生成示例（字符级语言模型） ====================
     print("\n" + "=" * 60)

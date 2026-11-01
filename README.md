@@ -9,6 +9,7 @@
 - **双模式 API**: 底层精细控制 + 高层 sklearn 风格封装
 - **完整的训练管线**: Early Stopping、梯度裁剪、学习率调度、模型保存/加载
 - **反向传播有数值梯度测试守着**: `Layer` / `MultiHeadAttention` / `Conv2d` / `BatchNorm1d` 的解析梯度都与数值梯度逐项比对
+- **因果注意力 / LLM**: `MultiHeadAttention(causal=True)` 因果掩码 + `CausalLM`（GPT 式字符级语言模型，训练与生成全部纯标准库）
 
 ## 快速开始
 
@@ -125,7 +126,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
 | `Sequential` | 层序列容器（不含 train/eval，内部的 Dropout 需自行切换） |
-| `MultiHeadAttention` | 多头注意力（`dropout` 参数**尚未实现**，注意力内不做 dropout） |
+| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码（`dropout` 参数**尚未实现**，注意力内不做 dropout） |
 
 > **早停与权重回滚**：`fit(patience=...)` 在指标不再改善时停止训练，但**不会自动回滚**
 > 到最优那一轮；需要最优权重时传 `restore_best_weights=True`。
@@ -165,11 +166,34 @@ model.train()     # 回到训练
 
 | 组件 | 说明 |
 |------|------|
-| `MultiHeadAttention` | 多头注意力机制 |
+| `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`） |
 | `FeedForward` | 前馈网络 |
-| `TransformerEncoderLayer` | 单层 Encoder |
-| `TransformerEncoder` | 多层 Encoder 堆叠 |
+| `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码） |
+| `TransformerEncoder` | 多层 Encoder 堆叠（`causal=True` 会传给每一层） |
 | `PositionalEncoding` | 位置编码 |
+| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate` |
+
+### 因果掩码与 LLM
+
+`causal=True` 把注意力分数矩阵的上三角（`j > t`）置为 `-inf`，softmax 之后
+这些权重恰好是 `0.0`，因此：
+
+- 位置 `t` 的输出**只依赖 `0..t`** —— 一次前向就能并行算出所有位置的「下一个 token」预测；
+- 反向不需要额外分支，被屏蔽位置的梯度天然为 `0`（`d_scores = attn * (...)` 里 `attn=0`）。
+
+`CausalLM` 直接建立在这套掩码之上，训练目标就是学生成「输入 `ids` → 目标 `ids[1:]`」：
+
+```python
+lm = CausalLM(vocab_size=3, d_model=16, num_heads=2, d_ff=32, num_layers=1)
+lm.fit([[0, 1, 2] * 5], epochs=120, lr=0.01)      # 学 012 循环
+lm.generate([0], max_new_tokens=8)                 # → [0, 1, 2, 0, 1, 2, 0, 1, 2]
+```
+
+整个实现是**纯标准库**：没有依赖矩阵库，也没有 `torch`。训练/生成都用一个
+小语料（15 个 token、1 层、d_model=16）即可在 1 秒内跑完，适合当教学样例。
+
+> 注意：`generate()` 会把模型切到 `eval()` 模式（关闭 Dropout）并保持；
+> 想继续训练请再调 `train()`。
 
 ### 优化器
 
@@ -318,7 +342,7 @@ generated = generate_text(model, tp, "君不见", length=15, temp=0.8)
 python AI.py
 ```
 
-依次运行 12 段演示：回归（`Model.fit`）→ 分类（`make_classifier` + Softmax/CE）→ CNN（卷积→池化→展平→MLP）→ RNN & LSTM 序列预测 → 模型保存/加载 → GRU 序列预测 → Dropout + LayerNorm → 梯度裁剪 + StepLR → `quick_train` 一行训练 → Transformer 序列分类 → 字符级文本生成 → PyTorch 数值对齐。
+依次运行 13 段演示：回归（`Model.fit`）→ 分类（`make_classifier` + Softmax/CE）→ CNN（卷积→池化→展平→MLP）→ RNN & LSTM 序列预测 → 模型保存/加载 → GRU 序列预测 → Dropout + LayerNorm → 梯度裁剪 + StepLR → `quick_train` 一行训练 → Transformer 序列分类 → 因果语言模型（`CausalLM`）→ 字符级文本生成 → PyTorch 数值对齐。
 
 ## 测试
 
@@ -326,7 +350,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-257 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+267 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -337,6 +361,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestBatchNormTraining` | `BatchNorm1d` 训练路径的 `dx / gamma / beta` vs 数值梯度，并与朴素实现逐位一致 |
 | `TestStepCache` / `TestCellGradSemantics` | `restore_cache` 与「重新前向」逐位一致；一次 `zero_grad` + 逐步 backward == 各步梯度之和 |
 | `TestValDataFormats` / `TestCrossEntropyTargets` | `val_data` 三种写法、CE 的 target 规范化 |
+| `TestCausalMask` | 因果掩码的**因果性**（改未来 token 不改过去输出）、掩码权重精确为 0、`W_v` 梯度 vs 数值梯度 |
+| `TestCausalLM` | 小语料过拟合（loss → <0.05）、贪心续写接上周期、前缀 logits 与未来无关、生成可复现、非法输入 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -345,6 +371,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 257 个单元测试
+├── test_ai.py       # 267 个单元测试
 └── README.md
 ```
