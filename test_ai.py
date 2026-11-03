@@ -3914,3 +3914,162 @@ class TestGQA:
         for bad in (0, -1, 3, 8, True, 1.5):
             with pytest.raises(ValueError):
                 AI.MultiHeadAttention(8, 4, num_kv_heads=bad)
+
+class TestGroupNorm:
+    """分组归一化 / 实例归一化"""
+
+    def test_forward_values(self):
+        gn = AI.GroupNorm(2, 4)
+        x = [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]],
+             [[9.0, 10.0], [11.0, 12.0]], [[13.0, 14.0], [15.0, 16.0]]]
+        y = gn.forward(x)
+        mean = 4.5
+        var = sum((v - mean) ** 2 for v in range(1, 9)) / 8
+        inv = 1.0 / math.sqrt(var + 1e-5)
+        assert abs(y[0][0][0] - (1.0 - mean) * inv) < 1e-12
+        out0 = [y[c][h][w] for c in (0, 1) for h in range(2) for w in range(2)]
+        assert abs(sum(out0) / 8) < 1e-9
+        assert abs(sum(v * v for v in out0) / 8 - 1.0) < 1e-4
+
+    def test_groups_independent(self):
+        """改组 2 的数据不改变组 1 的输出"""
+        gn = AI.GroupNorm(2, 4)
+        x = [[[float(i * 4 + j * 2 + k + 1) for k in range(2)] for j in range(2)]
+             for i in range(4)]
+        y = gn.forward(x)
+        x2 = [[list(r) for r in c] for c in x]
+        x2[2][0][0] = 99.0
+        y2 = gn.forward(x2)
+        assert y2[0][0][0] == y[0][0][0]
+
+    def test_gradient_numeric(self):
+        random.seed(91)
+        gn = AI.GroupNorm(2, 4)
+        gn.gamma = [1.1, 0.9, 1.3, 0.7]
+        gn.beta = [0.1, -0.2, 0.3, 0.05]
+        x = [[[random.gauss(0, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(4)]
+        dout = [[[random.gauss(0, 1) for _ in range(3)] for _ in range(3)]
+                for _ in range(4)]
+
+        def loss():
+            out = gn.forward(x)
+            return sum(out[c][h][w] * dout[c][h][w]
+                       for c in range(4) for h in range(3) for w in range(3))
+
+        gn.forward(x)
+        gg, gb, dx = gn.backward(dout)
+        eps = 1e-6
+        for c, h, w in ((0, 0, 0), (1, 2, 1), (3, 1, 2)):
+            old = x[c][h][w]
+            x[c][h][w] = old + eps
+            lp = loss()
+            x[c][h][w] = old - eps
+            lm = loss()
+            x[c][h][w] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(dx[c][h][w] - num) / max(1.0, abs(num)) < 1e-6
+        for c in range(4):
+            old = gn.gamma[c]
+            gn.gamma[c] = old + eps
+            lp = loss()
+            gn.gamma[c] = old - eps
+            lm = loss()
+            gn.gamma[c] = old
+            assert abs(gg[c] - (lp - lm) / (2 * eps)) / max(1.0, abs(gg[c])) < 1e-6
+            old = gn.beta[c]
+            gn.beta[c] = old + eps
+            lp = loss()
+            gn.beta[c] = old - eps
+            lm = loss()
+            gn.beta[c] = old
+            assert abs(gb[c] - (lp - lm) / (2 * eps)) / max(1.0, abs(gb[c])) < 1e-6
+
+    def test_instance_norm_equals_group_norm(self):
+        random.seed(92)
+        x = [[[random.gauss(0, 1) for _ in range(2)] for _ in range(2)]
+             for _ in range(3)]
+        o1 = AI.InstanceNorm(3).forward(x)
+        o2 = AI.GroupNorm(3, 3).forward(x)
+        for c in range(3):
+            for h in range(2):
+                for w in range(2):
+                    assert abs(o1[c][h][w] - o2[c][h][w]) < 1e-15
+
+    def test_invalid(self):
+        for args in ((0, 4), (3, 4), (-1, 4), (2, 0)):
+            with pytest.raises(ValueError):
+                AI.GroupNorm(*args)
+        with pytest.raises(ValueError):
+            AI.GroupNorm(2, 4).forward([[[1.0, 2.0]], [[3.0, 4.0]]])
+        with pytest.raises(RuntimeError):
+            AI.GroupNorm(2, 4).backward([[[1.0]]])
+
+
+class TestDropPath:
+    """随机深度：整条分支丢弃"""
+
+    def test_identity_when_disabled(self):
+        dp = AI.DropPath(0.0)
+        assert dp.forward([1.0, 2.0]) == [1.0, 2.0]
+        dp = AI.DropPath(0.5)
+        dp.eval()
+        assert dp.forward([1.0, 2.0]) == [1.0, 2.0]
+        assert dp.factor == 1.0
+
+    def test_drop_rate_and_scale(self):
+        dp = AI.DropPath(0.3)
+        random.seed(93)
+        dropped = 0
+        scales = set()
+        n = 2000
+        for _ in range(n):
+            out = dp.forward([1.0])
+            if out[0] == 0.0:
+                dropped += 1
+            else:
+                scales.add(out[0])
+        assert abs(dropped / n - 0.3) < 0.04
+        assert scales == {1.0 / 0.7}
+
+    def test_backward_matches_forward_gate(self):
+        dp = AI.DropPath(0.5)
+        random.seed(94)
+        for _ in range(50):
+            out = dp.forward([1.0, 2.0])
+            back = dp.backward([1.0, 2.0])
+            if out[0] == 0.0:
+                assert back == [0.0, 0.0]
+                return
+        raise AssertionError("50 次都没丢弃，概率上不该发生")
+
+    def test_scale_by_keep_false(self):
+        dp = AI.DropPath(0.5, scale_by_keep=False)
+        random.seed(95)
+        factors = set()
+        for _ in range(200):
+            dp.forward([1.0])
+            factors.add(dp.factor)
+        assert factors == {0.0, 1.0}
+
+    def test_invalid(self):
+        for bad in (-0.1, 1.0, 1.5):
+            with pytest.raises(ValueError):
+                AI.DropPath(bad)
+
+
+class TestPerplexity:
+    def test_matches_exp_of_loss(self):
+        random.seed(96)
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        lm.eval()
+        seqs = [[1, 2, 3], [3, 1, 4]]
+        assert abs(lm.perplexity(seqs) - math.exp(lm.evaluate(seqs))) < 1e-12
+
+    def test_overflow_guard(self):
+        lm = AI.CausalLM(vocab_size=3, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        lm.eval()
+        ppl = lm.perplexity([[0, 1]])
+        assert isinstance(ppl, float) and ppl > 0

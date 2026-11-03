@@ -5,7 +5,7 @@
   - Conv2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / FeedForward / Encoder / PositionalEncoding）
-  - Dropout / BatchNorm1d / LayerNorm / RMSNorm（正则化与归一化）
+  - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
@@ -792,6 +792,58 @@ class Dropout:
         return [delta[i] * self.mask[i] for i in range(len(delta))]
 
 
+def _scale_nested(x, k: float):
+    """把嵌套 list（向量 / 序列 / (C,H,W)）整体乘 k；k == 1.0 时原样返回"""
+    if k == 1.0:
+        return x
+    if isinstance(x, list):
+        return [_scale_nested(v, k) for v in x]
+    return x * k
+
+class DropPath:
+    """Stochastic Depth / DropPath：训练时整条残差分支以概率 p 被跳过
+
+    与 Dropout 的区别：Dropout 按元素丢，DropPath 丢**整条分支**（整个张量），
+    常见于深层 Transformer / ConvNeXt 的残差块里。训练时保留的分支放大
+    1/(1-p)（inverted，推理不做任何缩放）；`eval()` 后恒等。
+
+    用法::
+
+        out = x + drop_path(block(x))      # drop_path 在前面挡一下
+    """
+
+    def __init__(self, p: float = 0.0, scale_by_keep: bool = True):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"DropPath: p 必须在 [0, 1) 内，收到 {p!r}")
+        self.p = float(p)
+        self.scale_by_keep = bool(scale_by_keep)
+        self.factor = 1.0
+        self.training = True
+
+    def train(self):
+        """训练模式：按概率整条丢弃"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            self.factor = 1.0
+            return x
+        if random.random() < self.p:
+            self.factor = 0.0
+        else:
+            self.factor = 1.0 / (1.0 - self.p) if self.scale_by_keep else 1.0
+        return _scale_nested(x, self.factor)
+
+    def backward(self, dout):
+        return _scale_nested(dout, self.factor)
+
+
 class BatchNorm1d:
     """一维批归一化
 
@@ -997,6 +1049,122 @@ class LayerNorm:
 
         dx = [self.inv_std * (d * dx_hat[j] - s1 - self.x_hat[j] * s2) / d for j in range(d)]
         return grad_gamma, grad_beta, dx  # 约定: 最后一个元素为传播的 delta
+
+
+class GroupNorm:
+    """分组归一化（GroupNorm，Wu & He 2018）：CNN 小 batch 时替代 BatchNorm
+
+    输入是 (C, H, W)。把通道分成 num_groups 组，每组内对 (C/G, H, W) 的
+    C/G*H*W 个元素一起求均值方差——与 batch 大小无关，所以 batch=1 也稳定。
+    `InstanceNorm(num_channels)` 就是 `num_groups == num_channels` 的特例。
+    """
+
+    def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-5):
+        if isinstance(num_groups, bool) or not isinstance(num_groups, int) or num_groups < 1:
+            raise ValueError(f"GroupNorm: num_groups 必须是正整数，收到 {num_groups!r}")
+        if isinstance(num_channels, bool) or not isinstance(num_channels, int) or num_channels < 1:
+            raise ValueError(f"GroupNorm: num_channels 必须是正整数，收到 {num_channels!r}")
+        if num_channels % num_groups != 0:
+            raise ValueError(
+                f"GroupNorm: num_channels={num_channels} 必须能被 "
+                f"num_groups={num_groups} 整除"
+            )
+        self.groups = num_groups
+        self.channels = num_channels
+        self.eps = eps
+        self.gamma = [1.0] * num_channels
+        self.beta = [0.0] * num_channels
+        self.m_gamma = [0.0] * num_channels; self.v_gamma = [0.0] * num_channels
+        self.m_beta = [0.0] * num_channels; self.v_beta = [0.0] * num_channels
+        self.x = self.x_hat = None
+        self.stats = []        # 每组 (mean, inv_std)
+
+    def _check(self, x, who):
+        if len(x) != self.channels:
+            raise ValueError(
+                f"GroupNorm.{who}: 通道数 {len(x)} 与本层 {self.channels} 不一致"
+            )
+        shape = (len(x[0]), len(x[0][0])) if x and x[0] else (0, 0)
+        for c in range(len(x)):
+            if len(x[c]) != shape[0] or any(len(r) != shape[1] for r in x[c]):
+                raise ValueError(f"GroupNorm.{who}: 各通道的 H/W 必须一致")
+        if shape[0] < 1 or shape[1] < 1:
+            raise ValueError(f"GroupNorm.{who}: 输入不能为空")
+        return shape
+
+    def forward(self, x):
+        H, W = self._check(x, "forward")
+        self.x = x
+        self.x_hat = [[[0.0] * W for _ in range(H)] for _ in range(self.channels)]
+        self.stats = []
+        per = self.channels // self.groups
+        n = per * H * W
+        for g in range(self.groups):
+            mean = 0.0
+            for c in range(g * per, (g + 1) * per):
+                for h in range(H):
+                    mean += sum(x[c][h])
+            mean /= n
+            var = 0.0
+            for c in range(g * per, (g + 1) * per):
+                for h in range(H):
+                    for w in range(W):
+                        d = x[c][h][w] - mean
+                        var += d * d
+            var /= n
+            inv = 1.0 / math.sqrt(var + self.eps)
+            self.stats.append((mean, inv))
+            for c in range(g * per, (g + 1) * per):
+                for h in range(H):
+                    for w in range(W):
+                        self.x_hat[c][h][w] = (x[c][h][w] - mean) * inv
+        return [[[self.gamma[c] * self.x_hat[c][h][w] + self.beta[c]
+                  for w in range(W)] for h in range(H)] for c in range(self.channels)]
+
+    def backward(self, dout):
+        if self.x_hat is None:
+            raise RuntimeError("GroupNorm.backward: 必须先调用 forward()")
+        H, W = self._check(dout, "backward")
+        per = self.channels // self.groups
+        n = per * H * W
+        grad_gamma = [0.0] * self.channels
+        grad_beta = [0.0] * self.channels
+        for c in range(self.channels):
+            s = 0.0
+            for h in range(H):
+                s += sum(dout[c][h])
+            grad_beta[c] = s
+            t = 0.0
+            for h in range(H):
+                for w in range(W):
+                    t += dout[c][h][w] * self.x_hat[c][h][w]
+            grad_gamma[c] = t
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(self.channels)]
+        for g in range(self.groups):
+            mean, inv = self.stats[g]
+            s1 = 0.0     # sum(dx_hat)
+            s2 = 0.0     # sum(dx_hat * x_hat)
+            for c in range(g * per, (g + 1) * per):
+                gam = self.gamma[c]
+                for h in range(H):
+                    for w in range(W):
+                        d = dout[c][h][w] * gam
+                        s1 += d
+                        s2 += d * self.x_hat[c][h][w]
+            for c in range(g * per, (g + 1) * per):
+                gam = self.gamma[c]
+                for h in range(H):
+                    for w in range(W):
+                        d = dout[c][h][w] * gam
+                        dx[c][h][w] = inv * (n * d - s1 - self.x_hat[c][h][w] * s2) / n
+        return grad_gamma, grad_beta, dx       # 约定：最后一个元素是 delta
+
+
+class InstanceNorm(GroupNorm):
+    """实例归一化 = 每组一个通道的 GroupNorm"""
+
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__(num_channels, num_channels, eps)
 
 
 class RMSNorm:
@@ -2837,6 +3005,14 @@ class CausalLM:
         finally:
             if was_training:
                 self.train()
+
+    def perplexity(self, sequences):
+        """困惑度 = exp(交叉熵)。语言模型常用指标，越小越好"""
+        loss = self.evaluate(sequences)
+        if loss > 700.0:          # exp(709.78) 就溢出，直接给 inf
+            return float("inf")
+        return math.exp(loss)
+
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
                  top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0):

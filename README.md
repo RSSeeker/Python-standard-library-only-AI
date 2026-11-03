@@ -131,7 +131,9 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `GlobalAvgPool2d` | 全局平均池化：`(C,H,W) → (C,)`，CNN 分类头常用 |
 | `Flatten` | 展平（CNN → MLP） |
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
+| `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
+| `GroupNorm` / `InstanceNorm` | 分组归一化（`(C,H,W)`，小 batch 稳定）；`InstanceNorm` 是组数等于通道数的特例 |
 | `LayerNorm` | 层归一化 |
 | `RMSNorm` | RMS 归一化（Llama 系）：不减均值、无 beta，`y = gamma·x/sqrt(mean(x²)+eps)` |
 | `Embedding` | 嵌入层 |
@@ -280,6 +282,7 @@ lm = CausalLM(vocab_size=32, d_model=64, num_heads=8, d_ff=128,
               num_layers=2, num_kv_heads=2)   # 8 个 Q 头 → 2 组 K/V
 lm.fit(seqs, epochs=50, lr=3e-3)
 out = lm.generate([1, 2, 3], max_new_tokens=32, use_cache=True)
+print("困惑度:", lm.perplexity(seqs))    # exp(交叉熵)
 ```
 
 ### 训练工程化工具
@@ -502,7 +505,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-369 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+381 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -528,6 +531,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTopPSampling` | `top_p=1.0` 与旧行为逐位相同、nucleus 只留头部集合、cache 与重算路径一致、非法 `top_p` 报错 |
 | `TestAvgPool2d` | 平均池化前向值、反向均分、`dx` vs 数值梯度、`GlobalAvgPool2d` 形状、非法 kernel/stride |
 | `TestGQA` | KV 头形状、`num_kv_heads` 缺省与显式传等值逐位一致、**共享 KV 下 `W_k`/`W_v` 梯度 vs 数值梯度**、`forward_step` == 整段前向、参数确实变少、非法取值 |
+| `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
+| `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
+| `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -536,6 +542,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 369 个单元测试
+├── test_ai.py       # 381 个单元测试
 └── README.md
 ```
