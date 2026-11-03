@@ -10,6 +10,9 @@
 - **完整的训练管线**: Early Stopping、梯度裁剪、学习率调度、模型保存/加载
 - **反向传播有数值梯度测试守着**: `Layer` / `MultiHeadAttention` / `Conv2d` / `BatchNorm1d` 的解析梯度都与数值梯度逐项比对
 - **因果注意力 / LLM**: `MultiHeadAttention(causal=True)` 因果掩码 + `CausalLM`（GPT 式字符级语言模型，训练与生成全部纯标准库）；注意力权重 dropout 同样实现了反向
+- **现代 LLM 组件**: GELU / sigmoid 激活、`RMSNorm`、`Linear`、`AdamW`（解耦权重衰减）、`WarmupLR`、
+  RoPE 旋转位置编码、KV cache 生成（默认开启，比整段重算快约 18 倍且结果逐位相同），
+  以及 Focal / BCE / BCEWithLogits / Huber / KL 与 label smoothing
 
 ## 快速开始
 
@@ -115,7 +118,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 | 组件 | 说明 |
 |------|------|
-| `Layer` | 全连接层 + 激活函数（He 初始化） |
+| `Layer` | 全连接层 + 激活函数（He 初始化）；激活可选 `leaky_relu` / `relu` / `gelu` / `sigmoid` / `linear` / `softmax` |
+| `Linear` | 无激活的全连接层（`Layer(..., activation='linear')` 的语义化子类） |
 | `MLP` | 多层感知机容器 |
 | `Conv2d` | 二维卷积层 |
 | `MaxPool2d` | 二维最大池化 |
@@ -123,10 +127,11 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `LayerNorm` | 层归一化 |
+| `RMSNorm` | RMS 归一化（Llama 系）：不减均值、无 beta，`y = gamma·x/sqrt(mean(x²)+eps)` |
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
 | `Sequential` | 层序列容器（不含 train/eval，内部的 Dropout 需自行切换） |
-| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码；`dropout>0` 时对注意力权重做 inverted dropout（`eval()` 关闭） |
+| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码；`rope=True` 时对 Q/K 加旋转位置编码；`dropout>0` 时对注意力权重做 inverted dropout（`eval()` 关闭） |
 
 > **早停与权重回滚**：`fit(patience=...)` 在指标不再改善时停止训练，但**不会自动回滚**
 > 到最优那一轮；需要最优权重时传 `restore_best_weights=True`。
@@ -167,12 +172,12 @@ model.train()     # 回到训练
 
 | 组件 | 说明 |
 |------|------|
-| `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`dropout>0` → 注意力权重 dropout） |
+| `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`rope=True` → Q/K 旋转位置编码；`dropout>0` → 注意力权重 dropout） |
 | `FeedForward` | 前馈网络 |
-| `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码） |
-| `TransformerEncoder` | 多层 Encoder 堆叠（`causal=True` 会传给每一层） |
-| `PositionalEncoding` | 位置编码 |
-| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate` |
+| `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` 透传给注意力） |
+| `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` 会传给每一层） |
+| `PositionalEncoding` | sin/cos 绝对位置编码 |
+| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`generate(use_cache=True)` 走 KV cache |
 
 ### 因果掩码与 LLM
 
@@ -196,11 +201,61 @@ lm.generate([0], max_new_tokens=8)                 # → [0, 1, 2, 0, 1, 2, 0, 1
 > 注意：`generate()` 会把模型切到 `eval()` 模式（关闭 Dropout）并保持；
 > 想继续训练请再调 `train()`。
 
+### 现代 LLM 组件（GELU / RMSNorm / AdamW / warmup / RoPE / KV cache）
+
+这些是当下 LLM 训练的常用配置，全部是**纯增量**：不传新参数时，所有默认路径与旧版本
+**逐位一致**（`test_ai.py` 里有专门的回归与差分测试守着）。
+
+```python
+# 现代激活：GELU（tanh 近似）、sigmoid（分支写法，±800 不溢出）
+mlp = MLP([8, 32, 4], activations=['gelu', 'linear'])
+linear = Linear(8, 4)                     # 语义化写法 = Layer(..., activation='linear')
+norm = RMSNorm(32)                        # Llama 系：不减均值、无 beta
+
+# AdamW：解耦权重衰减（每步先把参数乘 1-lr*wd，再套 Adam）
+model = Model(MLP([5, 16, 2]), loss_fn='cross_entropy', optimizer='adamw',
+              lr=0.01, weight_decay=0.1)
+
+# 线性 warmup + 现有调度器组合（前 5 轮爬坡，之后交给 CosineAnnealingLR）
+sched = WarmupLR(optimizer, warmup_epochs=5,
+                 base_scheduler=CosineAnnealingLR(optimizer, T_max=50))
+```
+
+| 组件 | 说明 |
+|------|------|
+| `Layer(activation='gelu')` | GELU（tanh 近似），导数同样手写 |
+| `Layer(activation='sigmoid')` | sigmoid；用 `z>=0 ? 1/(1+e^-z) : e^z/(1+e^z)` 写法，避免 `exp` 溢出 |
+| `Linear(fan_in, fan_out)` | 无激活全连接层 |
+| `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
+| `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
+| `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
+| `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
+
+**RoPE + KV cache**：`CausalLM(..., rope=True)` 会默认关掉绝对位置编码（Llama 的做法），
+想两者同时用可传 `use_abs_pos=True`。
+
+```python
+lm = CausalLM(vocab_size=8, d_model=32, num_heads=4, d_ff=64, num_layers=2,
+              max_len=128, rope=True)
+lm.fit(seqs, epochs=50, lr=3e-3)
+
+# 默认走 KV cache：每个新 token 只前向一次（复用各层 K/V），复杂度 O(N·T)
+out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5)
+out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5, use_cache=False)  # 结果逐位相同
+```
+
+实测 4 层 / d_model=32 / prompt 8 / 新生成 40 个 token：`use_cache=True` 比整段重算快
+**约 18 倍**，且两者输出的 token **完全一致**（有测试用例逐位比对，含窗口滑动与 RoPE 两种情形）。
+
+> cache 依赖绝对位置，窗口超过 `max_len` 开始滑动时会自动按新窗口重建一次，
+> 所以滑动场景仍然与重算版一致。
+
 ### 优化器
 
 | 优化器 | 说明 |
 |------|------|
 | `Adam` | Adam（默认） |
+| `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
@@ -210,7 +265,15 @@ lm.generate([0], max_new_tokens=8)                 # → [0, 1, 2, 0, 1, 2, 0, 1
 | 函数 | 说明 |
 |------|------|
 | `mse_loss(pred, target)` | 均方误差；`target` 可以是序列或单个标量（`y=0.5` 也行），长度不一致会报错 |
-| `cross_entropy_loss(pred, target)` | 交叉熵；`target` 可以是类别索引、one-hot 或概率向量（软标签） |
+| `cross_entropy_loss(pred, target, label_smoothing=0.0)` | 交叉熵；`target` 可以是类别索引、one-hot 或概率向量（软标签）；`label_smoothing>0` 时目标分布取 `(1-ε)·onehot + ε/K` |
+| `focal_loss(pred, idx, gamma=2.0, alpha=None)` | Focal Loss：`-α(1-p_t)^γ·log p_t`，压易分样本、聚焦难样本（`gamma=0` 即普通 CE） |
+| `bce_loss(pred, target)` | 二元交叉熵，`pred` 是概率（配 `sigmoid` 输出层）；返回的梯度相对概率 |
+| `bce_with_logits_loss(logits, target)` | 数值稳定的 BCE：`max(z,0) - z·y + log1p(exp(-|z|))`，直接吃 logits |
+| `huber_loss(pred, target, delta=1.0)` | Huber / Smooth L1，对离群点比 MSE 稳 |
+| `kl_divergence(pred, target)` | `KL(target ‖ pred) = Σ t·log(t/p)`，蒸馏/软目标常用 |
+
+> 新增的四个损失与 `focal_loss` 都遵循和 `mse_loss` 相同的返回约定：`(loss, grad)`，
+> 可以直接当成 `Model(loss_fn=...)` 的自定义损失用。
 
 > 搭配约束：`softmax` 输出层的反向使用的是 **softmax + cross_entropy 的联合梯度**，
 > 因此只能与 `cross_entropy` 搭配。`Model(loss_fn='mse')` + softmax 输出层会**直接报错**，
@@ -248,6 +311,7 @@ lm.generate([0], max_new_tokens=8)                 # → [0, 1, 2, 0, 1, 2, 0, 1
 | `StepLR(optimizer, step_size, gamma)` | 阶梯衰减 |
 | `ExponentialLR(optimizer, gamma)` | 指数衰减 |
 | `CosineAnnealingLR(optimizer, T_max)` | 余弦退火 |
+| `WarmupLR(optimizer, warmup_epochs, start_factor, base_scheduler)` | 线性 warmup；到期后交给 `base_scheduler`（可与上面任意一个组合） |
 
 ### 文本处理
 
@@ -351,7 +415,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-273 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+309 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -365,6 +429,11 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCausalMask` | 因果掩码的**因果性**（改未来 token 不改过去输出）、掩码权重精确为 0、`W_v` 梯度 vs 数值梯度 |
 | `TestCausalLM` | 小语料过拟合（loss → <0.05）、贪心续写接上周期、前缀 logits 与未来无关、生成可复现、非法输入 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
+| `TestModernComponents` | GELU 公式与导数、sigmoid 不溢出、`Linear`、`RMSNorm` 的 `dx / dgamma` vs 数值梯度 |
+| `TestAdamWAndWarmup` | AdamW 零梯度只做衰减、`weight_decay=0` 与 Adam 逐位相同、`WarmupLR` 的爬坡/接力曲线 |
+| `TestExtraLosses` | `gamma=0` 的 focal 退化为 CE、focal/CE-ls 梯度 vs 数值梯度、BCE 的 logits 稳定分支、Huber 两段、KL 公式 |
+| `TestRoPE` | 增量前向 == 整段前向（逐位）、RoPE 改变输出、**Q/K 逆旋转后的梯度 vs 数值梯度** |
+| `TestKVCache` | KV cache 生成 == 整段重算（含窗口滑动与 RoPE 两种情形）、训练后仍一致、生成不改参数 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -373,6 +442,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 273 个单元测试
+├── test_ai.py       # 309 个单元测试
 └── README.md
 ```

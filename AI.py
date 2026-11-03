@@ -5,11 +5,11 @@
   - Conv2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / FeedForward / Encoder / PositionalEncoding）
-  - Dropout / BatchNorm1d / LayerNorm（正则化与归一化）
+  - Dropout / BatchNorm1d / LayerNorm / RMSNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）
-  - Adam / SGD / SGDMomentum / RMSprop（优化器）
-  - MSE / CrossEntropy 损失函数
-  - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR）
+  - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
+  - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
+  - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分 + Early Stopping + DataLoader
   - 模型保存 / 加载（JSON 格式）
 ================================================================================
@@ -40,6 +40,9 @@ from typing import List, Tuple, Optional, Callable, Any
 
 # 热路径别名：Layer / _matmul 每次调用都要用到 operator.mul
 _mul = operator.mul
+
+# GELU 的 tanh 近似常数：sqrt(2/pi)
+_GELU_C = math.sqrt(2.0 / math.pi)
 
 
 # ============================================================================
@@ -87,6 +90,12 @@ class Layer:
         elif activation == "linear":
             self.act_fn = self._linear
             self.act_deriv = self._linear_deriv
+        elif activation == "gelu":
+            self.act_fn = self._gelu
+            self.act_deriv = self._gelu_deriv
+        elif activation == "sigmoid":
+            self.act_fn = self._sigmoid
+            self.act_deriv = self._sigmoid_deriv
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -113,6 +122,39 @@ class Layer:
 
     def _leaky_relu_deriv(self, z):
         return [1.0 if zi > 0 else 0.01 for zi in z]
+
+    def _gelu(self, z):
+        # tanh 近似：0.5*z*(1+tanh(sqrt(2/pi)*(z+0.044715 z^3)))
+        # 纯标准库没有 erf，GPT-2 用的 tanh 近似与精确 erf 版差异 < 2e-3
+        out = []
+        for zi in z:
+            u = _GELU_C * (zi + 0.044715 * zi * zi * zi)
+            out.append(0.5 * zi * (1.0 + math.tanh(u)))
+        return out
+
+    def _gelu_deriv(self, z):
+        out = []
+        for zi in z:
+            u = _GELU_C * (zi + 0.044715 * zi * zi * zi)
+            t = math.tanh(u)
+            du = _GELU_C * (1.0 + 3.0 * 0.044715 * zi * zi)
+            out.append(0.5 * (1.0 + t) + 0.5 * zi * (1.0 - t * t) * du)
+        return out
+
+    def _sigmoid(self, z):
+        # 分支写法：x 很负时 exp(x) 不溢出（C 侧同一写法，逐位一致）
+        out = []
+        for zi in z:
+            if zi >= 0:
+                out.append(1.0 / (1.0 + math.exp(-zi)))
+            else:
+                e = math.exp(zi)
+                out.append(e / (1.0 + e))
+        return out
+
+    def _sigmoid_deriv(self, z):
+        s = self._sigmoid(z)
+        return [si * (1.0 - si) for si in s]
 
     def _softmax(self, z):
         max_z = max(z)
@@ -184,6 +226,17 @@ class Layer:
         next_delta = [sum(map(_mul, col, w)) for col in zip(*self.weights)]
 
         return grad_w, grad_b, next_delta
+
+
+class Linear(Layer):
+    """无激活的全连接层：y = Wx + b
+
+    等价于 Layer(..., activation="linear")，单独命名是为了让"纯投影"在代码里
+    一目了然（也与 PyTorch nn.Linear 的语义对齐）。
+    """
+
+    def __init__(self, fan_in: int, fan_out: int):
+        super().__init__(fan_in, fan_out, activation="linear")
 
 
 class MLP:
@@ -873,6 +926,55 @@ class LayerNorm:
         return grad_gamma, grad_beta, dx  # 约定: 最后一个元素为传播的 delta
 
 
+class RMSNorm:
+    """RMS 归一化（Llama / Qwen / Mistral 系）：y = gamma * x / sqrt(mean(x^2)+eps)
+
+    与 LayerNorm 的差别：不减均值、没有 beta。少一趟减均值与一次加 beta，
+    在 LLM 里更常见。
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-6):
+        if num_features is None or int(num_features) < 1:
+            raise ValueError(f"RMSNorm: num_features 必须 >= 1，收到 {num_features!r}")
+        self.d = int(num_features)
+        self.eps = eps
+        self.gamma = [1.0] * self.d
+        self.x = None
+        self.inv_rms = None
+        self.m_gamma = [0.0] * self.d
+        self.v_gamma = [0.0] * self.d
+
+    def forward(self, x):
+        # 多出的特征会被静默丢弃，而 mean(x^2) 仍是按全长算的，必须早失败
+        if len(x) != self.d:
+            raise ValueError(
+                f"RMSNorm.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致"
+            )
+        self.x = x
+        mean_sq = sum(xi * xi for xi in x) / self.d
+        self.inv_rms = 1.0 / math.sqrt(mean_sq + self.eps)
+        r = self.inv_rms
+        return [self.gamma[j] * x[j] * r for j in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("RMSNorm.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"RMSNorm.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致"
+            )
+        d = self.d
+        r = self.inv_rms
+        x = self.x
+        gamma = self.gamma
+        grad_gamma = [dout[j] * x[j] * r for j in range(d)]
+        # g = Σ_i dout_i * gamma_i * x_i；dx_j = gamma_j*dout_j/r - g*x_j/(d*r^3)
+        g = sum(dout[i] * gamma[i] * x[i] for i in range(d))
+        r3 = r * r * r
+        dx = [gamma[j] * dout[j] * r - g * x[j] * r3 / d for j in range(d)]
+        return grad_gamma, dx  # 约定: 最后一个元素为传播的 delta
+
+
 # ============================================================================
 #  RNN / LSTM
 # ============================================================================
@@ -1482,7 +1584,7 @@ class MultiHeadAttention:
     """
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
-                 causal: bool = False):
+                 causal: bool = False, rope: bool = False, rope_base: float = 10000.0):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -1490,11 +1592,17 @@ class MultiHeadAttention:
 
         causal: 为 True 时加因果掩码——位置 t 只能看到 0..t，看不到未来。
         这是自回归语言模型（GPT 式）的必要条件；默认 False 保持双向注意力。
+
+        rope: 为 True 时给 Q/K 加旋转位置编码（RoPE，Llama 系）。旋转是正交变换，
+        只改"方向"不改模长，attention 分数里自然带上相对位置信息，外推性比
+        固定 sin/cos 绝对位置编码好得多。默认 False 时与原行为逐位一致。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
         self.dropout = dropout
         self.causal = bool(causal)
+        self.rope = bool(rope)
+        self.rope_base = float(rope_base)
         self.training = True
         self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
         # 每次 forward 重建；反向只读这几个列表
@@ -1508,6 +1616,9 @@ class MultiHeadAttention:
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.dropout_p = dropout
+        # RoPE 的成对频率：第 i 对用 base^(-2i/d_k)，与 Llama 一致
+        self.rope_freqs = [1.0 / (self.rope_base ** (2.0 * i / self.d_k))
+                           for i in range(self.d_k // 2)]
 
         std = math.sqrt(2.0 / d_model)
         self.W_q = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
@@ -1566,6 +1677,60 @@ class MultiHeadAttention:
         self.training = False
         return self
 
+    def _rope_apply(self, vec, pos: int, sign: float = 1.0):
+        """对单个头的向量做 RoPE 旋转；sign=-1 即逆旋转（反向传播用）
+
+        第 i 维与第 i+half 维配对（GPT-NeoX 版式）。d_k 为奇数时中间那维不旋转。
+        """
+        half = self.d_k // 2
+        out = list(vec)
+        for i in range(half):
+            theta = pos * self.rope_freqs[i]
+            c = math.cos(theta)
+            s = sign * math.sin(theta)
+            x0 = vec[i]
+            x1 = vec[i + half]
+            out[i] = x0 * c - x1 * s
+            out[i + half] = x0 * s + x1 * c
+        return out
+
+    def forward_step(self, x_t, cache):
+        """单 token 增量前向（推理专用，不写反向缓存）
+
+        cache: dict，本层一份；存 `K`/`V`（每头一个 [t][d_k] 列表）与 `pos`。
+        只对"没在滑动窗口里"的情况保证与 forward 的最后一行逐位一致：
+        位置编码/因果掩码都依赖绝对位置，窗口滑动后必须重建 cache。
+        """
+        d = self.d_model
+        h = self.num_heads
+        d_k = self.d_k
+        q = [sum(map(_mul, self.W_q[j], x_t)) + self.b_q[j] for j in range(d)]
+        k = [sum(map(_mul, self.W_k[j], x_t)) + self.b_k[j] for j in range(d)]
+        v = [sum(map(_mul, self.W_v[j], x_t)) + self.b_v[j] for j in range(d)]
+        pos = cache.get("pos", 0)
+        cache["pos"] = pos + 1
+        K = cache.setdefault("K", [[] for _ in range(h)])
+        V = cache.setdefault("V", [[] for _ in range(h)])
+        scale = 1.0 / math.sqrt(d_k)
+        concat = [0.0] * d
+        for head in range(h):
+            off = head * d_k
+            qh = q[off:off + d_k]
+            kh = k[off:off + d_k]
+            vh = v[off:off + d_k]
+            if self.rope:
+                qh = self._rope_apply(qh, pos)
+                kh = self._rope_apply(kh, pos)
+            K[head].append(kh)
+            V[head].append(vh)
+            keys = K[head]
+            scores = [sum(map(_mul, qh, keys[j])) * scale for j in range(len(keys))]
+            attn = _softmax_row(scores)
+            cols = list(zip(*V[head]))
+            out = [sum(map(_mul, attn, col)) for col in cols]
+            concat[off:off + d_k] = out
+        return [sum(map(_mul, self.W_o[j], concat)) + self.b_o[j] for j in range(d)]
+
     def forward(self, x_seq):
         """x_seq: List[List[float]]  (seq_len, d_model)"""
         # 复制一份，避免调用者之后原地修改 x_seq 污染反向传播缓存
@@ -1594,6 +1759,10 @@ class MultiHeadAttention:
             q_h = [[q_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
             k_h = [[k_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
             v_h = [[v_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
+            if self.rope:
+                # 每个位置用自己的绝对位置角旋转（q 与 k 都转，v 不动）
+                q_h = [self._rope_apply(q_h[t], t) for t in range(self.seq_len)]
+                k_h = [self._rope_apply(k_h[t], t) for t in range(self.seq_len)]
             self.Q.append(q_h)
             self.K.append(k_h)
             self.V.append(v_h)
@@ -1718,6 +1887,11 @@ class MultiHeadAttention:
 
             # dK = d_scores^T @ Q  (seq_len, d_k)
             dK = _matmul(_transpose(d_scores), Q_h)
+
+            if self.rope:
+                # 前向 q' = R·q，所以 dL/dq = R^T·dL/dq'（反向旋转）
+                dQ = [self._rope_apply(dQ[t], t, -1.0) for t in range(seq_len)]
+                dK = [self._rope_apply(dK[t], t, -1.0) for t in range(seq_len)]
 
             dQ_list.append(dQ)
             dK_list.append(dK)
@@ -1869,10 +2043,11 @@ class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
-                 causal: bool = False):
+                 causal: bool = False, rope: bool = False):
         # causal=True 时自注意力加因果掩码（自回归语言模型用）；
         # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, causal=causal)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
+                                            causal=causal, rope=rope)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -1909,6 +2084,16 @@ class TransformerEncoderLayer:
         }
         self.self_attn.zero_grad()
         self.ffn.zero_grad()
+
+    def forward_step(self, x_t, cache):
+        """单 token 增量前向（推理用，eval 模式下与 forward 的最后一行逐位一致）"""
+        d_model = self.self_attn.d_model
+        attn_out = self.self_attn.forward_step(x_t, cache)
+        res1 = [x_t[j] + attn_out[j] for j in range(d_model)]
+        ln1_out = self.ln1.forward(res1)
+        ffn_out = self.ffn.forward([ln1_out])[0]
+        res2 = [ln1_out[j] + ffn_out[j] for j in range(d_model)]
+        return self.ln2.forward(res2)
 
     def forward(self, x_seq):
         self.x = x_seq
@@ -2024,11 +2209,13 @@ class TransformerEncoder:
     """堆叠多个 TransformerEncoderLayer"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
-                 num_layers: int = 6, dropout: float = 0.1, causal: bool = False):
+                 num_layers: int = 6, dropout: float = 0.1, causal: bool = False,
+                 rope: bool = False):
         """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
         self.causal = bool(causal)
         self.layers = [
-            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout, causal=causal)
+            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout,
+                                    causal=causal, rope=rope)
             for _ in range(num_layers)
         ]
 
@@ -2048,6 +2235,12 @@ class TransformerEncoder:
         for layer in self.layers:
             layer.eval()
         return self
+
+    def forward_step(self, x_t, caches):
+        """单 token 增量前向；caches 每层一个 dict（见 MHA.forward_step）"""
+        for li, layer in enumerate(self.layers):
+            x_t = layer.forward_step(x_t, caches[li])
+        return x_t
 
     def forward(self, x_seq):
         for layer in self.layers:
@@ -2207,7 +2400,7 @@ class CausalLM:
 
     def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
                  d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, rope: bool = False, use_abs_pos=None):
         if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
             raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
         if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
@@ -2218,10 +2411,15 @@ class CausalLM:
         self.d_model = d_model
         self.max_len = max_len
 
+        self.rope = bool(rope)
+        # RoPE 已自带相对位置信息，默认就不再叠加绝对位置编码（Llama 的做法）；
+        # 想两者都用可以显式传 use_abs_pos=True
+        self.use_abs_pos = (not self.rope) if use_abs_pos is None else bool(use_abs_pos)
+
         self.embedding = Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
-                                          dropout, causal=True)
+                                          dropout, causal=True, rope=self.rope)
 
         std = math.sqrt(2.0 / d_model)
         self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
@@ -2281,7 +2479,7 @@ class CausalLM:
                 f"CausalLM.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}"
             )
         emb = self.embedding.forward(ids)
-        x = self.pos.forward(emb)
+        x = self.pos.forward(emb) if self.use_abs_pos else emb
         h = self.encoder.forward(x)
         self.h = h
         logits = _matmul(h, _transpose(self.W_out))
@@ -2289,6 +2487,27 @@ class CausalLM:
             for v in range(self.vocab_size):
                 logits[t][v] += self.b_out[v]
         return logits
+
+    def _forward_step(self, token_id: int, pos: int, caches):
+        """单 token 增量前向：返回该位置 logits（长度 vocab_size）
+
+        caches: 每层一个 dict；pos 是该 token 在**当前窗口**里的位置。
+        与 `forward(窗口)[-1]` 逐位一致（前提：窗口没有滑动，位置未变）。
+        """
+        d = self.d_model
+        if not isinstance(token_id, int) or not 0 <= token_id < self.vocab_size:
+            raise ValueError(
+                f"CausalLM._forward_step: token {token_id!r} 越界（词表 {self.vocab_size}）")
+        row = self.embedding.weight[token_id]
+        if self.use_abs_pos:
+            self.pos._ensure_len(pos + 1)
+            pe = self.pos.pe[pos]
+            x = [row[j] + pe[j] for j in range(d)]
+        else:
+            x = list(row)
+        x = self.encoder.forward_step(x, caches)
+        return [sum(map(_mul, self.W_out[v], x)) + self.b_out[v]
+                for v in range(self.vocab_size)]
 
     def _loss_and_backward(self, ids):
         """单条序列的交叉熵（对预测位置取平均），并累积全部梯度；返回 loss"""
@@ -2408,10 +2627,14 @@ class CausalLM:
                 self.train()
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
-                 top_k: int = 0, rng=None):
+                 top_k: int = 0, rng=None, use_cache: bool = True):
         """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
 
         temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
+
+        use_cache: True（默认）走 KV cache —— 每个新 token 只前向一次，复用之前
+        各层 K/V，生成 N 个 token 的代价从 O(N·T²) 降到 O(N·T)。与 use_cache=False
+        的**结果逐位相同**（cache 路径前向的行与整段前向的最后一行一致）。
         """
         if max_new_tokens < 0:
             raise ValueError(f"CausalLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
@@ -2422,24 +2645,62 @@ class CausalLM:
             raise ValueError("CausalLM.generate: prompt_ids 不能为空")
         rng = rng or random
         self.eval()
-        for _ in range(int(max_new_tokens)):
+        n_new = int(max_new_tokens)
+        if use_cache and n_new > 0:
+            return self._generate_cached(ids, n_new, temperature, top_k, rng)
+        for _ in range(n_new):
             window = ids[-self.max_len:]
             logits = self.forward(window)[-1]
-            if top_k and top_k < self.vocab_size:
-                order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
-                keep = set(order[:int(top_k)])
-                logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
-            probs = _softmax_row([v / temperature for v in logits])
-            # 累积分布采样（不依赖 random.choices，可注入 rng 复现）
-            u = rng.random()
-            acc = 0.0
-            pick = self.vocab_size - 1
-            for v, p in enumerate(probs):
-                acc += p
-                if u < acc:
-                    pick = v
-                    break
+            ids.append(self._sample(logits, temperature, top_k, rng))
+        return ids
+
+    def _sample(self, logits, temperature, top_k, rng):
+        """从 logits 采一个 token（top_k 过滤 + 温度缩放 + 累积分布采样）"""
+        if top_k and top_k < self.vocab_size:
+            order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
+            keep = set(order[:int(top_k)])
+            logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        probs = _softmax_row([v / temperature for v in logits])
+        # 累积分布采样（不依赖 random.choices，可注入 rng 复现）
+        u = rng.random()
+        acc = 0.0
+        pick = self.vocab_size - 1
+        for v, p in enumerate(probs):
+            acc += p
+            if u < acc:
+                pick = v
+                break
+        return pick
+
+    def _generate_cached(self, ids, max_new_tokens, temperature, top_k, rng):
+        """KV cache 版生成：先整段预填充，然后每个新 token 只做单步前向
+
+        窗口满（len(ids) > max_len）时会整体左移，位置编码/因果掩码都依赖绝对
+        位置，此时缓存失效 → 用新窗口重建一次（代价 O(max_len)，摊还后仍远小于
+        每步重算整段）。
+        """
+        window = ids[-self.max_len:]
+        caches = [{} for _ in self.encoder.layers]
+        pos = 0
+        logits = None
+        for tok in window:
+            logits = self._forward_step(tok, pos, caches)
+            pos += 1
+        for _ in range(max_new_tokens):
+            pick = self._sample(logits, temperature, top_k, rng)
             ids.append(pick)
+            new_window = ids[-self.max_len:]
+            if len(new_window) == len(window) + 1:
+                logits = self._forward_step(pick, pos, caches)
+                pos += 1
+            else:
+                # 窗口滑动：位置整体左移，旧 K/V 全部作废，按新窗口重建
+                caches = [{} for _ in self.encoder.layers]
+                pos = 0
+                for tok in new_window:
+                    logits = self._forward_step(tok, pos, caches)
+                    pos += 1
+            window = new_window
         return ids
 
 
@@ -2556,7 +2817,7 @@ def mse_loss(pred: List[float], target):
     return loss, grad
 
 
-def cross_entropy_loss(pred: List[float], target_idx):
+def cross_entropy_loss(pred: List[float], target_idx, label_smoothing: float = 0.0):
     """
     pred: softmax 输出 (概率分布)
     target_idx: 正确类别的索引 (int)，或 one-hot / 概率向量 (list)
@@ -2565,8 +2826,15 @@ def cross_entropy_loss(pred: List[float], target_idx):
         索引     -> loss = -log(pred[idx])，梯度 = pred - one_hot(idx)
         向量     -> loss = -Σ t·log(pred)，梯度 = pred - t
     后者用于 TextProcessor.prepare_data 产出的 one-hot 标签。
+
+    label_smoothing > 0 时把目标分布软化成
+        q = (1-ε)·target + ε/K        （K = 类别数）
+    loss = -Σ q·log(pred)，梯度 = pred·Σq - q。
+    ε 取值 (0,1)；默认 0 时走原来的精确路径（逐位不变）。
     """
     eps = 1e-15
+    if label_smoothing:
+        return _cross_entropy_smoothed(pred, target_idx, label_smoothing, eps)
     if isinstance(target_idx, (list, tuple)):
         if len(target_idx) != len(pred):
             raise ValueError(
@@ -2607,6 +2875,202 @@ def cross_entropy_loss(pred: List[float], target_idx):
     # softmax + CE 的梯度 = pred - one_hot(target)
     grad = list(pred)
     grad[target_idx] -= 1.0
+    return loss, grad
+
+
+def _ce_scalar_index(target, n, who="cross_entropy_loss"):
+    """把标量目标规范成合法类别索引（bool / 非整数 float / 越界都拒绝）"""
+    if isinstance(target, bool):
+        raise TypeError(f"{who}: 类别索引不能是 bool，收到 {target!r}")
+    if isinstance(target, float):
+        if not target.is_integer():
+            raise ValueError(f"{who}: 类别索引必须是整数，收到 {target}")
+        target = int(target)
+    if not isinstance(target, int):
+        try:
+            target = operator.index(target)
+        except TypeError:
+            raise TypeError(f"{who}: 目标必须是类别索引，收到 {target!r}")
+    if not 0 <= target < n:
+        raise ValueError(f"{who}: 类别索引 {target} 越界（pred 长度 {n}）")
+    return target
+
+
+def _cross_entropy_smoothed(pred, target, smoothing, eps):
+    """cross_entropy_loss 的 label_smoothing 分支（目标分布 q 见调用处文档）"""
+    if not 0.0 < float(smoothing) < 1.0:
+        raise ValueError(
+            f"cross_entropy_loss: label_smoothing 必须在 (0,1)，收到 {smoothing!r}")
+    k = len(pred)
+    if isinstance(target, (list, tuple)):
+        if len(target) != k:
+            raise ValueError(
+                f"cross_entropy_loss: target 长度 {len(target)} != pred 长度 {k}，"
+                f"请对齐维度（原先 zip 会静默截断）"
+            )
+        if any(float(t) < 0.0 for t in target):
+            raise ValueError("cross_entropy_loss: 目标向量不能含负值")
+        ts = [float(t) for t in target]
+    else:
+        idx = _ce_scalar_index(target, k)
+        ts = [0.0] * k
+        ts[idx] = 1.0
+    uniform = float(smoothing) / k
+    q = [(1.0 - float(smoothing)) * t + uniform for t in ts]
+    loss = -sum(qi * math.log(max(float(p), eps)) for qi, p in zip(q, pred))
+    ssum = sum(q)
+    grad = [ssum * float(p) - qi for p, qi in zip(pred, q)]
+    return loss, grad
+
+
+def focal_loss(pred: List[float], target_idx, gamma: float = 2.0, alpha=None):
+    """Focal Loss：FL = -α_t·(1-p_t)^γ·log(p_t)
+
+    针对类别不平衡：易分样本（p_t 接近 1）的 (1-p_t)^γ 会把它的梯度压小，
+    训练集中到难样本上。pred 是 softmax 概率，target 只支持类别索引
+    （软标签下 focal 的定义不唯一）。alpha 可为标量或逐类列表（None=1）。
+
+    返回 (loss, grad)，grad 已含 softmax 与 focal 的联合求导，可直接喂给
+    `_softmax_deriv`（返回 1.0）那一层的 backward。
+    """
+    if gamma is None or gamma < 0:
+        raise ValueError(f"focal_loss: gamma 必须 >= 0，收到 {gamma!r}")
+    k = len(pred)
+    idx = _ce_scalar_index(target_idx, k, "focal_loss")
+    if isinstance(alpha, (list, tuple)):
+        if len(alpha) != k:
+            raise ValueError(
+                f"focal_loss: alpha 长度 {len(alpha)} != pred 长度 {k}")
+        a_t = float(alpha[idx])
+    else:
+        a_t = 1.0 if alpha is None else float(alpha)
+    p = min(max(float(pred[idx]), 1e-15), 1.0)
+    rest = 1.0 - p
+    log_p = math.log(p)
+    if rest <= 0.0:
+        # p_t 恰为 1：loss 与梯度都是 0（γ>0 时）
+        return 0.0, [0.0] * k
+    p_gamma = rest ** gamma
+    loss = -a_t * p_gamma * log_p
+    # dz_j = A·(δ_tj - p_j)，A = α·[γ·p_t·(1-p_t)^(γ-1)·log(p_t) - (1-p_t)^γ]
+    term = gamma * p * (rest ** (gamma - 1.0)) * log_p if gamma > 0 else 0.0
+    a = a_t * (term - p_gamma)
+    grad = [-a * float(pj) for pj in pred]
+    grad[idx] += a
+    return loss, grad
+
+
+def bce_loss(pred, target, eps: float = 1e-12):
+    """二元交叉熵（pred 是概率，通常来自 output 层的 sigmoid 激活）
+
+    target 可为 0/1 标量，或与 pred 等长的 0/1 列表。
+    loss 取逐元素平均；返回 (loss, grad)，grad 相对 pred
+    （Layer 的 sigmoid 导数会再乘上去，所以对 logits 的梯度是对的）。
+    """
+    if isinstance(target, (list, tuple)):
+        if len(target) != len(pred):
+            raise ValueError(
+                f"bce_loss: target 长度 {len(target)} != pred 长度 {len(pred)}")
+        ts, ps = [float(t) for t in target], [float(p) for p in pred]
+    else:
+        ts, ps = [float(target)], [float(p) for p in pred]
+        if len(ps) != 1:
+            raise ValueError(
+                f"bce_loss: 标量 target 只能配单个输出，pred 长度是 {len(ps)}；"
+                f"多输出请传等长列表")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    for y, p in zip(ts, ps):
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"bce_loss: pred 必须是概率 [0,1]，收到 {p}")
+        q = min(max(p, eps), 1.0 - eps)
+        loss += -(y * math.log(q) + (1.0 - y) * math.log(1.0 - q))
+        grad.append((q - y) / (q * (1.0 - q)) / n)
+    return loss / n, grad
+
+
+def bce_with_logits_loss(logits, target):
+    """带 logits 的二元交叉熵（数值稳定，内部做 sigmoid）
+
+    loss = max(z,0) - z·y + log(1+exp(-|z|))，返回 (loss, grad)，grad 相对 logits
+    （= sigmoid(z) - y）。target 规则同 bce_loss。
+    """
+    if isinstance(target, (list, tuple)):
+        if len(target) != len(logits):
+            raise ValueError(
+                f"bce_with_logits_loss: target 长度 {len(target)} != logits 长度 {len(logits)}")
+        ts, zs = [float(t) for t in target], [float(z) for z in logits]
+    else:
+        ts, zs = [float(target)], [float(z) for z in logits]
+        if len(zs) != 1:
+            raise ValueError(
+                f"bce_with_logits_loss: 标量 target 只能配单个输出，logits 长度是 {len(zs)}")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    for y, z in zip(ts, zs):
+        loss += max(z, 0.0) - z * y + math.log1p(math.exp(-abs(z)))
+        if z >= 0:
+            s = 1.0 / (1.0 + math.exp(-z))
+        else:
+            e = math.exp(z)
+            s = e / (1.0 + e)
+        grad.append((s - y) / n)
+    return loss / n, grad
+
+
+def huber_loss(pred, target, delta: float = 1.0):
+    """Huber 损失（Smooth L1）：|e|<=delta 用 0.5e²，否则 delta(|e|-0.5delta)
+
+    对离群点比 MSE 稳、对小误差比 MAE 光滑。target 可为标量或等长列表，
+    loss 取逐元素平均；返回 (loss, grad)，grad 相对 pred。
+    """
+    if delta is None or delta <= 0:
+        raise ValueError(f"huber_loss: delta 必须 > 0，收到 {delta!r}")
+    if isinstance(target, (list, tuple)):
+        if len(target) != len(pred):
+            raise ValueError(
+                f"huber_loss: target 长度 {len(target)} != pred 长度 {len(pred)}")
+        ts, ps = [float(t) for t in target], [float(p) for p in pred]
+    else:
+        ts, ps = [float(target)], [float(p) for p in pred]
+        if len(ps) != 1:
+            raise ValueError(
+                f"huber_loss: 标量 target 只能配单个输出，pred 长度是 {len(ps)}")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    for y, p in zip(ts, ps):
+        e = p - y
+        if abs(e) <= delta:
+            loss += 0.5 * e * e
+            grad.append(e / n)
+        else:
+            loss += delta * (abs(e) - 0.5 * delta)
+            grad.append((delta if e > 0 else -delta) / n)
+    return loss / n, grad
+
+
+def kl_divergence(pred, target, eps: float = 1e-12):
+    """KL(target ‖ pred) = Σ t·log(t/p)
+
+    pred 是模型输出的概率分布，target 是目标分布（不要求归一化）。
+    返回 (loss, grad)，grad 相对 pred（= -t/p）。
+    """
+    if len(target) != len(pred):
+        raise ValueError(
+            f"kl_divergence: target 长度 {len(target)} != pred 长度 {len(pred)}")
+    loss = 0.0
+    grad = []
+    for t, p in zip(target, pred):
+        t, p = float(t), float(p)
+        if t < 0.0:
+            raise ValueError("kl_divergence: target 不能含负值")
+        q = max(p, eps)
+        if t > 0.0:
+            loss += t * (math.log(t) - math.log(q))
+        grad.append(-t / q)
     return loss, grad
 
 
@@ -2658,6 +3122,60 @@ class Adam:
                     v = b2 * vwj[i] + o2 * g * g
                     mwj[i] = m
                     vwj[i] = v
+                    Wj[i] -= lr * (m / c1) / (sqrt(v / c2) + eps)
+
+
+class AdamW:
+    """AdamW：Adam + 解耦权重衰减（现代 LLM 训练的默认优化器）
+
+    与 Adam 的区别：weight_decay 不进入梯度（不进一阶/二阶矩的自适应缩放），
+    而是每步直接把参数乘上 (1 - lr*wd)，再套标准 Adam 更新。
+    Adam 里的 L2 会被 sqrt(v) 归一化，导致大梯度参数实际衰减更小；AdamW 没有这个问题。
+    """
+
+    def __init__(self, model: MLP, lr: float = 1e-3,
+                 beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8,
+                 weight_decay: float = 0.01):
+        if weight_decay is None or weight_decay < 0:
+            raise ValueError(f"AdamW: weight_decay 必须 >= 0，收到 {weight_decay!r}")
+        self.model = model
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = float(weight_decay)
+        self.step_count = 0
+
+    def step(self, all_grads):
+        self.step_count += 1
+        b1, b2, lr, eps = self.beta1, self.beta2, self.lr, self.eps
+        decay = 1.0 - lr * self.weight_decay
+        c1 = 1 - b1 ** self.step_count
+        c2 = 1 - b2 ** self.step_count
+        o1, o2 = 1 - b1, 1 - b2
+        sqrt = math.sqrt
+
+        for (layer, (grad_w, grad_b)) in zip(self.model.layers, all_grads):
+            m_w, v_w, W = layer.m_w, layer.v_w, layer.weights
+            m_b, v_b, B = layer.m_b, layer.v_b, layer.biases
+
+            for j in range(layer.fan_out):
+                g = grad_b[j]
+                m = b1 * m_b[j] + o1 * g
+                v = b2 * v_b[j] + o2 * g * g
+                m_b[j] = m
+                v_b[j] = v
+                B[j] *= decay
+                B[j] -= lr * (m / c1) / (sqrt(v / c2) + eps)
+
+                gwj, mwj, vwj, Wj = grad_w[j], m_w[j], v_w[j], W[j]
+                for i in range(layer.fan_in):
+                    g = gwj[i]
+                    m = b1 * mwj[i] + o1 * g
+                    v = b2 * vwj[i] + o2 * g * g
+                    mwj[i] = m
+                    vwj[i] = v
+                    Wj[i] *= decay
                     Wj[i] -= lr * (m / c1) / (sqrt(v / c2) + eps)
 
 
@@ -2841,6 +3359,42 @@ class CosineAnnealingLR:
             progress = ((epoch - 1) % self.T_max) / (self.T_max - 1)
         self.optimizer.lr = self.eta_min + 0.5 * (self.initial_lr - self.eta_min) * (
             1 + math.cos(math.pi * progress))
+
+
+class WarmupLR:
+    """线性 warmup + 可选后续调度器（LLM 训练标配）
+
+    前 warmup_epochs 轮把 lr 从 initial_lr*start_factor 线性升到 initial_lr，
+    之后交给 base_scheduler（StepLR / ExponentialLR / CosineAnnealingLR），
+    不传则保持 initial_lr。epoch 从 1 开始计数，与 Model.fit 一致。
+
+    不 warmup 直接上大学习率时，注意力与 LayerNorm 的早期梯度很容易把模型打散；
+    LLM 训练普遍用总步数的 1%~5% 做线性 warmup。
+    """
+
+    def __init__(self, optimizer, warmup_epochs: int = 5,
+                 start_factor: float = 0.0, base_scheduler=None):
+        if warmup_epochs is None or int(warmup_epochs) < 1:
+            raise ValueError(f"WarmupLR: warmup_epochs 必须 >= 1，收到 {warmup_epochs!r}")
+        if not 0.0 <= float(start_factor) <= 1.0:
+            raise ValueError(f"WarmupLR: start_factor 必须在 [0,1]，收到 {start_factor!r}")
+        self.optimizer = optimizer
+        self.warmup_epochs = int(warmup_epochs)
+        self.start_factor = float(start_factor)
+        self.base_scheduler = base_scheduler
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = max(int(epoch), 1)
+        if epoch <= self.warmup_epochs:
+            frac = epoch / self.warmup_epochs
+            self.optimizer.lr = self.initial_lr * (
+                self.start_factor + (1.0 - self.start_factor) * frac)
+            return
+        # warmup 结束：先回到基准 lr，再让后续调度器按绝对 epoch 接管
+        self.optimizer.lr = self.initial_lr
+        if self.base_scheduler is not None:
+            self.base_scheduler.step(epoch)
 
 
 # ============================================================================
@@ -3648,6 +4202,7 @@ class Model:
 
     _OPTIMIZER_MAP = {
         'adam': Adam,
+        'adamw': AdamW,
         'sgd': SGD,
         'sgd_momentum': SGDMomentum,
         'rmsprop': RMSprop,

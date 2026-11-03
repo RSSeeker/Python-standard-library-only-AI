@@ -93,9 +93,9 @@ class TestLayer:
         assert len(out) == 2
 
     def test_unknown_activation_raises(self):
-        """不合法的激活函数名称应抛出 ValueError"""
+        """不合法的激活函数名称应抛出 ValueError（sigmoid/gelu 现在是合法激活）"""
         with pytest.raises(ValueError):
-            Layer(1, 1, activation="sigmoid")
+            Layer(1, 1, activation="tanh")
 
     def test_backward_shapes(self):
         """反向传播: 返回梯度形状与权重和偏置一致"""
@@ -1447,7 +1447,7 @@ class TestActivationName:
 
     def test_unknown_activation_raises(self):
         with pytest.raises(ValueError):
-            Layer(1, 1, activation="sigmoid")
+            Layer(1, 1, activation="tanh")
 
     def test_save_load_keeps_activation(self, tmp_path):
         random.seed(42)
@@ -2983,3 +2983,315 @@ class TestAttentionDropout:
         layer.train()
         assert layer.self_attn.training is True
 
+
+# ========================== 24. LLM 时代组件（激活 / 归一化 / 优化器 / 损失 / 位置编码） ==========================
+
+class TestModernComponents:
+    """GELU / sigmoid / Linear / RMSNorm —— LLM 里最常见的四个小件"""
+
+    def test_gelu_matches_tanh_formula(self):
+        """GELU(tanh 近似) 必须精确等于 0.5*z*(1+tanh(c*(z+0.044715 z^3)))"""
+        layer = Layer(1, 1, activation="gelu")
+        layer.weights = [[1.0]]
+        layer.biases = [0.0]
+        for z in (-2.0, -0.5, 0.0, 0.7, 3.0):
+            expected = 0.5 * z * (1.0 + math.tanh(AI._GELU_C * (z + 0.044715 * z ** 3)))
+            assert abs(layer.forward([z])[0] - expected) <= 1e-12
+
+    @pytest.mark.parametrize("act", ["gelu", "sigmoid"])
+    @pytest.mark.parametrize("z", [-1.7, -0.4, 0.6, 2.2])
+    def test_activation_backward_matches_numeric(self, act, z):
+        """新激活的反向：单层单权重，解析 dout/dw 对中心差分"""
+        eps = 1e-6
+        layer = Layer(1, 1, activation=act)
+        layer.weights = [[1.0]]
+        layer.biases = [0.0]
+        layer.forward([z])  # backward 依赖 forward 缓存的 z
+        gw, _gb, _delta = layer.backward([1.0])
+
+        def out():
+            return layer.forward([z])[0]
+
+        old = layer.weights[0][0]
+        layer.weights[0][0] = old + eps
+        hi = out()
+        layer.weights[0][0] = old - eps
+        lo = out()
+        layer.weights[0][0] = old
+        num = (hi - lo) / (2 * eps)
+        assert abs(gw[0][0] - num) <= 1e-6 * max(1.0, abs(num))
+
+    def test_sigmoid_saturates_without_overflow(self):
+        """sigmoid 用分支写法：±800 不能抛 OverflowError，也不能返回 nan"""
+        layer = Layer(1, 1, activation="sigmoid")
+        layer.weights = [[1.0]]
+        layer.biases = [0.0]
+        assert layer.forward([-800.0])[0] == 0.0
+        assert layer.forward([800.0])[0] == 1.0
+
+    def test_linear_class_is_plain_affine(self):
+        lin = AI.Linear(3, 2)
+        assert isinstance(lin, Layer)
+        lin.weights = [[1.0, 2.0, 3.0], [0.0, -1.0, 0.5]]
+        lin.biases = [0.5, -1.0]
+        assert lin.forward([1.0, 1.0, 1.0]) == [6.5, -1.5]
+
+    def test_rmsnorm_forward_and_shift_sensitivity(self):
+        """RMSNorm 不减均值：整体平移输入后输出必须明显改变（LayerNorm 则几乎不变）"""
+        norm = AI.RMSNorm(3)
+        norm.gamma = [1.0, 1.0, 1.0]
+        base = norm.forward([1.0, 2.0, 3.0])
+        r = 1.0 / math.sqrt((1 + 4 + 9) / 3.0 + norm.eps)
+        assert abs(base[0] - r) <= 1e-15
+        shifted = norm.forward([11.0, 12.0, 13.0])
+        assert abs(shifted[0] - base[0]) > 1e-3
+
+    def test_rmsnorm_backward_matches_numeric(self):
+        random.seed(4242)
+        norm = AI.RMSNorm(4)
+        norm.gamma = [0.7, 1.3, 0.9, 1.1]
+        x = [random.gauss(0, 1) for _ in range(4)]
+        dout = [random.gauss(0, 1) for _ in range(4)]
+        norm.forward(x)
+        grad_gamma, dx = norm.backward(dout)
+        eps = 1e-6
+        for j in range(4):
+            old = x[j]
+            x[j] = old + eps
+            hi = sum(a * b for a, b in zip(dout, norm.forward(x)))
+            x[j] = old - eps
+            lo = sum(a * b for a, b in zip(dout, norm.forward(x)))
+            x[j] = old
+            num = (hi - lo) / (2 * eps)
+            assert abs(dx[j] - num) <= 1e-6 * max(1.0, abs(num)), f"dx[{j}]"
+
+            oldg = norm.gamma[j]
+            norm.gamma[j] = oldg + eps
+            hi = sum(a * b for a, b in zip(dout, norm.forward(x)))
+            norm.gamma[j] = oldg - eps
+            lo = sum(a * b for a, b in zip(dout, norm.forward(x)))
+            norm.gamma[j] = oldg
+            num = (hi - lo) / (2 * eps)
+            assert abs(grad_gamma[j] - num) <= 1e-6 * max(1.0, abs(num)), f"dgamma[{j}]"
+
+
+class TestAdamWAndWarmup:
+    def test_zero_grad_step_only_decays(self):
+        """梯度为 0 时 AdamW 仍按 (1-lr*wd) 收缩权重，Adam 则一动不动"""
+        mlp = MLP([3, 2])
+        before = [list(row) for row in mlp.layers[0].weights]
+        grads = [([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                  [0.0] * layer.fan_out) for layer in mlp.layers]
+        opt = AI.AdamW(mlp, lr=0.1, weight_decay=0.5)
+        opt.step(grads)
+        decay = 1.0 - 0.1 * 0.5
+        for j in range(2):
+            for i in range(3):
+                assert abs(mlp.layers[0].weights[j][i] - before[j][i] * decay) <= 1e-15
+
+    def test_zero_weight_decay_matches_adam(self):
+        """weight_decay=0 时 AdamW 与 Adam 逐位相同"""
+        random.seed(11)
+        a = MLP([2, 2])
+        b = MLP([2, 2])
+        for la, lb in zip(a.layers, b.layers):
+            lb.weights = [list(row) for row in la.weights]
+            lb.biases = list(la.biases)
+        grads = [([[0.3, -0.2], [0.1, 0.4]], [0.2, -0.4]) for _ in a.layers]
+        Adam(a, lr=0.01).step([(gw, gb) for gw, gb in grads])
+        AI.AdamW(b, lr=0.01, weight_decay=0.0).step([(gw, gb) for gw, gb in grads])
+        assert a.layers[0].weights == b.layers[0].weights
+        assert a.layers[0].biases == b.layers[0].biases
+
+    def test_warmup_linear_ramp_then_flat(self):
+        mlp = MLP([2, 1])
+        opt = SGD(mlp, lr=0.1)
+        sched = AI.WarmupLR(opt, warmup_epochs=4)
+        lrs = []
+        for epoch in range(1, 8):
+            sched.step(epoch)
+            lrs.append(opt.lr)
+        assert lrs[:4] == pytest.approx([0.025, 0.05, 0.075, 0.1])
+        assert lrs[4:] == pytest.approx([0.1, 0.1, 0.1])
+
+    def test_warmup_chains_base_scheduler(self):
+        """warmup 结束后把控制权交给基础调度器（这里用 StepLR 验一轮）"""
+        mlp = MLP([2, 1])
+        opt = SGD(mlp, lr=0.2)
+        sched = AI.WarmupLR(opt, warmup_epochs=2, base_scheduler=StepLR(opt, step_size=1, gamma=0.5))
+        lrs = []
+        for epoch in range(1, 5):
+            sched.step(epoch)
+            lrs.append(opt.lr)
+        # 前两轮线性爬升到 0.2；之后交给 StepLR，而 StepLR 用的是**绝对 epoch**
+        # （lr = initial * gamma**(epoch//step_size)），所以第 3 轮是 0.2*0.5^3
+        assert lrs[0] == pytest.approx(0.1)
+        assert lrs[1] == pytest.approx(0.2)
+        assert lrs[2] == pytest.approx(0.2 * 0.5 ** 3)
+        assert lrs[3] == pytest.approx(0.2 * 0.5 ** 4)
+
+
+class TestExtraLosses:
+    def test_focal_gamma_zero_equals_cross_entropy(self):
+        """γ=0 的 focal 必须退化成普通交叉熵（loss 与梯度都逐位一致）"""
+        pred = AI._softmax_row([0.4, -1.2, 2.0, 0.1])
+        for idx in range(4):
+            f, gf = AI.focal_loss(pred, idx, gamma=0.0)
+            c, gc = cross_entropy_loss(pred, idx)
+            assert abs(f - c) <= 1e-15
+            assert gf == pytest.approx(gc, abs=1e-15)
+
+    def test_focal_gradient_matches_numeric(self):
+        random.seed(6)
+        logits = [0.3, -0.8, 1.4, 0.2]
+        pred = AI._softmax_row(logits)
+        idx = 2
+        _loss, grad = AI.focal_loss(pred, idx, gamma=2.0, alpha=0.75)
+        eps = 1e-6
+        for j in range(4):
+            old = logits[j]
+            logits[j] = old + eps
+            hi = AI.focal_loss(AI._softmax_row(logits), idx, gamma=2.0, alpha=0.75)[0]
+            logits[j] = old - eps
+            lo = AI.focal_loss(AI._softmax_row(logits), idx, gamma=2.0, alpha=0.75)[0]
+            logits[j] = old
+            num = (hi - lo) / (2 * eps)
+            assert abs(grad[j] - num) <= 1e-6 * max(1.0, abs(num)), f"grad[{j}]"
+
+    def test_bce_with_logits_stable_for_huge_logits(self):
+        """logits=500 时 loss 应是 exp(-500) 量级，不能溢出成 inf/nan"""
+        loss, _grad = AI.bce_with_logits_loss([500.0], [1])
+        assert math.isfinite(loss) and loss < 1e-200
+        loss2, _g2 = AI.bce_with_logits_loss([-500.0], [0])
+        assert math.isfinite(loss2) and loss2 < 1e-200
+
+    def test_bce_gradient_is_prob_minus_target(self):
+        """bce_loss 的 grad 相对**概率**，所以是 (p-y)/(p(1-p))，再按元素平均"""
+        loss, grad = AI.bce_loss([0.9, 0.2], [1, 0])
+        expect = [(0.9 - 1) / (0.9 * 0.1) / 2, (0.2 - 0) / (0.2 * 0.8) / 2]
+        assert grad == pytest.approx(expect, abs=1e-9)
+        assert loss == pytest.approx(-(math.log(0.9) + math.log(0.8)) / 2, abs=1e-12)
+
+    def test_huber_quadratic_and_linear_branches(self):
+        assert AI.huber_loss([0.0], [0.5])[0] == pytest.approx(0.125)
+        assert AI.huber_loss([0.0], [3.0], delta=1.0)[0] == pytest.approx(2.5)
+
+    def test_kl_divergence_matches_formula(self):
+        p = [0.5, 0.3, 0.2]
+        t = [0.6, 0.3, 0.1]
+        expect = sum(ti * math.log(ti / pi) for ti, pi in zip(t, p))
+        loss, grad = AI.kl_divergence(p, t)
+        assert loss == pytest.approx(expect, abs=1e-12)
+        assert grad == pytest.approx([-ti / pi for ti, pi in zip(t, p)], abs=1e-12)
+
+    def test_label_smoothing_gradient_matches_numeric(self):
+        random.seed(8)
+        logits = [0.5, -0.4, 1.1]
+        eps_smooth = 0.2
+        idx = 1
+        _loss, grad = cross_entropy_loss(AI._softmax_row(logits), idx, label_smoothing=eps_smooth)
+        eps = 1e-6
+        for j in range(3):
+            old = logits[j]
+            logits[j] = old + eps
+            hi = cross_entropy_loss(AI._softmax_row(logits), idx, label_smoothing=eps_smooth)[0]
+            logits[j] = old - eps
+            lo = cross_entropy_loss(AI._softmax_row(logits), idx, label_smoothing=eps_smooth)[0]
+            logits[j] = old
+            num = (hi - lo) / (2 * eps)
+            assert abs(grad[j] - num) <= 1e-6 * max(1.0, abs(num)), f"grad[{j}]"
+
+
+class TestRoPE:
+    def _model(self, rope, layers=2):
+        random.seed(20250901)
+        return AI.CausalLM(7, d_model=8, num_heads=2, d_ff=16, num_layers=layers,
+                           max_len=12, dropout=0.0, rope=rope)
+
+    def test_rope_turns_off_absolute_position_by_default(self):
+        lm = self._model(True, layers=1)
+        assert lm.rope is True
+        assert lm.use_abs_pos is False
+        lm2 = AI.CausalLM(5, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=8,
+                          rope=True, use_abs_pos=True)
+        assert lm2.use_abs_pos is True
+
+    def test_rope_changes_logits(self):
+        a = self._model(False, layers=1)
+        b = self._model(True, layers=1)
+        la = a.forward([1, 2, 3, 4])[-1]
+        lb = b.forward([1, 2, 3, 4])[-1]
+        assert max(abs(x - y) for x, y in zip(la, lb)) > 1e-6
+
+    @pytest.mark.parametrize("rope", [False, True])
+    def test_step_forward_matches_full_forward(self, rope):
+        """增量前向的最后一格必须与整段前向的最后一行逐位相同"""
+        lm = self._model(rope)
+        ids = [0, 1, 2, 3]
+        full = lm.forward(ids)[-1]
+        caches = [{} for _ in lm.encoder.layers]
+        last = None
+        for pos, tok in enumerate(ids):
+            last = lm._forward_step(tok, pos, caches)
+        assert last == full
+
+    @pytest.mark.parametrize("rope", [False, True])
+    def test_gradients_match_numeric(self, rope):
+        """RoPE 的反向是逆旋转，必须与中心差分一致"""
+        lm = self._model(rope)
+        ids = [1, 4, 2, 5, 3]
+        lm.zero_grad()
+        lm._loss_and_backward(ids)
+        # _loss_and_backward 逐次累加梯度 → 先深拷贝快照，再跑数值
+        snapshot = {}
+        for name, _param, grad in lm._named_params():
+            snapshot[name] = [list(row) if isinstance(row, list) else row for row in grad]
+        params = {name: p for name, p, _g in lm._named_params()}
+        eps = 1e-6
+        checks = [("L0.attn.W_q", 1, 2), ("L0.attn.W_k", 3, 5), ("L0.attn.W_v", 2, 6),
+                  ("L0.ffn.W1", 2, 4), ("emb.weight", 2, 5), ("out.W", 3, 1)]
+        for name, i, j in checks:
+            ana = snapshot[name][i][j]
+            param = params[name]
+            old = param[i][j]
+            param[i][j] = old + eps
+            hi = lm._loss_and_backward(ids)
+            param[i][j] = old - eps
+            lo = lm._loss_and_backward(ids)
+            param[i][j] = old
+            num = (hi - lo) / (2 * eps)
+            assert abs(ana - num) <= 1e-5 * max(1.0, abs(num)), f"{name}[{i}][{j}]"
+
+
+class TestKVCache:
+    def _model(self, max_len, rope=False, layers=2):
+        random.seed(1000)
+        return AI.CausalLM(7, d_model=8, num_heads=2, d_ff=16, num_layers=layers,
+                           max_len=max_len, dropout=0.0, rope=rope)
+
+    @pytest.mark.parametrize("max_len", [32, 4])
+    @pytest.mark.parametrize("rope", [False, True])
+    def test_cached_generation_equals_recompute(self, max_len, rope):
+        """KV cache 版生成必须与每步整段重算给出完全相同的 token"""
+        lm = self._model(max_len, rope)
+        prompt = [1, 2, 3]
+        a = lm.generate(list(prompt), max_new_tokens=8, temperature=0.7, top_k=3,
+                        rng=random.Random(7), use_cache=False)
+        b = lm.generate(list(prompt), max_new_tokens=8, temperature=0.7, top_k=3,
+                        rng=random.Random(7), use_cache=True)
+        assert a == b
+
+    def test_cached_generation_after_training(self):
+        """训练过的权重（非初始化值）下也要一致"""
+        lm = self._model(32)
+        lm.fit([[1, 2, 3, 4, 1, 2], [2, 3, 4, 5, 2, 3]], epochs=3, lr=0.05, seed=3)
+        a = lm.generate([1, 2], max_new_tokens=6, rng=random.Random(11), use_cache=False)
+        b = lm.generate([1, 2], max_new_tokens=6, rng=random.Random(11), use_cache=True)
+        assert a == b
+
+    def test_generate_does_not_mutate_parameters(self):
+        lm = self._model(16)
+        before = [list(p) for _n, p, _g in lm._named_params()]
+        lm.generate([1, 2, 3], max_new_tokens=5, rng=random.Random(1))
+        after = [list(p) for _n, p, _g in lm._named_params()]
+        assert before == after
