@@ -137,7 +137,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
 | `Sequential` | 层序列容器（不含 train/eval，内部的 Dropout 需自行切换） |
-| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码；`window=N` 时改成滑动窗口（局部因果，只看最近 N 个位置）；`rope=True` 时对 Q/K 加旋转位置编码；`dropout>0` 时对注意力权重做 inverted dropout（`eval()` 关闭） |
+| `MultiHeadAttention` | 多头注意力；`causal=True` 时加因果掩码；`window=N` 时改成滑动窗口（局部因果，只看最近 N 个位置）；`num_kv_heads=K` 时用 GQA/MQA（多个 Q 头共享一组 K/V）；`rope=True` 时对 Q/K 加旋转位置编码；`dropout>0` 时对注意力权重做 inverted dropout（`eval()` 关闭） |
 
 > **早停与权重回滚**：`fit(patience=...)` 在指标不再改善时停止训练，但**不会自动回滚**
 > 到最优那一轮；需要最优权重时传 `restore_best_weights=True`。
@@ -239,6 +239,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
 | `MultiHeadAttention(window=N)` | 滑动窗口（Mistral 式局部因果）：只看最近 N 个位置，代价 O(T·window) |
 | `generate(..., top_p=0.9)` | nucleus 采样：按概率累加保留头部集合（与 `top_k` 可叠加；默认 1.0 不过滤） |
+| `MultiHeadAttention(num_kv_heads=K)` | GQA/MQA：K 个 Q 头共享一组 K/V，`W_k`/`W_v` 与 KV cache 同比例缩小 |
 
 **RoPE + KV cache**：`CausalLM(..., rope=True)` 会默认关掉绝对位置编码（Llama 的做法），
 想两者同时用可传 `use_abs_pos=True`。
@@ -267,6 +268,19 @@ out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5, use_cache=False)  # 结
 
 **nucleus 采样**：`generate(..., top_p=0.9)` 按温度缩放后的概率从高到低累加，保留累计概率
 刚好覆盖 0.9 的头部集合再采样；`top_p=1.0`（默认）不做过滤，输出与旧版逐位一致。
+
+**GQA / MQA**：`CausalLM(..., num_kv_heads=2)`（或 `MultiHeadAttention(num_kv_heads=2)`）
+让每 `num_heads/num_kv_heads` 个 Q 头共享一组 K/V——Llama-2 70B、Mistral 都用这套。
+`W_k`/`W_v` 的输出维度从 `d_model` 缩到 `num_kv_heads*d_k`（参数与 KV cache 同比例变小），
+反向时同组 Q 头的 `dK`/`dV` 在 KV 头上相加。`num_kv_heads` 缺省等于 `num_heads`，
+此时张量形状、随机数抽取顺序都与旧版完全一致；`num_kv_heads=1` 即 MQA。
+
+```python
+lm = CausalLM(vocab_size=32, d_model=64, num_heads=8, d_ff=128,
+              num_layers=2, num_kv_heads=2)   # 8 个 Q 头 → 2 组 K/V
+lm.fit(seqs, epochs=50, lr=3e-3)
+out = lm.generate([1, 2, 3], max_new_tokens=32, use_cache=True)
+```
 
 ### 训练工程化工具
 
@@ -488,7 +502,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-362 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+369 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -513,6 +527,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestWindowMask` | 窗口外权重恰为 0、窗口注意力保持因果性、`forward_step` == 整段前向最后一行（含 RoPE）、**带窗口时 `W_v` 梯度 vs 数值梯度** |
 | `TestTopPSampling` | `top_p=1.0` 与旧行为逐位相同、nucleus 只留头部集合、cache 与重算路径一致、非法 `top_p` 报错 |
 | `TestAvgPool2d` | 平均池化前向值、反向均分、`dx` vs 数值梯度、`GlobalAvgPool2d` 形状、非法 kernel/stride |
+| `TestGQA` | KV 头形状、`num_kv_heads` 缺省与显式传等值逐位一致、**共享 KV 下 `W_k`/`W_v` 梯度 vs 数值梯度**、`forward_step` == 整段前向、参数确实变少、非法取值 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -521,6 +536,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 362 个单元测试
+├── test_ai.py       # 369 个单元测试
 └── README.md
 ```

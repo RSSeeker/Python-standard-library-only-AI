@@ -1658,7 +1658,7 @@ class MultiHeadAttention:
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  causal: bool = False, rope: bool = False, rope_base: float = 10000.0,
-                 window: int = None):
+                 window: int = None, num_kv_heads: int = None):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -1674,6 +1674,11 @@ class MultiHeadAttention:
         rope: 为 True 时给 Q/K 加旋转位置编码（RoPE，Llama 系）。旋转是正交变换，
         只改"方向"不改模长，attention 分数里自然带上相对位置信息，外推性比
         固定 sin/cos 绝对位置编码好得多。默认 False 时与原行为逐位一致。
+
+        num_kv_heads: GQA / MQA 的 KV 头数（Llama-2 70B、Mistral 用）。设成小于
+        num_heads 时，多个 Q 头共享同一组 K/V：`W_k`/`W_v` 的输出维度从 d_model
+        缩到 num_kv_heads*d_k，KV cache 同比例变小。默认 None 等于 num_heads，
+        即普通 MHA——此时所有张量形状、随机数抽取顺序都与旧版一致。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
@@ -1706,19 +1711,39 @@ class MultiHeadAttention:
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.dropout_p = dropout
+        # GQA / MQA：KV 头数可以少于 Q 头数，每 num_heads/num_kv_heads 个 Q 头
+        # 共享同一组 K/V。None = num_heads（普通 MHA，形状与旧版完全一致）。
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if isinstance(num_kv_heads, bool) or not isinstance(num_kv_heads, int):
+            raise ValueError(
+                f"MultiHeadAttention: num_kv_heads 必须是正整数，收到 {num_kv_heads!r}"
+            )
+        if num_kv_heads < 1 or num_kv_heads > num_heads:
+            raise ValueError(
+                f"MultiHeadAttention: num_kv_heads 必须在 1..{num_heads} 内，收到 {num_kv_heads}"
+            )
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"MultiHeadAttention: num_heads={num_heads} 必须能被 "
+                f"num_kv_heads={num_kv_heads} 整除"
+            )
+        self.num_kv_heads = num_kv_heads
+        self.kv_dim = num_kv_heads * self.d_k   # W_k/W_v 的输出维度（KV cache 宽度）
+        self.kv_group = num_heads // num_kv_heads
         # RoPE 的成对频率：第 i 对用 base^(-2i/d_k)，与 Llama 一致
         self.rope_freqs = [1.0 / (self.rope_base ** (2.0 * i / self.d_k))
                            for i in range(self.d_k // 2)]
 
         std = math.sqrt(2.0 / d_model)
         self.W_q = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
-        self.W_k = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
-        self.W_v = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
+        self.W_k = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(self.kv_dim)]
+        self.W_v = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(self.kv_dim)]
         self.W_o = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
 
         self.b_q = [0.0] * d_model
-        self.b_k = [0.0] * d_model
-        self.b_v = [0.0] * d_model
+        self.b_k = [0.0] * self.kv_dim
+        self.b_v = [0.0] * self.kv_dim
         self.b_o = [0.0] * d_model
 
         self._init_adam()
@@ -1737,10 +1762,11 @@ class MultiHeadAttention:
         d = self.d_model
         def zeros_2d(r, c):
             return [[0.0] * c for _ in range(r)]
+        kv = self.kv_dim
         self.grads = {
             "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
-            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
-            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_k": zeros_2d(kv, d), "b_k": [0.0] * kv,
+            "W_v": zeros_2d(kv, d), "b_v": [0.0] * kv,
             "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
         }
 
@@ -1748,13 +1774,14 @@ class MultiHeadAttention:
         d = self.d_model
         def zeros_2d(r, c):
             return [[0.0] * c for _ in range(r)]
+        kv = self.kv_dim
         self.m_W_q = zeros_2d(d, d); self.v_W_q = zeros_2d(d, d)
-        self.m_W_k = zeros_2d(d, d); self.v_W_k = zeros_2d(d, d)
-        self.m_W_v = zeros_2d(d, d); self.v_W_v = zeros_2d(d, d)
+        self.m_W_k = zeros_2d(kv, d); self.v_W_k = zeros_2d(kv, d)
+        self.m_W_v = zeros_2d(kv, d); self.v_W_v = zeros_2d(kv, d)
         self.m_W_o = zeros_2d(d, d); self.v_W_o = zeros_2d(d, d)
         self.m_b_q = [0.0] * d; self.v_b_q = [0.0] * d
-        self.m_b_k = [0.0] * d; self.v_b_k = [0.0] * d
-        self.m_b_v = [0.0] * d; self.v_b_v = [0.0] * d
+        self.m_b_k = [0.0] * kv; self.v_b_k = [0.0] * kv
+        self.m_b_v = [0.0] * kv; self.v_b_v = [0.0] * kv
         self.m_b_o = [0.0] * d; self.v_b_o = [0.0] * d
 
     def train(self):
@@ -1794,33 +1821,40 @@ class MultiHeadAttention:
         d = self.d_model
         h = self.num_heads
         d_k = self.d_k
+        kv = self.kv_dim
         q = [sum(map(_mul, self.W_q[j], x_t)) + self.b_q[j] for j in range(d)]
-        k = [sum(map(_mul, self.W_k[j], x_t)) + self.b_k[j] for j in range(d)]
-        v = [sum(map(_mul, self.W_v[j], x_t)) + self.b_v[j] for j in range(d)]
+        k = [sum(map(_mul, self.W_k[j], x_t)) + self.b_k[j] for j in range(kv)]
+        v = [sum(map(_mul, self.W_v[j], x_t)) + self.b_v[j] for j in range(kv)]
         pos = cache.get("pos", 0)
         cache["pos"] = pos + 1
-        K = cache.setdefault("K", [[] for _ in range(h)])
-        V = cache.setdefault("V", [[] for _ in range(h)])
+        n_kv = self.num_kv_heads
+        K = cache.setdefault("K", [[] for _ in range(n_kv)])
+        V = cache.setdefault("V", [[] for _ in range(n_kv)])
         scale = 1.0 / math.sqrt(d_k)
         concat = [0.0] * d
         for head in range(h):
             off = head * d_k
+            # GQA：每 kv_group 个 Q 头共享一组 K/V（cache 也按 kv 头存）
+            kv_head = head // self.kv_group
+            kv_off = kv_head * d_k
             qh = q[off:off + d_k]
-            kh = k[off:off + d_k]
-            vh = v[off:off + d_k]
+            kh = k[kv_off:kv_off + d_k]
+            vh = v[kv_off:kv_off + d_k]
             if self.rope:
                 qh = self._rope_apply(qh, pos)
                 kh = self._rope_apply(kh, pos)
-            K[head].append(kh)
-            V[head].append(vh)
-            keys = K[head]
+            if len(K[kv_head]) == pos:
+                # 同一组的第一个 Q 头负责写入，后续 Q 头复用（不重复 append）
+                K[kv_head].append(kh)
+                V[kv_head].append(vh)
+            keys = K[kv_head]
             scores = [sum(map(_mul, qh, keys[j])) * scale for j in range(len(keys))]
             if self.window is not None:
                 # 增量前向只有「过去 + 自己」，窗口外的更早位置要屏蔽（与 forward 一致）
                 for j in range(max(0, pos - self.window + 1)):
                     scores[j] = float("-inf")
             attn = _softmax_row(scores)
-            cols = list(zip(*V[head]))
+            cols = list(zip(*V[kv_head]))
             out = [sum(map(_mul, attn, col)) for col in cols]
             concat[off:off + d_k] = out
         return [sum(map(_mul, self.W_o[j], concat)) + self.b_o[j] for j in range(d)]
@@ -1834,13 +1868,15 @@ class MultiHeadAttention:
         h = self.num_heads
 
         # 线性投影 Q, K, V
+        kv = self.kv_dim
         q_full = _matmul(x_seq, _transpose(self.W_q))  # (seq_len, d_model)
-        k_full = _matmul(x_seq, _transpose(self.W_k))
+        k_full = _matmul(x_seq, _transpose(self.W_k))  # (seq_len, kv_dim)
         v_full = _matmul(x_seq, _transpose(self.W_v))
         # 加 bias
         for t in range(self.seq_len):
             for j in range(self.d_model):
                 q_full[t][j] += self.b_q[j]
+            for j in range(kv):
                 k_full[t][j] += self.b_k[j]
                 v_full[t][j] += self.b_v[j]
 
@@ -1850,9 +1886,11 @@ class MultiHeadAttention:
         self.V = []
         for head in range(h):
             offset = head * d_k
+            # GQA：Q 头按组映射到 KV 头（num_kv_heads == num_heads 时即 head 本身）
+            kv_off = (head // self.kv_group) * d_k
             q_h = [[q_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
-            k_h = [[k_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
-            v_h = [[v_full[t][offset + j] for j in range(d_k)] for t in range(self.seq_len)]
+            k_h = [[k_full[t][kv_off + j] for j in range(d_k)] for t in range(self.seq_len)]
+            v_h = [[v_full[t][kv_off + j] for j in range(d_k)] for t in range(self.seq_len)]
             if self.rope:
                 # 每个位置用自己的绝对位置角旋转（q 与 k 都转，v 不动）
                 q_h = [self._rope_apply(q_h[t], t) for t in range(self.seq_len)]
@@ -1931,6 +1969,7 @@ class MultiHeadAttention:
         h = self.num_heads
         d_k = self.d_k
         d_model = self.d_model
+        kv = self.kv_dim
         seq_len = self.seq_len
 
         # 1. d_output → d_concat (通过 W_o)
@@ -1997,16 +2036,24 @@ class MultiHeadAttention:
             dV_list.append(dV)
 
         # 4. 拼接各头的 dQ, dK, dV → (seq_len, d_model)
+        kv = self.kv_dim
         dQ_full = [[0.0] * d_model for _ in range(seq_len)]
-        dK_full = [[0.0] * d_model for _ in range(seq_len)]
-        dV_full = [[0.0] * d_model for _ in range(seq_len)]
+        dK_full = [[0.0] * kv for _ in range(seq_len)]
+        dV_full = [[0.0] * kv for _ in range(seq_len)]
+        share_kv = self.num_kv_heads != h
         for head in range(h):
             offset = head * d_k
+            kv_off = (head // self.kv_group) * d_k
             for t in range(seq_len):
                 for j in range(d_k):
                     dQ_full[t][offset + j] = dQ_list[head][t][j]
-                    dK_full[t][offset + j] = dK_list[head][t][j]
-                    dV_full[t][offset + j] = dV_list[head][t][j]
+                    if share_kv:
+                        # 多个 Q 头共享同一组 K/V：它们的梯度要相加
+                        dK_full[t][kv_off + j] += dK_list[head][t][j]
+                        dV_full[t][kv_off + j] += dV_list[head][t][j]
+                    else:
+                        dK_full[t][kv_off + j] = dK_list[head][t][j]
+                        dV_full[t][kv_off + j] = dV_list[head][t][j]
 
         # 5. 通过投影矩阵反传梯度
         # 前向是 q_full = x @ W_q^T，即 W_q[b][a] 表示「输入 a → 输出 b」，
@@ -2016,8 +2063,8 @@ class MultiHeadAttention:
         grad_W_k = _matmul(_transpose(dK_full), self.x)
         grad_W_v = _matmul(_transpose(dV_full), self.x)
         grad_b_q = [sum(dQ_full[t][j] for t in range(seq_len)) for j in range(d_model)]
-        grad_b_k = [sum(dK_full[t][j] for t in range(seq_len)) for j in range(d_model)]
-        grad_b_v = [sum(dV_full[t][j] for t in range(seq_len)) for j in range(d_model)]
+        grad_b_k = [sum(dK_full[t][j] for t in range(seq_len)) for j in range(kv)]
+        grad_b_v = [sum(dV_full[t][j] for t in range(seq_len)) for j in range(kv)]
 
         # d_x = dQ_full @ W_q^T + dK_full @ W_k^T + dV_full @ W_v^T
         dx_q = _matmul(dQ_full, self.W_q)
@@ -2030,13 +2077,15 @@ class MultiHeadAttention:
         for i in range(self.d_model):
             for j in range(self.d_model):
                 self.grads["W_q"][i][j] += grad_W_q[i][j]
-                self.grads["W_k"][i][j] += grad_W_k[i][j]
-                self.grads["W_v"][i][j] += grad_W_v[i][j]
                 self.grads["W_o"][i][j] += grad_W_o[i][j]
             self.grads["b_q"][i] += grad_b_q[i]
+            self.grads["b_o"][i] += grad_b_o[i]
+        for i in range(kv):
+            for j in range(self.d_model):
+                self.grads["W_k"][i][j] += grad_W_k[i][j]
+                self.grads["W_v"][i][j] += grad_W_v[i][j]
             self.grads["b_k"][i] += grad_b_k[i]
             self.grads["b_v"][i] += grad_b_v[i]
-            self.grads["b_o"][i] += grad_b_o[i]
         return dx_seq
 
 
@@ -2201,11 +2250,13 @@ class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
-                 causal: bool = False, rope: bool = False, window: int = None):
+                 causal: bool = False, rope: bool = False, window: int = None,
+                 num_kv_heads: int = None):
         # causal=True 时自注意力加因果掩码（自回归语言模型用）；
         # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
-                                            causal=causal, rope=rope, window=window)
+                                            causal=causal, rope=rope, window=window,
+                                            num_kv_heads=num_kv_heads)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -2368,12 +2419,13 @@ class TransformerEncoder:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
                  num_layers: int = 6, dropout: float = 0.1, causal: bool = False,
-                 rope: bool = False, window: int = None):
+                 rope: bool = False, window: int = None, num_kv_heads: int = None):
         """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
         self.causal = bool(causal)
         self.layers = [
             TransformerEncoderLayer(d_model, num_heads, d_ff, dropout,
-                                    causal=causal, rope=rope, window=window)
+                                    causal=causal, rope=rope, window=window,
+                                    num_kv_heads=num_kv_heads)
             for _ in range(num_layers)
         ]
 
@@ -2559,7 +2611,7 @@ class CausalLM:
     def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
                  d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
                  dropout: float = 0.0, rope: bool = False, use_abs_pos=None,
-                 window: int = None):
+                 window: int = None, num_kv_heads: int = None):
         if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
             raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
         if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
@@ -2579,7 +2631,7 @@ class CausalLM:
         self.pos = PositionalEncoding(d_model, max_len)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
                                           dropout, causal=True, rope=self.rope,
-                                          window=window)
+                                          window=window, num_kv_heads=num_kv_heads)
 
         std = math.sqrt(2.0 / d_model)
         self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]

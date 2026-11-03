@@ -3818,3 +3818,99 @@ class TestAvgPool2d:
         with pytest.raises(ValueError):
             # 5x5 kernel 套 4x4 输入：输出尺寸 <= 0
             AI.AvgPool2d(5).forward([[[0.0] * 4 for _ in range(4)]])
+
+class TestGQA:
+    """GQA / MQA：num_kv_heads 少于 num_heads 时多个 Q 头共享一组 K/V"""
+
+    def test_kv_shapes(self):
+        m = AI.MultiHeadAttention(8, 4, num_kv_heads=2)
+        assert m.d_k == 2 and m.kv_dim == 4 and m.kv_group == 2
+        assert len(m.W_k) == 4 and len(m.W_k[0]) == 8   # (kv_dim, d_model)
+        assert len(m.W_q) == 8 and len(m.W_q[0]) == 8   # Q 头不变
+        assert len(m.b_k) == 4 and len(m.grads["W_k"]) == 4
+        assert len(m.m_W_k) == 4 and len(m.v_W_k[0]) == 8
+
+    def test_mqa_single_kv_head(self):
+        m = AI.MultiHeadAttention(8, 4, num_kv_heads=1)
+        assert m.kv_dim == 2 and m.kv_group == 4
+
+    def test_default_equals_none(self):
+        """num_kv_heads 缺省与显式传 num_heads 逐位一致"""
+        random.seed(71)
+        a = AI.MultiHeadAttention(8, 2, causal=True)
+        random.seed(71)
+        b = AI.MultiHeadAttention(8, 2, causal=True, num_kv_heads=2)
+        a.eval(); b.eval()
+        random.seed(72)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        assert a.forward(seq) == b.forward(seq)
+
+    def test_gradient_numeric(self):
+        """共享 KV 头后，dK/dV 要在组内求和——用中心差分验证"""
+        random.seed(73)
+        m = AI.MultiHeadAttention(8, 4, num_kv_heads=2, causal=True)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        dout = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+
+        def loss():
+            out = m.forward(seq)
+            return sum(out[t][j] * dout[t][j] for t in range(4) for j in range(8))
+
+        m.forward(seq)
+        m.zero_grad()
+        m.backward(dout)
+        ana_wk = [row[:] for row in m.grads["W_k"]]
+        ana_wv = [row[:] for row in m.grads["W_v"]]
+        eps = 1e-6
+        for i, j in ((0, 3), (3, 5)):
+            old = m.W_k[i][j]
+            m.W_k[i][j] = old + eps
+            lp = loss()
+            m.W_k[i][j] = old - eps
+            lm = loss()
+            m.W_k[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(ana_wk[i][j] - num) / max(1.0, abs(num)) < 1e-6
+        for i, j in ((2, 1),):
+            old = m.W_v[i][j]
+            m.W_v[i][j] = old + eps
+            lp = loss()
+            m.W_v[i][j] = old - eps
+            lm = loss()
+            m.W_v[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(ana_wv[i][j] - num) / max(1.0, abs(num)) < 1e-6
+
+    def test_forward_step_matches_forward(self):
+        """KV cache 按 kv 头存，增量前向仍与整段前向最后一行逐位一致"""
+        for rope in (False, True):
+            random.seed(74)
+            m = AI.MultiHeadAttention(8, 4, num_kv_heads=2, causal=True, rope=rope)
+            m.eval()
+            seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(5)]
+            full = m.forward(seq)
+            cache = {}
+            for tok in seq:
+                last = m.forward_step(tok, cache)
+            assert last == full[-1]
+            assert len(cache["K"]) == 2 and len(cache["K"][0]) == 5
+
+    def test_fewer_params(self):
+        def count(m):
+            n = 0
+            for _, p, _ in m._named_params():
+                n += sum(len(r) for r in p) if p and isinstance(p[0], list) else len(p)
+            return n
+
+        random.seed(75)
+        full = AI.CausalLM(vocab_size=7, d_model=8, num_heads=4, d_ff=16,
+                           num_layers=1, max_len=12)
+        random.seed(75)
+        gqa = AI.CausalLM(vocab_size=7, d_model=8, num_heads=4, d_ff=16,
+                          num_layers=1, max_len=12, num_kv_heads=2)
+        assert count(gqa) < count(full)
+
+    def test_invalid_num_kv_heads(self):
+        for bad in (0, -1, 3, 8, True, 1.5):
+            with pytest.raises(ValueError):
+                AI.MultiHeadAttention(8, 4, num_kv_heads=bad)
