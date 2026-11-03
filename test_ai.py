@@ -4073,3 +4073,196 @@ class TestPerplexity:
         lm.eval()
         ppl = lm.perplexity([[0, 1]])
         assert isinstance(ppl, float) and ppl > 0
+
+class TestCrossAttention:
+    """编码器-解码器交叉注意力"""
+
+    def _setup(self, seed=101, d=4, heads=2, tq=3, tk=2):
+        random.seed(seed)
+        ca = AI.CrossAttention(d, heads)
+        x = [[random.gauss(0, 1) for _ in range(d)] for _ in range(tq)]
+        mem = [[random.gauss(0, 1) for _ in range(d)] for _ in range(tk)]
+        dout = [[random.gauss(0, 1) for _ in range(d)] for _ in range(tq)]
+        return ca, x, mem, dout
+
+    def test_shapes_and_memory_dependence(self):
+        ca, x, mem, _ = self._setup()
+        out = ca.forward(x, mem)
+        assert len(out) == 3 and len(out[0]) == 4
+        assert len(ca.attn_weights[0]) == 3 and len(ca.attn_weights[0][0]) == 2
+        mem2 = [list(r) for r in mem]
+        mem2[0][0] += 1.0
+        out2 = ca.forward(x, mem2)
+        assert any(abs(out[t][j] - out2[t][j]) > 1e-12
+                   for t in range(3) for j in range(4))
+
+    def test_no_causal_mask(self):
+        """交叉注意力没有因果掩码：每个 query 位置都能看到整段 memory"""
+        ca, x, mem, _ = self._setup()
+        ca.forward(x, mem)
+        for t in range(3):
+            assert abs(sum(ca.attn_weights[0][t]) - 1.0) < 1e-12
+            assert all(ca.attn_weights[0][t][j] > 0.0 for j in range(2))
+
+    def test_gradient_numeric(self):
+        ca, x, mem, dout = self._setup(seed=102)
+        eps = 1e-6
+
+        def loss():
+            o = ca.forward(x, mem)
+            return sum(o[t][j] * dout[t][j] for t in range(3) for j in range(4))
+
+        ca.forward(x, mem)
+        dx, dmem = ca.backward(dout)
+        for t in range(3):
+            for j in range(4):
+                old = x[t][j]
+                x[t][j] = old + eps
+                lp = loss()
+                x[t][j] = old - eps
+                lm = loss()
+                x[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(dx[t][j] - num) / max(1.0, abs(num)) < 1e-6
+        for t in range(2):
+            for j in range(4):
+                old = mem[t][j]
+                mem[t][j] = old + eps
+                lp = loss()
+                mem[t][j] = old - eps
+                lm = loss()
+                mem[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(dmem[t][j] - num) / max(1.0, abs(num)) < 1e-6
+        mat = ca.W_k
+        for i, j in ((0, 1), (2, 3)):
+            old = mat[i][j]
+            mat[i][j] = old + eps
+            lp = loss()
+            mat[i][j] = old - eps
+            lm = loss()
+            mat[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(ca.grads["W_k"][i][j] - num) / max(1.0, abs(num)) < 1e-6
+
+    def test_dropout_train_eval(self):
+        random.seed(103)
+        ca = AI.CrossAttention(4, 1, dropout=0.5)
+        x = [[1.0, 0.5, -0.5, 0.2]]
+        mem = [[0.3, -0.2, 0.1, 0.4], [0.0, 0.6, -0.4, 0.2]]
+        ca.eval()
+        assert ca.forward(x, mem) == ca.forward(x, mem)
+        assert ca.attn_masks[0] is None
+        ca.train()
+        random.seed(104)
+        assert any(ca.forward(x, mem) is not None for _ in range(1))
+
+    def test_invalid(self):
+        for args in ((8, 3, 0.0), (8, 2, 1.0), (8, 2, -0.1)):
+            with pytest.raises(ValueError):
+                AI.CrossAttention(*args)
+        ca = AI.CrossAttention(4, 2)
+        with pytest.raises(ValueError):
+            ca.forward([[0.0] * 3], [[0.0] * 4])
+        with pytest.raises(ValueError):
+            ca.forward([[0.0] * 4], [])
+
+
+class TestTransformerDecoder:
+    """解码器层 / 堆叠解码器"""
+
+    def test_self_attn_causal_cross_attn_not(self):
+        random.seed(111)
+        layer = AI.TransformerDecoderLayer(8, 2, 16, dropout=0.0)
+        layer.eval()
+        xs = [[random.gauss(0, 1) for _ in range(8)] for _ in range(3)]
+        ms = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        o1 = layer.forward(xs, ms)
+        xs2 = [list(r) for r in xs]
+        xs2[-1] = [v + 1.0 for v in xs2[-1]]
+        o2 = layer.forward(xs2, ms)
+        assert all(o1[t][j] == o2[t][j] for t in range(2) for j in range(8))
+        assert o1[-1] != o2[-1]
+        ms2 = [list(r) for r in ms]
+        ms2[0][0] += 1.0
+        o3 = layer.forward(xs, ms2)
+        assert any(abs(o1[t][j] - o3[t][j]) > 1e-12
+                   for t in range(3) for j in range(8))
+
+    def test_gradient_numeric(self):
+        random.seed(112)
+        layer = AI.TransformerDecoderLayer(4, 2, 8, dropout=0.0)
+        xs = [[random.gauss(0, 1) for _ in range(4)] for _ in range(2)]
+        ms = [[random.gauss(0, 1) for _ in range(4)] for _ in range(3)]
+        dout = [[random.gauss(0, 1) for _ in range(4)] for _ in range(2)]
+        eps = 1e-6
+
+        def loss():
+            o = layer.forward(xs, ms)
+            return sum(o[t][j] * dout[t][j] for t in range(2) for j in range(4))
+
+        layer.forward(xs, ms)
+        dx, dmem = layer.backward(dout)
+        for t in range(2):
+            for j in range(4):
+                old = xs[t][j]
+                xs[t][j] = old + eps
+                lp = loss()
+                xs[t][j] = old - eps
+                lm = loss()
+                xs[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(dx[t][j] - num) / max(1.0, abs(num)) < 1e-5
+        for t in range(3):
+            for j in range(4):
+                old = ms[t][j]
+                ms[t][j] = old + eps
+                lp = loss()
+                ms[t][j] = old - eps
+                lm = loss()
+                ms[t][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(dmem[t][j] - num) / max(1.0, abs(num)) < 1e-5
+        mat = layer.cross_attn.W_k
+        old = mat[0][1]
+        mat[0][1] = old + eps
+        lp = loss()
+        mat[0][1] = old - eps
+        lm = loss()
+        mat[0][1] = old
+        num = (lp - lm) / (2 * eps)
+        assert abs(layer.cross_attn.grads["W_k"][0][1] - num) / max(1.0, abs(num)) < 1e-5
+
+    def test_decoder_single_layer_matches_layer(self):
+        """单层 TransformerDecoder 的 dmemory 与直接调该层逐位相同"""
+        random.seed(113)
+        dec = AI.TransformerDecoder(8, 2, 16, num_layers=1, dropout=0.0)
+        dec.eval()
+        xs = [[random.gauss(0, 1) for _ in range(8)] for _ in range(3)]
+        ms = [[random.gauss(0, 1) for _ in range(8)] for _ in range(5)]
+        dout = [[random.gauss(0, 1) for _ in range(8)] for _ in range(3)]
+        dec.forward(xs, ms)
+        dx1, dm1 = dec.backward(dout)
+        dec.layers[0].forward(xs, ms)
+        dx2, dm2 = dec.layers[0].backward(dout)
+        assert dx1 == dx2
+        assert dm1 == dm2
+
+    def test_multi_layer_dmemory_sums(self):
+        random.seed(114)
+        dec = AI.TransformerDecoder(8, 2, 16, num_layers=3, dropout=0.0)
+        dec.eval()
+        xs = [[random.gauss(0, 1) for _ in range(8)] for _ in range(2)]
+        ms = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        out = dec.forward(xs, ms)
+        assert len(out) == 2 and len(out[0]) == 8
+        dout = [[1.0] * 8 for _ in range(2)]
+        dx, dmem = dec.backward(dout)
+        assert len(dmem) == 4 and len(dmem[0]) == 8
+        assert any(abs(v) > 0 for row in dmem for v in row)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.TransformerDecoder(8, 2, 16, num_layers=0)
+        with pytest.raises(ValueError):
+            AI.TransformerDecoder(8, 2, 16, num_layers=-2)

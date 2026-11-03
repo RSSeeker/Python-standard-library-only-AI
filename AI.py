@@ -4,7 +4,7 @@
   - Layer / MLP（全连接层 + 激活函数）
   - Conv2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
-  - Transformer（MultiHeadAttention / FeedForward / Encoder / PositionalEncoding）
+  - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
   - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
@@ -2629,6 +2629,448 @@ class TransformerEncoder:
         for layer in reversed(self.layers):
             dout_seq = layer.backward(dout_seq)
         return dout_seq
+
+    def sgd_step(self, lr: float):
+        """对每一层做一次 SGD 参数更新"""
+        for layer in self.layers:
+            layer.sgd_step(lr)
+
+
+class CrossAttention:
+    """多头交叉注意力（encoder-decoder 的 decoder 端）
+
+    Q 来自解码器自己的序列 x_seq `(Tq, d_model)`，K/V 来自编码器输出
+    memory `(Tk, d_model)`：两者长度可以不同，也不需要 causal 掩码——
+    解码器对整段 memory 是全可见的。所以这里没有 causal / window / rope
+    参数（位置信息由各自那侧的注入方式决定）。
+
+    backward 返回 `(dx, dmemory)`：既要把梯度传回解码器上一层，也要传回
+    编码器（多层 decoder 共享同一份 memory，各层的 dmemory 相加）。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
+        """dropout: 交叉注意力权重上的 inverted dropout（训练模式生效）"""
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(
+                f"CrossAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"CrossAttention: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.dropout = dropout
+        self.training = True
+        self.rng = random
+
+        std = math.sqrt(2.0 / d_model)
+        self.W_q = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
+        self.W_k = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
+        self.W_v = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
+        self.W_o = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
+        self.b_q = [0.0] * d_model
+        self.b_k = [0.0] * d_model
+        self.b_v = [0.0] * d_model
+        self.b_o = [0.0] * d_model
+
+        self._init_adam()
+        self.zero_grad()
+
+        self.x = None          # (Tq, d_model) 解码器侧输入
+        self.memory = None     # (Tk, d_model) 编码器输出
+        self.Q = self.K = self.V = None
+        self.attn_weights = None
+        self.attn_dropped = None
+        self.attn_masks = None
+        self.concat = None
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        d = self.d_model
+        zeros_2d = lambda r, c: [[0.0] * c for _ in range(r)]
+        self.grads = {
+            "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
+            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
+            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
+        }
+
+    def _init_adam(self):
+        d = self.d_model
+        zeros_2d = lambda r, c: [[0.0] * c for _ in range(r)]
+        self.m_W_q = zeros_2d(d, d); self.v_W_q = zeros_2d(d, d)
+        self.m_W_k = zeros_2d(d, d); self.v_W_k = zeros_2d(d, d)
+        self.m_W_v = zeros_2d(d, d); self.v_W_v = zeros_2d(d, d)
+        self.m_W_o = zeros_2d(d, d); self.v_W_o = zeros_2d(d, d)
+        self.m_b_q = [0.0] * d; self.v_b_q = [0.0] * d
+        self.m_b_k = [0.0] * d; self.v_b_k = [0.0] * d
+        self.m_b_v = [0.0] * d; self.v_b_v = [0.0] * d
+        self.m_b_o = [0.0] * d; self.v_b_o = [0.0] * d
+
+    def train(self):
+        """训练模式：注意力权重 dropout 生效"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：关闭 dropout"""
+        self.training = False
+        return self
+
+    def forward(self, x_seq, memory):
+        """x_seq: (Tq, d_model) 解码器输入；memory: (Tk, d_model) 编码器输出"""
+        if len(x_seq) == 0:
+            raise ValueError("CrossAttention: x_seq 不能为空")
+        if len(memory) == 0:
+            raise ValueError("CrossAttention: memory 不能为空")
+        for t, row in enumerate(x_seq):
+            if len(row) != self.d_model:
+                raise ValueError(
+                    f"CrossAttention: x_seq[{t}] 长度 {len(row)} != d_model {self.d_model}")
+        for t, row in enumerate(memory):
+            if len(row) != self.d_model:
+                raise ValueError(
+                    f"CrossAttention: memory[{t}] 长度 {len(row)} != d_model {self.d_model}")
+        self.x = [list(row) for row in x_seq]
+        self.memory = [list(row) for row in memory]
+        tq, tk = len(x_seq), len(memory)
+        d, h, d_k = self.d_model, self.num_heads, self.d_k
+
+        q_full = _matmul(x_seq, _transpose(self.W_q))
+        k_full = _matmul(memory, _transpose(self.W_k))
+        v_full = _matmul(memory, _transpose(self.W_v))
+        for t in range(tq):
+            for j in range(d):
+                q_full[t][j] += self.b_q[j]
+        for t in range(tk):
+            for j in range(d):
+                k_full[t][j] += self.b_k[j]
+                v_full[t][j] += self.b_v[j]
+
+        self.Q, self.K, self.V = [], [], []
+        for head in range(h):
+            off = head * d_k
+            self.Q.append([[q_full[t][off + j] for j in range(d_k)] for t in range(tq)])
+            self.K.append([[k_full[t][off + j] for j in range(d_k)] for t in range(tk)])
+            self.V.append([[v_full[t][off + j] for j in range(d_k)] for t in range(tk)])
+
+        scale = 1.0 / math.sqrt(d_k)
+        self.attn_weights, self.attn_dropped, self.attn_masks = [], [], []
+        self.concat = [[0.0] * d for _ in range(tq)]
+        keep = 1.0 - self.dropout
+        inv = 1.0 / keep if keep > 0 else 1.0
+        for head in range(h):
+            q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
+            scores = [[v * scale for v in row] for row in _matmul(q_h, _transpose(k_h))]
+            # 交叉注意力没有因果掩码：解码器位置能看到整段 memory
+            attn = [_softmax_row(row) for row in scores]
+            mask = None
+            used = attn
+            if self.training and self.dropout > 0.0:
+                mask = [[inv if self.rng.random() < keep else 0.0 for _ in range(tk)]
+                        for _ in range(tq)]
+                used = [[attn[t][j] * mask[t][j] for j in range(tk)] for t in range(tq)]
+            out = _matmul(used, v_h)
+            self.attn_weights.append(attn)
+            self.attn_dropped.append(used)
+            self.attn_masks.append(mask)
+            off = head * d_k
+            for t in range(tq):
+                for j in range(d_k):
+                    self.concat[t][off + j] = out[t][j]
+
+        output = _matmul(self.concat, _transpose(self.W_o))
+        for t in range(tq):
+            for j in range(d):
+                output[t][j] += self.b_o[j]
+        return output
+
+    def backward(self, dout_seq):
+        """dout_seq: (Tq, d_model) → (dx_seq (Tq, d_model), dmemory (Tk, d_model))"""
+        tq, tk = len(self.x), len(self.memory)
+        d, h, d_k = self.d_model, self.num_heads, self.d_k
+        scale = 1.0 / math.sqrt(d_k)
+
+        d_concat = _matmul(dout_seq, self.W_o)
+        grad_W_o = _matmul(_transpose(dout_seq), self.concat)
+        grad_b_o = [sum(dout_seq[t][j] for t in range(tq)) for j in range(d)]
+
+        dQ_full = [[0.0] * d for _ in range(tq)]
+        dK_full = [[0.0] * d for _ in range(tk)]
+        dV_full = [[0.0] * d for _ in range(tk)]
+        for head in range(h):
+            off = head * d_k
+            attn = self.attn_weights[head]
+            used = self.attn_dropped[head]
+            mask = self.attn_masks[head]
+            V_h, Q_h, K_h = self.V[head], self.Q[head], self.K[head]
+            d_out = [[d_concat[t][off + j] for j in range(d_k)] for t in range(tq)]
+
+            dV = _matmul(_transpose(used), d_out)          # (Tk, d_k)
+            d_attn = _matmul(d_out, _transpose(V_h))       # (Tq, Tk)
+            if mask is not None:
+                for t in range(tq):
+                    row_d, row_m = d_attn[t], mask[t]
+                    for j in range(tk):
+                        row_d[j] *= row_m[j]
+            d_scores = []
+            for t in range(tq):
+                row_a, row_d = attn[t], d_attn[t]
+                s = sum(map(_mul, row_a, row_d))
+                d_scores.append([row_a[j] * (row_d[j] - s) * scale for j in range(tk)])
+            dQ = _matmul(d_scores, K_h)                     # (Tq, d_k)
+            dK = _matmul(_transpose(d_scores), Q_h)         # (Tk, d_k)
+            for t in range(tq):
+                for j in range(d_k):
+                    dQ_full[t][off + j] = dQ[t][j]
+            for t in range(tk):
+                for j in range(d_k):
+                    dK_full[t][off + j] = dK[t][j]
+                    dV_full[t][off + j] = dV[t][j]
+
+        grad_W_q = _matmul(_transpose(dQ_full), self.x)
+        grad_W_k = _matmul(_transpose(dK_full), self.memory)
+        grad_W_v = _matmul(_transpose(dV_full), self.memory)
+        grad_b_q = [sum(dQ_full[t][j] for t in range(tq)) for j in range(d)]
+        grad_b_k = [sum(dK_full[t][j] for t in range(tk)) for j in range(d)]
+        grad_b_v = [sum(dV_full[t][j] for t in range(tk)) for j in range(d)]
+
+        dx_seq = _matmul(dQ_full, self.W_q)
+        dmem_k = _matmul(dK_full, self.W_k)
+        dmem_v = _matmul(dV_full, self.W_v)
+        dmemory = [[dmem_k[t][j] + dmem_v[t][j] for j in range(d)] for t in range(tk)]
+
+        for i in range(d):
+            for j in range(d):
+                self.grads["W_q"][i][j] += grad_W_q[i][j]
+                self.grads["W_k"][i][j] += grad_W_k[i][j]
+                self.grads["W_v"][i][j] += grad_W_v[i][j]
+                self.grads["W_o"][i][j] += grad_W_o[i][j]
+            self.grads["b_q"][i] += grad_b_q[i]
+            self.grads["b_k"][i] += grad_b_k[i]
+            self.grads["b_v"][i] += grad_b_v[i]
+            self.grads["b_o"][i] += grad_b_o[i]
+        return dx_seq, dmemory
+
+    def sgd_step(self, lr: float):
+        """用累积的梯度做一次 SGD 参数更新"""
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _sgd_apply(getattr(self, name), self.grads[name], lr)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            _sgd_apply(getattr(self, name), self.grads[name], lr)
+
+
+class TransformerDecoderLayer:
+    """单层 Transformer Decoder：因果自注意力 → 交叉注意力 → FFN
+
+    三个子层各带「残差 + LayerNorm」：res1 = x + self_attn(x)；
+    res2 = ln1 + cross_attn(ln1, memory)；res3 = ln2 + ffn(ln2)。
+    结构与 TransformerEncoderLayer 保持一致（残差加的是子层输入），
+    多出来的第三块是交叉注意力。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
+                 causal: bool = True, window: int = None):
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
+                                            causal=causal, window=window)
+        self.cross_attn = CrossAttention(d_model, num_heads, dropout)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.ln1 = LayerNorm(d_model)
+        self.ln2 = LayerNorm(d_model)
+        self.ln3 = LayerNorm(d_model)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        self.dropout3 = Dropout(dropout)
+        self.d_model = d_model
+
+        self.zero_grad()
+        self.x = self.res1 = self.res2 = self.res3 = None
+        self.memory = None
+        self.dropout1_masks = self.dropout2_masks = self.dropout3_masks = None
+
+    def train(self):
+        """训练模式：三处 Dropout 与注意力 dropout 全部生效"""
+        self.self_attn.train()
+        self.cross_attn.train()
+        self.dropout1.train()
+        self.dropout2.train()
+        self.dropout3.train()
+        return self
+
+    def eval(self):
+        """推理模式：关闭全部 dropout"""
+        self.self_attn.eval()
+        self.cross_attn.eval()
+        self.dropout1.eval()
+        self.dropout2.eval()
+        self.dropout3.eval()
+        return self
+
+    def zero_grad(self):
+        """清零 LayerNorm 梯度，同时重置子模块梯度"""
+        d = self.d_model
+        self.grads = {
+            "ln1_gamma": [0.0] * d, "ln1_beta": [0.0] * d,
+            "ln2_gamma": [0.0] * d, "ln2_beta": [0.0] * d,
+            "ln3_gamma": [0.0] * d, "ln3_beta": [0.0] * d,
+        }
+        self.self_attn.zero_grad()
+        self.cross_attn.zero_grad()
+        self.ffn.zero_grad()
+
+    def forward(self, x_seq, memory):
+        d = self.d_model
+        self.x = [list(row) for row in x_seq]
+        self.memory = [list(row) for row in memory]
+        n = len(self.x)
+
+        attn_out = self.self_attn.forward(self.x)
+        self.dropout1_masks = []
+        attn_dropped = []
+        for a in attn_out:
+            dropped = self.dropout1.forward(a)
+            attn_dropped.append(dropped)
+            self.dropout1_masks.append(list(self.dropout1.mask))
+        self.res1 = [[self.x[t][j] + attn_dropped[t][j] for j in range(d)]
+                     for t in range(n)]
+        ln1_out = [self.ln1.forward(v) for v in self.res1]
+
+        cross_out = self.cross_attn.forward(ln1_out, memory)
+        self.dropout2_masks = []
+        cross_dropped = []
+        for c in cross_out:
+            dropped = self.dropout2.forward(c)
+            cross_dropped.append(dropped)
+            self.dropout2_masks.append(list(self.dropout2.mask))
+        self.res2 = [[ln1_out[t][j] + cross_dropped[t][j] for j in range(d)]
+                     for t in range(n)]
+        ln2_out = [self.ln2.forward(v) for v in self.res2]
+
+        ffn_out = self.ffn.forward(ln2_out)
+        self.dropout3_masks = []
+        ffn_dropped = []
+        for f in ffn_out:
+            dropped = self.dropout3.forward(f)
+            ffn_dropped.append(dropped)
+            self.dropout3_masks.append(list(self.dropout3.mask))
+        self.res3 = [[ln2_out[t][j] + ffn_dropped[t][j] for j in range(d)]
+                     for t in range(n)]
+        return [self.ln3.forward(v) for v in self.res3]
+
+    def backward(self, dout_seq):
+        """dout_seq: (Tq, d_model) → (dx (Tq, d_model), dmemory (Tk, d_model))"""
+        n = len(self.x)
+        d = self.d_model
+
+        def ln_backward(ln, res, d_in, key):
+            d_out = []
+            gg = [0.0] * d
+            gb = [0.0] * d
+            for t in range(n):
+                ln.forward(res[t])          # 重放该 token 的缓存
+                g_gamma, g_beta, dx = ln.backward(d_in[t])
+                d_out.append(dx)
+                for j in range(d):
+                    gg[j] += g_gamma[j]
+                    gb[j] += g_beta[j]
+            for j in range(d):
+                self.grads[key + "_gamma"][j] += gg[j]
+                self.grads[key + "_beta"][j] += gb[j]
+            return d_out
+
+        d_res3 = ln_backward(self.ln3, self.res3, dout_seq, "ln3")
+        d_ffn = [list(row) for row in d_res3]
+        if self.dropout3_masks is not None:
+            d_ffn = [[d_ffn[t][j] * self.dropout3_masks[t][j] for j in range(d)]
+                     for t in range(n)]
+        d_ln2 = self.ffn.backward(d_ffn)
+        for t in range(n):
+            for j in range(d):
+                d_ln2[t][j] += d_res3[t][j]
+
+        d_res2 = ln_backward(self.ln2, self.res2, d_ln2, "ln2")
+        d_cross = [list(row) for row in d_res2]
+        if self.dropout2_masks is not None:
+            d_cross = [[d_cross[t][j] * self.dropout2_masks[t][j] for j in range(d)]
+                       for t in range(n)]
+        d_ln1_cross, dmemory = self.cross_attn.backward(d_cross)
+        d_ln1 = [[d_ln1_cross[t][j] + d_res2[t][j] for j in range(d)] for t in range(n)]
+
+        d_res1 = ln_backward(self.ln1, self.res1, d_ln1, "ln1")
+        d_attn = [list(row) for row in d_res1]
+        if self.dropout1_masks is not None:
+            d_attn = [[d_attn[t][j] * self.dropout1_masks[t][j] for j in range(d)]
+                      for t in range(n)]
+        d_attn_out = self.self_attn.backward(d_attn)
+        d_x = [[d_res1[t][j] + d_attn_out[t][j] for j in range(d)] for t in range(n)]
+        return d_x, dmemory
+
+    def sgd_step(self, lr: float):
+        """对三个子层与三个 LayerNorm 各做一次 SGD 更新"""
+        attn = self.self_attn
+        for name in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+            _sgd_apply(getattr(attn, name), attn.grads[name], lr)
+        cross = self.cross_attn
+        for name in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+            _sgd_apply(getattr(cross, name), cross.grads[name], lr)
+        ffn = self.ffn
+        for name in ("W1", "b1", "W2", "b2"):
+            _sgd_apply(getattr(ffn, name), ffn.grads[name], lr)
+        for ln_name, ln in (("ln1", self.ln1), ("ln2", self.ln2), ("ln3", self.ln3)):
+            _sgd_apply(ln.gamma, self.grads[ln_name + "_gamma"], lr)
+            _sgd_apply(ln.beta, self.grads[ln_name + "_beta"], lr)
+
+
+class TransformerDecoder:
+    """堆叠多个 TransformerDecoderLayer（encoder-decoder 的 decoder）"""
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 num_layers: int = 6, dropout: float = 0.1, causal: bool = True,
+                 window: int = None):
+        if isinstance(num_layers, bool) or not isinstance(num_layers, int) or num_layers < 1:
+            raise ValueError(
+                f"TransformerDecoder: num_layers 必须是正整数，收到 {num_layers!r}")
+        self.causal = bool(causal)
+        self.layers = [
+            TransformerDecoderLayer(d_model, num_heads, d_ff, dropout,
+                                    causal=causal, window=window)
+            for _ in range(num_layers)
+        ]
+
+    def zero_grad(self):
+        """重置所有层的梯度"""
+        for layer in self.layers:
+            layer.zero_grad()
+
+    def train(self):
+        """训练模式（转发给每一层）"""
+        for layer in self.layers:
+            layer.train()
+        return self
+
+    def eval(self):
+        """推理模式（转发给每一层）"""
+        for layer in self.layers:
+            layer.eval()
+        return self
+
+    def forward(self, x_seq, memory):
+        for layer in self.layers:
+            x_seq = layer.forward(x_seq, memory)
+        return x_seq
+
+    def backward(self, dout_seq):
+        """返回 (dx_seq, dmemory)；各层的 dmemory 相加（共享同一份 memory）"""
+        d_memory = None
+        for layer in reversed(self.layers):
+            dout_seq, dm = layer.backward(dout_seq)
+            if d_memory is None:
+                d_memory = dm
+            else:
+                for t in range(len(dm)):
+                    for j in range(len(dm[0])):
+                        d_memory[t][j] += dm[t][j]
+        return dout_seq, d_memory
 
     def sgd_step(self, lr: float):
         """对每一层做一次 SGD 参数更新"""
