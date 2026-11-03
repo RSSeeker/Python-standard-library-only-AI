@@ -4542,3 +4542,79 @@ class TestBeamSearch:
         assert m.generate([1, 2, 3], max_new_tokens=3, num_beams=3) == [1, 2, 3]
         out = m.generate([1, 2, 3], max_new_tokens=3, num_beams=2, eos_id=2)
         assert 2 not in out and len(out) <= 3
+
+class TestBytePairTokenizer:
+    """字节级 BPE 分词器"""
+
+    TEXT = ("hello world hello there 你好，世界！emoji 😀🚀 "
+            "the quick brown fox jumps over the lazy dog. " * 6)
+
+    def test_roundtrip_unicode(self):
+        tok = AI.BytePairTokenizer().train(self.TEXT, vocab_size=320)
+        for s in ("", "a", "hello 世界", "😀🚀 emoji 测试", "line1\nline2\ttab"):
+            assert tok.decode(tok.encode(s)) == s
+        ids = tok.encode(self.TEXT)
+        assert tok.decode(ids) == self.TEXT
+        assert len(ids) < len(self.TEXT.encode("utf-8"))   # 真的合并了
+
+    def test_training_deterministic_and_vocab_size(self):
+        a = AI.BytePairTokenizer().train(self.TEXT, vocab_size=320)
+        b = AI.BytePairTokenizer().train(self.TEXT, vocab_size=320)
+        assert a.merges == b.merges
+        assert a.encode(self.TEXT) == b.encode(self.TEXT)
+        assert a.vocab_size == 256 + len(a.merges)
+        assert a.vocab_size <= 320
+        assert len(a) == a.vocab_size
+        assert "vocab_size=" in repr(a)
+        assert AI.BytePairTokenizer().vocab_size == 256
+
+    def test_merges_stay_inside_words(self):
+        tok = AI.BytePairTokenizer().train("cat cat cat cat", vocab_size=258)
+        # 不应该学到「字母 + 空格」这种跨词块的合并
+        assert all(m != (99, 32) and m != (32, 99) for m in tok.merges)
+        assert tok.decode(tok.encode("cat cat")) == "cat cat"
+
+    def test_save_load_and_encode_corpus(self, tmp_path):
+        tok = AI.BytePairTokenizer().train(self.TEXT, vocab_size=300)
+        ids = tok.encode(self.TEXT)
+        path = str(tmp_path / "bpe.json")
+        tok.save(path, quiet=True)
+        tok2 = AI.BytePairTokenizer.load(path)
+        assert tok2.merges == tok.merges
+        assert tok2.vocab_size == tok.vocab_size
+        assert tok2.encode(self.TEXT) == ids
+
+        assert tok.encode_corpus(self.TEXT) == [ids]
+        chunks = tok.encode_corpus(self.TEXT, seq_len=16)
+        assert all(2 <= len(c) <= 16 for c in chunks)
+        flat = [x for c in chunks for x in c]
+        assert flat == ids[:len(flat)]
+
+    def test_errors(self):
+        for bad in (0, 255, -1, True, 3.5):
+            with pytest.raises(ValueError):
+                AI.BytePairTokenizer().train("abc", vocab_size=bad)
+        with pytest.raises(ValueError):
+            AI.BytePairTokenizer().train("abc", vocab_size=300, min_frequency=0)
+        tok = AI.BytePairTokenizer().train("abc abc", vocab_size=258)
+        with pytest.raises(ValueError):
+            tok.encode(123)
+        with pytest.raises(ValueError):
+            tok.decode([tok.vocab_size + 5])
+        with pytest.raises(ValueError):
+            tok.decode([230])              # 截断的多字节序列
+        with pytest.raises(ValueError):
+            tok.encode_corpus("abc", seq_len=1)
+
+    def test_train_with_causallm(self):
+        """分词器 + CausalLM 串起来：编码语料 → 训练 → 生成 → 解码"""
+        random.seed(321)
+        text = "0120120120120120120120"
+        tok = AI.BytePairTokenizer().train(text, vocab_size=258)
+        seqs = tok.encode_corpus(text, seq_len=6)
+        lm = AI.CausalLM(vocab_size=tok.vocab_size, d_model=16, num_heads=2,
+                         d_ff=32, num_layers=1, max_len=8)
+        hist = lm.fit(seqs, epochs=40, lr=0.01, shuffle=False)
+        assert hist[-1] < 0.2 * hist[0]
+        out = lm.generate(tok.encode("0"), max_new_tokens=6, top_k=1)
+        assert isinstance(tok.decode(out), str)

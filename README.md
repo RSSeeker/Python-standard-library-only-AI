@@ -454,10 +454,28 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | 组件 | 说明 |
 |------|------|
 | `TextProcessor` | 字符级词表、one-hot 编码、滑动窗口 |
+| `BytePairTokenizer` | 字节级 BPE 分词器：`train(text, vocab_size)` 学合并、`encode`/`decode` 无损往返任意 UTF-8、`encode_corpus(text, seq_len)` 直接产出 `CausalLM.fit` 用的序列、`save`/`load` 存 JSON |
 | `generate_text(network, tp, start, length)` | 自回归文本生成（`generate_text_with_mlp` 的别名，保留以兼容旧调用） |
 | `generate_text_with_mlp(model, tp, start, length, window_size, temp)` | 自回归文本生成（滑动窗口上下文，只需 `forward`） |
 | `_softmax_with_temp(logits, temperature)` | 带温度的 Softmax |
 | `sample_index(probs)` | 随机采样 |
+
+```python
+tok = AI.BytePairTokenizer().train(corpus, vocab_size=512)   # 语料小会提前停
+ids = tok.encode("hello 世界")            # 任意 UTF-8 都不缺字
+assert tok.decode(ids) == "hello 世界"
+
+lm = AI.CausalLM(vocab_size=tok.vocab_size, d_model=32, num_heads=4)
+lm.fit(tok.encode_corpus(corpus, seq_len=64), epochs=20, lr=3e-3)
+print(tok.decode(lm.generate(tok.encode("hello"), max_new_tokens=16, top_k=4)))
+
+tok.save("bpe.json")
+tok = AI.BytePairTokenizer.load("bpe.json")
+```
+
+字节级的好处是**没有词表外字符**：中文、emoji、换行都落在 256 个基础字节 id 里。
+合并只在词块（字母数字 / 空白 / 其它符号的连续段）内部学习，所以不会学到
+「字母+空格」这种跨词 token；语料里重复片段耗尽时会提前停下，ocab_size 只是上限。
 
 ## 底层 API 示例
 
@@ -551,7 +569,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-405 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+411 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -581,6 +599,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
+| `TestBytePairTokenizer` | 任意 UTF-8 往返（含 emoji/换行）、训练确定性、合并不跨词块、`encode_corpus` 分块、JSON 存档往返、非法输入与截断 UTF-8 报错、与 `CausalLM` 串起来训练与生成 |
 | `TestBeamSearch` | `num_beams=1` 与贪心逐位相同、束搜索确定且累计对数概率不劣于贪心、非法 `num_beams` 报错、`Seq2SeqLM` 束搜索与 `eos` 提前停 |
 | `TestSeq2SeqLM` || `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
 | `TestCrossAttention` || `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
@@ -593,6 +612,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 405 个单元测试
+├── test_ai.py       # 411 个单元测试
 └── README.md
 ```

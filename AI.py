@@ -13,6 +13,7 @@
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
+  - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
   - 模型保存 / 加载（JSON 格式，可选带优化器状态做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
 """
@@ -5100,6 +5101,198 @@ def ascii_plot(history, keys=("train_loss", "val_loss"), width: int = 60,
 # ============================================================================
 #  Text Processing（字符级语言模型工具）
 # ============================================================================
+
+def _bpe_pretokenize(text):
+    """把文本切成词块：字母数字连续段 / 空白连续段 / 其它符号连续段
+
+    只在词块内部学习合并，避免跨单词边界生成 「the  cat」这类没用的 token
+    （GPT-2 的做法，规则简化到纯标准库能表达的程度）。
+    """
+    out, cur, kind = [], [], None
+    for ch in text:
+        if ch.isalnum():
+            k = "w"
+        elif ch.isspace():
+            k = "s"
+        else:
+            k = "p"
+        if k != kind:
+            if cur:
+                out.append("".join(cur))
+            cur, kind = [ch], k
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _bpe_apply_merge(tokens, pair, new_id):
+    """把 tokens 里所有不重叠的 pair 换成 new_id（从左往右）"""
+    out = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        if i + 1 < n and tokens[i] == pair[0] and tokens[i + 1] == pair[1]:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+class BytePairTokenizer:
+    """字节级 BPE 分词器：任意文本都能无损往返，词表从 256 个字节值开始长
+
+    为什么用**字节**而不是字符：任何 UTF-8 文本（中文、emoji、二进制脏数据）
+    都能被 256 个基础 id 覆盖，不会出现「词表外字符」。合并规则在词块内部学习，
+    所以 `encode` / `decode` 都可复现、可存档。
+
+    用法::
+
+        tok = BytePairTokenizer().train(text, vocab_size=512)
+        ids = tok.encode("hello 世界")
+        assert tok.decode(ids) == "hello 世界"
+        tok.save("bpe.json")
+    """
+
+    def __init__(self, merges=None):
+        self.merges = [tuple(int(x) for x in m) for m in (merges or [])]
+        for m in self.merges:
+            if len(m) != 2 or not all(0 <= v < 256 + len(self.merges) for v in m):
+                raise ValueError(f"BytePairTokenizer: 非法合并规则 {m!r}")
+        self._rebuild()
+
+    def _rebuild(self):
+        """按 merges 重建 id → 字节串 / 合并优先级表"""
+        self.id_to_bytes = {i: bytes([i]) for i in range(256)}
+        self.merge_rank = {}
+        for k, (a, b) in enumerate(self.merges):
+            self.id_to_bytes[256 + k] = self.id_to_bytes[a] + self.id_to_bytes[b]
+            self.merge_rank[(a, b)] = k
+        self.vocab_size = 256 + len(self.merges)
+
+    # ------------------------------------------------------------------ 训练
+    def train(self, text, vocab_size: int = 512, min_frequency: int = 2,
+              verbose: bool = False):
+        """在 text 上学习合并规则，直到词表达 vocab_size（或没有可合并的片段）
+
+        min_frequency: 出现次数少于它的片段不再合并，避免为一次性片段浪费词表。
+        同样的输入永远得到同样的 merges（按「出现次数降序、id 升序」挑下一个）。
+        """
+        if not isinstance(text, str):
+            raise ValueError(f"BytePairTokenizer.train: text 必须是字符串，收到 {type(text).__name__}")
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 256:
+            raise ValueError(
+                f"BytePairTokenizer.train: vocab_size 必须 >= 256（字节基数），收到 {vocab_size!r}")
+        if isinstance(min_frequency, bool) or not isinstance(min_frequency, int) or min_frequency < 1:
+            raise ValueError(
+                f"BytePairTokenizer.train: min_frequency 必须是 >= 1 的整数，收到 {min_frequency!r}")
+        words = [list(w.encode("utf-8")) for w in _bpe_pretokenize(text)]
+        self.merges = []
+        self._rebuild()
+        target = vocab_size - 256
+        for step in range(target):
+            counts = {}
+            for w in words:
+                for i in range(len(w) - 1):
+                    pair = (w[i], w[i + 1])
+                    counts[pair] = counts.get(pair, 0) + 1
+            if not counts:
+                break
+            pair, cnt = max(counts.items(), key=lambda kv: (kv[1], -kv[0][0], -kv[0][1]))
+            if cnt < min_frequency:
+                break
+            self.merges.append(pair)
+            self._rebuild()
+            new_id = 255 + len(self.merges)
+            words = [_bpe_apply_merge(w, pair, new_id) for w in words]
+            if verbose:
+                piece = self.id_to_bytes[new_id].decode("utf-8", "replace")
+                print(f"merge {step + 1}/{target}: {pair} -> {new_id} ({piece!r}) x{cnt}")
+        return self
+
+    # ------------------------------------------------------------------ 编解码
+    def encode(self, text: str) -> list:
+        """文本 → id 列表（按学习到的优先级从高到低贪心合并）"""
+        if not isinstance(text, str):
+            raise ValueError(f"BytePairTokenizer.encode: text 必须是字符串，收到 {type(text).__name__}")
+        ids = []
+        for word in _bpe_pretokenize(text):
+            toks = list(word.encode("utf-8"))
+            while True:
+                best_rank, best_i = None, -1
+                for i in range(len(toks) - 1):
+                    r = self.merge_rank.get((toks[i], toks[i + 1]))
+                    if r is not None and (best_rank is None or r < best_rank):
+                        best_rank, best_i = r, i
+                if best_rank is None:
+                    break
+                toks = (toks[:best_i] + [256 + best_rank] + toks[best_i + 2:])
+            ids.extend(toks)
+        return ids
+
+    def decode(self, ids) -> str:
+        """id 列表 → 文本；拼出来的字节不是合法 UTF-8 时报错（而不是静默替换）"""
+        chunks = []
+        for i in ids:
+            if isinstance(i, bool) or not isinstance(i, int) or i not in self.id_to_bytes:
+                raise ValueError(
+                    f"BytePairTokenizer.decode: 非法 id {i!r}（词表 {self.vocab_size}）")
+            chunks.append(self.id_to_bytes[i])
+        try:
+            return b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(
+                "BytePairTokenizer.decode: 这些 id 拼起来不是合法 UTF-8"
+                "（可能被截断，或来自另一个分词器）")
+
+    def encode_corpus(self, text: str, seq_len: int = None) -> list:
+        """把整段文本编码成 CausalLM.fit 可直接用的序列
+
+        seq_len=None 时返回一条长序列；给定时切成不重叠的块（最后一块可能更短，
+        长度 < 2 的块会被丢掉，因为语言模型至少要 2 个 token 才有预测目标）。
+        """
+        ids = self.encode(text)
+        if seq_len is None:
+            return [ids]
+        if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len < 2:
+            raise ValueError(
+                f"BytePairTokenizer.encode_corpus: seq_len 必须 >= 2，收到 {seq_len!r}")
+        return [ids[i:i + seq_len] for i in range(0, len(ids), seq_len)
+                if len(ids[i:i + seq_len]) >= 2]
+
+    # ------------------------------------------------------------------ 存档
+    def save(self, filepath: str, quiet: bool = False):
+        """把合并规则写成 JSON（纯标准库）"""
+        if not isinstance(filepath, str) or not filepath:
+            raise ValueError(f"BytePairTokenizer.save: filepath 必须是非空字符串，收到 {filepath!r}")
+        data = {"format": "ai_bpe_v1", "merges": [list(m) for m in self.merges]}
+        with io.open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        if not quiet:
+            print(f"已保存分词器: {filepath}（词表 {self.vocab_size}）")
+        return filepath
+
+    @staticmethod
+    def load(filepath: str):
+        """从 `save` 写出的 JSON 恢复分词器"""
+        with io.open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get("format") != "ai_bpe_v1":
+            raise ValueError(f"BytePairTokenizer.load: {filepath} 不是 ai_bpe_v1 存档")
+        merges = data.get("merges")
+        if not isinstance(merges, list):
+            raise ValueError("BytePairTokenizer.load: 存档缺少 merges 数组")
+        return BytePairTokenizer(merges)
+
+    def __len__(self):
+        return self.vocab_size
+
+    def __repr__(self):
+        return f"BytePairTokenizer(vocab_size={self.vocab_size})"
+
 
 class TextProcessor:
     """字符级文本处理器：词表构建、one-hot 编码、滑动窗口数据生成"""
