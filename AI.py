@@ -6,7 +6,7 @@
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / FeedForward / Encoder / PositionalEncoding）
   - Dropout / BatchNorm1d / LayerNorm / RMSNorm（正则化与归一化）
-  - Embedding / ResidualBlock / Sequential（基础组件）
+  - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
@@ -643,6 +643,78 @@ class MaxPool2d:
                     iw = ow * self.sw + kw
                     dx[c][ih][iw] += dout[c][oh][ow]
         return dx
+
+
+class AvgPool2d:
+    """2D 平均池化层（接口与 MaxPool2d 一致：forward 收 (C,H,W)，backward 收 dout）"""
+
+    def __init__(self, kernel_size, stride=None):
+        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        self.stride = self.kernel_size if stride is None else (
+            (stride, stride) if isinstance(stride, int) else tuple(stride)
+        )
+        self.kh, self.kw = self.kernel_size
+        self.sh, self.sw = self.stride
+        if self.kh <= 0 or self.kw <= 0:
+            raise ValueError(f"AvgPool2d: kernel_size 必须为正，收到 {self.kernel_size}")
+        if self.sh <= 0 or self.sw <= 0:
+            raise ValueError(f"AvgPool2d: stride 必须为正，收到 {self.stride}")
+        self.x_shape = None
+
+    def forward(self, x):
+        """x: (C, H, W) -> (C, Ho, Wo)，每个窗口取均值"""
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        self.x_shape = (C, H, W)
+        ho = (H - self.kh) // self.sh + 1
+        wo = (W - self.kw) // self.sw + 1
+        if ho <= 0 or wo <= 0:
+            raise ValueError(
+                f"AvgPool2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}、"
+                f"stride {self.sh}/{self.sw} 得到输出 {ho}x{wo}，必须都 > 0"
+            )
+        area = float(self.kh * self.kw)
+        out = [[[0.0] * wo for _ in range(ho)] for _ in range(C)]
+        for c in range(C):
+            for oh in range(ho):
+                for ow in range(wo):
+                    total = 0.0
+                    for kh in range(self.kh):
+                        for kw in range(self.kw):
+                            total += x[c][oh * self.sh + kh][ow * self.sw + kw]
+                    out[c][oh][ow] = total / area
+        return out
+
+    def backward(self, dout):
+        """dout: (C, Ho, Wo) -> dx: (C, H, W)，每个窗口均分到所有输入位置"""
+        C, H, W = self.x_shape
+        area = float(self.kh * self.kw)
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for oh in range(len(dout[0])):
+                for ow in range(len(dout[0][0])):
+                    g = dout[c][oh][ow] / area
+                    for kh in range(self.kh):
+                        for kw in range(self.kw):
+                            dx[c][oh * self.sh + kh][ow * self.sw + kw] += g
+        return dx
+
+
+class GlobalAvgPool2d:
+    """全局平均池化：(C, H, W) -> (C,)，等价于 kernel 覆盖整张特征图"""
+
+    def __init__(self):
+        self.x_shape = None
+
+    def forward(self, x):
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        self.x_shape = (C, H, W)
+        area = float(H * W)
+        return [sum(sum(row) for row in x[c]) / area for c in range(C)]
+
+    def backward(self, dout):
+        C, H, W = self.x_shape
+        area = float(H * W)
+        return [[[dout[c] / area] * W for _ in range(H)] for c in range(C)]
 
 
 class Flatten:
@@ -1585,7 +1657,8 @@ class MultiHeadAttention:
     """
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
-                 causal: bool = False, rope: bool = False, rope_base: float = 10000.0):
+                 causal: bool = False, rope: bool = False, rope_base: float = 10000.0,
+                 window: int = None):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -1593,6 +1666,10 @@ class MultiHeadAttention:
 
         causal: 为 True 时加因果掩码——位置 t 只能看到 0..t，看不到未来。
         这是自回归语言模型（GPT 式）的必要条件；默认 False 保持双向注意力。
+
+        window: 滑动窗口（Mistral 式局部因果）。设了就隐含因果——位置 t 只能看到
+        最近 window 个位置（含自己），更早的一律屏蔽；显存/算力从 O(T²) 降到
+        O(T·window)。默认 None 表示全注意力，行为与旧版逐位一致。
 
         rope: 为 True 时给 Q/K 加旋转位置编码（RoPE，Llama 系）。旋转是正交变换，
         只改"方向"不改模长，attention 分数里自然带上相对位置信息，外推性比
@@ -1604,6 +1681,18 @@ class MultiHeadAttention:
         self.causal = bool(causal)
         self.rope = bool(rope)
         self.rope_base = float(rope_base)
+        # 滑动窗口（Mistral 式局部因果）：只看最近 window 个位置（含自己）。
+        # 设了 window 就隐含因果——未来位置一律屏蔽；None 表示全注意力。
+        if window is None:
+            self.window = None
+        else:
+            if isinstance(window, bool) or not isinstance(window, int):
+                raise ValueError(
+                    f"MultiHeadAttention: window 必须是正整数或 None，收到 {window!r}"
+                )
+            if window < 1:
+                raise ValueError(f"MultiHeadAttention: window 必须 >= 1，收到 {window!r}")
+            self.window = window
         self.training = True
         self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
         # 每次 forward 重建；反向只读这几个列表
@@ -1726,6 +1815,10 @@ class MultiHeadAttention:
             V[head].append(vh)
             keys = K[head]
             scores = [sum(map(_mul, qh, keys[j])) * scale for j in range(len(keys))]
+            if self.window is not None:
+                # 增量前向只有「过去 + 自己」，窗口外的更早位置要屏蔽（与 forward 一致）
+                for j in range(max(0, pos - self.window + 1)):
+                    scores[j] = float("-inf")
             attn = _softmax_row(scores)
             cols = list(zip(*V[head]))
             out = [sum(map(_mul, attn, col)) for col in cols]
@@ -1786,11 +1879,16 @@ class MultiHeadAttention:
             # 因果掩码：位置 t 只能看到 j <= t。屏蔽位置置 -inf，
             # softmax 后权重恰为 0；反向的 d_scores = attn * (...) 在那些位置
             # 也自动为 0，所以 backward 不需要任何额外分支。
-            if self.causal:
+            if self.causal or self.window is not None:
                 for t in range(self.seq_len):
                     row = scores[t]
+                    # 未来一律不可见；设了 window 时同样按因果处理（局部因果）
                     for j in range(t + 1, self.seq_len):
                         row[j] = float("-inf")
+                    if self.window is not None:
+                        # 只看最近 window 个位置：更早的也屏蔽
+                        for j in range(max(0, t - self.window + 1)):
+                            row[j] = float("-inf")
 
             # softmax per row：attn 是「干净」权重，反向的 softmax 雅可比必须用它
             attn = [_softmax_row(row) for row in scores]
@@ -2103,11 +2201,11 @@ class TransformerEncoderLayer:
     """单层 Transformer Encoder: Self-Attn + Residual + LN + FFN + Residual + LN"""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
-                 causal: bool = False, rope: bool = False):
+                 causal: bool = False, rope: bool = False, window: int = None):
         # causal=True 时自注意力加因果掩码（自回归语言模型用）；
         # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
-                                            causal=causal, rope=rope)
+                                            causal=causal, rope=rope, window=window)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -2270,12 +2368,12 @@ class TransformerEncoder:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
                  num_layers: int = 6, dropout: float = 0.1, causal: bool = False,
-                 rope: bool = False):
+                 rope: bool = False, window: int = None):
         """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
         self.causal = bool(causal)
         self.layers = [
             TransformerEncoderLayer(d_model, num_heads, d_ff, dropout,
-                                    causal=causal, rope=rope)
+                                    causal=causal, rope=rope, window=window)
             for _ in range(num_layers)
         ]
 
@@ -2460,7 +2558,8 @@ class CausalLM:
 
     def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
                  d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
-                 dropout: float = 0.0, rope: bool = False, use_abs_pos=None):
+                 dropout: float = 0.0, rope: bool = False, use_abs_pos=None,
+                 window: int = None):
         if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
             raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
         if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
@@ -2479,7 +2578,8 @@ class CausalLM:
         self.embedding = Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
-                                          dropout, causal=True, rope=self.rope)
+                                          dropout, causal=True, rope=self.rope,
+                                          window=window)
 
         std = math.sqrt(2.0 / d_model)
         self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
@@ -2687,10 +2787,11 @@ class CausalLM:
                 self.train()
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
-                 top_k: int = 0, rng=None, use_cache: bool = True):
+                 top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0):
         """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
 
         temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
+        top_p: nucleus 采样阈值（(0,1]，默认 1.0 = 不过滤，与旧行为逐位相同）。
 
         use_cache: True（默认）走 KV cache —— 每个新 token 只前向一次，复用之前
         各层 K/V，生成 N 个 token 的代价从 O(N·T²) 降到 O(N·T)。与 use_cache=False
@@ -2700,6 +2801,8 @@ class CausalLM:
             raise ValueError(f"CausalLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
         if temperature <= 0:
             raise ValueError(f"CausalLM.generate: temperature 必须 > 0，收到 {temperature!r}")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError(f"CausalLM.generate: top_p 必须在 (0,1] 内，收到 {top_p!r}")
         ids = list(prompt_ids)
         if not ids:
             raise ValueError("CausalLM.generate: prompt_ids 不能为空")
@@ -2707,18 +2810,36 @@ class CausalLM:
         self.eval()
         n_new = int(max_new_tokens)
         if use_cache and n_new > 0:
-            return self._generate_cached(ids, n_new, temperature, top_k, rng)
+            return self._generate_cached(ids, n_new, temperature, top_k, rng, top_p)
         for _ in range(n_new):
             window = ids[-self.max_len:]
             logits = self.forward(window)[-1]
-            ids.append(self._sample(logits, temperature, top_k, rng))
+            ids.append(self._sample(logits, temperature, top_k, rng, top_p))
         return ids
 
-    def _sample(self, logits, temperature, top_k, rng):
-        """从 logits 采一个 token（top_k 过滤 + 温度缩放 + 累积分布采样）"""
+    def _sample(self, logits, temperature, top_k, rng, top_p: float = 1.0):
+        """从 logits 采一个 token（top_k / top_p 过滤 + 温度缩放 + 累积分布采样）
+
+        top_p（nucleus 采样）：按概率从高到低累加，只保留累计概率刚好覆盖 top_p
+        的头部集合。top_p=1.0（默认）不做过滤，与旧行为逐位相同。
+        """
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError(f"CausalLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
         if top_k and top_k < self.vocab_size:
             order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
             keep = set(order[:int(top_k)])
+            logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        if top_p < 1.0:
+            # nucleus：按温度缩放后的概率排序，保留累计概率刚好覆盖 top_p 的头部
+            probs_raw = _softmax_row([v / temperature for v in logits])
+            order = sorted(range(self.vocab_size), key=lambda v: probs_raw[v], reverse=True)
+            keep = set()
+            acc_p = 0.0
+            for v in order:
+                keep.add(v)
+                acc_p += probs_raw[v]
+                if acc_p >= top_p:
+                    break
             logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
         probs = _softmax_row([v / temperature for v in logits])
         # 累积分布采样（不依赖 random.choices，可注入 rng 复现）
@@ -2732,7 +2853,7 @@ class CausalLM:
                 break
         return pick
 
-    def _generate_cached(self, ids, max_new_tokens, temperature, top_k, rng):
+    def _generate_cached(self, ids, max_new_tokens, temperature, top_k, rng, top_p=1.0):
         """KV cache 版生成：先整段预填充，然后每个新 token 只做单步前向
 
         窗口满（len(ids) > max_len）时会整体左移，位置编码/因果掩码都依赖绝对
@@ -2747,7 +2868,7 @@ class CausalLM:
             logits = self._forward_step(tok, pos, caches)
             pos += 1
         for _ in range(max_new_tokens):
-            pick = self._sample(logits, temperature, top_k, rng)
+            pick = self._sample(logits, temperature, top_k, rng, top_p)
             ids.append(pick)
             new_window = ids[-self.max_len:]
             if len(new_window) == len(window) + 1:

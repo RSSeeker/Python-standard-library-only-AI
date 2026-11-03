@@ -3616,3 +3616,205 @@ class TestOptimizerPersistence:
         loaded = AI.Model.load(str(p), task="regression", restore_optimizer=True)
         assert loaded.optimizer.step_count == 0
 
+class TestWindowMask:
+    """滑动窗口（局部因果）注意力：MultiHeadAttention(window=...)"""
+
+    def _mha(self, **kw):
+        random.seed(31)
+        m = AI.MultiHeadAttention(8, 2, causal=True, **kw)
+        m.eval()
+        return m
+
+    def test_window_masks_outside(self):
+        """窗口外权重恰为 0，窗口内为正，每行和为 1"""
+        m = self._mha(window=2)
+        random.seed(32)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(6)]
+        m.forward(seq)
+        for head in range(2):
+            attn = m.attn_weights[head]
+            for t in range(6):
+                assert abs(sum(attn[t]) - 1.0) < 1e-12
+                for j in range(6):
+                    if j > t or j < t - 1:
+                        assert attn[t][j] == 0.0
+                    else:
+                        assert attn[t][j] > 0.0
+
+    def test_window_is_causal(self):
+        """改末位 token 不影响前面位置的输出"""
+        m = self._mha(window=3)
+        random.seed(33)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(5)]
+        out = m.forward(seq)
+        seq2 = [list(row) for row in seq]
+        seq2[-1] = [v + 1.0 for v in seq2[-1]]
+        out2 = m.forward(seq2)
+        for t in range(4):
+            for j in range(8):
+                assert out[t][j] == out2[t][j]
+        assert out[4] != out2[4]
+
+    def test_forward_step_matches_forward(self):
+        """增量前向（KV cache 用）与整段前向的最后一行逐位一致"""
+        for rope in (False, True):
+            random.seed(34)
+            m = AI.MultiHeadAttention(8, 2, causal=True, window=3, rope=rope)
+            m.eval()
+            seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(5)]
+            full = m.forward(seq)
+            cache = {}
+            step = None
+            for tok in seq:
+                step = m.forward_step(tok, cache)
+            assert full[-1] == step
+
+    def test_window_gradient(self):
+        """带窗口掩码时 W_v 的解析梯度 vs 中心差分"""
+        random.seed(35)
+        m = AI.MultiHeadAttention(4, 2, causal=True, window=2)
+        seq = [[random.gauss(0, 1) for _ in range(4)] for _ in range(4)]
+        dout = [[random.gauss(0, 1) for _ in range(4)] for _ in range(4)]
+
+        def loss():
+            out = m.forward(seq)
+            return sum(out[t][j] * dout[t][j] for t in range(4) for j in range(4))
+
+        m.forward(seq)
+        m.backward(dout)
+        ana = [row[:] for row in m.grads["W_v"]]
+        eps = 1e-6
+        for i, j in ((0, 1), (2, 3)):
+            old = m.W_v[i][j]
+            m.W_v[i][j] = old + eps
+            lp = loss()
+            m.W_v[i][j] = old - eps
+            lm = loss()
+            m.W_v[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(ana[i][j] - num) / max(1.0, abs(num)) < 1e-6
+
+    def test_window_none_equals_default(self):
+        """window=None 与不传 window 逐位一致"""
+        random.seed(36)
+        a = AI.MultiHeadAttention(8, 2, causal=True, window=None)
+        random.seed(36)
+        b = AI.MultiHeadAttention(8, 2, causal=True)
+        a.eval()
+        b.eval()
+        random.seed(37)
+        seq = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        assert a.forward(seq) == b.forward(seq)
+
+    def test_invalid_window(self):
+        for bad in (0, -1, 1.5, True):
+            with pytest.raises(ValueError):
+                AI.MultiHeadAttention(4, 2, window=bad)
+
+
+class TestTopPSampling:
+    """nucleus（top_p）采样"""
+
+    def _lm(self):
+        random.seed(41)
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        lm.eval()
+        return lm
+
+    def test_default_top_p_is_no_filter(self):
+        """top_p 默认 1.0，与不传时逐位相同"""
+        lm = self._lm()
+        a = lm.generate([1, 2], 5, temperature=0.8, top_k=0, rng=random.Random(9))
+        b = lm.generate([1, 2], 5, temperature=0.8, top_k=0,
+                        rng=random.Random(9), top_p=1.0)
+        assert a == b
+
+    def test_top_p_keeps_nucleus_only(self):
+        lm = self._lm()
+        for s in range(20):
+            pick = lm._sample([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0, 0,
+                              random.Random(s), 0.5)
+            assert pick == 0
+        seen = set()
+        for s in range(80):
+            seen.add(lm._sample([1.0] * 6, 1.0, 0, random.Random(s), 0.6))
+        assert seen.issubset({0, 1, 2, 3})
+        assert len(seen) >= 2
+
+    def test_top_p_cache_equals_recompute(self):
+        """KV cache 路径与整段重算路径在 top_p 下仍逐位相同"""
+        lm = self._lm()
+        a = lm.generate([1], 5, 0.9, 0, random.Random(5), True, 0.7)
+        b = lm.generate([1], 5, 0.9, 0, random.Random(5), False, 0.7)
+        assert a == b
+
+    def test_invalid_top_p(self):
+        lm = self._lm()
+        for bad in (0.0, -0.5, 1.01):
+            with pytest.raises(ValueError):
+                lm.generate([1], 3, 1.0, 0, None, True, bad)
+            with pytest.raises(ValueError):
+                lm._sample([0.0] * 6, 1.0, 0, random, bad)
+
+
+class TestAvgPool2d:
+    """平均池化层"""
+
+    def test_forward_values(self):
+        ap = AI.AvgPool2d(2, stride=2)
+        x = [[[1.0, 2.0, 3.0, 4.0],
+              [5.0, 6.0, 7.0, 8.0],
+              [9.0, 10.0, 11.0, 12.0],
+              [13.0, 14.0, 15.0, 16.0]]]
+        assert ap.forward(x) == [[[3.5, 5.5], [11.5, 13.5]]]
+
+    def test_backward_distributes_evenly(self):
+        ap = AI.AvgPool2d(2, stride=2)
+        ap.forward([[[0.0] * 4 for _ in range(4)]])
+        dx = ap.backward([[[1.0, 2.0], [3.0, 4.0]]])
+        assert abs(dx[0][0][0] - 0.25) < 1e-15
+        assert abs(dx[0][3][3] - 1.0) < 1e-15
+        assert abs(sum(sum(row) for row in dx[0]) - 10.0) < 1e-12
+
+    def test_gradient_numeric(self):
+        random.seed(42)
+        ap = AI.AvgPool2d(3, stride=1)
+        x = [[[random.gauss(0, 1) for _ in range(4)] for _ in range(4)]]
+        dout = [[[random.gauss(0, 1) for _ in range(2)] for _ in range(2)]]
+
+        def loss(z):
+            out = ap.forward(z)
+            return sum(out[c][i][j] * dout[c][i][j]
+                       for c in range(1) for i in range(2) for j in range(2))
+
+        ap.forward(x)
+        ana = ap.backward(dout)
+        eps = 1e-6
+        for i in range(4):
+            for j in range(4):
+                old = x[0][i][j]
+                x[0][i][j] = old + eps
+                lp = loss(x)
+                x[0][i][j] = old - eps
+                lm = loss(x)
+                x[0][i][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(ana[0][i][j] - num) < 1e-8
+
+    def test_global_avg_pool(self):
+        gp = AI.GlobalAvgPool2d()
+        x = [[[1.0, 2.0], [3.0, 4.0]]]
+        out = gp.forward(x)
+        assert len(out) == 1
+        assert abs(out[0] - 2.5) < 1e-15
+        dx = gp.backward([2.0])
+        assert abs(dx[0][0][0] - 2.0 / 4) < 1e-15
+
+    def test_invalid_args(self):
+        for kernel, stride in ((0, None), (-1, None), (2, 0)):
+            with pytest.raises(ValueError):
+                AI.AvgPool2d(kernel, stride=stride)
+        with pytest.raises(ValueError):
+            # 5x5 kernel 套 4x4 输入：输出尺寸 <= 0
+            AI.AvgPool2d(5).forward([[[0.0] * 4 for _ in range(4)]])
