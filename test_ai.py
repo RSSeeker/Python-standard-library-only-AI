@@ -4388,3 +4388,157 @@ class TestSeq2SeqLM:
             m.generate([1], max_new_tokens=-1)
         with pytest.raises(ValueError):
             m.generate([1], max_new_tokens=2, temperature=0.0)
+
+class TestLMPersistence:
+    """CausalLM / Seq2SeqLM 的 JSON 存档往返"""
+
+    def _lm(self, seed=301):
+        random.seed(seed)
+        lm = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=12, rope=True, window=4,
+                         num_kv_heads=1)
+        lm.eval()
+        return lm
+
+    @staticmethod
+    def _params(m):
+        return {n: p for n, p, _ in m._named_params()}
+
+    def test_save_load_roundtrip_bit_identical(self, tmp_path):
+        lm = self._lm()
+        ids = [1, 3, 5, 2]
+        before = lm.forward(ids)
+        path = str(tmp_path / "lm.json")
+        lm.save(path, quiet=True)
+        lm2 = AI.CausalLM.load(path)
+        assert (lm2.vocab_size, lm2.num_heads, lm2.num_layers, lm2.max_len) == (7, 2, 2, 12)
+        assert lm2.rope is True and lm2.window == 4 and lm2.num_kv_heads == 1
+        p1, p2 = self._params(lm), self._params(lm2)
+        assert set(p1) == set(p2)
+        assert all(p1[k] == p2[k] for k in p1)
+        assert lm2.forward(ids) == before
+        assert lm2.generate([1, 3], max_new_tokens=4, top_k=1) == \
+            lm.generate([1, 3], max_new_tokens=4, top_k=1)
+
+    def test_optimizer_state_resumes_bit_identically(self, tmp_path):
+        random.seed(302)
+        seqs = [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]]
+
+        def make():
+            return AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                               num_layers=1, max_len=10)
+
+        a = make()
+        a.fit(seqs, epochs=3, lr=0.01, shuffle=False)
+        path = str(tmp_path / "lm_opt.json")
+        a.save(path, include_optimizer=True, quiet=True)
+        b = AI.CausalLM.load(path, restore_optimizer=True)
+        assert b.step_count == 6            # 3 轮 × 2 条序列
+        assert abs(a.evaluate(seqs) - b.evaluate(seqs)) < 1e-15
+        a.fit(seqs, epochs=2, lr=0.01, shuffle=False)
+        b.fit(seqs, epochs=2, lr=0.01, shuffle=False)
+        pa, pb = self._params(a), self._params(b)
+        assert all(pa[k] == pb[k] for k in pa)       # 逐位续训
+
+        c = AI.CausalLM.load(path)                    # 不恢复优化器
+        c.fit(seqs, epochs=2, lr=0.01, shuffle=False)
+        pc = self._params(c)
+        diff = max(abs(pa[k][i][j] - pc[k][i][j]) for k in pa
+                   if isinstance(pa[k], list) and pa[k] and isinstance(pa[k][0], list)
+                   for i in range(len(pa[k])) for j in range(len(pa[k][0])))
+        assert diff > 1e-6                            # 对照组：确实不同
+
+    def test_corrupt_archive_errors(self, tmp_path):
+        lm = self._lm()
+        path = str(tmp_path / "lm.json")
+        lm.save(path, quiet=True)
+        with open(path, "r", encoding="utf-8") as f:
+            good = json.load(f)
+
+        bad = str(tmp_path / "bad1.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            json.dump({"format": "other"}, f)
+        with pytest.raises(ValueError):
+            AI.CausalLM.load(bad)
+
+        meta = copy.deepcopy(good)
+        meta["params"]["emb.weight"] = meta["params"]["emb.weight"][:2]
+        bad2 = str(tmp_path / "bad2.json")
+        with open(bad2, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        with pytest.raises(ValueError):
+            AI.CausalLM.load(bad2)
+
+        meta = copy.deepcopy(good)
+        meta["params"]["emb.weight"][0][0] = float("nan")
+        bad3 = str(tmp_path / "bad3.json")
+        with open(bad3, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        with pytest.raises(ValueError):
+            AI.CausalLM.load(bad3)
+
+        with pytest.raises(FileNotFoundError):
+            AI.CausalLM.load(str(tmp_path / "nope.json"))
+
+    def test_seq2seq_roundtrip(self, tmp_path):
+        random.seed(303)
+        m = AI.Seq2SeqLM(5, 5, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=10)
+        m.eval()
+        before = m.forward([1, 2], [m.bos_id, 3])
+        path = str(tmp_path / "s2s.json")
+        m.save(path, quiet=True)
+        m2 = AI.Seq2SeqLM.load(path)
+        assert (m2.src_vocab, m2.tgt_vocab, m2.max_len) == (5, 5, 10)
+        p1, p2 = self._params(m), self._params(m2)
+        assert all(p1[k] == p2[k] for k in p1)
+        assert m2.forward([1, 2], [m.bos_id, 3]) == before
+
+
+class TestBeamSearch:
+    """num_beams（束搜索）"""
+
+    def test_beam1_equals_greedy(self):
+        random.seed(311)
+        lm = AI.CausalLM(vocab_size=6, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=1, max_len=16)
+        lm.fit([[0, 1, 2, 3, 4, 5, 0, 1, 2, 3]], epochs=40, lr=0.01, shuffle=False)
+        greedy = lm.generate([0], max_new_tokens=5, top_k=1)
+        assert lm.generate([0], max_new_tokens=5, num_beams=1) == greedy
+        assert lm.generate([0], max_new_tokens=5) == greedy     # num_beams 默认 1
+
+    def test_beam_is_deterministic_and_not_worse(self):
+        random.seed(312)
+        lm = AI.CausalLM(vocab_size=6, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=1, max_len=16)
+        lm.fit([[0, 1, 2, 3, 4, 5, 0, 1, 2, 3]], epochs=40, lr=0.01, shuffle=False)
+        beam = lm.generate([0], max_new_tokens=5, num_beams=3)
+        assert beam == lm.generate([0], max_new_tokens=5, num_beams=3)
+
+        def score(tokens):
+            total = 0.0
+            for t in range(len(tokens)):
+                logp = AI._log_softmax_row(lm.forward(tokens[:t + 1])[-1])
+                total += logp[tokens[t]]
+            return total
+
+        greedy = lm.generate([0], max_new_tokens=5, top_k=1)
+        assert score(beam[1:]) >= score(greedy[1:]) - 1e-12
+
+    def test_invalid_num_beams(self):
+        random.seed(313)
+        lm = AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises(ValueError):
+                lm.generate([0], max_new_tokens=2, num_beams=bad)
+
+    def test_seq2seq_beam(self):
+        random.seed(314)
+        m = AI.Seq2SeqLM(5, 5, d_model=16, num_heads=2, d_ff=32, num_layers=1, max_len=12)
+        pairs = [([1, 2, 3], [1, 2, 3]), ([2, 3, 1], [2, 3, 1]), ([3, 1, 2], [3, 1, 2])]
+        m.fit(pairs, epochs=40, lr=0.01, shuffle=False)
+        greedy = m.generate([1, 2, 3], max_new_tokens=3, top_k=1)
+        assert m.generate([1, 2, 3], max_new_tokens=3, num_beams=1) == greedy
+        assert m.generate([1, 2, 3], max_new_tokens=3, num_beams=3) == [1, 2, 3]
+        out = m.generate([1, 2, 3], max_new_tokens=3, num_beams=2, eos_id=2)
+        assert 2 not in out and len(out) <= 3

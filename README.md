@@ -188,7 +188,7 @@ model.train()     # 回到训练
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
 | `TransformerDecoderLayer` / `TransformerDecoder` | 解码器层（因果自注意力 → 交叉注意力 → FFN，三段残差 + LayerNorm）与多层堆叠；`backward` 把梯度同时传回解码器输入和编码器输出 |
 | `PositionalEncoding` | sin/cos 绝对位置编码 |
-| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` 做 nucleus 采样 |
+| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` 做 nucleus 采样，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
 
 ### 因果掩码与 LLM
@@ -355,6 +355,30 @@ model.fit(x_train, y_train, epochs=2)
 - `restore_optimizer=True` 但存档里没有优化器状态时**静默跳过**；类型或形状不匹配则 `ValueError`。
 - `step_count` 记的是**批次数**（样本数 / batch_size），不是轮数。
 
+### 语言模型存档与束搜索
+
+```python
+lm = AI.CausalLM(vocab_size=32, d_model=64, num_heads=8, d_ff=128, num_layers=2)
+lm.fit(seqs, epochs=50, lr=3e-3)
+
+lm.save("lm.json", include_optimizer=True)      # 结构 + 参数（+ Adam 状态）
+lm = AI.CausalLM.load("lm.json", restore_optimizer=True)   # 可逐位接着训
+
+# 束搜索（确定性，不抽随机数）；num_beams=1 与贪心解码逐位相同
+print(lm.generate([1, 2, 3], max_new_tokens=32, num_beams=4))
+
+# Seq2SeqLM 同样有 save / load / num_beams
+m = AI.Seq2SeqLM(16, 16, d_model=32, num_heads=4)
+m.save("s2s.json")
+m = AI.Seq2SeqLM.load("s2s.json")
+```
+
+- 存档是纯 JSON：`{"format": "ai_lm_v1", "kind": "causal"|"seq2seq", "config": ..., "params": {名字: 值}}`；
+  名字与 `_named_params()` 一一对应，所以参数块增删会被检测出来（报 `ValueError`）。
+- `include_optimizer=True` 才会写 `optimizer`（`step_count` + 每个参数块的 `m`/`v`）；
+  `restore_optimizer=True` 后继续训练与不中断训练**逐位相同**（未恢复则实测差 ~4.5e-02）。
+- 束搜索按累计对数概率保留 `num_beams` 条前缀；`top_k>0` 时每步只展开前 `top_k` 个候选，
+  否则展开 `num_beams` 个。`Seq2SeqLM` 的束搜索会把以 `eos_id` 结尾的候选放进「已完成」再统一比较。
 ### 优化器
 
 | 优化器 | 说明 |
@@ -399,6 +423,7 @@ model.fit(x_train, y_train, epochs=2)
 | `train(model, loss_fn, optimizer, data, ...)` | 底层训练循环（Early Stopping + 验证集） |
 | `evaluate(model, loss_fn, data)` | 计算平均损失 |
 | `save_model(model, path, task=None, optimizer=None, quiet=False)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
+| `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上 |
 | `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`） |
 | `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训 |
@@ -526,7 +551,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-397 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+405 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -555,7 +580,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
-| `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
+| `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
+| `TestBeamSearch` | `num_beams=1` 与贪心逐位相同、束搜索确定且累计对数概率不劣于贪心、非法 `num_beams` 报错、`Seq2SeqLM` 束搜索与 `eos` 提前停 |
+| `TestSeq2SeqLM` || `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
 | `TestCrossAttention` || `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
 | `TestTransformerDecoder` | 自注意力因果但交叉注意力看全 memory、`dx`/`dmemory`/交叉 `W_k` vs 数值梯度、单层与直接调层逐位一致、多层 `dmemory` 形状、非法 `num_layers` |
 
@@ -566,6 +593,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 397 个单元测试
+├── test_ai.py       # 405 个单元测试
 └── README.md
 ```

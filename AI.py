@@ -13,7 +13,7 @@
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
-  - 模型保存 / 加载（JSON 格式，可选带优化器状态做逐位续训）
+  - 模型保存 / 加载（JSON 格式，可选带优化器状态做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
 """
 
@@ -3202,6 +3202,102 @@ def _adam_apply(param, grad, m, v, t, lr, b1=0.9, b2=0.999, eps=1e-8):
             param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
 
 
+def _log_softmax_row(v):
+    """对一维列表做 log-softmax（数值稳定版，供束搜索累加对数概率用）"""
+    mx = max(v)
+    if mx == float("-inf"):
+        return [float("-inf")] * len(v)
+    exps = [math.exp(x - mx) for x in v]
+    log_s = math.log(sum(exps)) + mx
+    return [x - log_s for x in v]
+
+
+def _lm_copy_into(cur, saved, name):
+    """递归把存档里的嵌套 list 写进 cur，顺带校验形状、类型与有限性"""
+    if not isinstance(cur, list):
+        raise ValueError(f"LM 参数 {name}: 无法写入标量槽位")
+    if not isinstance(saved, list):
+        raise ValueError(f"LM 参数 {name}: 期望数组，存档里是 {type(saved).__name__}")
+    if len(cur) != len(saved):
+        raise ValueError(
+            f"LM 参数 {name}: 长度不符（模型 {len(cur)}，存档 {len(saved)}）")
+    for i in range(len(cur)):
+        if isinstance(cur[i], list):
+            _lm_copy_into(cur[i], saved[i], name)
+            continue
+        val = saved[i]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"LM 参数 {name}: 期望数值，存档里是 {val!r}")
+        val = float(val)
+        if val != val or val in (float("inf"), float("-inf")):
+            raise ValueError(f"LM 参数 {name}: 存档里有非有限值 {val!r}")
+        cur[i] = val
+
+
+def _lm_save(lm, kind, filepath, include_optimizer=False, quiet=False):
+    """把 LM 的配置 + 全部参数（可选 Adam 状态）写成 JSON"""
+    if not isinstance(filepath, str) or not filepath:
+        raise ValueError(f"save: filepath 必须是非空字符串，收到 {filepath!r}")
+    data = {
+        "format": "ai_lm_v1",
+        "kind": kind,
+        "config": lm._config(),
+        "params": {name: param for name, param, _ in lm._named_params()},
+    }
+    if include_optimizer:
+        data["optimizer"] = {
+            "step_count": int(getattr(lm, "step_count", 0)),
+            "m": {k: v for k, v in getattr(lm, "_adam_m", {}).items()},
+            "v": {k: v for k, v in getattr(lm, "_adam_v", {}).items()},
+        }
+    with io.open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    if not quiet:
+        print(f"已保存 {kind} 模型: {filepath}")
+    return filepath
+
+
+def _lm_load(filepath, restore_optimizer=False):
+    """从 `_lm_save` 写出的 JSON 恢复 LM（结构与参数逐位还原）"""
+    with io.open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get("format") != "ai_lm_v1":
+        raise ValueError(f"load: {filepath} 不是 ai_lm_v1 格式的 LM 存档")
+    kind = data.get("kind")
+    classes = {"causal": CausalLM, "seq2seq": Seq2SeqLM}
+    if kind not in classes:
+        raise ValueError(f"load: 未知的模型类型 {kind!r}（支持 {sorted(classes)}）")
+    cfg = data.get("config") or {}
+    # 存档里 window/num_kv_heads 可能是 null，构造器接受 None
+    try:
+        model = classes[kind](**cfg)
+    except TypeError as e:
+        raise ValueError(f"load: 存档的配置与构造器不匹配（{e}）")
+    saved_params = data.get("params") or {}
+    named = {name: param for name, param, _ in model._named_params()}
+    missing = sorted(set(named) - set(saved_params))
+    extra = sorted(set(saved_params) - set(named))
+    if missing or extra:
+        raise ValueError(
+            f"load: 参数块与存档不一致（缺 {missing[:3]}，多 {extra[:3]}）")
+    for name, param in named.items():
+        _lm_copy_into(param, saved_params[name], name)
+    if restore_optimizer:
+        opt = data.get("optimizer")
+        if opt:
+            model.step_count = int(opt.get("step_count", 0))
+            for key, store in (("m", model._adam_m), ("v", model._adam_v)):
+                saved_bufs = opt.get(key) or {}
+                store.clear()
+                for name, param, _ in model._named_params():
+                    if name not in saved_bufs:
+                        continue
+                    buf = _zeros_like(param)
+                    _lm_copy_into(buf, saved_bufs[name], f"optimizer.{key}.{name}")
+                    store[name] = buf
+    return model
+
+
 class CausalLM:
     """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头
 
@@ -3232,6 +3328,12 @@ class CausalLM:
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_len = max_len
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.window = window
+        self.num_kv_heads = num_kv_heads
 
         self.rope = bool(rope)
         # RoPE 已自带相对位置信息，默认就不再叠加绝对位置编码（Llama 的做法）；
@@ -3457,12 +3559,62 @@ class CausalLM:
         return math.exp(loss)
 
 
+    def _config(self):
+        """构造参数（存档用）；load 时原样喂回构造器"""
+        return {"vocab_size": self.vocab_size, "d_model": self.d_model,
+                "num_heads": self.num_heads, "d_ff": self.d_ff,
+                "num_layers": self.num_layers, "max_len": self.max_len,
+                "dropout": self.dropout, "rope": self.rope,
+                "use_abs_pos": self.use_abs_pos, "window": self.window,
+                "num_kv_heads": self.num_kv_heads}
+
+    def save(self, filepath: str, include_optimizer: bool = False,
+             quiet: bool = False):
+        """把结构与参数写成 JSON（纯标准库）
+
+        include_optimizer=True 时连 Adam 的一阶/二阶矩和步数一起存，
+        `load(..., restore_optimizer=True)` 之后可以逐位接着训练。
+        """
+        return _lm_save(self, "causal", filepath, include_optimizer, quiet)
+
+    @staticmethod
+    def load(filepath: str, restore_optimizer: bool = False):
+        """从 `save` 写出的 JSON 恢复 CausalLM（参数逐位还原）"""
+        return _lm_load(filepath, restore_optimizer)
+
+    def _generate_beam(self, ids, max_new_tokens, num_beams, top_k):
+        """束搜索：每步保留累计对数概率最高的 num_beams 条前缀（不用随机数）
+
+        num_beams=1 时与贪心解码（`generate(top_k=1)`）逐位相同。
+        top_k>0 时每步只展开概率最高的 top_k 个候选，否则展开 num_beams 个。
+        """
+        beams = [(0.0, list(ids))]
+        for _ in range(max_new_tokens):
+            cands = []
+            for score, toks in beams:
+                window = toks[-self.max_len:]
+                logits = self.forward(window)[-1]
+                logp = _log_softmax_row(logits)
+                order = sorted(range(self.vocab_size),
+                               key=lambda v: logp[v], reverse=True)
+                take = order[:int(top_k)] if top_k else order[:num_beams]
+                for v in take:
+                    cands.append((score + logp[v], toks + [v]))
+            if not cands:
+                break
+            cands.sort(key=lambda c: c[0], reverse=True)
+            beams = cands[:num_beams]
+        return beams[0][1]
+
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
-                 top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0):
+                 top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0,
+                 num_beams: int = 1):
         """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
 
         temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
         top_p: nucleus 采样阈值（(0,1]，默认 1.0 = 不过滤，与旧行为逐位相同）。
+
+        num_beams: >1 时改用束搜索（确定性，不抽随机数），返回最优的一条完整序列。
 
         use_cache: True（默认）走 KV cache —— 每个新 token 只前向一次，复用之前
         各层 K/V，生成 N 个 token 的代价从 O(N·T²) 降到 O(N·T)。与 use_cache=False
@@ -3474,12 +3626,17 @@ class CausalLM:
             raise ValueError(f"CausalLM.generate: temperature 必须 > 0，收到 {temperature!r}")
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"CausalLM.generate: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        if isinstance(num_beams, bool) or not isinstance(num_beams, int) or num_beams < 1:
+            raise ValueError(
+                f"CausalLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
         ids = list(prompt_ids)
         if not ids:
             raise ValueError("CausalLM.generate: prompt_ids 不能为空")
         rng = rng or random
         self.eval()
         n_new = int(max_new_tokens)
+        if num_beams > 1:
+            return self._generate_beam(ids, n_new, num_beams, top_k)
         if use_cache and n_new > 0:
             return self._generate_cached(ids, n_new, temperature, top_k, rng, top_p)
         for _ in range(n_new):
@@ -3587,6 +3744,10 @@ class Seq2SeqLM:
         self.d_model = d_model
         self.max_len = max_len
         self.bos_id = tgt_vocab          # 词表外的 BOS
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.dropout = dropout
         self.step_count = 0
         self._adam_m = {}
         self._adam_v = {}
@@ -3850,8 +4011,63 @@ class Seq2SeqLM:
                 break
         return pick
 
+    def _config(self):
+        """构造参数（存档用）"""
+        return {"src_vocab": self.src_vocab, "tgt_vocab": self.tgt_vocab,
+                "d_model": self.d_model, "num_heads": self.num_heads,
+                "d_ff": self.d_ff, "num_layers": self.num_layers,
+                "max_len": self.max_len, "dropout": self.dropout}
+
+    def save(self, filepath: str, include_optimizer: bool = False,
+             quiet: bool = False):
+        """把结构与参数写成 JSON（include_optimizer=True 连 Adam 状态一起存）"""
+        return _lm_save(self, "seq2seq", filepath, include_optimizer, quiet)
+
+    @staticmethod
+    def load(filepath: str, restore_optimizer: bool = False):
+        """从 `save` 写出的 JSON 恢复 Seq2SeqLM（参数逐位还原）"""
+        return _lm_load(filepath, restore_optimizer)
+
+    def _generate_beam(self, src_ids, max_new_tokens, num_beams, top_k, eos_id=None):
+        """束搜索解码：编码一次，每步对每条前缀重算解码器并保留前 num_beams
+
+        eos_id 非 None 时把以 eos 结尾的候选放进「已完成」，最后按累计对数概率
+        在所有已完成/未完成候选里挑最好的。
+        """
+        memory = self._encode(list(src_ids))
+        beams = [(0.0, [self.bos_id], [])]
+        finished = []
+        for _ in range(max_new_tokens):
+            cands = []
+            for score, tgt, out in beams:
+                if len(tgt) >= self.max_len:
+                    finished.append((score, out))
+                    continue
+                logits = self._decode(tgt, memory)[-1]
+                logp = _log_softmax_row(logits)
+                order = sorted(range(self.tgt_vocab),
+                               key=lambda v: logp[v], reverse=True)
+                take = order[:int(top_k)] if top_k else order[:num_beams]
+                for v in take:
+                    if eos_id is not None and v == eos_id:
+                        finished.append((score + logp[v], out))
+                    else:
+                        cands.append((score + logp[v], tgt + [v], out + [v]))
+            if not cands:
+                break
+            cands.sort(key=lambda c: c[0], reverse=True)
+            beams = cands[:num_beams]
+        best = None
+        if finished:
+            finished.sort(key=lambda c: c[0], reverse=True)
+            best = finished[0]
+        if best is not None and (not beams or best[0] >= beams[0][0]):
+            return list(best[1])
+        return list(beams[0][2])
+
     def generate(self, src_ids, max_new_tokens: int = 5, temperature: float = 1.0,
-                 top_k: int = 0, top_p: float = 1.0, rng=None, eos_id=None):
+                 top_k: int = 0, top_p: float = 1.0, rng=None, eos_id=None,
+                 num_beams: int = 1):
         """编码一次、解码逐步生成；返回生成的 token 列表（不含 BOS）
 
         eos_id 非 None 时遇到它立即停止（也不把它放进结果）。
@@ -3865,8 +4081,14 @@ class Seq2SeqLM:
         if temperature <= 0:
             raise ValueError(
                 f"Seq2SeqLM.generate: temperature 必须 > 0，收到 {temperature!r}")
+        if isinstance(num_beams, bool) or not isinstance(num_beams, int) or num_beams < 1:
+            raise ValueError(
+                f"Seq2SeqLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
         rng = rng or random
         self.eval()
+        if num_beams > 1:
+            return self._generate_beam(src_ids, int(max_new_tokens), num_beams,
+                                       top_k, eos_id)
         memory = self._encode(list(src_ids))
         out = []
         tgt = [self.bos_id]
