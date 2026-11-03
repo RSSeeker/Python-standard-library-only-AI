@@ -12,7 +12,7 @@
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
-  - 模型保存 / 加载（JSON 格式）
+  - 模型保存 / 加载（JSON 格式，可选带优化器状态做逐位续训）
 ================================================================================
 """
 
@@ -4044,12 +4044,89 @@ def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
 
 
 
-def save_model(model, filepath: str, task: str = None):
+def _optimizer_state(optimizer):
+    """把 Adam / AdamW 的动量与步数导出成可 JSON 化的 dict。
+
+    其它优化器（SGD / SGDMomentum / RMSprop）的缓冲结构不同，返回 None，
+    对应文件里就不写 optimizer 字段（保持向后兼容）。
+    """
+    name = type(optimizer).__name__
+    if name not in ("Adam", "AdamW"):
+        return None
+    model = optimizer.model
+    return {
+        "type": name.lower(),
+        "lr": optimizer.lr,
+        "beta1": optimizer.beta1,
+        "beta2": optimizer.beta2,
+        "eps": optimizer.eps,
+        "step_count": getattr(optimizer, "step_count", 0),
+        "m_w": [layer.m_w for layer in model.layers],
+        "v_w": [layer.v_w for layer in model.layers],
+        "m_b": [layer.m_b for layer in model.layers],
+        "v_b": [layer.v_b for layer in model.layers],
+    }
+
+
+def load_optimizer_state(optimizer, state):
+    """把 save_model 写下的 optimizer 状态灌回优化器（同类型、同形状才行）。
+
+    返回 True 表示恢复成功；state 为 None 时返回 False。类型或形状不匹配会
+    raise ValueError——静默忽略会让人以为「续训」了，其实动量是空的。
+    """
+    if state is None:
+        return False
+    want = str(state.get("type", "")).lower()
+    got = type(optimizer).__name__.lower()
+    if want != got:
+        raise ValueError(
+            f"load_optimizer_state: 文件里是 {want!r} 的状态，当前优化器是 {got!r}；"
+            f"请用 optimizer={want!r} 加载模型"
+        )
+    model = optimizer.model
+    for key in ("m_w", "v_w", "m_b", "v_b"):
+        saved = state.get(key)
+        if saved is None or len(saved) != len(model.layers):
+            raise ValueError(
+                f"load_optimizer_state: {key} 的层数 {0 if saved is None else len(saved)}"
+                f" 与模型层数 {len(model.layers)} 不一致"
+            )
+    for i, layer in enumerate(model.layers):
+        for attr, key in (("m_w", "m_w"), ("v_w", "v_w"),
+                          ("m_b", "m_b"), ("v_b", "v_b")):
+            saved_layer = state[key][i]
+            cur = getattr(layer, attr)
+            # 权重缓冲是二维、偏置缓冲是一维：分别校验形状
+            if isinstance(cur[0], list):
+                ok = len(saved_layer) == len(cur) and all(
+                    isinstance(a, list) and len(a) == len(b)
+                    for a, b in zip(saved_layer, cur)
+                )
+            else:
+                ok = len(saved_layer) == len(cur) and all(
+                    not isinstance(a, list) for a in saved_layer
+                )
+            if not ok:
+                raise ValueError(
+                    f"load_optimizer_state: 第 {i} 层 {key} 形状不匹配"
+                )
+            setattr(layer, attr, [[float(v) for v in row] for row in saved_layer]
+                    if isinstance(cur[0], list)
+                    else [float(v) for v in saved_layer])
+    optimizer.step_count = int(state.get("step_count", 0))
+    return True
+
+
+def save_model(model, filepath: str, task: str = None, optimizer=None,
+               quiet: bool = False):
     """将 MLP 模型保存为 JSON 文件
 
     task: 可选，"regression" / "classification"。会写进文件，供旧格式（没有逐层
           activation 记录）加载时判断输出层该用 linear 还是 softmax。
     每层还会写入 activation 字段，因此新格式文件不依赖 task 也能正确还原。
+    optimizer: 可选，传入 Adam / AdamW 时同时保存动量与步数，配合
+          load_optimizer_state 可以精确续训（不传则文件与旧版完全一致）。
+    quiet: True 时不打印保存提示（checkpoint 每轮保存会刷屏）。
     """
     data = {
         "type": "MLP",
@@ -4081,6 +4158,11 @@ def save_model(model, filepath: str, task: str = None):
         }
         data["layers"].append(layer_data)
 
+    if optimizer is not None:
+        state = _optimizer_state(optimizer)
+        if state is not None:
+            data["optimizer"] = state
+
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             # allow_nan=False：否则会写出 RFC-4627 不合法的 NaN / Infinity 字面量，
@@ -4091,7 +4173,8 @@ def save_model(model, filepath: str, task: str = None):
             f"save_model: 权重里含 NaN / Inf，无法写出合法 JSON（{e}）；"
             "训练可能发散了"
         ) from None
-    print(f"模型已保存到: {filepath}")
+    if not quiet:
+        print(f"模型已保存到: {filepath}")
 
 
 def load_model(filepath: str, default_output_activation: Optional[str] = None) -> MLP:
@@ -4907,7 +4990,8 @@ class Model:
     def fit(self, x=None, y=None, data=None, epochs=100, batch_size=32,
             val_split=0.1, val_data=None, patience=50, verbose=True,
             shuffle=True, lr_scheduler=None, grad_clip=None,
-            early_stop_metric='val', restore_best_weights=False):
+            early_stop_metric='val', restore_best_weights=False,
+            checkpoint_path=None, checkpoint_every=1):
         """
         训练模型。
 
@@ -4928,6 +5012,8 @@ class Model:
             early_stop_metric: 'val'（默认，盯验证损失）或 'train'（盯训练损失，且不依赖验证集）
             restore_best_weights: True 时在训练结束后回滚到「被监控指标最好」的那一轮权重
                 （早停只在指标变差时停止，**不会自动回滚**；需要最优权重时打开这个开关）
+            checkpoint_path: 每 checkpoint_every 轮把权重 + 优化器状态写到该路径
+                （中断后可用 Model.load(path, restore_optimizer=True) 续训）
         """
         # === 规范化数据 ===
         if data is not None:
@@ -5107,6 +5193,11 @@ class Model:
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch)
 
+            # 落盘 checkpoint（含优化器动量，可精确续训）
+            if checkpoint_path is not None and epoch % max(int(checkpoint_every), 1) == 0:
+                save_model(self.model, checkpoint_path, task=self.task,
+                           optimizer=self.optimizer, quiet=True)
+
             # 打印
             if verbose and epoch % max(1, epochs // 10) == 0:
                 parts = [f"Epoch {epoch}/{epochs}", f"loss={train_loss:.6f}"]
@@ -5219,12 +5310,13 @@ class Model:
 # ── 持久化
 
     def save(self, filepath):
-        """保存模型到 JSON 文件"""
-        save_model(self.model, filepath, task=self.task)
+        """保存模型到 JSON 文件（Adam/AdamW 会连动量与步数一起存）"""
+        save_model(self.model, filepath, task=self.task, optimizer=self.optimizer)
 
     @staticmethod
     def load(filepath, loss_fn=None, optimizer='adam', lr=0.01,
-             task='auto', default_output_activation=None):
+             task='auto', default_output_activation=None,
+             restore_optimizer=False):
         """从 JSON 加载，返回 Model 实例
 
         default_output_activation:
@@ -5232,6 +5324,9 @@ class Model:
             不传时其输出层会退回 linear，从而被当成回归模型。
         task:
             'auto'（默认）时优先采用文件中记录的 task，其次按输出层激活推断。
+        restore_optimizer:
+            True 时把文件里的 Adam/AdamW 动量与 step_count 恢复进新优化器，
+            这样接着 fit 就是「精确续训」而不是重新热身；文件里没有该字段时忽略。
         """
         mlp = load_model(filepath, default_output_activation=default_output_activation)
         if task == 'auto':
@@ -5244,7 +5339,19 @@ class Model:
         if last_act == "softmax" and task != 'classification':
             print("提示: 输出层是 softmax，按分类加载（文件里的 task 与输出层激活矛盾）")
             task = 'classification'
-        return Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
+        obj = Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
+        if restore_optimizer:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, ValueError):
+                raw = {}
+            state = raw.get("optimizer")
+            if state is not None:
+                load_optimizer_state(obj.optimizer, state)
+                if getattr(obj.optimizer, "step_count", 1) > 1:
+                    print(f"已恢复优化器状态（step_count={obj.optimizer.step_count}）")
+        return obj
 
 # ── 信息
 

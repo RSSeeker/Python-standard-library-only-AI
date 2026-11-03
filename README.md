@@ -96,6 +96,7 @@ model2 = Model.load("model.json")
 | `patience` | Early Stopping 耐心值（0 = 关闭） |
 | `lr_scheduler` | StepLR / ExponentialLR / CosineAnnealingLR |
 | `grad_clip` | 梯度范数裁剪阈值 |
+| `checkpoint_path` / `checkpoint_every` | 每 `checkpoint_every` 轮把模型（含优化器状态）存到该路径，用于断点续训 |
 
 训练结束后 `model.history` 里有三个键：`train_loss`、`val_loss`、`grad_norm`
 （每轮平均梯度范数，裁剪前；用来判断训练是否发散）。
@@ -139,9 +140,10 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 > **早停与权重回滚**：`fit(patience=...)` 在指标不再改善时停止训练，但**不会自动回滚**
 > 到最优那一轮；需要最优权重时传 `restore_best_weights=True`。
 >
-> **优化器状态不落盘**：`save_model` / `Model.save` 只保存权重、偏置与结构（及 task），
-> 不保存 Adam 的动量/二阶矩。所以「加载后继续训练」不等于「不中断地训练」——
-> 前几步的更新幅度会偏大。需要严格续训时请自行保存初始权重并重放相同的训练计划。
+> **优化器状态默认不落盘**：`save_model` / `Model.save` 只保存权重、偏置与结构（及 task），
+> 要连 Adam 的动量/二阶矩一起存，需显式传 `optimizer=`（`Model.save` 默认已传），
+> 加载时再传 `restore_optimizer=True`。不恢复动量的话「加载后继续训练」不等于「不中断地训练」——
+> 前几步的更新幅度会偏大（实测 2.4e-02 量级差异）；恢复后可达**逐位续训**（见下方「断点续训」）。
 
 ### 训练 / 推理模式
 
@@ -283,6 +285,25 @@ print(AI.ascii_plot(model.history))
 > 可用 `max_params=` 调整；它已经把「梯度错」和「数值误差」区分开——人为改坏一个
 > 梯度元素时 `worst_rel` 会到 1.0 量级。
 
+### 断点续训
+
+`fit` 可以边训边存，`Model.load` 可以把优化器状态一起接上，做到**逐位续训**：
+
+```python
+# 训练 4 轮，每轮落一次盘
+model.fit(x_train, y_train, epochs=4, checkpoint_path="ck.json", checkpoint_every=1)
+
+# 从中断处接着训 2 轮：等价于一次训 6 轮（权重逐位相同）
+model = AI.Model.load("ck.json", task="regression", restore_optimizer=True)
+model.fit(x_train, y_train, epochs=2)
+```
+
+- 只存权重时 `save_model` 的输出与旧版**逐字段相同**（无 `optimizer` 键），旧存档照常可读。
+- 传 `optimizer=` 才会写入 `{"type","lr","beta1","beta2","eps","step_count","m_w","v_w","m_b","v_b"}`；
+  `SGD` / `SGDMomentum` / `RMSprop` 没有状态，`_optimizer_state()` 返回 `None`。
+- `restore_optimizer=True` 但存档里没有优化器状态时**静默跳过**；类型或形状不匹配则 `ValueError`。
+- `step_count` 记的是**批次数**（样本数 / batch_size），不是轮数。
+
 ### 优化器
 
 | 优化器 | 说明 |
@@ -326,9 +347,10 @@ print(AI.ascii_plot(model.history))
 | `DataLoader(dataset, batch_size, shuffle, seed, collate_fn=None)` | 批量迭代器（可自定义批次拼装） |
 | `train(model, loss_fn, optimizer, data, ...)` | 底层训练循环（Early Stopping + 验证集） |
 | `evaluate(model, loss_fn, data)` | 计算平均损失 |
-| `save_model(model, path, task=None)` / `load_model(path, default_output_activation=None)` | MLP 的 JSON 持久化；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
+| `save_model(model, path, task=None, optimizer=None, quiet=False)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上 |
-| `Model.save(path)` / `Model.load(path, task='auto', default_output_activation=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task |
+| `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`） |
+| `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训 |
 
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
 | `clip_grad_by_value(grads, clip_val)` | 梯度值裁剪 |
@@ -453,7 +475,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-339 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+347 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -472,6 +494,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExtraLosses` | `gamma=0` 的 focal 退化为 CE、focal/CE-ls 梯度 vs 数值梯度、BCE 的 logits 稳定分支、Huber 两段、KL 公式 |
 | `TestRoPE` | 增量前向 == 整段前向（逐位）、RoPE 改变输出、**Q/K 逆旋转后的梯度 vs 数值梯度** |
 | `TestKVCache` | KV cache 生成 == 整段重算（含窗口滑动与 RoPE 两种情形）、训练后仍一致、生成不改参数 |
+| `TestFeedForwardActivation` | `FeedForward` 换 GELU/sigmoid 后的 `d_x` vs 数值梯度，`relu` 路径与旧实现逐位一致 |
+| `TestGradCheck` | `grad_check` 对 MLP / Model / CausalLM 都返回 `ok`，且人为改坏梯度时能识别 |
+| `TestOptimizerPersistence` | 不传 `optimizer` 时存档与旧格式逐字段相同、Adam 状态往返、**续训与一次训完权重逐位相同**、类型/形状不匹配报错 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -480,6 +505,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 339 个单元测试
+├── test_ai.py       # 347 个单元测试
 └── README.md
 ```

@@ -3518,3 +3518,101 @@ class TestGradNormHistory:
         model.fit(x=[[0.1, 0.2], [0.3, -0.1]], y=[[0.3], [0.1]], epochs=2,
                   batch_size=1, val_split=0.0, verbose=False, grad_clip=0.5)
         assert all(math.isfinite(v) for _, v in model.history["grad_norm"])
+
+
+# ============================================================================
+# 批次 6：优化器状态持久化 + checkpoint
+# ============================================================================
+
+class TestOptimizerPersistence:
+    X = [[0.10, 0.20], [0.30, -0.10], [0.50, 0.40], [-0.20, 0.60],
+         [0.70, 0.10], [-0.40, 0.30]]
+    Y = [[0.30], [0.10], [0.70], [0.20], [0.90], [0.05]]
+
+    def _fitted(self, seed=102, epochs=3):
+        random.seed(seed)
+        model = AI.Model(AI.MLP([2, 4, 1]), task="regression")
+        model.fit(x=self.X, y=self.Y, epochs=epochs, batch_size=3,
+                  val_split=0.0, verbose=False, shuffle=False)
+        return model
+
+    def test_save_without_optimizer_matches_old_format(self, tmp_path):
+        random.seed(101)
+        mlp = AI.MLP([2, 3, 1])
+        p = tmp_path / "plain.json"
+        AI.save_model(mlp, str(p), task="regression", quiet=True)
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert "optimizer" not in data
+        assert data["type"] == "MLP" and len(data["layers"]) == 2
+
+    def test_model_save_stores_adam_state(self, tmp_path):
+        model = self._fitted()
+        p = tmp_path / "state.json"
+        model.save(str(p))
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        opt = raw["optimizer"]
+        assert opt["type"] == "adam"
+        # 3 轮 × (6 样本 / batch=3) = 6 步
+        assert opt["step_count"] == 6
+        assert len(opt["m_w"]) == 2 and len(opt["m_w"][0][0]) == 2
+        assert len(opt["m_b"]) == 2
+
+    def test_resume_is_bit_identical(self, tmp_path):
+        p_ck = tmp_path / "ck.json"
+        random.seed(7)
+        full = AI.Model(AI.MLP([2, 4, 1]), task="regression")
+        full.fit(x=self.X, y=self.Y, epochs=6, batch_size=3, val_split=0.0,
+                 verbose=False, shuffle=False)
+
+        random.seed(7)
+        half = AI.Model(AI.MLP([2, 4, 1]), task="regression")
+        half.fit(x=self.X, y=self.Y, epochs=4, batch_size=3, val_split=0.0,
+                 verbose=False, shuffle=False, checkpoint_path=str(p_ck))
+
+        resumed = AI.Model.load(str(p_ck), task="regression", restore_optimizer=True)
+        assert resumed.optimizer.step_count == half.optimizer.step_count
+        resumed.fit(x=self.X, y=self.Y, epochs=2, batch_size=3, val_split=0.0,
+                    verbose=False, shuffle=False)
+        got = [row for layer in resumed.model.layers for row in layer.weights]
+        want = [row for layer in full.model.layers for row in layer.weights]
+        assert got == want
+
+    def test_without_restore_starts_from_scratch(self, tmp_path):
+        p_ck = tmp_path / "ck2.json"
+        random.seed(7)
+        AI.Model(AI.MLP([2, 4, 1]), task="regression").fit(
+            x=self.X, y=self.Y, epochs=4, batch_size=3, val_split=0.0,
+            verbose=False, shuffle=False, checkpoint_path=str(p_ck))
+        naive = AI.Model.load(str(p_ck), task="regression", restore_optimizer=False)
+        assert naive.optimizer.step_count == 0
+
+    def test_optimizer_type_mismatch_raises(self):
+        model = self._fitted()
+        state = AI._optimizer_state(model.optimizer)
+        random.seed(103)
+        sgd = AI.Model(AI.MLP([2, 4, 1]), optimizer="sgd", task="regression")
+        with pytest.raises(ValueError):
+            AI.load_optimizer_state(sgd.optimizer, state)
+
+    def test_optimizer_shape_mismatch_raises(self):
+        model = self._fitted()
+        state = AI._optimizer_state(model.optimizer)
+        random.seed(104)
+        other = AI.Model(AI.MLP([2, 5, 1]), task="regression")
+        with pytest.raises(ValueError):
+            AI.load_optimizer_state(other.optimizer, state)
+
+    def test_sgd_has_no_state(self):
+        random.seed(105)
+        model = AI.Model(AI.MLP([2, 3, 1]), optimizer="sgd", task="regression")
+        assert AI._optimizer_state(model.optimizer) is None
+
+    def test_load_without_optimizer_field_is_ok(self, tmp_path):
+        p = tmp_path / "no_opt.json"
+        random.seed(105)
+        AI.save_model(AI.MLP([2, 3, 1]), str(p), task="regression", quiet=True)
+        loaded = AI.Model.load(str(p), task="regression", restore_optimizer=True)
+        assert loaded.optimizer.step_count == 0
+
