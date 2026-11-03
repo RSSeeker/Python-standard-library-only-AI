@@ -5,6 +5,7 @@
   - Conv2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
+  - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列）
   - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
@@ -3553,6 +3554,332 @@ class CausalLM:
                     pos += 1
             window = new_window
         return ids
+
+
+class Seq2SeqLM:
+    """编码器-解码器序列到序列模型（翻译 / 改写 / 复制类任务）
+
+    数据流::
+
+        src_ids → Embedding → PositionalEncoding → TransformerEncoder ─┐
+                                                                        │ memory
+        tgt_ids(右移一位) → Embedding → PosEnc → TransformerDecoder ────┘
+                                              ↓
+                                        词表头 → logits
+
+    解码器每一层先用因果自注意力看自己已生成的前缀，再用交叉注意力读整段
+    编码器输出；训练用 teacher forcing（把目标右移一位当输入），推理时逐 token
+    生成并把结果接回输入。
+
+    BOS 用「词表外的一个 id」（即 `tgt_vocab` 本身），所以目标端 embedding 有
+    `tgt_vocab + 1` 行：这样既能区分句首和真实 token，又不用改目标词表大小。
+    """
+
+    def __init__(self, src_vocab: int, tgt_vocab: int, d_model: int = 32,
+                 num_heads: int = 4, d_ff: int = 64, num_layers: int = 2,
+                 max_len: int = 64, dropout: float = 0.0):
+        for name, val in (("src_vocab", src_vocab), ("tgt_vocab", tgt_vocab),
+                          ("max_len", max_len), ("num_layers", num_layers)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"Seq2SeqLM: {name} 必须是正整数，收到 {val!r}")
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.d_model = d_model
+        self.max_len = max_len
+        self.bos_id = tgt_vocab          # 词表外的 BOS
+        self.step_count = 0
+        self._adam_m = {}
+        self._adam_v = {}
+
+        self.src_embedding = Embedding(src_vocab, d_model)
+        self.tgt_embedding = Embedding(tgt_vocab + 1, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers, dropout)
+        self.decoder = TransformerDecoder(d_model, num_heads, d_ff, num_layers,
+                                          dropout, causal=True)
+
+        std = math.sqrt(2.0 / d_model)
+        self.W_out = [[random.gauss(0, std) for _ in range(d_model)]
+                      for _ in range(tgt_vocab)]
+        self.b_out = [0.0] * tgt_vocab
+
+        self.zero_grad()
+        self.h = None       # 最近一次前向的解码器输出（反向要用）
+        self.enc = None     # 最近一次前向的编码器输出
+
+    def train(self):
+        """训练模式：编码器、解码器的 Dropout 全部生效"""
+        self.encoder.train()
+        self.decoder.train()
+        return self
+
+    def eval(self):
+        """推理模式：关闭全部 Dropout"""
+        self.encoder.eval()
+        self.decoder.eval()
+        return self
+
+    def zero_grad(self):
+        """清零全部梯度（两个词表、编码器、解码器、输出头）"""
+        self.src_embedding.zero_grad()
+        self.tgt_embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.decoder.zero_grad()
+        self.grads = {
+            "W_out": [[0.0] * self.d_model for _ in range(self.tgt_vocab)],
+            "b_out": [0.0] * self.tgt_vocab,
+        }
+
+    def _named_params(self):
+        """产出 (名字, 参数, 梯度)；名字保证 Adam 的矩跨步稳定
+
+        必须在 `zero_grad()` 之后调用（各模块的 grads 是重建的新列表）。
+        """
+        yield "src_emb.weight", self.src_embedding.weight, self.src_embedding.grad_weight
+        yield "tgt_emb.weight", self.tgt_embedding.weight, self.tgt_embedding.grad_weight
+        for li, layer in enumerate(self.encoder.layers):
+            attn = layer.self_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"enc.L{li}.attn.{k}", getattr(attn, k), attn.grads[k]
+            ffn = layer.ffn
+            for k in ("W1", "b1", "W2", "b2"):
+                yield f"enc.L{li}.ffn.{k}", getattr(ffn, k), ffn.grads[k]
+            for ln in ("ln1", "ln2"):
+                mod = getattr(layer, ln)
+                yield f"enc.L{li}.{ln}.gamma", mod.gamma, layer.grads[ln + "_gamma"]
+                yield f"enc.L{li}.{ln}.beta", mod.beta, layer.grads[ln + "_beta"]
+        for li, layer in enumerate(self.decoder.layers):
+            attn = layer.self_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"dec.L{li}.attn.{k}", getattr(attn, k), attn.grads[k]
+            cross = layer.cross_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"dec.L{li}.cross.{k}", getattr(cross, k), cross.grads[k]
+            ffn = layer.ffn
+            for k in ("W1", "b1", "W2", "b2"):
+                yield f"dec.L{li}.ffn.{k}", getattr(ffn, k), ffn.grads[k]
+            for ln in ("ln1", "ln2", "ln3"):
+                mod = getattr(layer, ln)
+                yield f"dec.L{li}.{ln}.gamma", mod.gamma, layer.grads[ln + "_gamma"]
+                yield f"dec.L{li}.{ln}.beta", mod.beta, layer.grads[ln + "_beta"]
+        yield "out.W", self.W_out, self.grads["W_out"]
+        yield "out.b", self.b_out, self.grads["b_out"]
+
+    def param_count(self):
+        """参数总数（标量个数）"""
+        return sum(len(p) if not isinstance(p[0], list) else
+                   sum(len(r) for r in p)
+                   for _, p, _ in self._named_params())
+
+    def _encode(self, src_ids):
+        """编码器前向，返回 memory (Ts, d_model)"""
+        emb = self.src_embedding.forward(src_ids)
+        x = self.pos.forward(emb)
+        return self.encoder.forward(x)
+
+    def _decode(self, tgt_ids, memory):
+        """解码器前向，返回 logits (Tt, tgt_vocab)（未经 softmax）"""
+        emb = self.tgt_embedding.forward(tgt_ids)
+        x = self.pos.forward(emb)
+        h = self.decoder.forward(x, memory)
+        self.h = h
+        logits = _matmul(h, _transpose(self.W_out))
+        for t in range(len(h)):
+            for v in range(self.tgt_vocab):
+                logits[t][v] += self.b_out[v]
+        return logits
+
+    def forward(self, src_ids, tgt_in_ids):
+        """完整前向：返回 (Tt, tgt_vocab) 的 logits"""
+        if not src_ids:
+            raise ValueError("Seq2SeqLM.forward: src_ids 不能为空")
+        if not tgt_in_ids:
+            raise ValueError("Seq2SeqLM.forward: tgt_in_ids 不能为空")
+        if len(src_ids) > self.max_len:
+            raise ValueError(
+                f"Seq2SeqLM.forward: 源序列长度 {len(src_ids)} 超过 max_len={self.max_len}")
+        if len(tgt_in_ids) > self.max_len:
+            raise ValueError(
+                f"Seq2SeqLM.forward: 目标序列长度 {len(tgt_in_ids)} 超过 max_len={self.max_len}")
+        self.enc = self._encode(src_ids)
+        return self._decode(tgt_in_ids, self.enc)
+
+    def _loss_and_backward(self, src_ids, tgt_ids):
+        """单对序列的 teacher-forcing 交叉熵（对目标 token 数取平均）并累积梯度"""
+        if len(tgt_ids) < 1:
+            raise ValueError("Seq2SeqLM: 目标序列不能为空")
+        tgt_in = [self.bos_id] + list(tgt_ids[:-1])
+        logits = self.forward(src_ids, tgt_in)
+        n = len(tgt_ids)
+        d_logits = []
+        loss = 0.0
+        for t in range(n):
+            probs = _softmax_row(logits[t])
+            target = tgt_ids[t]
+            p = probs[target]
+            loss += -math.log(p if p > 1e-12 else 1e-12)
+            row = list(probs)
+            row[target] -= 1.0
+            d_logits.append(row)
+        loss /= n
+        inv = 1.0 / n
+        d_logits = [[v * inv for v in row] for row in d_logits]
+
+        h = self.h
+        seq_len = len(h)
+        for v in range(self.tgt_vocab):
+            g_row = self.grads["W_out"][v]
+            gb = 0.0
+            for t in range(seq_len):
+                d = d_logits[t][v]
+                gb += d
+                ht = h[t]
+                for j in range(self.d_model):
+                    g_row[j] += d * ht[j]
+            self.grads["b_out"][v] += gb
+        dh = [[0.0] * self.d_model for _ in range(seq_len)]
+        for t in range(seq_len):
+            dl = d_logits[t]
+            for j in range(self.d_model):
+                s = 0.0
+                for v in range(self.tgt_vocab):
+                    s += dl[v] * self.W_out[v][j]
+                dh[t][j] = s
+
+        d_dec_in, d_enc = self.decoder.backward(dh)
+        self.tgt_embedding.backward(d_dec_in)      # 位置编码无参数，直通
+        d_src = self.encoder.backward(d_enc)
+        self.src_embedding.backward(d_src)
+        return loss
+
+    def adam_step(self, lr: float):
+        """对全部参数做一次 Adam 更新（梯度由 `_loss_and_backward` 累积）"""
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, pairs, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干 (src_ids, tgt_ids) 上训练，返回每个 epoch 的平均 loss"""
+        items = [(list(s), list(t)) for s, t in pairs]
+        if not items:
+            raise ValueError("Seq2SeqLM.fit: pairs 不能为空")
+        for s, t in items:
+            if not s or not t:
+                raise ValueError("Seq2SeqLM.fit: 每对的源/目标都不能为空")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 0:
+            raise ValueError(f"Seq2SeqLM.fit: epochs 不能为负，收到 {epochs!r}")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        self.train()
+        for ep in range(epochs):
+            order = list(range(len(items)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                self.zero_grad()
+                total += self._loss_and_backward(items[i][0], items[i][1])
+                self.adam_step(lr)
+            avg = total / len(items)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def evaluate(self, pairs):
+        """不更新参数的 teacher-forcing 交叉熵（按目标 token 总数平均）"""
+        items = [(list(s), list(t)) for s, t in pairs]
+        if not items:
+            raise ValueError("Seq2SeqLM.evaluate: pairs 不能为空")
+        was_training = self.decoder.layers[0].self_attn.training
+        self.eval()
+        try:
+            total = 0.0
+            count = 0
+            for s, t in items:
+                if not s or not t:
+                    raise ValueError("Seq2SeqLM.evaluate: 每对的源/目标都不能为空")
+                tgt_in = [self.bos_id] + list(t[:-1])
+                logits = self.forward(s, tgt_in)
+                for i in range(len(t)):
+                    probs = _softmax_row(logits[i])
+                    p = probs[t[i]]
+                    total += -math.log(p if p > 1e-12 else 1e-12)
+                    count += 1
+            return total / count
+        finally:
+            if was_training:
+                self.train()
+
+    def _sample(self, logits, temperature, top_k, rng, top_p, vocab_size):
+        """从 logits 采一个 token（top_k / top_p + 温度 + 累积分布）"""
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError(f"Seq2SeqLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        if top_k and top_k < vocab_size:
+            order = sorted(range(vocab_size), key=lambda v: logits[v], reverse=True)
+            keep = set(order[:int(top_k)])
+            logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        if top_p < 1.0:
+            probs_raw = _softmax_row([v / temperature for v in logits])
+            order = sorted(range(vocab_size), key=lambda v: probs_raw[v], reverse=True)
+            keep = set()
+            acc_p = 0.0
+            for v in order:
+                keep.add(v)
+                acc_p += probs_raw[v]
+                if acc_p >= top_p:
+                    break
+            logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        probs = _softmax_row([v / temperature for v in logits])
+        u = rng.random()
+        acc = 0.0
+        pick = vocab_size - 1
+        for v, p in enumerate(probs):
+            acc += p
+            if u < acc:
+                pick = v
+                break
+        return pick
+
+    def generate(self, src_ids, max_new_tokens: int = 5, temperature: float = 1.0,
+                 top_k: int = 0, top_p: float = 1.0, rng=None, eos_id=None):
+        """编码一次、解码逐步生成；返回生成的 token 列表（不含 BOS）
+
+        eos_id 非 None 时遇到它立即停止（也不把它放进结果）。
+        每步都对整个已生成前缀重算一次解码器（T 通常很短，实现保持简单）。
+        """
+        if not src_ids:
+            raise ValueError("Seq2SeqLM.generate: src_ids 不能为空")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int)                 or max_new_tokens < 0:
+            raise ValueError(
+                f"Seq2SeqLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
+        if temperature <= 0:
+            raise ValueError(
+                f"Seq2SeqLM.generate: temperature 必须 > 0，收到 {temperature!r}")
+        rng = rng or random
+        self.eval()
+        memory = self._encode(list(src_ids))
+        out = []
+        tgt = [self.bos_id]
+        for _ in range(max_new_tokens):
+            if len(tgt) >= self.max_len:
+                break
+            logits = self._decode(tgt, memory)[-1]
+            pick = self._sample(logits, temperature, top_k, rng, top_p, self.tgt_vocab)
+            tgt.append(pick)
+            if eos_id is not None and pick == eos_id:
+                break
+            out.append(pick)
+        return out
 
 
 class ResidualBlock:

@@ -4266,3 +4266,125 @@ class TestTransformerDecoder:
             AI.TransformerDecoder(8, 2, 16, num_layers=0)
         with pytest.raises(ValueError):
             AI.TransformerDecoder(8, 2, 16, num_layers=-2)
+
+class TestSeq2SeqLM:
+    """编码器-解码器序列到序列模型"""
+
+    def _model(self, seed=201, **kw):
+        random.seed(seed)
+        args = dict(d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=12)
+        args.update(kw)
+        m = AI.Seq2SeqLM(6, 6, **args)
+        m.eval()
+        return m
+
+    def test_shapes_and_param_blocks(self):
+        m = self._model()
+        logits = m.forward([1, 2, 3], [m.bos_id, 4, 2])
+        assert len(logits) == 3 and len(logits[0]) == 6
+        assert m.bos_id == 6            # BOS 在目标词表之外
+        blocks = list(m._named_params())
+        names = [n for n, _, _ in blocks]
+        assert len(blocks) == 2 + 16 + 26 + 2    # 两个词表 + enc + dec + 输出头
+        assert "src_emb.weight" in names and "tgt_emb.weight" in names
+        assert any(n.startswith("dec.L0.cross.") for n in names)
+        assert "out.W" in names and "out.b" in names
+        assert m.param_count() > 0
+
+    def test_decoder_causal_and_memory_dependence(self):
+        m = self._model()
+        a = m.forward([1, 2, 3], [m.bos_id, 1, 2, 3])
+        b = m.forward([1, 2, 3], [m.bos_id, 1, 5, 4])
+        assert a[0] == b[0] and a[1] == b[1]
+        assert a[2] != b[2] or a[3] != b[3]
+        c = m.forward([1, 2, 4], [m.bos_id, 1, 2, 3])
+        assert all(c[t] != a[t] for t in range(4))
+
+    def test_gradient_numeric(self):
+        m = self._model(seed=202)
+        src = [1, 2]
+        tgt = [3, 1]
+        eps = 1e-6
+
+        def train_loss():
+            m.zero_grad()
+            return m._loss_and_backward(src, tgt)
+
+        m.zero_grad()
+        m._loss_and_backward(src, tgt)
+        g_src = [row[:] for row in m.src_embedding.grad_weight]
+        for idx in (1, 2):
+            for j in (0, 3):
+                old = m.src_embedding.weight[idx][j]
+                m.src_embedding.weight[idx][j] = old + eps
+                lp = train_loss()
+                m.src_embedding.weight[idx][j] = old - eps
+                lm = train_loss()
+                m.src_embedding.weight[idx][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(g_src[idx][j] - num) / max(1.0, abs(num)) < 1e-5
+
+        m.zero_grad()
+        m._loss_and_backward(src, tgt)
+        cross = m.decoder.layers[0].cross_attn
+        g_k = [row[:] for row in cross.grads["W_k"]]
+        for i, j in ((0, 1), (2, 3)):
+            old = cross.W_k[i][j]
+            cross.W_k[i][j] = old + eps
+            lp = train_loss()
+            cross.W_k[i][j] = old - eps
+            lm = train_loss()
+            cross.W_k[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(g_k[i][j] - num) / max(1.0, abs(num)) < 1e-5
+
+        m.zero_grad()
+        m._loss_and_backward(src, tgt)
+        g_out = [row[:] for row in m.grads["W_out"]]
+        for i, j in ((0, 1), (4, 2)):
+            old = m.W_out[i][j]
+            m.W_out[i][j] = old + eps
+            lp = train_loss()
+            m.W_out[i][j] = old - eps
+            lm = train_loss()
+            m.W_out[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(g_out[i][j] - num) / max(1.0, abs(num)) < 1e-5
+
+    def test_learns_copy_task(self):
+        """小语料上学会「原样复制」：loss 大幅下降且贪心解码正确"""
+        random.seed(203)
+        m = AI.Seq2SeqLM(5, 5, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=1, max_len=12)
+        pairs = [([1, 2, 3], [1, 2, 3]), ([2, 3, 1], [2, 3, 1]),
+                 ([3, 1, 2], [3, 1, 2]), ([1, 3, 2], [1, 3, 2]),
+                 ([2, 1, 3], [2, 1, 3])]
+        hist = m.fit(pairs, epochs=40, lr=0.01, shuffle=False)
+        assert hist[-1] < 0.2 * hist[0]
+        assert m.generate([1, 2, 3], max_new_tokens=3, top_k=1) == [1, 2, 3]
+        assert m.generate([2, 3, 1], max_new_tokens=3, top_k=1) == [2, 3, 1]
+
+    def test_generate_reproducible_and_modes(self):
+        m = self._model(seed=204, dropout=0.5)
+        a = m.generate([1, 2, 3], 3, temperature=1.0, rng=random.Random(9))
+        b = m.generate([1, 2, 3], 3, temperature=1.0, rng=random.Random(9))
+        assert a == b
+        o1 = m.forward([1, 2], [m.bos_id, 1])
+        o2 = m.forward([1, 2], [m.bos_id, 1])
+        assert o1 == o2                      # generate 之后仍是 eval
+        m.train()
+        assert m.forward([1, 2], [m.bos_id, 1]) != o1
+
+    def test_invalid(self):
+        for args in ((0, 4), (4, 0), (4, 4, 8, 2, 16, 1, 0)):
+            with pytest.raises(ValueError):
+                AI.Seq2SeqLM(*args)
+        m = self._model()
+        with pytest.raises(ValueError):
+            m.forward([], [0])
+        with pytest.raises(ValueError):
+            m.forward([1], [])
+        with pytest.raises(ValueError):
+            m.generate([1], max_new_tokens=-1)
+        with pytest.raises(ValueError):
+            m.generate([1], max_new_tokens=2, temperature=0.0)

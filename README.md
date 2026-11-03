@@ -189,6 +189,7 @@ model.train()     # 回到训练
 | `TransformerDecoderLayer` / `TransformerDecoder` | 解码器层（因果自注意力 → 交叉注意力 → FFN，三段残差 + LayerNorm）与多层堆叠；`backward` 把梯度同时传回解码器输入和编码器输出 |
 | `PositionalEncoding` | sin/cos 绝对位置编码 |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` 做 nucleus 采样 |
+| `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
 
 ### 因果掩码与 LLM
 
@@ -286,6 +287,24 @@ lm.fit(seqs, epochs=50, lr=3e-3)
 out = lm.generate([1, 2, 3], max_new_tokens=32, use_cache=True)
 print("困惑度:", lm.perplexity(seqs))    # exp(交叉熵)
 ```
+
+### 序列到序列（Encoder-Decoder）
+
+```python
+import AI
+
+# 目标端 BOS 用词表外的 id（tgt_vocab），源/目标词表可以不同大小
+m = AI.Seq2SeqLM(src_vocab=16, tgt_vocab=16, d_model=32, num_heads=4,
+                 d_ff=64, num_layers=2, max_len=32)
+m.fit([([1, 2, 3], [1, 2, 3])], epochs=40, lr=0.01)   # teacher forcing
+print(m.evaluate([([1, 2, 3], [1, 2, 3])]))            # 平均交叉熵
+print(m.generate([1, 2, 3], max_new_tokens=3, top_k=1))  # 贪心解码
+```
+
+解码器里三层结构各带自己的残差与 LayerNorm：**因果自注意力 → 交叉注意力（K/V 来自编码器
+输出，长度可以与源序列不同）→ 前馈网络**；`backward` 同时把梯度传回解码器输入和编码器输出，
+所以整条 encoder-decoder 可以端到端训练。`fit` 把目标序列右移一位当输入
+（`[BOS] + tgt[:-1]`），交叉熵对目标 token 数取平均。
 
 ### 训练工程化工具
 
@@ -507,7 +526,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-391 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+397 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -536,7 +555,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
-| `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
+| `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
+| `TestCrossAttention` || `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
 | `TestTransformerDecoder` | 自注意力因果但交叉注意力看全 memory、`dx`/`dmemory`/交叉 `W_k` vs 数值梯度、单层与直接调层逐位一致、多层 `dmemory` 形状、非法 `num_layers` |
 
 CI（GitHub Actions）执行 flake8 + pytest。
@@ -546,6 +566,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 391 个单元测试
+├── test_ai.py       # 397 个单元测试
 └── README.md
 ```
