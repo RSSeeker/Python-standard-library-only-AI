@@ -4618,3 +4618,5 @@ class TestBytePairTokenizer:
         assert hist[-1] < 0.2 * hist[0]
         out = lm.generate(tok.encode("0"), max_new_tokens=6, top_k=1)
         assert isinstance(tok.decode(out), str)
+        assert lm.param_count() > 0
+

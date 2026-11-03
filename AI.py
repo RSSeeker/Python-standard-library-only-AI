@@ -32,9 +32,10 @@
 #  11. 应用梯度更新权重 (SGD)
 
 
-import json
-import sys
 import io
+import json
+import os
+import sys
 
 import math
 import operator
@@ -3395,6 +3396,12 @@ class CausalLM:
             yield f"L{li}.ln2.beta", layer.ln2.beta, layer.grads["ln2_beta"]
         yield "out.W", self.W_out, self.grads["W_out"]
         yield "out.b", self.b_out, self.grads["b_out"]
+
+    def param_count(self):
+        """参数总数（标量个数）"""
+        return sum(len(p) if not isinstance(p[0], list) else
+                   sum(len(r) for r in p)
+                   for _, p, _ in self._named_params())
 
     def forward(self, ids):
         """ids: List[int] → logits (seq_len, vocab_size)（未经 softmax）"""
@@ -7662,6 +7669,42 @@ if __name__ == "__main__":
     lm_out = lm.generate(lm_prompt, max_new_tokens=8, temperature=1e-6)
     print(f"  前缀 {''.join(map(str, lm_prompt))} → 续写 "
           f"{''.join(map(str, lm_out))}  （期望 012012012…）")
+
+    # ==================== 迷你 GPT：BPE 分词 + 存档续训 + 束搜索 ====================
+    print("\n" + "=" * 60)
+    print("迷你 GPT: BPE 分词 → 训练 → 存档 → 续训 → 束搜索")
+    print("=" * 60)
+
+    random.seed(7)
+    mini_corpus = "the quick brown fox jumps over the lazy dog. " * 6
+    mini_bpe = BytePairTokenizer().train(mini_corpus, vocab_size=320)
+    mini_seqs = mini_bpe.encode_corpus(mini_corpus, seq_len=24)
+    raw_bytes = len(mini_corpus.encode("utf-8"))
+    print(f"  语料 {raw_bytes} 字节 → 词表 {mini_bpe.vocab_size}"
+          f"（256 基础 + {len(mini_bpe.merges)} 合并）| {len(mini_seqs)} 条序列")
+
+    random.seed(11)
+    mini_lm = CausalLM(vocab_size=mini_bpe.vocab_size, d_model=24, num_heads=2,
+                       d_ff=48, num_layers=1, max_len=24)
+    mini_hist = mini_lm.fit(mini_seqs, epochs=30, lr=0.01, shuffle=True, seed=3)
+    print(f"  训练 30 轮: loss {mini_hist[0]:.4f} → {mini_hist[-1]:.4f}"
+          f" | 参数 {mini_lm.param_count()}")
+
+    mini_path = "demo_mini_gpt.json"
+    mini_lm.save(mini_path, include_optimizer=True, quiet=True)
+    mini_reload = CausalLM.load(mini_path, restore_optimizer=True)
+    mini_hist2 = mini_reload.fit(mini_seqs, epochs=5, lr=0.01, shuffle=True, seed=3)
+    print(f"  存档 → 重载 → 续训 5 轮: loss {mini_hist2[0]:.4f} → {mini_hist2[-1]:.4f}")
+
+    mini_prompt = mini_bpe.encode("the quick")
+    greedy = mini_lm.generate(mini_prompt, max_new_tokens=10, top_k=1)
+    beam = mini_lm.generate(mini_prompt, max_new_tokens=10, num_beams=3)
+    print(f"  贪心续写: {mini_bpe.decode(greedy)!r}")
+    print(f"  束搜索  : {mini_bpe.decode(beam)!r}")
+    try:
+        os.remove(mini_path)
+    except OSError:
+        pass
 
     # ==================== 文本生成示例（字符级语言模型） ====================
     print("\n" + "=" * 60)
