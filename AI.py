@@ -10,7 +10,8 @@
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
-  - 训练 / 验证 / 测试集拆分 + Early Stopping + DataLoader
+  - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
+  - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
   - 模型保存 / 加载（JSON 格式）
 ================================================================================
 """
@@ -1942,9 +1943,19 @@ class MultiHeadAttention:
 
 
 class FeedForward:
-    """Transformer 前馈网络: Linear → ReLU → Linear"""
+    """Transformer 前馈网络: Linear → 激活 → Linear
 
-    def __init__(self, d_model: int, d_ff: int):
+    activation 默认 "relu"（与原实现逐位一致）；"gelu" 是 GPT/LLaMA 的常用选择。
+    激活只作用于中间层，输出层仍是线性。
+    """
+
+    def __init__(self, d_model: int, d_ff: int, activation: str = "relu"):
+        if activation not in ("relu", "gelu", "sigmoid", "linear"):
+            raise ValueError(
+                f"FeedForward: 不支持的激活 {activation!r}；"
+                f"可选 relu/gelu/sigmoid/linear"
+            )
+        self.activation = activation
         self.d_model = d_model
         self.d_ff = d_ff
 
@@ -1958,6 +1969,7 @@ class FeedForward:
         self._init_adam()
         self.zero_grad()
         self.x = self.h = None  # 缓存
+        self.z = None           # 非 relu 时需要留中间层线性输出
 
     def _init_adam(self):
         def z2(r, c):
@@ -1980,17 +1992,57 @@ class FeedForward:
         """x_seq: (seq_len, d_model)"""
         self.x = x_seq
         self.seq_len = len(x_seq)
-        # W1 @ x + b1 → ReLU → W2 @ x + b2
+        # W1 @ x + b1 → 激活 → W2 @ x + b2
         h = _matmul(x_seq, _transpose(self.W1))
-        for t in range(self.seq_len):
-            for j in range(self.d_ff):
-                h[t][j] = max(0, h[t][j] + self.b1[j])  # ReLU
+        if self.activation == "relu":
+            for t in range(self.seq_len):
+                for j in range(self.d_ff):
+                    h[t][j] = max(0, h[t][j] + self.b1[j])  # ReLU
+        else:
+            z = [[h[t][j] + self.b1[j] for j in range(self.d_ff)]
+                 for t in range(self.seq_len)]
+            self.z = z
+            act = self._act_scalar
+            for t in range(self.seq_len):
+                zt, ht = z[t], h[t]
+                for j in range(self.d_ff):
+                    ht[j] = act(zt[j])
         self.h = h
         out = _matmul(h, _transpose(self.W2))
         for t in range(self.seq_len):
             for j in range(self.d_model):
                 out[t][j] += self.b2[j]
         return out
+
+    def _act_scalar(self, z: float) -> float:
+        """中间层激活（标量版，供非 relu 路径使用）"""
+        a = self.activation
+        if a == "relu":
+            return z if z > 0.0 else 0.0
+        if a == "gelu":
+            u = _GELU_C * (z + 0.044715 * z * z * z)
+            return 0.5 * z * (1.0 + math.tanh(u))
+        if a == "sigmoid":
+            if z >= 0.0:
+                return 1.0 / (1.0 + math.exp(-z))
+            e = math.exp(z)
+            return e / (1.0 + e)
+        return z  # linear
+
+    def _dact_scalar(self, z: float) -> float:
+        """中间层激活的导数（标量版）"""
+        a = self.activation
+        if a == "relu":
+            return 1.0 if z > 0.0 else 0.0
+        if a == "gelu":
+            u = _GELU_C * (z + 0.044715 * z * z * z)
+            t = math.tanh(u)
+            du = _GELU_C * (1.0 + 3.0 * 0.044715 * z * z)
+            return 0.5 * (1.0 + t) + 0.5 * z * (1.0 - t * t) * du
+        if a == "sigmoid":
+            s = self._act_scalar(z)
+            return s * (1.0 - s)
+        return 1.0  # linear
 
     def backward(self, dout_seq):
         """dout_seq: (seq_len, d_model) → dx_seq: (seq_len, d_model)"""
@@ -2003,11 +2055,19 @@ class FeedForward:
         # d_h = dout @ W2
         dh = _matmul(dout_seq, self.W2)  # (seq_len, d_ff)
 
-        # ReLU backward
-        for t in range(seq_len):
-            for j in range(self.d_ff):
-                if self.h[t][j] <= 0:
-                    dh[t][j] = 0.0
+        # 激活反向：relu 走原分支（读 h，保持逐位一致）；其它用中间层 z
+        if self.activation == "relu":
+            for t in range(seq_len):
+                for j in range(self.d_ff):
+                    if self.h[t][j] <= 0:
+                        dh[t][j] = 0.0
+        else:
+            dact = self._dact_scalar
+            z = self.z
+            for t in range(seq_len):
+                zt, dht = z[t], dh[t]
+                for j in range(self.d_ff):
+                    dht[j] *= dact(zt[j])
 
         # W1 backward: dW1 = dh^T @ x  (d_ff, seq_len) @ (seq_len, d_model) = (d_ff, d_model)
         grad_W1 = _matmul(_transpose(dh), self.x)
@@ -3401,8 +3461,13 @@ class WarmupLR:
 #  Data Utilities
 # ============================================================================
 
-def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int = 42):
-    """将数据拆分为 train / val / test"""
+def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int = 42,
+               stratify=None):
+    """将数据拆分为 train / val / test
+
+    stratify: 与 data 等长的标签序列（如类别 id）。给出时按标签分层抽样，
+        使各类别在 train/val/test 中的比例尽量与整体一致（类别极不均衡时很有用）。
+    """
     if not (0.0 <= val_ratio < 1.0) or not (0.0 <= test_ratio < 1.0) \
             or val_ratio + test_ratio >= 1.0:
         raise ValueError(
@@ -3412,6 +3477,25 @@ def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int 
     # 用局部 Random 实例，避免 random.seed() 污染全局随机状态
     rng = random.Random(seed)
     items = list(data)
+    if stratify is not None:
+        if len(stratify) != len(items):
+            raise ValueError(
+                f"split_data: stratify 长度 {len(stratify)} 与数据量 {len(items)} 不一致"
+            )
+        groups = {}
+        for idx, label in enumerate(stratify):
+            groups.setdefault(label, []).append(idx)
+        test_idx, val_idx, train_idx = [], [], []
+        for label, idxs in groups.items():
+            rng.shuffle(idxs)
+            k = len(idxs)
+            n_t = int(k * test_ratio)
+            n_v = int(k * val_ratio)
+            test_idx.extend(idxs[:n_t])
+            val_idx.extend(idxs[n_t:n_t + n_v])
+            train_idx.extend(idxs[n_t + n_v:])
+        return ([items[i] for i in train_idx], [items[i] for i in val_idx],
+                [items[i] for i in test_idx])
     rng.shuffle(items)
 
     n = len(items)
@@ -3429,7 +3513,7 @@ class DataLoader:
     """简易数据加载器：按 batch 迭代，支持 shuffle"""
 
     def __init__(self, dataset: list, batch_size: int = 32, shuffle: bool = True,
-                 seed=None):
+                 seed=None, collate_fn=None):
         if batch_size is None or batch_size <= 0:
             raise ValueError(f"DataLoader: batch_size 必须 >= 1，收到 {batch_size!r}")
         self.dataset = dataset
@@ -3437,16 +3521,240 @@ class DataLoader:
         self.shuffle = shuffle
         # 用局部 RNG：全局 random.shuffle 会推进调用方的随机状态，破坏可复现性
         self._rng = random.Random(seed)
+        # collate_fn(batch) -> batch：自定义批次拼装（padding、转张量等）
+        self.collate_fn = collate_fn
 
     def __iter__(self):
         items = list(self.dataset)
         if self.shuffle:
             self._rng.shuffle(items)
         for b in range(0, len(items), self.batch_size):
-            yield items[b:b + self.batch_size]
+            batch = items[b:b + self.batch_size]
+            if self.collate_fn is not None:
+                batch = self.collate_fn(batch)
+            yield batch
 
     def __len__(self):
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+
+def k_fold_indices(n_samples: int, n_splits: int = 5, shuffle: bool = True,
+                   seed: int = 42, stratify=None):
+    """生成 K 折交叉验证的 (train_idx, val_idx) 列表（纯索引，不复制数据）。
+
+    n_samples: 样本总数
+    n_splits:  折数（>=2）
+    stratify:  与样本等长的标签序列；给出时每折按类别分层
+    """
+    n_samples = int(n_samples)
+    n_splits = int(n_splits)
+    if n_samples <= 0:
+        raise ValueError(f"k_fold_indices: n_samples 必须 > 0，收到 {n_samples}")
+    if n_splits < 2:
+        raise ValueError(f"k_fold_indices: n_splits 必须 >= 2，收到 {n_splits}")
+    if n_splits > n_samples:
+        raise ValueError(
+            f"k_fold_indices: n_splits={n_splits} 超过样本数 {n_samples}"
+        )
+    rng = random.Random(seed)
+    if stratify is not None:
+        if len(stratify) != n_samples:
+            raise ValueError(
+                f"k_fold_indices: stratify 长度 {len(stratify)} 与样本数 {n_samples} 不一致"
+            )
+        groups = {}
+        for idx, label in enumerate(stratify):
+            groups.setdefault(label, []).append(idx)
+        folds = [[] for _ in range(n_splits)]
+        for label, idxs in groups.items():
+            rng.shuffle(idxs)
+            for i, idx in enumerate(idxs):
+                folds[i % n_splits].append(idx)
+    else:
+        order = list(range(n_samples))
+        if shuffle:
+            rng.shuffle(order)
+        folds = [[] for _ in range(n_splits)]
+        for i, idx in enumerate(order):
+            folds[i % n_splits].append(idx)
+    out = []
+    for k in range(n_splits):
+        val_idx = sorted(folds[k])
+        val_set = set(val_idx)
+        train_idx = [i for i in range(n_samples) if i not in val_set]
+        out.append((train_idx, val_idx))
+    return out
+
+
+class StandardScaler:
+    """逐特征标准化：(x - mean) / std（std 为 0 时按 1 处理，不做缩放）"""
+
+    def __init__(self):
+        self.mean_ = None
+        self.std_ = None
+
+    def _check(self, x):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError("StandardScaler: 输入必须是非空的二维列表")
+        width = len(x[0])
+        if width == 0:
+            raise ValueError("StandardScaler: 样本特征维度不能为 0")
+        for row in x:
+            if len(row) != width:
+                raise ValueError(
+                    f"StandardScaler: 各样本维度不一致（{len(row)} != {width}）"
+                )
+        return width
+
+    def fit(self, x):
+        width = self._check(x)
+        n = len(x)
+        self.mean_ = [sum(row[j] for row in x) / n for j in range(width)]
+        self.std_ = []
+        for j in range(width):
+            var = sum((row[j] - self.mean_[j]) ** 2 for row in x) / n
+            s = math.sqrt(var)
+            self.std_.append(s if s > 0.0 else 1.0)
+        return self
+
+    def transform(self, x):
+        if self.mean_ is None:
+            raise ValueError("StandardScaler: 请先 fit")
+        self._check(x)
+        return [[(row[j] - self.mean_[j]) / self.std_[j]
+                 for j in range(len(self.mean_))] for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.mean_ is None:
+            raise ValueError("StandardScaler: 请先 fit")
+        self._check(x)
+        return [[row[j] * self.std_[j] + self.mean_[j]
+                 for j in range(len(self.mean_))] for row in x]
+
+
+class MinMaxScaler:
+    """逐特征缩放到 [feature_range]（默认 [0, 1]；极差为 0 时映射到下界）"""
+
+    def __init__(self, feature_range=(0.0, 1.0)):
+        lo, hi = feature_range
+        if not (lo < hi):
+            raise ValueError(
+                f"MinMaxScaler: feature_range 要求 lo < hi，收到 {feature_range!r}"
+            )
+        self.range_ = (float(lo), float(hi))
+        self.data_min_ = None
+        self.data_max_ = None
+
+    def _check(self, x):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError("MinMaxScaler: 输入必须是非空的二维列表")
+        width = len(x[0])
+        if width == 0:
+            raise ValueError("MinMaxScaler: 样本特征维度不能为 0")
+        for row in x:
+            if len(row) != width:
+                raise ValueError(
+                    f"MinMaxScaler: 各样本维度不一致（{len(row)} != {width}）"
+                )
+        return width
+
+    def fit(self, x):
+        width = self._check(x)
+        self.data_min_ = [min(row[j] for row in x) for j in range(width)]
+        self.data_max_ = [max(row[j] for row in x) for j in range(width)]
+        return self
+
+    def transform(self, x):
+        if self.data_min_ is None:
+            raise ValueError("MinMaxScaler: 请先 fit")
+        self._check(x)
+        lo, hi = self.range_
+        out = []
+        for row in x:
+            new_row = []
+            for j in range(len(self.data_min_)):
+                span = self.data_max_[j] - self.data_min_[j]
+                if span > 0.0:
+                    new_row.append(lo + (row[j] - self.data_min_[j]) / span * (hi - lo))
+                else:
+                    new_row.append(lo)
+            out.append(new_row)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.data_min_ is None:
+            raise ValueError("MinMaxScaler: 请先 fit")
+        self._check(x)
+        lo, hi = self.range_
+        out = []
+        for row in x:
+            new_row = []
+            for j in range(len(self.data_min_)):
+                span = self.data_max_[j] - self.data_min_[j]
+                if span > 0.0 and hi > lo:
+                    new_row.append(
+                        self.data_min_[j] + (row[j] - lo) / (hi - lo) * span
+                    )
+                else:
+                    new_row.append(self.data_min_[j])
+            out.append(new_row)
+        return out
+
+
+def ascii_plot(history, keys=("train_loss", "val_loss"), width: int = 60,
+               height: int = 12, title: str = None):
+    """把 train_history 画成纯 ASCII 折线图（终端里直接看训练曲线）。
+
+    history: Model.fit 填的 {'train_loss': [(epoch, loss)...], ...}
+    keys:    要画的曲线名
+    """
+    if not isinstance(history, dict):
+        raise ValueError("ascii_plot: history 必须是 dict")
+    width = max(10, int(width))
+    height = max(3, int(height))
+    series = []
+    for k in keys:
+        pts = history.get(k)
+        if not pts:
+            continue
+        clean = [(float(e), float(v)) for e, v in pts if v is not None]
+        if clean:
+            series.append((k, clean))
+    if not series:
+        return "(ascii_plot: 没有可画的数据)"
+    all_vals = [v for _, pts in series for _, v in pts]
+    lo, hi = min(all_vals), max(all_vals)
+    if hi <= lo:
+        hi = lo + 1.0
+    all_epochs = [e for _, pts in series for e, _ in pts]
+    e_lo, e_hi = min(all_epochs), max(all_epochs)
+    span_e = (e_hi - e_lo) or 1.0
+    marks = [".", "o", "*", "+", "x"]
+    canvas = [[" "] * width for _ in range(height)]
+    for si, (name, pts) in enumerate(series):
+        ch = marks[si % len(marks)]
+        for e, v in pts:
+            cx = int((e - e_lo) / span_e * (width - 1))
+            cy = height - 1 - int((v - lo) / (hi - lo) * (height - 1))
+            canvas[cy][cx] = ch
+    lines = []
+    if title:
+        lines.append(str(title))
+    for r in range(height):
+        v = hi - (hi - lo) * r / (height - 1)
+        lines.append(f"{v:10.4f} |" + "".join(canvas[r]))
+    lines.append(" " * 10 + " +" + "-" * width)
+    lines.append(" " * 10 + f"  epoch {e_lo:g} .. {e_hi:g}")
+    legend = "  ".join(f"{marks[i % len(marks)]}={name}"
+                       for i, (name, _) in enumerate(series))
+    lines.append("  " + legend)
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -4165,6 +4473,164 @@ def compare_with_pytorch():
 #  High-Level API: Model 封装（sklearn 风格） + 工厂函数
 # ============================================================================
 
+def _param_leaves(param):
+    """枚举嵌套 list 的叶子路径：[(path, value), ...]"""
+    if isinstance(param, list):
+        out = []
+        for i, item in enumerate(param):
+            for path, value in _param_leaves(item):
+                out.append(((i,) + path, value))
+        return out
+    return [((), param)]
+
+
+def _pget(param, path):
+    for i in path:
+        param = param[i]
+    return param
+
+
+def _pset(param, path, value):
+    for i in path[:-1]:
+        param = param[i]
+    param[path[-1]] = value
+
+
+def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
+               tol: float = 1e-5, max_params=None):
+    """用中心差分校验解析梯度（纯标准库实现，方便在任意模型上自检）。
+
+    支持三类对象：
+        grad_check(mlp, x, y)         # MLP，默认 mse_loss
+        grad_check(model, x, y)       # Model（MLP 包装），默认用 model 自己的损失
+        grad_check(lm, ids)           # CausalLM，用下一个 token 的交叉熵
+
+    eps:        差分步长
+    tol:        相对误差阈值
+    max_params: 最多抽查多少个标量参数（None = MLP/Model 全查、CausalLM 抽查 24 个）
+
+    返回 dict：{'ok': bool, 'worst_name': str, 'worst_rel': float,
+                'checks': [{'name','rel','analytic','numeric'}, ...]}
+    """
+    if isinstance(module, CausalLM):
+        return _grad_check_lm(module, x, eps, tol, max_params)
+
+    if isinstance(module, MLP):
+        forward = module.forward
+        params = module.get_parameters()
+
+        def backward(dloss):
+            return _mlp_backward(module, dloss)
+        default_loss = mse_loss
+    elif isinstance(module, Model):
+        forward = module.forward
+        params = module.model.get_parameters()
+
+        def backward(dloss):
+            return module.backward(dloss)
+        default_loss = None
+    else:
+        raise TypeError(
+            f"grad_check: 支持 MLP / Model / CausalLM，收到 {type(module).__name__}"
+        )
+
+    if default_loss is None and loss_fn is None:
+        loss_fn = module._loss
+
+        def loss_of(xx, yy):
+            return loss_fn(forward(xx), yy)
+    else:
+        loss_fn = loss_fn or default_loss
+
+        def loss_of(xx, yy):
+            return loss_fn(forward(xx), yy)
+
+    _, dloss = loss_of(x, y)
+    grads = backward(dloss)
+
+    leaves = []
+    for li, (weights, biases) in enumerate(params):
+        for path, _ in _param_leaves(weights):
+            leaves.append((f"layers{li}.weight" + "".join(f"[{p}]" for p in path),
+                           weights, path, grads[li][0], path))
+        for path, _ in _param_leaves(biases):
+            leaves.append((f"layers{li}.bias" + "".join(f"[{p}]" for p in path),
+                           biases, path, grads[li][1], path))
+
+    if max_params is not None:
+        leaves = leaves[:int(max_params)]
+
+    checks = []
+    worst_name, worst_rel = "", 0.0
+    for name, holder, path, grad_holder, gpath in leaves:
+        orig = _pget(holder, path)
+        ana = _pget(grad_holder, gpath)
+        _pset(holder, path, orig + eps)
+        lp, _ = loss_of(x, y)
+        _pset(holder, path, orig - eps)
+        lm_, _ = loss_of(x, y)
+        _pset(holder, path, orig)
+        num = (lp - lm_) / (2.0 * eps)
+        rel = abs(ana - num) / max(1e-12, abs(ana) + abs(num))
+        checks.append({"name": name, "rel": rel, "analytic": ana, "numeric": num})
+        if rel > worst_rel:
+            worst_name, worst_rel = name, rel
+
+    return {
+        "ok": worst_rel <= tol,
+        "worst_name": worst_name,
+        "worst_rel": worst_rel,
+        "checks": checks,
+    }
+
+
+def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
+    """CausalLM 的梯度自检：按参数块名抽查（默认 24 个标量）。"""
+    lm.eval()
+    lm.zero_grad()
+    lm._loss_and_backward(list(ids))
+    named = lm._named_params()  # (name, param, grad)
+
+    leaves = []
+    for name, param, grad in named:
+        for path, _ in _param_leaves(param):
+            leaves.append((name + "".join(f"[{p}]" for p in path),
+                           param, path, grad, path))
+    if max_params is None:
+        max_params = 24
+    max_params = int(max_params)
+    if max_params < len(leaves):
+        rng = random.Random(0)
+        leaves = rng.sample(leaves, max_params)
+
+    def loss_now():
+        lm.zero_grad()
+        return lm._loss_and_backward(list(ids))
+
+    checks = []
+    worst_name, worst_rel = "", 0.0
+    for name, holder, path, grad_holder, gpath in leaves:
+        orig = _pget(holder, path)
+        ana = _pget(grad_holder, gpath)
+        _pset(holder, path, orig + eps)
+        lp = loss_now()
+        _pset(holder, path, orig - eps)
+        lm_ = loss_now()
+        _pset(holder, path, orig)
+        num = (lp - lm_) / (2.0 * eps)
+        rel = abs(ana - num) / max(1e-12, abs(ana) + abs(num))
+        checks.append({"name": name, "rel": rel, "analytic": ana, "numeric": num})
+        if rel > worst_rel:
+            worst_name, worst_rel = name, rel
+    loss_now()  # 复原缓存/grads 状态
+    return {
+        "ok": worst_rel <= tol,
+        "worst_name": worst_name,
+        "worst_rel": worst_rel,
+        "checks": checks,
+    }
+
+
 def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
     """内部工具：对 MLP 执行反向传播，返回每层的 (grad_w, grad_b) 列表"""
     delta = loss_grad
@@ -4531,7 +4997,7 @@ class Model:
         if batch_size is None or batch_size <= 0:
             batch_size = len(dataset)
 
-        self.history = {'train_loss': [], 'val_loss': []}
+        self.history = {'train_loss': [], 'val_loss': [], 'grad_norm': []}
         best_val_loss = float('inf')
         no_improve = 0
         best_snapshot = None      # restore_best_weights 用的最优权重快照
@@ -4541,6 +5007,8 @@ class Model:
                 random.shuffle(dataset)
 
             train_loss = 0.0
+            gn_sum = 0.0   # 本轮各 batch 梯度范数之和（裁剪前）
+            gn_n = 0
             for b in range(0, len(dataset), batch_size):
                 batch = dataset[b:b + batch_size]
 
@@ -4577,6 +5045,17 @@ class Model:
                     for i in range(len(self.model.layers))
                 ]
 
+                # 记录梯度范数（裁剪前，用来判断训练是否发散/爆炸）
+                sq = 0.0
+                for gw_l, gb_l in avg_grads:
+                    for row in gw_l:
+                        for v in row:
+                            sq += v * v
+                    for v in gb_l:
+                        sq += v * v
+                gn_sum += math.sqrt(sq)
+                gn_n += 1
+
                 # 梯度裁剪
                 if grad_clip is not None:
                     clip_grad_by_norm(avg_grads, max_norm=grad_clip)
@@ -4585,6 +5064,7 @@ class Model:
 
             train_loss /= len(dataset)
             self.history['train_loss'].append((epoch, train_loss))
+            self.history['grad_norm'].append((epoch, gn_sum / max(gn_n, 1)))
 
             # 验证
             val_loss = None

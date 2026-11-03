@@ -97,6 +97,9 @@ model2 = Model.load("model.json")
 | `lr_scheduler` | StepLR / ExponentialLR / CosineAnnealingLR |
 | `grad_clip` | 梯度范数裁剪阈值 |
 
+训练结束后 `model.history` 里有三个键：`train_loss`、`val_loss`、`grad_norm`
+（每轮平均梯度范数，裁剪前；用来判断训练是否发散）。
+
 `val_data` 支持三种写法（会校验维度，维度不符直接报错）：
 
 ```python
@@ -173,7 +176,7 @@ model.train()     # 回到训练
 | 组件 | 说明 |
 |------|------|
 | `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`rope=True` → Q/K 旋转位置编码；`dropout>0` → 注意力权重 dropout） |
-| `FeedForward` | 前馈网络 |
+| `FeedForward(d_model, d_ff, activation='relu')` | 前馈网络（`activation` 可选 relu/gelu/sigmoid/linear） |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` 会传给每一层） |
 | `PositionalEncoding` | sin/cos 绝对位置编码 |
@@ -250,6 +253,36 @@ out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5, use_cache=False)  # 结
 > cache 依赖绝对位置，窗口超过 `max_len` 开始滑动时会自动按新窗口重建一次，
 > 所以滑动场景仍然与重算版一致。
 
+### 训练工程化工具
+
+```python
+import AI
+
+# 分层切分：类别不均衡时按比例抽（默认行为不变）
+train, val, test = AI.split_data(data, 0.2, 0.1, seed=7, stratify=labels)
+
+# K 折交叉验证：只算索引，不复制数据
+for k, (tr_idx, va_idx) in enumerate(AI.k_fold_indices(len(data), 5, seed=7)):
+    model.fit(x=[data[i][0] for i in tr_idx], y=[data[i][1] for i in tr_idx], epochs=20)
+    print(k, model.score([data[i][0] for i in va_idx], [data[i][1] for i in va_idx]))
+
+# 标准化 / 归一化
+scaler = AI.StandardScaler().fit(x_train)
+x_train = scaler.transform(x_train)
+x_test = scaler.transform(x_test)
+
+# 梯度自检（中心差分，纯标准库）：返回 ok / worst_name / worst_rel / checks
+print(AI.grad_check(model, x_sample, y_sample)["worst_rel"])
+
+# 训练曲线（终端里直接看）
+model.fit(x_train, y_train, epochs=50, verbose=False)
+print(AI.ascii_plot(model.history))
+```
+
+> `grad_check` 的 `CausalLM` 分支默认抽查 24 个标量参数（整模型逐个差分太慢），
+> 可用 `max_params=` 调整；它已经把「梯度错」和「数值误差」区分开——人为改坏一个
+> 梯度元素时 `worst_rel` 会到 1.0 量级。
+
 ### 优化器
 
 | 优化器 | 说明 |
@@ -289,20 +322,25 @@ out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5, use_cache=False)  # 结
 
 | 函数 | 说明 |
 |------|------|
-| `split_data(data, val_ratio, test_ratio)` | 数据集拆分 |
-| `DataLoader` | 批量迭代器 |
+| `split_data(data, val_ratio, test_ratio, seed, stratify=None)` | 数据集拆分（`stratify` 分层） |
+| `DataLoader(dataset, batch_size, shuffle, seed, collate_fn=None)` | 批量迭代器（可自定义批次拼装） |
 | `train(model, loss_fn, optimizer, data, ...)` | 底层训练循环（Early Stopping + 验证集） |
 | `evaluate(model, loss_fn, data)` | 计算平均损失 |
 | `save_model(model, path, task=None)` / `load_model(path, default_output_activation=None)` | MLP 的 JSON 持久化；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上 |
 | `Model.save(path)` / `Model.load(path, task='auto', default_output_activation=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task |
 
-> 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
-> （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
-> 会被当成回归模型，请显式传 `default_output_activation='softmax'`。
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
 | `clip_grad_by_value(grads, clip_val)` | 梯度值裁剪 |
 | `compare_with_pytorch()` | 与 PyTorch 逐层数值对齐（可选，装了 torch 才跑） |
+| `k_fold_indices(n, n_splits, shuffle, seed, stratify)` | K 折交叉验证索引 |
+| `StandardScaler` / `MinMaxScaler` | 逐特征标准化 / 归一化（`fit`/`transform`/`inverse_transform`） |
+| `ascii_plot(history)` | 把训练曲线画成终端 ASCII 图 |
+| `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM） |
+
+> 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
+> （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
+> 会被当成回归模型，请显式传 `default_output_activation='softmax'`。
 
 ### 学习率调度器
 
@@ -415,7 +453,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-309 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+339 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -442,6 +480,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 309 个单元测试
+├── test_ai.py       # 339 个单元测试
 └── README.md
 ```

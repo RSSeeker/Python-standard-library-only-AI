@@ -3295,3 +3295,226 @@ class TestKVCache:
         lm.generate([1, 2, 3], max_new_tokens=5, rng=random.Random(1))
         after = [list(p) for _n, p, _g in lm._named_params()]
         assert before == after
+
+
+# ============================================================================
+# 批次 5：训练工程化与评估工具
+# ============================================================================
+
+class TestFeedForwardActivation:
+    def test_default_relu_matches_explicit_relu(self):
+        seq = [[0.1, -0.2, 0.3], [0.4, 0.5, -0.6]]
+        random.seed(5)
+        a = AI.FeedForward(3, 4)
+        random.seed(5)
+        b = AI.FeedForward(3, 4, activation="relu")
+        assert a.forward(seq) == b.forward(seq)
+
+    def test_gelu_changes_output(self):
+        seq = [[0.5, -0.5, 1.0, -1.0]]
+        random.seed(6)
+        relu = AI.FeedForward(4, 3)
+        random.seed(6)
+        gelu = AI.FeedForward(4, 3, activation="gelu")
+        assert relu.forward(seq) != gelu.forward(seq)
+
+    def test_gelu_backward_matches_numeric(self):
+        seq = [[0.2, -0.4, 0.6, 0.1], [-0.3, 0.5, -0.2, 0.8]]
+        random.seed(7)
+        ff = AI.FeedForward(4, 5, activation="gelu")
+        out = ff.forward(seq)
+        dout = [[2.0 * v for v in row] for row in out]
+        eps = 1e-6
+        for j in range(5):
+            orig = ff.W1[j][1]
+            ff.W1[j][1] = orig + eps
+            lp = sum(v * v for row in ff.forward(seq) for v in row)
+            ff.W1[j][1] = orig - eps
+            lm = sum(v * v for row in ff.forward(seq) for v in row)
+            ff.W1[j][1] = orig
+            num = (lp - lm) / (2 * eps)
+            ff.zero_grad()
+            ff.forward(seq)
+            ff.backward(dout)
+            ana = ff.grads["W1"][j][1]
+            assert abs(ana - num) < 1e-6
+
+    def test_invalid_activation_raises(self):
+        with pytest.raises(ValueError):
+            AI.FeedForward(3, 4, activation="tanh")
+
+
+class TestStratifiedSplit:
+    def test_stratify_keeps_class_balance(self):
+        data = [(i, i % 3) for i in range(30)]
+        labels = [i % 3 for i in range(30)]
+        tr, va, te = AI.split_data(data, 0.2, 0.1, seed=7, stratify=labels)
+        assert (len(va), len(te)) == (6, 3)
+        assert len(tr) + len(va) + len(te) == 30
+        assert len({id(d) for d in tr + va + te}) == 30
+
+    def test_stratify_length_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            AI.split_data([(i, i) for i in range(6)], stratify=[0, 1])
+
+    def test_default_path_is_deterministic(self):
+        data = [(i, i) for i in range(20)]
+        a = AI.split_data(data, 0.25, 0.15, seed=3)
+        b = AI.split_data(data, 0.25, 0.15, seed=3)
+        assert a == b
+
+    def test_k_fold_covers_every_sample_once(self):
+        folds = AI.k_fold_indices(17, n_splits=4, seed=1)
+        assert len(folds) == 4
+        seen = []
+        for tr_i, va_i in folds:
+            assert not (set(tr_i) & set(va_i))
+            assert len(set(tr_i) | set(va_i)) == 17
+            seen.extend(va_i)
+        assert sorted(seen) == list(range(17))
+
+    def test_k_fold_stratified_balance(self):
+        folds = AI.k_fold_indices(20, n_splits=4, seed=2,
+                                  stratify=[i % 2 for i in range(20)])
+        for _, va_i in folds:
+            even = sum(1 for i in va_i if i % 2 == 0)
+            assert abs(even - (len(va_i) - even)) <= 1
+
+    def test_k_fold_rejects_bad_splits(self):
+        with pytest.raises(ValueError):
+            AI.k_fold_indices(10, n_splits=1)
+        with pytest.raises(ValueError):
+            AI.k_fold_indices(3, n_splits=5)
+        with pytest.raises(ValueError):
+            AI.k_fold_indices(5, n_splits=2, stratify=[0])
+
+
+class TestScalers:
+    def test_standard_scaler_roundtrip(self):
+        x = [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]
+        sc = AI.StandardScaler().fit(x)
+        z = sc.transform(x)
+        assert abs(sum(r[0] for r in z) / 3) < 1e-12
+        assert sc.inverse_transform(z) == x
+
+    def test_standard_scaler_zero_variance(self):
+        x = [[5.0, 7.0], [5.0, 7.0]]
+        sc = AI.StandardScaler().fit(x)
+        assert sc.transform(x) == [[0.0, 0.0], [0.0, 0.0]]
+
+    def test_standard_scaler_unfitted_raises(self):
+        with pytest.raises(ValueError):
+            AI.StandardScaler().transform([[1.0]])
+
+    def test_minmax_scaler_endpoints(self):
+        x = [[1.0], [2.0], [3.0]]
+        z = AI.MinMaxScaler().fit_transform(x)
+        assert z[0][0] == 0.0 and z[2][0] == 1.0
+
+    def test_minmax_scaler_custom_range(self):
+        x = [[1.0], [3.0]]
+        z = AI.MinMaxScaler(feature_range=(-1.0, 1.0)).fit_transform(x)
+        assert z == [[-1.0], [1.0]]
+
+    def test_minmax_scaler_rejects_bad_range(self):
+        with pytest.raises(ValueError):
+            AI.MinMaxScaler(feature_range=(1.0, 0.0))
+
+    def test_scalers_reject_ragged_input(self):
+        with pytest.raises(ValueError):
+            AI.StandardScaler().fit([[1.0, 2.0], [3.0]])
+
+
+class TestAsciiPlot:
+    def test_renders_axes_and_legend(self):
+        hist = {"train_loss": [(i, 1.0 / i) for i in range(1, 6)],
+                "val_loss": [(i, 1.2 / i) for i in range(1, 6)]}
+        txt = AI.ascii_plot(hist)
+        assert "epoch 1 .. 5" in txt
+        assert "train_loss" in txt and "val_loss" in txt
+        assert len(txt.split("\n")) >= 12
+
+    def test_empty_history(self):
+        assert "没有可画" in AI.ascii_plot({})
+
+    def test_single_point(self):
+        assert "epoch 1 .. 1" in AI.ascii_plot({"train_loss": [(1, 0.5)]})
+
+    def test_custom_size(self):
+        txt = AI.ascii_plot({"train_loss": [(1, 1.0), (2, 0.5)]}, width=20, height=4)
+        assert len(txt.split("\n")) >= 6
+
+
+class TestDataLoaderCollate:
+    def test_collate_fn_applied(self):
+        dl = AI.DataLoader([(i, i * 2) for i in range(5)], batch_size=2,
+                           shuffle=False, collate_fn=lambda b: {"xs": [x for x, _ in b]})
+        batches = list(dl)
+        assert batches[0] == {"xs": [0, 1]}
+        assert batches[-1] == {"xs": [4]}
+
+    def test_default_is_noop(self):
+        dl = AI.DataLoader(list(range(5)), batch_size=2, shuffle=False)
+        assert list(dl) == [[0, 1], [2, 3], [4]]
+
+
+class TestGradCheck:
+    def test_mlp_passes(self):
+        random.seed(41)
+        mlp = AI.MLP([3, 4, 2])
+        res = AI.grad_check(mlp, [0.2, -0.3, 0.5], [0.4, -0.2])
+        assert res["ok"]
+        assert res["worst_rel"] < 1e-5
+        assert len(res["checks"]) == 3 * 4 + 4 + 4 * 2 + 2
+
+    def test_model_passes(self):
+        random.seed(42)
+        model = AI.Model(AI.MLP([3, 5, 2]), task="regression")
+        res = AI.grad_check(model, [0.2, -0.3, 0.5], [0.4, -0.2])
+        assert res["ok"]
+
+    def test_causallm_passes(self):
+        random.seed(43)
+        lm = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        res = AI.grad_check(lm, [1, 3, 2, 4])
+        assert res["ok"]
+        assert len(res["checks"]) == 24
+
+    def test_detects_broken_gradient(self, monkeypatch):
+        random.seed(44)
+        mlp = AI.MLP([2, 2])
+        orig = AI._mlp_backward
+
+        def broken(model, d_output):
+            grads = orig(model, d_output)
+            grads[0][0][0][0] += 0.5
+            return grads
+
+        monkeypatch.setattr(AI, "_mlp_backward", broken)
+        res = AI.grad_check(mlp, [0.3, -0.1], [0.5, 0.2])
+        assert not res["ok"]
+        assert res["worst_rel"] > 1e-2
+
+    def test_rejects_unknown_type(self):
+        with pytest.raises(TypeError):
+            AI.grad_check("nope", 1)
+
+
+class TestGradNormHistory:
+    def test_history_records_grad_norm(self):
+        random.seed(51)
+        model = AI.Model(AI.MLP([2, 4, 1]), task="regression")
+        model.fit(x=[[0.1, 0.2], [0.3, -0.1], [0.5, 0.4], [-0.2, 0.6]],
+                  y=[[0.3], [0.1], [0.7], [0.2]], epochs=4, batch_size=2,
+                  val_split=0.0, verbose=False)
+        gn = model.history["grad_norm"]
+        assert len(gn) == 4
+        assert all(v > 0.0 for _, v in gn)
+
+    def test_grad_norm_finite_with_clip(self):
+        random.seed(52)
+        model = AI.Model(AI.MLP([2, 3, 1]), task="regression")
+        model.fit(x=[[0.1, 0.2], [0.3, -0.1]], y=[[0.3], [0.1]], epochs=2,
+                  batch_size=1, val_split=0.0, verbose=False, grad_clip=0.5)
+        assert all(math.isfinite(v) for _, v in model.history["grad_norm"])
