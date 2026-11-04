@@ -5540,3 +5540,94 @@ class TestLossPersistence:
         assert again._loss_name == "focal"
         assert again.loss_kwargs == {"gamma": 2.0}
         assert again.optimizer.step_count > 0
+
+
+class TestFitSeed:
+    """fit / train 的 seed：传了就完全可复现，且不推进调用方的全局随机状态"""
+
+    @staticmethod
+    def _xy():
+        X = [[random.Random(i).uniform(-1, 1),
+              random.Random(i + 100).uniform(-1, 1)] for i in range(24)]
+        Y = [i % 2 for i in range(24)]
+        return X, Y
+
+    @staticmethod
+    def _build():
+        return AI.Model(AI.MLP([2, 8, 2], activations=["relu", "softmax"]),
+                        task="classification")
+
+    def test_seed_makes_fit_reproducible(self):
+        X, Y = self._xy()
+        random.seed(7)
+        m1 = self._build()
+        h1 = m1.fit(x=X, y=Y, epochs=6, batch_size=4, shuffle=True,
+                    val_split=0.25, verbose=False, seed=42)
+        random.seed(7)
+        m2 = self._build()
+        h2 = m2.fit(x=X, y=Y, epochs=6, batch_size=4, shuffle=True,
+                    val_split=0.25, verbose=False, seed=42)
+        assert [v for _, v in h1["train_loss"]] == [v for _, v in h2["train_loss"]]
+        assert h1["val_loss"] == h2["val_loss"]
+        assert h1["grad_norm"] == h2["grad_norm"]
+        for (wa, ba), (wb, bb) in zip(m1.model.get_parameters(),
+                                      m2.model.get_parameters()):
+            assert wa == wb and ba == bb
+
+    def test_different_seed_changes_order(self):
+        X, Y = self._xy()
+        random.seed(7)
+        m1 = self._build()
+        h1 = m1.fit(x=X, y=Y, epochs=6, batch_size=4, shuffle=True,
+                    val_split=0.25, verbose=False, seed=42)
+        random.seed(7)
+        m2 = self._build()
+        h2 = m2.fit(x=X, y=Y, epochs=6, batch_size=4, shuffle=True,
+                    val_split=0.25, verbose=False, seed=43)
+        assert [v for _, v in h1["train_loss"]] != [v for _, v in h2["train_loss"]]
+
+    def test_seed_does_not_advance_global_rng(self):
+        X, Y = self._xy()
+        random.seed(7)
+        m = self._build()
+        random.seed(123)
+        before = [random.random() for _ in range(3)]
+        random.seed(123)
+        m.fit(x=X, y=Y, epochs=2, batch_size=4, shuffle=True, val_split=0.0,
+              verbose=False, seed=9)
+        assert [random.random() for _ in range(3)] == before
+
+    def test_shuffle_false_is_reproducible(self):
+        X, Y = self._xy()
+        random.seed(7)
+        m1 = self._build()
+        h1 = m1.fit(x=X, y=Y, epochs=4, batch_size=4, shuffle=False,
+                    val_split=0.0, verbose=False, seed=1)
+        random.seed(7)
+        m2 = self._build()
+        h2 = m2.fit(x=X, y=Y, epochs=4, batch_size=4, shuffle=False,
+                    val_split=0.0, verbose=False, seed=1)
+        assert [v for _, v in h1["train_loss"]] == [v for _, v in h2["train_loss"]]
+
+    def test_no_seed_still_works(self):
+        X, Y = self._xy()
+        random.seed(7)
+        m = self._build()
+        h = m.fit(x=X, y=Y, epochs=2, batch_size=8, shuffle=True,
+                  val_split=0.0, verbose=False)
+        assert len(h["train_loss"]) == 2
+
+    def test_top_level_train_seed(self):
+        X, Y = self._xy()
+        data = [(list(x), y) for x, y in zip(X, Y)]
+
+        def run(seed):
+            random.seed(77)
+            mlp = AI.MLP([2, 6, 2], activations=["relu", "softmax"])
+            opt = AI.Adam(mlp, lr=0.05)
+            return AI.train(mlp, AI.cross_entropy_loss, opt, list(data),
+                            epochs=4, batch_size=4, patience=0, verbose=False,
+                            seed=seed)["train_loss"]
+
+        assert run(11) == run(11)
+        assert run(11) != run(12)

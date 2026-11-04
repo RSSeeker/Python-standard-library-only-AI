@@ -6332,9 +6332,13 @@ def generate_text_with_mlp(model, tp: TextProcessor, start_str: str,
 
 def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
           epochs: int = 2000, batch_size: int = 2, patience: int = 50,
-          val_data: Optional[list] = None, verbose: bool = True):
+          val_data: Optional[list] = None, verbose: bool = True,
+          shuffle: bool = True, seed=None):
     """
     loss_fn: 接受 (pred, target) -> (loss, grad)
+    shuffle: 每轮是否打乱训练数据（默认 True）
+    seed:    打乱用的随机种子（None = 全局 random，与旧版一致；传整数则用局部
+             Random，同样的调用再跑一次结果完全相同，也不推进全局随机状态）
 
     注意：与 Model 一样，softmax 输出层不能搭配 mse 损失——_softmax_deriv 返回全 1
     依赖 softmax+cross_entropy 的联合梯度，配 mse 会静默产生错误梯度。
@@ -6356,6 +6360,10 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
     no_improve = 0
     history = {"train_loss": [], "val_loss": []}
 
+    # seed 只影响本轮打乱用的随机流：不传时仍用全局 random（行为与旧版一致），
+    # 传了就换成局部 Random，既不推进全局状态、也能完整复现训练过程
+    rng = random.Random(seed) if seed is not None else random
+
     # 复制一份再打乱，避免修改调用者传入的列表顺序
     data = list(data)
     if not data:
@@ -6369,7 +6377,8 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 #============================================================================
 #  训练
 #============================================================================
-        random.shuffle(data)
+        if shuffle:
+            rng.shuffle(data)
         train_loss = 0.0
 
         for b in range(0, len(data), batch_size):
@@ -7488,7 +7497,8 @@ class Model:
             val_split=0.1, val_data=None, patience=50, verbose=True,
             shuffle=True, lr_scheduler=None, grad_clip=None,
             early_stop_metric='val', restore_best_weights=False,
-            checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1):
+            checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1,
+            seed=None):
         """
         训练模型。
 
@@ -7511,6 +7521,9 @@ class Model:
                 （早停只在指标变差时停止，**不会自动回滚**；需要最优权重时打开这个开关）
             checkpoint_path: 每 checkpoint_every 轮把权重 + 优化器状态写到该路径
                 （中断后可用 Model.load(path, restore_optimizer=True) 续训）
+            seed:         打乱数据的随机种子（None = 用全局 random，与旧版行为一致）。
+                传了整数就改用局部 Random：再跑一次同样的 fit 结果完全相同，
+                也不会推进调用方的全局随机状态。
             grad_accum:   梯度累积步数（1 = 每个 batch 更新一次）。大于 1 时先累加
                 grad_accum 个 batch 的**平均梯度**，再更新一次；代价是更新次数变少，
                 收益是等效 batch 更大而显存不变。每个 epoch 末尾会把剩余不足
@@ -7559,6 +7572,8 @@ class Model:
                 "（与 split_data 的校验保持一致；原实现会把 >=1 静默钳成 n-1）"
             )
 
+        rng = random.Random(seed) if seed is not None else random
+
         # === 验证集 ===
         if val_data is not None:
             val_set = self._normalize_val_data(val_data)
@@ -7571,7 +7586,7 @@ class Model:
             if n_val <= 0:
                 val_set = None
             elif shuffle:
-                random.shuffle(dataset)
+                rng.shuffle(dataset)
                 val_set = dataset[:n_val]
                 dataset = dataset[n_val:]
             else:
@@ -7594,7 +7609,7 @@ class Model:
 
         for epoch in range(1, epochs + 1):
             if shuffle:
-                random.shuffle(dataset)
+                rng.shuffle(dataset)
 
             train_loss = 0.0
             gn_sum = 0.0   # 本轮各次更新的梯度范数之和（裁剪前）
