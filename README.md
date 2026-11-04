@@ -378,6 +378,10 @@ model.fit(x_train, y_train, epochs=2)
   `SGD` / `SGDMomentum` / `RMSprop` 没有状态，`_optimizer_state()` 返回 `None`。
 - `restore_optimizer=True` 但存档里没有优化器状态时**静默跳过**；类型或形状不匹配则 `ValueError`。
 - `step_count` 记的是**批次数**（样本数 / batch_size），不是轮数。
+- `Model.save` 还会记下**损失函数名与 `loss_kwargs`**（例如 `focal(gamma=1.5)`、
+  `CE(label_smoothing=0.1)`）：重新 `Model.load` 后损失配置不变，接着训的 loss 曲线与
+  不中断训练逐位相同。显式传 `loss_fn=` / `loss_kwargs=` 会覆盖文件里的值；
+  旧文件没有这两个字段，退回按 `task` 推断的默认损失。
 
 ### 语言模型存档与束搜索
 
@@ -476,11 +480,11 @@ m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
 | `DataLoader(dataset, batch_size, shuffle, seed, collate_fn=None)` | 批量迭代器（可自定义批次拼装） |
 | `train(model, loss_fn, optimizer, data, ...)` | 底层训练循环（Early Stopping + 验证集） |
 | `evaluate(model, loss_fn, data)` | 计算平均损失 |
-| `save_model(model, path, task=None, optimizer=None, quiet=False)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
+| `save_model(model, path, task=None, optimizer=None, quiet=False, loss=None, loss_kwargs=None)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态，传 `loss=` / `loss_kwargs=` 时记下损失配置；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上 |
 | `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`） |
-| `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训 |
+| `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False, loss_kwargs=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训；损失函数名与 `loss_kwargs` 随存档往返，显式传参可覆盖 |
 
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
 | `clip_grad_by_value(grads, clip_val)` | 梯度值裁剪 |
@@ -628,7 +632,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-464 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+471 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -669,6 +673,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
 | `TestFlops` | `estimate_flops` 的 MACs / 参数量 / 逐层明细与手算一致、不认识的模块报 TypeError |
 | `TestFlopsExtended` | 分组/深度卷积按 `in_channels/groups` 计数（不按 `in_channels` 高估）、`Conv1d`/`ConvTranspose2d`/`AdaptiveAvgPool2d`/`GroupNorm`/`DropPath` 的计数与形状校验 |
+| `TestLossPersistence` | 默认存档不多写字段（旧文件逐字节不变）、`focal`/`CE(label_smoothing)` 往返后损失配置不变且续训曲线逐位相同、显式传参覆盖文件、坏 `loss` 字段忽略、自定义 callable 不写字段、与优化器状态共存 |
 | `TestAugmentation` | `sigma=0` 逐位不变且不改入参、图像翻转保持元素多重集、平移补 0、Mixup 中点与软标签、非法输入报错 |
 | `TestConvGroups` | `groups=2` 前向等价两个单组卷积、depthwise 通道、`grad_w` vs 数值、非法 groups |
 | `TestConv1d` | 形状与 stride、手算卷积、`groups` 等价、`grad_w`/`dx` vs 数值、非法参数 |
@@ -682,6 +687,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 464 个单元测试
+├── test_ai.py       # 471 个单元测试
 └── README.md
 ```

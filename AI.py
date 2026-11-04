@@ -14,7 +14,7 @@
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
-  - 模型保存 / 加载（JSON 格式，可选带优化器状态做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
+  - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
 """
 
@@ -6533,7 +6533,7 @@ def load_optimizer_state(optimizer, state):
 
 
 def save_model(model, filepath: str, task: str = None, optimizer=None,
-               quiet: bool = False):
+               quiet: bool = False, loss: str = None, loss_kwargs: dict = None):
     """将 MLP 模型保存为 JSON 文件
 
     task: 可选，"regression" / "classification"。会写进文件，供旧格式（没有逐层
@@ -6550,6 +6550,12 @@ def save_model(model, filepath: str, task: str = None, optimizer=None,
         "task": task,
         "layers": []
     }
+    # 损失函数名与参数（如 focal 的 gamma、CE 的 label_smoothing）：
+    # 旧文件没有这两个字段，读的时候缺省即可
+    if loss is not None:
+        data["loss"] = loss
+    if loss_kwargs:
+        data["loss_kwargs"] = dict(loss_kwargs)
     for layer in model.layers:
         # 推断激活函数类型名称：优先用 Layer 自己记录的名字
         act_name = getattr(layer, "activation_name", None)
@@ -6686,6 +6692,9 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
 
     # 供 Model.load 判断 task 用（MLP 本身没有 task 概念）
     model.saved_task = data.get("task")
+    # 损失配置同理（旧文件没有这两个键，get 到 None）
+    model.saved_loss = data.get("loss")
+    model.saved_loss_kwargs = data.get("loss_kwargs")
 
     print(f"模型已从 {filepath} 加载")
     return model
@@ -7843,13 +7852,19 @@ class Model:
 # ── 持久化
 
     def save(self, filepath):
-        """保存模型到 JSON 文件（Adam/AdamW 会连动量与步数一起存）"""
-        save_model(self.model, filepath, task=self.task, optimizer=self.optimizer)
+        """保存模型到 JSON 文件（Adam/AdamW 会连动量与步数一起存）
+
+        除结构与权重外，还会记下损失函数名与 `loss_kwargs`（用 focal / Focal 的
+        gamma、CE 的 label_smoothing 训练时，重新加载后不会悄悄退回默认损失）。
+        """
+        save_model(self.model, filepath, task=self.task, optimizer=self.optimizer,
+                   loss=None if self._loss_name == 'custom' else self._loss_name,
+                   loss_kwargs=self.loss_kwargs or None)
 
     @staticmethod
     def load(filepath, loss_fn=None, optimizer='adam', lr=0.01,
              task='auto', default_output_activation=None,
-             restore_optimizer=False):
+             restore_optimizer=False, loss_kwargs=None):
         """从 JSON 加载，返回 Model 实例
 
         default_output_activation:
@@ -7860,6 +7875,10 @@ class Model:
         restore_optimizer:
             True 时把文件里的 Adam/AdamW 动量与 step_count 恢复进新优化器，
             这样接着 fit 就是「精确续训」而不是重新热身；文件里没有该字段时忽略。
+        loss_fn / loss_kwargs:
+            不传时优先采用文件里记录的值（save 会写入），这样用 focal(gamma=…)
+            或 CE(label_smoothing=…) 训练的模型重新加载后损失配置不变；
+            显式传入则覆盖文件里的值。旧文件没有这些字段时退回默认。
         """
         mlp = load_model(filepath, default_output_activation=default_output_activation)
         if task == 'auto':
@@ -7872,7 +7891,16 @@ class Model:
         if last_act == "softmax" and task != 'classification':
             print("提示: 输出层是 softmax，按分类加载（文件里的 task 与输出层激活矛盾）")
             task = 'classification'
-        obj = Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task)
+        if loss_fn is None:
+            saved_loss = getattr(mlp, "saved_loss", None)
+            if isinstance(saved_loss, str) and saved_loss in Model._LOSS_MAP:
+                loss_fn = saved_loss
+        if loss_kwargs is None:
+            saved_kw = getattr(mlp, "saved_loss_kwargs", None)
+            if isinstance(saved_kw, dict):
+                loss_kwargs = saved_kw
+        obj = Model(mlp, loss_fn=loss_fn, optimizer=optimizer, lr=lr, task=task,
+                    loss_kwargs=loss_kwargs)
         if restore_optimizer:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:

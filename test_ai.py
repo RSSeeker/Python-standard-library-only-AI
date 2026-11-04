@@ -2326,6 +2326,9 @@ class TestPersistenceCompat:
         if legacy:
             for ld in d["layers"]:
                 ld.pop("activation", None)
+            # 真正的旧文件也没有 loss / loss_kwargs（这两个字段是后加的）
+            d.pop("loss", None)
+            d.pop("loss_kwargs", None)
         if drop_task:
             d.pop("task", None)
         json.dump(d, open(path, "w", encoding="utf-8"))
@@ -5430,3 +5433,110 @@ class TestFlopsExtended:
                        (AI.GroupNorm(2, 4), (3, 4, 4))):
             with pytest.raises(ValueError):
                 AI.estimate_flops(AI.Sequential([m]), shp)
+
+
+class TestLossPersistence:
+    """Model.save 要记住损失函数名与 loss_kwargs，否则重载会悄悄退回默认损失"""
+
+    def _data(self):
+        X = [[0.1, 0.9], [0.8, 0.2], [0.3, 0.7], [0.6, 0.4], [0.2, 0.8], [0.9, 0.1]]
+        Y = [0, 1, 0, 1, 0, 1]
+        return list(zip(X, Y))
+
+    def test_default_save_has_no_loss_keys(self, tmp_path):
+        """不传损失时文件里不该多出 loss 字段（旧文件格式完全不变）"""
+        random.seed(11)
+        mlp = AI.MLP([2, 6, 3], activations=["relu", "softmax"])
+        path = str(tmp_path / "d.json")
+        AI.save_model(mlp, path, task="classification", quiet=True)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert "loss" not in data
+        assert "loss_kwargs" not in data
+
+    def test_focal_round_trip(self, tmp_path):
+        random.seed(7)
+        m = AI.Model(AI.MLP([2, 6, 3], activations=["relu", "softmax"]),
+                     task="classification", loss_fn="focal",
+                     loss_kwargs={"gamma": 1.5, "alpha": 0.75})
+        m.fit(data=self._data(), epochs=20, batch_size=3, shuffle=False,
+              val_split=0.0, verbose=False)
+        path = str(tmp_path / "focal.json")
+        m.save(path)
+        again = AI.Model.load(path)
+        assert again._loss_name == "focal"
+        assert again.loss_kwargs == {"gamma": 1.5, "alpha": 0.75}
+        # 两份都从存档恢复（含优化器状态），再训的 loss 曲线必须逐位相同：
+        # 若 loss 配置没恢复成 focal，曲线就会分叉
+        a = AI.Model.load(path, restore_optimizer=True)
+        b = AI.Model.load(path, restore_optimizer=True)
+        h1 = a.fit(data=self._data(), epochs=5, batch_size=3, shuffle=False,
+                   val_split=0.0, verbose=False)
+        h2 = b.fit(data=self._data(), epochs=5, batch_size=3, shuffle=False,
+                   val_split=0.0, verbose=False)
+        assert [v for _, v in h1["train_loss"]] == [v for _, v in h2["train_loss"]]
+
+    def test_label_smoothing_round_trip(self, tmp_path):
+        random.seed(13)
+        m = AI.Model(AI.MLP([2, 5, 3], activations=["relu", "softmax"]),
+                     task="classification", loss_fn="ce",
+                     loss_kwargs={"label_smoothing": 0.1})
+        path = str(tmp_path / "ls.json")
+        m.save(path)
+        again = AI.Model.load(path)
+        assert again._loss_name == "ce"
+        assert again.loss_kwargs == {"label_smoothing": 0.1}
+
+    def test_explicit_args_override_file(self, tmp_path):
+        random.seed(7)
+        m = AI.Model(AI.MLP([2, 6, 3], activations=["relu", "softmax"]),
+                     task="classification", loss_fn="focal",
+                     loss_kwargs={"gamma": 1.5})
+        path = str(tmp_path / "ov.json")
+        m.save(path)
+        again = AI.Model.load(path, loss_fn="huber", loss_kwargs={"delta": 2.0})
+        assert again._loss_name == "huber"
+        assert again.loss_kwargs == {"delta": 2.0}
+
+    def test_invalid_loss_field_is_ignored(self, tmp_path):
+        random.seed(7)
+        m = AI.Model(AI.MLP([2, 6, 3], activations=["relu", "softmax"]),
+                     task="classification", loss_fn="focal")
+        path = str(tmp_path / "bad.json")
+        m.save(path)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["loss"] = "no_such_loss"
+        data["loss_kwargs"] = "not a dict"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        again = AI.Model.load(path)
+        # 坏字段一律忽略，退回按 task 推断的默认损失
+        assert again._loss_name == "cross_entropy"
+        assert again.loss_kwargs == {}
+
+    def test_custom_callable_writes_no_loss_field(self, tmp_path):
+        random.seed(21)
+        m = AI.Model(AI.MLP([2, 4, 1], activations=["relu", "linear"]),
+                     task="regression", loss_fn=AI.mse_loss)
+        path = str(tmp_path / "custom.json")
+        m.save(path)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert "loss" not in data
+        again = AI.Model.load(path)
+        assert again._loss_name == "mse"
+
+    def test_loss_config_and_optimizer_state_coexist(self, tmp_path):
+        random.seed(7)
+        m = AI.Model(AI.MLP([2, 6, 3], activations=["relu", "softmax"]),
+                     task="classification", loss_fn="focal",
+                     loss_kwargs={"gamma": 2.0})
+        m.fit(data=self._data(), epochs=10, batch_size=3, shuffle=False,
+              val_split=0.0, verbose=False)
+        path = str(tmp_path / "both.json")
+        m.save(path)
+        again = AI.Model.load(path, restore_optimizer=True)
+        assert again._loss_name == "focal"
+        assert again.loss_kwargs == {"gamma": 2.0}
+        assert again.optimizer.step_count > 0
