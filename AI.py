@@ -5115,6 +5115,15 @@ def kl_divergence(pred, target, eps: float = 1e-12):
 # ============================================================================
 
 class Adam:
+    """Adam 优化器（一阶矩 + 二阶矩 + 偏差修正）
+
+    每个参数：m = b1*m + (1-b1)*g，v = b2*v + (1-b2)*g*g，
+              p -= lr * (m/(1-b1^t)) / (sqrt(v/(1-b2^t)) + eps)
+    动量存在每层上（权重 m_w/v_w，偏置 m_b/v_b），`step_count` 记已更新步数。
+    想精确续训要用 `_optimizer_state` / `load_optimizer_state` 连状态一起存取；
+    只存权重再 load 会从 step_count=0 重新开始，偏差修正对不上。
+    """
+
     def __init__(self, model: MLP, lr: float = 1e-3,
                  beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
         self.model = model
