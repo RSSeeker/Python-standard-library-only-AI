@@ -5810,3 +5810,74 @@ class TestSeq2SeqPaddedBatch:
             self._build(seed=2).fit(
                 [([1, 2, 3, 4, 5, 6, 7, 1, 2], [1]), ([1], [1])],
                 epochs=1, batch_size=2)
+
+
+class TestKVCacheMatrix:
+    """KV cache 与整段重算在 GQA / RoPE / 滑动窗口 组合下必须逐位一致"""
+
+    def _lm(self, heads=4, kv=None, window=None, rope=False, max_len=8, seed=7):
+        random.seed(seed)
+        lm = AI.CausalLM(9, d_model=8, num_heads=heads, d_ff=16, num_layers=2,
+                         max_len=max_len, dropout=0.0, rope=rope,
+                         window=window, num_kv_heads=kv)
+        lm.eval()
+        return lm
+
+    def test_cache_matches_recompute_across_configs(self):
+        configs = [
+            dict(heads=2),
+            dict(heads=4, kv=1),
+            dict(heads=4, kv=2),
+            dict(heads=4, rope=True),
+            dict(heads=4, window=3),
+            dict(heads=4, kv=2, rope=True),
+            dict(heads=4, kv=2, rope=True, window=2),
+        ]
+        for cfg in configs:
+            for max_len, prompt in ((8, [1, 2, 3]), (8, [1, 2, 3, 4, 5, 6]), (4, [1, 2, 3, 4])):
+                lm = self._lm(max_len=max_len, **cfg)
+                for top_k in (1, 3):
+                    a = lm.generate(prompt, 5, temperature=0.8, top_k=top_k,
+                                    rng=random.Random(7), use_cache=True)
+                    b = lm.generate(prompt, 5, temperature=0.8, top_k=top_k,
+                                    rng=random.Random(7), use_cache=False)
+                    assert a == b, (cfg, max_len, prompt, top_k, a, b)
+
+    def test_beam_search_deterministic_across_configs(self):
+        for cfg in (dict(heads=2), dict(heads=4, kv=1), dict(heads=4, window=2, rope=True)):
+            lm = self._lm(**cfg)
+            for prompt in ([1, 2, 3], [4, 5, 6, 7]):
+                a = lm.generate(prompt, 4, num_beams=3, rng=random.Random(3))
+                b = lm.generate(prompt, 4, num_beams=3, rng=random.Random(3))
+                assert a == b, (cfg, prompt, a, b)
+
+
+class TestLMPersistenceMatrix:
+    """存档要能把 rope / window / num_kv_heads 一起带走，重载后数值逐位相同"""
+
+    def _roundtrip(self, path, **cfg):
+        random.seed(5)
+        lm = AI.CausalLM(9, d_model=8, num_heads=4, d_ff=16, num_layers=2,
+                         max_len=8, dropout=0.2, **cfg)
+        lm.fit([[1, 2, 3, 4]], epochs=2, lr=0.01, seed=1)
+        lm.save(path, include_optimizer=True, quiet=True)
+        back = AI.CausalLM.load(path, restore_optimizer=True)
+        return lm, back
+
+    def test_config_survives_roundtrip(self, tmp_path):
+        path = str(tmp_path / "lm.json")
+        for cfg in ({}, {"rope": True}, {"window": 3},
+                    {"num_kv_heads": 1}, {"rope": True, "window": 2, "num_kv_heads": 2}):
+            lm, back = self._roundtrip(path, **cfg)
+            assert back.num_kv_heads == cfg.get("num_kv_heads")
+            assert back.window == cfg.get("window")
+            assert back.rope is cfg.get("rope", False)
+            assert back.use_abs_pos == (not back.rope)
+            lm.eval()
+            back.eval()
+            probe = [1, 2, 3, 4]
+            assert lm.forward(probe) == back.forward(probe), cfg
+            assert lm.evaluate([probe]) == back.evaluate([probe]), cfg
+            assert lm.generate(probe, 4, top_k=1, rng=random.Random(2)) == \
+                   back.generate(probe, 4, top_k=1, rng=random.Random(2)), cfg
+            assert back.step_count == 2, cfg
