@@ -5308,3 +5308,67 @@ class TestConvTranspose2d:
             AI.ConvTranspose2d(2, 2, 0)
         with pytest.raises(ValueError):
             AI.ConvTranspose2d(2, 2, 3, padding=-1)
+
+class TestHooks:
+    def test_forward_hook_observes_output(self):
+        mlp = AI.MLP([3, 4, 2])
+        x = [0.5, -0.2, 0.3]
+        base = mlp.forward(x)
+        seen = []
+        mlp.register_forward_hook(0, lambda layer, out: seen.append(len(out)))
+        mlp.register_forward_hook(1, lambda layer, out: seen.append(len(out)))
+        out = mlp.forward(x)
+        assert seen == [4, 2]
+        assert out == base
+
+    def test_backward_hook_receives_deltas(self):
+        mlp = AI.MLP([3, 4, 2])
+        mlp.forward([0.5, -0.2, 0.3])
+        base = AI._mlp_backward(mlp, [1.0, -1.0])
+        mlp.clear_hooks()
+        mlp.forward([0.5, -0.2, 0.3])
+        got = []
+        mlp.register_backward_hook(1, lambda layer, d, gw, gb: got.append((len(d), len(gw))))
+        mlp.register_backward_hook(0, lambda layer, d, gw, gb: got.append((len(d), len(gw))))
+        grads = AI._mlp_backward(mlp, [1.0, -1.0])
+        assert got == [(4, 2), (3, 4)]
+        for (gw1, gb1), (gw2, gb2) in zip(base, grads):
+            for r1, r2 in zip(gw1, gw2):
+                for a, b in zip(r1, r2):
+                    assert abs(a - b) < 1e-15
+
+    def test_remove_and_clear(self):
+        mlp = AI.MLP([2, 2])
+        seen = []
+        mlp.register_forward_hook(0, lambda layer, out: seen.append("f"))
+        mlp.forward([0.1, 0.2])
+        assert seen == ["f"]
+        mlp.remove_hook(0, 'forward')
+        mlp.forward([0.1, 0.2])
+        assert seen == ["f"]
+        mlp.register_forward_hook(0, lambda layer, out: seen.append("f"))
+        mlp.clear_hooks()
+        mlp.forward([0.1, 0.2])
+        assert seen == ["f"]
+
+    def test_invalid_hook_args_and_model_delegation(self):
+        mlp = AI.MLP([2, 2])
+        with pytest.raises(ValueError):
+            mlp.register_forward_hook(5, lambda layer, out: None)
+        with pytest.raises(ValueError):
+            mlp.register_backward_hook(-1, lambda layer, d, gw, gb: None)
+        with pytest.raises(TypeError):
+            mlp.register_forward_hook(0, "not callable")
+        with pytest.raises(TypeError):
+            mlp.register_backward_hook(True, lambda layer, d, gw, gb: None)
+
+        random.seed(5)
+        m1 = AI.Model(AI.MLP([2, 3, 1]), task='regression')
+        random.seed(5)
+        m2 = AI.Model(AI.MLP([2, 3, 1]), task='regression')
+        m1.register_forward_hook(0, lambda layer, out: None)
+        m1.register_backward_hook(0, lambda layer, d, gw, gb: None)
+        data = [([0.1, 0.2], [0.5]), ([0.3, -0.1], [-0.2]), ([0.0, 0.4], [0.1])]
+        h1 = m1.fit(data=data, epochs=5, verbose=False, shuffle=False)
+        h2 = m2.fit(data=data, epochs=5, verbose=False, shuffle=False)
+        assert [v for _, v in h1['train_loss']] == [v for _, v in h2['train_loss']]

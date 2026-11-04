@@ -276,10 +276,59 @@ class MLP:
             )
             self.layers.append(layer)
 
+        # 前向/反向 hook：{层索引: 回调}。没注册时下面只多一次真假判断，
+        # 不影响任何数值（注册了也只观察，不参与计算）
+        self._fhooks = {}
+        self._bhooks = {}
+
     def forward(self, x):
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer.forward(x)
+            if self._fhooks:
+                fn = self._fhooks.get(i)
+                if fn is not None:
+                    fn(layer, x)
         return x
+
+# ── hook（调试/可视化用，注册了才生效）
+
+    def register_forward_hook(self, index: int, fn):
+        """在第 index 层前向后调用 fn(layer, output)；返回 fn 本身便于保存"""
+        if not callable(fn):
+            raise TypeError(f"MLP.register_forward_hook: fn 必须可调用，收到 {fn!r}")
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError(f"MLP.register_forward_hook: index 必须是整数，收到 {index!r}")
+        if not 0 <= index < len(self.layers):
+            raise ValueError(
+                f"MLP.register_forward_hook: index={index} 越界（共 {len(self.layers)} 层）"
+            )
+        self._fhooks[index] = fn
+        return fn
+
+    def register_backward_hook(self, index: int, fn):
+        """在第 index 层反向后调用 fn(layer, delta_in, grad_w, grad_b)"""
+        if not callable(fn):
+            raise TypeError(f"MLP.register_backward_hook: fn 必须可调用，收到 {fn!r}")
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError(f"MLP.register_backward_hook: index 必须是整数，收到 {index!r}")
+        if not 0 <= index < len(self.layers):
+            raise ValueError(
+                f"MLP.register_backward_hook: index={index} 越界（共 {len(self.layers)} 层）"
+            )
+        self._bhooks[index] = fn
+        return fn
+
+    def remove_hook(self, index: int, kind: str = 'forward'):
+        """注销某一层的 hook（kind 取 'forward' / 'backward'）"""
+        table = self._fhooks if kind == 'forward' else self._bhooks
+        if kind not in ('forward', 'backward'):
+            raise ValueError(f"MLP.remove_hook: kind 只能是 'forward'/'backward'，收到 {kind!r}")
+        table.pop(index, None)
+
+    def clear_hooks(self):
+        """注销全部 hook"""
+        self._fhooks.clear()
+        self._bhooks.clear()
 
     def get_parameters(self):
         params = []
@@ -7018,8 +7067,14 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
     """内部工具：对 MLP 执行反向传播，返回每层的 (grad_w, grad_b) 列表"""
     delta = loss_grad
     grads = []
-    for layer in reversed(model.layers):
+    fhooks = model._bhooks
+    for i in range(len(model.layers) - 1, -1, -1):
+        layer = model.layers[i]
         gw, gb, delta = layer.backward(delta)
+        if fhooks:
+            fn = fhooks.get(i)
+            if fn is not None:
+                fn(layer, delta, gw, gb)
         grads.append((gw, gb))
     grads.reverse()
     return grads
@@ -7275,6 +7330,18 @@ class Model:
     def backward(self, loss_grad):
         """反向传播：返回 [(gw, gb), ...] 梯度列表（逐层）"""
         return _mlp_backward(self.model, loss_grad)
+
+    def register_forward_hook(self, index: int, fn):
+        """转发到 MLP：在第 index 层前向后调用 fn(layer, output)"""
+        return self.model.register_forward_hook(index, fn)
+
+    def register_backward_hook(self, index: int, fn):
+        """转发到 MLP：在第 index 层反向后调用 fn(layer, delta, grad_w, grad_b)"""
+        return self.model.register_backward_hook(index, fn)
+
+    def clear_hooks(self):
+        """转发到 MLP：注销全部 hook"""
+        return self.model.clear_hooks()
 
 # ── 训练
 
