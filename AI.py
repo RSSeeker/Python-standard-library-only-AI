@@ -4,7 +4,8 @@
   - Layer / MLP（全连接层 + 激活函数）
   - Conv2d（含 groups 分组/深度卷积）/ Conv1d / ConvTranspose2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
-  - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
+  - Transformer（MultiHeadAttention 支持 causal / RoPE / 滑动窗口 / GQA / 注意力 dropout / KV cache，
+    另有 CrossAttention / Encoder / Decoder / PositionalEncoding）
   - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列），都支持 padded 批量训练
   - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
@@ -18,18 +19,26 @@
 ================================================================================
 """
 
-# 目录（按文件顺序）
-#  1. 激活函数
-#  2. 前向 / 反向
-#  3. 辅助
-#  4. 训练
-#  5. 验证
-#  6. 设定相同随机种子 & 初始化
-#  7. PyTorch 模型
-#  8. 我们的模型
-#  9. 前向对齐
-#  10. 反向对齐
-#  11. 应用梯度更新权重 (SGD)
+# 目录（按文件顺序，与下面的 # ==== 分节标题一一对应）
+#   1. Layer & MLP
+#   2. CNN: Conv2d / MaxPool2d / Flatten
+#   3. Regularization: Dropout / BatchNorm1d / LayerNorm
+#   4. RNN / LSTM
+#   5. Matrix helpers (用于 Transformer)
+#   6. GRU (Gated Recurrent Unit)
+#   7. Transformer 组件
+#   8. Embedding / Residual / Sequential
+#   9. Loss Functions
+#  10. Optimizer: Adam
+#  11. More Optimizers: SGD / SGD+Momentum / RMSprop
+#  12. Gradient Clipping / LR Scheduler
+#  13. Data Utilities
+#  14. Text Processing（字符级语言模型工具）
+#  15. Trainer
+#  16. 模型保存 / 加载 (JSON)
+#  17. PyTorch 数值对齐对比
+#  18. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  19. Main: 回归 + 分类 + CNN 完整示例
 
 
 import io
