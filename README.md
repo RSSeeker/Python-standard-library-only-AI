@@ -2,6 +2,10 @@
 
 纯 Python 标准库实现的神经网络工具箱，**零第三方依赖**。
 
+- **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
+  逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（429 项）
+
 ## 特性
 
 - **零第三方依赖**: 仅依赖 `math`、`random`、`json` 等标准库
@@ -12,7 +16,8 @@
 - **因果注意力 / LLM**: `MultiHeadAttention(causal=True)` 因果掩码 + `CausalLM`（GPT 式字符级语言模型，训练与生成全部纯标准库）；注意力权重 dropout 同样实现了反向
 - **现代 LLM 组件**: GELU / sigmoid 激活、`RMSNorm`、`Linear`、`AdamW`（解耦权重衰减）、`WarmupLR`、
   RoPE 旋转位置编码、KV cache 生成（默认开启，比整段重算快约 18 倍且结果逐位相同），
-  以及 Focal / BCE / BCEWithLogits / Huber / KL 与 label smoothing
+  以及 Focal / BCE / BCEWithLogits / Huber / KL 与 label smoothing；
+  这些损失都能通过 `Model(loss_fn='focal', loss_kwargs={...})` 直接用，配错输出层激活会在构造时报错
 
 ## 快速开始
 
@@ -417,8 +422,26 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `huber_loss(pred, target, delta=1.0)` | Huber / Smooth L1，对离群点比 MSE 稳 |
 | `kl_divergence(pred, target)` | `KL(target ‖ pred) = Σ t·log(t/p)`，蒸馏/软目标常用 |
 
-> 新增的四个损失与 `focal_loss` 都遵循和 `mse_loss` 相同的返回约定：`(loss, grad)`，
-> 可以直接当成 `Model(loss_fn=...)` 的自定义损失用。
+| 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
+|------|------|------|
+| `'mse'` | 任意（通常 `linear`） | 数值向量 / 标量 |
+| `'cross_entropy'` / `'ce'` | `softmax` | 类别索引 / one-hot / 软标签 |
+| `'focal'` | `softmax` | 类别索引 / 严格 one-hot（软标签会被拒绝） |
+| `'bce'` | `sigmoid` | 0/1 数值 |
+| `'bce_with_logits'` | `linear` | 0/1 数值（喂 logits） |
+| `'huber'` | 任意 | 数值向量 / 标量 |
+
+`kl_divergence` **不在**上面的映射里：它要求 `pred` 是概率分布，而 `softmax` 层的
+反向是 softmax+CE 的联合梯度，任何非 CE 损失叠在 softmax 上都拿到不自洽的梯度
+（实测 KL 训练 loss 会从 0.35 涨到 5.78）。需要 KL 时请手动调用
+`AI.kl_divergence` 并自己反传。
+
+配错「输出层激活 × 损失」会在 `Model(...)` 构造时直接抛 `ValueError`，而不是静默训歪。
+
+> 所有损失都遵循和 `mse_loss` 相同的返回约定：`(loss, grad)`，
+> 也都可以当成 `Model(loss_fn=...)` 的自定义可调用对象用。
+> 额外超参（`focal` 的 `gamma`/`alpha`、`ce` 的 `label_smoothing`、`huber` 的 `delta`）
+> 通过 `Model(..., loss_kwargs={"gamma": 1.5})` 传入，会被转发到损失函数上。
 
 > 搭配约束：`softmax` 输出层的反向使用的是 **softmax + cross_entropy 的联合梯度**，
 > 因此只能与 `cross_entropy` 搭配。`Model(loss_fn='mse')` + softmax 输出层会**直接报错**，
@@ -429,6 +452,18 @@ m = AI.Seq2SeqLM.load("s2s.json")
 > 给 `cross_entropy_loss` 的软标签分支，因此 label smoothing / 蒸馏的软目标不会被
 > argmax 硬化。软标签的联合梯度按 `Σt·p − t` 计算（全 0 目标得到全 0 梯度）。
 > 该守卫对 `loss_fn='mse'`、`loss_fn=mse_loss` 与 `functools.partial(mse_loss)` 都生效。
+
+```python
+# 新损失直接用名字 + loss_kwargs
+m = AI.Model(AI.MLP([8, 16, 3], activations=["relu", "softmax"]),
+             loss_fn="focal", task="classification", lr=0.01,
+             loss_kwargs={"gamma": 1.5, "alpha": [1.0, 2.0, 1.0]})
+m.fit(data=train, epochs=20)
+
+# 二元分类：sigmoid 输出层 + bce
+m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
+              loss_fn="bce", task="regression", lr=0.01)
+```
 
 ### 工具函数
 
@@ -585,7 +620,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-422 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+429 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -630,6 +665,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 422 个单元测试
+├── test_ai.py       # 429 个单元测试
 └── README.md
 ```

@@ -4808,3 +4808,80 @@ class TestAdaptiveAvgPool2d:
             AI.AdaptiveAvgPool2d((1, 1)).backward([[1.0]])
         with pytest.raises(ValueError):
             AI.AdaptiveAvgPool2d((1, 1)).forward([[]])
+
+
+class TestModelLossMap:
+    """Model(loss=...) 的损失映射与参数透传（P0）"""
+
+    def _cls_data(self, seed=11, n=60):
+        rng = random.Random(seed)
+        xs, ys = [], []
+        for _ in range(n):
+            c = rng.randrange(3)
+            base = [0.0, 0.0, 0.0]
+            base[c] = 1.0
+            xs.append([v + rng.gauss(0, 0.25) for v in base])
+            ys.append(c)
+        return xs, ys
+
+    def test_new_losses_are_constructionable(self):
+        xs, ys = self._cls_data()
+        cases = [
+            ("focal", ["leaky_relu", "softmax"], "classification", {}),
+            ("bce", ["leaky_relu", "sigmoid"], "regression", {}),
+            ("bce_with_logits", ["leaky_relu", "linear"], "regression", {}),
+            ("huber", ["leaky_relu", "linear"], "regression", {}),
+        ]
+        for name, acts, task, kwargs in cases:
+            m = AI.Model(AI.MLP([3, 4, 3 if task == "classification" else 1], activations=acts),
+                         loss_fn=name, task=task, lr=0.05, loss_kwargs=kwargs)
+            data = list(zip(xs, ys)) if task == "classification" else list(zip(xs, [0.3] * len(xs)))
+            h = m.fit(data=data, epochs=3, batch_size=8, verbose=False)
+            assert len(h["train_loss"]) == 3
+
+    def test_loss_kwargs_are_forwarded(self):
+        # label_smoothing 透传：Model 内的 loss 必须与直接调用 cross_entropy_loss 完全相等
+        m = AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "softmax"]),
+                     loss_fn="ce", task="classification", loss_kwargs={"label_smoothing": 0.1})
+        pred = [0.2, 0.5, 0.3]
+        got, _ = m._loss(pred, 1)
+        want, _ = AI.cross_entropy_loss(pred, 1, label_smoothing=0.1)
+        assert abs(got - want) < 1e-15
+
+    def test_loss_kwargs_must_be_dict(self):
+        with pytest.raises(TypeError):
+            AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "softmax"]),
+                     loss_fn="focal", task="classification", loss_kwargs=[1])
+
+    def test_focal_one_hot_equals_index(self):
+        m = AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "softmax"]),
+                     loss_fn="focal", task="classification")
+        pred = [0.2, 0.5, 0.3]
+        l_idx, _ = m._loss(pred, 1)
+        l_onehot, _ = m._loss(pred, [0.0, 1.0, 0.0])
+        assert abs(l_idx - l_onehot) < 1e-15
+        # 软标签对 focal 是明确拒绝的
+        with pytest.raises(ValueError):
+            m._loss(pred, [0.1, 0.8, 0.1])
+
+    def test_kl_is_rejected_by_model(self):
+        # softmax 的反向是 softmax+CE 的联合梯度，kl 叠上去梯度不自洽
+        with pytest.raises(ValueError):
+            AI.Model(AI.MLP([4, 8, 3], activations=["leaky_relu", "softmax"]),
+                     loss_fn="kl", task="classification")
+
+    def test_output_activation_guards(self):
+        with pytest.raises(ValueError):
+            AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "linear"]),
+                     loss_fn="bce", task="classification")
+        with pytest.raises(ValueError):
+            AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "sigmoid"]),
+                     loss_fn="bce_with_logits", task="classification")
+
+    def test_unknown_loss_message_lists_new_options(self):
+        with pytest.raises(ValueError) as ei:
+            AI.Model(AI.MLP([3, 4, 3], activations=["leaky_relu", "softmax"]),
+                     loss_fn="nope", task="classification")
+        msg = str(ei.value)
+        for name in ("focal", "bce", "huber"):
+            assert name in msg

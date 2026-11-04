@@ -6471,13 +6471,28 @@ class Model:
         'mse': mse_loss,
         'cross_entropy': cross_entropy_loss,
         'ce': cross_entropy_loss,
+        'focal': focal_loss,
+        'bce': bce_loss,
+        'bce_with_logits': bce_with_logits_loss,
+        'huber': huber_loss,
     }
 
+    # 目标按「类别索引」解释的损失（其余按数值向量解释）
+    _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal')
+    # 目标按数值向量解释的损失（标量会被包成 [target]）
+    _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber')
+
     def __init__(self, model, loss_fn=None, optimizer=None, lr=0.01,
-                 opt_kwargs=None, task='auto'):
+                 opt_kwargs=None, task='auto', loss_kwargs=None):
         """
         model:       MLP 实例（必传）
-        loss_fn:     'mse' / 'cross_entropy' / 'ce' / callable(pred, target) -> (loss, grad)
+        loss_fn:     'mse' / 'cross_entropy' / 'ce' / 'focal' / 'bce' /
+                     'bce_with_logits' / 'huber' / callable(pred, target) -> (loss, grad)
+                     （kl_divergence 不在此列：它要求 pred 是概率分布，而 softmax 层的
+                     反向是 softmax+CE 的联合梯度，非 CE 损失叠在 softmax 上梯度不自洽；
+                     需要 KL 时请手动调用 AI.kl_divergence 并自己反传）
+        loss_kwargs: dict，传给损失函数的额外参数（如交叉熵的 label_smoothing、
+                     focal 的 gamma/alpha、huber 的 delta）
         optimizer:   'adam' / 'sgd' / 'sgd_momentum' / 'rmsprop' / 优化器实例
         lr:          学习率（optimizer 为字符串时生效）
         opt_kwargs:  dict，传给优化器构造函数的额外参数（如 weight_decay）
@@ -6491,6 +6506,9 @@ class Model:
         self.model = model
         self.lr = lr
         self.opt_kwargs = opt_kwargs or {}
+        if loss_kwargs is not None and not isinstance(loss_kwargs, dict):
+            raise TypeError(f"loss_kwargs 必须是 dict 或 None，收到 {type(loss_kwargs).__name__}")
+        self.loss_kwargs = dict(loss_kwargs or {})
 
         # 自动推断任务类型
         if task == 'auto':
@@ -6521,37 +6539,52 @@ class Model:
             self.loss_fn = loss_fn
 
         # 构建带 target 规范化的损失函数
-        if self._loss_name == 'mse':
-            def _wrap_loss(pred, target):
-                if not isinstance(target, (list, tuple)):
-                    target = [target]
-                return self.loss_fn(pred, target)
-            self._loss = _wrap_loss
-        elif self._loss_name in ('cross_entropy', 'ce'):
+        kw = self.loss_kwargs
+
+        def _as_numeric_target(target):
+            """标量目标包成 [target]；list/tuple 原样复制（向量/概率向量目标）"""
+            if isinstance(target, (list, tuple)):
+                return list(target)
+            return [target]
+
+        if self._loss_name in self._INDEX_LOSSES:
             # 标量 / float / 长度 1 的列表归一化成类别索引；
             # 长度等于类数的 one-hot / 概率向量直接交给 CE 的软标签分支，
             # 不再 argmax 硬化（否则软目标、label smoothing、蒸馏信息全被丢弃）
             num_classes = model.layers[-1].fan_out
 
-            def _wrap_ce_loss(pred, target):
+            def _wrap_index_loss(pred, target):
                 idx = target
                 if isinstance(target, (list, tuple)):
                     if len(target) == num_classes:
+                        # focal 是按类别索引定义的（没有软标签形式），one-hot 先硬化成索引；
+                        # 真正的软目标（概率向量）只交给支持软标签的 CE 家族
+                        if self._loss_name == 'focal':
+                            ones = [j for j, v in enumerate(target) if float(v) == 1.0]
+                            zeros_ok = all(
+                                float(v) == 0.0 for j, v in enumerate(target) if j not in ones
+                            )
+                            if len(ones) != 1 or not zeros_ok:
+                                raise ValueError(
+                                    "focal_loss 不支持软标签：target 必须是类别索引或严格 one-hot，"
+                                    f"收到 {list(target)}"
+                                )
+                            return self.loss_fn(pred, ones[0], **kw)
                         # 1 类分类器：[1.0] 是唯一的 one-hot，也必须按软标签走，
                         # 否则会被当成索引 1 而越界
                         if num_classes == 1:
-                            return self.loss_fn(pred, [float(target[0])])
-                        return self.loss_fn(pred, target)
+                            return self.loss_fn(pred, [float(target[0])], **kw)
+                        return self.loss_fn(pred, target, **kw)
                     if len(target) != 1:
                         raise ValueError(
-                            f"cross_entropy 的 target 长度 {len(target)} 与模型输出维度 "
+                            f"{self._loss_name} 的 target 长度 {len(target)} 与模型输出维度 "
                             f"{num_classes} 不一致（应传类别索引、one-hot 或长度 1 的列表）"
                         )
                     idx = target[0]
                 if isinstance(idx, float):
                     if not idx.is_integer():
                         raise ValueError(
-                            f"cross_entropy 的 target 必须是整数类别索引，收到 {idx}"
+                            f"{self._loss_name} 的 target 必须是整数类别索引，收到 {idx}"
                         )
                     idx = int(idx)
                 if not isinstance(idx, int):
@@ -6559,17 +6592,26 @@ class Model:
                         idx = operator.index(idx)  # 兼容 numpy 等实现了 __index__ 的整数类型
                     except TypeError:
                         raise TypeError(
-                            f"cross_entropy 的 target 必须是类别索引或 one-hot 列表，收到 {target!r}"
+                            f"{self._loss_name} 的 target 必须是类别索引或 one-hot 列表，收到 {target!r}"
                         )
                 if not 0 <= idx < num_classes:
                     raise ValueError(
                         f"类别索引 {idx} 越界（模型输出维度 {num_classes}）"
                     )
-                return self.loss_fn(pred, idx)
+                return self.loss_fn(pred, idx, **kw)
 
-            self._loss = _wrap_ce_loss
+            self._loss = _wrap_index_loss
+        elif self._loss_name in self._NUMERIC_LOSSES:
+            def _wrap_numeric_loss(pred, target):
+                return self.loss_fn(pred, _as_numeric_target(target), **kw)
+            self._loss = _wrap_numeric_loss
         else:
-            self._loss = self.loss_fn  # custom 原样
+            if kw:
+                def _wrap_custom_loss(pred, target):
+                    return self.loss_fn(pred, target, **kw)
+                self._loss = _wrap_custom_loss
+            else:
+                self._loss = self.loss_fn  # custom 原样
 
         # 输出层激活函数与损失函数的搭配校验：
         # Layer._softmax_deriv 返回全 1，隐含假设是「softmax + cross_entropy 联合梯度」，
@@ -6583,13 +6625,26 @@ class Model:
         # 也要落到同一个守卫里，否则两条路径行为不一致
         _is_mse = (self._loss_name == 'mse') or (self.loss_fn is mse_loss) \
             or (getattr(self.loss_fn, 'func', None) is mse_loss)
-        if self._loss_name in ('cross_entropy', 'ce') and last_act != "softmax":
+        if self._loss_name in self._INDEX_LOSSES and last_act != "softmax":
             raise ValueError(
                 f"输出层激活是 {last_act!r}，但 loss_fn='{self._loss_name}'："
-                "内置交叉熵假设 pred 是 softmax 概率，并直接使用 softmax+CE 的联合梯度，"
+                "内置交叉熵假设 pred 是 softmax 概率，并直接使用 softmax+CE（或 focal）的联合梯度，"
                 "与非 softmax 输出层不匹配（算出的 loss 与梯度不自洽）。"
                 "请把输出层激活设为 'softmax'，或改用自定义 loss_fn。"
             )
+        # 其余损失对「输出层激活」也有硬性要求，配错会在第一批就抛错或静默训歪，
+        # 因此在构造时就拒绝（与上面 CE/mse 的守卫同一套风格）
+        _LOSS_ACT_C = {
+            'bce': ('sigmoid', "bce_loss 期望 pred 是概率（[0,1]），输出层激活请用 'sigmoid'"),
+            'bce_with_logits': ('linear', "bce_with_logits_loss 期望 logits，输出层激活请用 'linear'"),
+        }
+        want_act = _LOSS_ACT_C.get(self._loss_name)
+        if want_act is not None and last_act != want_act[0]:
+            raise ValueError(
+                f"输出层激活是 {last_act!r}，但 loss_fn='{self._loss_name}'："
+                f"{want_act[1]}。"
+            )
+
         if last_act == "softmax" and _is_mse:
             raise ValueError(
                 "输出层使用 softmax 时不能搭配 mse 损失："
