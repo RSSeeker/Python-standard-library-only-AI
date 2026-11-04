@@ -5019,3 +5019,292 @@ class TestAugmentation:
         assert len(soft) == 3
         with pytest.raises(ValueError):
             AI.mixup([1.0], 0.5, [2.0], 1)
+
+class TestConvGroups:
+    def test_groups_two_equals_two_separate_convs(self):
+        g = AI.Conv2d(4, 2, kernel_size=3, padding=1, groups=2)
+        g.weights[0] = [[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+                        [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6], [-0.7, -0.8, -0.9]]]
+        g.weights[1] = [[[0.2, 0.0, -0.2], [0.3, 0.1, -0.3], [0.4, 0.2, -0.4]],
+                        [[0.5, 0.3, 0.1], [0.6, 0.4, 0.2], [0.7, 0.5, 0.3]]]
+        a = AI.Conv2d(2, 1, kernel_size=3, padding=1)
+        a.weights[0] = g.weights[0]
+        a.biases[0] = g.biases[0]
+        b = AI.Conv2d(2, 1, kernel_size=3, padding=1)
+        b.weights[0] = g.weights[1]
+        b.biases[0] = g.biases[1]
+
+        x = [[[0.1 * (c + 1) + 0.05 * h + 0.01 * w for w in range(4)] for h in range(4)]
+             for c in range(4)]
+        out = g.forward(x)
+        oa = a.forward(x[:2])[0]
+        ob = b.forward(x[2:])[0]
+        for r1, r2 in zip(out[0], oa):
+            for v1, v2 in zip(r1, r2):
+                assert abs(v1 - v2) < 1e-15
+        for r1, r2 in zip(out[1], ob):
+            for v1, v2 in zip(r1, r2):
+                assert abs(v1 - v2) < 1e-15
+
+    def test_depthwise_channels(self):
+        dw = AI.Conv2d(3, 6, kernel_size=3, padding=1, groups=3)
+        assert all(len(w) == 1 for w in dw.weights)
+        out = dw.forward([[[0.1] * 4 for _ in range(4)] for _ in range(3)])
+        assert len(out) == 6
+
+    def test_groups_grad_vs_numeric(self):
+        random.seed(7)
+        g = AI.Conv2d(2, 2, kernel_size=3, padding=1, groups=2)
+        x = [[[0.3, -0.2, 0.5, 0.1], [0.2, 0.4, -0.3, 0.6],
+              [-0.1, 0.7, 0.2, -0.4], [0.5, -0.3, 0.8, 0.2]] for _ in range(2)]
+        tgt = [[[0.1 + 0.1 * h + 0.05 * w for w in range(4)] for h in range(4)]
+               for _ in range(2)]
+        denom = 32.0
+
+        def loss():
+            out = g.forward(x)
+            s = 0.0
+            for oc in range(2):
+                for h in range(4):
+                    for w in range(4):
+                        d = out[oc][h][w] - tgt[oc][h][w]
+                        s += d * d
+            return s / denom
+
+        def grad_out():
+            out = g.forward(x)
+            return [[[2.0 * (out[oc][h][w] - tgt[oc][h][w]) / denom for w in range(4)]
+                     for h in range(4)] for oc in range(2)]
+
+        g.zero_grad()
+        g.forward(x)
+        g.backward(grad_out())
+        ana = [[v for v in row] for row in g.grad_w[0][0]]
+
+        eps = 1e-6
+        worst = 0.0
+        for kh in range(3):
+            for kw in range(3):
+                base = g.weights[0][0][kh][kw]
+                g.weights[0][0][kh][kw] = base + eps
+                lp = loss()
+                g.weights[0][0][kh][kw] = base - eps
+                lm = loss()
+                g.weights[0][0][kh][kw] = base
+                worst = max(worst, abs((lp - lm) / (2 * eps) - ana[kh][kw]))
+        assert worst < 1e-8
+
+    def test_invalid_groups(self):
+        with pytest.raises(ValueError):
+            AI.Conv2d(3, 2, 3, groups=2)
+        with pytest.raises(ValueError):
+            AI.Conv2d(4, 3, 3, groups=2)
+        with pytest.raises(ValueError):
+            AI.Conv2d(4, 2, 3, groups=0)
+        with pytest.raises(ValueError):
+            AI.Conv2d(4, 2, 3, groups=True)
+
+
+class TestConv1d:
+    def test_shape_and_stride(self):
+        c = AI.Conv1d(2, 2, kernel_size=3, stride=1, padding=1)
+        out = c.forward([[0.0, 1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0]])
+        assert len(out) == 2 and len(out[0]) == 4
+
+        c2 = AI.Conv1d(1, 1, kernel_size=2, stride=2)
+        c2.weights[0] = [[1.0, 1.0]]
+        c2.biases = [0.0]
+        assert c2.forward([[1.0, 2.0, 3.0, 4.0, 5.0]]) == [[3.0, 7.0]]
+
+    def test_manual_convolution(self):
+        c = AI.Conv1d(2, 1, kernel_size=3, padding=1)
+        c.weights[0] = [[1.0, 0.0, -1.0], [0.5, 0.5, 0.5]]
+        c.biases = [0.5]
+        out = c.forward([[0.0, 1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0]])
+        # base = -1 -> 只用 k=1(权0.0) 与 k=2(权-1) 命中输入 0/1；第二通道同理
+        assert abs(out[0][0] - 4.0) < 1e-12
+
+    def test_groups_equals_separate(self):
+        g = AI.Conv1d(4, 2, kernel_size=3, padding=1, groups=2)
+        g.weights[0] = [[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]]
+        g.weights[1] = [[0.2, 0.0, -0.2], [0.5, 0.3, 0.1]]
+        a = AI.Conv1d(2, 1, kernel_size=3, padding=1)
+        a.weights[0] = g.weights[0]
+        a.biases[0] = g.biases[0]
+        b = AI.Conv1d(2, 1, kernel_size=3, padding=1)
+        b.weights[0] = g.weights[1]
+        b.biases[0] = g.biases[1]
+        x = [[0.1 * (ci + 1) + 0.05 * i for i in range(5)] for ci in range(4)]
+        out = g.forward(x)
+        oa = a.forward(x[:2])[0]
+        ob = b.forward(x[2:])[0]
+        for v1, v2 in zip(out[0], oa):
+            assert abs(v1 - v2) < 1e-15
+        for v1, v2 in zip(out[1], ob):
+            assert abs(v1 - v2) < 1e-15
+
+    def test_grad_vs_numeric(self):
+        random.seed(21)
+        m = AI.Conv1d(2, 2, kernel_size=3, padding=1)
+        x = [[0.3, -0.2, 0.5, 0.1, 0.4], [0.2, 0.4, -0.3, 0.6, -0.1]]
+        tgt = [[0.1, 0.2, 0.3, 0.4, 0.5], [0.5, 0.4, 0.3, 0.2, 0.1]]
+        denom = 10.0
+
+        def loss():
+            out = m.forward(x)
+            s = 0.0
+            for oc in range(2):
+                for i in range(5):
+                    d = out[oc][i] - tgt[oc][i]
+                    s += d * d
+            return s / denom
+
+        def grad_out():
+            out = m.forward(x)
+            return [[2.0 * (out[oc][i] - tgt[oc][i]) / denom for i in range(5)]
+                    for oc in range(2)]
+
+        m.zero_grad()
+        m.forward(x)
+        dx_ana = m.backward(grad_out())
+        ana_w = list(m.grad_w[1][0])
+
+        eps = 1e-6
+        worst = 0.0
+        for k in range(3):
+            base = m.weights[1][0][k]
+            m.weights[1][0][k] = base + eps
+            lp = loss()
+            m.weights[1][0][k] = base - eps
+            lm = loss()
+            m.weights[1][0][k] = base
+            worst = max(worst, abs((lp - lm) / (2 * eps) - ana_w[k]))
+        assert worst < 1e-8
+
+        worst = 0.0
+        for ci in range(2):
+            for i in range(3):
+                base = x[ci][i]
+                x[ci][i] = base + eps
+                lp = loss()
+                x[ci][i] = base - eps
+                lm = loss()
+                x[ci][i] = base
+                worst = max(worst, abs((lp - lm) / (2 * eps) - dx_ana[ci][i]))
+        assert worst < 1e-8
+
+    def test_invalid_params(self):
+        with pytest.raises(ValueError):
+            AI.Conv1d(3, 2, 3, groups=2)
+        with pytest.raises(ValueError):
+            AI.Conv1d(2, 2, 0)
+        with pytest.raises(ValueError):
+            AI.Conv1d(2, 2, 3, stride=0)
+        with pytest.raises(ValueError):
+            AI.Conv1d(2, 2, 3, padding=-1)
+        c = AI.Conv1d(2, 1, 3)
+        with pytest.raises(ValueError):
+            c.forward([[0.1], [0.2, 0.3]])
+
+
+class TestConvTranspose2d:
+    def test_output_shapes(self):
+        t = AI.ConvTranspose2d(1, 1, kernel_size=3, stride=2)
+        t.forward([[[1.0, 2.0], [3.0, 4.0]]])
+        assert (t.h_out, t.w_out) == (5, 5)
+
+        t2 = AI.ConvTranspose2d(1, 1, kernel_size=3, stride=2, padding=1, output_padding=1)
+        t2.forward([[[1.0, 2.0], [3.0, 4.0]]])
+        assert (t2.h_out, t2.w_out) == (4, 4)
+
+    def test_single_point_scatters_kernel(self):
+        t = AI.ConvTranspose2d(1, 1, kernel_size=2)
+        t.weights[0][0] = [[1.0, 2.0], [3.0, 4.0]]
+        t.biases = [0.0]
+        out = t.forward([[[1.0, 0.0], [0.0, 0.0]]])
+        assert out[0][0][0] == 1.0 and out[0][0][1] == 2.0
+        assert out[0][1][0] == 3.0 and out[0][1][1] == 4.0
+        assert out[0][2][0] == 0.0
+
+    def test_adjoint_identity(self):
+        random.seed(31)
+        cv = AI.Conv2d(2, 2, kernel_size=3, padding=1)
+        tv = AI.ConvTranspose2d(2, 2, kernel_size=3, padding=1)
+        tv.weights = [[[row[:] for row in kern] for kern in per_in] for per_in in cv.weights]
+        x = [[[0.5, -0.2, 0.1], [-0.4, 0.8, 0.2], [0.7, 0.3, -0.6]],
+             [[0.1, 0.4, -0.3], [0.6, -0.2, 0.5], [-0.3, 0.9, 0.2]]]
+        y = [[[0.2, -0.1, 0.3], [0.5, 0.4, -0.2], [0.1, 0.7, 0.3]],
+             [[-0.3, 0.2, 0.6], [0.4, -0.5, 0.1], [0.2, 0.8, -0.4]]]
+        cy = cv.forward(x)
+        lhs = sum(sum(cy[oc][h][w] * y[oc][h][w] for w in range(3))
+                  for oc in range(2) for h in range(3))
+        ty = tv.forward(y)
+        rhs = sum(sum(x[c][h][w] * ty[c][h][w] for w in range(3))
+                  for c in range(2) for h in range(3))
+        assert abs(lhs - rhs) < 1e-12
+
+    def test_grad_vs_numeric(self):
+        random.seed(41)
+        t = AI.ConvTranspose2d(2, 2, kernel_size=3, stride=2, padding=1)
+        x = [[[0.3, -0.2], [0.5, 0.1]], [[0.2, 0.4], [-0.3, 0.6]]]
+        t.forward(x)
+        ho, wo = t.h_out, t.w_out
+        tgt = [[[0.1 + 0.01 * h + 0.02 * w for w in range(wo)] for h in range(ho)]
+               for _ in range(2)]
+        denom = 2.0 * ho * wo
+
+        def loss():
+            out = t.forward(x)
+            s = 0.0
+            for oc in range(2):
+                for h in range(ho):
+                    for w in range(wo):
+                        d = out[oc][h][w] - tgt[oc][h][w]
+                        s += d * d
+            return s / denom
+
+        def grad_out():
+            out = t.forward(x)
+            return [[[2.0 * (out[oc][h][w] - tgt[oc][h][w]) / denom for w in range(wo)]
+                     for h in range(ho)] for oc in range(2)]
+
+        t.zero_grad()
+        t.forward(x)
+        dx_ana = t.backward(grad_out())
+        ana = [[v for v in row] for row in t.grad_w[0][1]]
+
+        eps = 1e-6
+        worst = 0.0
+        for kh in range(3):
+            for kw in range(3):
+                base = t.weights[0][1][kh][kw]
+                t.weights[0][1][kh][kw] = base + eps
+                lp = loss()
+                t.weights[0][1][kh][kw] = base - eps
+                lm = loss()
+                t.weights[0][1][kh][kw] = base
+                worst = max(worst, abs((lp - lm) / (2 * eps) - ana[kh][kw]))
+        assert worst < 1e-8
+
+        worst = 0.0
+        for ci in range(2):
+            for h in range(2):
+                for w in range(2):
+                    base = x[ci][h][w]
+                    x[ci][h][w] = base + eps
+                    lp = loss()
+                    x[ci][h][w] = base - eps
+                    lm = loss()
+                    x[ci][h][w] = base
+                    worst = max(worst, abs((lp - lm) / (2 * eps) - dx_ana[ci][h][w]))
+        assert worst < 1e-8
+
+    def test_invalid_params(self):
+        with pytest.raises(ValueError):
+            AI.ConvTranspose2d(3, 2, 3, groups=2)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose2d(2, 2, 3, stride=1, output_padding=1)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose2d(2, 2, 0)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose2d(2, 2, 3, padding=-1)

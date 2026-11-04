@@ -2,7 +2,7 @@
 ================================================================================
   全栈神经网络工具箱（纯 Python 标准库实现，零第三方依赖）
   - Layer / MLP（全连接层 + 激活函数）
-  - Conv2d / MaxPool2d（卷积与池化）
+  - Conv2d（含 groups 分组/深度卷积）/ Conv1d / ConvTranspose2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
   - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列）
@@ -361,9 +361,23 @@ class Conv2d:
     """2D 卷积层 (im2col 实现, 纯 Python 列表)"""
 
     def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size, stride=1, padding=0):
+                 kernel_size, stride=1, padding=0, groups: int = 1):
+        if not isinstance(groups, int) or isinstance(groups, bool) or groups < 1:
+            raise ValueError(f"Conv2d: groups 必须是 >=1 的整数，收到 {groups!r}")
+        if in_channels % groups != 0:
+            raise ValueError(
+                f"Conv2d: in_channels={in_channels} 必须能被 groups={groups} 整除"
+            )
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"Conv2d: out_channels={out_channels} 必须能被 groups={groups} 整除"
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.groups = groups
+        # 每个输出通道只连本组的 C/groups 个输入通道（groups=1 时就是原来的 C）
+        self.cg = in_channels // groups
+        self.og = out_channels // groups
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         self.stride = (stride, stride) if isinstance(stride, int) else stride
         self.padding = (padding, padding) if isinstance(padding, int) else padding
@@ -377,22 +391,22 @@ class Conv2d:
             raise ValueError(f"Conv2d: padding 不能为负，收到 {self.padding}")
         self.ph, self.pw = self.padding
 
-        # He 初始化
-        fan_in = in_channels * self.kh * self.kw
+        # He 初始化（groups=1 时 fan_in 与原来的 in_channels*kh*kw 相同）
+        fan_in = self.cg * self.kh * self.kw
         std = math.sqrt(2.0 / fan_in)
         self.weights = [
             [[[random.gauss(0, std) for _ in range(self.kw)]
               for _ in range(self.kh)]
-             for _ in range(in_channels)]
+             for _ in range(self.cg)]
             for _ in range(out_channels)
         ]
         self.biases = [0.0] * out_channels
 
         # Adam 状态
         self.m_w = [[[[0.0] * self.kw for _ in range(self.kh)]
-                      for _ in range(in_channels)] for _ in range(out_channels)]
+                      for _ in range(self.cg)] for _ in range(out_channels)]
         self.v_w = [[[[0.0] * self.kw for _ in range(self.kh)]
-                      for _ in range(in_channels)] for _ in range(out_channels)]
+                      for _ in range(self.cg)] for _ in range(out_channels)]
         self.m_b = [0.0] * out_channels
         self.v_b = [0.0] * out_channels
 
@@ -406,7 +420,7 @@ class Conv2d:
         """初始化/清零梯度缓冲区（保留前向缓存 h_out/w_out 供 backward 使用）"""
         self.grad_w = [
             [[[0.0] * self.kw for _ in range(self.kh)]
-             for _ in range(self.in_channels)]
+             for _ in range(self.cg)]
             for _ in range(self.out_channels)
         ]
         self.grad_b = [0.0] * self.out_channels
@@ -489,9 +503,9 @@ class Conv2d:
         return dx
 
     def _flatten_weights(self, oc):
-        """把第 oc 个输出通道的卷积核展平成 (C*kh*kw,)，顺序与 im2col 的行一致"""
+        """把第 oc 个输出通道的卷积核展平成 (cg*kh*kw,)，顺序与 im2col 的行一致"""
         out = []
-        for ic in range(self.in_channels):
+        for ic in range(self.cg):
             for kh in range(self.kh):
                 for kw in range(self.kw):
                     out.append(self.weights[oc][ic][kh][kw])
@@ -521,18 +535,32 @@ class Conv2d:
         self.h_out, self.w_out = ho, wo
         self.x_shape = (C, H, W)
 
-        x_pad = self._pad(x) if (self.ph > 0 or self.pw > 0) else x
-        col = self._im2col(x_pad, ho, wo)       # (C*kh*kw, ho*wo)
-        self.x_col = col
+        # 分组卷积：每组只把本组的 C/groups 个输入通道卷进本组的 out/groups 个输出通道。
+        # groups=1 时循环只跑一次，运算与原来逐位相同。
+        self.cols = []
+        outs = []
+        for g in range(self.groups):
+            xg = x if self.groups == 1 else x[g * self.cg:(g + 1) * self.cg]
+            xg_pad = self._pad(xg) if (self.ph > 0 or self.pw > 0) else xg
+            col = self._im2col(xg_pad, ho, wo)      # (cg*kh*kw, ho*wo)
+            self.cols.append(col)
 
-        # 一次 matmul 算出所有输出通道: (out_channels, C*kh*kw) × (C*kh*kw, ho*wo)
-        W_row = [self._flatten_weights(oc) for oc in range(self.out_channels)]
-        flat = _matmul(W_row, col)
-        return [
-            [[flat[oc][oh * wo + ow] + self.biases[oc] for ow in range(wo)]
-             for oh in range(ho)]
-            for oc in range(self.out_channels)
-        ]
+            # 一次 matmul 算出本组输出: (og, cg*kh*kw) × (cg*kh*kw, ho*wo)
+            W_row = [self._flatten_weights(oc)
+                     for oc in range(g * self.og, (g + 1) * self.og)]
+            flat = _matmul(W_row, col)
+            outs.append([
+                [[flat[oc - g * self.og][oh * wo + ow] + self.biases[oc]
+                  for ow in range(wo)]
+                 for oh in range(ho)]
+                for oc in range(g * self.og, (g + 1) * self.og)
+            ])
+
+        # 兼容旧代码（多处直接读 self.x_col）：单组时仍然指向那一份 col
+        self.x_col = self.cols[0] if len(self.cols) == 1 else None
+        if self.groups == 1:
+            return outs[0]
+        return [ch for grp in outs for ch in grp]
 
     def backward(self, dout):
         """
@@ -552,35 +580,353 @@ class Conv2d:
                     flat.append(dout[oc][oh][ow])
             dout_flat.append(flat)
 
-        # grad_w: dW = dout_flat × col^T（累积到内部梯度缓冲区）
-        # 即: grad_w[oc][ic][kh][kw] += sum over ho,wo: dout[oc][oh][ow] * col_row[oh*wo]
-        # 点积交给 C 层的 map(mul)/sum，求和顺序与逐元素累加一致
+        dx_groups = []
+        for g in range(self.groups):
+            col = self.cols[g]
+
+            # grad_w: dW = dout_flat × col^T（累积到内部梯度缓冲区）
+            # 即: grad_w[oc][ic][kh][kw] += sum over ho,wo: dout[oc][oh][ow] * col_row[oh*wo]
+            # 点积交给 C 层的 map(mul)/sum，求和顺序与逐元素累加一致
+            for oc in range(g * self.og, (g + 1) * self.og):
+                d = dout_flat[oc]
+                for ic in range(self.cg):
+                    for kh in range(self.kh):
+                        for kw in range(self.kw):
+                            row = ic * self.kh * self.kw + kh * self.kw + kw
+                            self.grad_w[oc][ic][kh][kw] += sum(map(_mul, d, col[row]))
+
+            for oc in range(g * self.og, (g + 1) * self.og):
+                self.grad_b[oc] += sum(dout_flat[oc])
+
+            # dx: col2im  dcol = W_flat^T × dout_flat  (cg*kh*kw, ho*wo)
+            dcol = [[0.0] * (ho * wo) for _ in range(len(col))]
+            for oc in range(g * self.og, (g + 1) * self.og):
+                d = dout_flat[oc]
+                w_flat = self._flatten_weights(oc)
+                for row in range(len(w_flat)):
+                    w = w_flat[row]
+                    # 累加顺序仍是「外层 oc、内层逐元素」，与原写法逐位一致
+                    dcol[row] = [a + w * b for a, b in zip(dcol[row], d)]
+
+            dx_padded = self._col2im(
+                dcol, (self.cg, H + 2 * self.ph, W + 2 * self.pw), ho, wo)
+
+            if self.ph > 0 or self.pw > 0:
+                dx_groups.append(self._unpad(dx_padded, H, W))
+            else:
+                dx_groups.append(dx_padded)
+
+        if self.groups == 1:
+            return dx_groups[0]
+        return [ch for grp in dx_groups for ch in grp]
+
+
+class Conv1d:
+    """1D 卷积层（输入 (C, L)，权重 [oc][cg][k]，He 初始化）
+
+    没有走 im2col：1D 的核很小，直接滑动窗口累加比先展开成矩阵更省内存。
+    groups 语义与 Conv2d 一致（每组只连本组的 C/groups 个输入通道）。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, groups: int = 1):
+        if not isinstance(groups, int) or isinstance(groups, bool) or groups < 1:
+            raise ValueError(f"Conv1d: groups 必须是 >=1 的整数，收到 {groups!r}")
+        if in_channels % groups != 0:
+            raise ValueError(
+                f"Conv1d: in_channels={in_channels} 必须能被 groups={groups} 整除"
+            )
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"Conv1d: out_channels={out_channels} 必须能被 groups={groups} 整除"
+            )
+        if not isinstance(kernel_size, int) or isinstance(kernel_size, bool) or kernel_size <= 0:
+            raise ValueError(f"Conv1d: kernel_size 必须是正整数，收到 {kernel_size!r}")
+        if not isinstance(stride, int) or isinstance(stride, bool) or stride <= 0:
+            raise ValueError(f"Conv1d: stride 必须是正整数，收到 {stride!r}")
+        if not isinstance(padding, int) or isinstance(padding, bool) or padding < 0:
+            raise ValueError(f"Conv1d: padding 必须是非负整数，收到 {padding!r}")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.groups = groups
+        self.cg = in_channels // groups
+        self.og = out_channels // groups
+        self.kernel_size = kernel_size
+        self.k = kernel_size
+        self.stride = stride
+        self.s = stride
+        self.padding = padding
+        self.p = padding
+
+        fan_in = self.cg * self.k
+        std = math.sqrt(2.0 / fan_in)
+        self.weights = [[[random.gauss(0, std) for _ in range(self.k)]
+                         for _ in range(self.cg)]
+                        for _ in range(out_channels)]
+        self.biases = [0.0] * out_channels
+
+        self.m_w = [[[0.0] * self.k for _ in range(self.cg)]
+                    for _ in range(out_channels)]
+        self.v_w = [[[0.0] * self.k for _ in range(self.cg)]
+                    for _ in range(out_channels)]
+        self.m_b = [0.0] * out_channels
+        self.v_b = [0.0] * out_channels
+
+        self.x = None
+        self.l_out = 0
+
+        self.zero_grad()
+
+    def zero_grad(self):
+        """清零梯度缓冲区"""
+        self.grad_w = [[[0.0] * self.k for _ in range(self.cg)]
+                       for _ in range(self.out_channels)]
+        self.grad_b = [0.0] * self.out_channels
+
+    def _out_len(self, L):
+        lo = (L + 2 * self.p - self.k) // self.s + 1
+        if lo <= 0:
+            raise ValueError(
+                f"Conv1d: 输入长度 {L} 配 kernel {self.k}、padding {self.p}、"
+                f"stride {self.s} 得到输出长度 {lo}，必须 > 0"
+            )
+        return lo
+
+    def forward(self, x):
+        """x: (C, L) -> (out_channels, Lo)"""
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"Conv1d.forward: 输入通道 {len(x)} != in_channels={self.in_channels}"
+            )
+        L = len(x[0])
+        for c in range(len(x)):
+            if len(x[c]) != L:
+                raise ValueError("Conv1d.forward: 各通道长度必须一致")
+        lo = self._out_len(L)
+        self.x = x
+        self.l_out = lo
+
+        out = []
         for oc in range(self.out_channels):
-            d = dout_flat[oc]
-            for ic in range(self.in_channels):
-                for kh in range(self.kh):
-                    for kw in range(self.kw):
-                        row = ic * self.kh * self.kw + kh * self.kw + kw
-                        self.grad_w[oc][ic][kh][kw] += sum(map(_mul, d, self.x_col[row]))
+            w_oc = self.weights[oc]
+            ic0 = (oc // self.og) * self.cg
+            row = [0.0] * lo
+            for o in range(lo):
+                total = self.biases[oc]
+                base = o * self.s - self.p
+                for ic in range(self.cg):
+                    wic = w_oc[ic]
+                    xc = x[ic0 + ic]
+                    for k in range(self.k):
+                        idx = base + k
+                        if 0 <= idx < L:
+                            total += wic[k] * xc[idx]
+                row[o] = total
+            out.append(row)
+        return out
+
+    def backward(self, dout):
+        """dout: (out_channels, Lo) -> dx: (C, L)，内部累积 grad_w / grad_b"""
+        if self.x is None:
+            raise RuntimeError("Conv1d.backward: 请先调用 forward")
+        L = len(self.x[0])
+        lo = self.l_out
+        dx = [[0.0] * L for _ in range(self.in_channels)]
 
         for oc in range(self.out_channels):
-            self.grad_b[oc] += sum(dout_flat[oc])
+            d = dout[oc]
+            self.grad_b[oc] += sum(d)
+            w_oc = self.weights[oc]
+            gw_oc = self.grad_w[oc]
+            ic0 = (oc // self.og) * self.cg
+            for o in range(lo):
+                base = o * self.s - self.p
+                dv = d[o]
+                for ic in range(self.cg):
+                    wic = w_oc[ic]
+                    gwic = gw_oc[ic]
+                    xc = self.x[ic0 + ic]
+                    dxi = dx[ic0 + ic]
+                    for k in range(self.k):
+                        idx = base + k
+                        if 0 <= idx < L:
+                            gwic[k] += dv * xc[idx]
+                            dxi[idx] += dv * wic[k]
+        return dx
 
-        # dx: col2im  dcol = W_flat^T × dout_flat  (C*kh*kw, ho*wo)
-        dcol = [[0.0] * (ho * wo) for _ in range(len(self.x_col))]
-        for oc in range(self.out_channels):
-            d = dout_flat[oc]
-            w_flat = self._flatten_weights(oc)
-            for row in range(len(w_flat)):
-                w = w_flat[row]
-                # 累加顺序仍是「外层 oc、内层逐元素」，与原写法逐位一致
-                dcol[row] = [a + w * b for a, b in zip(dcol[row], d)]
 
-        dx_padded = self._col2im(dcol, (C, H + 2 * self.ph, W + 2 * self.pw), ho, wo)
+class ConvTranspose2d:
+    """2D 转置卷积（反卷积）层：输入 (Cin, H, W) -> (Cout, Ho, Wo)
 
-        if self.ph > 0 or self.pw > 0:
-            return self._unpad(dx_padded, H, W)
-        return dx_padded
+    输出尺寸 Ho = (H-1)*stride - 2*padding + kernel + output_padding。
+    权重布局 [cin][og][kh][kw]，与 PyTorch 的 (in, out/groups, kh, kw) 一致。
+    forward 把每个输入元素按核散开累加到输出，backward 与之对称。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size,
+                 stride=1, padding=0, output_padding=0, groups: int = 1):
+        if not isinstance(groups, int) or isinstance(groups, bool) or groups < 1:
+            raise ValueError(f"ConvTranspose2d: groups 必须是 >=1 的整数，收到 {groups!r}")
+        if in_channels % groups != 0:
+            raise ValueError(
+                f"ConvTranspose2d: in_channels={in_channels} 必须能被 groups={groups} 整除"
+            )
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"ConvTranspose2d: out_channels={out_channels} 必须能被 groups={groups} 整除"
+            )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.groups = groups
+        self.cg = in_channels // groups
+        self.og = out_channels // groups
+        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        self.stride = (stride, stride) if isinstance(stride, int) else tuple(stride)
+        self.padding = (padding, padding) if isinstance(padding, int) else tuple(padding)
+        self.output_padding = ((output_padding, output_padding)
+                               if isinstance(output_padding, int) else tuple(output_padding))
+        self.kh, self.kw = self.kernel_size
+        self.sh, self.sw = self.stride
+        self.ph, self.pw = self.padding
+        self.oph, self.opw = self.output_padding
+        if self.kh <= 0 or self.kw <= 0:
+            raise ValueError(f"ConvTranspose2d: kernel_size 必须为正，收到 {self.kernel_size}")
+        if self.sh <= 0 or self.sw <= 0:
+            raise ValueError(f"ConvTranspose2d: stride 必须为正，收到 {self.stride}")
+        if self.ph < 0 or self.pw < 0:
+            raise ValueError(f"ConvTranspose2d: padding 不能为负，收到 {self.padding}")
+        if self.oph < 0 or self.opw < 0:
+            raise ValueError(
+                f"ConvTranspose2d: output_padding 不能为负，收到 {self.output_padding}"
+            )
+        # 与 PyTorch 一致：output_padding 必须小于 stride
+        if self.oph >= self.sh or self.opw >= self.sw:
+            raise ValueError(
+                f"ConvTranspose2d: output_padding {self.output_padding} "
+                f"必须小于 stride {self.stride}"
+            )
+
+        fan_in = self.cg * self.kh * self.kw
+        std = math.sqrt(2.0 / fan_in)
+        self.weights = [
+            [[[random.gauss(0, std) for _ in range(self.kw)]
+              for _ in range(self.kh)]
+             for _ in range(self.og)]
+            for _ in range(in_channels)
+        ]
+        self.biases = [0.0] * out_channels
+
+        self.m_w = [[[[0.0] * self.kw for _ in range(self.kh)]
+                     for _ in range(self.og)] for _ in range(in_channels)]
+        self.v_w = [[[[0.0] * self.kw for _ in range(self.kh)]
+                     for _ in range(self.og)] for _ in range(in_channels)]
+        self.m_b = [0.0] * out_channels
+        self.v_b = [0.0] * out_channels
+
+        self.x = None
+        self.x_shape = None
+        self.h_out = 0
+        self.w_out = 0
+
+        self.zero_grad()
+
+    def zero_grad(self):
+        """清零梯度缓冲区"""
+        self.grad_w = [[[[0.0] * self.kw for _ in range(self.kh)]
+                        for _ in range(self.og)] for _ in range(self.in_channels)]
+        self.grad_b = [0.0] * self.out_channels
+
+    def _out_shape(self, H, W):
+        ho = (H - 1) * self.sh - 2 * self.ph + self.kh + self.oph
+        wo = (W - 1) * self.sw - 2 * self.pw + self.kw + self.opw
+        if ho <= 0 or wo <= 0:
+            raise ValueError(
+                f"ConvTranspose2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}、"
+                f"stride {self.sh}/{self.sw}、padding {self.ph}/{self.pw} "
+                f"得到输出 {ho}x{wo}，必须都 > 0"
+            )
+        return ho, wo
+
+    def forward(self, x):
+        """x: (Cin, H, W) -> (Cout, Ho, Wo)"""
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"ConvTranspose2d.forward: 输入通道 {len(x)} != "
+                f"in_channels={self.in_channels}"
+            )
+        H, W = len(x[0]), len(x[0][0])
+        for c in range(len(x)):
+            if len(x[c]) != H or len(x[c][0]) != W:
+                raise ValueError("ConvTranspose2d.forward: 各通道尺寸必须一致")
+        ho, wo = self._out_shape(H, W)
+        self.x = x
+        self.x_shape = (len(x), H, W)
+        self.h_out, self.w_out = ho, wo
+
+        out = [[[self.biases[co] for _ in range(wo)] for _ in range(ho)]
+               for co in range(self.out_channels)]
+        for ci in range(self.in_channels):
+            co0 = (ci // self.cg) * self.og
+            for co in range(self.og):
+                w = self.weights[ci][co]
+                out_c = out[co0 + co]
+                for oh in range(H):
+                    xrow = x[ci][oh]
+                    base_h = oh * self.sh - self.ph
+                    for ow in range(W):
+                        v = xrow[ow]
+                        base_w = ow * self.sw - self.pw
+                        for kh in range(self.kh):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= ho:
+                                continue
+                            wrow = w[kh]
+                            dst = out_c[ih]
+                            for kw in range(self.kw):
+                                iw = base_w + kw
+                                if 0 <= iw < wo:
+                                    dst[iw] += v * wrow[kw]
+        return out
+
+    def backward(self, dout):
+        """dout: (Cout, Ho, Wo) -> dx: (Cin, H, W)，内部累积 grad_w / grad_b"""
+        if self.x_shape is None:
+            raise RuntimeError("ConvTranspose2d.backward: 请先调用 forward")
+        C, H, W = self.x_shape
+        ho, wo = self.h_out, self.w_out
+
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for ci in range(C):
+            co0 = (ci // self.cg) * self.og
+            for co in range(self.og):
+                out_c = dout[co0 + co]
+                w = self.weights[ci][co]
+                g_w = self.grad_w[ci][co]
+                self.grad_b[co0 + co] += sum(sum(row) for row in out_c)
+                for oh in range(H):
+                    xrow = self.x[ci][oh]
+                    dxrow = dx[ci][oh]
+                    base_h = oh * self.sh - self.ph
+                    for ow in range(W):
+                        base_w = ow * self.sw - self.pw
+                        xv = xrow[ow]
+                        acc = 0.0
+                        for kh in range(self.kh):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= ho:
+                                continue
+                            drow = out_c[ih]
+                            g_row = g_w[kh]
+                            for kw in range(self.kw):
+                                iw = base_w + kw
+                                if iw < 0 or iw >= wo:
+                                    continue
+                                dv = drow[iw]
+                                g_row[kw] += dv * xv
+                                acc += dv * w[kh][kw]
+                        dxrow[ow] += acc
+        return dx
 
 
 class MaxPool2d:

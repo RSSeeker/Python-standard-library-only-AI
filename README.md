@@ -131,7 +131,9 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Layer` | 全连接层 + 激活函数（He 初始化）；激活可选 `leaky_relu` / `relu` / `gelu` / `sigmoid` / `linear` / `softmax` |
 | `Linear` | 无激活的全连接层（`Layer(..., activation='linear')` 的语义化子类） |
 | `MLP` | 多层感知机容器 |
-| `Conv2d` | 二维卷积层 |
+| `Conv2d` | 二维卷积层（`groups=G` 支持分组/深度卷积） |
+| `Conv1d` | 一维卷积层（`(C, L)` 输入，滑动窗口直接累加） |
+| `ConvTranspose2d` | 二维转置卷积（反卷积；`output_padding` 与 PyTorch 同规则） |
 | `MaxPool2d` | 二维最大池化 |
 | `AvgPool2d` | 二维平均池化（接口同 `MaxPool2d`，反向把梯度均分回窗口） |
 | `GlobalAvgPool2d` | 全局平均池化：`(C,H,W) → (C,)`，CNN 分类头常用 |
@@ -625,7 +627,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-441 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+455 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -666,6 +668,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
 | `TestFlops` | `estimate_flops` 的 MACs / 参数量 / 逐层明细与手算一致、不认识的模块报 TypeError |
 | `TestAugmentation` | `sigma=0` 逐位不变且不改入参、图像翻转保持元素多重集、平移补 0、Mixup 中点与软标签、非法输入报错 |
+| `TestConvGroups` | `groups=2` 前向等价两个单组卷积、depthwise 通道、`grad_w` vs 数值、非法 groups |
+| `TestConv1d` | 形状与 stride、手算卷积、`groups` 等价、`grad_w`/`dx` vs 数值、非法参数 |
+| `TestConvTranspose2d` | 输出尺寸公式与 `output_padding`、单点散布核、伴随恒等 `<Cx,y>==<x,C^T y>`、梯度 vs 数值、非法参数 |
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
@@ -674,6 +679,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 441 个单元测试
+├── test_ai.py       # 455 个单元测试
 └── README.md
 ```
