@@ -5881,3 +5881,128 @@ class TestLMPersistenceMatrix:
             assert lm.generate(probe, 4, top_k=1, rng=random.Random(2)) == \
                    back.generate(probe, 4, top_k=1, rng=random.Random(2)), cfg
             assert back.step_count == 2, cfg
+
+
+# ============================================================================
+#  审计 7 条（F1–F7）的回归测试
+# ============================================================================
+class TestPadMaskAlignment:
+    def test_left_padding_raises(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        with pytest.raises(ValueError, match="右填充"):
+            lm.forward([0, 0, 1, 2, 3], pad_mask=[0, 0, 1, 1, 1])
+        with pytest.raises(ValueError, match="右填充"):
+            lm._loss_and_backward([0, 0, 1, 2, 3], [0, 0, 1, 1, 1])
+
+    def test_right_padding_still_works(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        lm.eval()
+        logits = lm.forward([1, 2, 3, 0, 0], pad_mask=[1, 1, 1, 0, 0])
+        assert all(v == v for row in logits for v in row)
+        loss = lm._loss_and_backward([1, 2, 3, 0, 0], [1, 1, 1, 0, 0])
+        assert loss == loss and loss > 0.0
+
+    def test_fully_masked_row_is_zero_not_nan(self):
+        assert AI._softmax_row([float("-inf")] * 3) == [0.0, 0.0, 0.0]
+
+
+class TestTopKValidation:
+    def test_invalid_top_k_raises(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        for bad in (0.5, -1, 2.7, True):
+            with pytest.raises(ValueError, match="top_k"):
+                lm._sample([0.1, 0.2, 0.3, 0.4, 0.5], 1.0, bad, random.Random(0))
+            with pytest.raises(ValueError, match="top_k"):
+                lm.generate([1], 3, top_k=bad)
+
+    def test_invalid_top_k_in_beam_search(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        with pytest.raises(ValueError, match="top_k"):
+            lm.generate([1], 3, num_beams=3, top_k=0.5)
+
+    def test_valid_top_k_still_samples(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        rng = random.Random(0)
+        logits = [0.1, 0.2, 0.3, 0.4, 0.5]
+        assert all(0 <= lm._sample(logits, 1.0, 2, rng) < 5 for _ in range(5))
+        assert lm._sample(logits, 1.0, 0, random.Random(1)) in range(5)
+
+
+class TestLMTargetValidation:
+    def test_negative_and_out_of_range_ids_raise(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        for bad in ([1, 2, -1], [1, 2, 5], [1, 2, -7], [True, 2, 3]):
+            with pytest.raises(ValueError, match="token id"):
+                lm._loss_and_backward(bad)
+        with pytest.raises(ValueError, match="token id"):
+            lm.evaluate([[1, 2, -1]])
+
+    def test_valid_ids_unchanged(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        loss = lm._loss_and_backward([1, 2, 3])
+        assert loss == loss and loss > 0.0
+
+
+class TestNonFiniteLogits:
+    def test_nan_weights_raise_instead_of_clamping(self):
+        lm = AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        lm.W_out[0][0] = float("nan")
+        with pytest.raises(ValueError, match="NaN"):
+            lm.evaluate([[1, 2, 3]])
+        with pytest.raises(ValueError, match="NaN"):
+            lm._loss_and_backward([1, 2, 3])
+
+
+class TestRestoreOptimizerStrict:
+    def test_missing_optimizer_state_raises(self, tmp_path):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        path = str(tmp_path / "lm.json")
+        lm.save(path, include_optimizer=False, quiet=True)
+        with pytest.raises(ValueError, match="没有优化器状态"):
+            AI.CausalLM.load(path, restore_optimizer=True)
+        assert AI.CausalLM.load(path) is not None
+
+    def test_present_optimizer_state_restores(self, tmp_path):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        lm.fit([[1, 2, 3]], epochs=2, lr=0.01, shuffle=False)
+        path = str(tmp_path / "lm.json")
+        lm.save(path, include_optimizer=True, quiet=True)
+        back = AI.CausalLM.load(path, restore_optimizer=True)
+        assert back.step_count == lm.step_count
+        assert len(back._adam_m) > 0
+
+
+class TestBPEForwardRef:
+    def test_forward_reference_raises_value_error(self):
+        for merges in ([(256, 97)], [(97, 98), (256, 257)], [(500, 97)]):
+            with pytest.raises(ValueError, match="合并规则"):
+                AI.BytePairTokenizer(merges)
+
+    def test_bad_type_raises_value_error(self):
+        with pytest.raises(ValueError, match="merges"):
+            AI.BytePairTokenizer("abc")
+
+    def test_valid_merges_still_work(self):
+        tok = AI.BytePairTokenizer([(97, 98), (256, 99)])
+        assert tok.decode(tok.encode("abcab")) == "abcab"
+
+
+class TestSeq2SeqGenerateValidation:
+    def test_source_longer_than_max_len_raises(self):
+        m = AI.Seq2SeqLM(src_vocab=10, tgt_vocab=10, d_model=8, num_heads=2,
+                         d_ff=8, num_layers=1, max_len=4)
+        with pytest.raises(ValueError, match="max_len"):
+            m.generate([1, 2, 3, 4, 5, 6], 3, top_k=1)
+        with pytest.raises(ValueError, match="max_len"):
+            m.generate([1, 2, 3, 4, 5, 6], 3, num_beams=2)
+
+    def test_source_id_out_of_range_raises(self):
+        m = AI.Seq2SeqLM(src_vocab=10, tgt_vocab=10, d_model=8, num_heads=2,
+                         d_ff=8, num_layers=1, max_len=4)
+        with pytest.raises(ValueError, match="token id"):
+            m.generate([1, 2, 3, 11], 3)
+
+    def test_normal_length_still_generates(self):
+        m = AI.Seq2SeqLM(src_vocab=10, tgt_vocab=10, d_model=8, num_heads=2,
+                         d_ff=8, num_layers=1, max_len=4)
+        assert len(m.generate([1, 2, 3], 3, top_k=1)) == 3

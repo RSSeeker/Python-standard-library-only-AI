@@ -2095,8 +2095,10 @@ def _transpose(M):
 
 
 def _softmax_row(v):
-    """对一维列表做 softmax"""
+    """对一维列表做 softmax（整行都是 -inf 时返回全 0，避免 exp(-inf-(-inf))=NaN）"""
     mx = max(v)
+    if mx == float("-inf"):
+        return [0.0] * len(v)
     exps = [math.exp(x - mx) for x in v]
     s = sum(exps)
     return [e / s for e in exps]
@@ -3805,17 +3807,20 @@ def _lm_load(filepath, restore_optimizer=False):
         _lm_copy_into(param, saved_params[name], name)
     if restore_optimizer:
         opt = data.get("optimizer")
-        if opt:
-            model.step_count = int(opt.get("step_count", 0))
-            for key, store in (("m", model._adam_m), ("v", model._adam_v)):
-                saved_bufs = opt.get(key) or {}
-                store.clear()
-                for name, param, _ in model._named_params():
-                    if name not in saved_bufs:
-                        continue
-                    buf = _zeros_like(param)
-                    _lm_copy_into(buf, saved_bufs[name], f"optimizer.{key}.{name}")
-                    store[name] = buf
+        if not opt:
+            raise ValueError(
+                "load: 存档里没有优化器状态（保存时需要 include_optimizer=True），"
+                "无法 restore_optimizer=True")
+        model.step_count = int(opt.get("step_count", 0))
+        for key, store in (("m", model._adam_m), ("v", model._adam_v)):
+            saved_bufs = opt.get(key) or {}
+            store.clear()
+            for name, param, _ in model._named_params():
+                if name not in saved_bufs:
+                    raise ValueError(f"load: 优化器状态缺少参数块 {name!r}")
+                buf = _zeros_like(param)
+                _lm_copy_into(buf, saved_bufs[name], f"optimizer.{key}.{name}")
+                store[name] = buf
     return model
 
 
@@ -3835,7 +3840,52 @@ def _check_pad_mask(mask, length, who):
             raise ValueError(f"{who}: pad_mask[{i}] 必须是 0 或 1，收到 {m!r}")
     if not any(out):
         raise ValueError(f"{who}: pad_mask 至少要有 1 个有效位置")
+    seen_pad = False
+    for i, m in enumerate(out):
+        if not m:
+            seen_pad = True
+        elif seen_pad:
+            raise ValueError(
+                f"{who}: pad_mask 只支持右填充（0 之后不能再出现 1，位置 {i}）")
     return out
+
+
+def _check_top_k(top_k, who):
+    """校验 top_k：非负整数（0 表示不过滤）
+
+    float/bool/负数都会让 `order[:int(top_k)]` 静默退化成空集或差一位，
+    采样结果变成「永远是最后一个 token」或丢掉最高概率项，所以一律拒绝。
+    """
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise ValueError(f"{who}: top_k 必须是 >= 0 的整数（0 表示不过滤），收到 {top_k!r}")
+    if top_k < 0:
+        raise ValueError(f"{who}: top_k 必须 >= 0，收到 {top_k!r}")
+    return top_k
+
+
+def _check_token_ids(ids, vocab_size, who):
+    """校验一串 token id 都在 [0, vocab_size) 内
+
+    Python 的负索引会让 `probs[-1]` 静默指向「最后一类」，loss 与梯度全算在错类上；
+    越界的正数反而抛 IndexError。统一在这里报 ValueError。
+    """
+    if not isinstance(ids, (list, tuple)):
+        raise ValueError(f"{who}: token id 序列必须是列表，收到 {type(ids).__name__}")
+    out = []
+    for i, v in enumerate(ids):
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v < vocab_size:
+            raise ValueError(
+                f"{who}: 第 {i} 个 token id 非法（{v!r}），必须在 [0, {vocab_size}) 内")
+        out.append(v)
+    return out
+
+
+def _check_finite_logits(logits, who):
+    """logits 出现 NaN/Inf 说明参数已经坏了；直接报错，别让它被 loss 的 clamp 掩盖"""
+    for t, row in enumerate(logits):
+        for v in row:
+            if v != v or v == float("inf") or v == float("-inf"):
+                raise ValueError(f"{who}: 第 {t} 行 logits 含 NaN/Inf，参数可能已损坏")
 
 
 class CausalLM:
@@ -3999,6 +4049,7 @@ class CausalLM:
         """
         if len(ids) < 2:
             raise ValueError("CausalLM: 序列至少要有 2 个 token 才能训练（输入 + 目标）")
+        ids = _check_token_ids(ids, self.vocab_size, "CausalLM._loss_and_backward")
         if pad_mask is None:
             valid = None
             key_mask = None
@@ -4011,6 +4062,7 @@ class CausalLM:
                 raise ValueError(
                     "CausalLM._loss_and_backward: pad_mask 里没有有效的目标位置（序列至少 2 个真实 token）")
         logits = self.forward(ids[:-1], key_mask)
+        _check_finite_logits(logits, "CausalLM._loss_and_backward")
         d_logits = []
         loss = 0.0
         for t in range(len(ids) - 1):
@@ -4136,7 +4188,9 @@ class CausalLM:
             for s in seqs:
                 if len(s) < 2:
                     raise ValueError("CausalLM.evaluate: 每条序列至少 2 个 token")
+                s = _check_token_ids(s, self.vocab_size, "CausalLM.evaluate")
                 logits = self.forward(s[:-1])
+                _check_finite_logits(logits, "CausalLM.evaluate")
                 for t in range(len(s) - 1):
                     probs = _softmax_row(logits[t])
                     p = probs[s[t + 1]]
@@ -4222,6 +4276,7 @@ class CausalLM:
             raise ValueError(f"CausalLM.generate: temperature 必须 > 0，收到 {temperature!r}")
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"CausalLM.generate: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        top_k = _check_top_k(top_k, "CausalLM.generate")
         if isinstance(num_beams, bool) or not isinstance(num_beams, int) or num_beams < 1:
             raise ValueError(
                 f"CausalLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
@@ -4249,6 +4304,7 @@ class CausalLM:
         """
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"CausalLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        top_k = _check_top_k(top_k, "CausalLM._sample")
         if top_k and top_k < self.vocab_size:
             order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
             keep = set(order[:int(top_k)])
@@ -4477,10 +4533,13 @@ class Seq2SeqLM:
         """
         if len(tgt_ids) < 1:
             raise ValueError("Seq2SeqLM: 目标序列不能为空")
+        src_ids = _check_token_ids(src_ids, self.src_vocab, "Seq2SeqLM._loss_and_backward")
+        tgt_ids = _check_token_ids(tgt_ids, self.tgt_vocab, "Seq2SeqLM._loss_and_backward")
         if tgt_mask is not None:
             tgt_mask = _check_pad_mask(tgt_mask, len(tgt_ids), "Seq2SeqLM._loss_and_backward")
         tgt_in = [self.bos_id] + list(tgt_ids[:-1])
         logits = self.forward(src_ids, tgt_in, src_mask=src_mask)
+        _check_finite_logits(logits, "Seq2SeqLM._loss_and_backward")
         n = len(tgt_ids) if tgt_mask is None else sum(1 for v in tgt_mask if v)
         if n <= 0:
             raise ValueError("Seq2SeqLM: 目标序列至少要有一个非填充位置")
@@ -4614,8 +4673,11 @@ class Seq2SeqLM:
             for s, t in items:
                 if not s or not t:
                     raise ValueError("Seq2SeqLM.evaluate: 每对的源/目标都不能为空")
+                s = _check_token_ids(s, self.src_vocab, "Seq2SeqLM.evaluate")
+                t = _check_token_ids(t, self.tgt_vocab, "Seq2SeqLM.evaluate")
                 tgt_in = [self.bos_id] + list(t[:-1])
                 logits = self.forward(s, tgt_in)
+                _check_finite_logits(logits, "Seq2SeqLM.evaluate")
                 for i in range(len(t)):
                     probs = _softmax_row(logits[i])
                     p = probs[t[i]]
@@ -4630,6 +4692,7 @@ class Seq2SeqLM:
         """从 logits 采一个 token（top_k / top_p + 温度 + 累积分布）"""
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"Seq2SeqLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        top_k = _check_top_k(top_k, "Seq2SeqLM._sample")
         if top_k and top_k < vocab_size:
             order = sorted(range(vocab_size), key=lambda v: logits[v], reverse=True)
             keep = set(order[:int(top_k)])
@@ -4720,7 +4783,8 @@ class Seq2SeqLM:
         """
         if not src_ids:
             raise ValueError("Seq2SeqLM.generate: src_ids 不能为空")
-        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int)                 or max_new_tokens < 0:
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) \
+                or max_new_tokens < 0:
             raise ValueError(
                 f"Seq2SeqLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
         if temperature <= 0:
@@ -4729,6 +4793,11 @@ class Seq2SeqLM:
         if isinstance(num_beams, bool) or not isinstance(num_beams, int) or num_beams < 1:
             raise ValueError(
                 f"Seq2SeqLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
+        top_k = _check_top_k(top_k, "Seq2SeqLM.generate")
+        src_ids = _check_token_ids(src_ids, self.src_vocab, "Seq2SeqLM.generate")
+        if len(src_ids) > self.max_len:
+            raise ValueError(
+                f"Seq2SeqLM.generate: 源序列长度 {len(src_ids)} 超过 max_len={self.max_len}")
         rng = rng or random
         self.eval()
         if num_beams > 1:
@@ -6121,10 +6190,19 @@ class BytePairTokenizer:
     """
 
     def __init__(self, merges=None):
-        self.merges = [tuple(int(x) for x in m) for m in (merges or [])]
-        for m in self.merges:
-            if len(m) != 2 or not all(0 <= v < 256 + len(self.merges) for v in m):
-                raise ValueError(f"BytePairTokenizer: 非法合并规则 {m!r}")
+        if merges is not None and not isinstance(merges, (list, tuple)):
+            raise ValueError(
+                f"BytePairTokenizer: merges 必须是列表，收到 {type(merges).__name__}")
+        try:
+            self.merges = [tuple(int(x) for x in m) for m in (merges or [])]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"BytePairTokenizer: 合并规则必须是 (a, b) 整数对（{e}）")
+        for k, m in enumerate(self.merges):
+            limit = 256 + k          # 只能引用「之前已经定义」的 id
+            if len(m) != 2 or not all(0 <= v < limit for v in m):
+                raise ValueError(
+                    f"BytePairTokenizer: 第 {k} 条合并规则 {m!r} 非法"
+                    f"（只能引用已定义的 id，范围 [0,{limit})）")
         self._rebuild()
 
     def _rebuild(self):
