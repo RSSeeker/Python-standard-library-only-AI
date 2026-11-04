@@ -5,7 +5,7 @@
   - Conv2d（含 groups 分组/深度卷积）/ Conv1d / ConvTranspose2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
-  - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列）
+  - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列），都支持 padded 批量训练
   - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
@@ -3216,8 +3216,12 @@ class CrossAttention:
         self.training = False
         return self
 
-    def forward(self, x_seq, memory):
-        """x_seq: (Tq, d_model) 解码器输入；memory: (Tk, d_model) 编码器输出"""
+    def forward(self, x_seq, memory, memory_mask=None):
+        """x_seq: (Tq, d_model) 解码器输入；memory: (Tk, d_model) 编码器输出
+
+        memory_mask: 长度 Tk 的 0/1 列表，0 表示该位置是填充、不能参与注意力
+        （批量训练时右填充的源序列）。
+        """
         if len(x_seq) == 0:
             raise ValueError("CrossAttention: x_seq 不能为空")
         if len(memory) == 0:
@@ -3230,6 +3234,8 @@ class CrossAttention:
             if len(row) != self.d_model:
                 raise ValueError(
                     f"CrossAttention: memory[{t}] 长度 {len(row)} != d_model {self.d_model}")
+        if memory_mask is not None:
+            memory_mask = _check_pad_mask(memory_mask, len(memory), "CrossAttention")
         self.x = [list(row) for row in x_seq]
         self.memory = [list(row) for row in memory]
         tq, tk = len(x_seq), len(memory)
@@ -3261,7 +3267,15 @@ class CrossAttention:
         for head in range(h):
             q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
             scores = [[v * scale for v in row] for row in _matmul(q_h, _transpose(k_h))]
-            # 交叉注意力没有因果掩码：解码器位置能看到整段 memory
+            # 交叉注意力没有因果掩码：解码器位置能看到整段 memory；
+            # 但批量训练时被填充的 memory 位置必须屏蔽（softmax 后权重恰为 0，
+            # 反向无需额外分支）
+            if memory_mask is not None:
+                for t in range(tq):
+                    row = scores[t]
+                    for j in range(tk):
+                        if not memory_mask[j]:
+                            row[j] = float("-inf")
             attn = [_softmax_row(row) for row in scores]
             mask = None
             used = attn
@@ -3417,7 +3431,7 @@ class TransformerDecoderLayer:
         self.cross_attn.zero_grad()
         self.ffn.zero_grad()
 
-    def forward(self, x_seq, memory):
+    def forward(self, x_seq, memory, memory_mask=None):
         d = self.d_model
         self.x = [list(row) for row in x_seq]
         self.memory = [list(row) for row in memory]
@@ -3434,7 +3448,7 @@ class TransformerDecoderLayer:
                      for t in range(n)]
         ln1_out = [self.ln1.forward(v) for v in self.res1]
 
-        cross_out = self.cross_attn.forward(ln1_out, memory)
+        cross_out = self.cross_attn.forward(ln1_out, memory, memory_mask)
         self.dropout2_masks = []
         cross_dropped = []
         for c in cross_out:
@@ -3553,9 +3567,9 @@ class TransformerDecoder:
             layer.eval()
         return self
 
-    def forward(self, x_seq, memory):
+    def forward(self, x_seq, memory, memory_mask=None):
         for layer in self.layers:
-            x_seq = layer.forward(x_seq, memory)
+            x_seq = layer.forward(x_seq, memory, memory_mask)
         return x_seq
 
     def backward(self, dout_seq):
@@ -4405,17 +4419,20 @@ class Seq2SeqLM:
                    sum(len(r) for r in p)
                    for _, p, _ in self._named_params())
 
-    def _encode(self, src_ids):
-        """编码器前向，返回 memory (Ts, d_model)"""
+    def _encode(self, src_ids, src_mask=None):
+        """编码器前向，返回 memory (Ts, d_model)
+
+        src_mask: 长度 Ts 的 0/1 列表，0 表示右填充的位置（批量训练用）
+        """
         emb = self.src_embedding.forward(src_ids)
         x = self.pos.forward(emb)
-        return self.encoder.forward(x)
+        return self.encoder.forward(x, key_mask=src_mask)
 
-    def _decode(self, tgt_ids, memory):
+    def _decode(self, tgt_ids, memory, memory_mask=None):
         """解码器前向，返回 logits (Tt, tgt_vocab)（未经 softmax）"""
         emb = self.tgt_embedding.forward(tgt_ids)
         x = self.pos.forward(emb)
-        h = self.decoder.forward(x, memory)
+        h = self.decoder.forward(x, memory, memory_mask)
         self.h = h
         logits = _matmul(h, _transpose(self.W_out))
         for t in range(len(h)):
@@ -4423,8 +4440,12 @@ class Seq2SeqLM:
                 logits[t][v] += self.b_out[v]
         return logits
 
-    def forward(self, src_ids, tgt_in_ids):
-        """完整前向：返回 (Tt, tgt_vocab) 的 logits"""
+    def forward(self, src_ids, tgt_in_ids, src_mask=None):
+        """完整前向：返回 (Tt, tgt_vocab) 的 logits
+
+        src_mask: 长度 len(src_ids) 的 0/1 列表，0 表示右填充位置；
+                  同时用于「编码器自注意力的 key」与「解码器的 memory」。
+        """
         if not src_ids:
             raise ValueError("Seq2SeqLM.forward: src_ids 不能为空")
         if not tgt_in_ids:
@@ -4435,19 +4456,31 @@ class Seq2SeqLM:
         if len(tgt_in_ids) > self.max_len:
             raise ValueError(
                 f"Seq2SeqLM.forward: 目标序列长度 {len(tgt_in_ids)} 超过 max_len={self.max_len}")
-        self.enc = self._encode(src_ids)
-        return self._decode(tgt_in_ids, self.enc)
+        self.enc = self._encode(src_ids, src_mask)
+        return self._decode(tgt_in_ids, self.enc, src_mask)
 
-    def _loss_and_backward(self, src_ids, tgt_ids):
-        """单对序列的 teacher-forcing 交叉熵（对目标 token 数取平均）并累积梯度"""
+    def _loss_and_backward(self, src_ids, tgt_ids, src_mask=None, tgt_mask=None,
+                           grad_scale: float = 1.0):
+        """单对序列的 teacher-forcing 交叉熵（对目标 token 数取平均）并累积梯度
+
+        src_mask / tgt_mask: 批量训练时的右填充掩码（None 时行为与之前完全一致）
+        grad_scale:          梯度整体缩放（批量训练里按 token 数加权用）
+        """
         if len(tgt_ids) < 1:
             raise ValueError("Seq2SeqLM: 目标序列不能为空")
+        if tgt_mask is not None:
+            tgt_mask = _check_pad_mask(tgt_mask, len(tgt_ids), "Seq2SeqLM._loss_and_backward")
         tgt_in = [self.bos_id] + list(tgt_ids[:-1])
-        logits = self.forward(src_ids, tgt_in)
-        n = len(tgt_ids)
+        logits = self.forward(src_ids, tgt_in, src_mask=src_mask)
+        n = len(tgt_ids) if tgt_mask is None else sum(1 for v in tgt_mask if v)
+        if n <= 0:
+            raise ValueError("Seq2SeqLM: 目标序列至少要有一个非填充位置")
         d_logits = []
         loss = 0.0
-        for t in range(n):
+        for t in range(len(tgt_ids)):
+            if tgt_mask is not None and not tgt_mask[t]:
+                d_logits.append([0.0] * self.tgt_vocab)
+                continue
             probs = _softmax_row(logits[t])
             target = tgt_ids[t]
             p = probs[target]
@@ -4456,7 +4489,7 @@ class Seq2SeqLM:
             row[target] -= 1.0
             d_logits.append(row)
         loss /= n
-        inv = 1.0 / n
+        inv = grad_scale / n
         d_logits = [[v * inv for v in row] for row in d_logits]
 
         h = self.h
@@ -4501,8 +4534,14 @@ class Seq2SeqLM:
             _adam_apply(param, grad, m, v, t, lr)
 
     def fit(self, pairs, epochs: int = 1, lr: float = 3e-3,
-            shuffle: bool = True, seed=None, verbose: bool = False):
-        """在若干 (src_ids, tgt_ids) 上训练，返回每个 epoch 的平均 loss"""
+            shuffle: bool = True, seed=None, verbose: bool = False,
+            batch_size: int = 1):
+        """在若干 (src_ids, tgt_ids) 上训练，返回每个 epoch 的平均 loss
+
+        batch_size > 1 时把长度不同的样本右填充成一批，用 pad 掩码屏蔽填充位，
+        梯度按 token 数加权（等价于把整批的目标 token 拉平后取平均），
+        每批做一次 Adam 更新。默认 batch_size=1 时行为与之前完全一致。
+        """
         items = [(list(s), list(t)) for s, t in pairs]
         if not items:
             raise ValueError("Seq2SeqLM.fit: pairs 不能为空")
@@ -4511,6 +4550,8 @@ class Seq2SeqLM:
                 raise ValueError("Seq2SeqLM.fit: 每对的源/目标都不能为空")
         if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 0:
             raise ValueError(f"Seq2SeqLM.fit: epochs 不能为负，收到 {epochs!r}")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError(f"Seq2SeqLM.fit: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
         rng = random.Random(seed) if seed is not None else random
         history = []
         self.train()
@@ -4519,10 +4560,32 @@ class Seq2SeqLM:
             if shuffle:
                 rng.shuffle(order)
             total = 0.0
-            for i in order:
-                self.zero_grad()
-                total += self._loss_and_backward(items[i][0], items[i][1])
-                self.adam_step(lr)
+            if batch_size == 1:
+                for i in order:
+                    self.zero_grad()
+                    total += self._loss_and_backward(items[i][0], items[i][1])
+                    self.adam_step(lr)
+            else:
+                for start in range(0, len(order), batch_size):
+                    group = [items[i] for i in order[start:start + batch_size]]
+                    width_src = max(len(s) for s, _ in group)
+                    width_tgt = max(len(t) for _, t in group)
+                    if width_src > self.max_len or width_tgt > self.max_len:
+                        raise ValueError(
+                            "Seq2SeqLM.fit: 批量补齐后超过 max_len="
+                            f"{self.max_len}（源 {width_src}、目标 {width_tgt}）"
+                        )
+                    n_total = sum(len(t) for _, t in group)
+                    self.zero_grad()
+                    for s, t in group:
+                        pad_s = list(s) + [0] * (width_src - len(s))
+                        pad_t = list(t) + [0] * (width_tgt - len(t))
+                        src_mask = [1] * len(s) + [0] * (width_src - len(s))
+                        tgt_mask = [1] * len(t) + [0] * (width_tgt - len(t))
+                        total += self._loss_and_backward(
+                            pad_s, pad_t, src_mask=src_mask, tgt_mask=tgt_mask,
+                            grad_scale=len(t) / n_total)
+                    self.adam_step(lr)
             avg = total / len(items)
             history.append(avg)
             if verbose:

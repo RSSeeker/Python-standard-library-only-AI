@@ -331,6 +331,22 @@ print(m.generate([1, 2, 3], max_new_tokens=3, top_k=1))  # 贪心解码
 所以整条 encoder-decoder 可以端到端训练。`fit` 把目标序列右移一位当输入
 （`[BOS] + tgt[:-1]`），交叉熵对目标 token 数取平均。
 
+**批量 padded 训练**（与 `CausalLM` 的 `pad_mask` 同一套思路）：
+
+```python
+# 长度不同的样本会右填充成一批；padding 不进注意力、不计入 loss
+m.fit(pairs, epochs=40, lr=0.01, batch_size=4)
+
+# 单独调用也可以自己传掩码：0 表示右填充位置
+logits = m.forward(src, tgt_in, src_mask=[1, 1, 1, 0])
+m._loss_and_backward(src, tgt, src_mask=[1, 1, 1, 0], tgt_mask=[1, 1, 1, 0])
+```
+
+实现上只有两处需要屏蔽：编码器自注意力的 key（`src_mask`）与解码器交叉注意力的 memory
+（同一份 `src_mask`）——softmax 后填充位置权重恰为 0，反向自动零梯度。梯度按 token 数加权
+（`grad_scale = 该样本目标 token 数 / 整批目标 token 总数`），所以 `batch_size=4` 一步等于
+把 4 条序列的目标 token 拉平后取平均；不传掩码时与逐条训练**逐位一致**。
+
 ### 训练工程化工具
 
 ```python
@@ -625,7 +641,7 @@ generated = generate_text(model, tp, "君不见", length=15, temp=0.8)
 python AI.py
 ```
 
-依次运行 13 段演示：回归（`Model.fit`）→ 分类（`make_classifier` + Softmax/CE）→ CNN（卷积→池化→展平→MLP）→ RNN & LSTM 序列预测 → 模型保存/加载 → GRU 序列预测 → Dropout + LayerNorm → 梯度裁剪 + StepLR → `quick_train` 一行训练 → Transformer 序列分类 → 因果语言模型（`CausalLM`）→ 字符级文本生成 → PyTorch 数值对齐。
+依次运行 14 段演示：回归（`Model.fit`）→ 分类（`make_classifier` + Softmax/CE）→ CNN（卷积→池化→展平→MLP）→ RNN & LSTM 序列预测 → 模型保存/加载 → GRU 序列预测 → Dropout + LayerNorm → 梯度裁剪 + StepLR → `quick_train` 一行训练 → Transformer 序列分类 → 因果语言模型（`CausalLM`）→ 迷你 GPT（BPE 分词 + 存档续训 + 束搜索）→ 字符级文本生成 → PyTorch 数值对齐。
 
 ## 测试
 
@@ -633,7 +649,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-486 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+492 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -654,6 +670,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCache` | KV cache 生成 == 整段重算（含窗口滑动与 RoPE 两种情形）、训练后仍一致、生成不改参数 |
 | `TestFeedForwardActivation` | `FeedForward` 换 GELU/sigmoid 后的 `d_x` vs 数值梯度，`relu` 路径与旧实现逐位一致 |
 | `TestGradCheck` | `grad_check` 对 MLP / Model / CausalLM 都返回 `ok`，且人为改坏梯度时能识别 |
+| `TestSeq2SeqPaddedBatch` | `Seq2SeqLM` 的 `pad_mask`：补齐后 loss/梯度逐位不变、`batch_size` 一步等于手工按 token 加权、mask 校验 |
 | `TestGradCheckSeq2Seq` | `Seq2SeqLM` 的 `grad_check` 通过、覆盖解码器与输出层、零梯度（`b_k`）不误报、检查后模式复原 |
 | `TestOptimizerPersistence` | 不传 `optimizer` 时存档与旧格式逐字段相同、Adam 状态往返、**续训与一次训完权重逐位相同**、类型/形状不匹配报错 |
 | `TestWindowMask` | 窗口外权重恰为 0、窗口注意力保持因果性、`forward_step` == 整段前向最后一行（含 RoPE）、**带窗口时 `W_v` 梯度 vs 数值梯度** |
@@ -691,6 +708,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 486 个单元测试
+├── test_ai.py       # 492 个单元测试
 └── README.md
 ```

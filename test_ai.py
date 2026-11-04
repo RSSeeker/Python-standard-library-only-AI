@@ -5723,3 +5723,90 @@ class TestGradCheckSeq2Seq:
         s2s = self._model()
         with pytest.raises(TypeError):
             AI.grad_check(s2s, [1, 2, 3])
+
+
+class TestSeq2SeqPaddedBatch:
+    """Seq2SeqLM 的 pad_mask：补齐不改变真实位置的数值，批量训练按 token 加权"""
+
+    @staticmethod
+    def _build(seed=5):
+        random.seed(seed)
+        return AI.Seq2SeqLM(7, 7, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=8, dropout=0.0)
+
+    @staticmethod
+    def _grads(model):
+        out = []
+        for _, _, g in model._named_params():
+            out.append([[list(r) for r in g] if isinstance(g[0], list) else list(g)])
+        return out
+
+    def test_padding_is_numerically_transparent(self):
+        m = self._build()
+        m.eval()
+        m.zero_grad()
+        base = m._loss_and_backward([1, 2, 3, 4], [3, 5, 6])
+        g_base = self._grads(m)
+
+        m.zero_grad()
+        padded = m._loss_and_backward(
+            [1, 2, 3, 4, 0, 0], [3, 5, 6, 0, 0],
+            src_mask=[1, 1, 1, 1, 0, 0], tgt_mask=[1, 1, 1, 0, 0])
+        assert padded == base
+        assert self._grads(m) == g_base
+
+    def test_padding_keeps_real_logits(self):
+        m = self._build()
+        m.eval()
+        a = m.forward([1, 2, 3, 4], [3, 5])
+        b = m.forward([1, 2, 3, 4, 0, 0], [3, 5, 0, 0],
+                      src_mask=[1, 1, 1, 1, 0, 0])
+        for t in range(2):
+            assert a[t] == b[t]
+
+    def test_batched_step_matches_manual_weighting(self):
+        pairs = [([1, 2, 3], [3, 5, 6]), ([4, 2], [6, 1]), ([1, 5, 3, 2], [2, 2, 6])]
+        a = self._build(seed=9)
+        b = self._build(seed=9)
+        assert [p for _, p, _ in a._named_params()] == [p for _, p, _ in b._named_params()]
+
+        a.train()
+        a.zero_grad()
+        a.fit(pairs, epochs=1, lr=0.01, shuffle=False, batch_size=2)
+
+        b.train()
+        for group in (pairs[:2], pairs[2:]):
+            n_total = sum(len(t) for _, t in group)
+            b.zero_grad()
+            for s, t in group:
+                b._loss_and_backward(s, t, grad_scale=len(t) / n_total)
+            b.adam_step(0.01)
+
+        for (na, pa, _), (nb, pb, _) in zip(a._named_params(), b._named_params()):
+            assert na == nb
+            assert pa == pb
+
+    def test_epoch_loss_accounting_matches(self):
+        pairs = [([1, 2, 3], [3, 5, 6]), ([4, 2], [6, 1]), ([1, 5, 3, 2], [2, 2, 6])]
+        # lr=0 参数不动，两者记的都是「各样本 loss 的平均」
+        h1 = self._build(seed=21).fit(pairs, epochs=1, lr=0.0, shuffle=False)
+        h2 = self._build(seed=21).fit(pairs, epochs=1, lr=0.0, shuffle=False,
+                                      batch_size=3)
+        assert h1 == h2
+
+    def test_batch_size_validation(self):
+        pairs = [([1, 2], [3])]
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises((ValueError, TypeError)):
+                self._build(seed=1).fit(pairs, epochs=1, batch_size=bad)
+
+    def test_mask_validation(self):
+        m = self._build()
+        with pytest.raises(ValueError):
+            m._loss_and_backward([1, 2, 3], [1, 2], src_mask=[1, 1])
+        with pytest.raises(ValueError):
+            m._loss_and_backward([1, 2, 3], [1, 2], tgt_mask=[0, 0])
+        with pytest.raises(ValueError):
+            self._build(seed=2).fit(
+                [([1, 2, 3, 4, 5, 6, 7, 1, 2], [1]), ([1], [1])],
+                epochs=1, batch_size=2)
