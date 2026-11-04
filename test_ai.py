@@ -5372,3 +5372,61 @@ class TestHooks:
         h1 = m1.fit(data=data, epochs=5, verbose=False, shuffle=False)
         h2 = m2.fit(data=data, epochs=5, verbose=False, shuffle=False)
         assert [v for _, v in h1['train_loss']] == [v for _, v in h2['train_loss']]
+
+
+class TestFlopsExtended:
+    """estimate_flops 对分组卷积与新增模块的计数"""
+
+    def test_grouped_conv_uses_channels_per_group(self):
+        # groups=2 时每个输出通道只连 2 个输入通道，MACs 必须是 6*2*9*25
+        seq = AI.Sequential([AI.Conv2d(4, 6, kernel_size=3, padding=1, groups=2)])
+        r = AI.estimate_flops(seq, (4, 5, 5))
+        assert r['by_layer'][0][1] == 6 * 2 * 9 * 25
+        assert r['params'] == 6 * 2 * 9 + 6
+        # 与 groups=1 的同形状卷积对比，后者是 4 倍（2 组 × 2 输入通道）
+        seq1 = AI.Sequential([AI.Conv2d(4, 6, kernel_size=3, padding=1)])
+        r1 = AI.estimate_flops(seq1, (4, 5, 5))
+        assert r1['by_layer'][0][1] == 6 * 4 * 9 * 25
+
+    def test_depthwise_conv_counts(self):
+        seq = AI.Sequential([AI.Conv2d(3, 3, kernel_size=3, padding=1, groups=3)])
+        r = AI.estimate_flops(seq, (3, 4, 4))
+        assert r['by_layer'][0][1] == 3 * 1 * 9 * 16
+        assert r['params'] == 3 * 1 * 9 + 3
+
+    def test_conv1d_and_transposed_conv(self):
+        c1 = AI.Sequential([AI.Conv1d(2, 3, kernel_size=3, stride=2, padding=1)])
+        r1 = AI.estimate_flops(c1, (2, 10))
+        assert r1['output_shape'] == [3, 5]
+        assert r1['by_layer'][0][1] == 3 * 2 * 3 * 5
+        assert r1['params'] == 3 * 2 * 3 + 3
+
+        ct = AI.Sequential([AI.ConvTranspose2d(2, 4, kernel_size=3, stride=2,
+                                              padding=1, output_padding=1)])
+        r2 = AI.estimate_flops(ct, (2, 3, 3))
+        assert r2['output_shape'] == [4, 6, 6]
+        assert r2['by_layer'][0][1] == 2 * 4 * 9 * 9
+        assert r2['params'] == 2 * 4 * 9 + 4
+
+    def test_pool_norm_droppath_supported(self):
+        ad = AI.Sequential([AI.AdaptiveAvgPool2d((2, 2))])
+        ra = AI.estimate_flops(ad, (3, 4, 4))
+        assert ra['output_shape'] == [3, 2, 2]
+        assert ra['by_layer'][0][1] == 3 * 16
+
+        gn = AI.Sequential([AI.GroupNorm(2, 4)])
+        rg = AI.estimate_flops(gn, (4, 3, 3))
+        assert rg['by_layer'][0][1] == 4 * 36
+        assert rg['params'] == 8
+
+        dp = AI.Sequential([AI.DropPath(0.1)])
+        rdp = AI.estimate_flops(dp, [8])
+        assert rdp['macs'] == 0 and rdp['params'] == 0
+
+    def test_shape_mismatch_raises(self):
+        for m, shp in ((AI.Conv2d(3, 2, 3), (2, 4, 4)),
+                       (AI.Conv1d(3, 2, 3), (2, 8)),
+                       (AI.ConvTranspose2d(3, 2, 3), (2, 4, 4)),
+                       (AI.GroupNorm(2, 4), (3, 4, 4))):
+            with pytest.raises(ValueError):
+                AI.estimate_flops(AI.Sequential([m]), shp)

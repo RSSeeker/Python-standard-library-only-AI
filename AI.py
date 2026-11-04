@@ -5393,10 +5393,13 @@ def _grads_norm(grads):
 def estimate_flops(model, input_shape):
     """估算前向的计算量（纯标准库，不计显存/访存）。
 
-    model:       MLP / Model / Sequential（支持 Layer、Conv2d、MaxPool2d、
-                 AvgPool2d、GlobalAvgPool2d、Flatten、BatchNorm1d、LayerNorm、
-                 Dropout；遇到不认识的模块抛 TypeError，而不是静默给个错数）
-    input_shape: MLP 传 [fan_in]；卷积传 (C, H, W)；BatchNorm1d 也接受 (C, H, W)
+    model:       MLP / Model / Sequential（支持 Layer、Conv1d、Conv2d、
+                 ConvTranspose2d、MaxPool2d、AvgPool2d、GlobalAvgPool2d、
+                 AdaptiveAvgPool2d、Flatten、BatchNorm1d、LayerNorm、GroupNorm、
+                 InstanceNorm、Dropout、DropPath；遇到不认识的模块抛 TypeError，
+                 而不是静默给个错数）
+    input_shape: MLP 传 [fan_in]；二维卷积/池化/归一化传 (C, H, W)；
+                 Conv1d 传 (C, L)；BatchNorm1d 也接受 (C, H, W)
 
     返回 dict：
         {'macs': 乘加次数, 'flops': 2*macs, 'params': 参数量,
@@ -5458,9 +5461,11 @@ def estimate_flops(model, input_shape):
                     f"estimate_flops: 输入 {h}x{w} 经 kernel={m.kernel_size} "
                     f"stride={m.stride} padding={m.padding} 后输出尺寸非正"
                 )
-            step = m.in_channels * m.kh * m.kw * m.out_channels * out_h * out_w
+            # 分组卷积每个输出通道只连 cg = in_channels/groups 个输入通道，
+            # 按 in_channels 计数会把 groups>1 的 MACs/参数量成倍高估
+            step = m.out_channels * m.cg * m.kh * m.kw * out_h * out_w
             shape = [m.out_channels, out_h, out_w]
-            params += m.out_channels * m.in_channels * m.kh * m.kw + m.out_channels
+            params += m.out_channels * m.cg * m.kh * m.kw + m.out_channels
         elif isinstance(m, MaxPool2d):
             if len(shape) != 3:
                 raise ValueError(f"estimate_flops: MaxPool2d 需要 (C, H, W)，收到 {shape}")
@@ -5485,6 +5490,67 @@ def estimate_flops(model, input_shape):
             c, h, w = shape
             step = c * h * w
             shape = [c]
+        elif isinstance(m, Conv1d):
+            if len(shape) != 2:
+                raise ValueError(f"estimate_flops: Conv1d 需要 (C, L)，收到 {shape}")
+            c_in, length = shape
+            if c_in != m.in_channels:
+                raise ValueError(
+                    f"estimate_flops: Conv1d 期望 {m.in_channels} 通道，输入是 {c_in}"
+                )
+            out_l = (length + 2 * m.p - m.k) // m.s + 1
+            if out_l <= 0:
+                raise ValueError(
+                    f"estimate_flops: 输入长度 {length} 经 kernel={m.k} "
+                    f"stride={m.s} padding={m.p} 后输出长度非正"
+                )
+            step = m.out_channels * m.cg * m.k * out_l
+            shape = [m.out_channels, out_l]
+            params += m.out_channels * m.cg * m.k + m.out_channels
+        elif isinstance(m, ConvTranspose2d):
+            if len(shape) != 3:
+                raise ValueError(
+                    f"estimate_flops: ConvTranspose2d 需要 (C, H, W)，收到 {shape}"
+                )
+            c_in, h, w = shape
+            if c_in != m.in_channels:
+                raise ValueError(
+                    f"estimate_flops: ConvTranspose2d 期望 {m.in_channels} 通道，"
+                    f"输入是 {c_in}"
+                )
+            out_h = (h - 1) * m.sh - 2 * m.ph + m.kh + m.oph
+            out_w = (w - 1) * m.sw - 2 * m.pw + m.kw + m.opw
+            if out_h <= 0 or out_w <= 0:
+                raise ValueError(
+                    f"estimate_flops: 输入 {h}x{w} 经转置卷积后输出尺寸非正"
+                )
+            # 每个输入元素对每个 (本组输出通道, 核位置) 贡献一次乘加
+            step = m.in_channels * m.og * m.kh * m.kw * h * w
+            shape = [m.out_channels, out_h, out_w]
+            params += m.in_channels * m.og * m.kh * m.kw + m.out_channels
+        elif isinstance(m, AdaptiveAvgPool2d):
+            if len(shape) != 3:
+                raise ValueError(
+                    f"estimate_flops: AdaptiveAvgPool2d 需要 (C, H, W)，收到 {shape}"
+                )
+            c, h, w = shape
+            oh, ow = m.out_size
+            step = c * h * w          # 每个输入元素恰好参与一次求均
+            shape = [c, oh, ow]
+        elif isinstance(m, (GroupNorm, InstanceNorm)):
+            if len(shape) != 3:
+                raise ValueError(
+                    f"estimate_flops: {name} 需要 (C, H, W)，收到 {shape}"
+                )
+            c, h, w = shape
+            if c != m.channels:
+                raise ValueError(
+                    f"estimate_flops: {name} 期望 {m.channels} 通道，输入是 {c}"
+                )
+            step = 4 * c * h * w      # 均值 + 方差 + 归一化 + 仿射
+            params += 2 * m.channels
+        elif isinstance(m, DropPath):
+            step = 0
         elif isinstance(m, (BatchNorm1d, LayerNorm, Dropout, Flatten)):
             if isinstance(m, Flatten):
                 if len(shape) == 1:
