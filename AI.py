@@ -7,7 +7,7 @@
   - Transformer（MultiHeadAttention / CrossAttention / Encoder / Decoder / PositionalEncoding）
   - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列）
   - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
-  - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d（池化）
+  - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
@@ -718,6 +718,86 @@ class GlobalAvgPool2d:
         C, H, W = self.x_shape
         area = float(H * W)
         return [[[dout[c] / area] * W for _ in range(H)] for c in range(C)]
+
+
+class AdaptiveAvgPool2d:
+    """自适应平均池化：(C, H, W) -> (C, out_h, out_w)，输出尺寸由参数指定。
+
+    分箱规则与 PyTorch 一致：第 oh 个输出格子覆盖输入行区间
+    [floor(oh*H/out_h), ceil((oh+1)*H/out_h))，列同理。所以当 H 不能被 out_h
+    整除时各格大小不同（相邻格会重叠 1 行），每格按自己的实际面积取均值。
+    对任意 H、W 都能把输出固定成 out_size，方便接在任意尺寸的卷积后面。
+
+    `out_size=(1, 1)` 与 `GlobalAvgPool2d` 等价（数值逐位相同）。
+    """
+
+    def __init__(self, out_size):
+        if isinstance(out_size, int):
+            out_size = (out_size, out_size)
+        out_size = tuple(out_size)
+        if len(out_size) != 2:
+            raise ValueError(f"AdaptiveAvgPool2d: out_size 必须是 1 个或 2 个整数，收到 {out_size}")
+        oh, ow = out_size
+        for name, v in (("out_h", oh), ("out_w", ow)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValueError(f"AdaptiveAvgPool2d: {name} 必须是整数，收到 {v!r}")
+            if v <= 0:
+                raise ValueError(f"AdaptiveAvgPool2d: {name} 必须为正，收到 {v}")
+        self.out_size = (oh, ow)
+        self.x_shape = None
+        self._bins = None      # ((rows, cols), ...) 每个输出格子的输入区间
+
+    @staticmethod
+    def _bin_range(size, n_out, i):
+        start = (i * size) // n_out
+        end = -(-((i + 1) * size) // n_out)     # ceil
+        return start, end
+
+    def forward(self, x):
+        """x: (C, H, W) -> (C, out_h, out_w)"""
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("AdaptiveAvgPool2d: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        for c in range(C):
+            if len(x[c]) != H:
+                raise ValueError(f"AdaptiveAvgPool2d: 第 {c} 个通道高度不一致")
+            for row in x[c]:
+                if len(row) != W:
+                    raise ValueError(f"AdaptiveAvgPool2d: 第 {c} 个通道宽度不一致")
+        oh, ow = self.out_size
+        self.x_shape = (C, H, W)
+        row_bins = [self._bin_range(H, oh, i) for i in range(oh)]
+        col_bins = [self._bin_range(W, ow, i) for i in range(ow)]
+        self._bins = (row_bins, col_bins)
+        out = [[[0.0] * ow for _ in range(oh)] for _ in range(C)]
+        for c in range(C):
+            for i, (h0, h1) in enumerate(row_bins):
+                for j, (w0, w1) in enumerate(col_bins):
+                    area = float((h1 - h0) * (w1 - w0))
+                    # 行内用 sum()（CPython 的补偿求和），再对行求和 —— 与
+                    # GlobalAvgPool2d 的 sum(sum(row) for row in x[c]) 完全同序，
+                    # 因此 out_size=(1, 1) 时两者逐位相同
+                    total = sum(sum(x[c][h][w0:w1]) for h in range(h0, h1))
+                    out[c][i][j] = total / area
+        return out
+
+    def backward(self, dout):
+        """dout: (C, out_h, out_w) -> dx: (C, H, W)，每格把梯度按面积均分回输入位置"""
+        if self.x_shape is None or self._bins is None:
+            raise RuntimeError("AdaptiveAvgPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        row_bins, col_bins = self._bins
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for i, (h0, h1) in enumerate(row_bins):
+                for j, (w0, w1) in enumerate(col_bins):
+                    area = float((h1 - h0) * (w1 - w0))
+                    g = dout[c][i][j] / area
+                    for h in range(h0, h1):
+                        row = dx[c][h]
+                        for w in range(w0, w1):
+                            row[w] += g
+        return dx
 
 
 class Flatten:

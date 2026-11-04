@@ -4742,3 +4742,69 @@ class TestPaddedBatch:
         lm.zero_grad()
         b = lm._loss_and_backward([1, 2, 3, 4, 0, 0], [1, 1, 1, 1, 0, 0])
         assert a == b
+
+
+class TestAdaptiveAvgPool2d:
+    """自适应平均池化（任意输出尺寸）"""
+
+    def test_grid_matches_hand_computation(self):
+        """H=3,W=4 → out=(2,3)：不能被整除时按 PyTorch 的分箱规则重叠取窗"""
+        pool = AI.AdaptiveAvgPool2d((2, 3))
+        x = [[[1.0, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]]
+        assert pool.forward(x) == [[[3.5, 4.5, 5.5], [7.5, 8.5, 9.5]]]
+
+    def test_1x1_equals_global_avg_pool(self):
+        """out_size=(1,1) 与 GlobalAvgPool2d 逐位相同（求和顺序一致）"""
+        random.seed(31)
+        for _ in range(10):
+            c, h, w = random.randint(1, 4), random.randint(1, 8), random.randint(1, 8)
+            img = [[[random.uniform(-3, 3) for _ in range(w)] for _ in range(h)] for _ in range(c)]
+            a = AI.AdaptiveAvgPool2d((1, 1)).forward(img)
+            b = AI.GlobalAvgPool2d().forward(img)
+            assert [a[i][0][0] for i in range(c)] == list(b)
+
+    def test_divisible_equals_plain_avg_pool(self):
+        random.seed(32)
+        img = [[[random.uniform(-2, 2) for _ in range(6)] for _ in range(6)] for _ in range(2)]
+        a = AI.AdaptiveAvgPool2d((3, 3)).forward(img)
+        b = AI.AvgPool2d(2).forward(img)
+        for c in range(2):
+            for i in range(3):
+                for j in range(3):
+                    assert abs(a[c][i][j] - b[c][i][j]) <= 1e-15
+
+    def test_backward_numeric(self):
+        """dx 与数值梯度一致（每个格子把 dout/面积均分回自己的输入区间）"""
+        random.seed(33)
+        img = [[[random.uniform(-1, 1) for _ in range(5)] for _ in range(4)] for _ in range(2)]
+        dout = [[[random.uniform(-1, 1) for _ in range(2)] for _ in range(3)] for _ in range(2)]
+        pool = AI.AdaptiveAvgPool2d((3, 2))
+        pool.forward(img)
+        dx = pool.backward(dout)
+
+        flat = [img[c][h][w] for c in range(2) for h in range(4) for w in range(5)]
+
+        def loss_of(values):
+            x = [[[values[(c * 4 + h) * 5 + w] for w in range(5)] for h in range(4)] for c in range(2)]
+            out = pool.forward(x)
+            return sum(out[c][i][j] * dout[c][i][j]
+                       for c in range(2) for i in range(3) for j in range(2))
+
+        worst = 0.0
+        for idx, base in enumerate(flat):
+            eps = 1e-6
+            up = list(flat); up[idx] = base + eps
+            down = list(flat); down[idx] = base - eps
+            num = (loss_of(up) - loss_of(down)) / (2 * eps)
+            ana = dx[idx // 20][(idx % 20) // 5][idx % 5]
+            worst = max(worst, abs(num - ana))
+        assert worst <= 1e-9, f"max|diff|={worst:.3e}"
+
+    def test_size_validation(self):
+        for bad in (0, -1, (0, 2), (2, 0), (True, 3), (2.0, 2), (1, 2, 3)):
+            with pytest.raises(ValueError):
+                AI.AdaptiveAvgPool2d(bad)
+        with pytest.raises(RuntimeError):
+            AI.AdaptiveAvgPool2d((1, 1)).backward([[1.0]])
+        with pytest.raises(ValueError):
+            AI.AdaptiveAvgPool2d((1, 1)).forward([[]])
