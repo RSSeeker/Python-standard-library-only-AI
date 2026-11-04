@@ -4885,3 +4885,137 @@ class TestModelLossMap:
         msg = str(ei.value)
         for name in ("focal", "bce", "huber"):
             assert name in msg
+
+
+class TestGradAccum:
+    """梯度累积（fit 的 grad_accum 参数）"""
+
+    def _data(self, seed=7, n=12):
+        rng = random.Random(seed)
+        xs = [[rng.uniform(-1, 1) for _ in range(3)] for _ in range(n)]
+        ys = [rng.randrange(2) for _ in range(n)]
+        return xs, ys
+
+    def _weights(self, model):
+        return [[row[:] for row in l.weights] for l in model.model.layers]
+
+    def test_grad_accum_one_is_bit_identical(self):
+        xs, ys = self._data()
+        acts = ["leaky_relu", "softmax"]
+        random.seed(31)
+        m1 = AI.Model(AI.MLP([3, 4, 2], activations=acts), loss_fn="ce",
+                      task="classification", lr=0.05)
+        h1 = m1.fit(x=xs, y=ys, epochs=4, batch_size=4, val_split=0.0, verbose=False)
+
+        random.seed(31)
+        m2 = AI.Model(AI.MLP([3, 4, 2], activations=acts), loss_fn="ce",
+                      task="classification", lr=0.05)
+        h2 = m2.fit(x=xs, y=ys, epochs=4, batch_size=4, val_split=0.0, verbose=False,
+                    grad_accum=1)
+
+        w1, w2 = self._weights(m1), self._weights(m2)
+        for a, b in zip(w1, w2):
+            for ra, rb in zip(a, b):
+                assert ra == rb
+        assert [v for _, v in h1["train_loss"]] == [v for _, v in h2["train_loss"]]
+
+    def test_accum_equals_bigger_batch(self):
+        xs, ys = self._data()
+        acts = ["leaky_relu", "softmax"]
+        random.seed(99)
+        m1 = AI.Model(AI.MLP([3, 4, 2], activations=acts), loss_fn="ce",
+                      task="classification", lr=0.05)
+        m1.fit(x=xs, y=ys, epochs=4, batch_size=4, val_split=0.0, verbose=False,
+               shuffle=False)
+
+        random.seed(99)
+        m2 = AI.Model(AI.MLP([3, 4, 2], activations=acts), loss_fn="ce",
+                      task="classification", lr=0.05)
+        m2.fit(x=xs, y=ys, epochs=4, batch_size=2, val_split=0.0, verbose=False,
+               shuffle=False, grad_accum=2)
+
+        w1, w2 = self._weights(m1), self._weights(m2)
+        for a, b in zip(w1, w2):
+            for ra, rb in zip(a, b):
+                for va, vb in zip(ra, rb):
+                    assert abs(va - vb) < 1e-15
+
+    def test_leftover_batches_are_applied(self):
+        xs, ys = self._data(n=9)
+        m = AI.Model(AI.MLP([3, 4, 2], activations=["leaky_relu", "softmax"]),
+                     loss_fn="ce", task="classification", lr=0.05)
+        h = m.fit(x=xs, y=ys, epochs=2, batch_size=3, val_split=0.0, verbose=False,
+                  shuffle=False, grad_accum=2)
+        # 9 个样本 / batch 3 = 3 个 batch；grad_accum=2 -> 每 epoch 2 次更新（2+1）
+        assert len(h["grad_norm"]) == 2
+
+    def test_invalid_grad_accum(self):
+        xs, ys = self._data()
+        m = AI.Model(AI.MLP([3, 4, 2], activations=["leaky_relu", "softmax"]),
+                     loss_fn="ce", task="classification", lr=0.05)
+        for bad in (0, -1, True, 1.5, "2"):
+            with pytest.raises((ValueError, TypeError)):
+                m.fit(x=xs, y=ys, epochs=1, batch_size=4, val_split=0.0,
+                      verbose=False, grad_accum=bad)
+
+
+class TestFlops:
+    def test_mlp(self):
+        r = AI.estimate_flops(AI.MLP([4, 8, 3], activations=["relu", "linear"]), [4])
+        assert r["macs"] == 4 * 8 + 8 * 3
+        assert r["params"] == (4 * 8 + 8) + (8 * 3 + 3)
+        assert r["output_shape"] == [3]
+        assert r["flops"] == 2 * r["macs"]
+
+    def test_cnn_layer_by_layer(self):
+        cnn = AI.Sequential([
+            AI.Conv2d(1, 2, kernel_size=3, stride=1),
+            AI.MaxPool2d(2),
+            AI.Flatten(),
+            AI.Layer(8, 5),
+        ])
+        r = AI.estimate_flops(cnn, (1, 6, 6))
+        conv = 1 * 3 * 3 * 2 * 4 * 4
+        pool = 2 * 2 * 2 * 2 * 2
+        dense = 8 * 5
+        assert r["macs"] == conv + pool + dense
+        assert r["output_shape"] == [5]
+        assert len(r["by_layer"]) == 4
+
+    def test_unknown_module_raises(self):
+        with pytest.raises(TypeError):
+            AI.estimate_flops(AI.Sequential(object()), [3])
+
+
+class TestAugmentation:
+    def test_noise_zero_is_copy(self):
+        x = [1.0, 2.0, 3.0]
+        out = AI.augment_noise(x, sigma=0.0)
+        assert out == x and out is not x
+        assert x == [1.0, 2.0, 3.0]
+
+    def test_noise_batch_and_validation(self):
+        batch = AI.augment_noise([[1.0, 2.0], [3.0, 4.0]], sigma=0.0)
+        assert batch == [[1.0, 2.0], [3.0, 4.0]]
+        with pytest.raises(ValueError):
+            AI.augment_noise([1.0], sigma=-0.1)
+
+    def test_image_flip_keeps_multiset(self):
+        img = [[[float(y * 10 + x) for x in range(4)] for y in range(3)]]
+        out = AI.augment_image(img, flip=True, max_shift=0, rng=random.Random(11))
+        assert len(out) == 1 and len(out[0]) == 3 and len(out[0][0]) == 4
+        assert sorted(v for row in out[0] for v in row) == \
+            sorted(v for row in img[0] for v in row)
+
+    def test_image_shift_pads_zero(self):
+        img = [[[float(y * 10 + x) for x in range(4)] for y in range(3)]]
+        out = AI.augment_image(img, flip=False, max_shift=2, rng=random.Random(4))
+        assert any(v == 0.0 for row in out[0] for v in row)
+
+    def test_mixup(self):
+        mx, soft = AI.mixup([1.0, 2.0], 0, [3.0, 4.0], 2, alpha=0.0)
+        assert mx == [2.0, 3.0]
+        assert abs(sum(soft) - 1.0) < 1e-15
+        assert len(soft) == 3
+        with pytest.raises(ValueError):
+            AI.mixup([1.0], 0.5, [2.0], 1)

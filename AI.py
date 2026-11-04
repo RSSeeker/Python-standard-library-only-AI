@@ -4979,6 +4979,250 @@ class WarmupLR:
 #  Data Utilities
 # ============================================================================
 
+def _grads_norm(grads):
+    """把 [(grad_w, grad_b), ...] 里所有元素的平方和开根号。
+
+    求和顺序沿用 Model.fit 里原来内联的写法（层 → 行 → 列 → 偏置），
+    这样把内联改成函数调用不会改变任何一位。
+    """
+    sq = 0.0
+    for gw_l, gb_l in grads:
+        for row in gw_l:
+            for v in row:
+                sq += v * v
+        for v in gb_l:
+            sq += v * v
+    return math.sqrt(sq)
+
+
+def estimate_flops(model, input_shape):
+    """估算前向的计算量（纯标准库，不计显存/访存）。
+
+    model:       MLP / Model / Sequential（支持 Layer、Conv2d、MaxPool2d、
+                 AvgPool2d、GlobalAvgPool2d、Flatten、BatchNorm1d、LayerNorm、
+                 Dropout；遇到不认识的模块抛 TypeError，而不是静默给个错数）
+    input_shape: MLP 传 [fan_in]；卷积传 (C, H, W)；BatchNorm1d 也接受 (C, H, W)
+
+    返回 dict：
+        {'macs': 乘加次数, 'flops': 2*macs, 'params': 参数量,
+         'output_shape': 输出形状, 'by_layer': [(名字, macs), ...]}
+
+    注意：这是**解析估算**，不是实测。卷积按 im2col 后的稠密矩阵乘法计数，
+    不做 winograd/FFT 之类的算法级优化假设。
+    """
+    if isinstance(model, Model):
+        seq = model.model
+    else:
+        seq = model
+    if isinstance(seq, MLP):
+        layers = list(seq.layers)
+    elif isinstance(seq, Sequential):
+        layers = list(seq.modules)
+        # 允许 Sequential([a, b]) 这种把列表当唯一 module 传进来的写法
+        if len(layers) == 1 and isinstance(layers[0], (list, tuple)):
+            layers = list(layers[0])
+    elif hasattr(seq, 'layers'):
+        layers = list(seq.layers)
+    else:
+        raise TypeError(f"estimate_flops: 不支持的模型类型 {type(seq).__name__}")
+
+    shape = list(input_shape)
+    if not shape:
+        raise ValueError("estimate_flops: input_shape 不能为空")
+    by_layer = []
+    macs = 0
+    params = 0
+
+    def _dense(fan_in, fan_out):
+        return fan_in * fan_out
+
+    for m in layers:
+        name = type(m).__name__
+        if isinstance(m, Layer):
+            fan_in, fan_out = m.fan_in, m.fan_out
+            if len(shape) != 1 or shape[0] != fan_in:
+                raise ValueError(
+                    f"estimate_flops: {fan_in} 输入的 Layer 收到了形状 {shape}"
+                )
+            step = _dense(fan_in, fan_out)
+            shape = [fan_out]
+            params += fan_in * fan_out + fan_out
+        elif isinstance(m, Conv2d):
+            if len(shape) != 3:
+                raise ValueError(f"estimate_flops: Conv2d 需要 (C, H, W)，收到 {shape}")
+            c_in, h, w = shape
+            if c_in != m.in_channels:
+                raise ValueError(
+                    f"estimate_flops: Conv2d 期望 {m.in_channels} 通道，输入是 {c_in}"
+                )
+            pad_h, pad_w = m.padding
+            out_h = (h + 2 * pad_h - m.kh) // m.sh + 1
+            out_w = (w + 2 * pad_w - m.kw) // m.sw + 1
+            if out_h <= 0 or out_w <= 0:
+                raise ValueError(
+                    f"estimate_flops: 输入 {h}x{w} 经 kernel={m.kernel_size} "
+                    f"stride={m.stride} padding={m.padding} 后输出尺寸非正"
+                )
+            step = m.in_channels * m.kh * m.kw * m.out_channels * out_h * out_w
+            shape = [m.out_channels, out_h, out_w]
+            params += m.out_channels * m.in_channels * m.kh * m.kw + m.out_channels
+        elif isinstance(m, MaxPool2d):
+            if len(shape) != 3:
+                raise ValueError(f"estimate_flops: MaxPool2d 需要 (C, H, W)，收到 {shape}")
+            c, h, w = shape
+            out_h = (h - m.kh) // m.sh + 1
+            out_w = (w - m.kw) // m.sw + 1
+            step = c * m.kh * m.kw * out_h * out_w  # 比较次数
+            shape = [c, out_h, out_w]
+        elif isinstance(m, AvgPool2d):
+            if len(shape) != 3:
+                raise ValueError(f"estimate_flops: AvgPool2d 需要 (C, H, W)，收到 {shape}")
+            c, h, w = shape
+            out_h = (h - m.kh) // m.sh + 1
+            out_w = (w - m.kw) // m.sw + 1
+            step = c * out_h * out_w * (m.kh * m.kw)  # 求和 + 除
+            shape = [c, out_h, out_w]
+        elif isinstance(m, GlobalAvgPool2d):
+            if len(shape) != 3:
+                raise ValueError(
+                    f"estimate_flops: GlobalAvgPool2d 需要 (C, H, W)，收到 {shape}"
+                )
+            c, h, w = shape
+            step = c * h * w
+            shape = [c]
+        elif isinstance(m, (BatchNorm1d, LayerNorm, Dropout, Flatten)):
+            if isinstance(m, Flatten):
+                if len(shape) == 1:
+                    step = 0
+                else:
+                    step = 0
+                    shape = [shape[0] * shape[1] * shape[2]] if len(shape) == 3 else shape
+            elif isinstance(m, Dropout):
+                step = 0
+            elif isinstance(m, LayerNorm):
+                step = 2 * shape[0]
+            else:  # BatchNorm1d：均值 + 方差 + 归一化 + 仿射，按 4 次元素操作计
+                n = 1
+                for d in shape:
+                    n *= d
+                step = 4 * max(n, shape[0])
+        else:
+            raise TypeError(
+                f"estimate_flops: 不认识的模块 {name}（不做静默估算，请手动计数）"
+            )
+        macs += step
+        by_layer.append((name, step))
+
+    return {
+        'macs': macs,
+        'flops': 2 * macs,
+        'params': params,
+        'output_shape': list(shape),
+        'by_layer': by_layer,
+    }
+
+
+def augment_noise(x, sigma: float = 0.01, rng=None):
+    """加性高斯噪声（对样本内的每个数独立采样）。
+
+    x:    单个样本（list）或一组样本（list[list]），原样维度返回，不修改入参
+    sigma: 噪声标准差，必须 >= 0（0 表示拷贝一份，逐位相同）
+    """
+    if not isinstance(sigma, (int, float)) or isinstance(sigma, bool) or sigma < 0:
+        raise ValueError(f"augment_noise: sigma 必须是非负数，收到 {sigma!r}")
+    r = random if rng is None else rng
+
+    def _one(vec):
+        if sigma == 0:
+            return [float(v) for v in vec]
+        return [float(v) + r.gauss(0.0, sigma) for v in vec]
+
+    if x and isinstance(x[0], (list, tuple)):
+        return [_one(list(xi)) for xi in x]
+    return _one(list(x))
+
+
+def augment_image(x, flip: bool = True, max_shift: int = 1, rng=None):
+    """图像样本的翻转/平移增强，输入 (C, H, W)，返回同形状的新样本。
+
+    flip:      True 时以 50% 概率左右翻转（逐通道同步）
+    max_shift: 水平/垂直各在 [-max_shift, max_shift] 内随机平移，越界处补 0
+    """
+    if not (isinstance(x, (list, tuple)) and len(x) >= 1 and x[0]
+            and isinstance(x[0][0], (list, tuple))):
+        raise ValueError("augment_image: 需要 (C, H, W) 的图像样本")
+    if not isinstance(max_shift, int) or isinstance(max_shift, bool) or max_shift < 0:
+        raise ValueError(f"augment_image: max_shift 必须是非负整数，收到 {max_shift!r}")
+    r = random if rng is None else rng
+    c, h, w = len(x), len(x[0]), len(x[0][0])
+    for ch in x:
+        if len(ch) != h or any(len(row) != w for row in ch):
+            raise ValueError("augment_image: 各通道的 H/W 必须一致")
+
+    do_flip = flip and r.random() < 0.5
+    dx = r.randint(-max_shift, max_shift) if max_shift else 0
+    dy = r.randint(-max_shift, max_shift) if max_shift else 0
+
+    out = []
+    for ch in x:
+        new_ch = [[0.0] * w for _ in range(h)]
+        for y in range(h):
+            sy = y + dy
+            if not 0 <= sy < h:
+                continue
+            src_row = ch[sy]
+            dst_row = new_ch[y]
+            for xx in range(w):
+                sx = xx + dx
+                if not 0 <= sx < w:
+                    continue
+                v = float(src_row[w - 1 - sx] if do_flip else src_row[sx])
+                dst_row[xx] = v
+        out.append(new_ch)
+    return out
+
+
+def mixup(x1, y1, x2, y2, alpha: float = 0.2, rng=None):
+    """Mixup：返回 (混合后的 x, 混合后的软标签向量)。
+
+    lam ~ Beta(alpha, alpha)（alpha<=0 时取 lam=0.5，即固定中点）；
+    y1/y2 必须是**类别索引**，返回的标签是 lam*y1 + (1-lam)*y2 的概率向量，
+    可直接喂给 cross_entropy_loss 的软标签分支。
+    """
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+        raise ValueError(f"mixup: alpha 必须是数字，收到 {alpha!r}")
+    if not isinstance(y1, int) or isinstance(y1, bool) or not isinstance(y2, int)             or isinstance(y2, bool):
+        raise ValueError("mixup: y1/y2 必须是类别索引")
+    if len(x1) != len(x2):
+        raise ValueError(f"mixup: 两个样本维度不同（{len(x1)} vs {len(x2)}）")
+    n_cls = max(y1, y2) + 1
+    r = random if rng is None else rng
+    if alpha > 0:
+        # Beta(a, a) 用两个 Gamma(a) 采样相除；标准库没有 gamma，用 Marsaglia-Tsang
+        def _gamma(a):
+            if a < 1.0:
+                return _gamma(a + 1.0) * (r.random() ** (1.0 / a))
+            d = a - 1.0 / 3.0
+            c = 1.0 / math.sqrt(9.0 * d)
+            while True:
+                while True:
+                    v = r.gauss(0.0, 1.0)
+                    if v > -1.0 / c:
+                        break
+                u = r.random()
+                x = (1.0 + c * v) ** 3
+                if math.log(u) < 0.5 * v * v + d - d * x + d * math.log(x):
+                    return d * x
+        lam = _gamma(alpha) / (_gamma(alpha) + _gamma(alpha))
+    else:
+        lam = 0.5
+    mixed_x = [lam * float(a) + (1.0 - lam) * float(b) for a, b in zip(x1, x2)]
+    soft = [0.0] * n_cls
+    soft[y1] += lam
+    soft[y2] += 1.0 - lam
+    return mixed_x, soft
+
+
 def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int = 42,
                stratify=None):
     """将数据拆分为 train / val / test
@@ -6756,7 +7000,7 @@ class Model:
             val_split=0.1, val_data=None, patience=50, verbose=True,
             shuffle=True, lr_scheduler=None, grad_clip=None,
             early_stop_metric='val', restore_best_weights=False,
-            checkpoint_path=None, checkpoint_every=1):
+            checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1):
         """
         训练模型。
 
@@ -6779,6 +7023,10 @@ class Model:
                 （早停只在指标变差时停止，**不会自动回滚**；需要最优权重时打开这个开关）
             checkpoint_path: 每 checkpoint_every 轮把权重 + 优化器状态写到该路径
                 （中断后可用 Model.load(path, restore_optimizer=True) 续训）
+            grad_accum:   梯度累积步数（1 = 每个 batch 更新一次）。大于 1 时先累加
+                grad_accum 个 batch 的**平均梯度**，再更新一次；代价是更新次数变少，
+                收益是等效 batch 更大而显存不变。每个 epoch 末尾会把剩余不足
+                grad_accum 的 batch 也更新一次（不会白算）。
         """
         # === 规范化数据 ===
         if data is not None:
@@ -6848,6 +7096,9 @@ class Model:
         if batch_size is None or batch_size <= 0:
             batch_size = len(dataset)
 
+        if not isinstance(grad_accum, int) or isinstance(grad_accum, bool) or grad_accum < 1:
+            raise ValueError(f"fit: grad_accum 必须是 >=1 的整数，收到 {grad_accum!r}")
+
         self.history = {'train_loss': [], 'val_loss': [], 'grad_norm': []}
         best_val_loss = float('inf')
         no_improve = 0
@@ -6858,8 +7109,10 @@ class Model:
                 random.shuffle(dataset)
 
             train_loss = 0.0
-            gn_sum = 0.0   # 本轮各 batch 梯度范数之和（裁剪前）
+            gn_sum = 0.0   # 本轮各次更新的梯度范数之和（裁剪前）
             gn_n = 0
+            pending = None      # grad_accum > 1 时的累加缓冲
+            pending_n = 0
             for b in range(0, len(dataset), batch_size):
                 batch = dataset[b:b + batch_size]
 
@@ -6896,22 +7149,58 @@ class Model:
                     for i in range(len(self.model.layers))
                 ]
 
-                # 记录梯度范数（裁剪前，用来判断训练是否发散/爆炸）
-                sq = 0.0
-                for gw_l, gb_l in avg_grads:
-                    for row in gw_l:
-                        for v in row:
-                            sq += v * v
-                    for v in gb_l:
-                        sq += v * v
-                gn_sum += math.sqrt(sq)
+                if grad_accum == 1:
+                    # 记录梯度范数（裁剪前，用来判断训练是否发散/爆炸）
+                    gn_sum += _grads_norm(avg_grads)
+                    gn_n += 1
+
+                    # 梯度裁剪
+                    if grad_clip is not None:
+                        clip_grad_by_norm(avg_grads, max_norm=grad_clip)
+
+                    self.optimizer.step(avg_grads)
+                else:
+                    # 先累加各 batch 的**平均梯度**（等价于把 batch 拼大，
+                    # 但不需要同时把它们的前向缓存都留在内存里）
+                    if pending is None:
+                        pending = [([row[:] for row in gw], gb[:])
+                                   for gw, gb in avg_grads]
+                    else:
+                        for (pw, pb), (gw, gb) in zip(pending, avg_grads):
+                            for j in range(len(gw)):
+                                pwj, gwj = pw[j], gw[j]
+                                for k in range(len(gwj)):
+                                    pwj[k] += gwj[k]
+                                pb[j] += gb[j]
+                    pending_n += 1
+                    if pending_n >= grad_accum:
+                        merged = [
+                            ([[v / pending_n for v in row] for row in pw],
+                             [v / pending_n for v in pb])
+                            for pw, pb in pending
+                        ]
+                        gn_sum += _grads_norm(merged)
+                        gn_n += 1
+                        if grad_clip is not None:
+                            clip_grad_by_norm(merged, max_norm=grad_clip)
+                        self.optimizer.step(merged)
+                        pending = None
+                        pending_n = 0
+
+            # 收尾：把本 epoch 剩下的不足 grad_accum 个 batch 也更新掉
+            if grad_accum > 1 and pending is not None and pending_n > 0:
+                merged = [
+                    ([[v / pending_n for v in row] for row in pw],
+                     [v / pending_n for v in pb])
+                    for pw, pb in pending
+                ]
+                gn_sum += _grads_norm(merged)
                 gn_n += 1
-
-                # 梯度裁剪
                 if grad_clip is not None:
-                    clip_grad_by_norm(avg_grads, max_norm=grad_clip)
-
-                self.optimizer.step(avg_grads)
+                    clip_grad_by_norm(merged, max_norm=grad_clip)
+                self.optimizer.step(merged)
+                pending = None
+                pending_n = 0
 
             train_loss /= len(dataset)
             self.history['train_loss'].append((epoch, train_loss))
