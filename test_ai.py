@@ -4620,3 +4620,125 @@ class TestBytePairTokenizer:
         assert isinstance(tok.decode(out), str)
         assert lm.param_count() > 0
 
+
+
+class TestPaddedBatch:
+    """批量 padded 训练（pad_mask）"""
+
+    @staticmethod
+    def _lm(seed=11, **kw):
+        random.seed(seed)
+        cfg = dict(vocab_size=7, d_model=16, num_heads=2, d_ff=32,
+                   num_layers=2, max_len=12)
+        cfg.update(kw)
+        return AI.CausalLM(**cfg)
+
+    @staticmethod
+    def _params(model):
+        return {name: p for name, p, _ in model._named_params()}
+
+    @staticmethod
+    def _grads(model):
+        out = {}
+        for name, _, g in model._named_params():
+            rows = g if isinstance(g[0], list) else [g]
+            out[name] = [row[:] for row in rows]
+        return out
+
+    def test_padding_keeps_loss_grads_and_logits(self):
+        """右侧补齐 + pad_mask 后，真实位置的 logits、loss、梯度都逐位不变"""
+        seq = [1, 4, 2, 5, 3]
+        padded = seq + [0, 0, 0]
+        mask = [1] * 5 + [0] * 3
+
+        m1 = self._lm()
+        m1.zero_grad()
+        loss1 = m1._loss_and_backward(seq)
+        g1 = self._grads(m1)
+        lg1 = m1.forward(seq)
+
+        m2 = self._lm()
+        m2.zero_grad()
+        loss2 = m2._loss_and_backward(padded, mask)
+        g2 = self._grads(m2)
+        lg2 = m2.forward(padded, mask)
+
+        assert loss1 == loss2
+        for name in g1:
+            for r1, r2 in zip(g1[name], g2[name]):
+                assert r1 == r2
+        for r1, r2 in zip(lg1, lg2):
+            assert r1 == r2
+
+    def test_mask_validation(self):
+        m = self._lm()
+        padded = [1, 4, 2, 5, 3, 0, 0, 0]
+        with pytest.raises(ValueError):
+            m._loss_and_backward(padded, [1] * 5)              # 长度不符
+        with pytest.raises(ValueError):
+            m._loss_and_backward(padded, [0] * 8)              # 全 0
+        with pytest.raises(ValueError):
+            m._loss_and_backward(padded, [2] * 5 + [0] * 3)    # 非 0/1
+        with pytest.raises(ValueError):
+            m._loss_and_backward([3, 0, 0, 0], [1, 0, 0, 0])   # 没有有效目标
+        with pytest.raises(ValueError):
+            m.forward(padded, [1] * 3)                         # forward 里也校验
+
+    def test_batch_step_equals_manual_weighted_step(self):
+        """batch_size=2 的一步 == 手工按 token 数加权的一步"""
+        seqs = [[1, 4, 2, 5, 3], [2, 3]]
+        width = max(len(s) for s in seqs)
+        n_valid = sum(len(s) - 1 for s in seqs)
+
+        manual = self._lm(31)
+        manual.zero_grad()
+        for s in seqs:
+            pad = width - len(s)
+            manual._loss_and_backward(s + [0] * pad,
+                                      [1] * len(s) + [0] * pad,
+                                      grad_scale=(len(s) - 1) / n_valid)
+        manual.adam_step(0.01)
+
+        batched = self._lm(31)
+        batched.fit(seqs, epochs=1, lr=0.01, shuffle=False, batch_size=2)
+
+        p_manual = self._params(manual)
+        for name, p_batch, _ in batched._named_params():
+            assert p_manual[name] == p_batch
+
+    def test_step_count_and_learning(self):
+        seqs = [[1, 4, 2, 5, 3], [2, 3], [6, 1, 2, 4, 5, 3, 2]]
+        one = self._lm(7)
+        one.fit(seqs, epochs=1, lr=0.01, shuffle=False, batch_size=1)
+        assert one.step_count == len(seqs)
+
+        two = self._lm(7)
+        two.fit(seqs, epochs=1, lr=0.01, shuffle=False, batch_size=2)
+        assert two.step_count == 2
+
+        lm = self._lm(5)
+        before = lm.evaluate(seqs)
+        hist = lm.fit(seqs, epochs=60, lr=0.01, shuffle=True, seed=1, batch_size=3)
+        assert len(hist) == 60
+        assert lm.evaluate(seqs) < before * 0.5
+
+    def test_batch_size_validation(self):
+        seqs = [[1, 2, 3]]
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises(ValueError):
+                self._lm().fit(seqs, epochs=1, batch_size=bad)
+
+    def test_eval_and_generate_still_work(self):
+        lm = self._lm(17, max_len=8)
+        lm.fit([[1, 2, 3, 1, 2, 3]], epochs=5, lr=0.01, shuffle=False, batch_size=1)
+        out = lm.generate([1], max_new_tokens=4, top_k=1)
+        assert len(out) == 5
+        assert isinstance(lm.evaluate([[1, 2, 3]]), float)
+
+        # eval 模式下（dropout 关闭）补齐同样逐位一致
+        lm.eval()
+        lm.zero_grad()
+        a = lm._loss_and_backward([1, 2, 3, 4])
+        lm.zero_grad()
+        b = lm._loss_and_backward([1, 2, 3, 4, 0, 0], [1, 1, 1, 1, 0, 0])
+        assert a == b

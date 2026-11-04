@@ -2030,8 +2030,21 @@ class MultiHeadAttention:
             concat[off:off + d_k] = out
         return [sum(map(_mul, self.W_o[j], concat)) + self.b_o[j] for j in range(d)]
 
-    def forward(self, x_seq):
-        """x_seq: List[List[float]]  (seq_len, d_model)"""
+    def forward(self, x_seq, key_mask=None):
+        """x_seq: List[List[float]]  (seq_len, d_model)
+
+        key_mask: 长度 seq_len 的 0/1 列表，0 表示该位置是填充、不能当 key
+        （分数置 -inf，softmax 后权重恰为 0，反向自动为 0）。
+        None 表示全有效，行为与旧版逐位相同。
+        """
+        if key_mask is not None:
+            if len(key_mask) != len(x_seq):
+                raise ValueError(
+                    f"MultiHeadAttention.forward: key_mask 长度 {len(key_mask)} "
+                    f"与 seq_len={len(x_seq)} 不一致")
+            if not any(key_mask):
+                raise ValueError("MultiHeadAttention.forward: key_mask 至少要有 1 个有效位置")
+        self.key_mask = key_mask
         # 复制一份，避免调用者之后原地修改 x_seq 污染反向传播缓存
         self.x = [list(row) for row in x_seq]
         self.seq_len = len(x_seq)
@@ -2097,6 +2110,14 @@ class MultiHeadAttention:
                     if self.window is not None:
                         # 只看最近 window 个位置：更早的也屏蔽
                         for j in range(max(0, t - self.window + 1)):
+                            row[j] = float("-inf")
+
+            # 填充位置不能当 key：所有 query 行都要屏蔽这些列
+            if key_mask is not None:
+                for t in range(self.seq_len):
+                    row = scores[t]
+                    for j in range(self.seq_len):
+                        if not key_mask[j]:
                             row[j] = float("-inf")
 
             # softmax per row：attn 是「干净」权重，反向的 softmax 雅可比必须用它
@@ -2475,11 +2496,11 @@ class TransformerEncoderLayer:
         res2 = [ln1_out[j] + ffn_out[j] for j in range(d_model)]
         return self.ln2.forward(res2)
 
-    def forward(self, x_seq):
+    def forward(self, x_seq, key_mask=None):
         self.x = x_seq
         d_model = self.self_attn.d_model
         # Self-Attention + Dropout1（逐 token 存储 mask）
-        attn_out = self.self_attn.forward(x_seq)
+        attn_out = self.self_attn.forward(x_seq, key_mask)
         self.dropout1_masks = []
         attn_dropped = []
         for a in attn_out:
@@ -2623,9 +2644,9 @@ class TransformerEncoder:
             x_t = layer.forward_step(x_t, caches[li])
         return x_t
 
-    def forward(self, x_seq):
+    def forward(self, x_seq, key_mask=None):
         for layer in self.layers:
-            x_seq = layer.forward(x_seq)
+            x_seq = layer.forward(x_seq, key_mask)
         return x_seq
 
     def backward(self, dout_seq):
@@ -3300,6 +3321,25 @@ def _lm_load(filepath, restore_optimizer=False):
     return model
 
 
+def _check_pad_mask(mask, length, who):
+    """校验 pad_mask：与序列等长的 0/1 列表，至少一个有效位；返回 bool 列表"""
+    if not isinstance(mask, (list, tuple)):
+        raise ValueError(f"{who}: pad_mask 必须是列表，收到 {type(mask).__name__}")
+    if len(mask) != length:
+        raise ValueError(f"{who}: pad_mask 长度 {len(mask)} 与序列长度 {length} 不一致")
+    out = []
+    for i, m in enumerate(mask):
+        if isinstance(m, bool):
+            out.append(m)
+        elif isinstance(m, int) and m in (0, 1):
+            out.append(bool(m))
+        else:
+            raise ValueError(f"{who}: pad_mask[{i}] 必须是 0 或 1，收到 {m!r}")
+    if not any(out):
+        raise ValueError(f"{who}: pad_mask 至少要有 1 个有效位置")
+    return out
+
+
 class CausalLM:
     """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头
 
@@ -3403,17 +3443,25 @@ class CausalLM:
                    sum(len(r) for r in p)
                    for _, p, _ in self._named_params())
 
-    def forward(self, ids):
-        """ids: List[int] → logits (seq_len, vocab_size)（未经 softmax）"""
+    def forward(self, ids, pad_mask=None):
+        """ids: List[int] → logits (seq_len, vocab_size)（未经 softmax）
+
+        pad_mask: 与 ids 等长的 0/1 列表，0 表示填充位置（不当 key）。
+        填充必须靠右，真实 token 的位置编号才不会被挪动。None 时行为与旧版一致。
+        """
         if not ids:
             raise ValueError("CausalLM.forward: ids 不能为空")
         if len(ids) > self.max_len:
             raise ValueError(
                 f"CausalLM.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}"
             )
+        key_mask = None
+        if pad_mask is not None:
+            valid = _check_pad_mask(pad_mask, len(ids), "CausalLM.forward")
+            key_mask = valid
         emb = self.embedding.forward(ids)
         x = self.pos.forward(emb) if self.use_abs_pos else emb
-        h = self.encoder.forward(x)
+        h = self.encoder.forward(x, key_mask)
         self.h = h
         logits = _matmul(h, _transpose(self.W_out))
         for t in range(len(h)):
@@ -3442,15 +3490,35 @@ class CausalLM:
         return [sum(map(_mul, self.W_out[v], x)) + self.b_out[v]
                 for v in range(self.vocab_size)]
 
-    def _loss_and_backward(self, ids):
-        """单条序列的交叉熵（对预测位置取平均），并累积全部梯度；返回 loss"""
+    def _loss_and_backward(self, ids, pad_mask=None, grad_scale: float = 1.0):
+        """单条序列的交叉熵（对**有效**预测位置取平均），并累积全部梯度；返回 loss
+
+        pad_mask: 与 ids 等长的 0/1 列表，0 表示填充。
+          - 填充位置不当 key（注意力里屏蔽）
+          - loss 只在目标位置有效处计入，除以有效目标数
+          - 梯度额外乘 grad_scale（批量训练时按 token 数加权）
+        pad_mask=None 时与旧版逐位相同。
+        """
         if len(ids) < 2:
             raise ValueError("CausalLM: 序列至少要有 2 个 token 才能训练（输入 + 目标）")
-        n = len(ids) - 1
-        logits = self.forward(ids[:-1])
+        if pad_mask is None:
+            valid = None
+            key_mask = None
+            n = len(ids) - 1
+        else:
+            valid = _check_pad_mask(pad_mask, len(ids), "CausalLM._loss_and_backward")
+            key_mask = valid[:-1]
+            n = sum(valid[1:])
+            if n < 1:
+                raise ValueError(
+                    "CausalLM._loss_and_backward: pad_mask 里没有有效的目标位置（序列至少 2 个真实 token）")
+        logits = self.forward(ids[:-1], key_mask)
         d_logits = []
         loss = 0.0
-        for t in range(n):
+        for t in range(len(ids) - 1):
+            if valid is not None and not valid[t + 1]:
+                d_logits.append([0.0] * self.vocab_size)
+                continue
             probs = _softmax_row(logits[t])
             target = ids[t + 1]
             p = probs[target]
@@ -3459,7 +3527,7 @@ class CausalLM:
             row[target] -= 1.0
             d_logits.append(row)
         loss /= n
-        inv = 1.0 / n
+        inv = grad_scale / n
         d_logits = [[v * inv for v in row] for row in d_logits]
 
         h = self.h
@@ -3503,12 +3571,19 @@ class CausalLM:
             _adam_apply(param, grad, m, v, t, lr)
 
     def fit(self, sequences, epochs: int = 1, lr: float = 3e-3,
-            shuffle: bool = True, seed=None, verbose: bool = False):
+            shuffle: bool = True, seed=None, verbose: bool = False,
+            batch_size: int = 1):
         """在若干条 token 序列上做 teacher-forcing 训练，返回每个 epoch 的平均 loss
 
-        sequences: List[List[int]]，每条至少 2 个 token。
-        每个序列单独一步：前向 → 交叉熵 → 反向 → Adam。
+        sequences: List[List[int]]，每条至少 2 个 token，长度可以不同。
+        batch_size=1（默认）时每个序列单独一步，与旧版逐位相同；
+        batch_size>1 时把一批序列右侧补齐成同一长度、用 pad_mask 屏蔽填充，
+        梯度按 token 数加权、每批一次 Adam。
         """
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise ValueError(f"CausalLM.fit: batch_size 必须是正整数，收到 {batch_size!r}")
+        if batch_size < 1:
+            raise ValueError(f"CausalLM.fit: batch_size 必须 >= 1，收到 {batch_size!r}")
         seqs = [list(s) for s in sequences]
         if not seqs:
             raise ValueError("CausalLM.fit: sequences 不能为空")
@@ -3525,10 +3600,25 @@ class CausalLM:
             if shuffle:
                 rng.shuffle(order)
             total = 0.0
-            for i in order:
-                self.zero_grad()
-                total += self._loss_and_backward(seqs[i])
-                self.adam_step(lr)
+            if batch_size == 1:
+                for i in order:
+                    self.zero_grad()
+                    total += self._loss_and_backward(seqs[i])
+                    self.adam_step(lr)
+            else:
+                for start in range(0, len(order), batch_size):
+                    batch = order[start:start + batch_size]
+                    width = max(len(seqs[i]) for i in batch)
+                    n_valid = sum(len(seqs[i]) - 1 for i in batch)
+                    self.zero_grad()
+                    for i in batch:
+                        s = seqs[i]
+                        pad = width - len(s)
+                        total += self._loss_and_backward(
+                            s + [0] * pad,
+                            [1] * len(s) + [0] * pad,
+                            grad_scale=(len(s) - 1) / n_valid)
+                    self.adam_step(lr)
             avg = total / len(seqs)
             history.append(avg)
             if verbose:
