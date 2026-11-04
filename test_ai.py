@@ -5631,3 +5631,39 @@ class TestFitSeed:
 
         assert run(11) == run(11)
         assert run(11) != run(12)
+
+
+class TestQuickTrainSeed:
+    """quick_train 的 seed 同时管住「权重初始化」与「每轮打乱」"""
+
+    @staticmethod
+    def _xy():
+        X = [[random.Random(i).uniform(-1, 1),
+              random.Random(i + 50).uniform(-1, 1)] for i in range(20)]
+        Y = [0.5 * x[0] - 0.25 * x[1] for x in X]
+        return X, Y
+
+    @staticmethod
+    def _weights(model):
+        return [[[v for v in row] for row in w] for w, _ in model.model.get_parameters()]
+
+    def test_same_seed_reproducible(self):
+        X, Y = self._xy()
+        a = AI.quick_train(X, Y, epochs=10, batch_size=8, verbose=False, seed=42)
+        b = AI.quick_train(X, Y, epochs=10, batch_size=8, verbose=False, seed=42)
+        assert self._weights(a) == self._weights(b)
+        assert [v for _, v in a.history["train_loss"]] ==                [v for _, v in b.history["train_loss"]]
+
+    def test_different_seed_differs(self):
+        X, Y = self._xy()
+        a = AI.quick_train(X, Y, epochs=10, batch_size=8, verbose=False, seed=42)
+        b = AI.quick_train(X, Y, epochs=10, batch_size=8, verbose=False, seed=43)
+        assert self._weights(a) != self._weights(b)
+
+    def test_seed_does_not_advance_global_rng(self):
+        X, Y = self._xy()
+        random.seed(2024)
+        before = [random.random() for _ in range(3)]
+        random.seed(2024)
+        AI.quick_train(X, Y, epochs=3, batch_size=8, verbose=False, seed=7)
+        assert [random.random() for _ in range(3)] == before

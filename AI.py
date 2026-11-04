@@ -8035,13 +8035,17 @@ def make_regressor(input_dim, output_dim=1, hidden_layers=(32,),
 
 def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
                 batch_size=32, lr=0.01, val_split=0.1, patience=30,
-                optimizer='adam', verbose=True):
+                optimizer='adam', verbose=True, seed=None):
     """
     一行代码训练并返回模型。
 
     task='classification' 时 y 可以是整数类别索引（允许非连续，如 [0, 2]），
     也可以是 one-hot / 概率向量——类数按向量长度或 max+1 推断，不会因为
     某个类在本批数据里没出现而少建输出单元。小数标签与负索引会直接报错。
+
+    seed: 传整数时，「权重初始化」与「每轮打乱」都用这个种子，同样的调用
+          再跑一次得到的模型权重与 loss 曲线完全相同；初始化期间会临时设置
+          全局 random 并在结束后恢复，不会推进调用方的随机状态。
 
     用法:
         model = quick_train(x, y, task='classification', epochs=300)
@@ -8084,17 +8088,29 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
                 labels.append(int(fv))
             y = labels
             num_classes = max(y) + 1
-        model = make_classifier(input_dim, num_classes,
-                                hidden_layers=hidden_layers, lr=lr,
-                                optimizer=optimizer)
+        build = lambda: make_classifier(input_dim, num_classes,
+                                        hidden_layers=hidden_layers, lr=lr,
+                                        optimizer=optimizer)
     else:
         output_dim = len(y[0]) if isinstance(y[0], (list, tuple)) else 1
-        model = make_regressor(input_dim, output_dim,
-                               hidden_layers=hidden_layers, lr=lr,
-                               optimizer=optimizer)
+        build = lambda: make_regressor(input_dim, output_dim,
+                                       hidden_layers=hidden_layers, lr=lr,
+                                       optimizer=optimizer)
+
+    # 权重初始化也吃同一个 seed：临时设置全局 random，构造完立刻恢复原状态
+    if seed is not None:
+        _saved_state = random.getstate()
+        try:
+            random.seed(seed)
+            model = build()
+        finally:
+            random.setstate(_saved_state)
+    else:
+        model = build()
 
     model.fit(x, y, epochs=epochs, batch_size=batch_size,
-              val_split=val_split, patience=patience, verbose=verbose)
+              val_split=val_split, patience=patience, verbose=verbose,
+              seed=seed)
     return model
 
 
