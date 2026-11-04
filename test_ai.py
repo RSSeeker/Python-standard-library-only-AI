@@ -3482,7 +3482,8 @@ class TestGradCheck:
                          num_layers=1, max_len=8)
         res = AI.grad_check(lm, [1, 3, 2, 4])
         assert res["ok"]
-        assert len(res["checks"]) == 24
+        # 抽查 24 个标量；其中解析与数值都为 0 的（如 b_k）单列进 zeros
+        assert len(res["checks"]) + len(res["zeros"]) == 24
 
     def test_detects_broken_gradient(self, monkeypatch):
         random.seed(44)
@@ -5667,3 +5668,58 @@ class TestQuickTrainSeed:
         random.seed(2024)
         AI.quick_train(X, Y, epochs=3, batch_size=8, verbose=False, seed=7)
         assert [random.random() for _ in range(3)] == before
+
+
+class TestGradCheckSeq2Seq:
+    """grad_check 支持 Seq2SeqLM，并且不再把模型留在 eval"""
+
+    @staticmethod
+    def _model(seed=11):
+        random.seed(seed)
+        return AI.Seq2SeqLM(6, 7, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=6, dropout=0.0)
+
+    def test_seq2seq_passes(self):
+        s2s = self._model()
+        res = AI.grad_check(s2s, ([1, 2, 3], [4, 5, 2]), tol=1e-5)
+        assert res["ok"], res["worst_name"]
+        assert res["worst_rel"] <= 1e-5
+        assert "zeros" in res
+
+    def test_seq2seq_covers_decoder(self):
+        s2s = self._model()
+        res = AI.grad_check(s2s, ([1, 2, 3], [4, 5, 2]), max_params=40)
+        names = [c["name"] for c in res["checks"]]
+        assert any(n.startswith("out.") for n in names)
+        assert any(".cross." in n for n in names)
+
+    def test_zero_gradient_recognized(self):
+        # b_k 对 softmax 等价于「整行加常数」，真实梯度为 0：
+        # 应该进 zeros 而不是算成相对误差 1.0 误报
+        s2s = self._model()
+        res = AI.grad_check(s2s, ([1, 2, 3], [4, 5, 2]), max_params=60)
+        assert res["ok"], res["worst_name"]
+        assert any(".b_k" in z for z in res["zeros"]) or len(res["zeros"]) > 0
+
+    def test_restores_training_mode(self):
+        s2s = self._model()
+        s2s.train()
+        AI.grad_check(s2s, ([1, 2, 3], [4, 5, 2]))
+        assert s2s.encoder.layers[0].self_attn.training is True
+        s2s.eval()
+        AI.grad_check(s2s, ([1, 2, 3], [4, 5, 2]))
+        assert s2s.encoder.layers[0].self_attn.training is False
+
+    def test_causal_lm_mode_restored(self):
+        random.seed(12)
+        lm = AI.CausalLM(7, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                         max_len=6, dropout=0.2)
+        lm.train()
+        res = AI.grad_check(lm, [0, 1, 2, 3])
+        assert res["ok"], res["worst_name"]
+        assert lm.encoder.layers[0].self_attn.training is True
+
+    def test_requires_pair(self):
+        s2s = self._model()
+        with pytest.raises(TypeError):
+            AI.grad_check(s2s, [1, 2, 3])

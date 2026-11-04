@@ -357,7 +357,7 @@ model.fit(x_train, y_train, epochs=50, verbose=False)
 print(AI.ascii_plot(model.history))
 ```
 
-> `grad_check` 的 `CausalLM` 分支默认抽查 24 个标量参数（整模型逐个差分太慢），
+> `grad_check` 的 `CausalLM` / `Seq2SeqLM` 分支默认抽查 24 个标量参数（整模型逐个差分太慢），
 > 可用 `max_params=` 调整；它已经把「梯度错」和「数值误差」区分开——人为改坏一个
 > 梯度元素时 `worst_rel` 会到 1.0 量级。
 
@@ -493,7 +493,7 @@ m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
 | `k_fold_indices(n, n_splits, shuffle, seed, stratify)` | K 折交叉验证索引 |
 | `StandardScaler` / `MinMaxScaler` | 逐特征标准化 / 归一化（`fit`/`transform`/`inverse_transform`） |
 | `ascii_plot(history)` | 把训练曲线画成终端 ASCII 图 |
-| `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM） |
+| `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
 | `mlp.register_forward_hook(i, fn)` / `register_backward_hook(i, fn)` | 第 i 层前向/反向后的回调（`fn(layer, output)` / `fn(layer, delta, grad_w, grad_b)`）；不注册时只多一次真假判断，`Model` 上同名方法转发给内部的 `MLP` |
 | `estimate_flops(model, input_shape)` | 前向乘加次数（MACs）/ 参数量 / 逐层明细；支持 MLP 与 `Sequential`（`Layer`/`Conv1d`/`Conv2d`（含 `groups`）/`ConvTranspose2d`/各种池化/`BatchNorm1d`/`LayerNorm`/`GroupNorm`/`InstanceNorm`/`Dropout`/`DropPath`/`Flatten`），不认识的模块报 TypeError 而不是静默估算 |
 | `augment_noise(x, sigma=0.01)` | 加性高斯噪声（单样本或一批样本，不改入参） |
@@ -633,7 +633,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-480 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+486 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -654,6 +654,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCache` | KV cache 生成 == 整段重算（含窗口滑动与 RoPE 两种情形）、训练后仍一致、生成不改参数 |
 | `TestFeedForwardActivation` | `FeedForward` 换 GELU/sigmoid 后的 `d_x` vs 数值梯度，`relu` 路径与旧实现逐位一致 |
 | `TestGradCheck` | `grad_check` 对 MLP / Model / CausalLM 都返回 `ok`，且人为改坏梯度时能识别 |
+| `TestGradCheckSeq2Seq` | `Seq2SeqLM` 的 `grad_check` 通过、覆盖解码器与输出层、零梯度（`b_k`）不误报、检查后模式复原 |
 | `TestOptimizerPersistence` | 不传 `optimizer` 时存档与旧格式逐字段相同、Adam 状态往返、**续训与一次训完权重逐位相同**、类型/形状不匹配报错 |
 | `TestWindowMask` | 窗口外权重恰为 0、窗口注意力保持因果性、`forward_step` == 整段前向最后一行（含 RoPE）、**带窗口时 `W_v` 梯度 vs 数值梯度** |
 | `TestTopPSampling` | `top_p=1.0` 与旧行为逐位相同、nucleus 只留头部集合、cache 与重算路径一致、非法 `top_p` 报错 |
@@ -690,6 +691,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 480 个单元测试
+├── test_ai.py       # 486 个单元测试
 └── README.md
 ```

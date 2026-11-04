@@ -7020,16 +7020,24 @@ def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
         grad_check(mlp, x, y)         # MLP，默认 mse_loss
         grad_check(model, x, y)       # Model（MLP 包装），默认用 model 自己的损失
         grad_check(lm, ids)           # CausalLM，用下一个 token 的交叉熵
+        grad_check(s2s, (src, tgt))   # Seq2SeqLM，用 teacher forcing 的交叉熵
 
     eps:        差分步长
     tol:        相对误差阈值
     max_params: 最多抽查多少个标量参数（None = MLP/Model 全查、CausalLM 抽查 24 个）
 
     返回 dict：{'ok': bool, 'worst_name': str, 'worst_rel': float,
-                'checks': [{'name','rel','analytic','numeric'}, ...]}
+                'checks': [{'name','rel','analytic','numeric'}, ...],
+                'zeros': [名字, ...]}
+
+    解析与数值都 < 1e-8 的参数视为「本应为 0」（如 softmax 前的 b_k：
+    给整行加常数不改变输出），只记进 `zeros`、不参与相对误差判断；
+    只有一边接近 0 时仍按相对误差严格比较。
     """
     if isinstance(module, CausalLM):
         return _grad_check_lm(module, x, eps, tol, max_params)
+    if isinstance(module, Seq2SeqLM):
+        return _grad_check_seq2seq(module, x, eps, tol, max_params)
 
     if isinstance(module, MLP):
         forward = module.forward
@@ -7077,6 +7085,7 @@ def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
         leaves = leaves[:int(max_params)]
 
     checks = []
+    zeros = []
     worst_name, worst_rel = "", 0.0
     for name, holder, path, grad_holder, gpath in leaves:
         orig = _pget(holder, path)
@@ -7087,6 +7096,9 @@ def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
         lm_, _ = loss_of(x, y)
         _pset(holder, path, orig)
         num = (lp - lm_) / (2.0 * eps)
+        if abs(ana) < _GRAD_CHECK_ZERO and abs(num) < _GRAD_CHECK_ZERO:
+            zeros.append(name)
+            continue
         rel = abs(ana - num) / max(1e-12, abs(ana) + abs(num))
         checks.append({"name": name, "rel": rel, "analytic": ana, "numeric": num})
         if rel > worst_rel:
@@ -7097,14 +7109,42 @@ def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
         "worst_name": worst_name,
         "worst_rel": worst_rel,
         "checks": checks,
+        "zeros": zeros,
     }
 
 
-def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
-    """CausalLM 的梯度自检：按参数块名抽查（默认 24 个标量）。"""
-    lm.eval()
+# 解析与数值梯度都小于该阈值时视为「本应为 0」，跳过相对误差判断：
+# 例如偏置 b_k 对 softmax 等价于「给整行加常数」，真实梯度恰好为 0，
+# 数值差分只剩 1e-10 级浮点噪声，此时相对误差必然算成 1 而误报。
+_GRAD_CHECK_ZERO = 1e-8
+
+
+def _lm_training_state(lm):
+    """读当前是不是训练模式（取编码器第一层的注意力标志）"""
+    try:
+        return bool(lm.encoder.layers[0].self_attn.training)
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _lm_restore_mode(lm, was_training):
+    """把模型恢复成调用 grad_check 之前的状态（None 表示无法判断，保持不动）"""
+    if was_training is None:
+        return
+    if was_training:
+        lm.train()
+    else:
+        lm.eval()
+
+
+def _grad_check_named(lm, loss_fn, eps: float, tol: float, max_params):
+    """按参数块名抽查数值梯度（CausalLM / Seq2SeqLM 共用）
+
+    loss_fn() 负责「清零梯度 → 前向+反向 → 返回标量 loss」，
+    且必须可重复调用（中心差分要正负各一次）。
+    """
     lm.zero_grad()
-    lm._loss_and_backward(list(ids))
+    loss_fn()
     named = lm._named_params()  # (name, param, grad)
 
     leaves = []
@@ -7120,10 +7160,10 @@ def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
         leaves = rng.sample(leaves, max_params)
 
     def loss_now():
-        lm.zero_grad()
-        return lm._loss_and_backward(list(ids))
+        return loss_fn()
 
     checks = []
+    zeros = []
     worst_name, worst_rel = "", 0.0
     for name, holder, path, grad_holder, gpath in leaves:
         orig = _pget(holder, path)
@@ -7134,6 +7174,9 @@ def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
         lm_ = loss_now()
         _pset(holder, path, orig)
         num = (lp - lm_) / (2.0 * eps)
+        if abs(ana) < _GRAD_CHECK_ZERO and abs(num) < _GRAD_CHECK_ZERO:
+            zeros.append(name)
+            continue
         rel = abs(ana - num) / max(1e-12, abs(ana) + abs(num))
         checks.append({"name": name, "rel": rel, "analytic": ana, "numeric": num})
         if rel > worst_rel:
@@ -7144,7 +7187,42 @@ def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
         "worst_name": worst_name,
         "worst_rel": worst_rel,
         "checks": checks,
+        "zeros": zeros,
     }
+
+
+def _grad_check_lm(lm, ids, eps: float, tol: float, max_params):
+    """CausalLM 的梯度自检：按参数块名抽查（默认 24 个标量）"""
+    was_training = _lm_training_state(lm)
+    lm.eval()  # 关掉 dropout，否则固定 seed 也未必复现
+    try:
+        def loss_fn():
+            lm.zero_grad()
+            return lm._loss_and_backward(list(ids))
+
+        return _grad_check_named(lm, loss_fn, eps, tol, max_params)
+    finally:
+        _lm_restore_mode(lm, was_training)
+
+
+def _grad_check_seq2seq(lm, pair, eps: float, tol: float, max_params):
+    """Seq2SeqLM 的梯度自检：pair 是 (src_ids, tgt_ids)"""
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        raise TypeError(
+            "grad_check: Seq2SeqLM 的 x 必须是 (src_ids, tgt_ids) 二元组，"
+            f"收到 {pair!r}"
+        )
+    src_ids, tgt_ids = pair
+    was_training = _lm_training_state(lm)
+    lm.eval()
+    try:
+        def loss_fn():
+            lm.zero_grad()
+            return lm._loss_and_backward(list(src_ids), list(tgt_ids))
+
+        return _grad_check_named(lm, loss_fn, eps, tol, max_params)
+    finally:
+        _lm_restore_mode(lm, was_training)
 
 
 def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
