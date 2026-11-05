@@ -5487,6 +5487,120 @@ class Sequential:
         return delta
 
 
+
+class LoRA:
+    """低秩适配（LoRA）：冻结原层，只训练两个小矩阵
+
+    ``y = Layer(x) + scaling * B (A x)``，``A`` 形状 (rank, fan_in)、
+    ``B`` 形状 (fan_out, rank)，``scaling = alpha / rank``（alpha 默认 = rank）。
+
+    训练时原层参数被冻结（梯度算出来就丢弃），只更新 A/B；``merge()`` 把
+    ``scaling * B A`` 折进原层权重，之后推理零额外开销。1000×1000 的层用
+    rank=8 只需 16000 个新参数（0.16%）。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 4, alpha: float = None):
+        if not isinstance(layer, Layer):
+            raise TypeError(f"LoRA: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            raise ValueError(f"LoRA: rank 必须是正整数，收到 {rank!r}")
+        self.layer = layer
+        self.rank = rank
+        self.alpha = float(rank if alpha is None else alpha)
+        if self.alpha <= 0.0:
+            raise ValueError(f"LoRA: alpha 必须 > 0，收到 {alpha!r}")
+        self.scaling = self.alpha / rank
+        self.fan_in = layer.fan_in
+        self.fan_out = layer.fan_out
+        std = 1.0 / math.sqrt(self.fan_in)
+        self.A = [[random.gauss(0, std) for _ in range(self.fan_in)]
+                  for _ in range(self.rank)]
+        # B 初始化为 0：训练开始时适配分支输出为 0，原模型行为不变
+        self.B = [[0.0] * self.rank for _ in range(self.fan_out)]
+        self.merged = False
+        self.zero_grad()
+        self.h = self.x = None
+
+    def zero_grad(self):
+        """清零 A/B 的梯度"""
+        self.grad_A = [[0.0] * self.fan_in for _ in range(self.rank)]
+        self.grad_B = [[0.0] * self.rank for _ in range(self.fan_out)]
+
+    def params(self):
+        """返回 [(参数, 梯度)]，可直接喂给上面的优化器"""
+        return [(self.A, self.grad_A), (self.B, self.grad_B)]
+
+    def forward(self, x):
+        base = self.layer.forward(x)
+        if self.merged:
+            return base
+        self.x = x
+        self.h = [sum(map(_mul, row, x)) for row in self.A]        # (rank,)
+        delta = [sum(map(_mul, row, self.h)) for row in self.B]    # (fan_out,)
+        return [base[j] + self.scaling * delta[j] for j in range(self.fan_out)]
+
+    def backward(self, delta_out):
+        """返回 dx（穿过原层与低秩分支）；原层梯度被丢弃（冻结）"""
+        if self.merged:
+            return self.layer.backward(delta_out)[-1]
+        if self.h is None:
+            raise RuntimeError("LoRA.backward: 必须先调用 forward()")
+        dx_base = self.layer.backward(delta_out)[-1]
+        # grad_B += scaling * outer(delta_out, h)
+        for j in range(self.fan_out):
+            g = self.scaling * delta_out[j]
+            row = self.grad_B[j]
+            for r in range(self.rank):
+                row[r] += g * self.h[r]
+        # dh = scaling * B^T delta_out
+        dh = [0.0] * self.rank
+        for r in range(self.rank):
+            acc = 0.0
+            for j in range(self.fan_out):
+                acc += self.B[j][r] * delta_out[j]
+            dh[r] = self.scaling * acc
+        # grad_A += outer(dh, x)
+        for r in range(self.rank):
+            g = dh[r]
+            row = self.grad_A[r]
+            for i in range(self.fan_in):
+                row[i] += g * self.x[i]
+        # dx = dx_base + A^T dh
+        dx = list(dx_base)
+        for i in range(self.fan_in):
+            acc = 0.0
+            for r in range(self.rank):
+                acc += self.A[r][i] * dh[r]
+            dx[i] += acc
+        return dx
+
+    def merge(self):
+        """把 scaling*B@A 折进原层权重，之后 forward 不再走低秩分支"""
+        if self.merged:
+            return self
+        W = self.layer.weights
+        for j in range(self.fan_out):
+            for i in range(self.fan_in):
+                acc = 0.0
+                for r in range(self.rank):
+                    acc += self.B[j][r] * self.A[r][i]
+                W[j][i] += self.scaling * acc
+        for j in range(self.fan_out):
+            for r in range(self.rank):
+                self.B[j][r] = 0.0
+        self.merged = True
+        return self
+
+    def trainable_param_count(self):
+        """可训练参数个数：只算 A/B（原层被冻结）"""
+        return self.rank * self.fan_in + self.fan_out * self.rank
+
+    def total_param_count(self):
+        """包装后的参数总数：原层参数 + 可训练的 A/B"""
+        return self.fan_out * (self.fan_in + 1) + self.trainable_param_count()
+
+
+
 # ============================================================================
 #  Loss Functions
 # ============================================================================
@@ -5977,6 +6091,137 @@ class RMSprop:
                     Wj[i] -= lr * g / (sqrt(s) + eps)
 
 
+
+
+class Lion:
+    """Lion 优化器（EvoLved Sign Momentum，Google 2023）
+
+    只对「动量符号」做更新：``p -= lr * (sign(b1*m + (1-b1)*g) + wd*p)``，
+    动量用 b2 更新。每步只存一份动量（Adam 存两份），显存减半；
+    论文里在同等算力下常能追平 AdamW。
+
+    注意：Lion 对 lr 比 Adam 敏感，通常取 AdamW 的 1/3 ~ 1/10。
+    """
+
+    def __init__(self, model: MLP, lr: float = 1e-4, beta1: float = 0.9,
+                 beta2: float = 0.99, weight_decay: float = 0.0):
+        if not 0.0 <= float(beta1) <= 1.0:
+            raise ValueError(f"Lion: beta1 必须在 [0,1]，收到 {beta1!r}")
+        if not 0.0 <= float(beta2) <= 1.0:
+            raise ValueError(f"Lion: beta2 必须在 [0,1]，收到 {beta2!r}")
+        if float(weight_decay) < 0.0:
+            raise ValueError(f"Lion: weight_decay 必须 >= 0，收到 {weight_decay!r}")
+        self.model = model
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.weight_decay = weight_decay
+        self.step_count = 0
+        self.m_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                    for layer in model.layers]
+        self.m_b = [[0.0] * layer.fan_out for layer in model.layers]
+
+    def step(self, all_grads):
+        """all_grads: List[(grad_w, grad_b)]，与 Adam.step 同签名"""
+        self.step_count += 1
+        lr, b1, b2, wd = self.lr, self.beta1, self.beta2, self.weight_decay
+        for idx, (layer, (grad_w, grad_b)) in enumerate(zip(self.model.layers, all_grads)):
+            mw, mb = self.m_w[idx], self.m_b[idx]
+            W, B = layer.weights, layer.biases
+            for j in range(layer.fan_out):
+                g = grad_b[j]
+                c = b1 * mb[j] + (1.0 - b1) * g
+                upd = (1.0 if c > 0.0 else (-1.0 if c < 0.0 else 0.0)) + wd * B[j]
+                B[j] -= lr * upd
+                mb[j] = b2 * mb[j] + (1.0 - b2) * g
+                gwj, mwj, Wj = grad_w[j], mw[j], W[j]
+                for i in range(layer.fan_in):
+                    g = gwj[i]
+                    c = b1 * mwj[i] + (1.0 - b1) * g
+                    upd = (1.0 if c > 0.0 else (-1.0 if c < 0.0 else 0.0)) + wd * Wj[i]
+                    Wj[i] -= lr * upd
+                    mwj[i] = b2 * mwj[i] + (1.0 - b2) * g
+
+
+class Adafactor:
+    """Adafactor 优化器（Google 2018）：二阶矩「行列因子化」，显存 O(m+n)
+
+    Adam 给每个元素存一份 v；对 (m,n) 权重矩阵，Adafactor 只存
+    行均值 R(m) 与列均值 C(n)，近似 ``v_ij ≈ R_i * C_j / mean(R)``。
+    更新量乘以相对步长 ``max(eps2, rms(g))``（论文的 relative step size），
+    否则梯度很小时几乎不前进。
+
+    没有一阶动量（省一份缓冲）——这是论文的默认配置；
+    ``weight_decay`` 是解耦的（不乘进梯度）。
+    """
+
+    def __init__(self, model: MLP, lr: float = 1e-3, eps: float = 1e-30,
+                 eps2: float = 1e-3, beta2: float = 0.999, weight_decay: float = 0.0):
+        if float(eps) <= 0.0 or float(eps2) <= 0.0:
+            raise ValueError("Adafactor: eps / eps2 必须 > 0")
+        if not 0.0 <= float(beta2) < 1.0:
+            raise ValueError(f"Adafactor: beta2 必须在 [0,1)，收到 {beta2!r}")
+        if float(weight_decay) < 0.0:
+            raise ValueError(f"Adafactor: weight_decay 必须 >= 0，收到 {weight_decay!r}")
+        self.model = model
+        self.lr = lr
+        self.eps = eps
+        self.eps2 = eps2
+        self.beta2 = beta2
+        self.weight_decay = weight_decay
+        self.step_count = 0
+        # R: 每个输出通道一行（对 fan_in 求均值）；C: 每个输入通道一列
+        self.R = [[0.0] * layer.fan_out for layer in model.layers]
+        self.C = [[0.0] * layer.fan_in for layer in model.layers]
+        self.V_b = [[0.0] * layer.fan_out for layer in model.layers]
+
+    def step(self, all_grads):
+        self.step_count += 1
+        t = self.step_count
+        decay = 1.0 - (t ** -0.8)
+        if decay < 0.0:
+            decay = 0.0
+        lr, eps, eps2, wd = self.lr, self.eps, self.eps2, self.weight_decay
+        for idx, (layer, (grad_w, grad_b)) in enumerate(zip(self.model.layers, all_grads)):
+            R, C, Vb = self.R[idx], self.C[idx], self.V_b[idx]
+            W, B = layer.weights, layer.biases
+            fo, fi = layer.fan_out, layer.fan_in
+            om = 1.0 - decay
+            # 1) 行列二阶矩（行均值 / 列均值）
+            sq = 0.0
+            for j in range(fo):
+                row, gwj = R, grad_w[j]
+                acc = 0.0
+                for i in range(fi):
+                    g = gwj[i]
+                    acc += g * g
+                    sq += g * g
+                row[j] = decay * row[j] + om * (acc / fi)
+            for i in range(fi):
+                acc = 0.0
+                for j in range(fo):
+                    g = grad_w[j][i]
+                    acc += g * g
+                C[i] = decay * C[i] + om * (acc / fo)
+            mean_R = sum(R) / fo if fo else 1.0
+            if mean_R <= 0.0:
+                mean_R = 1.0
+            # 相对步长（论文的 relative step size）
+            lr_t = lr * max(eps2, math.sqrt(sq / (fo * fi) if fo * fi else 0.0))
+            # 2) 更新
+            for j in range(fo):
+                gwj, Wj = grad_w[j], W[j]
+                for i in range(fi):
+                    v = R[j] * C[i] / mean_R
+                    # 解耦权重衰减必须用「更新前」的权重：写成单个表达式求值，
+                    # 否则 wd 会作用在已经减过一次的值上（顺序错就多衰减一次）
+                    Wj[i] = (Wj[i] - lr_t * gwj[i] / math.sqrt(v + eps)
+                             - lr * wd * Wj[i])
+                g = grad_b[j]
+                Vb[j] = decay * Vb[j] + om * g * g
+                B[j] = B[j] - lr_t * g / math.sqrt(Vb[j] + eps) - lr * wd * B[j]
+
+
 # ============================================================================
 #  Gradient Clipping / LR Scheduler
 # ============================================================================
@@ -6104,6 +6349,70 @@ class WarmupLR:
         self.optimizer.lr = self.initial_lr
         if self.base_scheduler is not None:
             self.base_scheduler.step(epoch)
+
+
+
+
+class ReduceLROnPlateau:
+    """按验证指标停滞降学习率：``lr *= factor``（PyTorch 同名调度器）
+
+    step(metric)：指标在 ``patience`` 轮内没有改善（相对 ``threshold``）时把
+    lr 乘 ``factor``，降 ``max_reductions`` 次后停在 ``min_lr``。
+    mode='min' 表示指标越小越好（loss），'max' 表示越大越好（accuracy）。
+    """
+
+    def __init__(self, optimizer, factor: float = 0.5, patience: int = 10,
+                 min_lr: float = 0.0, mode: str = "min", threshold: float = 1e-4,
+                 max_reductions: int = None):
+        if not 0.0 < float(factor) < 1.0:
+            raise ValueError(f"ReduceLROnPlateau: factor 必须在 (0,1)，收到 {factor!r}")
+        if mode not in ("min", "max"):
+            raise ValueError(f"ReduceLROnPlateau: mode 只能是 'min' 或 'max'，收到 {mode!r}")
+        if isinstance(patience, bool) or not isinstance(patience, int) or patience < 0:
+            raise ValueError(f"ReduceLROnPlateau: patience 必须是 >=0 的整数，收到 {patience!r}")
+        if float(min_lr) < 0.0:
+            raise ValueError(f"ReduceLROnPlateau: min_lr 必须 >= 0，收到 {min_lr!r}")
+        if max_reductions is not None and (isinstance(max_reductions, bool)
+                                           or not isinstance(max_reductions, int)
+                                           or max_reductions < 0):
+            raise ValueError("ReduceLROnPlateau: max_reductions 必须是 None 或 >=0 的整数")
+        self.optimizer = optimizer
+        self.factor = float(factor)
+        self.patience = int(patience)
+        self.min_lr = float(min_lr)
+        self.mode = mode
+        self.threshold = float(threshold)
+        self.max_reductions = max_reductions
+        self.initial_lr = optimizer.lr
+        self.best = None
+        self.num_bad = 0
+        self.reductions = 0
+
+    def step(self, metric: float):
+        """用这一轮的验证指标调用一次；返回当前 lr"""
+        m = float(metric)
+        if m != m:                      # NaN 指标不参与比较
+            return self.optimizer.lr
+        if self.best is None:
+            self.best = m
+            return self.optimizer.lr
+        if self.mode == "min":
+            better = m < self.best - self.threshold
+        else:
+            better = m > self.best + self.threshold
+        if better:
+            self.best = m
+            self.num_bad = 0
+            return self.optimizer.lr
+        self.num_bad += 1
+        if self.num_bad > self.patience:
+            if self.max_reductions is not None and self.reductions >= self.max_reductions:
+                return self.optimizer.lr
+            self.optimizer.lr = max(self.min_lr, self.optimizer.lr * self.factor)
+            self.num_bad = 0
+            self.reductions += 1
+        return self.optimizer.lr
+
 
 
 # ============================================================================

@@ -6763,3 +6763,271 @@ class TestALiBi:
         te = AI.TransformerEncoder(4, 2, 8, num_layers=1)
         assert te.layers[0].self_attn.alibi is False
 
+
+
+class TestLion:
+    def test_one_step_matches_manual(self):
+        random.seed(5)
+        mlp = AI.MLP([2, 2])
+        opt = AI.Lion(mlp, lr=0.1, beta1=0.9, beta2=0.99, weight_decay=0.1)
+        gw = [[0.5, -0.25], [0.0, 1.0]]
+        gb = [0.3, -0.7]
+        W0 = [row[:] for row in mlp.layers[0].weights]
+        B0 = list(mlp.layers[0].biases)
+        opt.step([(gw, gb)])
+        for j in range(2):
+            m = (1 - 0.9) * gb[j]
+            upd = (1.0 if m > 0 else (-1.0 if m < 0 else 0.0)) + 0.1 * B0[j]
+            assert abs(mlp.layers[0].biases[j] - (B0[j] - 0.1 * upd)) < 1e-15
+            for i in range(2):
+                m = (1 - 0.9) * gw[j][i]
+                upd = (1.0 if m > 0 else (-1.0 if m < 0 else 0.0)) + 0.1 * W0[j][i]
+                assert abs(mlp.layers[0].weights[j][i] - (W0[j][i] - 0.1 * upd)) < 1e-15
+
+    def test_zero_grad_keeps_weights(self):
+        random.seed(6)
+        mlp = AI.MLP([2, 2])
+        opt = AI.Lion(mlp, lr=0.1)
+        W0 = [row[:] for row in mlp.layers[0].weights]
+        opt.step([([[0.0, 0.0], [0.0, 0.0]], [0.0, 0.0])])
+        assert all(mlp.layers[0].weights[j][i] == W0[j][i]
+                   for j in range(2) for i in range(2))
+
+    def test_sign_magnitude(self):
+        """Lion 的更新量大小恒为 lr（符号优化器），与梯度大小无关。"""
+        random.seed(7)
+        mlp = AI.MLP([2, 2])
+        opt = AI.Lion(mlp, lr=0.05)
+        W0 = [row[:] for row in mlp.layers[0].weights]
+        opt.step([([[1e-6, -1e-6], [1e-6, -1e-6]], [1e-6, -1e-6])])
+        for j in range(2):
+            for i in range(2):
+                assert abs(abs(mlp.layers[0].weights[j][i] - W0[j][i]) - 0.05) < 1e-15
+
+    def test_trains(self):
+        # 用线性回归而不是 XOR：Lion 是符号优化器（步长恒为 lr），在 XOR 这种
+        # 有局部极小的任务上不同种子差异很大（实测 0.02~0.42 倍），不适合当收敛判据。
+        # 线性回归无局部极小，三个种子的末/首损失比都 ≤0.005。
+        random.seed(8)
+        mlp = AI.MLP([2, 4, 1])
+        opt = AI.Lion(mlp, lr=0.02)
+        data = [([1.0, 0.0], [2.0]), ([0.0, 1.0], [-3.0]),
+                ([1.0, 1.0], [-1.0]), ([2.0, 3.0], [-5.0])]
+        hist = []
+        for _ in range(200):
+            total = 0.0
+            for x, y in data:
+                pred = mlp.forward(x)
+                loss, grad = AI.mse_loss(pred, y)
+                total += loss
+                opt.step(AI._mlp_backward(mlp, grad))
+            hist.append(total / len(data))
+        assert hist[-1] < 0.05 * hist[0]
+
+
+class TestAdafactor:
+    @staticmethod
+    def _manual(gw, gb, lr, eps, eps2, wd, W0, B0):
+        fo, fi = len(gw), len(gw[0])
+        R = [sum(g * g for g in gw[j]) / fi for j in range(fo)]
+        C = [sum(gw[j][i] ** 2 for j in range(fo)) / fo for i in range(fi)]
+        mean_R = sum(R) / fo
+        sq = sum(g * g for row in gw for g in row)
+        lr_t = lr * max(eps2, math.sqrt(sq / (fo * fi)))
+        W = [[W0[j][i] - lr_t * gw[j][i] / math.sqrt(R[j] * C[i] / mean_R + eps)
+              - lr * wd * W0[j][i] for i in range(fi)] for j in range(fo)]
+        B = [B0[j] - lr_t * gb[j] / math.sqrt(gb[j] * gb[j] + eps) - lr * wd * B0[j]
+             for j in range(fo)]
+        return W, B
+
+    def test_one_step_matches_independent_formula(self):
+        random.seed(8)
+        mlp = AI.MLP([3, 2])
+        opt = AI.Adafactor(mlp, lr=0.1, eps=1e-30, eps2=1e-3, weight_decay=0.01)
+        gw = [[0.3, -0.4, 0.2], [0.1, 0.05, -0.6]]
+        gb = [0.2, -0.3]
+        W0 = [row[:] for row in mlp.layers[0].weights]
+        B0 = list(mlp.layers[0].biases)
+        opt.step([(gw, gb)])
+        W, B = self._manual(gw, gb, 0.1, 1e-30, 1e-3, 0.01, W0, B0)
+        for j in range(2):
+            assert abs(mlp.layers[0].biases[j] - B[j]) < 1e-15
+            for i in range(3):
+                assert abs(mlp.layers[0].weights[j][i] - W[j][i]) < 1e-15
+
+    def test_weight_decay_uses_pre_update_weight(self):
+        """解耦衰减必须作用于更新前的权重（写成两步就会衰减两次）。"""
+        random.seed(9)
+        mlp = AI.MLP([2, 2])
+        opt = AI.Adafactor(mlp, lr=0.1, eps=1e-30, eps2=1e-3, weight_decay=0.5)
+        gw = [[1.0, 0.5], [0.25, -1.0]]
+        gb = [0.5, -0.5]
+        W0 = [row[:] for row in mlp.layers[0].weights]
+        B0 = list(mlp.layers[0].biases)
+        opt.step([(gw, gb)])
+        W, B = self._manual(gw, gb, 0.1, 1e-30, 1e-3, 0.5, W0, B0)
+        for j in range(2):
+            assert abs(mlp.layers[0].biases[j] - B[j]) < 1e-15
+            for i in range(2):
+                assert abs(mlp.layers[0].weights[j][i] - W[j][i]) < 1e-15
+
+    def test_trains(self):
+        # 注意 lr 语义：Adafactor 乘的是「相对步长」rms(g)，所以 lr 比 Adam 小一个量级；
+        # 实测 lr=0.01 时某个种子会发散，0.005 下三个种子的末/首比都 ≤0.012。
+        random.seed(10)
+        mlp = AI.MLP([2, 4, 1])
+        opt = AI.Adafactor(mlp, lr=0.005)
+        data = [([1.0, 0.0], [2.0]), ([0.0, 1.0], [-3.0]),
+                ([1.0, 1.0], [-1.0]), ([2.0, 3.0], [-5.0])]
+        hist = []
+        for _ in range(250):
+            total = 0.0
+            for x, y in data:
+                pred = mlp.forward(x)
+                loss, grad = AI.mse_loss(pred, y)
+                total += loss
+                opt.step(AI._mlp_backward(mlp, grad))
+            hist.append(total / len(data))
+        assert hist[-1] < 0.05 * hist[0]
+
+
+class TestReduceLROnPlateau:
+    def test_reduces_on_plateau(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        sch = AI.ReduceLROnPlateau(base, factor=0.5, patience=2)
+        for _ in range(10):
+            sch.step(1.0)
+        assert abs(base.lr - 0.1 * 0.5 ** sch.reductions) < 1e-12
+        assert sch.reductions >= 1
+
+    def test_no_reduction_while_improving(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        sch = AI.ReduceLROnPlateau(base, factor=0.5, patience=1)
+        for m in (1.0, 0.9, 0.8, 0.7):
+            sch.step(m)
+        assert base.lr == 0.1
+        assert sch.reductions == 0
+
+    def test_min_lr_floor(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        sch = AI.ReduceLROnPlateau(base, factor=0.5, patience=0, min_lr=0.03)
+        for _ in range(5):
+            sch.step(1.0)
+        assert base.lr == 0.03
+
+    def test_mode_max(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        sch = AI.ReduceLROnPlateau(base, factor=0.5, patience=0, mode="max")
+        for _ in range(3):
+            sch.step(0.5)
+        assert base.lr < 0.1
+
+    def test_nan_metric_is_ignored(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        sch = AI.ReduceLROnPlateau(base, factor=0.5, patience=0)
+        for _ in range(3):
+            sch.step(float("nan"))
+        assert base.lr == 0.1
+
+    def test_invalid_args(self):
+        mlp = AI.MLP([2, 2])
+        base = AI.Adam(mlp, lr=0.1)
+        for bad in (dict(factor=1.0), dict(factor=0.0), dict(mode="avg"), dict(patience=-1)):
+            with pytest.raises(ValueError):
+                AI.ReduceLROnPlateau(base, **bad)
+
+
+class TestLoRA:
+    def test_zero_init_matches_base(self):
+        random.seed(20)
+        layer = AI.Layer(4, 3, activation="linear")
+        x = [0.3, -0.7, 1.1, 0.2]
+        base_out = list(layer.forward(x))
+        lora = AI.LoRA(layer, rank=2)
+        out = lora.forward(x)
+        assert out == base_out
+
+    def test_gradients_match_numeric(self):
+        random.seed(21)
+        layer = AI.Layer(4, 3, activation="linear")
+        lora = AI.LoRA(layer, rank=2)
+        lora.B = [[0.3, -0.2], [0.1, 0.4], [-0.5, 0.25]]
+        x = [0.3, -0.7, 1.1, 0.2]
+        delta = [0.5, -0.9, 0.4]
+
+        def loss():
+            out = lora.forward(x)
+            return sum(out[j] * delta[j] for j in range(3))
+
+        lora.zero_grad()
+        lora.forward(x)          # zero_grad 只清梯度，但 backward 依赖 forward 的缓存
+        dx = lora.backward(delta)
+        eps = 1e-6
+        for r in range(2):
+            for i in range(4):
+                old = lora.A[r][i]
+                lora.A[r][i] = old + eps
+                up = loss()
+                lora.A[r][i] = old - eps
+                dn = loss()
+                lora.A[r][i] = old
+                assert abs(lora.grad_A[r][i] - (up - dn) / (2 * eps)) < 1e-6
+        for j in range(3):
+            for r in range(2):
+                old = lora.B[j][r]
+                lora.B[j][r] = old + eps
+                up = loss()
+                lora.B[j][r] = old - eps
+                dn = loss()
+                lora.B[j][r] = old
+                assert abs(lora.grad_B[j][r] - (up - dn) / (2 * eps)) < 1e-6
+        for i in range(4):
+            old = x[i]
+            x[i] = old + eps
+            up = loss()
+            x[i] = old - eps
+            dn = loss()
+            x[i] = old
+            assert abs(dx[i] - (up - dn) / (2 * eps)) < 1e-6
+
+    def test_base_layer_frozen(self):
+        random.seed(22)
+        layer = AI.Layer(3, 2, activation="linear")
+        lora = AI.LoRA(layer, rank=2)
+        W0 = [row[:] for row in layer.weights]
+        B0 = list(layer.biases)
+        lora.forward([0.5, -0.2, 0.9])
+        lora.backward([1.0, -1.0])
+        assert layer.weights == W0
+        assert layer.biases == B0
+
+    def test_merge_preserves_output(self):
+        random.seed(23)
+        layer = AI.Layer(3, 2, activation="linear")
+        lora = AI.LoRA(layer, rank=2)
+        lora.B = [[0.4, -0.1], [-0.3, 0.7]]
+        x = [0.5, -0.2, 0.9]
+        before = list(lora.forward(x))
+        lora.merge()
+        after = list(lora.forward(x))
+        assert max(abs(before[j] - after[j]) for j in range(2)) < 1e-12
+        assert lora.merged
+        assert all(v == 0.0 for row in lora.B for v in row)
+
+    def test_param_counts(self):
+        layer = AI.Layer(4, 3, activation="linear")
+        lora = AI.LoRA(layer, rank=2)
+        assert lora.trainable_param_count() == 2 * 4 + 3 * 2
+        assert lora.total_param_count() == 15 + 14
+
+    def test_invalid_args(self):
+        with pytest.raises(TypeError):
+            AI.LoRA(object())
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises(ValueError):
+                AI.LoRA(AI.Layer(3, 3), rank=bad)

@@ -99,7 +99,7 @@ model2 = Model.load("model.json")
 | `batch_size` | 批次大小（-1 = 全批量） |
 | `val_split` / `val_data` | 验证集比例或自定义验证集（见下方说明） |
 | `patience` | Early Stopping 耐心值（0 = 关闭） |
-| `lr_scheduler` | StepLR / ExponentialLR / CosineAnnealingLR |
+| `lr_scheduler` | StepLR / ExponentialLR / CosineAnnealingLR / ReduceLROnPlateau（后者要传指标：`sched.step(val_loss)`） |
 | `grad_clip` | 梯度范数裁剪阈值 |
 | `checkpoint_path` / `checkpoint_every` | 每 `checkpoint_every` 轮把模型（含优化器状态）存到该路径，用于断点续训 |
 | `grad_accum` | 梯度累积步数（1 = 每个 batch 更新一次）；>1 时累加若干 batch 的平均梯度再更新，等效放大 batch 而不占额外内存 |
@@ -256,8 +256,12 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `MultiHeadAttention(alibi=True)` | ALiBi 线性偏置：第 h 个头加 `slope_h·(t-j)`，`slope_h=2^(-8(h+1)/num_heads)`；无需位置编码即可外推，偏置是常数、反向无额外分支 |
 | `Linear(fan_in, fan_out)` | 无激活全连接层 |
 | `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
+| `LoRA(layer, rank=4, alpha=None)` | 低秩适配：冻结原层，只训 `A (rank, in)` / `B (out, rank)`；`B` 初始为 0（包装后行为不变）；`merge()` 把 `scaling·BA` 折进原层权重 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
+| `Lion(model, lr=1e-4, beta1=0.9, beta2=0.99)` | 符号动量优化器：更新量恒为 `±lr`（+ 解耦 wd），只存一份动量；**lr 通常比 Adam 小一个量级** |
+| `Adafactor(model, lr=1e-3, eps2=1e-3, weight_decay=0.0)` | 行列因子化二阶矩，显存 O(m+n)；乘相对步长 `max(eps2, rms(g))`，所以 lr 语义比 Adam 小一个量级 |
 | `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
+| `ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=0.0, mode='min')` | 指标停滞 `patience+1` 次就把 lr 乘 `factor`（可反复降档，与 PyTorch 一致）；`step()` 要传指标 |
 | `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
 | `MultiHeadAttention(window=N)` | 滑动窗口（Mistral 式局部因果）：只看最近 N 个位置，代价 O(T·window) |
 | `generate(..., top_p=0.9)` | nucleus 采样：按概率累加保留头部集合（与 `top_k` 可叠加；默认 1.0 不过滤） |
@@ -269,6 +273,17 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 
 **RoPE + KV cache**：`CausalLM(..., rope=True)` 会默认关掉绝对位置编码（Llama 的做法），
 想两者同时用可传 `use_abs_pos=True`。
+
+**优化器与 LoRA**：`Lion`（符号动量，`lr` 取 1e-4~1e-3）和 `Adafactor`（行列因子化，显存 O(m+n)）
+都能直接 `opt.step(AI._mlp_backward(model, grad))`；`LoRA` 用来冻结原层只训低秩分支：
+
+```python
+layer = MLP([64, 128]).layers[0]
+lora = LoRA(layer, rank=4)          # B 初始为 0，包装后前向逐位不变
+out = lora.forward(x)               # 与原层同形状
+opt = Adam(lora, lr=1e-3)           # 只更新 A/B（原层被冻结）
+lora.merge()                        # 训练完折回原层权重，推理零额外开销
+```
 
 ```python
 lm = CausalLM(vocab_size=8, d_model=32, num_heads=4, d_ff=64, num_layers=2,
@@ -731,7 +746,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-568 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+587 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -755,6 +770,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCacheMatrix` | KV cache == 整段重算在 7 种组合下都成立（GQA/MQA × RoPE × 滑动窗口 × max_len 8/4），束搜索在这些组合下也确定性 |
 | `TestNewActivations` | SiLU/Mish/ELU/SELU 的前向数值、导数 vs 数值微分、`Layer.backward` 梯度、`FeedForward` 支持这四种激活、非法激活名仍报错 |
 | `TestSwiGLU` | 门控全 0 时退化成 `b2`、六个参数的梯度 vs 数值、`dx` vs 数值、梯度累加语义、参数校验 |
+| `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
+| `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
+| `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
+| `TestLoRA` | B=0 等价原层 / A、B、dx 数值梯度 / 原层冻结 / merge 保输出 / 参数量 / 非法参数 |
 | `TestALiBi` | 输入全 0 时注意力权重等于 `softmax(slope·(t-j))` 的闭式解、因果掩码仍生效、`forward_step` 与 `forward` 末行逐位一致、`W_q` 梯度 vs 数值、`CausalLM(alibi=True)` 端到端训练、默认为关 |
 | `TestFeedForwardActivation` | `FeedForward` 换 GELU/sigmoid 后的 `d_x` vs 数值梯度，`relu` 路径与旧实现逐位一致 |
 | `TestGradCheck` | `grad_check` 对 MLP / Model / CausalLM 都返回 `ok`，且人为改坏梯度时能识别 |
@@ -807,6 +826,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 568 个单元测试
+├── test_ai.py       # 587 个单元测试
 └── README.md
 ```
