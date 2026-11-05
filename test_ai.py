@@ -7630,3 +7630,90 @@ class TestWordPieceTokenizer:
         wp = self._wp()
         ids = [wp.cls_id] + wp.encode("the dog") + [wp.sep_id]
         assert wp.decode(ids) == "the dog"
+
+
+class TestAttentionMaps:
+    @staticmethod
+    def _x(seq=5, d=8, seed=11):
+        rnd = random.Random(seed)
+        return [[rnd.gauss(0, 1) for _ in range(d)] for _ in range(seq)]
+
+    def test_mha_maps(self):
+        random.seed(11)
+        mha = AI.MultiHeadAttention(d_model=8, num_heads=2, causal=True)
+        rep = AI.attention_maps(mha, self._x())
+        assert rep["num_heads"] == 2 and rep["seq_len"] == 5
+        assert all(len(m) == 5 and len(m[0]) == 5 for m in rep["maps"])
+        assert all(abs(sum(row) - 1.0) < 1e-12 for m in rep["maps"] for row in m)
+        # 因果掩码：上三角恰好 0
+        assert all(m[t][j] == 0.0 for m in rep["maps"]
+                   for t in range(5) for j in range(t + 1, 5))
+        assert mha.training is True   # 采样后恢复训练模式
+
+    def test_eval_deterministic(self):
+        mha = AI.MultiHeadAttention(d_model=8, num_heads=2, causal=True)
+        mha.eval()
+        a = AI.attention_maps(mha, self._x())["maps"]
+        b = AI.attention_maps(mha, self._x())["maps"]
+        assert a == b
+        assert mha.training is False
+
+    def test_layer_and_encoder(self):
+        tel = AI.TransformerEncoderLayer(d_model=8, num_heads=2, d_ff=16, dropout=0.3)
+        rep = AI.attention_maps(tel, self._x())
+        assert rep["num_heads"] == 2 and rep["seq_len"] == 5
+        assert tel.self_attn.training is True
+
+        enc = AI.TransformerEncoder(d_model=8, num_heads=2, d_ff=16, num_layers=3, dropout=0.0)
+        all_layers = AI.attention_maps(enc, self._x())
+        assert [l["layer"] for l in all_layers["layers"]] == [0, 1, 2]
+        one = AI.attention_maps(enc, self._x(), layer_index=2)
+        assert len(one["layers"]) == 1 and one["layers"][0]["layer"] == 2
+        with pytest.raises(ValueError):
+            AI.attention_maps(enc, self._x(), layer_index=9)
+        with pytest.raises(TypeError):
+            AI.attention_maps(enc, self._x(), layer_index=True)
+
+    def test_causallm_maps_and_readonly(self):
+        lm = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=8)
+        before = [p[:] if not isinstance(p[0], list) else [r[:] for r in p]
+                  for _, p, _ in lm._named_params()]
+        rep = AI.attention_maps(lm, [1, 2, 3, 4])
+        assert len(rep["layers"]) == 2
+        assert rep["layers"][0]["seq_len"] == 4
+        assert all(m[t][j] == 0.0 for m in rep["layers"][0]["maps"]
+                   for t in range(4) for j in range(t + 1, 4))
+        after = [p for _, p, _ in lm._named_params()]
+        assert before == after                     # 只读
+        assert lm.encoder.layers[0].self_attn.training is True
+
+    def test_ascii(self):
+        random.seed(11)
+        mha = AI.MultiHeadAttention(d_model=8, num_heads=2, causal=True)
+        rep = AI.attention_maps(mha, self._x())
+        art = AI.attention_ascii(rep)
+        lines = art.split("\n")
+        assert "head 0" in lines[0]
+        assert lines[1].strip().startswith("0 |")
+        assert "强度" in lines[-1]
+        assert "head 1" in AI.attention_ascii(rep["maps"], head=1).split("\n")[0]
+        narrow = AI.attention_ascii(rep, max_width=3).split("\n")[1]
+        assert len(narrow) < 20
+
+    def test_invalid(self):
+        random.seed(11)
+        mha = AI.MultiHeadAttention(d_model=8, num_heads=2, causal=True)
+        rep = AI.attention_maps(mha, self._x())
+        with pytest.raises(TypeError):
+            AI.attention_maps(object(), self._x())
+        with pytest.raises(ValueError):
+            AI.attention_ascii(rep, head=5)
+        with pytest.raises(TypeError):
+            AI.attention_ascii(rep, head=True)
+        with pytest.raises(ValueError):
+            AI.attention_ascii([])
+        with pytest.raises(ValueError):
+            AI.attention_ascii({})
+        with pytest.raises(ValueError):
+            AI.attention_ascii(rep, max_width=0)

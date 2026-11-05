@@ -5917,6 +5917,154 @@ class LoRA:
 
 
 
+_ATTN_RAMP = " .:-=+*#%@"
+
+
+def _copy_attn_maps(heads, who):
+    """把 MHA 缓存的每头权重整理成纯 float 的嵌套列表，并做形状自检。"""
+    if heads is None:
+        raise RuntimeError(f"{who}: 没有注意力缓存（先 forward 一次）")
+    if not isinstance(heads, list) or not heads:
+        raise RuntimeError(f"{who}: 注意力缓存为空")
+    out = []
+    seq = None
+    for h, mat in enumerate(heads):
+        if not isinstance(mat, list) or not mat:
+            raise RuntimeError(f"{who}: 第 {h} 头的注意力矩阵为空")
+        cols = len(mat[0])
+        if seq is None:
+            seq = len(mat)
+        if len(mat) != seq or any(len(row) != cols for row in mat):
+            raise RuntimeError(f"{who}: 第 {h} 头的注意力矩阵不是方阵")
+        out.append([[float(v) for v in row] for row in mat])
+    return out, seq
+
+
+def attention_maps(module, x, layer_index=None):
+    """跑一次前向，取回每头注意力权重（只读，不改参数）。
+
+    支持：
+      - `MultiHeadAttention`：返回 `{"num_heads", "seq_len", "maps"}`，
+        其中 `maps[h][t][j]` 是第 h 头里位置 t 对位置 j 的权重（行和 1）。
+      - `TransformerEncoderLayer`：取它的 `self_attn`。
+      - `TransformerEncoder`：返回 `{"layers": [{"layer": i, ...}, ...]}`；
+        给 `layer_index` 时只取那一层。
+      - `CausalLM`：`x` 是 token id 列表，返回编码器各层的图。
+
+    为了不受 dropout 随机遮罩影响，采样期间会把模型切到 eval，结束后恢复原模式。
+    """
+    if layer_index is not None and (isinstance(layer_index, bool)
+                                    or not isinstance(layer_index, int)):
+        raise TypeError("attention_maps: layer_index 必须是 int 或 None")
+
+    def _grab(mha, who):
+        maps, seq = _copy_attn_maps(getattr(mha, "attn_weights", None), who)
+        return {"num_heads": len(maps), "seq_len": seq, "maps": maps}
+
+    if isinstance(module, MultiHeadAttention):
+        was = module.training
+        module.eval()
+        try:
+            module.forward(x)
+        finally:
+            module.train() if was else module.eval()
+        return _grab(module, "attention_maps(MultiHeadAttention)")
+
+    if isinstance(module, TransformerEncoderLayer):
+        was = module.self_attn.training
+        module.eval()
+        try:
+            module.forward(x)
+        finally:
+            module.train() if was else module.eval()
+        return _grab(module.self_attn, "attention_maps(TransformerEncoderLayer)")
+
+    if isinstance(module, TransformerEncoder):
+        was = module.layers[0].self_attn.training
+        module.eval()
+        try:
+            module.forward(x)
+        finally:
+            module.train() if was else module.eval()
+        layers = []
+        for i, layer in enumerate(module.layers):
+            if layer_index is not None and i != layer_index:
+                continue
+            item = _grab(layer.self_attn, f"attention_maps(encoder 第 {i} 层)")
+            item["layer"] = i
+            layers.append(item)
+        if not layers:
+            raise ValueError(
+                f"attention_maps: layer_index={layer_index} 超出范围 [0, {len(module.layers)})")
+        return {"layers": layers}
+
+    if isinstance(module, CausalLM):
+        was = _lm_training_state(module)
+        module.eval()
+        try:
+            module.forward(x)
+        finally:
+            _lm_restore_mode(module, was)
+        layers = []
+        for i, layer in enumerate(module.encoder.layers):
+            if layer_index is not None and i != layer_index:
+                continue
+            item = _grab(layer.self_attn, f"attention_maps(CausalLM 第 {i} 层)")
+            item["layer"] = i
+            layers.append(item)
+        if not layers:
+            raise ValueError(
+                f"attention_maps: layer_index={layer_index} 超出范围 [0, {len(module.encoder.layers)})")
+        return {"layers": layers}
+
+    raise TypeError(
+        "attention_maps: 支持 MultiHeadAttention / TransformerEncoderLayer / "
+        f"TransformerEncoder / CausalLM，收到 {type(module).__name__}")
+
+
+def attention_ascii(maps, head=0, max_width=48):
+    """把一张注意力矩阵画成字符热图（每行归一化到自身最大值）。
+
+    `maps` 可以是 `attention_maps` 的返回值，也可以直接是 `heads` 列表；
+    返回多行字符串，含 0-9 的强度刻度说明。
+    """
+    if isinstance(maps, dict):
+        if "maps" in maps:
+            maps = maps["maps"]
+        elif "layers" in maps:
+            if not maps["layers"]:
+                raise ValueError("attention_ascii: layers 为空")
+            maps = maps["layers"][0]["maps"]
+        else:
+            raise ValueError("attention_ascii: 不认识的结构")
+    if not isinstance(maps, (list, tuple)) or not maps:
+        raise ValueError("attention_ascii: maps 必须是非空列表")
+    if isinstance(head, bool) or not isinstance(head, int):
+        raise TypeError("attention_ascii: head 必须是 int")
+    if head < 0 or head >= len(maps):
+        raise ValueError(f"attention_ascii: head={head} 越界 [0, {len(maps)})")
+    if isinstance(max_width, bool) or not isinstance(max_width, int):
+        raise TypeError("attention_ascii: max_width 必须是 int")
+    if max_width < 1:
+        raise ValueError("attention_ascii: max_width 必须 >= 1")
+
+    mat = maps[head]
+    n = len(mat)
+    step = max(1, (n + max_width - 1) // max_width)
+    rows = [f"head {head}  ({n}x{n}，每 {step} 个位置取一格)"]
+    for t in range(0, n, step):
+        row = mat[t]
+        peak = max(row) if row else 0.0
+        chars = []
+        for j in range(0, n, step):
+            v = row[j] / peak if peak > 0 else 0.0
+            chars.append(_ATTN_RAMP[min(len(_ATTN_RAMP) - 1, int(v * (len(_ATTN_RAMP) - 1) + 0.5))])
+        rows.append(f"{t:>4} |" + "".join(chars) + "|")
+    rows.append("     " + "-" * len(range(0, n, step)))
+    rows.append("     强度：'" + _ATTN_RAMP.strip() + "' = 0 -> 1（每行按自身最大值缩放）")
+    return "\n".join(rows)
+
+
 def profile_model(model, x, backward: bool = False, repeat: int = 3):
     """逐层统计前向（可选反向）耗时，返回 dict
 
