@@ -7031,3 +7031,171 @@ class TestLoRA:
         for bad in (0, -1, True, 1.5):
             with pytest.raises(ValueError):
                 AI.LoRA(AI.Layer(3, 3), rank=bad)
+
+
+class TestTripletLoss:
+    def test_satisfied_margin_has_zero_grad(self):
+        loss, ga, gp, gn = AI.triplet_loss([1.0, 0.0], [0.0, 0.0], [3.0, 4.0], margin=1.0)
+        assert loss == 0.0
+        assert ga == [0.0, 0.0] and gp == [0.0, 0.0] and gn == [0.0, 0.0]
+
+    def test_gradients_match_numeric(self):
+        a, p, n = [1.0, 0.0], [0.0, 0.0], [1.2, 0.0]
+        loss, ga, gp, gn = AI.triplet_loss(a, p, n, margin=1.0)
+        assert loss > 0.0
+
+        def f():
+            return AI.triplet_loss(a, p, n, margin=1.0)[0]
+
+        eps = 1e-6
+        for vec, grad in ((a, ga), (p, gp), (n, gn)):
+            for i in range(len(vec)):
+                old = vec[i]
+                vec[i] = old + eps
+                up = f()
+                vec[i] = old - eps
+                dn = f()
+                vec[i] = old
+                assert abs(grad[i] - (up - dn) / (2 * eps)) < 1e-6
+
+    def test_invalid(self):
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError):
+                AI.triplet_loss([1.0], [0.0], [2.0], margin=bad)
+        with pytest.raises(ValueError):
+            AI.triplet_loss([1.0], [1.0, 2.0], [1.0])
+        with pytest.raises(ValueError):
+            AI.triplet_loss([float("nan")], [0.0], [1.0])
+
+
+class TestInfoNCELoss:
+    @staticmethod
+    def _cos(u, v):
+        un = math.sqrt(sum(x * x for x in u))
+        vn = math.sqrt(sum(x * x for x in v))
+        return sum(x * y for x, y in zip(u, v)) / (un * vn)
+
+    def test_loss_matches_formula(self):
+        a, pos = [1.0, 0.0, 0.0], [0.9, 0.1, 0.0]
+        negs = [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        loss, _, _, _ = AI.info_nce_loss(a, pos, negs, temperature=0.5)
+        sims = [self._cos(a, c) / 0.5 for c in [pos] + negs]
+        z = sum(math.exp(s) for s in sims)
+        assert abs(loss - (-math.log(math.exp(sims[0]) / z))) < 1e-12
+
+    def test_gradients_match_numeric(self):
+        a, pos = [1.0, 0.0, 0.0], [0.9, 0.1, 0.0]
+        negs = [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        loss, ga, gpos, gnegs = AI.info_nce_loss(a, pos, negs, temperature=0.5)
+
+        def f():
+            return AI.info_nce_loss(a, pos, negs, temperature=0.5)[0]
+
+        eps = 1e-6
+        for vec, grad in [(a, ga), (pos, gpos)] + [(negs[k], gnegs[k]) for k in range(2)]:
+            for i in range(len(vec)):
+                old = vec[i]
+                vec[i] = old + eps
+                up = f()
+                vec[i] = old - eps
+                dn = f()
+                vec[i] = old
+                assert abs(grad[i] - (up - dn) / (2 * eps)) < 1e-5
+
+    def test_hard_negative_hurts_more(self):
+        easy = AI.info_nce_loss([1.0, 0.0], [1.0, 0.0], [[0.0, 1.0]], temperature=1.0)[0]
+        hard = AI.info_nce_loss([1.0, 0.0], [1.0, 0.0], [[0.9, 0.1]], temperature=1.0)[0]
+        assert hard > easy
+
+    def test_invalid(self):
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError):
+                AI.info_nce_loss([1.0], [1.0], [[0.0]], temperature=bad)
+        with pytest.raises(ValueError):
+            AI.info_nce_loss([0.0, 0.0], [1.0, 0.0], [[0.0, 1.0]])
+        with pytest.raises(ValueError):
+            AI.info_nce_loss([1.0, 0.0], [1.0, 0.0], [])
+
+
+class TestDiceLoss:
+    def test_loss_matches_formula(self):
+        loss, _ = AI.dice_loss([[0.9, 0.1], [0.8, 0.2]], [[1.0, 0.0], [1.0, 0.0]])
+        num = 2 * (0.9 + 0.8)
+        den = (0.9 + 0.1 + 0.8 + 0.2) + 2.0 + 1e-6
+        assert abs(loss - (1 - num / den)) < 1e-12
+
+    def test_gradient_matches_numeric(self):
+        target = [[1.0, 0.0], [1.0, 0.0]]
+        flat = [0.9, 0.1, 0.8, 0.2]
+        _, grad = AI.dice_loss([flat[0:2], flat[2:4]], target)
+        eps = 1e-6
+        for k in range(4):
+            old = flat[k]
+            flat[k] = old + eps
+            up = AI.dice_loss([flat[0:2], flat[2:4]], target)[0]
+            flat[k] = old - eps
+            dn = AI.dice_loss([flat[0:2], flat[2:4]], target)[0]
+            flat[k] = old
+            ana = grad[k // 2][k % 2]
+            assert abs(ana - (up - dn) / (2 * eps)) < 1e-5
+
+    def test_perfect_prediction(self):
+        assert AI.dice_loss([[1.0, 0.0]], [[1.0, 0.0]])[0] < 1e-5
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.dice_loss([[0.5, 0.5]], [[1.0]])
+
+
+class TestCTCLoss:
+    @staticmethod
+    def _brute(logits, labels, blank):
+        total = 0.0
+        n_cls = len(logits[0])
+        import itertools
+        for path in itertools.product(range(n_cls), repeat=len(logits)):
+            out, prev = [], None
+            for c in path:
+                if c != blank and c != prev:
+                    out.append(c)
+                prev = c
+            if out == labels:
+                p = 1.0
+                for t, c in enumerate(path):
+                    p *= logits[t][c]
+                total += p
+        return -math.log(total)
+
+    def test_loss_matches_bruteforce(self):
+        logits = [[0.2, 0.6, 0.2], [0.5, 0.3, 0.2], [0.1, 0.8, 0.1]]
+        lp = [[math.log(p) for p in row] for row in logits]
+        loss, grad = AI.ctc_loss(lp, [1], blank=0)
+        assert abs(loss - self._brute(logits, [1], 0)) < 1e-12
+        assert len(grad) == 3 and len(grad[0]) == 3
+
+    def test_gradient_matches_numeric(self):
+        logits = [[0.2, 0.6, 0.2], [0.5, 0.3, 0.2], [0.1, 0.8, 0.1]]
+        lp = [[math.log(p) for p in row] for row in logits]
+        _, grad = AI.ctc_loss(lp, [1], blank=0)
+        flat = [v for row in lp for v in row]
+        eps = 1e-7
+        for k in range(9):
+            old = flat[k]
+            flat[k] = old + eps
+            up = AI.ctc_loss([flat[0:3], flat[3:6], flat[6:9]], [1], blank=0)[0]
+            flat[k] = old - eps
+            dn = AI.ctc_loss([flat[0:3], flat[3:6], flat[6:9]], [1], blank=0)[0]
+            flat[k] = old
+            ana = grad[k // 3][k % 3]
+            assert abs(ana - (up - dn) / (2 * eps)) < 1e-5
+
+    def test_unreachable_and_invalid(self):
+        lp = [[math.log(0.5), math.log(0.5)]]
+        with pytest.raises(ValueError):
+            AI.ctc_loss(lp, [1, 1], blank=0)
+        with pytest.raises(ValueError):
+            AI.ctc_loss([[math.log(0.5), math.log(0.5)]], [0], blank=0)
+        with pytest.raises(ValueError):
+            AI.ctc_loss([[math.log(0.5), math.log(0.5)]], [5], blank=0)
+        with pytest.raises(TypeError):
+            AI.ctc_loss([[math.log(0.5), math.log(0.5)]], [1.5], blank=0)

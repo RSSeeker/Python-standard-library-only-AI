@@ -5888,6 +5888,271 @@ def kl_divergence(pred, target, eps: float = 1e-12):
     return loss, grad
 
 
+def _loss_vector(v, name, who):
+    """校验一维数字序列（拒绝 bool / NaN / Inf / 空）"""
+    if not isinstance(v, (list, tuple)):
+        raise TypeError(f"{who}: {name} 必须是序列，收到 {type(v).__name__}")
+    out = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            raise TypeError(f"{who}: {name} 只能含数字，收到 {x!r}")
+        x = float(x)
+        if x != x or x in (float("inf"), float("-inf")):
+            raise ValueError(f"{who}: {name} 不能含 NaN/Inf")
+        out.append(x)
+    if not out:
+        raise ValueError(f"{who}: {name} 不能为空")
+    return out
+
+
+def _loss_norm(x):
+    return math.sqrt(sum(v * v for v in x))
+
+
+def triplet_loss(anchor, positive, negative, margin: float = 1.0):
+    """Triplet 损失：max(0, d(a,p) - d(a,n) + margin)，d 为欧氏距离
+
+    返回 (loss, d_anchor, d_positive, d_negative)，三个梯度都相对输入向量。
+    margin 必须 > 0：等于 0 时正负样本距离相等就没有梯度，等于静默失效。
+    已满足间隔时 loss 为 0、三个梯度全 0。
+    """
+    who = "triplet_loss"
+    a = _loss_vector(anchor, "anchor", who)
+    p = _loss_vector(positive, "positive", who)
+    n = _loss_vector(negative, "negative", who)
+    if not (len(a) == len(p) == len(n)):
+        raise ValueError(f"{who}: 三个向量长度必须相同，收到 {len(a)}/{len(p)}/{len(n)}")
+    margin = float(margin)
+    if margin <= 0.0:
+        raise ValueError(f"{who}: margin 必须 > 0，收到 {margin!r}")
+
+    dap = _loss_norm([a[i] - p[i] for i in range(len(a))])
+    dan = _loss_norm([a[i] - n[i] for i in range(len(a))])
+    loss = dap - dan + margin
+    if loss <= 0.0:
+        zeros = [0.0] * len(a)
+        return 0.0, list(zeros), list(zeros), list(zeros)
+
+    d_anchor = [0.0] * len(a)
+    d_positive = [0.0] * len(a)
+    d_negative = [0.0] * len(a)
+    for i in range(len(a)):
+        d_anchor[i] = (a[i] - p[i]) / dap - (a[i] - n[i]) / dan
+        d_positive[i] = -(a[i] - p[i]) / dap
+        d_negative[i] = (a[i] - n[i]) / dan
+    return loss, d_anchor, d_positive, d_negative
+
+
+def info_nce_loss(anchor, positive, negatives, temperature: float = 0.07):
+    """InfoNCE 对比损失：正样本 1 个 + 负样本若干
+
+    相似度用归一化点积（余弦），loss = -log( exp(s_pos/τ) / Σ_j exp(s_j/τ) )，
+    j 遍历 [positive] + negatives。
+    返回 (loss, d_anchor, d_positive, d_negatives)。
+    """
+    who = "info_nce_loss"
+    a = _loss_vector(anchor, "anchor", who)
+    if not isinstance(negatives, (list, tuple)) or not negatives:
+        raise ValueError(f"{who}: negatives 必须是非空序列")
+    cands = [_loss_vector(positive, "positive", who)]
+    for k, neg in enumerate(negatives):
+        cands.append(_loss_vector(neg, f"negatives[{k}]", who))
+    for k, c in enumerate(cands):
+        if len(c) != len(a):
+            raise ValueError(f"{who}: 第 {k} 个候选长度 {len(c)} != anchor 长度 {len(a)}")
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"{who}: temperature 必须 > 0，收到 {temperature!r}")
+
+    a_norm = _loss_norm(a)
+    if a_norm == 0.0:
+        raise ValueError(f"{who}: anchor 不能是零向量")
+    c_norms = [_loss_norm(c) for c in cands]
+    for k, cw in enumerate(c_norms):
+        if cw == 0.0:
+            raise ValueError(f"{who}: 第 {k} 个候选不能是零向量")
+
+    sims = [sum(map(_mul, a, c)) / (a_norm * c_norms[k]) / temperature
+            for k, c in enumerate(cands)]
+    mx = max(sims)
+    exps = [math.exp(v - mx) for v in sims]
+    total = sum(exps)
+    loss = -(sims[0] - mx - math.log(total))
+
+    probs = [e / total for e in exps]
+    d_anchor = [0.0] * len(a)
+    d_cands = [[0.0] * len(c) for c in cands]
+    for j, c in enumerate(cands):
+        coeff = probs[j] - (1.0 if j == 0 else 0.0)
+        if coeff == 0.0:
+            continue
+        inv_t = 1.0 / temperature
+        for i in range(len(a)):
+            d_anchor[i] += coeff * (inv_t * c[i] / (a_norm * c_norms[j])
+                                    - sims[j] * a[i] / (a_norm * a_norm))
+        for i in range(len(c)):
+            d_cands[j][i] += coeff * (inv_t * a[i] / (a_norm * c_norms[j])
+                                      - sims[j] * c[i] / (c_norms[j] ** 2))
+    d_pos = d_cands[0]
+    d_negs = d_cands[1:]
+    return loss, d_anchor, d_pos, d_negs
+
+
+def _loss_flatten(x, who):
+    """把嵌套 list 摊平，返回 (flat, shape)；顺带校验形状一致与数值有限"""
+    shape = []
+    cur = x
+    while isinstance(cur, (list, tuple)):
+        shape.append(len(cur))
+        if not cur:
+            break
+        cur = cur[0]
+    flat = []
+
+    def walk(v, depth):
+        if depth == len(shape):
+            if isinstance(v, (list, tuple)):
+                raise ValueError(f"{who}: 嵌套层数不一致")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError(f"{who}: 只能含数字，收到 {v!r}")
+            v = float(v)
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 不能含 NaN/Inf")
+            flat.append(v)
+            return
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(f"{who}: 嵌套层数不一致")
+        if len(v) != shape[depth]:
+            raise ValueError(f"{who}: 第 {depth} 维长度不一致（{len(v)} != {shape[depth]}）")
+        for item in v:
+            walk(item, depth + 1)
+
+    walk(x, 0)
+    return flat, tuple(shape)
+
+
+def _loss_unflatten(flat, shape):
+    if not shape:
+        return flat[0]
+    if len(shape) == 1:
+        return list(flat)
+    step = len(flat) // shape[0]
+    return [_loss_unflatten(flat[i * step:(i + 1) * step], shape[1:]) for i in range(shape[0])]
+
+
+def dice_loss(pred, target, eps: float = 1e-6):
+    """Dice 损失（分割）：1 - (2|p∩t| + eps') / (|p| + |t| + eps')
+
+    pred 是概率（0~1），target 是 0/1 掩码，形状需一致（(C,H,W) 或扁平列表均可）。
+    返回 (loss, grad)，grad 相对 pred。全局 Dice（不是逐类平均）。
+    """
+    who = "dice_loss"
+    flat_p, shape_p = _loss_flatten(pred, who)
+    flat_t, shape_t = _loss_flatten(target, who)
+    if shape_p != shape_t:
+        raise ValueError(f"{who}: pred 形状 {shape_p} 与 target 形状 {shape_t} 不一致")
+    if not flat_p:
+        raise ValueError(f"{who}: 输入不能为空")
+    eps = float(eps)
+    if eps <= 0.0:
+        raise ValueError(f"{who}: eps 必须 > 0，收到 {eps!r}")
+
+    num = 2.0 * sum(p * t for p, t in zip(flat_p, flat_t))
+    den = sum(flat_p) + sum(flat_t) + eps
+    loss = 1.0 - num / den
+    grad_flat = [-2.0 * t / den + num / (den * den) for t in flat_t]
+    return loss, _loss_unflatten(grad_flat, shape_p)
+
+
+def ctc_loss(log_probs, targets, blank: int = 0):
+    """CTC 损失（单样本，log 空间前向后向）
+
+    log_probs: (T, K) 的 log 概率（softmax 之后取 log）
+    targets: 目标标签序列（不含 blank）
+    返回 (loss, grad)，grad 相对 log_probs，形状 (T, K)。
+
+    用 log-sum-exp 累加，长序列不会下溢；不可达的标签序列直接报错。
+    """
+    who = "ctc_loss"
+    flat_lp, shape = _loss_flatten(log_probs, who)
+    if len(shape) != 2:
+        raise ValueError(f"{who}: log_probs 必须是 (T, K) 二维结构，收到形状 {shape}")
+    T, K = shape
+    if T <= 0 or K <= 0:
+        raise ValueError(f"{who}: log_probs 不能有空维度（{T}×{K}）")
+    if isinstance(blank, bool) or not isinstance(blank, int) or not 0 <= blank < K:
+        raise ValueError(f"{who}: blank 必须是 [0, {K}) 的整数，收到 {blank!r}")
+    if isinstance(targets, (int, float, str)) or not isinstance(targets, (list, tuple)):
+        raise TypeError(f"{who}: targets 必须是序列，收到 {type(targets).__name__}")
+    labels = []
+    for t in targets:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise TypeError(f"{who}: targets 只能含整数，收到 {t!r}")
+        if not 0 <= t < K:
+            raise ValueError(f"{who}: targets 含越界标签 {t}（词表大小 {K}）")
+        if t == blank:
+            raise ValueError(f"{who}: targets 不能包含 blank={blank}（与空符号冲突）")
+        labels.append(t)
+    if not labels:
+        raise ValueError(f"{who}: targets 不能为空")
+
+    lp = [flat_lp[t * K:(t + 1) * K] for t in range(T)]
+    L = len(labels)
+    S = 2 * L + 1
+    ext = [blank if s % 2 == 0 else labels[s // 2] for s in range(S)]
+    NEG = float("-inf")
+
+    def lse(vals):
+        m = max(vals)
+        if m == NEG:
+            return NEG
+        return m + math.log(sum(math.exp(v - m) for v in vals))
+
+    alpha = [[NEG] * S for _ in range(T)]
+    alpha[0][0] = lp[0][ext[0]]
+    if S > 1:
+        alpha[0][1] = lp[0][ext[1]]
+    for t in range(1, T):
+        for s in range(S):
+            prev = [alpha[t - 1][s]]
+            if s >= 1:
+                prev.append(alpha[t - 1][s - 1])
+            if s >= 2 and ext[s] != blank and ext[s] != ext[s - 2]:
+                prev.append(alpha[t - 1][s - 2])
+            base = lse(prev)
+            alpha[t][s] = base + lp[t][ext[s]] if base != NEG else NEG
+
+    beta = [[NEG] * S for _ in range(T)]
+    beta[T - 1][S - 1] = lp[T - 1][ext[S - 1]]
+    if S > 1:
+        beta[T - 1][S - 2] = lp[T - 1][ext[S - 2]]
+    for t in range(T - 2, -1, -1):
+        for s in range(S):
+            nxt = [beta[t + 1][s]]
+            if s + 1 < S:
+                nxt.append(beta[t + 1][s + 1])
+            if s + 2 < S and ext[s + 2] != blank and ext[s + 2] != ext[s]:
+                nxt.append(beta[t + 1][s + 2])
+            base = lse(nxt)
+            beta[t][s] = base + lp[t][ext[s]] if base != NEG else NEG
+
+    ends = [alpha[T - 1][S - 1]]
+    if S > 1:
+        ends.append(alpha[T - 1][S - 2])
+    log_p = lse(ends)
+    if log_p == NEG:
+        raise ValueError(f"{who}: 该标签序列在给定长度下不可达（T={T}, 标签 {L} 个）")
+
+    grad = [[0.0] * K for _ in range(T)]
+    for t in range(T):
+        for s in range(S):
+            a_t, b_t = alpha[t][s], beta[t][s]
+            if a_t == NEG or b_t == NEG:
+                continue
+            grad[t][ext[s]] -= math.exp(a_t + b_t - log_p - lp[t][ext[s]])
+    return -log_p, grad
+
+
 # ============================================================================
 #  Optimizer: Adam
 # ============================================================================

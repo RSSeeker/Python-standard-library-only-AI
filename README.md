@@ -503,6 +503,10 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `bce_with_logits_loss(logits, target)` | 数值稳定的 BCE：`max(z,0) - z·y + log1p(exp(-|z|))`，直接吃 logits |
 | `huber_loss(pred, target, delta=1.0)` | Huber / Smooth L1，对离群点比 MSE 稳 |
 | `kl_divergence(pred, target)` | `KL(target ‖ pred) = Σ t·log(t/p)`，蒸馏/软目标常用 |
+| `triplet_loss(anchor, pos, neg, margin=1.0)` | `max(0, d(a,p) − d(a,n) + margin)`（欧氏距离），返回三个梯度；已满足间隔时梯度全 0 |
+| `info_nce_loss(anchor, pos, negs, temperature=0.07)` | 对比学习：余弦相似度 + 交叉熵，1 正 + N 负；返回 anchor / 正 / 每个负的梯度 |
+| `dice_loss(pred, target)` | 分割常用 `1 − (2|p∩t|+ε)/(|p|+|t|+ε)`，支持 `(C,H,W)` 或扁平结构 |
+| `ctc_loss(log_probs, targets, blank=0)` | CTC（单样本、log 空间前向后向）：输入 `(T,K)` 的 log 概率，返回对 log 概率的梯度 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
 |------|------|------|
@@ -746,7 +750,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-587 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+601 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -770,6 +774,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCacheMatrix` | KV cache == 整段重算在 7 种组合下都成立（GQA/MQA × RoPE × 滑动窗口 × max_len 8/4），束搜索在这些组合下也确定性 |
 | `TestNewActivations` | SiLU/Mish/ELU/SELU 的前向数值、导数 vs 数值微分、`Layer.backward` 梯度、`FeedForward` 支持这四种激活、非法激活名仍报错 |
 | `TestSwiGLU` | 门控全 0 时退化成 `b2`、六个参数的梯度 vs 数值、`dx` vs 数值、梯度累加语义、参数校验 |
+| `TestTripletLoss` | 满足间隔 ⇒ 零梯度 / 三个梯度 vs 数值 / 非法 margin 与长度 |
+| `TestInfoNCELoss` | loss 与闭式公式一致 / 四个梯度 vs 数值 / 难负样本 loss 更大 / 非法参数 |
+| `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
+| `TestCTCLoss` | loss 与穷举所有对齐路径一致 / 梯度 vs 数值 / 不可达与非法标签 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -826,6 +834,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 587 个单元测试
+├── test_ai.py       # 601 个单元测试
 └── README.md
 ```
