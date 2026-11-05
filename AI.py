@@ -2,12 +2,12 @@
 ================================================================================
   全栈神经网络工具箱（纯 Python 标准库实现，零第三方依赖）
   - Layer / MLP（全连接层 + 激活函数）
-  - Conv2d（含 groups 分组/深度卷积）/ Conv1d / ConvTranspose2d / MaxPool2d（卷积与池化）
+  - Conv2d（含 groups 分组/深度卷积、dilation 空洞卷积）/ Conv1d / ConvTranspose2d / MaxPool2d（卷积与池化）
   - RNN / LSTM / GRU（循环神经网络家族，含完整 BPTT）
   - Transformer（MultiHeadAttention 支持 causal / RoPE / 滑动窗口 / GQA / 注意力 dropout / KV cache，
     另有 CrossAttention / Encoder / Decoder / PositionalEncoding）
   - CausalLM（因果语言模型）/ Seq2SeqLM（编码器-解码器序列到序列），都支持 padded 批量训练
-  - Dropout / DropPath / BatchNorm1d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
+  - Dropout / DropPath / BatchNorm1d / BatchNorm2d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
@@ -422,7 +422,8 @@ class Conv2d:
     """2D 卷积层 (im2col 实现, 纯 Python 列表)"""
 
     def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size, stride=1, padding=0, groups: int = 1):
+                 kernel_size, stride=1, padding=0, groups: int = 1,
+                 dilation=1):
         if not isinstance(groups, int) or isinstance(groups, bool) or groups < 1:
             raise ValueError(f"Conv2d: groups 必须是 >=1 的整数，收到 {groups!r}")
         if in_channels % groups != 0:
@@ -442,6 +443,8 @@ class Conv2d:
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         self.stride = (stride, stride) if isinstance(stride, int) else stride
         self.padding = (padding, padding) if isinstance(padding, int) else padding
+        self.dilation = ((dilation, dilation) if isinstance(dilation, int)
+                         else tuple(dilation))
         self.kh, self.kw = self.kernel_size
         self.sh, self.sw = self.stride
         if self.kh <= 0 or self.kw <= 0:
@@ -450,7 +453,13 @@ class Conv2d:
             raise ValueError(f"Conv2d: stride 必须为正，收到 {self.stride}")
         if min(self.padding) < 0:
             raise ValueError(f"Conv2d: padding 不能为负，收到 {self.padding}")
+        if len(self.dilation) != 2 or min(self.dilation) <= 0:
+            raise ValueError(f"Conv2d: dilation 必须是正数（或二元组），收到 {dilation!r}")
         self.ph, self.pw = self.padding
+        self.dh, self.dw = self.dilation
+        # 空洞卷积的等效感受野：(k-1)*d + 1
+        self.kh_eff = (self.kh - 1) * self.dh + 1
+        self.kw_eff = (self.kw - 1) * self.dw + 1
 
         # He 初始化（groups=1 时 fan_in 与原来的 in_channels*kh*kw 相同）
         fan_in = self.cg * self.kh * self.kw
@@ -490,12 +499,13 @@ class Conv2d:
 #  辅助
 #============================================================================
     def _img_shape(self, H, W):
-        ho = (H + 2 * self.ph - self.kh) // self.sh + 1
-        wo = (W + 2 * self.pw - self.kw) // self.sw + 1
+        ho = (H + 2 * self.ph - self.kh_eff) // self.sh + 1
+        wo = (W + 2 * self.pw - self.kw_eff) // self.sw + 1
         # 输入比卷积核还小时 ho/wo 会是 0 或负数，原实现返回空输出而不报错
         if ho <= 0 or wo <= 0:
             raise ValueError(
-                f"Conv2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}、"
+                f"Conv2d: 输入 {H}x{W} 配 kernel {self.kh}x{self.kw}"
+                f"（dilation {self.dh}/{self.dw} → 等效 {self.kh_eff}x{self.kw_eff}）、"
                 f"padding {self.ph}/{self.pw}、stride {self.sh}/{self.sw} "
                 f"得到输出 {ho}x{wo}，必须都 > 0"
             )
@@ -532,7 +542,9 @@ class Conv2d:
                         row = c * self.kh * self.kw + kh * self.kw + kw
                         dst = col[row]
                         for oh in range(ho):
-                            dst[oh * wo:(oh + 1) * wo] = ch[oh + kh][kw:kw + wo]
+                            # 空洞：第 kh 行取输入的 kh*dh 行，列偏移 kw*dw
+                            dst[oh * wo:(oh + 1) * wo] = ch[oh + kh * self.dh][
+                                kw * self.dw:kw * self.dw + wo]
             return col
 
         for c in range(C):
@@ -542,10 +554,10 @@ class Conv2d:
                     row = c * self.kh * self.kw + kh * self.kw + kw
                     dst = col[row]
                     for oh in range(ho):
-                        src = ch[oh * self.sh + kh]
+                        src = ch[oh * self.sh + kh * self.dh]
                         off = oh * wo
                         for ow in range(wo):
-                            dst[off + ow] = src[ow * self.sw + kw]
+                            dst[off + ow] = src[ow * self.sw + kw * self.dw]
         return col
 
     def _col2im(self, dcol, x_padded_shape, ho, wo):
@@ -558,8 +570,8 @@ class Conv2d:
                     row = c * self.kh * self.kw + kh * self.kw + kw
                     for oh in range(ho):
                         for ow in range(wo):
-                            ih = oh * self.sh + kh
-                            iw = ow * self.sw + kw
+                            ih = oh * self.sh + kh * self.dh
+                            iw = ow * self.sw + kw * self.dw
                             dx[c][ih][iw] += dcol[row][oh * wo + ow]
         return dx
 
@@ -1499,6 +1511,127 @@ class BatchNorm1d:
             for i in range(n)
         ]
         return dx_batch, grad_gamma, grad_beta
+
+
+class BatchNorm2d:
+    """二维批归一化：按通道在 H×W 上归一化（CNN 里紧跟 Conv2d 使用）
+
+    训练: forward(x) 用**本样本**的 H×W 统计量，并更新 running 统计量；
+    推理: forward(x) 用 running_mean / running_var（与 BatchNorm1d 语义一致）。
+    """
+
+    # backward 返回 (dx, grad_gamma, grad_beta)，delta 在第 0 位（同 BatchNorm1d）
+    delta_index = 0
+
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        if isinstance(num_features, bool) or not isinstance(num_features, int) \
+                or num_features < 1:
+            raise ValueError(
+                f"BatchNorm2d: num_features 必须是 >=1 的整数，收到 {num_features!r}")
+        if not (0.0 <= momentum <= 1.0):
+            raise ValueError(f"BatchNorm2d: momentum 必须在 [0,1] 内，收到 {momentum!r}")
+        if eps <= 0:
+            raise ValueError(f"BatchNorm2d: eps 必须 > 0，收到 {eps!r}")
+        self.c = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.gamma = [1.0] * self.c
+        self.beta = [0.0] * self.c
+        self.running_mean = [0.0] * self.c
+        self.running_var = [1.0] * self.c
+        self.training = True
+        self.x_hat = None
+        self.stats = None
+        self._cache_mode = 'train'
+        self.m_gamma = [0.0] * self.c
+        self.v_gamma = [0.0] * self.c
+        self.m_beta = [0.0] * self.c
+        self.v_beta = [0.0] * self.c
+
+    def train(self):
+        """训练模式：forward 用当前样本的统计量"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：forward 用 running 统计量"""
+        self.training = False
+        return self
+
+    def _check(self, x, who):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError(f"{who}: 输入必须是非空的 (C, H, W)")
+        if len(x) != self.c:
+            raise ValueError(f"{who}: 通道数 {len(x)} != num_features={self.c}")
+        h = len(x[0])
+        if h == 0:
+            raise ValueError(f"{who}: H 不能为 0")
+        w = len(x[0][0])
+        if w == 0:
+            raise ValueError(f"{who}: W 不能为 0")
+        for c in range(self.c):
+            if len(x[c]) != h:
+                raise ValueError(f"{who}: 各通道 H 不一致（通道 {c}）")
+            for hh in range(h):
+                if len(x[c][hh]) != w:
+                    raise ValueError(f"{who}: 各通道 W 不一致（通道 {c}, 行 {hh}）")
+        return h, w
+
+    def forward(self, x):
+        """(C, H, W) → (C, H, W)（训练模式更新 running 统计量）"""
+        h, w = self._check(x, "BatchNorm2d.forward")
+        m_size = h * w
+        self._cache_mode = 'train' if self.training else 'eval'
+        x_hat = []
+        stats = []
+        out = []
+        for c in range(self.c):
+            flat = [x[c][hh][ww] for hh in range(h) for ww in range(w)]
+            if self.training:
+                mean = sum(flat) / m_size
+                var = sum((v - mean) ** 2 for v in flat) / m_size
+                self.running_mean[c] = ((1 - self.momentum) * self.running_mean[c]
+                                        + self.momentum * mean)
+                unb = var * m_size / (m_size - 1) if m_size > 1 else var
+                self.running_var[c] = ((1 - self.momentum) * self.running_var[c]
+                                       + self.momentum * unb)
+            else:
+                mean = self.running_mean[c]
+                var = self.running_var[c]
+            inv = 1.0 / math.sqrt(var + self.eps)
+            stats.append((mean, inv))
+            xh = [(v - mean) * inv for v in flat]
+            x_hat.append(xh)
+            g, b = self.gamma[c], self.beta[c]
+            out.append([[g * xh[hh * w + ww] + b for ww in range(w)]
+                        for hh in range(h)])
+        self.x_hat = x_hat
+        self.stats = stats
+        return out
+
+    def backward(self, dout):
+        """返回 (dx, grad_gamma, grad_beta)：dx 与该层输入同形 (C, H, W)"""
+        if self.x_hat is None or self.stats is None:
+            raise RuntimeError("BatchNorm2d.backward: 请先 forward")
+        h, w = self._check(dout, "BatchNorm2d.backward")
+        m_size = h * w
+        grad_gamma = [0.0] * self.c
+        grad_beta = [0.0] * self.c
+        dx = []
+        for c in range(self.c):
+            mean, inv = self.stats[c]
+            xh = self.x_hat[c]
+            d_flat = [dout[c][hh][ww] for hh in range(h) for ww in range(w)]
+            g = self.gamma[c]
+            grad_gamma[c] = sum(d * a for d, a in zip(d_flat, xh))
+            grad_beta[c] = sum(d_flat)
+            dxh = [d * g for d in d_flat]
+            sum_dxh = sum(dxh)
+            sum_dxh_xh = sum(r * a for r, a in zip(dxh, xh))
+            d_flat_out = [inv * (m_size * r - sum_dxh - a * sum_dxh_xh) / m_size
+                          for r, a in zip(dxh, xh)]
+            dx.append([[d_flat_out[hh * w + ww] for ww in range(w)] for hh in range(h)])
+        return dx, grad_gamma, grad_beta
 
 
 class LayerNorm:
@@ -5786,8 +5919,8 @@ def estimate_flops(model, input_shape):
                     f"estimate_flops: Conv2d 期望 {m.in_channels} 通道，输入是 {c_in}"
                 )
             pad_h, pad_w = m.padding
-            out_h = (h + 2 * pad_h - m.kh) // m.sh + 1
-            out_w = (w + 2 * pad_w - m.kw) // m.sw + 1
+            out_h = (h + 2 * pad_h - m.kh_eff) // m.sh + 1
+            out_w = (w + 2 * pad_w - m.kw_eff) // m.sw + 1
             if out_h <= 0 or out_w <= 0:
                 raise ValueError(
                     f"estimate_flops: 输入 {h}x{w} 经 kernel={m.kernel_size} "
@@ -5814,6 +5947,17 @@ def estimate_flops(model, input_shape):
             out_w = (w - m.kw) // m.sw + 1
             step = c * out_h * out_w * (m.kh * m.kw)  # 求和 + 除
             shape = [c, out_h, out_w]
+        elif isinstance(m, BatchNorm2d):
+            if len(shape) != 3:
+                raise ValueError(f"estimate_flops: BatchNorm2d 需要 (C, H, W)，收到 {shape}")
+            c, h, w = shape
+            if c != m.c:
+                raise ValueError(
+                    f"estimate_flops: BatchNorm2d 期望 {m.c} 通道，输入是 {c}")
+            # 每元素约 4 次运算（减均值、乘 inv_std、乘 gamma、加 beta）+ 统计量
+            step = 4 * c * h * w
+            params += 2 * m.c
+            shape = [c, h, w]
         elif isinstance(m, GlobalAvgPool2d):
             if len(shape) != 3:
                 raise ValueError(
@@ -7515,6 +7659,7 @@ def save_conv_model(conv_layers, fc_model, filepath: str):
                 "stride": conv.stride,
                 "padding": conv.padding,
                 "groups": conv.groups,
+                "dilation": list(conv.dilation),
                 "weights": conv.weights,
                 "biases": conv.biases,
             })
@@ -7571,7 +7716,8 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
         # groups 是后加的字段：旧存档没有它，按 1 处理
         conv = Conv2d(cd["in_channels"], cd["out_channels"],
                        cd["kernel_size"], cd["stride"], cd["padding"],
-                       groups=int(cd.get("groups", 1)))
+                       groups=int(cd.get("groups", 1)),
+                       dilation=tuple(cd.get("dilation", (1, 1))))
         oc, ic, kh, kw = conv.out_channels, conv.cg, conv.kh, conv.kw
         cw = cd["weights"]
         shape_ok = (len(cw) == oc

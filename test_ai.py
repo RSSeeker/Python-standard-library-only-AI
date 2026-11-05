@@ -17,6 +17,7 @@ import pytest
 import math
 import random
 import os
+import tempfile
 import json
 import copy
 import AI
@@ -6336,3 +6337,171 @@ class TestSamplingControls:
                             no_repeat_ngram_size=0) == base
         with pytest.raises(ValueError):
             s2s.generate([1, 2], 2, min_p=1.5)
+
+
+class TestConvDilation:
+    """Conv2d 的 dilation（空洞卷积）。"""
+
+    @staticmethod
+    def _rand(C, H, W, seed=1):
+        r = random.Random(seed)
+        return [[[r.uniform(-1, 1) for _ in range(W)] for _ in range(H)] for _ in range(C)]
+
+    def test_receptive_field_and_manual_match(self):
+        random.seed(31)
+        conv = AI.Conv2d(2, 3, 3, padding=1, dilation=2)
+        x = self._rand(2, 5, 5, seed=7)
+        out = conv.forward(x)
+        # 等效核 5×5：5+2-5=2 → 3×3
+        assert len(out) == 3 and len(out[0]) == 3 and len(out[0][0]) == 3
+        # 朴素参考实现（逐输出、逐核、逐通道，自己算空洞偏移与零填充）
+        for oc in range(3):
+            for oh in range(3):
+                for ow in range(3):
+                    acc = conv.biases[oc]
+                    for ic in range(2):
+                        for kh in range(3):
+                            for kw in range(3):
+                                ih = oh + kh * 2 - 1
+                                iw = ow + kw * 2 - 1
+                                if 0 <= ih < 5 and 0 <= iw < 5:
+                                    acc += conv.weights[oc][ic][kh][kw] * x[ic][ih][iw]
+                    assert abs(out[oc][oh][ow] - acc) < 1e-12
+
+    def test_dilation_one_matches_old_behaviour(self):
+        random.seed(5)
+        c1 = AI.Conv2d(2, 3, 3, padding=1)
+        random.seed(5)
+        c2 = AI.Conv2d(2, 3, 3, padding=1, dilation=1)
+        x = self._rand(2, 4, 4)
+        assert c1.weights == c2.weights
+        assert c1.forward(x) == c2.forward(x)
+
+    def test_gradients_vs_numeric(self):
+        random.seed(9)
+        conv = AI.Conv2d(1, 1, 3, padding=2, dilation=2)
+        x = self._rand(1, 4, 4)
+        dout = [[[1.0 if (h + w) % 2 == 0 else -0.5 for w in range(4)]
+                 for h in range(4)]]
+        conv.forward(x)          # backward 依赖前向缓存 (x_shape / cols)
+        conv.zero_grad()
+        dx = conv.backward(dout)
+
+        def loss():
+            o = conv.forward(x)
+            return sum(o[0][h][w] * dout[0][h][w] for h in range(4) for w in range(4))
+
+        eps = 1e-6
+        for (c, h, w) in ((0, 1, 2), (0, 3, 0)):
+            old = x[0][h][w]
+            x[0][h][w] = old + eps
+            lp = loss()
+            x[0][h][w] = old - eps
+            lm = loss()
+            x[0][h][w] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(num - dx[0][h][w]) < 1e-6
+        old = conv.weights[0][0][1][1]
+        conv.weights[0][0][1][1] = old + eps
+        lp = loss()
+        conv.weights[0][0][1][1] = old - eps
+        lm = loss()
+        conv.weights[0][0][1][1] = old
+        assert abs((lp - lm) / (2 * eps) - conv.grad_w[0][0][1][1]) < 1e-6
+
+    def test_invalid_dilation(self):
+        for bad in (0, -1, (1, 0)):
+            with pytest.raises(ValueError):
+                AI.Conv2d(2, 2, 3, dilation=bad)
+
+    def test_conv_save_round_trip(self):
+        random.seed(3)
+        convs = [AI.Conv2d(2, 4, 3, padding=1, dilation=2, groups=2)]
+        fc = AI.MLP([4 * 4 * 4, 3], activations=["linear"])
+        path = os.path.join(tempfile.gettempdir(), "conv_dilation_rt.json")
+        x = self._rand(2, 4, 4, seed=11)
+        expected = convs[0].forward(x)
+        try:
+            AI.save_conv_model(convs, fc, path)
+            c2, _ = AI.load_conv_model(path)
+            assert c2[0].dilation == (2, 2) and c2[0].groups == 2
+            assert c2[0].forward(x) == expected
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+class TestBatchNorm2d:
+    """BatchNorm2d：按通道在 H×W 上归一化。"""
+
+    def test_train_mode_statistics(self):
+        bn = AI.BatchNorm2d(2)
+        x = [[[1.0, 2.0], [3.0, 4.0]], [[0.0, 0.0], [0.0, 0.0]]]
+        y = bn.forward(x)
+        flat = [v for row in y[0] for v in row]
+        assert abs(sum(flat) / 4) < 1e-12
+        assert abs(sum(v * v for v in flat) / 4 - 1.0) < 1e-3
+        assert all(abs(v) < 1e-12 for row in y[1] for v in row)
+        # running 统计量按 momentum 更新
+        assert abs(bn.running_mean[0] - 0.1 * 2.5) < 1e-12
+
+    def test_eval_uses_running(self):
+        bn = AI.BatchNorm2d(1)
+        bn.forward([[[1.0]]])
+        bn.eval()
+        x = [[[2.0]]]
+        y = bn.forward(x)
+        inv = 1.0 / math.sqrt(bn.running_var[0] + bn.eps)
+        assert abs(y[0][0][0] - (2.0 - bn.running_mean[0]) * inv) < 1e-12
+        assert bn.forward(x) == y
+
+    def test_backward_vs_numeric(self):
+        random.seed(4)
+        bn = AI.BatchNorm2d(2)
+        bn.gamma = [1.3, 0.7]
+        bn.beta = [0.1, -0.2]
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        dout = [[[0.3 * (h + 1) - 0.1 * w for w in range(3)] for h in range(3)]
+                for _ in range(2)]
+        bn.forward(x)
+        dx, gg, gb = bn.backward(dout)
+
+        def loss():
+            o = bn.forward(x)
+            return sum(o[c][h][w] * dout[c][h][w]
+                       for c in range(2) for h in range(3) for w in range(3))
+
+        eps = 1e-6
+        for (c, h, w) in ((0, 0, 1), (1, 2, 2)):
+            old = x[c][h][w]
+            x[c][h][w] = old + eps
+            lp = loss()
+            x[c][h][w] = old - eps
+            lm = loss()
+            x[c][h][w] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(num - dx[c][h][w]) < 1e-6
+        assert abs(gb[0] - sum(dout[0][h][w] for h in range(3) for w in range(3))) < 1e-12
+        bn.forward(x)            # 差分循环最后一次用的是扰动输入，重算干净缓存
+        assert abs(gg[1] - sum(dout[1][h][w] * bn.x_hat[1][h * 3 + w]
+                               for h in range(3) for w in range(3))) < 1e-12
+
+    def test_delta_index_and_validation(self):
+        assert AI.BatchNorm2d.delta_index == 0
+        for bad in (0, -1, True):
+            with pytest.raises(ValueError):
+                AI.BatchNorm2d(bad)
+        with pytest.raises(ValueError):
+            AI.BatchNorm2d(2).forward([[[1.0]]])
+        with pytest.raises(RuntimeError):
+            AI.BatchNorm2d(2).backward([[[1.0]]])
+        with pytest.raises(ValueError):
+            AI.BatchNorm2d(1, momentum=1.5)
+
+    def test_estimate_flops(self):
+        net = AI.Sequential(AI.Conv2d(2, 4, 3, padding=1, dilation=2),
+                            AI.BatchNorm2d(4), AI.MaxPool2d(2), AI.Flatten(),
+                            AI.Layer(4 * 2 * 2, 3))
+        info = AI.estimate_flops(net, (2, 6, 6))
+        assert info["flops"] > 0 and info["output_shape"] == [3]

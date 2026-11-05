@@ -132,7 +132,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Layer` | 全连接层 + 激活函数（He 初始化）；激活可选 `leaky_relu` / `relu` / `gelu` / `sigmoid` / `linear` / `softmax` |
 | `Linear` | 无激活的全连接层（`Layer(..., activation='linear')` 的语义化子类） |
 | `MLP` | 多层感知机容器 |
-| `Conv2d` | 二维卷积层（`groups=G` 支持分组/深度卷积） |
+| `Conv2d` | 二维卷积层（`groups=G` 支持分组/深度卷积，`dilation=D` 支持空洞卷积） |
 | `Conv1d` | 一维卷积层（`(C, L)` 输入，滑动窗口直接累加） |
 | `ConvTranspose2d` | 二维转置卷积（反卷积；`output_padding` 与 PyTorch 同规则） |
 | `MaxPool2d` | 二维最大池化 |
@@ -143,6 +143,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
 | `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
+| `BatchNorm2d` | 二维批归一化：按通道在 H×W 上归一化，训练更新 running 统计量、`eval()` 用 running；`backward` 返回 `(dx, grad_gamma, grad_beta)` |
 | `GroupNorm` / `InstanceNorm` | 分组归一化（`(C,H,W)`，小 batch 稳定）；`InstanceNorm` 是组数等于通道数的特例 |
 | `LayerNorm` | 层归一化 |
 | `RMSNorm` | RMS 归一化（Llama 系）：不减均值、无 beta，`y = gamma·x/sqrt(mean(x²)+eps)` |
@@ -175,6 +176,7 @@ model.train()     # 回到训练
 | `TransformerEncoderLayer` / `TransformerEncoder` | `train()` / `eval()` 会转发到内部两个 Dropout **和注意力的权重 dropout** |
 | `MultiHeadAttention` | `train()` / `eval()` 只控制注意力权重 dropout（不看模式的数学本身） |
 | `BatchNorm1d` | `train()` / `eval()`；`forward` 按模式自动选 batch / running 统计量 |
+| `BatchNorm2d` | `train()` / `eval()`；训练用当前样本的 H×W 统计量，推理用 running 统计量 |
 | `MLP` / `Model` | **不含 Dropout**，`quick_train`、`make_classifier` 的返回值无需 `eval()` |
 
 > `Sequential` 目前没有 train/eval，把 Dropout 放进 `Sequential` 时需要自行对子模块调用。
@@ -724,13 +726,15 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-542 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+552 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
 | `TestLayerNumericalGradients` | `Layer` / `MLP` 的 `grad_w / grad_b`、反向传播链（`dL/dx`）vs 数值梯度；含 softmax+CE 联合梯度约定 |
 | `TestTransformerEncoderGradients` | `TransformerEncoderLayer` / `TransformerEncoder` 的 `d_x` 与 LayerNorm 参数梯度 vs 数值梯度（**seq_len>1 必须测**，见下方实现说明） |
 | `TestAttentionGradients` | `MultiHeadAttention` 的 `W_q/W_k/W_v/W_o` 解析梯度 vs 数值梯度 |
+| `TestConvDilation` | 空洞卷积的等效感受野与朴素参考实现逐元素一致、`dilation=1` 与旧行为逐位相同、`dx`/`grad_w` vs 数值梯度、非法 dilation 报错、存档带走 `dilation`/`groups` 且前向逐位一致 |
+| `TestBatchNorm2d` | 训练模式输出均值 0/方差 1、running 统计量按 momentum 更新、`eval()` 用 running、`dx` vs 数值梯度、`grad_gamma`/`grad_beta` 公式、`delta_index=0`、非法构造与未 forward 就 backward 报错、`estimate_flops` 能算 |
 | `TestConv2dGradients` | `Conv2d` 的 `grad_w / grad_b / dx` vs 数值梯度（含 padding 与 stride=2） |
 | `TestBatchNormTraining` | `BatchNorm1d` 训练路径的 `dx / gamma / beta` vs 数值梯度，并与朴素实现逐位一致 |
 | `TestStepCache` / `TestCellGradSemantics` | `restore_cache` 与「重新前向」逐位一致；一次 `zero_grad` + 逐步 backward == 各步梯度之和 |
@@ -795,6 +799,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 542 个单元测试
+├── test_ai.py       # 552 个单元测试
 └── README.md
 ```
