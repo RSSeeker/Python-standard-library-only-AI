@@ -6249,3 +6249,90 @@ class TestMetrics:
             AI.confusion_matrix([0, 3], [0, 1], num_classes=2)
         with pytest.raises(TypeError):
             AI.evaluate_all(object(), [1], [1])
+
+
+class TestSamplingControls:
+    """生成采样控制：min_p / 重复惩罚 / presence / frequency / 禁重复 n-gram。"""
+
+    @staticmethod
+    def _trained_lm():
+        random.seed(11)
+        lm = AI.CausalLM(vocab_size=3, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=1, max_len=16)
+        lm.fit([list(range(3)) * 4], epochs=40, lr=0.02, shuffle=False)
+        return lm
+
+    def test_penalties_default_is_identity(self):
+        logits = [1.0, 2.0, 3.0]
+        same = AI._apply_generation_penalties(logits, [0, 1])
+        assert same == logits and logits == [1.0, 2.0, 3.0]   # 不回改入参
+
+    def test_repetition_penalty(self):
+        got = AI._apply_generation_penalties([1.0, 2.0, 3.0], [2], repetition_penalty=2.0)
+        assert abs(got[2] - 1.5) < 1e-12
+        got_neg = AI._apply_generation_penalties([-1.0, 2.0, 3.0], [0],
+                                                 repetition_penalty=2.0)
+        assert abs(got_neg[0] + 2.0) < 1e-12
+
+    def test_presence_and_frequency(self):
+        pre = AI._apply_generation_penalties([1.0, 1.0, 1.0], [1, 1, 2],
+                                             presence_penalty=0.5)
+        assert abs(pre[1] - 0.5) < 1e-12 and abs(pre[2] - 0.5) < 1e-12
+        freq = AI._apply_generation_penalties([1.0, 1.0, 1.0], [1, 1, 2],
+                                              frequency_penalty=0.5)
+        assert abs(freq[1] - 0.0) < 1e-12 and abs(freq[2] - 0.5) < 1e-12
+
+    def test_no_repeat_ngram_mask(self):
+        # 末尾是 (1,2)，历史上 (1,2) 后面跟过 0 → 禁用 0
+        got = AI._apply_generation_penalties([0.0] * 4, [1, 2, 0, 1, 2],
+                                             no_repeat_ngram_size=3)
+        assert got[0] == float("-inf") and got[3] == 0.0
+
+    def test_mask_min_p(self):
+        masked = AI._mask_min_p([0.0, 0.0, 10.0], 0.5)
+        assert masked[0] == float("-inf") and masked[2] == 10.0
+        assert AI._mask_min_p([1.0, 2.0], 0.0) == [1.0, 2.0]
+
+    def test_default_generate_unchanged(self):
+        lm = self._trained_lm()
+        assert lm.generate([0], 8, top_k=1) == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+        explicit = lm.generate([0], 8, top_k=1, min_p=0.0, repetition_penalty=1.0,
+                               presence_penalty=0.0, frequency_penalty=0.0,
+                               no_repeat_ngram_size=0)
+        assert explicit == lm.generate([0], 8, top_k=1)
+
+    def test_sampling_cache_matches_recompute(self):
+        lm = self._trained_lm()
+        a = lm.generate([0], 8, rng=random.Random(5), use_cache=True)
+        b = lm.generate([0], 8, rng=random.Random(5), use_cache=False)
+        assert a == b
+
+    def test_no_repeat_ngram_changes_greedy(self):
+        lm = self._trained_lm()
+        greedy = lm.generate([0, 1, 2], 6, top_k=1)
+        banned = lm.generate([0, 1, 2], 6, top_k=1, no_repeat_ngram_size=2)
+        assert greedy != banned
+        pairs = [(banned[i], banned[i + 1]) for i in range(len(banned) - 1)]
+        assert len(set(pairs)) == len(pairs)
+
+    def test_penalty_validation(self):
+        lm = self._trained_lm()
+        for kwargs in ({"min_p": 1.0}, {"min_p": -0.1}, {"repetition_penalty": 0.0},
+                       {"repetition_penalty": -2.0}, {"no_repeat_ngram_size": 1},
+                       {"no_repeat_ngram_size": -1}, {"presence_penalty": True}):
+            with pytest.raises(ValueError):
+                lm.generate([0], 2, **kwargs)
+
+    def test_seq2seq_default_and_validation(self):
+        random.seed(21)
+        s2s = AI.Seq2SeqLM(4, 4, d_model=16, num_heads=2, d_ff=32,
+                           num_layers=1, max_len=10)
+        pairs = [([1, 2, 3], [1, 2, 3]), ([2, 3, 1], [2, 3, 1]), ([3, 1, 2], [3, 1, 2])]
+        s2s.fit(pairs, epochs=40, lr=0.01, shuffle=False)
+        base = s2s.generate([1, 2, 3], 3, top_k=1)
+        assert base == [1, 2, 3]
+        assert s2s.generate([1, 2, 3], 3, top_k=1, min_p=0.0, repetition_penalty=1.0,
+                            presence_penalty=0.0, frequency_penalty=0.0,
+                            no_repeat_ngram_size=0) == base
+        with pytest.raises(ValueError):
+            s2s.generate([1, 2], 2, min_p=1.5)

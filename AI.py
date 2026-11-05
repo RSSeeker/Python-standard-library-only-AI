@@ -3906,6 +3906,94 @@ def _check_finite_logits(logits, who):
                 raise ValueError(f"{who}: 第 {t} 行 logits 含 NaN/Inf，参数可能已损坏")
 
 
+def _check_penalty_args(repetition_penalty, presence_penalty, frequency_penalty,
+                        no_repeat_ngram_size, who):
+    """校验生成惩罚参数（重复/存在/频率/禁重复 n-gram）"""
+    for name, val in (("repetition_penalty", repetition_penalty),
+                      ("presence_penalty", presence_penalty),
+                      ("frequency_penalty", frequency_penalty)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"{who}: {name} 必须是数字，收到 {val!r}")
+        if val != val or val in (float("inf"), float("-inf")):
+            raise ValueError(f"{who}: {name} 必须是有限值，收到 {val!r}")
+    if repetition_penalty <= 0:
+        raise ValueError(
+            f"{who}: repetition_penalty 必须 > 0，收到 {repetition_penalty!r}")
+    if isinstance(no_repeat_ngram_size, bool) or not isinstance(no_repeat_ngram_size, int) \
+            or no_repeat_ngram_size < 0:
+        raise ValueError(
+            f"{who}: no_repeat_ngram_size 必须是 >= 0 的整数，收到 {no_repeat_ngram_size!r}")
+    if no_repeat_ngram_size == 1:
+        # n=1 会把所有已出现的 token 全禁掉，等于只能输出新 token，几乎必然无解
+        raise ValueError(f"{who}: no_repeat_ngram_size=1 没有意义（会禁用所有已出现的 token）")
+
+
+def _mask_min_p(logits, min_p: float):
+    """把概率低于 min_p * max_prob 的 token 置 -inf（min_p<=0 时原样返回）"""
+    if min_p <= 0.0:
+        return logits
+    probs = _softmax_row(logits)
+    peak = max(probs)
+    thresh = min_p * peak
+    return [v if probs[i] >= thresh else float("-inf") for i, v in enumerate(logits)]
+
+
+def _check_min_p(min_p, who):
+    """校验 min_p（(0,1) 内的阈值；0 表示不过滤）"""
+    if isinstance(min_p, bool) or not isinstance(min_p, (int, float)):
+        raise ValueError(f"{who}: min_p 必须是数字，收到 {min_p!r}")
+    if min_p != min_p or not (0.0 <= min_p < 1.0):
+        raise ValueError(f"{who}: min_p 必须在 [0,1) 内，收到 {min_p!r}")
+    return float(min_p)
+
+
+def _apply_generation_penalties(logits, ids, repetition_penalty: float = 1.0,
+                                presence_penalty: float = 0.0,
+                                frequency_penalty: float = 0.0,
+                                no_repeat_ngram_size: int = 0):
+    """按已生成的 token 调整 logits（默认参数下原样返回，保证旧行为逐位不变）
+
+    - repetition_penalty: >1 抑制重复（正 logit 除以它、负 logit 乘以它）
+    - presence_penalty: 出现过就扣一次
+    - frequency_penalty: 按出现次数扣
+    - no_repeat_ngram_size=n: 禁止让末尾 (n-1)-gram 立刻再重复一次
+    """
+    has_ngram = no_repeat_ngram_size and no_repeat_ngram_size >= 2
+    if (repetition_penalty == 1.0 and presence_penalty == 0.0
+            and frequency_penalty == 0.0 and not has_ngram):
+        return logits
+
+    out = list(logits)
+    vocab = len(out)
+    counts = {}
+    for tok in ids:
+        if isinstance(tok, int) and not isinstance(tok, bool) and 0 <= tok < vocab:
+            counts[tok] = counts.get(tok, 0) + 1
+
+    if repetition_penalty != 1.0:
+        for tok in counts:
+            if out[tok] > 0:
+                out[tok] = out[tok] / repetition_penalty
+            else:
+                out[tok] = out[tok] * repetition_penalty
+    if presence_penalty:
+        for tok in counts:
+            out[tok] -= presence_penalty
+    if frequency_penalty:
+        for tok, c in counts.items():
+            out[tok] -= frequency_penalty * c
+    if has_ngram:
+        n = int(no_repeat_ngram_size)
+        if len(ids) >= n - 1:
+            prefix = list(ids[len(ids) - (n - 1):])
+            for i in range(len(ids) - (n - 1)):
+                if list(ids[i:i + n - 1]) == prefix:
+                    nxt = ids[i + n - 1]
+                    if isinstance(nxt, int) and not isinstance(nxt, bool) and 0 <= nxt < vocab:
+                        out[nxt] = float("-inf")
+    return out
+
+
 class CausalLM:
     """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头
 
@@ -4250,18 +4338,24 @@ class CausalLM:
         """从 `save` 写出的 JSON 恢复 CausalLM（参数逐位还原）"""
         return _lm_load(filepath, restore_optimizer)
 
-    def _generate_beam(self, ids, max_new_tokens, num_beams, top_k):
+    def _generate_beam(self, ids, max_new_tokens, num_beams, top_k, min_p: float = 0.0,
+                       repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                       frequency_penalty: float = 0.0, no_repeat_ngram_size: int = 0):
         """束搜索：每步保留累计对数概率最高的 num_beams 条前缀（不用随机数）
 
         num_beams=1 时与贪心解码（`generate(top_k=1)`）逐位相同。
         top_k>0 时每步只展开概率最高的 top_k 个候选，否则展开 num_beams 个。
+        min_p 也在这里生效（对每条前缀各自的分布过滤）。
         """
         beams = [(0.0, list(ids))]
         for _ in range(max_new_tokens):
             cands = []
             for score, toks in beams:
                 window = toks[-self.max_len:]
-                logits = self.forward(window)[-1]
+                logits = _apply_generation_penalties(
+                    self.forward(window)[-1], toks, repetition_penalty,
+                    presence_penalty, frequency_penalty, no_repeat_ngram_size)
+                logits = _mask_min_p(logits, min_p)
                 logp = _log_softmax_row(logits)
                 order = sorted(range(self.vocab_size),
                                key=lambda v: logp[v], reverse=True)
@@ -4276,7 +4370,9 @@ class CausalLM:
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 1.0,
                  top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0,
-                 num_beams: int = 1):
+                 num_beams: int = 1, min_p: float = 0.0,
+                 repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                 frequency_penalty: float = 0.0, no_repeat_ngram_size: int = 0):
         """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
 
         temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
@@ -4287,6 +4383,11 @@ class CausalLM:
         use_cache: True（默认）走 KV cache —— 每个新 token 只前向一次，复用之前
         各层 K/V，生成 N 个 token 的代价从 O(N·T²) 降到 O(N·T)。与 use_cache=False
         的**结果逐位相同**（cache 路径前向的行与整段前向的最后一行一致）。
+
+        抗重复 / 截尾：min_p（(0,1)，相对最大概率截尾）、repetition_penalty（>1 抑制
+        重复 token）、presence_penalty / frequency_penalty（按出现与否/次数扣分）、
+        no_repeat_ngram_size（禁止 n-gram 立刻重复）。默认值全部等于「不干预」，
+        与旧行为逐位相同。
         """
         if max_new_tokens < 0:
             raise ValueError(f"CausalLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
@@ -4298,6 +4399,9 @@ class CausalLM:
         if isinstance(num_beams, bool) or not isinstance(num_beams, int) or num_beams < 1:
             raise ValueError(
                 f"CausalLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
+        min_p = _check_min_p(min_p, "CausalLM.generate")
+        _check_penalty_args(repetition_penalty, presence_penalty, frequency_penalty,
+                            no_repeat_ngram_size, "CausalLM.generate")
         ids = list(prompt_ids)
         if not ids:
             raise ValueError("CausalLM.generate: prompt_ids 不能为空")
@@ -4305,23 +4409,32 @@ class CausalLM:
         self.eval()
         n_new = int(max_new_tokens)
         if num_beams > 1:
-            return self._generate_beam(ids, n_new, num_beams, top_k)
+            return self._generate_beam(ids, n_new, num_beams, top_k, min_p,
+                                       repetition_penalty, presence_penalty,
+                                       frequency_penalty, no_repeat_ngram_size)
         if use_cache and n_new > 0:
-            return self._generate_cached(ids, n_new, temperature, top_k, rng, top_p)
+            return self._generate_cached(ids, n_new, temperature, top_k, rng, top_p, min_p,
+                                         repetition_penalty, presence_penalty,
+                                         frequency_penalty, no_repeat_ngram_size)
         for _ in range(n_new):
             window = ids[-self.max_len:]
-            logits = self.forward(window)[-1]
-            ids.append(self._sample(logits, temperature, top_k, rng, top_p))
+            logits = _apply_generation_penalties(
+                self.forward(window)[-1], ids, repetition_penalty,
+                presence_penalty, frequency_penalty, no_repeat_ngram_size)
+            ids.append(self._sample(logits, temperature, top_k, rng, top_p, min_p))
         return ids
 
-    def _sample(self, logits, temperature, top_k, rng, top_p: float = 1.0):
-        """从 logits 采一个 token（top_k / top_p 过滤 + 温度缩放 + 累积分布采样）
+    def _sample(self, logits, temperature, top_k, rng, top_p: float = 1.0,
+                min_p: float = 0.0):
+        """从 logits 采一个 token（top_k / top_p / min_p 过滤 + 温度 + 累积分布采样）
 
         top_p（nucleus 采样）：按概率从高到低累加，只保留累计概率刚好覆盖 top_p
         的头部集合。top_p=1.0（默认）不做过滤，与旧行为逐位相同。
+        min_p：在 top_k/top_p 之后再按「概率 >= min_p * 最大概率」截尾（0 = 关闭）。
         """
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"CausalLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        min_p = _check_min_p(min_p, "CausalLM._sample")
         top_k = _check_top_k(top_k, "CausalLM._sample")
         if top_k and top_k < self.vocab_size:
             order = sorted(range(self.vocab_size), key=lambda v: logits[v], reverse=True)
@@ -4339,6 +4452,12 @@ class CausalLM:
                 if acc_p >= top_p:
                     break
             logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        if min_p > 0.0:
+            peak = max(_softmax_row([v / temperature for v in logits]))
+            thresh = float(min_p) * peak
+            probs_now = _softmax_row([v / temperature for v in logits])
+            logits = [v if probs_now[i] >= thresh else float("-inf")
+                      for i, v in enumerate(logits)]
         probs = _softmax_row([v / temperature for v in logits])
         # 累积分布采样（不依赖 random.choices，可注入 rng 复现）
         u = rng.random()
@@ -4351,7 +4470,10 @@ class CausalLM:
                 break
         return pick
 
-    def _generate_cached(self, ids, max_new_tokens, temperature, top_k, rng, top_p=1.0):
+    def _generate_cached(self, ids, max_new_tokens, temperature, top_k, rng, top_p=1.0,
+                         min_p: float = 0.0, repetition_penalty: float = 1.0,
+                         presence_penalty: float = 0.0, frequency_penalty: float = 0.0,
+                         no_repeat_ngram_size: int = 0):
         """KV cache 版生成：先整段预填充，然后每个新 token 只做单步前向
 
         窗口满（len(ids) > max_len）时会整体左移，位置编码/因果掩码都依赖绝对
@@ -4366,7 +4488,10 @@ class CausalLM:
             logits = self._forward_step(tok, pos, caches)
             pos += 1
         for _ in range(max_new_tokens):
-            pick = self._sample(logits, temperature, top_k, rng, top_p)
+            cur = _apply_generation_penalties(logits, ids, repetition_penalty,
+                                              presence_penalty, frequency_penalty,
+                                              no_repeat_ngram_size)
+            pick = self._sample(cur, temperature, top_k, rng, top_p, min_p)
             ids.append(pick)
             new_window = ids[-self.max_len:]
             if len(new_window) == len(window) + 1:
@@ -4706,10 +4831,12 @@ class Seq2SeqLM:
             if was_training:
                 self.train()
 
-    def _sample(self, logits, temperature, top_k, rng, top_p, vocab_size):
-        """从 logits 采一个 token（top_k / top_p + 温度 + 累积分布）"""
+    def _sample(self, logits, temperature, top_k, rng, top_p, vocab_size,
+                min_p: float = 0.0):
+        """从 logits 采一个 token（top_k / top_p / min_p + 温度 + 累积分布）"""
         if not (0.0 < top_p <= 1.0):
             raise ValueError(f"Seq2SeqLM._sample: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+        min_p = _check_min_p(min_p, "Seq2SeqLM._sample")
         top_k = _check_top_k(top_k, "Seq2SeqLM._sample")
         if top_k and top_k < vocab_size:
             order = sorted(range(vocab_size), key=lambda v: logits[v], reverse=True)
@@ -4726,6 +4853,11 @@ class Seq2SeqLM:
                 if acc_p >= top_p:
                     break
             logits = [v if i in keep else float("-inf") for i, v in enumerate(logits)]
+        if min_p > 0.0:
+            probs_now = _softmax_row([v / temperature for v in logits])
+            thresh = float(min_p) * max(probs_now)
+            logits = [v if probs_now[i] >= thresh else float("-inf")
+                      for i, v in enumerate(logits)]
         probs = _softmax_row([v / temperature for v in logits])
         u = rng.random()
         acc = 0.0
@@ -4754,7 +4886,10 @@ class Seq2SeqLM:
         """从 `save` 写出的 JSON 恢复 Seq2SeqLM（参数逐位还原）"""
         return _lm_load(filepath, restore_optimizer)
 
-    def _generate_beam(self, src_ids, max_new_tokens, num_beams, top_k, eos_id=None):
+    def _generate_beam(self, src_ids, max_new_tokens, num_beams, top_k, eos_id=None,
+                       min_p: float = 0.0, repetition_penalty: float = 1.0,
+                       presence_penalty: float = 0.0, frequency_penalty: float = 0.0,
+                       no_repeat_ngram_size: int = 0):
         """束搜索解码：编码一次，每步对每条前缀重算解码器并保留前 num_beams
 
         eos_id 非 None 时把以 eos 结尾的候选放进「已完成」，最后按累计对数概率
@@ -4769,7 +4904,10 @@ class Seq2SeqLM:
                 if len(tgt) >= self.max_len:
                     finished.append((score, out))
                     continue
-                logits = self._decode(tgt, memory)[-1]
+                logits = _apply_generation_penalties(
+                    self._decode(tgt, memory)[-1], tgt, repetition_penalty,
+                    presence_penalty, frequency_penalty, no_repeat_ngram_size)
+                logits = _mask_min_p(logits, min_p)
                 logp = _log_softmax_row(logits)
                 order = sorted(range(self.tgt_vocab),
                                key=lambda v: logp[v], reverse=True)
@@ -4793,11 +4931,16 @@ class Seq2SeqLM:
 
     def generate(self, src_ids, max_new_tokens: int = 5, temperature: float = 1.0,
                  top_k: int = 0, top_p: float = 1.0, rng=None, eos_id=None,
-                 num_beams: int = 1):
+                 num_beams: int = 1, min_p: float = 0.0,
+                 repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                 frequency_penalty: float = 0.0, no_repeat_ngram_size: int = 0):
         """编码一次、解码逐步生成；返回生成的 token 列表（不含 BOS）
 
         eos_id 非 None 时遇到它立即停止（也不把它放进结果）。
         每步都对整个已生成前缀重算一次解码器（T 通常很短，实现保持简单）。
+
+        min_p / repetition_penalty / presence_penalty / frequency_penalty /
+        no_repeat_ngram_size 与 CausalLM 同义，默认值等于「不干预」。
         """
         if not src_ids:
             raise ValueError("Seq2SeqLM.generate: src_ids 不能为空")
@@ -4812,6 +4955,9 @@ class Seq2SeqLM:
             raise ValueError(
                 f"Seq2SeqLM.generate: num_beams 必须是 >= 1 的整数，收到 {num_beams!r}")
         top_k = _check_top_k(top_k, "Seq2SeqLM.generate")
+        min_p = _check_min_p(min_p, "Seq2SeqLM.generate")
+        _check_penalty_args(repetition_penalty, presence_penalty, frequency_penalty,
+                            no_repeat_ngram_size, "Seq2SeqLM.generate")
         src_ids = _check_token_ids(src_ids, self.src_vocab, "Seq2SeqLM.generate")
         if len(src_ids) > self.max_len:
             raise ValueError(
@@ -4820,15 +4966,20 @@ class Seq2SeqLM:
         self.eval()
         if num_beams > 1:
             return self._generate_beam(src_ids, int(max_new_tokens), num_beams,
-                                       top_k, eos_id)
+                                       top_k, eos_id, min_p, repetition_penalty,
+                                       presence_penalty, frequency_penalty,
+                                       no_repeat_ngram_size)
         memory = self._encode(list(src_ids))
         out = []
         tgt = [self.bos_id]
         for _ in range(max_new_tokens):
             if len(tgt) >= self.max_len:
                 break
-            logits = self._decode(tgt, memory)[-1]
-            pick = self._sample(logits, temperature, top_k, rng, top_p, self.tgt_vocab)
+            logits = _apply_generation_penalties(
+                self._decode(tgt, memory)[-1], tgt, repetition_penalty,
+                presence_penalty, frequency_penalty, no_repeat_ngram_size)
+            pick = self._sample(logits, temperature, top_k, rng, top_p,
+                                self.tgt_vocab, min_p)
             tgt.append(pick)
             if eos_id is not None and pick == eos_id:
                 break

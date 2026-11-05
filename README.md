@@ -198,7 +198,7 @@ model.train()     # 回到训练
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
 | `TransformerDecoderLayer` / `TransformerDecoder` | 解码器层（因果自注意力 → 交叉注意力 → FFN，三段残差 + LayerNorm）与多层堆叠；`backward` 把梯度同时传回解码器输入和编码器输出 |
 | `PositionalEncoding` | sin/cos 绝对位置编码 |
-| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` 做 nucleus 采样，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
+| `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
 
 ### 因果掩码与 LLM
@@ -254,6 +254,10 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
 | `MultiHeadAttention(window=N)` | 滑动窗口（Mistral 式局部因果）：只看最近 N 个位置，代价 O(T·window) |
 | `generate(..., top_p=0.9)` | nucleus 采样：按概率累加保留头部集合（与 `top_k` 可叠加；默认 1.0 不过滤） |
+| `generate(..., min_p=0.05)` | min-p 截尾：低于「最大概率 × min_p」的全丢掉（比 top_p 更稳；默认 0 关闭） |
+| `generate(..., repetition_penalty=1.2)` | 重复惩罚：已出现的 token，正 logit 除以它、负 logit 乘以它（默认 1.0 不惩罚） |
+| `generate(..., presence_penalty=0.5, frequency_penalty=0.5)` | 存在惩罚（出现过就扣一次）/ 频率惩罚（按出现次数扣） |
+| `generate(..., no_repeat_ngram_size=3)` | 禁止 n-gram 立刻重复：末尾 (n-1)-gram 再次出现时，把它后面跟过的 token 置 `-inf` |
 | `MultiHeadAttention(num_kv_heads=K)` | GQA/MQA：K 个 Q 头共享一组 K/V，`W_k`/`W_v` 与 KV cache 同比例缩小 |
 
 **RoPE + KV cache**：`CausalLM(..., rope=True)` 会默认关掉绝对位置编码（Llama 的做法），
@@ -283,6 +287,30 @@ out = lm.generate([1, 2, 3], max_new_tokens=32, top_k=5, use_cache=False)  # 结
 
 **nucleus 采样**：`generate(..., top_p=0.9)` 按温度缩放后的概率从高到低累加，保留累计概率
 刚好覆盖 0.9 的头部集合再采样；`top_p=1.0`（默认）不做过滤，输出与旧版逐位一致。
+
+**抗重复与 min-p**：采样路径另外支持五项控制，默认值全部等于「不干预」，因此不传参时输出与
+旧版逐位相同：
+
+```python
+# 1) min-p：只保留概率 >= 最大概率 5% 的 token（比 top_p 更稳，2024 年起常用）
+lm.generate(prompt, 80, min_p=0.05, temperature=0.9)
+
+# 2) 重复惩罚：>1 抑制已出现的 token（正 logit 除以它、负 logit 乘以它）
+lm.generate(prompt, 80, repetition_penalty=1.2)
+
+# 3) presence / frequency：出现过扣一次 / 按出现次数扣
+lm.generate(prompt, 80, presence_penalty=0.5, frequency_penalty=0.3)
+
+# 4) 禁重复 n-gram：3-gram 不再立刻重复（末尾 2-gram 再次出现时禁掉后继）
+lm.generate(prompt, 80, no_repeat_ngram_size=3)
+
+# 5) 与束搜索、KV cache、top_p、top_k 可任意叠加
+lm.generate(prompt, 80, num_beams=3, no_repeat_ngram_size=2, min_p=0.02)
+```
+
+`Seq2SeqLM.generate` 支持同样的五个参数（含义一致，作用在解码器侧）。`min_p` 要求 `[0,1)`，
+`repetition_penalty` 要求 `> 0`，`no_repeat_ngram_size` 要求 `>= 2`（=1 会禁掉所有已出现的
+token，没有意义，直接报错）。
 
 **GQA / MQA**：`CausalLM(..., num_kv_heads=2)`（或 `MultiHeadAttention(num_kv_heads=2)`）
 让每 `num_heads/num_kv_heads` 个 Q 头共享一组 K/V——Llama-2 70B、Mistral 都用这套。
@@ -696,7 +724,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-532 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+542 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -750,6 +778,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFlopsExtended` | 分组/深度卷积按 `in_channels/groups` 计数（不按 `in_channels` 高估）、`Conv1d`/`ConvTranspose2d`/`AdaptiveAvgPool2d`/`GroupNorm`/`DropPath` 的计数与形状校验 |
 | `TestLossPersistence` | 默认存档不多写字段（旧文件逐字节不变）、`focal`/`CE(label_smoothing)` 往返后损失配置不变且续训曲线逐位相同、显式传参覆盖文件、坏 `loss` 字段忽略、自定义 callable 不写字段、与优化器状态共存 |
 | `TestAugmentation` | `sigma=0` 逐位不变且不改入参、图像翻转保持元素多重集、平移补 0、Mixup 中点与软标签、非法输入报错 |
+| `TestSamplingControls` | 默认参数逐位不变、`repetition_penalty` 对正/负 logit 的处理、presence 只扣一次与 frequency 按次数扣、禁 n-gram 掩码、min-p 截尾、采样路径 cache == 重算、禁 2-gram 改变贪心输出且无重复二元组、七类非法参数、Seq2SeqLM 侧同样覆盖 |
 | `TestMetrics` | 混淆矩阵/准确率、macro/micro/weighted 三种平均、MCC 与 AUC（含全同分=0.5）、Top-k、MAE/RMSE/MAPE/R²（含常数目标 1.0/0.0）、BLEU 无重叠判 0、ROUGE-L、`evaluate_all` 分类与回归键齐、七类非法输入 |
 | `TestReviewFixes` | `ConvTranspose2d` 偏置梯度不被 `cin/groups` 放大、`mixup` 的 `lam` 恒在 `[0,1]` 且软标签合法、分组卷积存档往返（含缺 `groups` 的旧存档）、`CrossAttention.delta_index=0`、`estimate_flops` 拒绝一维/二维 `Flatten`、`CausalLM.save` 拒绝 NaN、`summary` 显示真实激活名、`grad_check` 消息含 Seq2SeqLM、`Sequential` 收列表且拒非模块 |
 | `TestConvGroups` | `groups=2` 前向等价两个单组卷积、depthwise 通道、`grad_w` vs 数值、非法 groups |
@@ -766,6 +795,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 532 个单元测试
+├── test_ai.py       # 542 个单元测试
 └── README.md
 ```
