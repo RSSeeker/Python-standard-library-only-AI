@@ -8084,3 +8084,116 @@ class TestMultiLabelHead:
         last = total / len(xs)
         assert last < first / 3.0
         assert all(head.predict(head.forward(v)) == y for v, y in zip(xs, ys))
+
+
+class TestMoE:
+    """专家混合层：路由语义、梯度、未使用专家的零梯度、可训练性。"""
+
+    def test_shapes_and_validation(self):
+        random.seed(3)
+        moe = AI.MoE(4, 6, num_experts=3, top_k=2)
+        xs = [[0.5, -0.2, 0.1, 0.3], [0.1, 0.4, -0.3, 0.2]]
+        out = moe.forward(xs)
+        assert len(out) == 2 and all(len(r) == 4 for r in out)
+        assert moe.param_count() == 405
+        assert all(len(r) == 2 for r in moe.routes)
+        assert all(abs(sum(w for _e, w in r) - 1.0) < 1e-12 for r in moe.routes)
+        for bad in ({"d_model": 0}, {"d_ff": 0}, {"num_experts": 0},
+                    {"top_k": 0}, {"top_k": 5}, {"top_k": True}):
+            kw = dict(d_model=4, d_ff=6, num_experts=3, top_k=2)
+            kw.update(bad)
+            with pytest.raises(ValueError):
+                AI.MoE(**kw)
+        with pytest.raises(ValueError):
+            moe.forward([])
+        with pytest.raises(ValueError):
+            moe.forward([[1.0, 2.0]])
+        with pytest.raises(RuntimeError):
+            AI.MoE(4, 6).backward([[0.0] * 4])
+
+    def test_top1_routing_weight_is_one(self):
+        random.seed(9)
+        moe = AI.MoE(3, 5, num_experts=2, top_k=1)
+        moe.forward([[0.3, -0.4, 0.2], [0.1, 0.2, -0.5]])
+        assert all(abs(w - 1.0) < 1e-12 for r in moe.routes for _e, w in r)
+
+    def test_gradients_match_numeric(self):
+        random.seed(5)
+        moe = AI.MoE(4, 6, num_experts=3, top_k=2)
+        xs = [[0.5, -0.2, 0.1, 0.3], [0.1, 0.4, -0.3, 0.2]]
+        dout = [[0.3, -0.1, 0.2, 0.05], [-0.2, 0.4, 0.1, 0.25]]
+
+        def loss():
+            out = moe.forward(xs)
+            return sum(dout[t][j] * out[t][j]
+                       for t in range(2) for j in range(4))
+
+        moe.forward(xs)
+        moe.zero_grad()
+        moe.backward(dout)
+        gate = [[v for v in row] for row in moe.grad_W_gate]
+        exp0 = [[v for v in row] for row in moe.experts[0].grads["W1"]]
+
+        eps = 1e-6
+        old = moe.W_gate[0][1]
+        moe.W_gate[0][1] = old + eps
+        lp = loss()
+        moe.W_gate[0][1] = old - eps
+        lm = loss()
+        moe.W_gate[0][1] = old
+        num = (lp - lm) / (2 * eps)
+        assert abs(gate[0][1] - num) <= 1e-6 * max(1e-8, abs(gate[0][1]) + abs(num))
+
+        old = moe.experts[0].W1[2][1]
+        moe.experts[0].W1[2][1] = old + eps
+        lp = loss()
+        moe.experts[0].W1[2][1] = old - eps
+        lm = loss()
+        moe.experts[0].W1[2][1] = old
+        num = (lp - lm) / (2 * eps)
+        assert abs(exp0[2][1] - num) <= 1e-6 * max(1e-8, abs(exp0[2][1]) + abs(num))
+
+    def test_unused_expert_gets_zero_gradient(self):
+        random.seed(11)
+        moe = AI.MoE(3, 4, num_experts=4, top_k=1)
+        moe.forward([[0.5, 0.5, 0.5]])
+        used = {e for e, _w in moe.routes[0]}
+        moe.zero_grad()
+        moe.backward([[0.1, 0.2, 0.3]])
+        sums = {e: sum(abs(v) for row in moe.experts[e].grads["W1"] for v in row)
+                for e in range(4)}
+        assert any(sums[e] > 0.0 for e in used)
+        assert all(sums[e] == 0.0 for e in range(4) if e not in used)
+
+    def test_training_reduces_loss_and_uses_experts(self):
+        random.seed(21)
+        moe = AI.MoE(4, 8, num_experts=3, top_k=2)
+        data = []
+        for _ in range(12):
+            vec = [random.uniform(-1, 1) for _ in range(4)]
+            target = [0.0] * 4
+            target[max(range(4), key=lambda j: vec[j])] = 1.0
+            data.append((vec, target))
+
+        def total_loss():
+            s = 0.0
+            for vec, tgt in data:
+                out = moe.forward([vec])[0]
+                s += sum((out[j] - tgt[j]) ** 2 for j in range(4)) / 4.0
+            return s / len(data)
+
+        first = total_loss()
+        for _ in range(200):
+            moe.zero_grad()
+            for vec, tgt in data:
+                out = moe.forward([vec])
+                d = [[2.0 * (out[0][j] - tgt[j]) / (4.0 * len(data)) for j in range(4)]]
+                moe.backward(d)
+            moe.adam_step(0.05)
+        assert total_loss() < first / 5.0
+
+        used = set()
+        for vec, _t in data:
+            moe.forward([vec])
+            used.update(e for e, _w in moe.routes[0])
+        assert len(used) >= 2

@@ -3322,6 +3322,214 @@ class SwiGLU:
         return dx_seq
 
 
+class MoE:
+    """专家混合前馈层（Mixture of Experts）
+
+    out_t = Σ_{e ∈ top-k} q_e · FFN_e(x_t)，其中 q 是在**被选中的专家**上做的 softmax
+    （Switch/GShard 风格：路由只对被选中的专家归一化，未被选中的专家梯度为 0）。
+
+    与 `FeedForward` 的区别：多个专家并行，每个 token 只走 top_k 条路径，
+    因此参数量随专家数线性增长，计算量只按 top_k 增长。
+
+    注意：这是一个**教学级实现**——它把 token 分组后逐专家前向，没有做批量矩阵化，
+    token 数少时很快，超长序列比稠密 FFN 慢。真实的大模型实现会用 scatter/gather。
+    """
+
+    def __init__(self, d_model: int, d_ff: int, num_experts: int = 4,
+                 top_k: int = 2, activation: str = "gelu"):
+        for name, value in (("d_model", d_model), ("d_ff", d_ff),
+                            ("num_experts", num_experts), ("top_k", top_k)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"MoE: {name} 必须是 >= 1 的整数，收到 {value!r}")
+        if top_k > num_experts:
+            raise ValueError(f"MoE: top_k({top_k}) 不能大于 num_experts({num_experts})")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.activation = activation
+
+        self.experts = [FeedForward(d_model, d_ff, activation) for _ in range(num_experts)]
+        std = math.sqrt(2.0 / d_model)
+        self.W_gate = [[random.gauss(0.0, std) for _ in range(d_model)]
+                       for _ in range(num_experts)]
+        self.b_gate = [0.0] * num_experts
+
+        self._init_adam()
+        self.zero_grad()
+        self.x = None
+        self.routes = None      # 每个 token: [(expert, weight), ...]
+        self.group_index = None  # 每个专家: [token 下标, ...]
+        self.group_w = None
+
+    # ---- 参数与状态
+    def _named_params(self):
+        for e, expert in enumerate(self.experts):
+            for key in ("W1", "b1", "W2", "b2"):
+                yield f"e{e}.{key}", getattr(expert, key), expert.grads[key]
+        yield "W_gate", self.W_gate, self.grad_W_gate
+        yield "b_gate", self.b_gate, self.grad_b_gate
+
+    def zero_grad(self):
+        for expert in self.experts:
+            expert.zero_grad()
+        self.grad_W_gate = _zeros_like(self.W_gate)
+        self.grad_b_gate = _zeros_like(self.b_gate)
+
+    def _init_adam(self):
+        self.m = {}
+        self.v = {}
+        self.step_count = 0
+        for expert in self.experts:
+            expert._init_adam()
+        self._sync_adam()
+
+    def _sync_adam(self):
+        for name, param in self._param_views():
+            if self.m.get(name) is None or len(self.m[name]) != len(param):
+                self.m[name] = _zeros_like(param)
+                self.v[name] = _zeros_like(param)
+
+    def _param_views(self):
+        for e, expert in enumerate(self.experts):
+            for key in ("W1", "b1", "W2", "b2"):
+                yield f"e{e}.{key}", getattr(expert, key)
+        yield "W_gate", self.W_gate
+        yield "b_gate", self.b_gate
+
+    def param_count(self):
+        per = sum(len(row) for row in self.experts[0].W1) * self.d_model
+        per += len(self.experts[0].b1)
+        per += self.d_model * len(self.experts[0].W2[0])
+        per += len(self.experts[0].b2)
+        return per * self.num_experts + len(self.W_gate) * self.d_model + len(self.b_gate)
+
+    # ---- 前向
+    def forward(self, x_seq):
+        if not isinstance(x_seq, (list, tuple)) or not x_seq:
+            raise ValueError("MoE.forward: 输入必须是非空序列")
+        T = len(x_seq)
+        for t, row in enumerate(x_seq):
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(f"MoE.forward: 第 {t} 个位置维度应为 {self.d_model}")
+        self.x = [list(row) for row in x_seq]
+
+        routes = []
+        for t in range(T):
+            xt = self.x[t]
+            logits = [sum(map(_mul, self.W_gate[e], xt)) + self.b_gate[e]
+                      for e in range(self.num_experts)]
+            order = sorted(range(self.num_experts), key=lambda e: -logits[e])[:self.top_k]
+            picked = [logits[e] for e in order]
+            probs = _softmax_row(picked)
+            routes.append([(order[k], probs[k]) for k in range(self.top_k)])
+        self.routes = routes
+
+        group_index = [[] for _ in range(self.num_experts)]
+        group_w = [[] for _ in range(self.num_experts)]
+        group_pos = [{} for _ in range(self.num_experts)]
+        for t in range(T):
+            for e, w in routes[t]:
+                group_pos[e][t] = len(group_index[e])
+                group_index[e].append(t)
+                group_w[e].append(w)
+        self.group_index = group_index
+        self.group_w = group_w
+        self.group_pos = group_pos
+
+        out = [[0.0] * self.d_model for _ in range(T)]
+        self._last_group_out = {}
+        for e in range(self.num_experts):
+            idx = group_index[e]
+            if not idx:
+                continue
+            group_out = self.experts[e].forward([self.x[t] for t in idx])
+            self._last_group_out[e] = group_out
+            for k, t in enumerate(idx):
+                w = group_w[e][k]
+                row = group_out[k]
+                target = out[t]
+                for j in range(self.d_model):
+                    target[j] += w * row[j]
+        return out
+
+    # ---- 反向
+    def backward(self, dout_seq):
+        if self.x is None:
+            raise RuntimeError("MoE.backward: 必须先 forward")
+        T = len(self.x)
+        if not isinstance(dout_seq, (list, tuple)) or len(dout_seq) != T:
+            raise ValueError(f"MoE.backward: dout 长度应为 {T}")
+        for t in range(T):
+            if len(dout_seq[t]) != self.d_model:
+                raise ValueError(f"MoE.backward: 第 {t} 行梯度维度应为 {self.d_model}")
+
+        dx = [[0.0] * self.d_model for _ in range(T)]
+
+        # 1) 各专家的输入梯度：dL/dout_t 乘路由权重后按组回传
+        for e in range(self.num_experts):
+            idx = self.group_index[e]
+            if not idx:
+                continue
+            dgroup = []
+            for k, t in enumerate(idx):
+                w = self.group_w[e][k]
+                dgroup.append([w * v for v in dout_seq[t]])
+            dx_group = self.experts[e].backward(dgroup)
+            for k, t in enumerate(idx):
+                row = dx_group[k]
+                for j in range(self.d_model):
+                    dx[t][j] += row[j]
+
+        # 2) 路由梯度：被选中专家的 softmax
+        for t in range(T):
+            route = self.routes[t]
+            c = []
+            for e, _w in route:
+                gpos = self.group_pos[e][t]
+                c.append(sum(map(_mul, dout_seq[t], self._last_group_out[e][gpos])))
+            # p 已归一化在选中集合上：dz_j = p_j (c_j - Σ_k p_k c_k)
+            q = [w for _e, w in route]
+            base = sum(q[k] * c[k] for k in range(len(route)))
+            xt = self.x[t]
+            for k, (e, _w) in enumerate(route):
+                dz = q[k] * (c[k] - base)
+                self.grad_b_gate[e] += dz
+                gw = self.grad_W_gate[e]
+                for j in range(self.d_model):
+                    gw[j] += dz * xt[j]
+                    dx[t][j] += dz * self.W_gate[e][j]
+        return dx
+
+    # ---- 优化
+    def sgd_step(self, lr: float = 0.01):
+        for _name, param, grad in self._named_params():
+            if isinstance(param[0], list):
+                for i in range(len(param)):
+                    for j in range(len(param[i])):
+                        param[i][j] -= lr * grad[i][j]
+            else:
+                for i in range(len(param)):
+                    param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float = 1e-3, b1: float = 0.9, b2: float = 0.999,
+                  eps: float = 1e-8):
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            _adam_apply(param, grad, self.m[name], self.v[name], t, lr, b1, b2, eps)
+
+    def train(self):
+        for expert in self.experts:
+            expert.train()
+        return self
+
+    def eval(self):
+        for expert in self.experts:
+            expert.eval()
+        return self
+
+
 def _sgd_apply(param, grad, lr):
     """就地 SGD 更新参数: 支持 1D / 2D 列表（param 与 grad 结构一致）"""
     if grad and isinstance(grad[0], (list, tuple)):

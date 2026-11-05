@@ -196,6 +196,7 @@ model.train()     # 回到训练
 | `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`window=N` → 滑动窗口局部因果；`rope=True` → Q/K 旋转位置编码；`dropout>0` → 注意力权重 dropout） |
 | `FeedForward(d_model, d_ff, activation='relu')` | 前馈网络（`activation` 可选 relu/gelu/sigmoid/silu/mish/elu/selu/linear） |
 | `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN |
+| `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` / `window=N` / `alibi=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` / `window` 会传给每一层） |
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
@@ -712,6 +713,27 @@ print(model.history['train_loss'][-1])
 `input_dim`/`output_dim` 可以只给一个、另一个从 `data` 推断，
 `seed` 同时固定权重初始化与每轮打乱，因此同配置同数据可复现。
 
+## 专家混合（MoE）
+
+`MoE` 用一条路由网络给每个 token 选 top-k 个专家，只让这几条路径参与计算：
+
+```python
+moe = AI.MoE(d_model=32, d_ff=64, num_experts=4, top_k=2)
+out = moe.forward(hidden)            # (T, d_model)，与 FeedForward 同形
+loss, dout = ..., ...               # 由上层给出对 out 的梯度
+dx = moe.backward(dout)             # (T, d_model)，可继续往前传
+moe.adam_step(lr=1e-3)
+```
+
+与 `FeedForward` 的区别：参数量随 `num_experts` 线性增长，但每个 token 只走
+`top_k` 条路径，所以计算量按 `top_k` 增长而不是按专家数。路由权重是在
+**被选中的专家**上做的 softmax（Switch/GShard 风格），未被选中的专家梯度恰为 0，
+这一点在测试里单独断言过。
+
+实现上这是教学版本：token 先按专家分组再逐组前向，没有做 scatter/gather 的
+批量矩阵化。token 数不多时很快，超长序列会比稠密 FFN 慢；真实实现需要更复杂的
+分组矩阵乘法。
+
 ## 序列标注与多标签分类
 
 `CausalLM` / `TransformerEncoder` 输出的是逐位置隐状态，接上分类头就能做 NER、
@@ -851,7 +873,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-660 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+665 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -872,6 +894,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHyperparameterSearch` | 网格全组合与参数覆盖、`best` 确实是最优分、随机搜索同 seed 可复现、`accuracy` 取最大、全局 RNG 不被推进、十类非法输入（含 `val_split=0` 用 `val_loss`、缺 `x`/`y` 用 `accuracy`） |
 | `TestTokenClassificationHead` | 形状与参数校验、W/b 中心差分、`mask` 只算有效 token 且被屏蔽行梯度为 0、`predict` 的 argmax 与 mask 语义、300 步训练后 loss 降 20 倍并全对 |
 | `TestMultiLabelHead` | 概率范围与校验、BCE 梯度中心差分、阈值预测（含非法阈值）、400 步训练后 loss 降 3 倍并全对 |
+| `TestMoE` | 形状与参数校验（含 `top_k > num_experts`、非法 `top_k`）、`top_k=1` 权重恒 1、路由权重与专家权重/输入的中心差分、未选中专家梯度恰为 0、200 步训练降 5 倍且至少两个专家被用到 |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -947,6 +970,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 660 个单元测试
+├── test_ai.py       # 665 个单元测试
 └── README.md
 ```
