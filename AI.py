@@ -10999,6 +10999,238 @@ def make_regressor(input_dim, output_dim=1, hidden_layers=(32,),
                  lr=lr, opt_kwargs=opt_kwargs, task='regression')
 
 
+_CONFIG_KEYS = frozenset({
+    "input_dim", "output_dim", "hidden", "activations", "output_activation", "task",
+    "loss", "loss_kwargs", "optimizer", "lr", "opt_kwargs",
+    "epochs", "batch_size", "val_split", "patience", "seed", "shuffle",
+    "grad_clip", "grad_accum", "restore_best_weights", "verbose",
+    "lr_scheduler", "checkpoint_path", "checkpoint_every",
+})
+
+_SCHEDULER_KEYS = frozenset({
+    "type", "step_size", "gamma", "t_max", "eta_min",
+    "warmup_epochs", "start_factor", "base_scheduler",
+    "factor", "patience", "min_lr", "mode", "threshold", "max_reductions",
+})
+
+
+def _config_mapping(config, who):
+    if isinstance(config, str):
+        with io.open(config, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    if not isinstance(config, dict):
+        raise TypeError(f"{who}: 配置必须是 dict 或 JSON 文件路径")
+    unknown = sorted(set(config) - _CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{who}: 不认识的配置项 {unknown}；可用项见 AI._CONFIG_KEYS")
+    return dict(config)
+
+
+def _config_int(config, key, default, minimum=None, who="config"):
+    value = config.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{who}: {key} 必须是 int，收到 {value!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{who}: {key} 必须 >= {minimum}，收到 {value}")
+    return value
+
+
+def _config_number(config, key, default, who="config"):
+    value = config.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{who}: {key} 必须是数字，收到 {value!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"{who}: {key} 必须是有限数，收到 {value!r}")
+    return float(value)
+
+
+def _config_bool(config, key, default, who="config"):
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"{who}: {key} 必须是 bool，收到 {value!r}")
+
+
+def _build_scheduler(spec, optimizer, who="config"):
+    """把 {"type": "step", ...} 这样的描述变成调度器对象。"""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise TypeError(f"{who}: lr_scheduler 必须是 dict 或 None")
+    unknown = sorted(set(spec) - _SCHEDULER_KEYS)
+    if unknown:
+        raise ValueError(f"{who}: lr_scheduler 里有不认识的键 {unknown}")
+    kind = spec.get("type")
+    if not isinstance(kind, str):
+        raise TypeError(f"{who}: lr_scheduler.type 必须是字符串")
+    kind = kind.lower()
+    if kind == "step":
+        return StepLR(optimizer,
+                      step_size=_config_int(spec, "step_size", 30, 1, who),
+                      gamma=_config_number(spec, "gamma", 0.1, who))
+    if kind == "exponential":
+        return ExponentialLR(optimizer, gamma=_config_number(spec, "gamma", 0.99, who))
+    if kind == "cosine":
+        return CosineAnnealingLR(optimizer,
+                                 T_max=_config_int(spec, "t_max", 10, 1, who),
+                                 eta_min=_config_number(spec, "eta_min", 0.0, who))
+    if kind == "warmup":
+        base_spec = spec.get("base_scheduler")
+        base = None
+        if base_spec is not None:
+            if not isinstance(base_spec, dict):
+                raise TypeError(f"{who}: warmup.base_scheduler 必须是 dict 或 None")
+            base = _build_scheduler(base_spec, optimizer, who)
+        return WarmupLR(optimizer,
+                        warmup_epochs=_config_int(spec, "warmup_epochs", 5, 1, who),
+                        start_factor=_config_number(spec, "start_factor", 0.0, who),
+                        base_scheduler=base)
+    if kind == "plateau":
+        return ReduceLROnPlateau(optimizer,
+                                 factor=_config_number(spec, "factor", 0.5, who),
+                                 patience=_config_int(spec, "patience", 10, 0, who),
+                                 min_lr=_config_number(spec, "min_lr", 0.0, who),
+                                 mode=spec.get("mode", "min"),
+                                 threshold=_config_number(spec, "threshold", 1e-4, who),
+                                 max_reductions=spec.get("max_reductions"))
+    raise ValueError(
+        f"{who}: 未知的 lr_scheduler.type {kind!r}（可选 step / exponential / cosine / warmup / plateau）")
+
+
+def _infer_dims(data):
+    """从 [(x, y), ...] 推断输入/输出维度。"""
+    if not isinstance(data, (list, tuple)) or not data:
+        raise ValueError("build_model: 没有给 input_dim/output_dim 时必须提供非空 data")
+    first = data[0]
+    if not isinstance(first, (list, tuple)) or len(first) != 2:
+        raise ValueError("build_model: data 的每个样本必须是 (x, y)")
+    x, y = first
+    x = x if isinstance(x, (list, tuple)) else [x]
+    y = y if isinstance(y, (list, tuple)) else [y]
+    if not x or not y:
+        raise ValueError("build_model: 样本的 x / y 不能为空")
+    return len(x), len(y)
+
+
+def build_model(config, data=None):
+    """按配置字典（或 JSON 文件路径）建一个 `Model`。
+
+    必需：`input_dim` / `output_dim`（也可以给 `data` 让函数推断）。
+    `hidden` 缺省 `[16]`；`activations` 缺省全部 `relu`；
+    `output_activation` 缺省按 `task` 取（分类 softmax、回归 linear）。
+    """
+    cfg = _config_mapping(config, "build_model")
+    in_dim, out_dim = cfg.get("input_dim"), cfg.get("output_dim")
+    if in_dim is None or out_dim is None:
+        guessed_in, guessed_out = _infer_dims(data)
+        in_dim = guessed_in if in_dim is None else in_dim
+        out_dim = guessed_out if out_dim is None else out_dim
+    in_dim = _config_int({"v": in_dim}, "v", 1, 1, "build_model")
+    out_dim = _config_int({"v": out_dim}, "v", 1, 1, "build_model")
+
+    hidden = cfg.get("hidden", [16])
+    if not isinstance(hidden, (list, tuple)):
+        raise TypeError("build_model: hidden 必须是 list")
+    if not hidden:
+        raise ValueError("build_model: hidden 不能为空（至少一层隐藏层）")
+    hidden = [_config_int({"h": h}, "h", 1, 1, "build_model") for h in hidden]
+
+    task = cfg.get("task", "auto")
+    if task not in ("auto", "regression", "classification"):
+        raise ValueError(f"build_model: task 只能是 auto/regression/classification，收到 {task!r}")
+    if task == "auto":
+        task = "classification" if out_dim > 1 else "regression"
+
+    default_out = "softmax" if task == "classification" else "linear"
+    out_act = cfg.get("output_activation", default_out)
+
+    n_hidden = len(hidden)
+    activations = cfg.get("activations")
+    if activations is None:
+        activations = ["relu"] * n_hidden
+    if not isinstance(activations, (list, tuple)):
+        raise TypeError("build_model: activations 必须是 list")
+    if len(activations) != n_hidden:
+        raise ValueError(
+            f"build_model: activations 有 {len(activations)} 项，但 hidden 有 {n_hidden} 层")
+    activations = list(activations) + [out_act]
+
+    mlp = MLP([in_dim] + hidden + [out_dim], activations=activations)
+    return Model(
+        mlp,
+        loss_fn=cfg.get("loss"),
+        optimizer=cfg.get("optimizer", "adam"),
+        lr=_config_number(cfg, "lr", 0.01, "build_model"),
+        opt_kwargs=cfg.get("opt_kwargs"),
+        task=task,
+        loss_kwargs=cfg.get("loss_kwargs"),
+    )
+
+
+def train_from_config(config, data=None, x=None, y=None, verbose=None):
+    """按配置建模型并训练，返回训练好的 `Model`（`model.history` 里有曲线）。
+
+    `data` 与 `x`/`y` 二选一；给了 `data` 时若配置里没有维度就自动推断。
+    `verbose` 不传时用配置里的 `verbose`（缺省 True）。
+    """
+    cfg = _config_mapping(config, "train_from_config")
+    if data is not None and (x is not None or y is not None):
+        raise ValueError("train_from_config: data 与 x/y 不能同时给")
+
+    seed = cfg.get("seed")
+    if seed is not None:
+        # 与 quick_train 一致：seed 同时固定初始化与打乱，
+        # 且只在初始化期间临时改全局 random，之后原样恢复。
+        _saved_state = random.getstate()
+        try:
+            random.seed(seed)
+            model = build_model(cfg, data=data)
+        finally:
+            random.setstate(_saved_state)
+    else:
+        model = build_model(cfg, data=data)
+
+    if verbose is None:
+        verbose = cfg.get("verbose", True)
+    if not isinstance(verbose, bool):
+        raise TypeError("train_from_config: verbose 必须是 bool")
+
+    scheduler = _build_scheduler(cfg.get("lr_scheduler"), model.optimizer,
+                                 "train_from_config")
+
+    fit_kwargs = dict(
+        epochs=_config_int(cfg, "epochs", 100, 0, "train_from_config"),
+        batch_size=_config_int(cfg, "batch_size", 32, 1, "train_from_config"),
+        patience=_config_int(cfg, "patience", 50, 0, "train_from_config"),
+        grad_accum=_config_int(cfg, "grad_accum", 1, 1, "train_from_config"),
+        shuffle=_config_bool(cfg, "shuffle", True, "train_from_config"),
+        restore_best_weights=_config_bool(cfg, "restore_best_weights", False,
+                                          "train_from_config"),
+        verbose=verbose,
+        lr_scheduler=scheduler,
+        checkpoint_path=cfg.get("checkpoint_path"),
+        checkpoint_every=_config_int(cfg, "checkpoint_every", 1, 1, "train_from_config"),
+        seed=seed,
+    )
+    if cfg.get("val_split") is not None:
+        fit_kwargs["val_split"] = _config_number(cfg, "val_split", 0.1, "train_from_config")
+    if cfg.get("grad_clip") is not None:
+        fit_kwargs["grad_clip"] = _config_number(cfg, "grad_clip", 0.0, "train_from_config")
+
+    if data is not None:
+        model.fit(data=data, **fit_kwargs)
+    else:
+        if x is None or y is None:
+            raise ValueError("train_from_config: 必须给 data 或同时给 x 和 y")
+        model.fit(x=x, y=y, **fit_kwargs)
+    return model
+
+
 def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
                 batch_size=32, lr=0.01, val_split=0.1, patience=30,
                 optimizer='adam', verbose=True, seed=None):

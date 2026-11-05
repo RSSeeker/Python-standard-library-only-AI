@@ -7717,3 +7717,116 @@ class TestAttentionMaps:
             AI.attention_ascii({})
         with pytest.raises(ValueError):
             AI.attention_ascii(rep, max_width=0)
+
+
+class TestConfigDriven:
+    CFG = {"input_dim": 2, "output_dim": 2, "hidden": [8], "task": "classification",
+           "lr": 0.05, "epochs": 40, "batch_size": 4, "seed": 3, "verbose": False,
+           "patience": 0}
+
+    @staticmethod
+    def _data():
+        xs = [[i / 20.0, 0.0] for i in range(20)]
+        ys = [1 if v[0] > 0.5 else 0 for v in xs]
+        return xs, ys, list(zip(xs, ys))
+
+    def test_build_model(self):
+        m = AI.build_model({"input_dim": 3, "output_dim": 2, "hidden": [5, 4],
+                            "activations": ["relu", "sigmoid"]})
+        assert [l.fan_in for l in m.model.layers] == [3, 5, 4]
+        assert [l.fan_out for l in m.model.layers] == [5, 4, 2]
+        assert m.model.layers[-1].activation_name == "softmax"
+        assert m.model.param_count() == 3 * 5 + 5 + 5 * 4 + 4 + 4 * 2 + 2
+        # 从 data 推断维度
+        xs, ys, pairs = self._data()
+        m2 = AI.build_model({"hidden": [6]}, data=pairs)
+        assert [l.fan_in for l in m2.model.layers] == [2, 6]
+        # y 是标量 -> 推断为 1 维回归输出
+        assert m2.model.layers[-1].fan_out == 1
+        assert m2.task == "regression"
+        # 显式给 output_dim / task 时按给定的来
+        m3 = AI.build_model({"hidden": [6], "output_dim": 2, "task": "classification"},
+                            data=pairs)
+        assert m3.model.layers[-1].fan_out == 2
+        assert m3.model.layers[-1].activation_name == "softmax"
+        # 回归默认 linear 输出
+        reg = AI.build_model({"input_dim": 2, "output_dim": 1, "task": "regression"})
+        assert reg.model.layers[-1].activation_name == "linear"
+        assert reg.task == "regression"
+
+    def test_validation(self):
+        base = {"input_dim": 2, "output_dim": 1}
+        with pytest.raises(TypeError):
+            AI.build_model(dict(base, hidden="abc"))
+        with pytest.raises(ValueError):
+            AI.build_model(dict(base, hidden=[3], activations=["relu", "relu"]))
+        with pytest.raises(TypeError):
+            AI.build_model(dict(base, lr="fast"))
+        with pytest.raises(ValueError):
+            AI.build_model(dict(base, lr=float("nan")))
+        with pytest.raises(ValueError):
+            AI.build_model(dict(base, typo_key=1))
+        with pytest.raises(ValueError):
+            AI.build_model(dict(base, task="clf"))
+        with pytest.raises(ValueError):
+            AI.build_model({"hidden": [3]})
+        with pytest.raises(TypeError):
+            AI.build_model(123)
+
+    def test_scheduler_build(self):
+        m = AI.build_model({"input_dim": 2, "output_dim": 1, "hidden": [3]})
+        opt = m.optimizer
+        assert isinstance(AI._build_scheduler({"type": "step", "step_size": 10}, opt), AI.StepLR)
+        assert isinstance(AI._build_scheduler({"type": "exponential", "gamma": 0.9}, opt),
+                          AI.ExponentialLR)
+        assert isinstance(AI._build_scheduler({"type": "cosine", "t_max": 20}, opt),
+                          AI.CosineAnnealingLR)
+        assert isinstance(AI._build_scheduler({"type": "plateau", "patience": 3}, opt),
+                          AI.ReduceLROnPlateau)
+        warm = AI._build_scheduler({"type": "warmup", "warmup_epochs": 3,
+                                    "base_scheduler": {"type": "step", "step_size": 10}}, opt)
+        assert isinstance(warm, AI.WarmupLR) and isinstance(warm.base_scheduler, AI.StepLR)
+        with pytest.raises(ValueError):
+            AI._build_scheduler({"type": "magic"}, opt)
+        with pytest.raises(ValueError):
+            AI._build_scheduler({"type": "step", "bogus": 1}, opt)
+
+    def test_train_from_config(self):
+        xs, ys, pairs = self._data()
+        model = AI.train_from_config(self.CFG, data=pairs)
+        hist = [v for _, v in model.history["train_loss"]]
+        assert len(hist) == 40
+        assert hist[-1] < 0.5 * hist[0]
+        preds = [max(range(len(p)), key=lambda k: p[k])
+                 for p in (model.predict(v) for v in xs)]
+        assert len(set(preds)) == 2
+        assert sum(1 for p, t in zip(preds, ys) if p == t) / len(xs) >= 0.8
+
+    def test_seed_reproducible(self):
+        _xs, _ys, pairs = self._data()
+        a = AI.train_from_config(self.CFG, data=pairs)
+        b = AI.train_from_config(self.CFG, data=pairs)
+        assert [v for _, v in a.history["train_loss"]] == [v for _, v in b.history["train_loss"]]
+        for (wa, ba), (wb, bb) in zip(a.model.get_parameters(), b.model.get_parameters()):
+            for ra, rb in zip(wa, wb):
+                assert all(abs(x - y) < 1e-15 for x, y in zip(ra, rb))
+            assert all(abs(x - y) < 1e-15 for x, y in zip(ba, bb))
+
+    def test_json_config_and_conflicts(self):
+        xs, ys, pairs = self._data()
+        cfg = dict(self.CFG, epochs=10, lr_scheduler={"type": "step", "step_size": 5})
+        path = os.path.join(tempfile.gettempdir(), "test_config.json")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, ensure_ascii=False)
+            model = AI.train_from_config(path, data=pairs)
+            assert len(model.history["train_loss"]) == 10
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        model2 = AI.train_from_config(self.CFG, x=xs, y=ys)
+        assert len(model2.history["train_loss"]) == 40
+        with pytest.raises(ValueError):
+            AI.train_from_config(self.CFG, data=pairs, x=xs)
+        with pytest.raises(ValueError):
+            AI.train_from_config(self.CFG)
