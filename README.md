@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（429 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（677 项）
 
 ## 特性
 
@@ -18,6 +18,11 @@
   RoPE 旋转位置编码、KV cache 生成（默认开启，比整段重算快约 18 倍且结果逐位相同），
   以及 Focal / BCE / BCEWithLogits / Huber / KL 与 label smoothing；
   这些损失都能通过 `Model(loss_fn='focal', loss_kwargs={...})` 直接用，配错输出层激活会在构造时报错
+- **LLM 全家桶**: `Seq2SeqLM`（encoder-decoder + teacher forcing）/ `MaskedLM`（BERT 式）、GQA/MQA、滑动窗口、ALiBi、SwiGLU、LoRA、Lion / Adafactor、以及 min-p / 重复·存在·频率惩罚 / 禁重复 n-gram 五种采样控制
+- **训练工程化**: 梯度累积、断点续训（含优化器与损失配置）、分层切分、K 折、`StandardScaler` / `MinMaxScaler`、配置驱动训练、超参搜索、逐层性能剖析、学习率扫描
+- **评估与诊断**: 14 个纯标准库指标（含混淆矩阵 / PRF / MCC / AUC / BLEU / ROUGE-L）、`grad_check` 梯度自检、`estimate_flops`、`ascii_plot`、注意力可视化
+- **更多模型**: 序列标注头与多标签头、`MoE` 专家混合、VAE / GAN / DDPM 三个生成模型
+- **分词器**: 字节级 BPE（任意 UTF-8 无损）与 WordPiece（`##` 子词 + 最长前缀匹配）
 
 ## 快速开始
 
@@ -507,12 +512,12 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `cross_entropy_loss(pred, target, label_smoothing=0.0)` | 交叉熵；`target` 可以是类别索引、one-hot 或概率向量（软标签）；`label_smoothing>0` 时目标分布取 `(1-ε)·onehot + ε/K` |
 | `focal_loss(pred, idx, gamma=2.0, alpha=None)` | Focal Loss：`-α(1-p_t)^γ·log p_t`，压易分样本、聚焦难样本（`gamma=0` 即普通 CE） |
 | `bce_loss(pred, target)` | 二元交叉熵，`pred` 是概率（配 `sigmoid` 输出层）；返回的梯度相对概率 |
-| `bce_with_logits_loss(logits, target)` | 数值稳定的 BCE：`max(z,0) - z·y + log1p(exp(-|z|))`，直接吃 logits |
+| `bce_with_logits_loss(logits, target)` | 数值稳定的 BCE：`max(z,0) - z·y + log1p(exp(-\|z\|))`，直接吃 logits |
 | `huber_loss(pred, target, delta=1.0)` | Huber / Smooth L1，对离群点比 MSE 稳 |
 | `kl_divergence(pred, target)` | `KL(target ‖ pred) = Σ t·log(t/p)`，蒸馏/软目标常用 |
 | `triplet_loss(anchor, pos, neg, margin=1.0)` | `max(0, d(a,p) − d(a,n) + margin)`（欧氏距离），返回三个梯度；已满足间隔时梯度全 0 |
 | `info_nce_loss(anchor, pos, negs, temperature=0.07)` | 对比学习：余弦相似度 + 交叉熵，1 正 + N 负；返回 anchor / 正 / 每个负的梯度 |
-| `dice_loss(pred, target)` | 分割常用 `1 − (2|p∩t|+ε)/(|p|+|t|+ε)`，支持 `(C,H,W)` 或扁平结构 |
+| `dice_loss(pred, target)` | 分割常用 `1 − (2\|p∩t\|+ε)/(\|p\|+\|t\|+ε)`，支持 `(C,H,W)` 或扁平结构 |
 | `ctc_loss(log_probs, targets, blank=0)` | CTC（单样本、log 空间前向后向）：输入 `(T,K)` 的 log 概率，返回对 log 概率的梯度 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |

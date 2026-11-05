@@ -35,13 +35,15 @@
 #  11. More Optimizers: SGD / SGD+Momentum / RMSprop
 #  12. Gradient Clipping / LR Scheduler
 #  13. Data Utilities
-#  14. Text Processing（字符级语言模型工具）
+#  14. Text Processing（分词与文本工具）
 #  15. Trainer
 #  16. 评估指标（分类 / 回归 / 序列 / 生成）
 #  17. 模型保存 / 加载 (JSON)
-#  18. PyTorch 数值对齐对比
-#  19. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  20. Main: 回归 + 分类 + CNN 完整示例
+#  18. 序列标注 / 多标签分类头
+#  19. PyTorch 数值对齐对比
+#  20. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  21. 生成模型：VAE / GAN / DDPM
+#  22. Main: 回归 + 分类 + CNN 完整示例
 
 
 import io
@@ -8371,7 +8373,7 @@ def ascii_plot(history, keys=("train_loss", "val_loss"), width: int = 60,
 
 
 # ============================================================================
-#  Text Processing（字符级语言模型工具）
+#  Text Processing（分词与文本工具）
 # ============================================================================
 
 def _bpe_pretokenize(text):
@@ -9101,6 +9103,11 @@ def train(model: MLP, loss_fn: Callable, optimizer: Adam, data: list,
 
 
 def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
+    """在 `data`（样本对列表）上算平均损失，不训练、不改权重。
+
+    `loss_fn(pred, y)` 返回 `(loss, grad)`，这里只用第一项；空数据集报 ValueError。
+    只看损失、要完整指标时用 `Model.evaluate_all` / `evaluate_all`。
+    """
     if not data:
         raise ValueError("evaluate: 数据集为空")
     total = 0.0
