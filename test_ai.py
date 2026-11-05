@@ -6505,3 +6505,261 @@ class TestBatchNorm2d:
                             AI.Layer(4 * 2 * 2, 3))
         info = AI.estimate_flops(net, (2, 6, 6))
         assert info["flops"] > 0 and info["output_shape"] == [3]
+
+
+#============================================================================
+#  批量 A：新激活 / SwiGLU / ALiBi
+#============================================================================
+class TestNewActivations:
+    """SiLU / Mish / ELU / SELU 的前向数值与导数"""
+
+    def _ref(self, name, z):
+        if name == "silu":
+            return z / (1.0 + math.exp(-z))
+        if name == "mish":
+            return z * math.tanh(math.log1p(math.exp(z)))
+        if name == "elu":
+            return z if z > 0 else math.exp(z) - 1.0
+        if name == "selu":
+            la, al = 1.0507009873554805, 1.6732632423543772
+            return la * (z if z > 0 else al * (math.exp(z) - 1.0))
+        raise AssertionError(name)
+
+    def test_forward_values(self):
+        zs = [-3.0, -1.2, -0.3, 0.0, 0.5, 2.0, 5.0]
+        for name in ("silu", "mish", "elu", "selu"):
+            layer = AI.Layer(4, 4, activation=name)
+            got = layer.act_fn(zs)
+            for g, z in zip(got, zs):
+                assert abs(g - self._ref(name, z)) < 1e-12, (name, z, g)
+
+    def test_deriv_vs_numeric(self):
+        zs = [-2.0, -0.4, 0.7, 1.5]
+        eps = 1e-6
+        for name in ("silu", "mish", "elu", "selu"):
+            layer = AI.Layer(4, 4, activation=name)
+            d = layer.act_deriv(zs)
+            for i, z in enumerate(zs):
+                num = (self._ref(name, z + eps) - self._ref(name, z - eps)) / (2 * eps)
+                rel = abs(d[i] - num) / max(1e-12, abs(d[i]) + abs(num))
+                assert rel < 1e-6, (name, z, d[i], num)
+
+    def test_layer_backward_gradient(self):
+        random.seed(11)
+        layer = AI.Layer(4, 3, activation="mish")
+        x = [0.3, -0.7, 1.1, 0.2]
+        delta = [0.5, -0.9, 0.4]
+        layer.forward(x)
+        gw, gb, _ = layer.backward(delta)
+        eps = 1e-6
+        ana = gw[1][2]
+        layer.weights[1][2] += eps
+        up = sum(layer.forward(x)[j] * delta[j] for j in range(3))
+        layer.weights[1][2] -= 2 * eps
+        dn = sum(layer.forward(x)[j] * delta[j] for j in range(3))
+        layer.weights[1][2] += eps
+        num = (up - dn) / (2 * eps)
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_feedforward_supports_new_activations(self):
+        eps = 1e-6
+        for act in ("silu", "mish", "elu", "selu"):
+            random.seed(23)
+            ff = AI.FeedForward(4, 6, activation=act)
+            xs = [[0.2, -0.5, 0.9, 0.1], [-1.0, 0.4, 0.3, 0.7]]
+            dout = [[0.3, -0.2, 0.5, 0.1], [0.1, 0.2, -0.3, 0.4]]
+            ff.zero_grad()
+            ff.forward(xs)
+            ff.backward(dout)
+            ana = ff.grads["W1"][2][1]
+
+            def loss():
+                o = ff.forward(xs)
+                return sum(o[t][j] * dout[t][j] for t in range(2) for j in range(4))
+
+            old = ff.W1[2][1]
+            ff.W1[2][1] = old + eps
+            up = loss()
+            ff.W1[2][1] = old - eps
+            dn = loss()
+            ff.W1[2][1] = old
+            num = (up - dn) / (2 * eps)
+            assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6, act
+
+    def test_unknown_activation_still_rejected(self):
+        with pytest.raises(ValueError):
+            AI.Layer(3, 3, activation="gelu2")
+        with pytest.raises(ValueError):
+            AI.FeedForward(4, 8, activation="swish")
+
+
+class TestSwiGLU:
+    """门控前馈网络 SwiGLU"""
+
+    def test_bias_only_path(self):
+        # W_g = 0, b_g = 0 → silu(0) = 0 → 门控全 0 → 输出只剩 b2
+        gl = AI.SwiGLU(3, 5)
+        gl.Wg = [[0.0] * 3 for _ in range(5)]
+        gl.bg = [0.0] * 5
+        gl.b2 = [0.5, -0.5, 1.0]
+        out = gl.forward([[1.0, 2.0, 3.0]])
+        assert out[0] == pytest.approx([0.5, -0.5, 1.0], abs=1e-12)
+
+    def test_gradients_vs_numeric(self):
+        random.seed(31)
+        gl = AI.SwiGLU(4, 6)
+        xs = [[0.2, -0.5, 0.9, 0.1], [-1.0, 0.4, 0.3, 0.7]]
+        dout = [[0.3, -0.2, 0.5, 0.1], [0.1, 0.2, -0.3, 0.4]]
+        gl.zero_grad()
+        gl.forward(xs)
+        gl.backward(dout)
+        eps = 1e-6
+
+        def loss():
+            o = gl.forward(xs)
+            return sum(o[t][j] * dout[t][j] for t in range(2) for j in range(4))
+
+        for name, i, j in (("W1", 2, 1), ("Wg", 0, 3), ("W2", 1, 4)):
+            ana = gl.grads[name][i][j]
+            m = getattr(gl, name)
+            old = m[i][j]
+            m[i][j] = old + eps
+            up = loss()
+            m[i][j] = old - eps
+            dn = loss()
+            m[i][j] = old
+            num = (up - dn) / (2 * eps)
+            assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6, name
+        for name, i in (("b1", 1), ("bg", 2), ("b2", 3)):
+            ana = gl.grads[name][i]
+            m = getattr(gl, name)
+            old = m[i]
+            m[i] = old + eps
+            up = loss()
+            m[i] = old - eps
+            dn = loss()
+            m[i] = old
+            num = (up - dn) / (2 * eps)
+            assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6, name
+
+    def test_dx_vs_numeric(self):
+        random.seed(32)
+        gl = AI.SwiGLU(3, 4)
+        xs = [[0.4, -0.2, 0.6], [0.1, 0.3, -0.5]]
+        dout = [[1.0, -1.0, 0.5], [0.2, 0.4, -0.3]]
+        gl.zero_grad()
+        gl.forward(xs)
+        dx = gl.backward(dout)
+        eps = 1e-6
+        old = xs[0][1]
+        xs[0][1] = old + eps
+        o = gl.forward(xs)
+        up = sum(o[t][j] * dout[t][j] for t in range(2) for j in range(3))
+        xs[0][1] = old - eps
+        o = gl.forward(xs)
+        dn = sum(o[t][j] * dout[t][j] for t in range(2) for j in range(3))
+        xs[0][1] = old
+        num = (up - dn) / (2 * eps)
+        assert abs(dx[0][1] - num) / max(1e-12, abs(dx[0][1]) + abs(num)) < 1e-6
+
+    def test_gradient_accumulates(self):
+        random.seed(33)
+        gl = AI.SwiGLU(3, 4)
+        xs = [[0.4, -0.2, 0.6]]
+        dout = [[1.0, -1.0, 0.5]]
+        gl.zero_grad()
+        gl.forward(xs)
+        gl.backward(dout)
+        once = gl.grads["W1"][1][1]
+        gl.backward(dout)
+        assert abs(gl.grads["W1"][1][1] - 2 * once) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.SwiGLU(0, 4)
+        with pytest.raises(ValueError):
+            AI.SwiGLU(4, -1)
+        gl = AI.SwiGLU(3, 4)
+        with pytest.raises(ValueError):
+            gl.forward([])
+        with pytest.raises(ValueError):
+            gl.forward([[1.0, 2.0]])
+        with pytest.raises(RuntimeError):
+            gl.backward([[1.0, 1.0, 1.0]])
+
+
+class TestALiBi:
+    """线性注意力偏置"""
+
+    def test_uniform_content_matches_formula(self):
+        # 输入全 0 → Q/K/V 全 0 → scores 只剩 ALiBi 偏置
+        mha = AI.MultiHeadAttention(4, 2, causal=True, alibi=True)
+        xs = [[0.0] * 4 for _ in range(5)]
+        mha.forward(xs)
+        slope = mha.alibi_slopes[0]
+        attn = mha.attn_weights[0]
+        for j in range(5):
+            expect = math.exp(slope * (4 - j))
+            total = sum(math.exp(slope * (4 - k)) for k in range(5))
+            assert abs(attn[4][j] - expect / total) < 1e-12, j
+
+    def test_causal_mask_preserved(self):
+        mha = AI.MultiHeadAttention(4, 2, causal=True, alibi=True)
+        xs = [[0.1 * t + 0.02 * j for j in range(4)] for t in range(5)]
+        mha.forward(xs)
+        attn = mha.attn_weights[0]
+        for t in range(5):
+            for j in range(t + 1, 5):
+                assert attn[t][j] == 0.0
+
+    def test_forward_step_matches_forward(self):
+        random.seed(41)
+        mha = AI.MultiHeadAttention(8, 2, causal=True, alibi=True)
+        xs = [[0.1 * t + 0.05 * j for j in range(8)] for t in range(5)]
+        cache = {}
+        last = None
+        for t in range(5):
+            last = mha.forward_step(xs[t], cache)
+        full = mha.forward(xs)[-1]
+        for j in range(8):
+            assert abs(last[j] - full[j]) == 0.0
+
+    def test_gradient_vs_numeric(self):
+        random.seed(42)
+        mha = AI.MultiHeadAttention(8, 2, causal=True, alibi=True)
+        xs = [[0.1 * t - 0.03 * j for j in range(8)] for t in range(4)]
+        dout = [[0.1 * (t + 1) + 0.01 * j for j in range(8)] for t in range(4)]
+        mha.zero_grad()
+        mha.forward(xs)
+        mha.backward(dout)
+        ana = mha.grads["W_q"][1][2]
+        eps = 1e-6
+
+        def loss():
+            o = mha.forward(xs)
+            return sum(o[t][j] * dout[t][j] for t in range(4) for j in range(8))
+
+        old = mha.W_q[1][2]
+        mha.W_q[1][2] = old + eps
+        up = loss()
+        mha.W_q[1][2] = old - eps
+        dn = loss()
+        mha.W_q[1][2] = old
+        num = (up - dn) / (2 * eps)
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_passthrough_and_training(self):
+        random.seed(7)
+        lm = AI.CausalLM(5, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                         max_len=8, alibi=True)
+        assert lm.encoder.layers[0].self_attn.alibi is True
+        hist = lm.fit([[0, 1, 2, 3, 4]], epochs=20, lr=0.01)
+        assert hist[-1] < 0.3 * hist[0]
+        assert lm.generate([0], 4, top_k=1) == [0, 1, 2, 3, 4]
+
+    def test_alibi_off_is_default(self):
+        mha = AI.MultiHeadAttention(4, 2)
+        assert mha.alibi is False
+        te = AI.TransformerEncoder(4, 2, 8, num_layers=1)
+        assert te.layers[0].self_attn.alibi is False
+

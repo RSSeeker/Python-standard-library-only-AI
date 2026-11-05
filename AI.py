@@ -59,6 +59,70 @@ _mul = operator.mul
 
 # GELU 的 tanh 近似常数：sqrt(2/pi)
 _GELU_C = math.sqrt(2.0 / math.pi)
+# SiLU / Mish / ELU / SELU 的标量实现（Layer 与 FeedForward / SwiGLU 共用，
+# 保证同一种激活在各处数值完全一致）
+_SELU_LAMBDA = 1.0507009873554805
+_SELU_ALPHA = 1.6732632423543772
+_ELU_ALPHA = 1.0
+
+
+def _silu_scalar(z: float) -> float:
+    """SiLU / Swish：z * sigmoid(z)（LLaMA 的门控激活）"""
+    if z >= 0.0:
+        return z / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return z * e / (1.0 + e)
+
+
+def _dsilu_scalar(z: float) -> float:
+    if z >= 0.0:
+        s = 1.0 / (1.0 + math.exp(-z))
+    else:
+        e = math.exp(z)
+        s = e / (1.0 + e)
+    return s * (1.0 + z * (1.0 - s))
+
+
+def _softplus_scalar(z: float) -> float:
+    """softplus(z) = log(1+exp(z))，z 很大时退化成 z（避免 exp 溢出）"""
+    if z > 30.0:
+        return z
+    return math.log1p(math.exp(z))
+
+
+def _mish_scalar(z: float) -> float:
+    return z * math.tanh(_softplus_scalar(z))
+
+
+def _dmish_scalar(z: float) -> float:
+    sp = _softplus_scalar(z)
+    t = math.tanh(sp)
+    if z >= 0.0:
+        s = 1.0 / (1.0 + math.exp(-z))
+    else:
+        e = math.exp(z)
+        s = e / (1.0 + e)
+    return t + z * (1.0 - t * t) * s
+
+
+def _elu_scalar(z: float) -> float:
+    return z if z > 0.0 else _ELU_ALPHA * (math.exp(z) - 1.0)
+
+
+def _delu_scalar(z: float) -> float:
+    return 1.0 if z > 0.0 else _ELU_ALPHA * math.exp(z)
+
+
+def _selu_scalar(z: float) -> float:
+    if z > 0.0:
+        return _SELU_LAMBDA * z
+    return _SELU_LAMBDA * _SELU_ALPHA * (math.exp(z) - 1.0)
+
+
+def _dselu_scalar(z: float) -> float:
+    if z > 0.0:
+        return _SELU_LAMBDA
+    return _SELU_LAMBDA * _SELU_ALPHA * math.exp(z)
 
 
 # ============================================================================
@@ -112,6 +176,18 @@ class Layer:
         elif activation == "sigmoid":
             self.act_fn = self._sigmoid
             self.act_deriv = self._sigmoid_deriv
+        elif activation == "silu":
+            self.act_fn = self._silu
+            self.act_deriv = self._silu_deriv
+        elif activation == "mish":
+            self.act_fn = self._mish
+            self.act_deriv = self._mish_deriv
+        elif activation == "elu":
+            self.act_fn = self._elu
+            self.act_deriv = self._elu_deriv
+        elif activation == "selu":
+            self.act_fn = self._selu
+            self.act_deriv = self._selu_deriv
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -171,6 +247,30 @@ class Layer:
     def _sigmoid_deriv(self, z):
         s = self._sigmoid(z)
         return [si * (1.0 - si) for si in s]
+
+    def _silu(self, z):
+        return [_silu_scalar(zi) for zi in z]
+
+    def _silu_deriv(self, z):
+        return [_dsilu_scalar(zi) for zi in z]
+
+    def _mish(self, z):
+        return [_mish_scalar(zi) for zi in z]
+
+    def _mish_deriv(self, z):
+        return [_dmish_scalar(zi) for zi in z]
+
+    def _elu(self, z):
+        return [_elu_scalar(zi) for zi in z]
+
+    def _elu_deriv(self, z):
+        return [_delu_scalar(zi) for zi in z]
+
+    def _selu(self, z):
+        return [_selu_scalar(zi) for zi in z]
+
+    def _selu_deriv(self, z):
+        return [_dselu_scalar(zi) for zi in z]
 
     def _softmax(self, z):
         max_z = max(z)
@@ -2455,7 +2555,7 @@ class MultiHeadAttention:
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  causal: bool = False, rope: bool = False, rope_base: float = 10000.0,
-                 window: int = None, num_kv_heads: int = None):
+                 window: int = None, num_kv_heads: int = None, alibi: bool = False):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -2476,6 +2576,11 @@ class MultiHeadAttention:
         num_heads 时，多个 Q 头共享同一组 K/V：`W_k`/`W_v` 的输出维度从 d_model
         缩到 num_kv_heads*d_k，KV cache 同比例变小。默认 None 等于 num_heads，
         即普通 MHA——此时所有张量形状、随机数抽取顺序都与旧版一致。
+
+        alibi: 为 True 时给注意力分数加 ALiBi 线性偏置（Attention with Linear
+        Biases）：第 h 个头加 `slope_h * (t - j)`，slope_h = 2^(-8*(h+1)/num_heads)。
+        距离越远惩罚越大，天然带「近处优先」，且无需位置编码就能外推更长的序列。
+        偏置是常数、不参与求导，所以反向不需要额外分支。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
@@ -2495,6 +2600,7 @@ class MultiHeadAttention:
             if window < 1:
                 raise ValueError(f"MultiHeadAttention: window 必须 >= 1，收到 {window!r}")
             self.window = window
+        self.alibi = bool(alibi)
         self.training = True
         self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
         # 每次 forward 重建；反向只读这几个列表
@@ -2531,6 +2637,9 @@ class MultiHeadAttention:
         # RoPE 的成对频率：第 i 对用 base^(-2i/d_k)，与 Llama 一致
         self.rope_freqs = [1.0 / (self.rope_base ** (2.0 * i / self.d_k))
                            for i in range(self.d_k // 2)]
+        # ALiBi 的逐头斜率：2^(-8*(h+1)/num_heads)，与论文/CausalLM 实现一致
+        self.alibi_slopes = [2.0 ** (-8.0 * (h + 1) / num_heads)
+                             for h in range(num_heads)]
 
         std = math.sqrt(2.0 / d_model)
         self.W_q = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(d_model)]
@@ -2646,6 +2755,10 @@ class MultiHeadAttention:
                 V[kv_head].append(vh)
             keys = K[kv_head]
             scores = [sum(map(_mul, qh, keys[j])) * scale for j in range(len(keys))]
+            if self.alibi:
+                slope = self.alibi_slopes[head]
+                for j in range(len(scores)):
+                    scores[j] += slope * (pos - j)
             if self.window is not None:
                 # 增量前向只有「过去 + 自己」，窗口外的更早位置要屏蔽（与 forward 一致）
                 for j in range(max(0, pos - self.window + 1)):
@@ -2723,6 +2836,15 @@ class MultiHeadAttention:
             # scores = Q @ K^T / sqrt(d_k)  (seq_len, seq_len)
             k_t = _transpose(k_h)  # (d_k, seq_len)
             scores = [[v * scale for v in row] for row in _matmul(q_h, k_t)]
+
+            # ALiBi：按「距离」加线性偏置（常数，不参与求导）
+            if self.alibi:
+                slope = self.alibi_slopes[head]
+                for t in range(self.seq_len):
+                    row = scores[t]
+                    for j in range(self.seq_len):
+                        if j <= t:
+                            row[j] += slope * (t - j)
 
             # 因果掩码：位置 t 只能看到 j <= t。屏蔽位置置 -inf，
             # softmax 后权重恰为 0；反向的 d_scores = attn * (...) 在那些位置
@@ -2915,10 +3037,11 @@ class FeedForward:
     """
 
     def __init__(self, d_model: int, d_ff: int, activation: str = "relu"):
-        if activation not in ("relu", "gelu", "sigmoid", "linear"):
+        if activation not in ("relu", "gelu", "sigmoid", "linear",
+                              "silu", "mish", "elu", "selu"):
             raise ValueError(
                 f"FeedForward: 不支持的激活 {activation!r}；"
-                f"可选 relu/gelu/sigmoid/linear"
+                f"可选 relu/gelu/sigmoid/linear/silu/mish/elu/selu"
             )
         self.activation = activation
         self.d_model = d_model
@@ -2992,6 +3115,14 @@ class FeedForward:
                 return 1.0 / (1.0 + math.exp(-z))
             e = math.exp(z)
             return e / (1.0 + e)
+        if a == "silu":
+            return _silu_scalar(z)
+        if a == "mish":
+            return _mish_scalar(z)
+        if a == "elu":
+            return _elu_scalar(z)
+        if a == "selu":
+            return _selu_scalar(z)
         return z  # linear
 
     def _dact_scalar(self, z: float) -> float:
@@ -3007,6 +3138,14 @@ class FeedForward:
         if a == "sigmoid":
             s = self._act_scalar(z)
             return s * (1.0 - s)
+        if a == "silu":
+            return _dsilu_scalar(z)
+        if a == "mish":
+            return _dmish_scalar(z)
+        if a == "elu":
+            return _delu_scalar(z)
+        if a == "selu":
+            return _dselu_scalar(z)
         return 1.0  # linear
 
     def backward(self, dout_seq):
@@ -3053,6 +3192,134 @@ class FeedForward:
         return dx_seq
 
 
+
+class SwiGLU:
+    """门控前馈网络（LLaMA / PaLM 用的 SwiGLU）
+
+    out = (silu(x W_g) ⊙ (x W_1)) W_2 + b_2
+
+    与 `FeedForward` 的区别：多一路门控投影 `W_g`，两个分支逐元素相乘
+    （SwiGLU = Swish-Gated Linear Unit）。表达力更强，LLaMA 用它替代 ReLU-FFN。
+    d_ff 通常取 FeedForward 的 2/3 左右效果相当（这里由调用者决定）。
+    """
+
+    def __init__(self, d_model: int, d_ff: int):
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"SwiGLU: d_model 必须是正整数，收到 {d_model!r}")
+        if isinstance(d_ff, bool) or not isinstance(d_ff, int) or d_ff < 1:
+            raise ValueError(f"SwiGLU: d_ff 必须是正整数，收到 {d_ff!r}")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        std1 = math.sqrt(2.0 / d_model)
+        std2 = math.sqrt(2.0 / d_ff)
+        self.W1 = [[random.gauss(0, std1) for _ in range(d_model)] for _ in range(d_ff)]
+        self.b1 = [0.0] * d_ff
+        self.Wg = [[random.gauss(0, std1) for _ in range(d_model)] for _ in range(d_ff)]
+        self.bg = [0.0] * d_ff
+        self.W2 = [[random.gauss(0, std2) for _ in range(d_ff)] for _ in range(d_model)]
+        self.b2 = [0.0] * d_model
+        self.training = True
+        self._init_adam()
+        self.zero_grad()
+        self.x = self.h1 = self.g = self.zg = self.h = None
+        self.seq_len = 0
+
+    def _init_adam(self):
+        def z2(r, c):
+            return [[0.0] * c for _ in range(r)]
+        self.m_W1 = z2(self.d_ff, self.d_model); self.v_W1 = z2(self.d_ff, self.d_model)
+        self.m_Wg = z2(self.d_ff, self.d_model); self.v_Wg = z2(self.d_ff, self.d_model)
+        self.m_W2 = z2(self.d_model, self.d_ff); self.v_W2 = z2(self.d_model, self.d_ff)
+        self.m_b1 = [0.0] * self.d_ff; self.v_b1 = [0.0] * self.d_ff
+        self.m_bg = [0.0] * self.d_ff; self.v_bg = [0.0] * self.d_ff
+        self.m_b2 = [0.0] * self.d_model; self.v_b2 = [0.0] * self.d_model
+
+    def zero_grad(self):
+        """初始化/清零所有参数梯度"""
+        self.grads = {
+            "W1": [[0.0] * self.d_model for _ in range(self.d_ff)],
+            "b1": [0.0] * self.d_ff,
+            "Wg": [[0.0] * self.d_model for _ in range(self.d_ff)],
+            "bg": [0.0] * self.d_ff,
+            "W2": [[0.0] * self.d_ff for _ in range(self.d_model)],
+            "b2": [0.0] * self.d_model,
+        }
+
+    def train(self):
+        """训练模式（本模块无 dropout，接口对齐 Transformer 子模块）"""
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def forward(self, x_seq):
+        """x_seq: (seq_len, d_model) → (seq_len, d_model)"""
+        if not x_seq:
+            raise ValueError("SwiGLU.forward: 输入序列为空")
+        if len(x_seq[0]) != self.d_model:
+            raise ValueError(
+                f"SwiGLU.forward: 输入维度 {len(x_seq[0])} 与 d_model={self.d_model} 不一致")
+        self.x = x_seq
+        self.seq_len = len(x_seq)
+        self.h1 = _matmul(x_seq, _transpose(self.W1))
+        zg = _matmul(x_seq, _transpose(self.Wg))
+        self.zg = zg
+        self.g = [[_silu_scalar(zg[t][j]) + self.bg[j] for j in range(self.d_ff)]
+                  for t in range(self.seq_len)]
+        # 门控分支的 bias 加在 silu 之后（LLaMA 无 bias，这里是通用写法）
+        for t in range(self.seq_len):
+            for j in range(self.d_ff):
+                self.h1[t][j] += self.b1[j]
+        self.h = [[self.h1[t][j] * self.g[t][j] for j in range(self.d_ff)]
+                  for t in range(self.seq_len)]
+        out = _matmul(self.h, _transpose(self.W2))
+        for t in range(self.seq_len):
+            for j in range(self.d_model):
+                out[t][j] += self.b2[j]
+        return out
+
+    def backward(self, dout_seq):
+        """dout_seq: (seq_len, d_model) → dx_seq: (seq_len, d_model)"""
+        if self.h is None:
+            raise RuntimeError("SwiGLU.backward: 必须先调用 forward()")
+        T = self.seq_len
+        grad_W2 = _matmul(_transpose(dout_seq), self.h)
+        grad_b2 = [sum(dout_seq[t][j] for t in range(T)) for j in range(self.d_model)]
+        dh = _matmul(dout_seq, self.W2)
+        # 两条分支各自的梯度
+        dh1 = [[dh[t][j] * self.g[t][j] for j in range(self.d_ff)] for t in range(T)]
+        dg = [[dh[t][j] * self.h1[t][j] for j in range(self.d_ff)] for t in range(T)]
+        # bg 是加在 silu 之后的（g = silu(z_g) + b_g），所以它的梯度不乘 silu'
+        dg_pre = [row[:] for row in dg]
+        # 门控分支反向：d silu（只用于 W_g 与 dx）
+        for t in range(T):
+            for j in range(self.d_ff):
+                dg[t][j] *= _dsilu_scalar(self.zg[t][j])
+        grad_W1 = _matmul(_transpose(dh1), self.x)
+        grad_b1 = [sum(dh1[t][j] for t in range(T)) for j in range(self.d_ff)]
+        grad_Wg = _matmul(_transpose(dg), self.x)
+        grad_bg = [sum(dg_pre[t][j] for t in range(T)) for j in range(self.d_ff)]
+        dx_seq = _matmul(dh1, self.W1)
+        dx_g = _matmul(dg, self.Wg)
+        for t in range(T):
+            for j in range(self.d_model):
+                dx_seq[t][j] += dx_g[t][j]
+        # 累积梯度（与 FeedForward 一致：+= 累加，配合 zero_grad）
+        for i in range(self.d_ff):
+            for j in range(self.d_model):
+                self.grads["W1"][i][j] += grad_W1[i][j]
+                self.grads["Wg"][i][j] += grad_Wg[i][j]
+            self.grads["b1"][i] += grad_b1[i]
+            self.grads["bg"][i] += grad_bg[i]
+        for i in range(self.d_model):
+            for j in range(self.d_ff):
+                self.grads["W2"][i][j] += grad_W2[i][j]
+            self.grads["b2"][i] += grad_b2[i]
+        return dx_seq
+
+
 def _sgd_apply(param, grad, lr):
     """就地 SGD 更新参数: 支持 1D / 2D 列表（param 与 grad 结构一致）"""
     if grad and isinstance(grad[0], (list, tuple)):
@@ -3069,12 +3336,12 @@ class TransformerEncoderLayer:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
                  causal: bool = False, rope: bool = False, window: int = None,
-                 num_kv_heads: int = None):
+                 num_kv_heads: int = None, alibi: bool = False):
         # causal=True 时自注意力加因果掩码（自回归语言模型用）；
         # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
                                             causal=causal, rope=rope, window=window,
-                                            num_kv_heads=num_kv_heads)
+                                            num_kv_heads=num_kv_heads, alibi=alibi)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -3237,13 +3504,14 @@ class TransformerEncoder:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
                  num_layers: int = 6, dropout: float = 0.1, causal: bool = False,
-                 rope: bool = False, window: int = None, num_kv_heads: int = None):
+                 rope: bool = False, window: int = None, num_kv_heads: int = None,
+                 alibi: bool = False):
         """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
         self.causal = bool(causal)
         self.layers = [
             TransformerEncoderLayer(d_model, num_heads, d_ff, dropout,
                                     causal=causal, rope=rope, window=window,
-                                    num_kv_heads=num_kv_heads)
+                                    num_kv_heads=num_kv_heads, alibi=alibi)
             for _ in range(num_layers)
         ]
 
@@ -4147,7 +4415,8 @@ class CausalLM:
     def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
                  d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
                  dropout: float = 0.0, rope: bool = False, use_abs_pos=None,
-                 window: int = None, num_kv_heads: int = None):
+                 window: int = None, num_kv_heads: int = None,
+                 alibi: bool = False):
         if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
             raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
         if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
@@ -4171,9 +4440,11 @@ class CausalLM:
 
         self.embedding = Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len)
+        self.alibi = bool(alibi)
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
                                           dropout, causal=True, rope=self.rope,
-                                          window=window, num_kv_heads=num_kv_heads)
+                                          window=window, num_kv_heads=num_kv_heads,
+                                          alibi=self.alibi)
 
         std = math.sqrt(2.0 / d_model)
         self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
