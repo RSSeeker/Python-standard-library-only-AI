@@ -255,6 +255,8 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `Layer(activation='mish')` | Mish：`z·tanh(softplus(z))`，softplus 用 `log1p(exp(z))` 且 `z>30` 时退化成 `z` |
 | `Layer(activation='elu'/'selu')` | ELU（α=1）与 SELU（λ=1.0507, α=1.6733），自带自归一化性质 |
 | `MultiHeadAttention(alibi=True)` | ALiBi 线性偏置：第 h 个头加 `slope_h·(t-j)`，`slope_h=2^(-8(h+1)/num_heads)`；无需位置编码即可外推，偏置是常数、反向无额外分支 |
+| `TokenClassificationHead(d_model, num_labels)` | 序列标注头：`(T,d_model)→(T,num_labels)`，loss 按有效 token 平均，`mask` 位置梯度恰 0，`predict` 逐位置取 argmax |
+| `MultiLabelHead(fan_in, num_labels)` | 多标签头：逐标签 sigmoid + BCE-with-logits，标签之间不竞争，`predict(threshold=0.5)` 返回 0/1 列表 |
 | `Linear(fan_in, fan_out)` | 无激活全连接层 |
 | `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
 | `LoRA(layer, rank=4, alpha=None)` | 低秩适配：冻结原层，只训 `A (rank, in)` / `B (out, rank)`；`B` 初始为 0（包装后行为不变）；`merge()` 把 `scaling·BA` 折进原层权重 |
@@ -710,6 +712,31 @@ print(model.history['train_loss'][-1])
 `input_dim`/`output_dim` 可以只给一个、另一个从 `data` 推断，
 `seed` 同时固定权重初始化与每轮打乱，因此同配置同数据可复现。
 
+## 序列标注与多标签分类
+
+`CausalLM` / `TransformerEncoder` 输出的是逐位置隐状态，接上分类头就能做 NER、
+词性标注；单个向量接多标签头则处理「一条样本命中多个标签」的场景。
+
+```python
+head = AI.TokenClassificationHead(d_model=32, num_labels=5)
+logits = head.forward(hidden)                    # (T, 5)
+loss, d_logits = head.loss_grad(logits, tags, mask=valid)   # 右填充用 mask
+d_hidden = head.backward(d_logits)               # (T, d_model)，可继续往前传
+head.adam_step(lr=0.01)
+
+multi = AI.MultiLabelHead(fan_in=32, num_labels=3)
+probs = multi.forward(feature)                   # [0.12, 0.87, 0.44]
+loss, d_logits = multi.loss_grad(probs, [0, 1, 0])
+d_feature = multi.backward(d_logits)
+print(multi.predict(probs))                      # [0, 1, 0]
+```
+
+要点：两个头都自带 `zero_grad` / `sgd_step` / `adam_step` / `param_count`；
+序列标注的 `mask` 语义与 `CausalLM` 的 `pad_mask` 一致（右填充、False 不参与），
+`predict` 对 mask 位置返回 `-1`；多标签用 BCE-with-logits 而不是 softmax+CE，
+因为标签之间不该互相竞争。两者都已在 `grad_check` 覆盖范围之外，
+所以测试里单独做了中心差分校验。
+
 ## 超参搜索
 
 在配置空间上做网格或随机搜索，直接复用 `train_from_config`：
@@ -824,7 +851,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-653 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+660 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -843,6 +870,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAttentionMaps` | MHA 形状/行和/因果上三角、eval 两次一致、TEL 与 Encoder 多层与 `layer_index`、CausalLM 只读且模式复原、ASCII 结构与抽样、六类非法输入 |
 | `TestConfigDriven` | `build_model` 结构与维度推断（部分给、全不给、显式覆盖）、八类配置错误、五种调度器构造、`train_from_config` 训练与收敛、同 seed 曲线与权重逐位一致、JSON 路径与 `data`/`x` 冲突 |
 | `TestHyperparameterSearch` | 网格全组合与参数覆盖、`best` 确实是最优分、随机搜索同 seed 可复现、`accuracy` 取最大、全局 RNG 不被推进、十类非法输入（含 `val_split=0` 用 `val_loss`、缺 `x`/`y` 用 `accuracy`） |
+| `TestTokenClassificationHead` | 形状与参数校验、W/b 中心差分、`mask` 只算有效 token 且被屏蔽行梯度为 0、`predict` 的 argmax 与 mask 语义、300 步训练后 loss 降 20 倍并全对 |
+| `TestMultiLabelHead` | 概率范围与校验、BCE 梯度中心差分、阈值预测（含非法阈值）、400 步训练后 loss 降 3 倍并全对 |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -918,6 +947,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 653 个单元测试
+├── test_ai.py       # 660 个单元测试
 └── README.md
 ```

@@ -7927,3 +7927,160 @@ class TestHyperparameterSearch:
                                      data=data, metric="val_loss")
         with pytest.raises(ValueError):
             AI.hyperparameter_search(base, {"lr": [0.05]}, data=data, metric="accuracy")
+
+
+class TestTokenClassificationHead:
+    """Token 级分类头：形状、mask、梯度、可训练性。"""
+
+    def test_shapes_and_validation(self):
+        head = AI.TokenClassificationHead(4, 3)
+        logits = head.forward([[1.0, 0.0, 0.5, -0.5], [0.2, 0.3, 0.1, 0.0]])
+        assert len(logits) == 2 and all(len(r) == 3 for r in logits)
+        assert head.param_count() == 15
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises(ValueError):
+                AI.TokenClassificationHead(bad, 3)
+            with pytest.raises(ValueError):
+                AI.TokenClassificationHead(4, bad)
+        with pytest.raises(ValueError):
+            head.forward([])
+        with pytest.raises(ValueError):
+            head.forward([[1.0, 2.0]])
+
+    def test_gradients_match_numeric(self):
+        random.seed(31)
+        head = AI.TokenClassificationHead(4, 3)
+        xs = [[1.0, 0.0, 0.5, -0.5], [0.2, 0.3, 0.1, 0.0]]
+        head.zero_grad()
+        loss, d_logits = head.loss_grad(head.forward(xs), [0, 2])
+        assert math.isfinite(loss)
+        dx = head.backward(d_logits)
+        assert len(dx) == 2 and all(len(r) == 4 for r in dx)
+        # 只查一个权重与一个偏置，避免测试过慢
+        eps, i, j = 1e-6, 1, 2
+        old = head.W[i][j]
+        head.W[i][j] = old + eps
+        lp, _ = head.loss_grad(head.forward(xs), [0, 2])
+        head.W[i][j] = old - eps
+        lm, _ = head.loss_grad(head.forward(xs), [0, 2])
+        head.W[i][j] = old
+        num = (lp - lm) / (2 * eps)
+        ana = head.grad_W[i][j]
+        assert abs(ana - num) <= 1e-6 * max(1e-8, abs(ana) + abs(num))
+
+        old_b = head.b[2]
+        head.b[2] = old_b + eps
+        lp, _ = head.loss_grad(head.forward(xs), [0, 2])
+        head.b[2] = old_b - eps
+        lm, _ = head.loss_grad(head.forward(xs), [0, 2])
+        head.b[2] = old_b
+        num_b = (lp - lm) / (2 * eps)
+        assert abs(head.grad_b[2] - num_b) <= 1e-6 * max(1e-8, abs(num_b))
+
+    def test_mask_excludes_padding(self):
+        head = AI.TokenClassificationHead(4, 3)
+        xs = [[1.0, 0.0, 0.5, -0.5], [0.2, 0.3, 0.1, 0.0], [0.0, 0.0, 0.0, 0.0]]
+        logits = head.forward(xs)
+        head.zero_grad()
+        loss_all, d_all = head.loss_grad(logits, [0, 2, 1])
+        loss_masked, d_masked = head.loss_grad(logits, [0, 2, 1],
+                                               mask=[True, True, False])
+        expect = sum(-math.log(max(1e-12, AI._softmax_row(logits[t])[[0, 2][t]]))
+                     for t in range(2)) / 2
+        assert abs(loss_masked - expect) < 1e-9
+        assert all(v == 0.0 for v in d_masked[2])
+        assert abs(loss_all - loss_masked) > 1e-6
+        with pytest.raises(ValueError):
+            head.loss_grad(logits, [0, 2, 1], mask=[False, False, False])
+        for bad in ([0, 5, 1], [0, 2], [0, 2, 1.5], [0, 2, True]):
+            with pytest.raises(ValueError):
+                head.loss_grad(logits, bad)
+
+    def test_predict_and_training(self):
+        head = AI.TokenClassificationHead(6, 4)
+        logits = head.forward([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]])
+        assert head.predict(logits) == [max(range(4), key=lambda l: logits[0][l])]
+        assert head.predict(logits, mask=[False]) == [-1]
+
+        random.seed(5)
+        samples = []
+        for _ in range(20):
+            vec = [random.uniform(-1, 1) for _ in range(6)]
+            label = max(range(4), key=lambda l: sum(vec[l::4]))
+            samples.append((vec, label))
+        first = None
+        for _ in range(300):
+            head.zero_grad()
+            total = 0.0
+            for vec, label in samples:
+                loss, d = head.loss_grad(head.forward([vec]), [label])
+                total += loss
+                head.backward(d)
+            head.adam_step(0.05)
+            first = total / len(samples) if first is None else first
+        last = total / len(samples)
+        assert last < first / 20.0
+        hit = sum(head.predict(head.forward([v]))[0] == y for v, y in samples)
+        assert hit == len(samples)
+
+
+class TestMultiLabelHead:
+    """多标签头：概率、BCE 梯度、阈值预测、可训练性。"""
+
+    def test_shapes_and_validation(self):
+        head = AI.MultiLabelHead(4, 3)
+        probs = head.forward([1.0, 0.0, 0.5, -0.5])
+        assert len(probs) == 3 and all(0.0 < p < 1.0 for p in probs)
+        assert head.param_count() == 15
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises(ValueError):
+                AI.MultiLabelHead(bad, 3)
+        with pytest.raises(ValueError):
+            head.forward([1.0, 2.0])
+        with pytest.raises(ValueError):
+            head.loss_grad(probs, [1, 2, 0])
+
+    def test_gradients_match_numeric(self):
+        random.seed(41)
+        head = AI.MultiLabelHead(4, 3)
+        x = [1.0, 0.0, 0.5, -0.5]
+        head.zero_grad()
+        loss, dz = head.loss_grad(head.forward(x), [1, 0, 1])
+        assert math.isfinite(loss)
+        dx = head.backward(dz)
+        assert len(dx) == 4
+        eps = 1e-6
+        old = head.W[0][1]
+        head.W[0][1] = old + eps
+        lp, _ = head.loss_grad(head.forward(x), [1, 0, 1])
+        head.W[0][1] = old - eps
+        lm, _ = head.loss_grad(head.forward(x), [1, 0, 1])
+        head.W[0][1] = old
+        num = (lp - lm) / (2 * eps)
+        ana = head.grad_W[0][1]
+        assert abs(ana - num) <= 1e-6 * max(1e-8, abs(ana) + abs(num))
+
+    def test_predict_threshold_and_training(self):
+        head = AI.MultiLabelHead(5, 3)
+        assert head.predict([0.9, 0.4, 0.5]) == [1, 0, 1]
+        assert head.predict([0.9, 0.4, 0.5], threshold=0.4) == [1, 1, 1]
+        with pytest.raises(ValueError):
+            head.predict([0.9, 0.4, 0.5], threshold=1.0)
+
+        random.seed(7)
+        xs = [[random.uniform(-1, 1) for _ in range(5)] for _ in range(24)]
+        ys = [[1 if v[0] + v[1] > 0 else 0, 1 if v[2] - v[3] > 0 else 0,
+               1 if v[4] > 0 else 0] for v in xs]
+        first = None
+        for _ in range(400):
+            head.zero_grad()
+            total = 0.0
+            for v, y in zip(xs, ys):
+                loss, dz = head.loss_grad(head.forward(v), y)
+                total += loss
+                head.backward(dz)
+            head.adam_step(0.05)
+            first = total / len(xs) if first is None else first
+        last = total / len(xs)
+        assert last < first / 3.0
+        assert all(head.predict(head.forward(v)) == y for v, y in zip(xs, ys))

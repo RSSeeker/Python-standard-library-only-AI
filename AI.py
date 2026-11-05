@@ -9738,6 +9738,307 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
 
 
 # ============================================================================
+#  序列标注 / 多标签分类头
+# ============================================================================
+
+def _sigmoid_scalar(z: float) -> float:
+    """数值稳定的 sigmoid（与 Layer 的 sigmoid 分支同写法）。"""
+    if z >= 0.0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+class TokenClassificationHead:
+    """Token 级分类头：把 (T, d_model) 序列映射成 (T, num_labels) logits。
+
+    典型用法是接在 `TransformerEncoder` / `CausalLM` 的隐状态之后做 NER、词性标注：
+
+        head = TokenClassificationHead(d_model=32, num_labels=5)
+        logits = head.forward(hidden)                 # (T, 5)
+        loss, d_logits = head.loss_grad(logits, tags, mask=valid)
+        d_hidden = head.backward(d_logits)            # (T, d_model)
+        head.adam_step(lr)
+
+    `mask` 为 False 的位置不参与 loss，梯度也恰为 0（右填充时直接用 `mask`）。
+    """
+
+    def __init__(self, d_model: int, num_labels: int):
+        for name, value in (("d_model", d_model), ("num_labels", num_labels)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"TokenClassificationHead: {name} 必须是 >= 1 的整数")
+        self.d_model = d_model
+        self.num_labels = num_labels
+        std = math.sqrt(2.0 / d_model)
+        self.W = [[random.gauss(0.0, std) for _ in range(d_model)] for _ in range(num_labels)]
+        self.b = [0.0] * num_labels
+        self.x = None
+        self._init_adam()
+        self.zero_grad()
+
+    # ---- 参数与状态
+    def _named_params(self):
+        yield "W", self.W, self.grad_W
+        yield "b", self.b, self.grad_b
+
+    def zero_grad(self):
+        self.grad_W = _zeros_like(self.W)
+        self.grad_b = _zeros_like(self.b)
+        self._sync_adam()
+
+    def _init_adam(self):
+        self.m = {}
+        self.v = {}
+        self.step_count = 0
+        self._sync_adam()
+
+    def _sync_adam(self):
+        for name, param in (("W", self.W), ("b", self.b)):
+            if self.m.get(name) is None or len(self.m[name]) != len(param):
+                self.m[name] = _zeros_like(param)
+                self.v[name] = _zeros_like(param)
+
+    def _init_adam_buffers(self):  # 兼容旧调用名
+        self._init_adam()
+
+    def param_count(self):
+        return sum(len(row) for row in self.W) + len(self.b)
+
+    # ---- 前向 / 反向
+    def forward(self, x_seq):
+        if not isinstance(x_seq, (list, tuple)) or not x_seq:
+            raise ValueError("TokenClassificationHead.forward: 输入必须是非空序列")
+        T = len(x_seq)
+        for t, row in enumerate(x_seq):
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(
+                    f"TokenClassificationHead.forward: 第 {t} 个位置维度应为 {self.d_model}")
+        self.x = [list(row) for row in x_seq]
+        out = []
+        for t in range(T):
+            xt = self.x[t]
+            out.append([sum(map(_mul, self.W[l], xt)) + self.b[l] for l in range(self.num_labels)])
+        return out
+
+    def loss_grad(self, logits, targets, mask=None):
+        """softmax + 交叉熵，按有效 token 取平均；返回 (loss, d_logits)。"""
+        if not isinstance(logits, (list, tuple)) or not logits:
+            raise ValueError("TokenClassificationHead.loss_grad: logits 必须是非空序列")
+        T = len(logits)
+        if not isinstance(targets, (list, tuple)) or len(targets) != T:
+            raise ValueError(
+                f"TokenClassificationHead.loss_grad: targets 长度应为 {T}，收到 "
+                f"{len(targets) if isinstance(targets, (list, tuple)) else type(targets).__name__}")
+        if mask is None:
+            mask = [True] * T
+        if not isinstance(mask, (list, tuple)) or len(mask) != T:
+            raise ValueError(
+                f"TokenClassificationHead.loss_grad: mask 长度应为 {T}")
+        valid = [1 if m else 0 for m in mask]
+        n = sum(valid)
+        if n == 0:
+            raise ValueError("TokenClassificationHead.loss_grad: mask 全为 0，没有可训练的 token")
+        loss = 0.0
+        d_logits = []
+        for t in range(T):
+            target = targets[t]
+            if isinstance(target, bool) or not isinstance(target, int):
+                raise ValueError(
+                    f"TokenClassificationHead.loss_grad: 第 {t} 个标签必须是整数，"
+                    f"收到 {type(target).__name__}")
+            if not 0 <= target < self.num_labels:
+                raise ValueError(
+                    f"TokenClassificationHead.loss_grad: 第 {t} 个标签 {target} 超出 "
+                    f"[0, {self.num_labels})")
+            probs = _softmax_row(logits[t])
+            if not valid[t]:
+                d_logits.append([0.0] * self.num_labels)
+                continue
+            p = probs[target]
+            loss += -math.log(p if p > 1e-12 else 1e-12)
+            row = list(probs)
+            row[target] -= 1.0
+            d_logits.append([v / n for v in row])
+        loss /= n
+        return loss, d_logits
+
+    def backward(self, d_logits):
+        if self.x is None:
+            raise RuntimeError("TokenClassificationHead.backward: 必须先 forward")
+        if not isinstance(d_logits, (list, tuple)) or len(d_logits) != len(self.x):
+            raise ValueError(
+                f"TokenClassificationHead.backward: d_logits 长度应为 {len(self.x)}")
+        T = len(self.x)
+        dx = [[0.0] * self.d_model for _ in range(T)]
+        for t in range(T):
+            drow = d_logits[t]
+            if len(drow) != self.num_labels:
+                raise ValueError(
+                    f"TokenClassificationHead.backward: 第 {t} 行梯度维度应为 {self.num_labels}")
+            xt = self.x[t]
+            for l in range(self.num_labels):
+                d = drow[l]
+                if d == 0.0:
+                    continue
+                self.grad_b[l] += d
+                gw = self.grad_W[l]
+                for j in range(self.d_model):
+                    gw[j] += d * xt[j]
+                for j in range(self.d_model):
+                    dx[t][j] += d * self.W[l][j]
+        return dx
+
+    def predict(self, logits, mask=None):
+        T = len(logits)
+        mask = [True] * T if mask is None else mask
+        return [max(range(self.num_labels), key=lambda l: logits[t][l]) if mask[t] else -1
+                for t in range(T)]
+
+    # ---- 优化
+    def sgd_step(self, lr: float = 0.01):
+        for name, param, grad in self._named_params():
+            if isinstance(param[0], list):
+                for i in range(len(param)):
+                    for j in range(len(param[i])):
+                        param[i][j] -= lr * grad[i][j]
+            else:
+                for i in range(len(param)):
+                    param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float = 1e-3, b1: float = 0.9, b2: float = 0.999,
+                  eps: float = 1e-8):
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            _adam_apply(param, grad, self.m[name], self.v[name], t, lr, b1, b2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class MultiLabelHead:
+    """多标签分类头：每个标签独立 sigmoid，用 BCE-with-logits 计算损失。
+
+    与 `Layer(activation='softmax')` 的区别：多标签允许一个样本同时命中多个类别，
+    标签之间不竞争，因此逐标签做二分类。
+    """
+
+    def __init__(self, fan_in: int, num_labels: int):
+        for name, value in (("fan_in", fan_in), ("num_labels", num_labels)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"MultiLabelHead: {name} 必须是 >= 1 的整数")
+        self.fan_in = fan_in
+        self.num_labels = num_labels
+        std = math.sqrt(2.0 / fan_in)
+        self.W = [[random.gauss(0.0, std) for _ in range(fan_in)] for _ in range(num_labels)]
+        self.b = [0.0] * num_labels
+        self.x = None
+        self._init_adam()
+        self.zero_grad()
+
+    def _named_params(self):
+        yield "W", self.W, self.grad_W
+        yield "b", self.b, self.grad_b
+
+    def zero_grad(self):
+        self.grad_W = _zeros_like(self.W)
+        self.grad_b = _zeros_like(self.b)
+        self._sync_adam()
+
+    def _init_adam(self):
+        self.m = {}
+        self.v = {}
+        self.step_count = 0
+        self._sync_adam()
+
+    def _sync_adam(self):
+        for name, param in (("W", self.W), ("b", self.b)):
+            if self.m.get(name) is None or len(self.m[name]) != len(param):
+                self.m[name] = _zeros_like(param)
+                self.v[name] = _zeros_like(param)
+
+    def param_count(self):
+        return sum(len(row) for row in self.W) + len(self.b)
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != self.fan_in:
+            raise ValueError(f"MultiLabelHead.forward: 输入维度应为 {self.fan_in}")
+        self.x = [float(v) for v in x]
+        self.logits = [sum(map(_mul, self.W[l], self.x)) + self.b[l]
+                       for l in range(self.num_labels)]
+        self.probs = [_sigmoid_scalar(z) for z in self.logits]
+        return list(self.probs)
+
+    def loss_grad(self, probs, targets):
+        """BCE-with-logits（数值稳定），返回 (loss, d_logits)。"""
+        if not isinstance(probs, (list, tuple)) or len(probs) != self.num_labels:
+            raise ValueError(f"MultiLabelHead.loss_grad: probs 长度应为 {self.num_labels}")
+        if not isinstance(targets, (list, tuple)) or len(targets) != self.num_labels:
+            raise ValueError(f"MultiLabelHead.loss_grad: targets 长度应为 {self.num_labels}")
+        loss = 0.0
+        d_logits = []
+        for l in range(self.num_labels):
+            y = targets[l]
+            if y not in (0, 1, True, False):
+                raise ValueError(
+                    f"MultiLabelHead.loss_grad: 第 {l} 个标签必须是 0/1 或布尔，收到 {y!r}")
+            y = 1.0 if y else 0.0
+            z = self.logits[l]
+            loss += max(z, 0.0) - z * y + math.log1p(math.exp(-abs(z)))
+            d_logits.append((self.probs[l] - y) / self.num_labels)
+        return loss / self.num_labels, d_logits
+
+    def backward(self, d_logits):
+        if self.x is None:
+            raise RuntimeError("MultiLabelHead.backward: 必须先 forward")
+        if not isinstance(d_logits, (list, tuple)) or len(d_logits) != self.num_labels:
+            raise ValueError(f"MultiLabelHead.backward: d_logits 长度应为 {self.num_labels}")
+        dx = [0.0] * self.fan_in
+        for l in range(self.num_labels):
+            d = d_logits[l]
+            if d == 0.0:
+                continue
+            self.grad_b[l] += d
+            gw = self.grad_W[l]
+            for j in range(self.fan_in):
+                gw[j] += d * self.x[j]
+                dx[j] += d * self.W[l][j]
+        return dx
+
+    def predict(self, probs=None, threshold: float = 0.5):
+        probs = self.probs if probs is None else probs
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("MultiLabelHead.predict: threshold 必须在 (0, 1) 内")
+        return [1 if p >= threshold else 0 for p in probs]
+
+    def sgd_step(self, lr: float = 0.01):
+        for _name, param, grad in self._named_params():
+            if isinstance(param[0], list):
+                for i in range(len(param)):
+                    for j in range(len(param[i])):
+                        param[i][j] -= lr * grad[i][j]
+            else:
+                for i in range(len(param)):
+                    param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float = 1e-3, b1: float = 0.9, b2: float = 0.999,
+                  eps: float = 1e-8):
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            _adam_apply(param, grad, self.m[name], self.v[name], t, lr, b1, b2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+# ============================================================================
 #  PyTorch 数值对齐对比
 # ============================================================================
 
