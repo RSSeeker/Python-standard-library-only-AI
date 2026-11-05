@@ -197,6 +197,9 @@ model.train()     # 回到训练
 | `FeedForward(d_model, d_ff, activation='relu')` | 前馈网络（`activation` 可选 relu/gelu/sigmoid/silu/mish/elu/selu/linear） |
 | `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN |
 | `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
+| `VAE(input_dim, hidden_dim=32, latent_dim=2, beta=1.0)` | 变分自编码器：重参数化采样 `z = mu + eps·std`，损失 = 重构 MSE + `beta·KL`；`fit` / `sample` |
+| `GAN(input_dim, hidden_dim=32, latent_dim=2)` | 生成对抗网络：D 用 sigmoid + BCE，G 的梯度经 D 反传（`d_out = -1/p`）；`step` 一次更新 D 与 G |
+| `DDPM(data_dim, hidden_dim=32, steps=50)` | 扩散模型：线性 beta 表 + 累积 `abar`；`q_sample` 加噪、`predict_noise` 预测噪声、`sample` 反向去噪 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` / `window=N` / `alibi=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` / `window` 会传给每一层） |
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
@@ -734,6 +737,31 @@ moe.adam_step(lr=1e-3)
 批量矩阵化。token 数不多时很快，超长序列会比稠密 FFN 慢；真实实现需要更复杂的
 分组矩阵乘法。
 
+## 生成模型：VAE / GAN / DDPM
+
+三个生成模型都只用标准库实现，可单独训练并采样：
+
+```python
+# 变分自编码器：重建 + KL，重参数化采样
+vae = AI.VAE(input_dim=2, hidden_dim=32, latent_dim=4, beta=1.0)
+history = vae.fit(data, epochs=300, lr=0.01, seed=7)
+samples = vae.sample(8)                     # 从 N(0,1) 采样再解码
+
+# 生成对抗网络：D 学真伪，G 骗过 D
+gan = AI.GAN(input_dim=2, hidden_dim=32, latent_dim=4)
+for _ in range(500):
+    d_loss, g_loss = gan.step(real_batch)
+
+# 扩散模型：学会预测噪声，再反向去噪
+ddpm = AI.DDPM(data_dim=2, hidden_dim=32, steps=100)
+ddpm.fit(data, epochs=500, lr=1e-3, seed=3)
+samples = ddpm.sample(8)
+```
+
+三者的梯度都用中心差分验证过（`dec2`/`enc2`、D 与 G、扩散网络的输出层），
+训练曲线在探针里分别降 6.9×、把生成均值从 3.16 拉到 1.75、降 4.4×。DDPM 的
+`train_step` 允许显式传入 `t` 与 `noise`，就是为了让测试能固定随机性做差分。
+
 ## 序列标注与多标签分类
 
 `CausalLM` / `TransformerEncoder` 输出的是逐位置隐状态，接上分类头就能做 NER、
@@ -873,7 +901,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-665 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+677 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -895,6 +923,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTokenClassificationHead` | 形状与参数校验、W/b 中心差分、`mask` 只算有效 token 且被屏蔽行梯度为 0、`predict` 的 argmax 与 mask 语义、300 步训练后 loss 降 20 倍并全对 |
 | `TestMultiLabelHead` | 概率范围与校验、BCE 梯度中心差分、阈值预测（含非法阈值）、400 步训练后 loss 降 3 倍并全对 |
 | `TestMoE` | 形状与参数校验（含 `top_k > num_experts`、非法 `top_k`）、`top_k=1` 权重恒 1、路由权重与专家权重/输入的中心差分、未选中专家梯度恰为 0、200 步训练降 5 倍且至少两个专家被用到 |
+| `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
+| `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
+| `TestDDPM` | `q_sample` 与公式逐位一致、`t`/`x0`/`noise` 三类校验、噪声预测层梯度中心差分、150 轮训练降 2.5 倍、反向采样有限且均值在数据尺度内 |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -970,6 +1001,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 665 个单元测试
+├── test_ai.py       # 677 个单元测试
 └── README.md
 ```
