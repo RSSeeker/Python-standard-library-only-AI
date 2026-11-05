@@ -52,6 +52,7 @@ import sys
 import math
 import operator
 import random
+import time
 from typing import List, Tuple, Optional, Callable, Any
 
 # 热路径别名：Layer / _matmul 每次调用都要用到 operator.mul
@@ -5914,6 +5915,199 @@ class LoRA:
         """包装后的参数总数：原层参数 + 可训练的 A/B"""
         return self.fan_out * (self.fan_in + 1) + self.trainable_param_count()
 
+
+
+def profile_model(model, x, backward: bool = False, repeat: int = 3):
+    """逐层统计前向（可选反向）耗时，返回 dict
+
+    参数：
+        model: `MLP` / `Model` / `Sequential`，或任何带 `.layers` 与 `.forward` 的对象
+        x: 一个样本（调用方保证维度正确）
+        backward: 为 True 时一并统计反向（用全 1 的 delta 起反传）
+        repeat: 每种测量重复次数，取**最小值**（受调度抖动影响最小）
+
+    返回：`{"layers": [{"index","type","forward_ms","backward_ms"}],
+            "total_ms", "backward_total_ms", "params"}`
+
+    说明：这是纯墙钟测量，不含 CUDA/内存统计；单层耗时很小（微秒级）时
+    数字抖动明显，用 `repeat` 取最小值和相对占比来读更可靠。
+    """
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+        raise ValueError(f"profile_model: repeat 必须是正整数，收到 {repeat!r}")
+    net = model.model if isinstance(model, Model) else model
+    if not hasattr(net, "layers") or not hasattr(net, "forward"):
+        raise TypeError(
+            f"profile_model: 需要带 layers/forward 的网络，收到 {type(model).__name__}")
+    if not net.layers:
+        raise ValueError("profile_model: 网络没有任何层")
+
+    params = sum(getattr(l, "fan_in", 0) * getattr(l, "fan_out", 0)
+                 + getattr(l, "fan_out", 0) for l in net.layers)
+
+    # 前向：逐层测量，同时把输出串给下一层
+    fwd = []
+    cur = list(x)
+    for layer in net.layers:
+        best = None
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            out = layer.forward(list(cur))
+            dt = time.perf_counter() - t0
+            best = dt if best is None else min(best, dt)
+        fwd.append(best)
+        cur = out
+
+    # 反向：先整网前向一次建立每层的缓存，再从最后一层往前测
+    bwd = [0.0] * len(net.layers)
+    if backward:
+        net.forward(list(x))
+        delta = [1.0] * net.layers[-1].fan_out
+        for i in range(len(net.layers) - 1, -1, -1):
+            layer = net.layers[i]
+            base_delta = delta          # 每次重复都用同一个输入，才能比较耗时
+            best = None
+            nxt = None
+            for _ in range(repeat):
+                t0 = time.perf_counter()
+                _gw, _gb, nxt = layer.backward(base_delta)
+                dt = time.perf_counter() - t0
+                best = dt if best is None else min(best, dt)
+            bwd[i] = best
+            delta = nxt
+
+    layers = [{
+        "index": i,
+        "type": type(layer).__name__,
+        "forward_ms": fwd[i] * 1000.0,
+        "backward_ms": bwd[i] * 1000.0,
+    } for i, layer in enumerate(net.layers)]
+    return {
+        "layers": layers,
+        "total_ms": sum(fwd) * 1000.0,
+        "backward_total_ms": (sum(bwd) * 1000.0) if backward else None,
+        "params": params,
+    }
+
+
+def lr_finder(model, data=None, x=None, y=None, start_lr: float = 1e-5,
+              end_lr: float = 1.0, steps: int = 60, smooth: float = 0.05,
+              seed=None):
+    """学习率扫描（LR range test 简化版）
+
+    从 `start_lr` 指数增长到 `end_lr`，每步取一个样本做一次真实更新并记录 loss。
+    返回 `{"history": [(lr, loss, smoothed)], "best_lr", "suggested_lr", "final_loss"}`。
+
+    `suggested_lr` 取「平滑 loss 最低点 / 10」并夹在 `[start_lr, end_lr]` 内：
+    最低点通常已在发散边缘，低一个量级更安全。
+
+    注意：扫描会**真实修改模型权重**（与 PyTorch 的 lr_finder 一样），
+    需要干净权重请先复制；结束后 `optimizer.lr` 会恢复原值。
+    """
+    if not isinstance(model, Model):
+        raise TypeError(f"lr_finder: 需要 Model，收到 {type(model).__name__}")
+    for name, val in (("start_lr", start_lr), ("end_lr", end_lr)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or not val > 0:
+            raise ValueError(f"lr_finder: {name} 必须是正数，收到 {val!r}")
+    if not end_lr > start_lr:
+        raise ValueError(
+            f"lr_finder: 要求 end_lr > start_lr，收到 {start_lr!r} -> {end_lr!r}")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 2:
+        raise ValueError(f"lr_finder: steps 必须是 >=2 的整数，收到 {steps!r}")
+    if isinstance(smooth, bool) or not isinstance(smooth, (int, float)) \
+            or not 0.0 < float(smooth) <= 1.0:
+        raise ValueError(f"lr_finder: smooth 必须在 (0,1] 内，收到 {smooth!r}")
+
+    if data is not None:
+        dataset = [(list(a), b) for a, b in data]
+    elif x is not None and y is not None:
+        if isinstance(y, (int, float)) and not isinstance(y, bool):
+            y = [y] * len(x)
+        if len(x) != len(y):
+            raise ValueError(
+                f"lr_finder: x 有 {len(x)} 个样本，y 有 {len(y)} 个，数量必须一致")
+        dataset = [(list(a), b) for a, b in zip(x, y)]
+    else:
+        raise ValueError("lr_finder: 需要 data 或 (x, y)")
+    if not dataset:
+        raise ValueError("lr_finder: 数据集不能为空")
+
+    rng = random.Random(seed) if seed is not None else random
+    order = list(range(len(dataset)))
+    rng.shuffle(order)
+
+    old_lr = model.optimizer.lr
+    lr = float(start_lr)
+    mult = (float(end_lr) / float(start_lr)) ** (1.0 / (steps - 1))
+    history = []
+    ema = None
+    diverged_at = None
+    # 单个样本的 loss 噪声太大，指数平滑也救不回来；这里每步用小批的平均值
+    batch = min(8, len(dataset))
+    layers = model.model.layers
+    try:
+        for step in range(steps):
+            idxs = [order[(step * batch + t) % len(order)] for t in range(batch)]
+            model.optimizer.lr = lr
+            acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                     for layer in layers]
+            acc_b = [[0.0] * layer.fan_out for layer in layers]
+            loss_sum = 0.0
+            for i in idxs:
+                xi, yi = dataset[i]
+                pred = model.forward(xi)
+                loss_i, grad_i = model._loss(pred, yi)
+                loss_sum += loss_i
+                delta = grad_i
+                li = len(layers) - 1
+                for layer in reversed(layers):
+                    gw, gb, delta = layer.backward(delta)
+                    aw, ab = acc_w[li], acc_b[li]
+                    for j in range(layer.fan_out):
+                        awj, gwj = aw[j], gw[j]
+                        for k in range(layer.fan_in):
+                            awj[k] += gwj[k]
+                        ab[j] += gb[j]
+                    li -= 1
+            loss = loss_sum / batch
+            n = float(batch)
+            grads = [([[v / n for v in row] for row in acc_w[i]],
+                      [v / n for v in acc_b[i]]) for i in range(len(layers))]
+            model.optimizer.step(grads)
+            # 一旦 loss 变成 inf/NaN 就停：继续扫描只会污染权重，也没有信息量
+            if not math.isfinite(loss):
+                diverged_at = lr
+                break
+            ema = loss if ema is None else (1.0 - smooth) * ema + smooth * loss
+            if not math.isfinite(ema):
+                diverged_at = lr
+                break
+            history.append((lr, loss, ema))
+            lr *= mult
+    finally:
+        model.optimizer.lr = old_lr
+
+    # 经典 fastai 规则：取平滑 loss 的最低点，推荐它的 1/10
+    # （最低点往往已在发散边缘，降一个量级更稳；这与我们的 lr_finder 探针实测一致）
+    note = None
+    if len(history) > 1:
+        inner = history[1:] if len(history) > 4 else history   # 跳过第一步（EMA 尚未稳定）
+        low_item = min(inner, key=lambda r: r[2])
+    else:
+        low_item = history[0]
+    best_lr = low_item[0]
+    if low_item is history[-1] or best_lr == history[-1][0]:
+        note = "loss 到扫描末尾仍在下降，建议把 end_lr 调大后再扫一次"
+    lowest = best_lr
+    suggested = max(float(start_lr), min(float(end_lr), float(best_lr) / 10.0))
+    return {
+        "history": history,
+        "best_lr": best_lr,
+        "lowest_loss_lr": lowest,
+        "suggested_lr": suggested,
+        "final_loss": history[-1][1],
+        "diverged_at": diverged_at,
+        "note": note,
+    }
 
 
 # ============================================================================

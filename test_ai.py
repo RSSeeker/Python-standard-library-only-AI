@@ -7456,3 +7456,92 @@ class TestMaskedLM:
             lm.predict([1, 2, 3], [])
         with pytest.raises(ValueError):
             lm.fit([])
+
+
+class TestProfileModel:
+    def test_forward_only(self):
+        random.seed(1)
+        mlp = AI.MLP([4, 6, 3])
+        rep = AI.profile_model(mlp, [0.1, 0.2, 0.3, 0.4])
+        assert len(rep["layers"]) == len(mlp.layers)
+        assert rep["total_ms"] > 0
+        assert rep["backward_total_ms"] is None
+        assert rep["params"] == 4 * 6 + 6 + 6 * 3 + 3
+        assert abs(sum(l["forward_ms"] for l in rep["layers"]) - rep["total_ms"]) < 1e-9
+
+    def test_backward(self):
+        random.seed(1)
+        mlp = AI.MLP([3, 5, 2])
+        rep = AI.profile_model(mlp, [1.0, 0.5, -0.5], backward=True, repeat=2)
+        assert rep["backward_total_ms"] is not None and rep["backward_total_ms"] >= 0
+        assert all(l["backward_ms"] >= 0 for l in rep["layers"])
+
+    def test_accepts_model(self):
+        random.seed(2)
+        m = AI.Model(AI.MLP([2, 4, 1]), task="regression")
+        assert len(AI.profile_model(m, [0.5, 0.2])["layers"]) == 2
+
+    def test_invalid(self):
+        mlp = AI.MLP([2, 2])
+        with pytest.raises(ValueError):
+            AI.profile_model(mlp, [0.1, 0.2], repeat=0)
+        with pytest.raises(TypeError):
+            AI.profile_model("not a net", [0.1, 0.2])
+
+
+class TestLRFinder:
+    @staticmethod
+    def _data():
+        x = [[i / 10.0] for i in range(20)]
+        return x, [3 * v[0] + 1 for v in x]
+
+    @staticmethod
+    def _model(seed=2):
+        random.seed(seed)
+        return AI.Model(AI.MLP([1, 8, 1]), task="regression", lr=0.01)
+
+    def test_shape_and_geometric_growth(self):
+        x, y = self._data()
+        rep = AI.lr_finder(self._model(), x=x, y=y, start_lr=1e-5, end_lr=0.1,
+                           steps=25, smooth=0.1, seed=2)
+        assert len(rep["history"]) == 25
+        ratios = [rep["history"][k + 1][0] / rep["history"][k][0]
+                  for k in range(len(rep["history"]) - 1)]
+        assert max(ratios) - min(ratios) < 1e-9
+        assert 1e-5 <= rep["suggested_lr"] <= 0.1
+        assert any(abs(lr - rep["best_lr"]) < 1e-15 for lr, _, _ in rep["history"])
+
+    def test_restores_optimizer_lr(self):
+        x, y = self._data()
+        m = self._model()
+        m.optimizer.lr = 0.007
+        AI.lr_finder(m, x=x, y=y, start_lr=1e-4, end_lr=0.05, steps=10, seed=1)
+        assert abs(m.optimizer.lr - 0.007) < 1e-15
+
+    def test_reproducible(self):
+        x, y = self._data()
+        a = AI.lr_finder(self._model(), x=x, y=y, start_lr=1e-4, end_lr=0.1, steps=15, seed=3)
+        b = AI.lr_finder(self._model(), x=x, y=y, start_lr=1e-4, end_lr=0.1, steps=15, seed=3)
+        assert a["history"] == b["history"]
+        assert a["suggested_lr"] == b["suggested_lr"]
+
+    def test_note_when_loss_never_recovers(self):
+        x, y = self._data()
+        rep = AI.lr_finder(self._model(), x=x, y=y, start_lr=1e-6, end_lr=1e-3,
+                           steps=15, seed=4)
+        assert rep["note"] is not None
+        assert "end_lr" in rep["note"]
+
+    def test_invalid(self):
+        x, y = self._data()
+        for kwargs in (dict(start_lr=0.1, end_lr=0.1), dict(start_lr=0.1, end_lr=0.01),
+                       dict(steps=1), dict(smooth=0.0), dict(smooth=1.5),
+                       dict(start_lr=-1.0)):
+            with pytest.raises(ValueError):
+                AI.lr_finder(self._model(), x=x, y=y, **kwargs)
+        with pytest.raises(TypeError):
+            AI.lr_finder("nope", x=x, y=y)
+        with pytest.raises(ValueError):
+            AI.lr_finder(self._model())
+        with pytest.raises(ValueError):
+            AI.lr_finder(self._model(), x=x, y=y[:-1])

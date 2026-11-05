@@ -612,6 +612,8 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `StandardScaler` / `MinMaxScaler` | 逐特征标准化 / 归一化（`fit`/`transform`/`inverse_transform`） |
 | `ascii_plot(history)` | 把训练曲线画成终端 ASCII 图 |
 | `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
+| `profile_model(model, x, backward=False)` | 逐层前向/反向墙钟耗时 + 参数量；`repeat` 取最小值降抖动（纯计时，无内存统计） |
+| `lr_finder(model, x=..., y=..., start_lr, end_lr, steps)` | LR range test：等比扫 lr、记录平滑 loss，按 fastai 规则推荐「最低点 / 10」；会改动权重，结束后恢复 `optimizer.lr` |
 | `mlp.register_forward_hook(i, fn)` / `register_backward_hook(i, fn)` | 第 i 层前向/反向后的回调（`fn(layer, output)` / `fn(layer, delta, grad_w, grad_b)`）；不注册时只多一次真假判断，`Model` 上同名方法转发给内部的 `MLP` |
 | `estimate_flops(model, input_shape)` | 前向乘加次数（MACs）/ 参数量 / 逐层明细；支持 MLP 与 `Sequential`（`Layer`/`Conv1d`/`Conv2d`（含 `groups`）/`ConvTranspose2d`/各种池化/`BatchNorm1d`/`LayerNorm`/`GroupNorm`/`InstanceNorm`/`Dropout`/`DropPath`/`Flatten`），不认识的模块报 TypeError 而不是静默估算；`Flatten` 只接受 `(C, H, W)`，传一维/二维会明确报错（`Flatten.forward` 本来也跑不了） |
 | `augment_noise(x, sigma=0.01)` | 加性高斯噪声（单样本或一批样本，不改入参） |
@@ -754,7 +756,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-621 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+630 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -770,6 +772,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCausalMask` | 因果掩码的**因果性**（改未来 token 不改过去输出）、掩码权重精确为 0、`W_v` 梯度 vs 数值梯度 |
 | `TestCausalLM` | 小语料过拟合（loss → <0.05）、贪心续写接上周期、前缀 logits 与未来无关、生成可复现、非法输入 |
 | `TestMaskedLM` | 遮罩的 80/10/10 比例与 `mask_id` 在词表外、双向性（改末位影响前面的 logits）、`out.W` 梯度 vs 数值、全遮罩记忆后能填空还原、`evaluate` 可复现且不改模式、19 块参数去重、非法输入 |
+| `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
+| `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
 | `TestModernComponents` | GELU 公式与导数、sigmoid 不溢出、`Linear`、`RMSNorm` 的 `dx / dgamma` vs 数值梯度 |
 | `TestAdamWAndWarmup` | AdamW 零梯度只做衰减、`weight_decay=0` 与 Adam 逐位相同、`WarmupLR` 的爬坡/接力曲线 |
@@ -842,6 +846,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 621 个单元测试
+├── test_ai.py       # 630 个单元测试
 └── README.md
 ```
