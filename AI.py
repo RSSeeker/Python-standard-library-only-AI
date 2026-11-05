@@ -11434,6 +11434,477 @@ class Model:
                f"optimizer={type(self.optimizer).__name__}, lr={self.lr})"
 
 
+# ============================================================================
+#  生成模型：VAE / GAN / DDPM
+# ============================================================================
+
+def _gauss_vec(n, rng):
+    r = rng or random
+    return [r.gauss(0.0, 1.0) for _ in range(n)]
+
+
+def _time_features(t, steps, dim=8):
+    """把扩散步 t 编成 sinusoidal 特征（与位置编码同思路）。"""
+    out = []
+    for i in range(dim // 2):
+        freq = 1.0 / (10000.0 ** (2.0 * i / max(1, dim)))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    return out
+
+
+class VAE:
+    """变分自编码器（MLP encoder/decoder，2 维潜空间常用来做可视化）
+
+    损失 = 重构 MSE（对维度取平均） + beta * KL(q(z|x) || N(0,1))，
+    KL 按维求和、按样本取平均。重参数化 z = mu + eps*exp(logvar/2)。
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 32, latent_dim: int = 2,
+                 beta: float = 1.0):
+        for name, value in (("input_dim", input_dim), ("hidden_dim", hidden_dim),
+                            ("latent_dim", latent_dim)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"VAE: {name} 必须是 >= 1 的整数")
+        if not isinstance(beta, (int, float)) or isinstance(beta, bool) or beta < 0:
+            raise ValueError("VAE: beta 必须是 >= 0 的数")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.beta = float(beta)
+        self.enc1 = Layer(input_dim, hidden_dim, activation="relu")
+        self.enc2 = Layer(hidden_dim, 2 * latent_dim, activation="linear")
+        self.dec1 = Layer(latent_dim, hidden_dim, activation="relu")
+        self.dec2 = Layer(hidden_dim, input_dim, activation="linear")
+        self.layers = [self.enc1, self.enc2, self.dec1, self.dec2]
+        self.step_count = 0
+
+    def _zeros(self):
+        return [None] * len(self.layers)
+
+    def zero_grad(self):
+        self._g = self._zeros()
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+        else:
+            cur_w, cur_b = self._g[i]
+            for r in range(len(cur_w)):
+                row_c, row_n = cur_w[r], gw[r]
+                for c in range(len(row_c)):
+                    row_c[c] += row_n[c]
+            for k in range(len(cur_b)):
+                cur_b[k] += gb[k]
+
+    def encode(self, x):
+        h = self.enc1.forward(x)
+        out = self.enc2.forward(h)
+        mu = out[:self.latent_dim]
+        logvar = out[self.latent_dim:]
+        return mu, logvar
+
+    def decode(self, z):
+        return self.dec2.forward(self.dec1.forward(z))
+
+    def forward(self, x, eps=None, rng=None):
+        mu, logvar = self.encode(x)
+        if eps is None:
+            eps = _gauss_vec(self.latent_dim, rng)
+        if len(eps) != self.latent_dim:
+            raise ValueError(f"VAE.forward: eps 维度应为 {self.latent_dim}")
+        std = [math.exp(0.5 * v) for v in logvar]
+        z = [mu[i] + eps[i] * std[i] for i in range(self.latent_dim)]
+        x_hat = self.decode(z)
+        self._x, self._mu, self._logvar, self._eps, self._std, self._z = \
+            list(x), mu, logvar, list(eps), std, z
+        return x_hat
+
+    def loss_and_backward(self, x, eps=None, rng=None):
+        if not isinstance(x, (list, tuple)) or len(x) != self.input_dim:
+            raise ValueError(f"VAE.loss_and_backward: x 维度应为 {self.input_dim}")
+        x_hat = self.forward(x, eps=eps, rng=rng)
+        n = self.input_dim
+        recon = sum((x_hat[j] - x[j]) ** 2 for j in range(n)) / n
+        kl = 0.5 * sum(self._mu[i] ** 2 + math.exp(self._logvar[i])
+                       - 1.0 - self._logvar[i] for i in range(self.latent_dim))
+        loss = recon + self.beta * kl
+
+        # 重构项 → decoder
+        d_x_hat = [2.0 * (x_hat[j] - x[j]) / n for j in range(n)]
+        gw2, gb2, d_h = self.dec2.backward(d_x_hat)
+        gw1, gb1, d_z = self.dec1.backward(d_h)
+        # 重参数化 + KL → encoder 输出（mu 在前、logvar 在后）
+        d_mu = [d_z[i] + self.beta * self._mu[i] for i in range(self.latent_dim)]
+        d_logvar = [d_z[i] * self._eps[i] * 0.5 * self._std[i]
+                    + self.beta * 0.5 * (math.exp(self._logvar[i]) - 1.0)
+                    for i in range(self.latent_dim)]
+        gwe, gbe, d_hidden = self.enc2.backward(d_mu + d_logvar)
+        gw0, gb0, _ = self.enc1.backward(d_hidden)
+
+        self._acc(0, gw0, gb0)
+        self._acc(1, gwe, gbe)
+        self._acc(2, gw1, gb1)
+        self._acc(3, gw2, gb2)
+        return loss
+
+    def fit(self, data, epochs=200, lr=1e-2, batch_size=None, seed=None,
+            verbose=False):
+        if not data:
+            raise ValueError("VAE.fit: data 不能为空")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError("VAE.fit: lr 必须为正数")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 0:
+            raise ValueError("VAE.fit: epochs 必须是非负整数")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        for _epoch in range(epochs):
+            total = 0.0
+            self.zero_grad()
+            for x in data:
+                total += self.loss_and_backward(x, eps=_gauss_vec(self.latent_dim, rng))
+            self._scale_grads(1.0 / len(data))
+            self.adam_step(lr)
+            history.append(total / len(data))
+        return history
+
+    def _scale_grads(self, factor):
+        if factor == 1.0:
+            return
+        for item in self._g:
+            if item is None:
+                continue
+            gw, gb = item
+            for row in gw:
+                for c in range(len(row)):
+                    row[c] *= factor
+            for k in range(len(gb)):
+                gb[k] *= factor
+
+    def adam_step(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+        self.step_count += 1
+        t = self.step_count
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _adam_apply(layer.weights, gw, layer.m_w, layer.v_w, t, lr, b1, b2, eps)
+            _adam_apply(layer.biases, gb, layer.m_b, layer.v_b, t, lr, b1, b2, eps)
+
+    def sgd_step(self, lr=1e-2):
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _sgd_apply(layer.weights, gw, lr)
+            _sgd_apply(layer.biases, gb, lr)
+
+    def sample(self, n=1, rng=None):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("VAE.sample: n 必须是 >= 1 的整数")
+        return [self.decode(_gauss_vec(self.latent_dim, rng)) for _ in range(n)]
+
+
+class GAN:
+    """最小可训练 GAN（MLP 生成器 / 判别器，BCE 损失）
+
+    判别器：D(x) = sigmoid(MLP(x))；生成器：G(z) 直接输出样本。
+    训练时 D 用「真实样本 + 生成样本」各一次 BCE，G 只走判别器的生成分支
+    （梯度穿过 D 但不更新 D 的参数）。
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 32, latent_dim: int = 2):
+        for name, value in (("input_dim", input_dim), ("hidden_dim", hidden_dim),
+                            ("latent_dim", latent_dim)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"GAN: {name} 必须是 >= 1 的整数")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.d1 = Layer(input_dim, hidden_dim, activation="leaky_relu")
+        self.d2 = Layer(hidden_dim, 1, activation="sigmoid")
+        self.g1 = Layer(latent_dim, hidden_dim, activation="relu")
+        self.g2 = Layer(hidden_dim, input_dim, activation="linear")
+
+    # ---- 判别器
+    def discriminate(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != self.input_dim:
+            raise ValueError(f"GAN.discriminate: x 维度应为 {self.input_dim}")
+        h = self.d1.forward(x)
+        out = self.d2.forward(h)
+        return out[0]
+
+    def _d_grads(self, x, target):
+        p = self.discriminate(x)
+        p = min(max(p, 1e-12), 1.0 - 1e-12)
+        loss = -(target * math.log(p) + (1.0 - target) * math.log(1.0 - p))
+        d_out = [-(target / p) + (1.0 - target) / (1.0 - p)]
+        gw2, gb2, d_h = self.d2.backward(d_out)
+        gw1, gb1, d_x = self.d1.backward(d_h)
+        return loss, (gw1, gb1), (gw2, gb2), d_x
+
+    # ---- 生成器
+    def generate(self, z):
+        if not isinstance(z, (list, tuple)) or len(z) != self.latent_dim:
+            raise ValueError(f"GAN.generate: z 维度应为 {self.latent_dim}")
+        return self.g2.forward(self.g1.forward(z))
+
+    def _g_grads(self, z):
+        """生成样本的 D 分数对 G 的梯度（希望 D 判为 1）。"""
+        x_fake = self.generate(z)
+        p = self.discriminate(x_fake)
+        p = min(max(p, 1e-12), 1.0 - 1e-12)
+        d_out = [-1.0 / p]
+        gw2, gb2, d_h = self.d2.backward(d_out)
+        _gw1, _gb1, d_x = self.d1.backward(d_h)
+        gw_g2, gb_g2, d_h1 = self.g2.backward(d_x)
+        gw_g1, gb_g1, _ = self.g1.backward(d_h1)
+        return (gw_g1, gb_g1), (gw_g2, gb_g2)
+
+    def step(self, real_batch, rng=None, lr_d=1e-3, lr_g=1e-3, adam=True):
+        if not real_batch:
+            raise ValueError("GAN.step: real_batch 不能为空")
+        r = rng or random
+        # 1) 判别器：真实 + 生成各一次
+        d_loss = 0.0
+        accs = {"d1": None, "d2": None}
+        for x in real_batch:
+            loss, (w1, b1), (w2, b2), _ = self._d_grads(x, 1.0)
+            d_loss += loss
+            self._acc_pair(accs, "d1", w1, b1)
+            self._acc_pair(accs, "d2", w2, b2)
+        for _ in real_batch:
+            z = _gauss_vec(self.latent_dim, r)
+            loss, (w1, b1), (w2, b2), _ = self._d_grads(self.generate(z), 0.0)
+            d_loss += loss
+            self._acc_pair(accs, "d1", w1, b1)
+            self._acc_pair(accs, "d2", w2, b2)
+        scale = 1.0 / (2 * len(real_batch))
+        self._apply(self.d1, accs["d1"], lr_d, scale, adam, "d1")
+        self._apply(self.d2, accs["d2"], lr_d, scale, adam, "d2")
+
+        # 2) 生成器：只更新 g1/g2
+        g_loss = 0.0
+        gaccs = {"g1": None, "g2": None}
+        for _ in real_batch:
+            z = _gauss_vec(self.latent_dim, r)
+            (w1, b1), (w2, b2) = self._g_grads(z)
+            g_loss += -math.log(max(1e-12, self.discriminate(self.generate(z))))
+            self._acc_pair(gaccs, "g1", w1, b1)
+            self._acc_pair(gaccs, "g2", w2, b2)
+        scale_g = 1.0 / len(real_batch)
+        self._apply(self.g1, gaccs["g1"], lr_g, scale_g, adam, "g1")
+        self._apply(self.g2, gaccs["g2"], lr_g, scale_g, adam, "g2")
+        return d_loss / (2 * len(real_batch)), g_loss / len(real_batch)
+
+    @staticmethod
+    def _acc_pair(accs, key, gw, gb):
+        if accs[key] is None:
+            accs[key] = [[[v for v in row] for row in gw], list(gb)]
+        else:
+            cur = accs[key]
+            for r_ in range(len(cur[0])):
+                for c in range(len(cur[0][r_])):
+                    cur[0][r_][c] += gw[r_][c]
+            for k in range(len(cur[1])):
+                cur[1][k] += gb[k]
+
+    def _apply(self, layer, acc, lr, scale, adam, tag):
+        if acc is None:
+            return
+        gw, gb = acc
+        for row in gw:
+            for c in range(len(row)):
+                row[c] *= scale
+        for k in range(len(gb)):
+            gb[k] *= scale
+        self._adam_t = getattr(self, "_adam_t", 0)
+        if adam:
+            self._adam_t += 1
+            _adam_apply(layer.weights, gw, layer.m_w, layer.v_w, self._adam_t, lr)
+            _adam_apply(layer.biases, gb, layer.m_b, layer.v_b, self._adam_t, lr)
+        else:
+            _sgd_apply(layer.weights, gw, lr)
+            _sgd_apply(layer.biases, gb, lr)
+
+    def fit(self, data, epochs=200, lr_d=1e-3, lr_g=1e-3, seed=None,
+            verbose=False):
+        if not data:
+            raise ValueError("GAN.fit: data 不能为空")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        for _epoch in range(epochs):
+            d_loss, g_loss = self.step(data, rng=rng, lr_d=lr_d, lr_g=lr_g)
+            history.append((d_loss, g_loss))
+        return history
+
+
+class DDPM:
+    """最小 DDPM（去噪扩散概率模型）
+
+    前向：x_t = sqrt(abar_t)*x0 + sqrt(1-abar_t)*noise
+    训练：给网络 (x_t, t) 让它预测 noise，损失是逐维 MSE
+    采样：从 x_T ~ N(0,1) 逐步反向去噪
+    """
+
+    def __init__(self, data_dim: int, hidden_dim: int = 32, steps: int = 50,
+                 beta_start: float = 1e-4, beta_end: float = 0.02, t_dim: int = 8):
+        for name, value in (("data_dim", data_dim), ("hidden_dim", hidden_dim),
+                            ("steps", steps), ("t_dim", t_dim)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"DDPM: {name} 必须是 >= 1 的整数")
+        if not 0.0 < beta_start < beta_end < 1.0:
+            raise ValueError("DDPM: 需要 0 < beta_start < beta_end < 1")
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.steps = steps
+        self.t_dim = t_dim if t_dim % 2 == 0 else t_dim + 1
+
+        self.betas = [beta_start + (beta_end - beta_start) * i / max(1, steps - 1)
+                      for i in range(steps)]
+        self.alphas = [1.0 - b for b in self.betas]
+        self.abar = []
+        prod = 1.0
+        for a in self.alphas:
+            prod *= a
+            self.abar.append(prod)
+
+        self.l1 = Layer(data_dim + self.t_dim, hidden_dim, activation="relu")
+        self.l2 = Layer(hidden_dim, hidden_dim, activation="relu")
+        self.l3 = Layer(hidden_dim, data_dim, activation="linear")
+        self.layers = [self.l1, self.l2, self.l3]
+        self.step_count = 0
+        self.zero_grad()
+
+    def zero_grad(self):
+        self._g = [None] * len(self.layers)
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+            return
+        cur_w, cur_b = self._g[i]
+        for r in range(len(cur_w)):
+            for c in range(len(cur_w[r])):
+                cur_w[r][c] += gw[r][c]
+        for k in range(len(cur_b)):
+            cur_b[k] += gb[k]
+
+    def _grid(self, x, t):
+        if t < 0 or t >= self.steps:
+            raise ValueError(f"DDPM: 步数 t 必须在 [0, {self.steps})")
+        if not isinstance(x, (list, tuple)) or len(x) != self.data_dim:
+            raise ValueError(f"DDPM: x 维度应为 {self.data_dim}")
+        return list(x) + _time_features(t, self.steps, self.t_dim)
+
+    def q_sample(self, x0, t, noise):
+        """前向加噪：x_t = sqrt(abar_t) * x0 + sqrt(1 - abar_t) * noise。"""
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise TypeError("DDPM.q_sample: t 必须是整数")
+        if t < 0 or t >= self.steps:
+            raise ValueError(f"DDPM.q_sample: 步数 t 必须在 [0, {self.steps})")
+        for name, v in (("x0", x0), ("noise", noise)):
+            if not isinstance(v, (list, tuple)) or len(v) != self.data_dim:
+                raise ValueError(f"DDPM.q_sample: {name} 维度应为 {self.data_dim}")
+        a = math.sqrt(self.abar[t])
+        b = math.sqrt(1.0 - self.abar[t])
+        return [a * x0[i] + b * noise[i] for i in range(self.data_dim)]
+
+    def predict_noise(self, x_t, t):
+        inp = self._grid(x_t, t)
+        h1 = self.l1.forward(inp)
+        h2 = self.l2.forward(h1)
+        return self.l3.forward(h2)
+
+    def train_step(self, x0, rng=None, t=None, noise=None):
+        """一步训练：随机取 t 与噪声，预测噪声并累积梯度。
+
+        `t` / `noise` 显式给出时用于测试（固定随机性做中心差分）。
+        """
+        if not isinstance(x0, (list, tuple)) or len(x0) != self.data_dim:
+            raise ValueError(f"DDPM.train_step: x0 维度应为 {self.data_dim}")
+        r = rng or random
+        if t is None:
+            t = r.randrange(self.steps)
+        if noise is None:
+            noise = _gauss_vec(self.data_dim, r)
+        x_t = self.q_sample(x0, t, noise)
+        pred = self.predict_noise(x_t, t)
+        n = self.data_dim
+        loss = sum((pred[i] - noise[i]) ** 2 for i in range(n)) / n
+        d_pred = [2.0 * (pred[i] - noise[i]) / n for i in range(n)]
+        gw3, gb3, d2 = self.l3.backward(d_pred)
+        gw2, gb2, d1 = self.l2.backward(d2)
+        gw1, gb1, _ = self.l1.backward(d1)
+        self._acc(0, gw1, gb1)
+        self._acc(1, gw2, gb2)
+        self._acc(2, gw3, gb3)
+        return loss
+
+    def fit(self, data, epochs=200, lr=1e-3, seed=None, verbose=False):
+        if not data:
+            raise ValueError("DDPM.fit: data 不能为空")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        for _epoch in range(epochs):
+            total = 0.0
+            self.zero_grad()
+            for x in data:
+                total += self.train_step(x, rng=rng)
+            for item in self._g:
+                if item is None:
+                    continue
+                gw, gb = item
+                for row in gw:
+                    for c in range(len(row)):
+                        row[c] /= len(data)
+                for k in range(len(gb)):
+                    gb[k] /= len(data)
+            self.adam_step(lr)
+            history.append(total / len(data))
+        return history
+
+    def adam_step(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+        self.step_count += 1
+        t = self.step_count
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _adam_apply(layer.weights, gw, layer.m_w, layer.v_w, t, lr, b1, b2, eps)
+            _adam_apply(layer.biases, gb, layer.m_b, layer.v_b, t, lr, b1, b2, eps)
+
+    def sgd_step(self, lr=1e-2):
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _sgd_apply(layer.weights, gw, lr)
+            _sgd_apply(layer.biases, gb, lr)
+
+    def sample(self, n=1, rng=None):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("DDPM.sample: n 必须是 >= 1 的整数")
+        r = rng or random
+        out = []
+        for _ in range(n):
+            x = _gauss_vec(self.data_dim, r)
+            for t in range(self.steps - 1, -1, -1):
+                eps_pred = self.predict_noise(x, t)
+                a = self.alphas[t]
+                ab = self.abar[t]
+                mean = [(x[i] - (1.0 - a) / math.sqrt(max(1e-12, 1.0 - ab)) * eps_pred[i])
+                        / math.sqrt(a) for i in range(self.data_dim)]
+                if t > 0:
+                    sigma = math.sqrt(self.betas[t])
+                    z = _gauss_vec(self.data_dim, r)
+                    x = [mean[i] + sigma * z[i] for i in range(self.data_dim)]
+                else:
+                    x = mean
+            out.append(x)
+        return out
+
+
 # ── 工厂函数
 
 def distill(teacher, student, x, y, epochs=400, batch_size=16,

@@ -8197,3 +8197,201 @@ class TestMoE:
             moe.forward([vec])
             used.update(e for e, _w in moe.routes[0])
         assert len(used) >= 2
+
+class TestVAE:
+    """VAE：重参数化、KL、梯度、采样。"""
+
+    @staticmethod
+    def _mk():
+        random.seed(1)
+        vae = AI.VAE(3, hidden_dim=6, latent_dim=2)
+        x0 = [0.5, -0.2, 0.1]
+        eps = [0.3, -0.4]
+        return vae, x0, eps
+
+    def test_reparam_and_kl(self):
+        vae, x0, eps = self._mk()
+        vae.zero_grad()
+        loss = vae.loss_and_backward(x0, eps=eps)
+        assert math.isfinite(loss)
+        for i in range(2):
+            assert abs(vae._z[i] - (vae._mu[i] + eps[i] * vae._std[i])) < 1e-15
+        kl = 0.5 * sum(vae._mu[i] ** 2 + math.exp(vae._logvar[i]) - 1 - vae._logvar[i]
+                       for i in range(2))
+        assert kl >= -1e-12
+        rec = sum((vae.decode(vae._z)[j] - x0[j]) ** 2 for j in range(3)) / 3
+        assert abs(loss - (rec + kl)) < 1e-12
+
+    def test_gradients_numeric(self):
+        vae, x0, eps = self._mk()
+
+        def L():
+            return vae.loss_and_backward(x0, eps=eps)
+
+        vae.zero_grad()
+        L()
+        ana_dec = vae._g[3][0][0][0]
+        ana_enc = vae._g[1][0][0][0]
+        e = 1e-6
+        for layer, ana, tag in ((vae.dec2, ana_dec, "dec2"), (vae.enc2, ana_enc, "enc2")):
+            old = layer.weights[0][0]
+            layer.weights[0][0] = old + e
+            vae.zero_grad()
+            lp = L()
+            layer.weights[0][0] = old - e
+            vae.zero_grad()
+            lm = L()
+            layer.weights[0][0] = old
+            num = (lp - lm) / (2 * e)
+            assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6, tag
+
+    def test_fit_and_sample(self):
+        random.seed(2)
+        data = [[0.6, 0.4], [0.5, 0.6], [-0.5, -0.4], [-0.6, -0.3],
+                [0.1, -0.5], [-0.2, 0.5]]
+        vae = AI.VAE(2, hidden_dim=12, latent_dim=2, beta=0.5)
+        hist = vae.fit(data, epochs=120, lr=0.02, seed=7)
+        assert hist[-1] < hist[0] * 0.3
+        out = vae.sample(5, rng=random.Random(3))
+        assert len(out) == 5 and all(len(v) == 2 for v in out)
+        assert all(math.isfinite(x) for v in out for x in v)
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.VAE(0)
+        with pytest.raises(ValueError):
+            AI.VAE(2, beta=-1.0)
+        vae, x0, _eps = self._mk()
+        with pytest.raises(ValueError):
+            vae.forward(x0, eps=[0.1])
+        with pytest.raises(ValueError):
+            vae.loss_and_backward([0.1, 0.2])
+
+
+class TestGAN:
+    """GAN：判别器/生成器梯度与训练方向。"""
+
+    def test_ranges(self):
+        random.seed(4)
+        gan = AI.GAN(2, hidden_dim=8, latent_dim=2)
+        p = gan.discriminate([0.4, 0.5])
+        assert 0.0 < p < 1.0
+        assert len(gan.generate([0.3, -0.2])) == 2
+
+    def test_discriminator_gradient(self):
+        random.seed(4)
+        gan = AI.GAN(2, hidden_dim=8, latent_dim=2)
+        xr = [0.4, 0.5]
+        w1 = gan._d_grads(xr, 1.0)[1][0]
+        ana = w1[0][0]
+        e = 1e-6
+        old = gan.d1.weights[0][0]
+        gan.d1.weights[0][0] = old + e
+        lp = gan._d_grads(xr, 1.0)[0]
+        gan.d1.weights[0][0] = old - e
+        lm = gan._d_grads(xr, 1.0)[0]
+        gan.d1.weights[0][0] = old
+        num = (lp - lm) / (2 * e)
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_generator_gradient(self):
+        random.seed(4)
+        gan = AI.GAN(2, hidden_dim=8, latent_dim=2)
+        z = [0.3, -0.2]
+        gan.generate(z)
+        gen_w = gan._g_grads(z)[1][0]
+        ana = gen_w[0][0]
+
+        def obj():
+            return -math.log(max(1e-12, gan.discriminate(gan.generate(z))))
+
+        e = 1e-6
+        old = gan.g2.weights[0][0]
+        gan.g2.weights[0][0] = old + e
+        lp = obj()
+        gan.g2.weights[0][0] = old - e
+        lm = obj()
+        gan.g2.weights[0][0] = old
+        num = (lp - lm) / (2 * e)
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_training_moves_toward_data(self):
+        random.seed(5)
+        gan = AI.GAN(2, hidden_dim=16, latent_dim=2)
+        target = [[1.8, 1.6], [2.2, 1.9], [2.0, 2.2], [1.7, 2.1]]
+
+        def gen_mean():
+            r = random.Random(11)
+            pts = [gan.generate([r.gauss(0, 1), r.gauss(0, 1)]) for _ in range(6)]
+            return [sum(p[i] for p in pts) / 6 for i in range(2)]
+
+        before = gen_mean()
+        for _ in range(300):
+            gan.step(target, rng=random.Random(13))
+        after = gen_mean()
+        d0 = math.hypot(before[0] - 1.9, before[1] - 1.9)
+        d1 = math.hypot(after[0] - 1.9, after[1] - 1.9)
+        assert d1 < d0 * 0.9
+        with pytest.raises(ValueError):
+            gan.step([])
+
+
+class TestDDPM:
+    """DDPM：前向加噪、噪声预测梯度、反向采样。"""
+
+    def test_q_sample(self):
+        random.seed(6)
+        d = AI.DDPM(2, hidden_dim=8, steps=10)
+        x0, noise, t = [0.4, -0.3], [0.2, -0.7], 4
+        xt = d.q_sample(x0, t, noise)
+        a = math.sqrt(d.abar[t])
+        b = math.sqrt(1.0 - d.abar[t])
+        for i in range(2):
+            assert abs(xt[i] - (a * x0[i] + b * noise[i])) < 1e-15
+        with pytest.raises(TypeError):
+            d.q_sample(x0, True, noise)
+        with pytest.raises(ValueError):
+            d.q_sample(x0, 10, noise)
+        with pytest.raises(ValueError):
+            d.q_sample([0.1], t, noise)
+        with pytest.raises(ValueError):
+            d.q_sample(x0, t, [0.1])
+
+    def test_gradient(self):
+        random.seed(6)
+        d = AI.DDPM(2, hidden_dim=8, steps=10)
+        x0, noise, t = [0.4, -0.3], [0.2, -0.7], 4
+        d.zero_grad()
+        d.train_step(x0, t=t, noise=noise)
+        ana = d._g[2][0][0][0]
+        e = 1e-6
+        old = d.l3.weights[0][0]
+        d.l3.weights[0][0] = old + e
+        d.zero_grad()
+        lp = d.train_step(x0, t=t, noise=noise)
+        d.l3.weights[0][0] = old - e
+        d.zero_grad()
+        lm = d.train_step(x0, t=t, noise=noise)
+        d.l3.weights[0][0] = old
+        num = (lp - lm) / (2 * e)
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_fit_and_sample(self):
+        random.seed(7)
+        d = AI.DDPM(2, hidden_dim=16, steps=16)
+        data = [[1.0, 1.0], [0.9, 1.1], [-1.0, -0.9], [-0.9, -1.1]]
+        hist = d.fit(data, epochs=150, lr=2e-3, seed=5)
+        assert hist[-1] < hist[0] * 0.4
+        out = d.sample(4, rng=random.Random(9))
+        assert len(out) == 4 and all(len(v) == 2 for v in out)
+        assert all(math.isfinite(x) for v in out for x in v)
+        mean = [sum(v[i] for v in out) / 4 for i in range(2)]
+        assert abs(mean[0]) < 2 and abs(mean[1]) < 2
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.DDPM(2, beta_start=0.5, beta_end=0.1)
+        with pytest.raises(ValueError):
+            AI.DDPM(0)
+        with pytest.raises(ValueError):
+            AI.DDPM(2).train_step([0.1])
