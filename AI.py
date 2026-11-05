@@ -961,7 +961,6 @@ class ConvTranspose2d:
                 out_c = dout[co0 + co]
                 w = self.weights[ci][co]
                 g_w = self.grad_w[ci][co]
-                self.grad_b[co0 + co] += sum(sum(row) for row in out_c)
                 for oh in range(H):
                     xrow = self.x[ci][oh]
                     dxrow = dx[ci][oh]
@@ -984,6 +983,11 @@ class ConvTranspose2d:
                                 g_row[kw] += dv * xv
                                 acc += dv * w[kh][kw]
                         dxrow[ow] += acc
+        # 偏置梯度每次反向只加一遍：同一组的输入通道共享同一张输出图，
+        # 原来写在 ci 循环里会按 cin/groups 倍放大（实测 cin=2 时 2 倍、cin=3 时 3 倍）
+        for _co0 in range(0, self.out_channels, self.og):
+            for _co in range(self.og):
+                self.grad_b[_co0 + _co] += sum(sum(row) for row in dout[_co0 + _co])
         return dx
 
 
@@ -3156,7 +3160,12 @@ class CrossAttention:
 
     backward 返回 `(dx, dmemory)`：既要把梯度传回解码器上一层，也要传回
     编码器（多层 decoder 共享同一份 memory，各层的 dmemory 相加）。
+
+    `delta_index = 0` 显式声明「往回传的是第 0 项」：容器（Sequential 等）
+    默认取 -1，会把 dmemory 当成输入梯度，静默拿错。
     """
+
+    delta_index = 0
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
         """dropout: 交叉注意力权重上的 inverted dropout（训练模式生效）"""
@@ -3774,7 +3783,9 @@ def _lm_save(lm, kind, filepath, include_optimizer=False, quiet=False):
             "v": {k: v for k, v in getattr(lm, "_adam_v", {}).items()},
         }
     with io.open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        # allow_nan=False：参数发散成 NaN/Inf 时宁可保存失败，也不写出
+        # 不合 RFC-4627 的 JSON（save_model 一直是这样做的）
+        json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
     if not quiet:
         print(f"已保存 {kind} 模型: {filepath}")
     return filepath
@@ -3825,7 +3836,11 @@ def _lm_load(filepath, restore_optimizer=False):
 
 
 def _check_pad_mask(mask, length, who):
-    """校验 pad_mask：与序列等长的 0/1 列表，至少一个有效位；返回 bool 列表"""
+    """校验 pad_mask：与序列等长的 0/1 列表，至少一个有效位；返回 bool 列表
+
+    只支持**右填充**（有效位在前、0 在后）：CausalLM 用 `valid[:-1]` 当 key_mask，
+    左填充会把 key_mask 截错位置，算出来的 loss 是错的但不会报错。
+    """
     if not isinstance(mask, (list, tuple)):
         raise ValueError(f"{who}: pad_mask 必须是列表，收到 {type(mask).__name__}")
     if len(mask) != length:
@@ -4870,6 +4885,17 @@ class Sequential:
     """
 
     def __init__(self, *modules):
+        # 两种写法都接受：Sequential(a, b) 与 Sequential([a, b])。
+        # 后者原来会把整个列表当成一个模块，直到 forward 才炸成
+        # AttributeError: 'list' object has no attribute 'forward'，现在直接摊平。
+        if len(modules) == 1 and isinstance(modules[0], (list, tuple)):
+            modules = tuple(modules[0])
+        for _i, _m in enumerate(modules):
+            if not hasattr(_m, "forward"):
+                raise ValueError(
+                    f"Sequential: 第 {_i} 个模块 {type(_m).__name__} 没有 forward()，"
+                    f"不能放进容器"
+                )
         self.modules = list(modules)
 
     def train(self):
@@ -4895,7 +4921,9 @@ class Sequential:
         for m in reversed(self.modules):
             result = m.backward(delta)
             if result is not None:
-                # delta_index 默认 -1（末位），BatchNorm1d 声明为 0
+                # delta_index 默认 -1（末位）：Layer 的 (gw, gb, dx)、LayerNorm 的
+                # (dγ, dβ, dx) 都以 dx 结尾；BatchNorm2d/CrossAttention 这类
+                # 「多返回值但主梯度在前」的模块自己声明 delta_index = 0
                 delta = (result[getattr(m, "delta_index", -1)]
                          if isinstance(result, tuple) else result)
         return delta
@@ -5703,11 +5731,15 @@ def estimate_flops(model, input_shape):
             step = 0
         elif isinstance(m, (BatchNorm1d, LayerNorm, Dropout, Flatten)):
             if isinstance(m, Flatten):
-                if len(shape) == 1:
-                    step = 0
-                else:
-                    step = 0
-                    shape = [shape[0] * shape[1] * shape[2]] if len(shape) == 3 else shape
+                # Flatten.forward 要求 (C,H,W)；1 维/2 维在这里静默通过、
+                # 真跑却抛 TypeError，属于「估算说能跑、实际跑不了」，直接报错
+                if len(shape) != 3:
+                    raise ValueError(
+                        f"estimate_flops: Flatten 需要三维输入 (C,H,W)，"
+                        f"当前输入形状 {shape}（一维/二维请先补维度）"
+                    )
+                step = 0
+                shape = [shape[0] * shape[1] * shape[2]]
             elif isinstance(m, Dropout):
                 step = 0
             elif isinstance(m, LayerNorm):
@@ -5802,7 +5834,7 @@ def mixup(x1, y1, x2, y2, alpha: float = 0.2, rng=None):
     """
     if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
         raise ValueError(f"mixup: alpha 必须是数字，收到 {alpha!r}")
-    if not isinstance(y1, int) or isinstance(y1, bool) or not isinstance(y2, int)             or isinstance(y2, bool):
+    if not isinstance(y1, int) or isinstance(y1, bool) or not isinstance(y2, int) or isinstance(y2, bool):
         raise ValueError("mixup: y1/y2 必须是类别索引")
     if len(x1) != len(x2):
         raise ValueError(f"mixup: 两个样本维度不同（{len(x1)} vs {len(x2)}）")
@@ -5824,7 +5856,11 @@ def mixup(x1, y1, x2, y2, alpha: float = 0.2, rng=None):
                 x = (1.0 + c * v) ** 3
                 if math.log(u) < 0.5 * v * v + d - d * x + d * math.log(x):
                     return d * x
-        lam = _gamma(alpha) / (_gamma(alpha) + _gamma(alpha))
+        # Beta(a, a)：用两个独立 Gamma(a) 采样相除；分母必须包含分子那一项，
+        # 原来写成 _gamma(a)/(_gamma(a)+_gamma(a)) 漏了分子，实测 lam 会超过 1
+        g1 = _gamma(alpha)
+        g2 = _gamma(alpha)
+        lam = g1 / (g1 + g2)
     else:
         lam = 0.5
     mixed_x = [lam * float(a) + (1.0 - lam) * float(b) for a, b in zip(x1, x2)]
@@ -6900,6 +6936,7 @@ def save_conv_model(conv_layers, fc_model, filepath: str):
                 "kernel_size": conv.kernel_size,
                 "stride": conv.stride,
                 "padding": conv.padding,
+                "groups": conv.groups,
                 "weights": conv.weights,
                 "biases": conv.biases,
             })
@@ -6953,9 +6990,11 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
     # 重建 CNN 层（先校验形状，坏文件在加载期就报错）
     conv_layers = []
     for k, cd in enumerate(data["conv"]):
+        # groups 是后加的字段：旧存档没有它，按 1 处理
         conv = Conv2d(cd["in_channels"], cd["out_channels"],
-                       cd["kernel_size"], cd["stride"], cd["padding"])
-        oc, ic, kh, kw = conv.out_channels, conv.in_channels, conv.kh, conv.kw
+                       cd["kernel_size"], cd["stride"], cd["padding"],
+                       groups=int(cd.get("groups", 1)))
+        oc, ic, kh, kw = conv.out_channels, conv.cg, conv.kh, conv.kw
         cw = cd["weights"]
         shape_ok = (len(cw) == oc
                     and all(len(ch) == ic for ch in cw)
@@ -6964,7 +7003,7 @@ def load_conv_model(filepath: str, default_output_activation: Optional[str] = No
         if not shape_ok:
             raise ValueError(
                 f"load_conv_model: 第 {k} 个 Conv2d 的 weights 形状与超参数不符"
-                f"（应为 {oc}×{ic}×{kh}×{kw}）"
+                f"（应为 {oc}×{ic}×{kh}×{kw}，注意分组卷积每个输出通道只连 {ic} 个输入通道）"
             )
         if len(cd["biases"]) != oc:
             raise ValueError(
@@ -7214,7 +7253,8 @@ def grad_check(module, x, y=None, loss_fn=None, eps: float = 1e-6,
         default_loss = None
     else:
         raise TypeError(
-            f"grad_check: 支持 MLP / Model / CausalLM，收到 {type(module).__name__}"
+            f"grad_check: 支持 MLP / Model / CausalLM / Seq2SeqLM，"
+                f"收到 {type(module).__name__}"
         )
 
     if default_loss is None and loss_fn is None:
@@ -8175,15 +8215,26 @@ class Model:
         print(f"  Loss: {self._loss_name}  |  Optimizer: {type(self.optimizer).__name__}(lr={self.lr})")
         print(f"  {'='*50}")
         total = 0
+        _ACT_DISPLAY = {
+            'leaky_relu': 'LeakyReLU', 'relu': 'ReLU', 'softmax': 'Softmax',
+            'linear': 'Linear', 'gelu': 'GELU', 'sigmoid': 'Sigmoid',
+        }
         for i, layer in enumerate(self.model.layers):
-            if layer.act_fn == layer._leaky_relu:
-                act = 'LeakyReLU'
-            elif layer.act_fn == layer._relu:
-                act = 'ReLU'
-            elif layer.act_fn == layer._softmax:
-                act = 'Softmax'
-            else:
-                act = 'Linear'
+            # 优先用 Layer 自己记下的名字：gelu/sigmoid 原来会被显示成 Linear
+            act = _ACT_DISPLAY.get(getattr(layer, 'activation_name', None))
+            if act is None:
+                if layer.act_fn == layer._leaky_relu:
+                    act = 'LeakyReLU'
+                elif layer.act_fn == layer._relu:
+                    act = 'ReLU'
+                elif layer.act_fn == layer._softmax:
+                    act = 'Softmax'
+                elif layer.act_fn == getattr(layer, '_gelu', None):
+                    act = 'GELU'
+                elif layer.act_fn == getattr(layer, '_sigmoid', None):
+                    act = 'Sigmoid'
+                else:
+                    act = 'Linear'
             params = layer.fan_in * layer.fan_out + layer.fan_out
             total += params
             print(f"  [{i}] Linear({layer.fan_in} → {layer.fan_out}) + {act}   [{params:,}]")

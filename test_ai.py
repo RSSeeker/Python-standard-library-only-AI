@@ -4987,8 +4987,20 @@ class TestFlops:
         assert len(r["by_layer"]) == 4
 
     def test_unknown_module_raises(self):
+        # 不认识的模块必须在估算时就报 TypeError，而不是给个错数
+        class _Unknown:
+            def forward(self, x):
+                return x
+
+            def backward(self, delta):
+                return delta
+
         with pytest.raises(TypeError):
-            AI.estimate_flops(AI.Sequential(object()), [3])
+            AI.estimate_flops(AI.Sequential(_Unknown()), [3])
+
+        # 不是模块的东西进不了 Sequential（构造期就报，而不是 forward 时才炸）
+        with pytest.raises(ValueError):
+            AI.Sequential(object())
 
 
 class TestAugmentation:
@@ -6006,3 +6018,128 @@ class TestSeq2SeqGenerateValidation:
         m = AI.Seq2SeqLM(src_vocab=10, tgt_vocab=10, d_model=8, num_heads=2,
                          d_ff=8, num_layers=1, max_len=4)
         assert len(m.generate([1, 2, 3], 3, top_k=1)) == 3
+
+
+class TestReviewFixes:
+    """外部评审确认的缺陷：越界梯度、错误采样分布、存档丢字段等。"""
+
+    def test_conv_transpose_bias_grad_not_scaled(self):
+        # 偏置梯度原来写在 ci 循环里，被放大 cin/groups 倍
+        for cin, cout, groups in ((2, 3, 1), (3, 2, 1), (4, 2, 2)):
+            random.seed(11)
+            ct = AI.ConvTranspose2d(cin, cout, 3, stride=2, padding=1, groups=groups)
+            x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                 for _ in range(cin)]
+            out = ct.forward(x)
+            dout = [[[random.uniform(-1, 1) for _ in row] for row in ch] for ch in out]
+            ct.zero_grad()
+            ct.backward(dout)
+            ana = list(ct.grad_b)
+
+            def loss_of():
+                o = ct.forward(x)
+                return sum(o[c][h][w] * dout[c][h][w]
+                           for c in range(len(o))
+                           for h in range(len(o[c]))
+                           for w in range(len(o[c][h])))
+
+            eps = 1e-6
+            for i in range(cout):
+                ct.biases[i] += eps
+                lp = loss_of()
+                ct.biases[i] -= 2 * eps
+                lm = loss_of()
+                ct.biases[i] += eps
+                num = (lp - lm) / (2 * eps)
+                assert abs(ana[i] - num) <= 1e-6 * max(1.0, abs(num)), (cin, groups, i)
+
+    def test_mixup_lam_is_beta(self):
+        rng = random.Random(5)
+        lams = []
+        for _ in range(2000):
+            xs, soft = AI.mixup([0.0], 1, [1.0], 2, alpha=0.2, rng=rng)
+            lam = soft[1]
+            lams.append(lam)
+            assert 0.0 <= lam <= 1.0
+            # 软标签必须是合法概率：每项非负、和为 1
+            assert all(v >= 0.0 for v in soft)
+            assert abs(sum(soft) - 1.0) < 1e-12
+            AI.cross_entropy_loss([0.5, 0.3, 0.2], soft)  # 不应被 CE 拒绝
+        mean = sum(lams) / len(lams)
+        assert abs(mean - 0.5) < 0.05
+
+    def test_grouped_conv_archive_round_trip(self, tmp_path):
+        random.seed(3)
+        conv = AI.Conv2d(4, 6, 3, stride=1, padding=1, groups=2)
+        fc = AI.MLP([6, 3])
+        path = str(tmp_path / "conv_groups.json")
+        AI.save_conv_model([conv], fc, path)
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["conv"][0]["groups"] == 2
+
+        back, _ = AI.load_conv_model(path)
+        assert back[0].groups == 2 and back[0].cg == 2
+
+    def test_legacy_conv_archive_without_groups(self, tmp_path):
+        random.seed(4)
+        conv = AI.Conv2d(4, 6, 3, stride=1, padding=1, groups=1)
+        fc = AI.MLP([6, 3])
+        path = str(tmp_path / "conv_legacy.json")
+        AI.save_conv_model([conv], fc, path)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["conv"][0].pop("groups")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        back, _ = AI.load_conv_model(path)
+        assert back[0].groups == 1 and back[0].cg == 4
+
+    def test_cross_attention_declares_delta_index(self):
+        # 不声明的话容器取末项，会静默拿到 dmemory
+        assert getattr(AI.CrossAttention, "delta_index", -1) == 0
+        ca = AI.CrossAttention(8, 2)
+        seq = AI.Sequential(ca)
+        assert getattr(seq.modules[0], "delta_index", -1) == 0
+
+    def test_estimate_flops_flatten_rejects_low_dim(self):
+        seq = AI.Sequential(AI.Flatten(), AI.Layer(12, 5))
+        for shape in ([4], [4, 4]):
+            with pytest.raises(ValueError, match="Flatten"):
+                AI.estimate_flops(seq, shape)
+        assert AI.estimate_flops(seq, [3, 2, 2])["output_shape"] == [5]
+
+    def test_lm_save_rejects_nan(self, tmp_path):
+        random.seed(1)
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=8)
+        lm.W_out[0][0] = float("nan")
+        with pytest.raises(ValueError):
+            lm.save(str(tmp_path / "nan_lm.json"))
+
+    def test_pad_mask_doc_mentions_right_padding(self):
+        doc = AI._check_pad_mask.__doc__ or ""
+        assert "右填充" in doc
+
+    def test_summary_shows_real_activation(self, capsys):
+        mlp = AI.MLP([3, 5, 2], activations=["gelu", "softmax"])
+        model = AI.Model(mlp, task="classification")
+        model.summary()
+        out = capsys.readouterr().out
+        assert "GELU" in out and "Softmax" in out
+        assert "Linear(3 → 5) + Linear" not in out
+
+    def test_grad_check_message_lists_seq2seq(self):
+        with pytest.raises(TypeError, match="Seq2SeqLM"):
+            AI.grad_check(123, [1.0])
+
+    def test_sequential_accepts_list_and_rejects_non_module(self):
+        a, b = AI.Layer(4, 6), AI.Layer(6, 3)
+        flat = AI.Sequential([a, b])
+        assert len(flat.modules) == 2
+        assert len(flat.forward([0.5, -0.2, 0.1, 0.3])) == 3
+
+        with pytest.raises(ValueError, match="forward"):
+            AI.Sequential(object())
