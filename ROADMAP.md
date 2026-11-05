@@ -27,8 +27,10 @@
    - 测试：每族 1 个测试类、3–6 个用例；收集数变化要同步 README 两处计数；
    - README：组件表一行 + 需要时加小节；
    - 一个单元或一族一个提交，提交信息写清「验证数字」。
-4. **C / Web 同步**默认不做。C 侧只维持「LLM 主线 + 已对拍组件」的逐位一致；新特性
-   属于 Python 侧扩展，需要时再单独排期（否则每轮都要改三份，无法收敛）。
+4. **C / Web 同步**：能同步的尽量同步，但按「可逐位对拍」分级（见第 7 节）。判据很简单
+   —— 纯标量数学（激活、损失、优化器、调度器、指标、初始化）默认进 A 档必同步；
+   需要新张量布局或新子系统的进 B 档（排进同波的后半段）；只跟宿主环境有关的进 C 档
+   不同步。Python 永远先做完并验证，C/Web 再跟。
 5. 每波结束跑一次：`pytest`、`python AI.py`（14 段 demo）、`probe_default_paths.py`。
 
 ---
@@ -280,5 +282,93 @@
    `AI.py`（`git show HEAD:AI.py`），一旦出现非零差异就回退。
 3. **测试变慢**：新测试一律小规模（≤200 步、d_model ≤ 32），慢测试标 `@pytest.mark.slow`。
 4. **README 计数漂移**：已在提交前固定检查（正文 + 文件结构树两处）。
-5. **C/Web 失同步**：本路线图明确 Python 优先；C 侧只保留「LLM 主线逐位一致」，
-   新增特性不同步，除非单独要求。
+5. **C/Web 失同步**：按第 7 节的三档分级执行——A 档（纯标量数学）必须当场同步，
+   B 档排进同波后半段，C 档明确不同步并写进 `c/README.md` 的已知边界。
+
+
+---
+
+## 7. 跨语言同步策略（C / Web）
+
+### 7.1 三档分级
+
+| 档 | 判据 | 处理 |
+|---|---|---|
+| **A** | 纯标量数学：激活、损失、优化器、调度器、指标、初始化、采样参数 | 当场同步；容差 0 |
+| **B** | 需要新的张量布局或新子系统：`(C,H,W)` 归一化、MoE、序列标注头、生成模型、分词器、LoRA | 排进同波后半段；容差 0（单步）/ 1e-12（多步轨迹） |
+| **C** | 只跟宿主环境有关：数据集管道、CLI / 日志 / 配置、剖析与可视化、超参搜索、图网络 / RL / 多模态 / 检测 | 不同步，写进 `c/README.md` 的已知边界 |
+
+判据只有一条：**能不能用固定权重 + 固定输入，把 Python 的输出逐位复现**。能，就进 A/B；
+不能（因为依赖宿主 RNG、文件系统、进程模型），就进 C。
+
+### 7.2 同步流程（六步，缺一步不算完成）
+
+1. Python 侧先实现并用探针验证（解析梯度 / 闭式解）；
+2. 写 `c/tools/<topic>_reference.py`：固定 seed、显式导出权重与输入、把期望输出写进
+   `c/<topic>_reference.json`；
+3. C 侧实现（沿用 `numeric.h` 的 Neumaier 求和与既有模块风格，不引入新依赖）；
+4. `c/tests/compare_<topic>.c`：注入同一份权重后逐项比对，**单步/前向容差 0**，
+   多步训练轨迹允许 1e-12（msvcrt 与 ucrtbase 的 `exp`/`log` 有 1 ULP 差异）；
+5. `c/tests/test_<topic>.c` 自测（形状、边界、非法输入），并确认 11 个既有二进制不回归；
+6. `c/README.md` 更新（状态表 / 模块表 / 验证节 / 已知差异），两仓分别提交。
+
+### 7.3 各波同步档位
+
+| 波次 | C 侧 | Web 侧 |
+|---|---|---|
+| W0 训练基础设施 | C（回调/续训是宿主概念） | C |
+| W1 损失 | **A**（L1/LogCosh/Quantile 等回归族、SoftCE 等） | C |
+| W2 卷积与视觉块 | **A**（池化家族、DepthwiseSeparable、ResNet 块）+ B（Conv3d/Transpose3d） | C |
+| W3 归一化·激活·初始化 | **A**（初始化族、激活族、GLU、残差变体）+ B（WeightNorm/SpectralNorm） | C |
+| W4 视觉骨干 | B（ViT/U-Net 需新图结构） | C |
+| W5 注意力与位置编码 | **A**（YaRN/NTK-RoPE 改 `rope_freqs`、xPos、T5 偏置）+ B（线性注意力族） | B（页面只做可展示的采样/偏置项） |
+| W6 图神经网络 | C | C |
+| W7 LLM 微调与推理 | B（LoRA/DoRA、约束解码、序列打包）+ A（采样扩展） | **A/B**（采样扩展、约束解码） |
+| W8 生成模型 | B（VAE/GAN/DDPM 各挑最小可对拍版本） | C |
+| W9 优化器与调度 | **A**（全部） | C |
+| W10 正则与训练技巧 | B（DropBlock/DropConnect、对抗训练） | C |
+| W11 数据管道 | C | C |
+| W12 分词与批处理 | B（BPE/WordPiece、padding/mask） | C |
+| W13 指标扩展 | **A**（全部，纯函数） | B（困惑度/BLEU 展示） |
+| W14 可解释性 | C（可视化是宿主能力） | C |
+| W15 推理与部署 | B（结构化剪枝、QAT、集成） | C |
+| W16 自监督·多模态·RL | C | C |
+| W17 领域应用 | C（除时序 1D 卷积） | C |
+| W18 测试与数值稳定 | **A**（稳定性套件、基线快照可共用 JSON） | C |
+| W19 工程化收尾 | C | C |
+| W20 研究前沿 | C | C |
+
+### 7.4 C 侧欠账清单（Python 已有、C 尚未同步）
+
+按「先补最常用的」排序，每项都走 7.2 的六步：
+
+- [ ] **AdamW**（C 目前只有 Adam / SGD / SGDMomentum / RMSprop）
+- [ ] Lion / Adafactor
+- [ ] WarmupLR / ReduceLROnPlateau（C 只有 Step / Exponential / Cosine）
+- [ ] RMSNorm
+- [ ] `silu` / `mish` / `elu` / `selu`（扩 `act_apply` 枚举）与 GELU 版 FFN
+- [ ] 损失枚举补齐：先核对 `LossKind` 现有成员，再补 focal / bce / bce_with_logits / huber
+- [ ] 指标模块：accuracy / precision / recall / f1 / confusion_matrix / mae / rmse / mape / top-k / roc_auc
+- [ ] `Conv2d` 的 `groups` / `dilation`；`Conv1d` / `ConvTranspose2d`
+- [ ] `BatchNorm2d` / `GroupNorm` / `InstanceNorm` / `DropPath`
+- [ ] Mixup / CutMix / Cutout / RandAugment（纯张量运算，A 档）
+- [ ] MoE / 序列标注头 / 多标签头（B 档）
+- [ ] BPE / WordPiece 分词器（B 档）
+- [ ] LoRA、EMA / SWA / Lookahead（等 Python 侧 W9 完成后同步）
+
+### 7.5 Web 同步范围
+
+页面是一个「单层因果 LM 教学页」，能同步的只有 LLM 相关能力：
+
+- 已同步：因果掩码、KV cache、`top_k`/`top_p`/`min_p`、五种惩罚、滑动窗口、`ALiBi`、
+  模型存档/加载、困惑度、输入校验（66→87 checks）
+- 待同步（跟着 W7 走）：typical / mirostat / eta / top-a / tail-free / contrastive 采样、
+  约束解码（JSON Schema / 正则）、Prefix/Prompt cache 的可视化
+- 不同步：网络层扩展、图 / RL / 多模态、数据管道（页面没有「数据集」概念）
+
+### 7.6 成本影响
+
+A 档每项约为 Python 同类工作的 0.8–1.2 倍工时（实现 + 参考导出 + 对拍 + 自测 + 文档），
+B 档 2–3 倍。把已估的 25–35 个会话上调到 **30–42 个会话（+20%~25%）**；欠账清单（7.4）
+单独算 **4–6 个会话**，按「AdamW → 损失 → 指标 → Conv 扩展 → 归一化 → 分词器」顺序补。
+优先级不变：A 档不允许欠账，B 档允许落后一个波次。
