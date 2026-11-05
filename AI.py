@@ -8218,6 +8218,256 @@ class BytePairTokenizer:
         return f"BytePairTokenizer(vocab_size={self.vocab_size})"
 
 
+_WP_SPECIALS = ("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]")
+_WP_CONT = "##"
+
+
+class WordPieceTokenizer:
+    """WordPiece 分词器（BERT 风格）：词表 = 特殊标记 + 字符 + 子词。
+
+    与 `BytePairTokenizer` 的区别：
+      - 词表里存**字符串**（可读、可手写、可存档对比），不是字节序列；
+      - 词内非首字符一律带 `##` 前缀，所以「词中间的子词」和「词首的子词」
+        是两个不同 token —— 这也是 BERT 能把 `playing` 拆成 `play + ##ing`
+        却不把 `ing` 当成独立词的原因；
+      - 训练按 `频次 / (左频次 × 右频次)` 打分（BERT 原始做法），高频组合优先，
+        避免 `the` 这类高频词把词表占满；
+      - 编码用「最长前缀匹配」，词表外字符落到 `[UNK]`。
+
+    词表顺序固定：`[PAD] [UNK] [CLS] [SEP] [MASK]` 在最前，`id` 即下标，
+    存档/加载后 id 与训练时完全一致。
+    """
+
+    def __init__(self, vocab=None):
+        if vocab is None:
+            vocab = list(_WP_SPECIALS)
+        self._install(vocab)
+
+    def _install(self, vocab):
+        if not isinstance(vocab, (list, tuple)):
+            raise TypeError("WordPieceTokenizer: vocab 必须是 list 或 tuple")
+        tokens = [self._check_token(t) for t in vocab]
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("WordPieceTokenizer: vocab 里有重复 token")
+        for name in _WP_SPECIALS:
+            if name not in tokens:
+                raise ValueError(f"WordPieceTokenizer: vocab 缺少特殊标记 {name}")
+        self.tokens = list(tokens)
+        self.token_to_id = {t: k for k, t in enumerate(self.tokens)}
+        self.unk_id = self.token_to_id["[UNK]"]
+        self.pad_id = self.token_to_id["[PAD]"]
+        self.cls_id = self.token_to_id["[CLS]"]
+        self.sep_id = self.token_to_id["[SEP]"]
+        self.mask_id = self.token_to_id["[MASK]"]
+        return self
+
+    @staticmethod
+    def _check_token(token):
+        if not isinstance(token, str):
+            raise TypeError(f"WordPieceTokenizer: token 必须是 str，收到 {type(token).__name__}")
+        if not token:
+            raise ValueError("WordPieceTokenizer: token 不能是空字符串")
+        if token.startswith(_WP_CONT) and token == _WP_CONT:
+            raise ValueError(f"WordPieceTokenizer: token {token!r} 只有前缀、没有内容")
+        return token
+
+    @property
+    def vocab_size(self):
+        return len(self.tokens)
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def __repr__(self):
+        return f"WordPieceTokenizer(vocab_size={self.vocab_size})"
+
+    # ---------- 切词 ----------
+    @staticmethod
+    def _split_words(text):
+        """切成词块：字母数字连写 / 空白连写 / 其它符号连写。"""
+        words = []
+        cur = ""
+        kind = None
+        for ch in text:
+            k = "w" if ch.isalnum() else ("s" if ch.isspace() else "o")
+            if k == kind:
+                cur += ch
+            else:
+                if cur:
+                    words.append(cur)
+                cur = ch
+                kind = k
+        if cur:
+            words.append(cur)
+        return words
+
+    @staticmethod
+    def _to_pieces(word):
+        """词 -> WordPiece 初始切片：首字符原样，其余加 ##。"""
+        pieces = []
+        for k, ch in enumerate(word):
+            pieces.append(ch if k == 0 else _WP_CONT + ch)
+        return pieces
+
+    # ---------- 训练 ----------
+    def train(self, text, vocab_size=512, min_frequency=2, verbose=False):
+        if not isinstance(text, str):
+            raise TypeError("WordPieceTokenizer.train: text 必须是 str")
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int):
+            raise TypeError("WordPieceTokenizer.train: vocab_size 必须是 int")
+        if vocab_size < len(_WP_SPECIALS) + 1:
+            raise ValueError(
+                f"WordPieceTokenizer.train: vocab_size 至少 {len(_WP_SPECIALS) + 1}")
+        if isinstance(min_frequency, bool) or not isinstance(min_frequency, int):
+            raise TypeError("WordPieceTokenizer.train: min_frequency 必须是 int")
+        if min_frequency < 1:
+            raise ValueError("WordPieceTokenizer.train: min_frequency 必须 >= 1")
+
+        tokens = list(_WP_SPECIALS)
+        seen = set(tokens)
+        words = []
+        for word in self._split_words(text):
+            pieces = self._to_pieces(word)
+            words.append(pieces)
+            for p in pieces:
+                if p not in seen:
+                    tokens.append(p)
+                    seen.add(p)
+
+        while len(tokens) < vocab_size:
+            pair_freq = {}
+            token_freq = {}
+            for pieces in words:
+                for t in pieces:
+                    token_freq[t] = token_freq.get(t, 0) + 1
+                for k in range(len(pieces) - 1):
+                    pair = (pieces[k], pieces[k + 1])
+                    pair_freq[pair] = pair_freq.get(pair, 0) + 1
+            if not pair_freq:
+                break
+            best = None
+            best_score = -1.0
+            for (left, right), freq in pair_freq.items():
+                if freq < min_frequency:
+                    continue
+                score = freq / float(token_freq[left] * token_freq[right])
+                if score > best_score or (score == best_score and (left, right) < best):
+                    best = (left, right)
+                    best_score = score
+            if best is None:
+                break
+            left, right = best
+            body = right[len(_WP_CONT):] if right.startswith(_WP_CONT) else right
+            merged = (left if left.startswith(_WP_CONT) else left) + body
+            if merged in seen:
+                break
+            tokens.append(merged)
+            seen.add(merged)
+            new_words = []
+            for pieces in words:
+                out = []
+                k = 0
+                while k < len(pieces):
+                    if k + 1 < len(pieces) and pieces[k] == left and pieces[k + 1] == right:
+                        out.append(merged)
+                        k += 2
+                    else:
+                        out.append(pieces[k])
+                        k += 1
+                new_words.append(out)
+            words = new_words
+            if verbose:
+                print(f"  merge {left!r} + {right!r} -> {merged!r}  (freq={pair_freq[best]})")
+
+        return self._install(tokens)
+
+    # ---------- 编码 ----------
+    def _encode_word(self, word, max_chars):
+        if len(word) > max_chars:
+            return [self.unk_id]
+        ids = []
+        start = 0
+        n = len(word)
+        while start < n:
+            end = n
+            found = None
+            while start < end:
+                piece = word[start:end]
+                if start > 0:
+                    piece = _WP_CONT + piece
+                if piece in self.token_to_id:
+                    found = piece
+                    break
+                end -= 1
+            if found is None:
+                return [self.unk_id]
+            ids.append(self.token_to_id[found])
+            start = end
+        return ids
+
+    def encode(self, text, max_chars_per_word=100):
+        if not isinstance(text, str):
+            raise TypeError("WordPieceTokenizer.encode: text 必须是 str")
+        if isinstance(max_chars_per_word, bool) or not isinstance(max_chars_per_word, int):
+            raise TypeError("WordPieceTokenizer.encode: max_chars_per_word 必须是 int")
+        if max_chars_per_word < 1:
+            raise ValueError("WordPieceTokenizer.encode: max_chars_per_word 必须 >= 1")
+        ids = []
+        for word in self._split_words(text):
+            ids.extend(self._encode_word(word, max_chars_per_word))
+        return ids
+
+    def encode_pair(self, text_a, text_b):
+        """BERT 句式输入：[CLS] a [SEP] b [SEP]。"""
+        return ([self.cls_id] + self.encode(text_a) + [self.sep_id]
+                + self.encode(text_b) + [self.sep_id])
+
+    def decode(self, ids):
+        if not isinstance(ids, (list, tuple)):
+            raise TypeError("WordPieceTokenizer.decode: ids 必须是 list 或 tuple")
+        out = []
+        # 逐 token 拼接：`##xx` 直接接上，空白 token 原样输出，词首 token 视情况补空格
+        for i, tid in enumerate(ids):
+            if isinstance(tid, bool) or not isinstance(tid, int):
+                raise TypeError(f"WordPieceTokenizer.decode: 第 {i} 个 id 不是 int")
+            if tid < 0 or tid >= self.vocab_size:
+                raise ValueError(
+                    f"WordPieceTokenizer.decode: 第 {i} 个 id {tid} 越界 [0, {self.vocab_size})")
+            token = self.tokens[tid]
+            if token in _WP_SPECIALS:
+                continue
+            if token.startswith(_WP_CONT):
+                out.append(token[len(_WP_CONT):])
+                continue
+            if token.strip() == "":
+                out.append(token)
+                continue
+            # 词首 token：只有当前不在空白处才补一个空格
+            if out and not out[-1].endswith((" ", "\t", "\n")):
+                out.append(" ")
+            out.append(token)
+        return "".join(out)
+
+    # ---------- 存档 ----------
+    def save(self, filepath, quiet=False):
+        payload = {"format": "ai_wordpiece_v1", "tokens": list(self.tokens)}
+        with io.open(filepath, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        if not quiet:
+            print(f"WordPieceTokenizer 已保存: {filepath}（{self.vocab_size} 个 token）")
+
+    @staticmethod
+    def load(filepath):
+        with io.open(filepath, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict) or payload.get("format") != "ai_wordpiece_v1":
+            raise ValueError(f"WordPieceTokenizer.load: {filepath} 不是 wordpiece 存档")
+        tokens = payload.get("tokens")
+        if not isinstance(tokens, list):
+            raise ValueError("WordPieceTokenizer.load: tokens 字段必须是 list")
+        return WordPieceTokenizer(tokens)
+
+
 class TextProcessor:
     """字符级文本处理器：词表构建、one-hot 编码、滑动窗口数据生成"""
 

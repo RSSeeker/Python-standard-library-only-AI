@@ -7545,3 +7545,88 @@ class TestLRFinder:
             AI.lr_finder(self._model())
         with pytest.raises(ValueError):
             AI.lr_finder(self._model(), x=x, y=y[:-1])
+
+
+class TestWordPieceTokenizer:
+    TEXT = ("the quick brown fox jumps over the lazy dog. "
+            "the quick red fox runs past the lazy brown dog. ") * 12
+
+    @staticmethod
+    def _wp(vocab_size=200):
+        return AI.WordPieceTokenizer().train(
+            TestWordPieceTokenizer.TEXT, vocab_size=vocab_size, min_frequency=2)
+
+    def test_vocab_layout(self):
+        wp = AI.WordPieceTokenizer()
+        assert wp.vocab_size == len(AI._WP_SPECIALS)
+        assert (wp.pad_id, wp.unk_id, wp.cls_id, wp.sep_id, wp.mask_id) == (0, 1, 2, 3, 4)
+        wp = self._wp()
+        assert wp.vocab_size <= 200
+        assert len(wp) == wp.vocab_size
+        assert list(wp.tokens[:5]) == list(AI._WP_SPECIALS)
+        assert any(t.startswith("##") for t in wp.tokens)
+
+    def test_encode_decode_round_trip(self):
+        wp = self._wp()
+        ids = wp.encode("the quick brown fox")
+        assert all(0 <= i < wp.vocab_size for i in ids)
+        assert wp.decode(ids) == "the quick brown fox"
+        # 连续空白被归一化（词表里的空白 token 只留一个）
+        assert wp.decode(wp.encode("the  quick")) == "the quick"
+        # 生词 -> UNK -> 解码为空
+        assert wp.encode("zzzqqq") == [wp.unk_id]
+        assert wp.decode([wp.unk_id]) == ""
+
+    def test_word_level_tokens_and_pair(self):
+        wp = self._wp()
+        assert [wp.tokens[i] for i in wp.encode("brown")] == ["brown"]
+        pair = wp.encode_pair("the dog", "quick fox")
+        assert pair[0] == wp.cls_id and pair[-1] == wp.sep_id
+        assert pair.count(wp.sep_id) == 2
+        text = wp.decode(pair)
+        assert "the dog" in text and "quick fox" in text
+
+    def test_deterministic_and_save_load(self):
+        a = self._wp()
+        b = self._wp()
+        assert a.tokens == b.tokens
+        path = os.path.join(tempfile.gettempdir(), "test_wordpiece.json")
+        try:
+            a.save(path, quiet=True)
+            c = AI.WordPieceTokenizer.load(path)
+            assert c.tokens == a.tokens
+            assert c.encode("the quick fox") == a.encode("the quick fox")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.WordPieceTokenizer(["a"])
+        with pytest.raises(ValueError):
+            AI.WordPieceTokenizer(list(AI._WP_SPECIALS) + ["a", "a"])
+        with pytest.raises(ValueError):
+            AI.WordPieceTokenizer(list(AI._WP_SPECIALS) + ["##"])
+        with pytest.raises(TypeError):
+            AI.WordPieceTokenizer([1, 2])
+        with pytest.raises(ValueError):
+            AI.WordPieceTokenizer().train(self.TEXT, vocab_size=3)
+        with pytest.raises(ValueError):
+            AI.WordPieceTokenizer().train(self.TEXT, min_frequency=0)
+        wp = self._wp()
+        with pytest.raises(TypeError):
+            wp.encode(123)
+        with pytest.raises(ValueError):
+            wp.decode([wp.vocab_size + 3])
+        with pytest.raises(TypeError):
+            wp.decode([True])
+        with pytest.raises(TypeError):
+            wp.decode("abc")
+
+    def test_differs_from_bpe(self):
+        # BPE 字节级无损；WordPiece 有特殊标记与 ## 前缀，解码会丢特殊 token
+        bpe = AI.BytePairTokenizer().train(self.TEXT, vocab_size=300)
+        assert bpe.decode(bpe.encode("the quick brown fox")) == "the quick brown fox"
+        wp = self._wp()
+        ids = [wp.cls_id] + wp.encode("the dog") + [wp.sep_id]
+        assert wp.decode(ids) == "the dog"

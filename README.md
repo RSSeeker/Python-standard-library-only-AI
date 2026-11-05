@@ -642,6 +642,7 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 |------|------|
 | `TextProcessor` | 字符级词表、one-hot 编码、滑动窗口 |
 | `BytePairTokenizer` | 字节级 BPE 分词器：`train(text, vocab_size)` 学合并、`encode`/`decode` 无损往返任意 UTF-8、`encode_corpus(text, seq_len)` 直接产出 `CausalLM.fit` 用的序列、`save`/`load` 存 JSON；手工构造时每条规则只能引用**之前已定义**的 id（前向引用报 `ValueError`，不会漏成 `KeyError`） |
+| `WordPieceTokenizer` | BERT 风格子词分词器：`train(text, vocab_size)` 学词表、`encode`/`decode`/`encode_pair`、`save`/`load`；词内非首字符带 `##` 前缀，词表外落到 `[UNK]` |
 | `generate_text(network, tp, start, length)` | 自回归文本生成（`generate_text_with_mlp` 的别名，保留以兼容旧调用） |
 | `generate_text_with_mlp(model, tp, start, length, window_size, temp)` | 自回归文本生成（滑动窗口上下文，只需 `forward`） |
 | `_softmax_with_temp(logits, temperature)` | 带温度的 Softmax |
@@ -662,7 +663,24 @@ tok = AI.BytePairTokenizer.load("bpe.json")
 
 字节级的好处是**没有词表外字符**：中文、emoji、换行都落在 256 个基础字节 id 里。
 合并只在词块（字母数字 / 空白 / 其它符号的连续段）内部学习，所以不会学到
-「字母+空格」这种跨词 token；语料里重复片段耗尽时会提前停下，ocab_size 只是上限。
+「字母+空格」这种跨词 token；语料里重复片段耗尽时会提前停下，vocab_size 只是上限。
+
+WordPiece 走另一条路：词表里是**字符串**，词内非首字符带 `##` 前缀，
+所以 `playing` 能拆成 `play + ##ing`，而 `ing` 不会和它混为一谈。
+训练打分用 BERT 原始的 `频次 / (左频次 × 右频次)`，高频组合优先合并。
+
+```python
+wp = AI.WordPieceTokenizer().train(corpus, vocab_size=512)
+ids = wp.encode("the quick brown fox")
+print([wp.tokens[i] for i in ids])      # 常见词整体成 token，词内子词带 ##
+assert wp.decode(ids) == 'the quick brown fox'
+
+pair = wp.encode_pair('the dog', 'a fox')   # [CLS] a [SEP] b [SEP]
+print(pair[0] == wp.cls_id, pair[-1] == wp.sep_id)
+```
+
+与 BPE 的分工：BPE 字节级、**永不产生 `[UNK]`**，适合从零训练语言模型；
+WordPiece 有可读词表与特殊标记，适合接 BERT 式双向编码器与 `MaskedLM`。
 
 ## 底层 API 示例
 
@@ -756,7 +774,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-630 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+636 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -819,6 +837,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSeq2SeqGenerateValidation` | 源序列超 `max_len`、源 id 越界在 `generate` 里报错（原来只有 `forward` 检查） |
 | `TestPaddedBatch` | 右侧补齐 + `pad_mask` 后 logits/loss/梯度逐位不变、`batch_size=2` 的一步等于手工按 token 加权的一步、步数 = ceil(n/batch)、非法 mask 与非法 batch_size 报错、eval 下补齐同样逐位一致 |
 | `TestBytePairTokenizer` | 任意 UTF-8 往返（含 emoji/换行）、训练确定性、合并不跨词块、`encode_corpus` 分块、JSON 存档往返、非法输入与截断 UTF-8 报错、与 `CausalLM` 串起来训练与生成 |
+| `TestWordPieceTokenizer` | 词表布局（特殊标记在前、## 子词）、编码解码往返与空白归一化、词级 token 与 `encode_pair`、确定性与存档往返、十类非法输入、与 BPE 的行为差异 |
 | `TestBeamSearch` | `num_beams=1` 与贪心逐位相同、束搜索确定且累计对数概率不劣于贪心、非法 `num_beams` 报错、`Seq2SeqLM` 束搜索与 `eos` 提前停 |
 | `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
 | `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
@@ -846,6 +865,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 630 个单元测试
+├── test_ai.py       # 636 个单元测试
 └── README.md
 ```
