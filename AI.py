@@ -4395,6 +4395,321 @@ def _apply_generation_penalties(logits, ids, repetition_penalty: float = 1.0,
     return out
 
 
+class MaskedLM:
+    """掩码语言模型（BERT 式）：Embedding → 位置编码 → **双向** Transformer → 词表头
+
+    与 `CausalLM` 的区别只有两点：
+      1. 注意力**不加因果掩码**，每个位置都能看到左右上下文；
+      2. 训练目标是「还原被遮住的位置」，而不是预测下一个 token。
+
+    遮罩策略与 BERT 一致：随机选 `mask_prob` 比例的位置，其中 80% 换成
+    `mask_id`、10% 换成随机 token、10% 保持不变（保持不变的位置仍然要预测，
+    否则模型会只学会「看到 mask 才输出」）。`mask_id` 默认取 `vocab_size`
+    （额外占一行词向量），不会与真实 token 冲突。
+
+    用法::
+
+        lm = MaskedLM(vocab_size=10, d_model=16, num_heads=2, num_layers=1)
+        lm.fit([[1, 2, 3, 4, 5, 6]], epochs=200, lr=0.01)
+        lm.predict([1, 9, 3, 4, 9, 6], [1, 4])   # 填空
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
+                 d_ff: int = 64, num_layers: int = 2, max_len: int = 64,
+                 dropout: float = 0.0, mask_prob: float = 0.15,
+                 replace_prob: float = 0.1):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"MaskedLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"MaskedLM: max_len 必须 >= 1，收到 {max_len!r}")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"MaskedLM: num_layers 必须 >= 1，收到 {num_layers!r}")
+        for name, val in (("mask_prob", mask_prob), ("replace_prob", replace_prob)):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not 0.0 < float(val) < 1.0:
+                raise ValueError(f"MaskedLM: {name} 必须在 (0,1) 内，收到 {val!r}")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.mask_prob = float(mask_prob)
+        self.replace_prob = float(replace_prob)
+        # mask 用一个词表之外的 id，避免和真实 token 混淆
+        self.mask_id = vocab_size
+
+        self.embedding = Embedding(vocab_size + 1, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
+                                          dropout, causal=False)
+
+        std = math.sqrt(2.0 / d_model)
+        self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
+        self.b_out = [0.0] * vocab_size
+        self.zero_grad()
+        self.step_count = 0
+        self._adam_m = {}
+        self._adam_v = {}
+        self.h = None
+
+    def train(self):
+        """训练模式（Dropout 生效）"""
+        self.encoder.train()
+        return self
+
+    def eval(self):
+        """推理模式（关闭 Dropout，同一输入输出确定）"""
+        self.encoder.eval()
+        return self
+
+    def zero_grad(self):
+        """清零全部梯度"""
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.grads = {
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0] * self.vocab_size,
+        }
+
+    def _named_params(self):
+        """产出 (名字, 参数, 梯度)；必须在 `zero_grad()` 之后调用"""
+        yield "emb.weight", self.embedding.weight, self.embedding.grad_weight
+        for li, layer in enumerate(self.encoder.layers):
+            attn = layer.self_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"L{li}.attn.{k}", getattr(attn, k), attn.grads[k]
+            ffn = layer.ffn
+            for k in ("W1", "b1", "W2", "b2"):
+                yield f"L{li}.ffn.{k}", getattr(ffn, k), ffn.grads[k]
+            yield f"L{li}.ln1.gamma", layer.ln1.gamma, layer.grads["ln1_gamma"]
+            yield f"L{li}.ln1.beta", layer.ln1.beta, layer.grads["ln1_beta"]
+            yield f"L{li}.ln2.gamma", layer.ln2.gamma, layer.grads["ln2_gamma"]
+            yield f"L{li}.ln2.beta", layer.ln2.beta, layer.grads["ln2_beta"]
+        yield "out.W", self.W_out, self.grads["W_out"]
+        yield "out.b", self.b_out, self.grads["b_out"]
+
+    def param_count(self):
+        """参数总数（标量个数）"""
+        return sum(len(p) if not isinstance(p[0], list) else
+                   sum(len(r) for r in p)
+                   for _, p, _ in self._named_params())
+
+    def mask_tokens(self, ids, rng=None):
+        """按 BERT 策略遮罩，返回 (corrupted_ids, positions, targets)
+
+        positions 是**被遮住的位置下标**（升序），targets 是对应位置的原始 token。
+        至少遮一个位置：短序列随机选时可能一个都没选中，这里强制补一个。
+        """
+        ids = _check_token_ids(ids, self.vocab_size, "MaskedLM.mask_tokens")
+        rng = random if rng is None else rng
+        if not ids:
+            raise ValueError("MaskedLM.mask_tokens: ids 不能为空")
+        positions = [t for t in range(len(ids)) if rng.random() < self.mask_prob]
+        if not positions:
+            positions = [rng.randrange(len(ids))]
+        corrupted = list(ids)
+        for t in positions:
+            r = rng.random()
+            if r < 0.8:
+                corrupted[t] = self.mask_id
+            elif r < 0.9:
+                corrupted[t] = rng.randrange(self.vocab_size)
+            # 剩下 10% 保持原样（但仍计入预测目标）
+        return corrupted, positions, [ids[t] for t in positions]
+
+    def forward(self, ids):
+        """ids: List[int] → logits (seq_len, vocab_size)（bidirectional，无因果掩码）"""
+        if not ids:
+            raise ValueError("MaskedLM.forward: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"MaskedLM.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        ids = _check_token_ids(ids, self.vocab_size + 1, "MaskedLM.forward")
+        emb = self.embedding.forward(ids)
+        x = self.pos.forward(emb)
+        h = self.encoder.forward(x)
+        self.h = h
+        logits = _matmul(h, _transpose(self.W_out))
+        for t in range(len(h)):
+            for v in range(self.vocab_size):
+                logits[t][v] += self.b_out[v]
+        return logits
+
+    def _loss_and_backward(self, ids, positions, targets, grad_scale: float = 1.0):
+        """只在 positions 上算交叉熵并反传，返回该条序列的平均 loss
+
+        ids 是**遮罩后**的输入，targets 是对应位置上的原始 token
+        （两者必须分开传：遮罩位置上的 ids 是 mask_id，不能当答案）。
+        """
+        if not isinstance(positions, (list, tuple)) or not positions:
+            raise ValueError("MaskedLM._loss_and_backward: positions 不能为空")
+        if not isinstance(targets, (list, tuple)) or len(targets) != len(positions):
+            raise ValueError(
+                "MaskedLM._loss_and_backward: targets 必须与 positions 等长"
+                f"（{len(positions)} 个位置，收到 {targets!r}）")
+        pos = []
+        for p in positions:
+            if isinstance(p, bool) or not isinstance(p, int):
+                raise ValueError(f"MaskedLM._loss_and_backward: 位置必须是整数，收到 {p!r}")
+            if not 0 <= p < len(ids):
+                raise ValueError(
+                    f"MaskedLM._loss_and_backward: 位置 {p} 越界（序列长 {len(ids)}）")
+            pos.append(p)
+        ids = _check_token_ids(ids, self.vocab_size + 1, "MaskedLM._loss_and_backward")
+        logits = self.forward(ids)
+        _check_finite_logits(logits, "MaskedLM._loss_and_backward")
+
+        d_logits = [[0.0] * self.vocab_size for _ in range(len(ids))]
+        loss = 0.0
+        n = len(pos)
+        for j, t in enumerate(pos):
+            probs = _softmax_row(logits[t])
+            target = targets[j]
+            if isinstance(target, bool) or not isinstance(target, int) or \
+                    not 0 <= target < self.vocab_size:
+                raise ValueError(
+                    f"MaskedLM._loss_and_backward: 位置 {t} 的目标 {target!r} 越界"
+                    f"（词表 {self.vocab_size}）")
+            p = probs[target]
+            loss += -math.log(p if p > 1e-12 else 1e-12)
+            row = d_logits[t]
+            row[:] = probs
+            row[target] -= 1.0
+        loss /= n
+        inv = grad_scale / n
+        d_logits = [[v * inv for v in row] for row in d_logits]
+
+        h = self.h
+        for v in range(self.vocab_size):
+            g_row = self.grads["W_out"][v]
+            for t in range(len(h)):
+                d = d_logits[t][v]
+                if d != 0.0:
+                    for j in range(self.d_model):
+                        g_row[j] += d * h[t][j]
+        for v in range(self.vocab_size):
+            s = 0.0
+            for t in range(len(h)):
+                d = d_logits[t][v]
+                if d != 0.0:
+                    s += d
+            self.grads["b_out"][v] += s
+
+        dh = []
+        for t in range(len(h)):
+            row = [0.0] * self.d_model
+            dl = d_logits[t]
+            for j in range(self.d_model):
+                s = 0.0
+                for v in range(self.vocab_size):
+                    d = dl[v]
+                    if d != 0.0:
+                        s += d * self.W_out[v][j]
+                row[j] = s
+            dh.append(row)
+
+        d_emb = self.encoder.backward(dh)
+        self.embedding.backward(d_emb)
+        return loss
+
+    def adam_step(self, lr: float):
+        """对全部参数做一次 Adam 更新（梯度已由 `_loss_and_backward` 累积）"""
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, sentences, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干条 token 序列上做掩码语言建模，返回每个 epoch 的平均 loss
+
+        每个 epoch 对每条序列**重新采样一次遮罩**（与 BERT 一样），
+        所以同一句话会反复以不同遮罩出现。
+        """
+        seqs = [list(s) for s in sentences]
+        if not seqs:
+            raise ValueError("MaskedLM.fit: sentences 不能为空")
+        for s in seqs:
+            if not s:
+                raise ValueError("MaskedLM.fit: 每条序列不能为空")
+            if len(s) > self.max_len:
+                raise ValueError(
+                    f"MaskedLM.fit: 序列长度 {len(s)} 超过 max_len={self.max_len}")
+        if epochs < 0:
+            raise ValueError(f"MaskedLM.fit: epochs 不能为负，收到 {epochs!r}")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        self.train()
+        for ep in range(int(epochs)):
+            order = list(range(len(seqs)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                corrupted, positions, targets = self.mask_tokens(seqs[i], rng)
+                self.zero_grad()
+                total += self._loss_and_backward(corrupted, positions, targets)
+                self.adam_step(lr)
+            avg = total / len(seqs)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def evaluate(self, sentences, seed: int = 0):
+        """不更新参数的掩码 loss（eval 模式）
+
+        固定 seed 让遮罩可复现，从而不同模型/不同轮次之间可比。
+        """
+        seqs = [list(s) for s in sentences]
+        if not seqs:
+            raise ValueError("MaskedLM.evaluate: sentences 不能为空")
+        rng = random.Random(seed)
+        was_training = self.encoder.layers[0].self_attn.training
+        self.eval()
+        try:
+            total = 0.0
+            for s in seqs:
+                corrupted, positions, _targets = self.mask_tokens(s, random.Random(seed))
+                logits = self.forward(corrupted)
+                _check_finite_logits(logits, "MaskedLM.evaluate")
+                for t, p in enumerate(positions):
+                    probs = _softmax_row(logits[p])
+                    target = s[p]
+                    total += -math.log(probs[target] if probs[target] > 1e-12 else 1e-12)
+            return total / max(1, sum(1 for _ in seqs))
+        finally:
+            if was_training:
+                self.train()
+            else:
+                self.eval()
+
+    def predict(self, ids, positions):
+        """把 positions 处的 token 预测出来（argmax），返回 List[int]"""
+        if not isinstance(positions, (list, tuple)) or not positions:
+            raise ValueError("MaskedLM.predict: positions 不能为空")
+        logits = self.forward(ids)
+        out = []
+        for p in positions:
+            if isinstance(p, bool) or not isinstance(p, int) or not 0 <= p < len(ids):
+                raise ValueError(f"MaskedLM.predict: 位置 {p!r} 非法")
+            row = logits[p]
+            best = 0
+            for v in range(1, self.vocab_size):
+                if row[v] > row[best]:
+                    best = v
+            out.append(best)
+        return out
+
+
 class CausalLM:
     """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头
 

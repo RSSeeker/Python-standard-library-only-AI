@@ -7320,3 +7320,139 @@ class TestRandAugment:
             AI.augment_randaugment(x, n=1, ops=["blur"])
         with pytest.raises(ValueError):
             AI.augment_randaugment(x, n=-1)
+
+
+class TestMaskedLM:
+    @staticmethod
+    def _lm(seed=5, **kw):
+        random.seed(seed)
+        return AI.MaskedLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                           num_layers=2, max_len=12, **kw)
+
+    def test_mask_tokens_semantics(self):
+        lm = self._lm()
+        assert lm.mask_id == 8            # 词表外的额外一行
+        ids = list(range(8))
+        rng = random.Random(1)
+        n_mask = n_rand = n_keep = total = 0
+        for _ in range(300):
+            corrupted, pos, targets = lm.mask_tokens(ids, rng)
+            assert len(corrupted) == len(ids)
+            for j, p in enumerate(pos):
+                total += 1
+                if corrupted[p] == lm.mask_id:
+                    n_mask += 1
+                elif corrupted[p] != targets[j]:
+                    n_rand += 1
+                else:
+                    n_keep += 1
+        assert abs(n_mask / total - 0.8) < 0.06
+        assert abs(n_rand / total - 0.1) < 0.05
+        # 短序列至少遮一个位置
+        _, pos, _ = lm.mask_tokens([3, 4], random.Random(9))
+        assert len(pos) >= 1
+
+    def test_bidirectional(self):
+        lm = self._lm()
+        lm.eval()
+        a = lm.forward([1, 2, 3, 4, 5])
+        b = lm.forward([1, 2, 3, 4, 7])
+        # 改末位会影响**前面**位置的 logits（对比 CausalLM 的因果性）
+        assert any(abs(a[t][v] - b[t][v]) > 1e-9
+                   for t in range(4) for v in range(lm.vocab_size))
+
+    def test_gradients_match_numeric(self):
+        lm = self._lm(seed=9)
+        lm.eval()
+        corrupted = [1, 8, 3, 4, 8, 6]
+        pos = [1, 4]
+        targets = [2, 5]
+
+        def loss_only():
+            logits = lm.forward(corrupted)
+            s = 0.0
+            for p, tgt in zip(pos, targets):
+                probs = AI._softmax_row(logits[p])
+                s += -math.log(max(probs[tgt], 1e-12))
+            return s / len(pos)
+
+        lm.zero_grad()
+        lm._loss_and_backward(corrupted, pos, targets)
+        probe = (2, 3)
+        old = lm.W_out[probe[0]][probe[1]]
+        eps = 1e-5
+        lm.W_out[probe[0]][probe[1]] = old + eps
+        lp = loss_only()
+        lm.W_out[probe[0]][probe[1]] = old - eps
+        lm_ = loss_only()
+        lm.W_out[probe[0]][probe[1]] = old
+        num = (lp - lm_) / (2 * eps)
+        ana = lm.grads["W_out"][probe[0]][probe[1]]
+        assert abs(ana - num) / max(1e-12, abs(ana) + abs(num)) < 1e-6
+
+    def test_learns_fill_mask(self):
+        # 全遮罩记忆：给定「每条位置都是 mask」，模型要还原整条序列。
+        # 这是 MLM 最基本的可学习性证据，且 250 步后 loss 会掉到初值的 1% 以下，
+        # 判据不依赖随机遮罩的具体轨迹。
+        random.seed(3)
+        lm = AI.MaskedLM(vocab_size=6, d_model=16, num_heads=2, d_ff=32,
+                         num_layers=2, max_len=8)
+        seq = [1, 2, 3, 4, 5, 1]
+        corrupted = [lm.mask_id] * len(seq)
+        pos = list(range(len(seq)))
+        lm.train()
+        first = None
+        loss = None
+        for _ in range(250):
+            lm.zero_grad()
+            loss = lm._loss_and_backward(corrupted, pos, seq)
+            if first is None:
+                first = loss
+            lm.adam_step(0.02)
+        assert loss < 0.2 * first
+        lm.eval()
+        assert lm.predict(corrupted, pos) == seq
+
+    def test_evaluate_and_mode(self):
+        lm = self._lm()
+        seq = [1, 2, 3, 4]
+        lm.train()
+        e1 = lm.evaluate([seq], seed=3)
+        e2 = lm.evaluate([seq], seed=3)
+        assert e1 == e2
+        assert lm.encoder.layers[0].self_attn.training is True
+        lm.eval()
+        assert isinstance(lm.evaluate([seq], seed=3), float)
+
+    def test_param_count_and_blocks(self):
+        lm = self._lm()
+        names = [n for n, _, _ in lm._named_params()]
+        assert len(names) == len(set(names)) == 1 + 2 * 16 + 2   # emb + 每层 16 + out
+        assert names[0] == "emb.weight" and names[-1] == "out.b"
+        assert lm.param_count() > 0
+
+    def test_invalid(self):
+        for bad in (0, -1, True, 1.5, "8"):
+            with pytest.raises((ValueError, TypeError)):
+                AI.MaskedLM(bad)
+        with pytest.raises(ValueError):
+            AI.MaskedLM(8, mask_prob=0.0)
+        with pytest.raises(ValueError):
+            AI.MaskedLM(8, replace_prob=1.0)
+        lm = self._lm()
+        with pytest.raises(ValueError):
+            lm.forward([])
+        with pytest.raises(ValueError):
+            lm.forward([1] * 13)
+        with pytest.raises(ValueError):
+            lm._loss_and_backward([1, 2, 3], [], [])
+        with pytest.raises(ValueError):
+            lm._loss_and_backward([1, 2, 3], [5], [1])
+        with pytest.raises(ValueError):
+            lm._loss_and_backward([1, 8, 3], [1], [8])
+        with pytest.raises(ValueError):
+            lm._loss_and_backward([1, 8, 3], [1, 2], [2])
+        with pytest.raises(ValueError):
+            lm.predict([1, 2, 3], [])
+        with pytest.raises(ValueError):
+            lm.fit([])
