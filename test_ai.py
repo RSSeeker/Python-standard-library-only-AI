@@ -7830,3 +7830,100 @@ class TestConfigDriven:
             AI.train_from_config(self.CFG, data=pairs, x=xs)
         with pytest.raises(ValueError):
             AI.train_from_config(self.CFG)
+
+
+class TestHyperparameterSearch:
+    """配置空间搜索：全组合、随机、指标方向、非法输入。"""
+
+    def _data(self):
+        random.seed(11)
+        data = []
+        for _ in range(96):
+            a = random.uniform(-1.0, 1.0)
+            b = random.uniform(-1.0, 1.0)
+            data.append(([a, b], 1 if a + b > 0.0 else 0))
+        return data
+
+    def _base(self, **kw):
+        cfg = {"input_dim": 2, "output_dim": 2, "hidden": [6],
+               "activations": ["relu"], "task": "classification",
+               "loss": "cross_entropy", "optimizer": "adam", "lr": 0.05,
+               "epochs": 6, "batch_size": 16, "val_split": 0.2,
+               "patience": 0, "seed": 3}
+        cfg.update(kw)
+        return cfg
+
+    def test_grid_covers_all_combinations(self):
+        data = self._data()
+        base = self._base()
+        res = AI.hyperparameter_search(
+            base, {"lr": [0.02, 0.05], "hidden": [[6], [8]]},
+            data=data, method="grid", metric="val_loss")
+        assert len(res["trials"]) == 4
+        assert res["params_names"] == ["lr", "hidden"]
+        assert res["mode"] == "min"
+        assert res["best"]["score"] == min(t["score"] for t in res["trials"])
+        # 每个 trial 都真的训过，参数覆盖 grid
+        for t in res["trials"]:
+            assert set(t["params"]) == {"lr", "hidden"}
+            assert t["history"]["train_loss"]
+        combos = {(t["params"]["lr"], tuple(t["params"]["hidden"])) for t in res["trials"]}
+        assert combos == {(0.02, (6,)), (0.02, (8,)), (0.05, (6,)), (0.05, (8,))}
+
+    def test_random_search_is_reproducible(self):
+        data = self._data()
+        base = self._base()
+        grid = {"lr": [0.01, 0.05, 0.1]}
+        r1 = AI.hyperparameter_search(base, grid, data=data, method="random",
+                                      n_trials=2, seed=9)
+        r2 = AI.hyperparameter_search(base, grid, data=data, method="random",
+                                      n_trials=2, seed=9)
+        assert len(r1["trials"]) == 2
+        assert [t["params"] for t in r1["trials"]] == [t["params"] for t in r2["trials"]]
+        assert [t["score"] for t in r1["trials"]] == [t["score"] for t in r2["trials"]]
+
+    def test_accuracy_metric_maximises(self):
+        data = self._data()
+        xs = [d[0] for d in data]
+        ys = [d[1] for d in data]
+        res = AI.hyperparameter_search(self._base(), {"lr": [0.05]},
+                                       x=xs, y=ys, metric="accuracy")
+        assert res["mode"] == "max"
+        assert 0.0 <= res["best"]["score"] <= 1.0
+        assert res["best"]["score"] == max(t["score"] for t in res["trials"])
+
+    def test_global_rng_untouched(self):
+        data = self._data()
+        random.seed(4321)
+        before = [random.random() for _ in range(3)]
+        random.seed(4321)
+        AI.hyperparameter_search(self._base(), {"lr": [0.05]}, data=data,
+                                 metric="train_loss")
+        after = [random.random() for _ in range(3)]
+        assert before == after
+
+    def test_rejects_bad_inputs(self):
+        data = self._data()
+        base = self._base()
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, [], data=data)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {}, data=data)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"epoch": [1]}, data=data)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": 0.05}, data=data)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": []}, data=data)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": [0.05]}, data=data, method="bayes")
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": [0.05]}, data=data,
+                                     method="random", n_trials=0)
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": [0.05]}, data=data, metric="f1")
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(self._base(val_split=0.0), {"lr": [0.05]},
+                                     data=data, metric="val_loss")
+        with pytest.raises(ValueError):
+            AI.hyperparameter_search(base, {"lr": [0.05]}, data=data, metric="accuracy")

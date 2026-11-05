@@ -45,6 +45,7 @@
 
 
 import io
+import itertools
 import json
 import os
 import sys
@@ -11229,6 +11230,111 @@ def train_from_config(config, data=None, x=None, y=None, verbose=None):
             raise ValueError("train_from_config: 必须给 data 或同时给 x 和 y")
         model.fit(x=x, y=y, **fit_kwargs)
     return model
+
+
+_SEARCH_METRICS = {
+    "val_loss": "min", "train_loss": "min", "grad_norm": "min",
+    "accuracy": "max",
+}
+
+
+def _search_score(model, metric, x, y):
+    """按指标名从训练结果里取分；accuracy 需要 x/y。"""
+    hist = model.history
+    if metric in ("val_loss", "train_loss", "grad_norm"):
+        if metric == "val_loss" and not hist.get("val_loss"):
+            raise ValueError(
+                "hyperparameter_search: 配置里没有验证集（val_split=0），无法用 val_loss 评分")
+        series = hist.get(metric) or []
+        if not series:
+            raise ValueError(f"hyperparameter_search: history 里没有 {metric}")
+        return float(series[-1][1] if isinstance(series[-1], tuple) else series[-1])
+    if metric == "accuracy":
+        if x is None or y is None:
+            raise ValueError("hyperparameter_search: 用 accuracy 评分时必须提供 x 和 y")
+        preds = []
+        for xi in x:
+            out = model.predict(xi)
+            out = out if isinstance(out, (list, tuple)) else [out]
+            preds.append(max(range(len(out)), key=lambda k: out[k]) if len(out) > 1
+                         else (1 if out[0] > 0.5 else 0))
+        truth = []
+        for yi in y:
+            if isinstance(yi, (list, tuple)):
+                truth.append(max(range(len(yi)), key=lambda k: yi[k]))
+            elif isinstance(yi, bool):
+                truth.append(1 if yi else 0)
+            else:
+                truth.append(int(yi))
+        hit = sum(1 for p, t in zip(preds, truth) if p == t)
+        return hit / max(1, len(truth))
+    raise ValueError(f"hyperparameter_search: 未知指标 {metric!r}")
+
+
+def hyperparameter_search(base_config, grid, data=None, x=None, y=None,
+                          method="grid", n_trials=16, metric="val_loss",
+                          seed=None, verbose=False):
+    """在配置空间里搜超参，返回最优配置与全部试验记录。
+
+    base_config: 基础配置（同 `train_from_config`），必须含维度或给 `data`。
+    grid:        {参数名: [候选值, ...]}，参数名必须是合法配置项。
+    method:      "grid" 全组合；"random" 随机抽 `n_trials` 组（去重后不足则按顺序补）。
+    metric:      "val_loss" / "train_loss" / "grad_norm"（越小越好）或 "accuracy"（越大越好）。
+    seed:        随机搜索与训练共用的种子；给了就整轮可复现。
+
+    返回 {"best": {...}, "trials": [...], "metric", "mode", "params_names"}。
+    每次试验都用 `train_from_config` 训练，`verbose` 默认关掉以免刷屏。
+    """
+    if not isinstance(grid, dict) or not grid:
+        raise ValueError("hyperparameter_search: grid 必须是非空 dict")
+    base = _config_mapping(base_config, "hyperparameter_search")
+    unknown = sorted(set(grid) - _CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"hyperparameter_search: grid 里有不认识的配置项 {unknown}")
+    values = {}
+    for key, options in grid.items():
+        if not isinstance(options, (list, tuple)) or not options:
+            raise ValueError(f"hyperparameter_search: grid[{key!r}] 必须是非空 list")
+        values[key] = list(options)
+    if method not in ("grid", "random"):
+        raise ValueError(f"hyperparameter_search: method 只能是 grid/random，收到 {method!r}")
+    if isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1:
+        raise ValueError(f"hyperparameter_search: n_trials 必须是 >= 1 的 int")
+    if metric not in _SEARCH_METRICS:
+        raise ValueError(
+            f"hyperparameter_search: 未知指标 {metric!r}（可选 {sorted(_SEARCH_METRICS)}）")
+    mode = _SEARCH_METRICS[metric]
+
+    keys = list(values)
+    if method == "grid":
+        combos = [dict(zip(keys, picks)) for picks in itertools.product(*(values[k] for k in keys))]
+    else:
+        rng = random.Random(seed) if seed is not None else random
+        seen = set()
+        combos = []
+        while len(combos) < n_trials:
+            picks = tuple(rng.choice(values[k]) for k in keys)
+            if picks in seen:
+                if len(seen) >= len(list(itertools.product(*(values[k] for k in keys)))):
+                    break
+                continue
+            seen.add(picks)
+            combos.append(dict(zip(keys, picks)))
+
+    trials = []
+    best = None
+    for trial_no, combo in enumerate(combos):
+        cfg = dict(base)
+        cfg.update(combo)
+        model = train_from_config(cfg, data=data, x=x, y=y, verbose=verbose)
+        score = _search_score(model, metric, x, y)
+        item = {"trial": trial_no, "params": dict(combo), "score": score,
+                "history": model.history}
+        trials.append(item)
+        if best is None or (score < best["score"] if mode == "min" else score > best["score"]):
+            best = item
+    return {"best": best, "trials": trials, "metric": metric, "mode": mode,
+            "params_names": keys}
 
 
 def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,

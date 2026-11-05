@@ -614,6 +614,7 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
 | `build_model(config, data=None)` | 按 dict（或 JSON 路径）建 `Model`：`hidden`/`activations`/`task`/`loss`/`loss_kwargs`/`optimizer`/`lr`；维度可写死也可从 `data` 推断，未知配置项直接报错 |
 | `train_from_config(config, data=..., x=..., y=...)` | 按配置建模型并训练，返回已训练好的 `Model`；`seed` 同时固定初始化与打乱，`lr_scheduler` 支持 step/exponential/cosine/warmup/plateau |
+| `hyperparameter_search(base, grid, data=...)` | 在配置空间里搜超参：`method="grid"` 全组合 / `"random"` 随机抽 `n_trials` 组（给 `seed` 可复现）；指标支持 `val_loss`/`train_loss`/`grad_norm`（越小越好）与 `accuracy`（越大越好） |
 | `attention_maps(module, x, layer_index=None)` | 跑一次前向取回每头注意力权重；支持 `MultiHeadAttention` / `TransformerEncoderLayer` / `TransformerEncoder` / `CausalLM`，采样期间切 eval 以避开 dropout 噪声、结束后恢复原模式 |
 | `attention_ascii(maps, head=0, max_width=48)` | 把注意力矩阵画成字符热图（每行按自身最大值缩放，支持 `max_width` 抽样） |
 | `profile_model(model, x, backward=False)` | 逐层前向/反向墙钟耗时 + 参数量；`repeat` 取最小值降抖动（纯计时，无内存统计） |
@@ -709,6 +710,28 @@ print(model.history['train_loss'][-1])
 `input_dim`/`output_dim` 可以只给一个、另一个从 `data` 推断，
 `seed` 同时固定权重初始化与每轮打乱，因此同配置同数据可复现。
 
+## 超参搜索
+
+在配置空间上做网格或随机搜索，直接复用 `train_from_config`：
+
+```python
+res = AI.hyperparameter_search(
+    base_config,
+    {"lr": [1e-3, 5e-3, 1e-2], "hidden": [[16], [32, 16]],
+     "activation": ["relu", "gelu"]},
+    data=dataset, method="random", n_trials=8, metric="val_loss", seed=3)
+print(res["best"]["params"], res["best"]["score"])
+for t in res["trials"]:
+    print(t["trial"], t["params"], round(t["score"], 4))
+```
+
+约定：`grid` 的键必须是合法配置项（写错直接报错，不会静默忽略）；
+`metric` 决定方向（`val_loss`/`train_loss`/`grad_norm` 取最小，`accuracy` 取最大）；
+用 `val_loss` 时配置里必须有验证集，用 `accuracy` 时必须同时给 `x`/`y`；
+`seed` 同时控制随机搜索的抽样与每次训练的初始化，因此整轮可复现。
+返回 `{"best", "trials", "metric", "mode", "params_names"}`，
+每个 trial 里带自己的 `history`，方便事后画曲线。
+
 ## 底层 API 示例
 
 ### CNN
@@ -801,7 +824,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-648 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+653 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -819,6 +842,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMaskedLM` | 遮罩的 80/10/10 比例与 `mask_id` 在词表外、双向性（改末位影响前面的 logits）、`out.W` 梯度 vs 数值、全遮罩记忆后能填空还原、`evaluate` 可复现且不改模式、19 块参数去重、非法输入 |
 | `TestAttentionMaps` | MHA 形状/行和/因果上三角、eval 两次一致、TEL 与 Encoder 多层与 `layer_index`、CausalLM 只读且模式复原、ASCII 结构与抽样、六类非法输入 |
 | `TestConfigDriven` | `build_model` 结构与维度推断（部分给、全不给、显式覆盖）、八类配置错误、五种调度器构造、`train_from_config` 训练与收敛、同 seed 曲线与权重逐位一致、JSON 路径与 `data`/`x` 冲突 |
+| `TestHyperparameterSearch` | 网格全组合与参数覆盖、`best` 确实是最优分、随机搜索同 seed 可复现、`accuracy` 取最大、全局 RNG 不被推进、十类非法输入（含 `val_split=0` 用 `val_loss`、缺 `x`/`y` 用 `accuracy`） |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -894,6 +918,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 648 个单元测试
+├── test_ai.py       # 653 个单元测试
 └── README.md
 ```
