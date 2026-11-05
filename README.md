@@ -497,6 +497,39 @@ m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
               loss_fn="bce", task="regression", lr=0.01)
 ```
 
+### 评估指标
+
+```python
+import AI
+
+# 分类：一次拿到全部常用指标
+model = AI.Model(AI.MLP([2, 8, 3], activations=["relu", "softmax"]),
+                 task="classification", loss_fn="cross_entropy")
+model.fit(data=train_data, epochs=50)
+print(model.evaluate_all(x_test, y_test))
+# {'task': 'classification', 'n_samples': 30, 'accuracy': 0.93, 'precision': 0.93,
+#  'recall': 0.93, 'f1': 0.93, 'confusion_matrix': [[...]], 'mcc': 0.89,
+#  'top_k_accuracy': 1.0, 'roc_auc': 0.98}
+
+# 单独用某个指标
+AI.precision_recall_f1(y_true, y_pred, average="macro")
+AI.confusion_matrix(y_true, y_pred, num_classes=3)
+AI.roc_auc_score(y_binary, y_score)
+f1 = AI.precision_recall_f1(y_true, y_pred)["f1"]
+
+# 回归
+AI.mean_absolute_error(y_true, y_pred)
+AI.r2_score(y_true, y_pred)
+
+# 生成质量（token 列表或空白分隔的字符串都行）
+AI.bleu_score(pred_tokens, ref_tokens, max_n=4)
+AI.rouge_l(pred_tokens, ref_tokens)
+AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
+```
+
+> 指标全部是**纯标准库实现**，输入会做防御性校验（空列表、长度不符、负类别索引、
+> 非有限数值都直接报 `ValueError`，不会静默给出 `nan`）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -515,6 +548,12 @@ m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
 | `clip_grad_by_value(grads, clip_val)` | 梯度值裁剪 |
 | `compare_with_pytorch()` | 与 PyTorch 逐层数值对齐（可选，装了 torch 才跑） |
 | `k_fold_indices(n, n_splits, shuffle, seed, stratify)` | K 折交叉验证索引 |
+| `accuracy_score` / `precision_recall_f1` / `confusion_matrix` / `matthews_corrcoef` | 分类指标；`precision_recall_f1` 支持 `macro` / `micro` / `weighted` / `none` |
+| `roc_auc_score` / `top_k_accuracy` | 二分类 AUC（并列取平均秩）、Top-k 准确率 |
+| `mean_absolute_error` / `root_mean_squared_error` / `mean_absolute_percentage_error` / `r2_score` | 回归指标，多输出按全部元素平均；常数目标时 R² 返回 1.0 或 0.0 |
+| `sequence_accuracy(preds, targets)` | 整条序列全对才算对（Seq2Seq 常用） |
+| `bleu_score(pred, ref, max_n=4)` / `rouge_l(pred, ref)` | 生成质量：BLEU（含简短惩罚）与 ROUGE-L F1 |
+| `evaluate_all(model, x, y)` | 按任务一次算完：回归 `mae/rmse/mape/r2`；分类 `accuracy/precision/recall/f1/confusion_matrix/mcc`，二分类加 `roc_auc`、多分类加 `top_k_accuracy`；`Model.evaluate_all(x, y)` 同名方法 |
 | `StandardScaler` / `MinMaxScaler` | 逐特征标准化 / 归一化（`fit`/`transform`/`inverse_transform`） |
 | `ascii_plot(history)` | 把训练曲线画成终端 ASCII 图 |
 | `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
@@ -657,7 +696,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-523 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+532 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -711,6 +750,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFlopsExtended` | 分组/深度卷积按 `in_channels/groups` 计数（不按 `in_channels` 高估）、`Conv1d`/`ConvTranspose2d`/`AdaptiveAvgPool2d`/`GroupNorm`/`DropPath` 的计数与形状校验 |
 | `TestLossPersistence` | 默认存档不多写字段（旧文件逐字节不变）、`focal`/`CE(label_smoothing)` 往返后损失配置不变且续训曲线逐位相同、显式传参覆盖文件、坏 `loss` 字段忽略、自定义 callable 不写字段、与优化器状态共存 |
 | `TestAugmentation` | `sigma=0` 逐位不变且不改入参、图像翻转保持元素多重集、平移补 0、Mixup 中点与软标签、非法输入报错 |
+| `TestMetrics` | 混淆矩阵/准确率、macro/micro/weighted 三种平均、MCC 与 AUC（含全同分=0.5）、Top-k、MAE/RMSE/MAPE/R²（含常数目标 1.0/0.0）、BLEU 无重叠判 0、ROUGE-L、`evaluate_all` 分类与回归键齐、七类非法输入 |
 | `TestReviewFixes` | `ConvTranspose2d` 偏置梯度不被 `cin/groups` 放大、`mixup` 的 `lam` 恒在 `[0,1]` 且软标签合法、分组卷积存档往返（含缺 `groups` 的旧存档）、`CrossAttention.delta_index=0`、`estimate_flops` 拒绝一维/二维 `Flatten`、`CausalLM.save` 拒绝 NaN、`summary` 显示真实激活名、`grad_check` 消息含 Seq2SeqLM、`Sequential` 收列表且拒非模块 |
 | `TestConvGroups` | `groups=2` 前向等价两个单组卷积、depthwise 通道、`grad_w` vs 数值、非法 groups |
 | `TestConv1d` | 形状与 stride、手算卷积、`groups` 等价、`grad_w`/`dx` vs 数值、非法参数 |
@@ -726,6 +766,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 523 个单元测试
+├── test_ai.py       # 532 个单元测试
 └── README.md
 ```

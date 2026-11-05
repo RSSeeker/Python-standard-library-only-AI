@@ -14,6 +14,8 @@
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
+  - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
+    MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
@@ -35,10 +37,11 @@
 #  13. Data Utilities
 #  14. Text Processing（字符级语言模型工具）
 #  15. Trainer
-#  16. 模型保存 / 加载 (JSON)
-#  17. PyTorch 数值对齐对比
-#  18. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  19. Main: 回归 + 分类 + CNN 完整示例
+#  16. 评估指标（分类 / 回归 / 序列 / 生成）
+#  17. 模型保存 / 加载 (JSON)
+#  18. PyTorch 数值对齐对比
+#  19. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  20. Main: 回归 + 分类 + CNN 完整示例
 
 
 import io
@@ -6658,6 +6661,430 @@ def evaluate(model: MLP, loss_fn: Callable, data: list) -> float:
 
 
 # ============================================================================
+#  评估指标（分类 / 回归 / 序列 / 生成）
+# ============================================================================
+
+def _metric_pairs(y_true, y_pred, who):
+    """校验两个等长的标签/预测序列，返回 list 副本。"""
+    if not isinstance(y_true, (list, tuple)) or not isinstance(y_pred, (list, tuple)):
+        raise ValueError(f"{who}: y_true / y_pred 必须是列表")
+    if len(y_true) != len(y_pred):
+        raise ValueError(f"{who}: 长度不一致（{len(y_true)} vs {len(y_pred)}）")
+    if not y_true:
+        raise ValueError(f"{who}: 不能是空列表")
+    return list(y_true), list(y_pred)
+
+
+def _metric_label(v, who, i):
+    """类别索引必须是非负整数（bool 不算）。"""
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError(f"{who}: 第 {i} 个标签必须是整数类别索引，收到 {v!r}")
+    if v < 0:
+        raise ValueError(f"{who}: 第 {i} 个标签不能是负数，收到 {v}")
+    return v
+
+
+def _metric_number(v, who, i):
+    """数值型指标的值必须是有限实数（bool 不算）。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{who}: 第 {i} 个值必须是数字，收到 {v!r}")
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"{who}: 第 {i} 个值必须是有限数，收到 {v!r}")
+    return v
+
+
+def confusion_matrix(y_true, y_pred, num_classes: int = None):
+    """混淆矩阵：`matrix[t][p]` = 真实类别 t 被预测成 p 的样本数。
+
+    num_classes 省略时取 `max(标签)+1`（不够则自动给出更小的方阵）。
+    返回 list[list[int]]，`len(matrix) == num_classes`。
+    """
+    yt, yp = _metric_pairs(y_true, y_pred, "confusion_matrix")
+    labels = []
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        labels.append(_metric_label(t, "confusion_matrix.y_true", i))
+        labels.append(_metric_label(p, "confusion_matrix.y_pred", i))
+    n = max(labels) + 1
+    if num_classes is not None:
+        if isinstance(num_classes, bool) or not isinstance(num_classes, int):
+            raise ValueError(f"confusion_matrix: num_classes 必须是整数，收到 {num_classes!r}")
+        if num_classes < n:
+            raise ValueError(
+                f"confusion_matrix: num_classes={num_classes} 小于实际类别数 {n}"
+            )
+        n = num_classes
+    mat = [[0] * n for _ in range(n)]
+    for t, p in zip(yt, yp):
+        mat[t][p] += 1
+    return mat
+
+
+def accuracy_score(y_true, y_pred) -> float:
+    """分类准确率（逐样本比较）。"""
+    yt, yp = _metric_pairs(y_true, y_pred, "accuracy_score")
+    hit = 0
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        hit += 1 if _metric_label(t, "accuracy_score.y_true", i) == \
+            _metric_label(p, "accuracy_score.y_pred", i) else 0
+    return hit / len(yt)
+
+
+def precision_recall_f1(y_true, y_pred, average: str = "macro",
+                        num_classes: int = None) -> dict:
+    """精确率 / 召回率 / F1。
+
+    average: 'macro'（各类等权，默认）、'micro'（全局计数）、'weighted'（按支持数加权）
+             或 'none'（只返回 per_class）。
+    返回 {'precision','recall','f1','per_class':[{'precision','recall','f1','support'},...]}
+    """
+    if average not in ("macro", "micro", "weighted", "none"):
+        raise ValueError(
+            f"precision_recall_f1: average 必须是 macro/micro/weighted/none，收到 {average!r}"
+        )
+    mat = confusion_matrix(y_true, y_pred, num_classes)
+    n = len(mat)
+    per_class = []
+    total_tp = total_fp = total_fn = 0
+    for c in range(n):
+        tp = mat[c][c]
+        support = sum(mat[c])
+        predicted = sum(mat[r][c] for r in range(n))
+        fp = predicted - tp
+        fn = support - tp
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        precision = tp / predicted if predicted else 0.0
+        recall = tp / support if support else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        per_class.append({
+            "precision": precision, "recall": recall, "f1": f1, "support": support,
+        })
+
+    if average == "micro":
+        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
+        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    elif average == "weighted":
+        total_support = sum(row["support"] for row in per_class)
+        if total_support:
+            precision = sum(row["precision"] * row["support"] for row in per_class) / total_support
+            recall = sum(row["recall"] * row["support"] for row in per_class) / total_support
+            f1 = sum(row["f1"] * row["support"] for row in per_class) / total_support
+        else:
+            precision = recall = f1 = 0.0
+    else:
+        # macro / none：只在「出现过」的类别上平均（支持数或预测数为 0 的类不计入）
+        used = [row for row in per_class if row["support"] or row["f1"]]
+        if used:
+            precision = sum(row["precision"] for row in used) / len(used)
+            recall = sum(row["recall"] for row in used) / len(used)
+            f1 = sum(row["f1"] for row in used) / len(used)
+        else:
+            precision = recall = f1 = 0.0
+
+    return {"precision": precision, "recall": recall, "f1": f1, "per_class": per_class}
+
+
+def matthews_corrcoef(y_true, y_pred, num_classes: int = None) -> float:
+    """多分类 MCC（二分类时即标准 MCC，取值 [-1,1]，0 表示随机）。"""
+    mat = confusion_matrix(y_true, y_pred, num_classes)
+    n = len(mat)
+    total = sum(sum(row) for row in mat)
+    if total == 0:
+        raise ValueError("matthews_corrcoef: 没有样本")
+    correct = sum(mat[c][c] for c in range(n))
+    row_sums = [sum(mat[c]) for c in range(n)]
+    col_sums = [sum(mat[r][c] for r in range(n)) for c in range(n)]
+    cov_ytyp = correct * total - sum(row_sums[c] * col_sums[c] for c in range(n))
+    cov_ypyp = total * total - sum(v * v for v in col_sums)
+    cov_ytyt = total * total - sum(v * v for v in row_sums)
+    denom = math.sqrt(cov_ypyp * cov_ytyt)
+    if denom == 0:
+        return 0.0
+    return cov_ytyp / denom
+
+
+def top_k_accuracy(y_true, y_score, k: int = 1) -> float:
+    """Top-k 准确率：正确类别出现在前 k 个预测里就算对。
+
+    y_score: 每个样本一个得分列表（长度 = 类别数，越大越可能）。
+    """
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"top_k_accuracy: k 必须是 ≥1 的整数，收到 {k!r}")
+    yt, ys = _metric_pairs(y_true, y_score, "top_k_accuracy")
+    hit = 0
+    for i, (t, row) in enumerate(zip(yt, ys)):
+        t = _metric_label(t, "top_k_accuracy.y_true", i)
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"top_k_accuracy: 第 {i} 个得分必须是列表")
+        scores = [_metric_number(v, "top_k_accuracy.y_score", i) for v in row]
+        if t >= len(scores):
+            raise ValueError(
+                f"top_k_accuracy: 第 {i} 个样本的真实类别 {t} 超出得分长度 {len(scores)}"
+            )
+        order = sorted(range(len(scores)), key=lambda c: (-scores[c], c))
+        if t in order[:k]:
+            hit += 1
+    return hit / len(yt)
+
+
+def roc_auc_score(y_true, y_score) -> float:
+    """二分类 ROC-AUC（用秩和/Mann-Whitney U 统计量，并列取平均秩）。"""
+    yt, ys = _metric_pairs(y_true, y_score, "roc_auc_score")
+    labels = [_metric_label(t, "roc_auc_score.y_true", i) for i, t in enumerate(yt)]
+    scores = [_metric_number(s, "roc_auc_score.y_score", i) for i, s in enumerate(ys)]
+    if any(t not in (0, 1) for t in labels):
+        raise ValueError("roc_auc_score: y_true 只能是 0/1（二分类）")
+    n_pos = sum(labels)
+    n_neg = len(labels) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError("roc_auc_score: 需要同时包含正例和负例")
+
+    order = sorted(range(len(scores)), key=lambda i: scores[i])
+    ranks = [0.0] * len(scores)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        # 并列值取平均秩（秩从 1 开始）
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    rank_sum = sum(r for r, t in zip(ranks, labels) if t == 1)
+    return (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _regression_pairs(y_true, y_pred, who):
+    """把回归目标转成一维浮点列表（支持标量列表或多输出逐维平均）。"""
+    yt, yp = _metric_pairs(y_true, y_pred, who)
+    flat_t, flat_p = [], []
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        # 单输出模型常返回 [v]，而标签是标量：这种「长度 1 列表 vs 标量」先摊平
+        if isinstance(t, (list, tuple)) and len(t) == 1 and not isinstance(p, (list, tuple)):
+            t = t[0]
+        if isinstance(p, (list, tuple)) and len(p) == 1 and not isinstance(t, (list, tuple)):
+            p = p[0]
+        if isinstance(t, (list, tuple)) or isinstance(p, (list, tuple)):
+            if not isinstance(t, (list, tuple)) or not isinstance(p, (list, tuple)):
+                raise ValueError(f"{who}: 第 {i} 个样本的形式不一致（一个标量、一个向量）")
+            if len(t) != len(p):
+                raise ValueError(f"{who}: 第 {i} 个样本维度不同（{len(t)} vs {len(p)}）")
+            for j, (tv, pv) in enumerate(zip(t, p)):
+                flat_t.append(_metric_number(tv, f"{who}.y_true[{i}][{j}]", j))
+                flat_p.append(_metric_number(pv, f"{who}.y_pred[{i}][{j}]", j))
+        else:
+            flat_t.append(_metric_number(t, f"{who}.y_true", i))
+            flat_p.append(_metric_number(p, f"{who}.y_pred", i))
+    if not flat_t:
+        raise ValueError(f"{who}: 没有可比较的数值")
+    return flat_t, flat_p
+
+
+def mean_absolute_error(y_true, y_pred) -> float:
+    """MAE（多输出时按全部元素平均）。"""
+    yt, yp = _regression_pairs(y_true, y_pred, "mean_absolute_error")
+    return sum(abs(t - p) for t, p in zip(yt, yp)) / len(yt)
+
+
+def root_mean_squared_error(y_true, y_pred) -> float:
+    """RMSE（多输出时按全部元素平均）。"""
+    yt, yp = _regression_pairs(y_true, y_pred, "root_mean_squared_error")
+    return math.sqrt(sum((t - p) ** 2 for t, p in zip(yt, yp)) / len(yt))
+
+
+def mean_absolute_percentage_error(y_true, y_pred, eps: float = 1e-12) -> float:
+    """MAPE（百分比，0.1 表示 10%）；真实值为 0 时用 eps 兜底，避免除零。"""
+    if not isinstance(eps, (int, float)) or isinstance(eps, bool) or eps <= 0:
+        raise ValueError(f"mean_absolute_percentage_error: eps 必须是正数，收到 {eps!r}")
+    yt, yp = _regression_pairs(y_true, y_pred, "mean_absolute_percentage_error")
+    total = 0.0
+    for t, p in zip(yt, yp):
+        denom = abs(t) if abs(t) > eps else eps
+        total += abs(t - p) / denom
+    return 100.0 * total / len(yt)
+
+
+def r2_score(y_true, y_pred) -> float:
+    """决定系数 R²（多输出时按全部元素统一计算）。
+
+    真实值恒定时返回值与 `Model.score` 一致：完全预测对返回 1.0，否则 0.0
+    （原来的 `-1e15` 兜底会让结果无法解读）。
+    """
+    yt, yp = _regression_pairs(y_true, y_pred, "r2_score")
+    mean = sum(yt) / len(yt)
+    ss_tot = sum((t - mean) ** 2 for t in yt)
+    ss_res = sum((t - p) ** 2 for t, p in zip(yt, yp))
+    if ss_tot == 0.0:
+        return 1.0 if ss_res == 0.0 else 0.0
+    return 1.0 - ss_res / ss_tot
+
+
+def sequence_accuracy(preds, targets) -> float:
+    """整条序列全对才算对（Seq2Seq 常用）。"""
+    yt, yp = _metric_pairs(targets, preds, "sequence_accuracy")
+    hit = 0
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        if not isinstance(t, (list, tuple)) or not isinstance(p, (list, tuple)):
+            raise ValueError(f"sequence_accuracy: 第 {i} 个样本必须是序列")
+        if list(t) == list(p):
+            hit += 1
+    return hit / len(yt)
+
+
+def _as_tokens(x, who):
+    """字符串按空白切分；list/tuple 原样转成 str 列表。"""
+    if isinstance(x, str):
+        return x.split()
+    if isinstance(x, (list, tuple)):
+        return [str(t) for t in x]
+    raise ValueError(f"{who}: 需要字符串或 token 列表，收到 {type(x).__name__}")
+
+
+def _ngram_counts(tokens, n):
+    counts = {}
+    for i in range(len(tokens) - n + 1):
+        key = tuple(tokens[i:i + n])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def bleu_score(pred, ref, max_n: int = 4) -> float:
+    """BLEU（1-4 gram 几何平均 + 简短惩罚，缺失的 n-gram 用 add-1 平滑）。
+
+    pred / ref 可以是字符串（按空白切分）或 token 列表。
+    语料级 BLEU 请对多条分别调用后取平均，或自行拼接。
+    """
+    if isinstance(max_n, bool) or not isinstance(max_n, int) or max_n < 1:
+        raise ValueError(f"bleu_score: max_n 必须是 ≥1 的整数，收到 {max_n!r}")
+    p_tokens = _as_tokens(pred, "bleu_score.pred")
+    r_tokens = _as_tokens(ref, "bleu_score.ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    log_sum = 0.0
+    for n in range(1, max_n + 1):
+        p_counts = _ngram_counts(p_tokens, n)
+        r_counts = _ngram_counts(r_tokens, n)
+        overlap = 0
+        total = max(0, len(p_tokens) - n + 1)
+        for key, cnt in p_counts.items():
+            overlap += min(cnt, r_counts.get(key, 0))
+        if n == 1 and overlap == 0:
+            # 连一个词都不重叠：直接判 0，否则 add-1 平滑会让无关句子拿到 0.3+
+            return 0.0
+        # add-1 平滑只用在 n>=2：短句子的 3/4-gram 常常一个都不命中，
+        # 不平滑会让 BLEU 恒为 0（这也是 BLEU 在小样本上的已知缺陷）
+        precision = (overlap + 1.0) / (total + 1.0) if n >= 2 else overlap / total
+        log_sum += math.log(precision)
+    bp = 1.0
+    if len(p_tokens) < len(r_tokens):
+        bp = math.exp(1.0 - len(r_tokens) / len(p_tokens))
+    return bp * math.exp(log_sum / max_n)
+
+
+def rouge_l(pred, ref) -> float:
+    """ROUGE-L 的 F1（基于最长公共子序列）。"""
+    p_tokens = _as_tokens(pred, "rouge_l.pred")
+    r_tokens = _as_tokens(ref, "rouge_l.ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    m, n = len(p_tokens), len(r_tokens)
+    # 只存两行，避免长序列吃内存
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        cur = [0] * (n + 1)
+        pi = p_tokens[i - 1]
+        for j in range(1, n + 1):
+            if pi == r_tokens[j - 1]:
+                cur[j] = prev[j - 1] + 1
+            else:
+                cur[j] = prev[j] if prev[j] >= cur[j - 1] else cur[j - 1]
+        prev = cur
+    lcs = prev[n]
+    if lcs == 0:
+        return 0.0
+    precision = lcs / m
+    recall = lcs / n
+    return 2 * precision * recall / (precision + recall)
+
+
+def evaluate_all(model, x, y) -> dict:
+    """按模型任务一次性算出常用指标，返回 dict。
+
+    - 回归：mae / rmse / mape / r2
+    - 分类：accuracy / precision / recall / f1（macro）/ confusion_matrix，
+           二分类另给 roc_auc；输出是概率时给 top_k_accuracy
+    - 其它：只给 loss
+    模型类型支持 Model（用它的 task）以及 MLP（按回归处理）。
+    """
+    if not hasattr(model, "forward"):
+        raise TypeError(f"evaluate_all: model 需要 forward()，收到 {type(model).__name__}")
+    if not isinstance(x, (list, tuple)) or not isinstance(y, (list, tuple)):
+        raise ValueError("evaluate_all: x / y 必须是列表")
+    if len(x) != len(y):
+        raise ValueError(f"evaluate_all: x 与 y 长度不一致（{len(x)} vs {len(y)}）")
+    if not x:
+        raise ValueError("evaluate_all: x / y 不能为空")
+
+    task = getattr(model, "task", None)
+    result = {"task": task or "unknown", "n_samples": len(x)}
+
+    if task == "regression" or (task is None and not _looks_like_probs(model, x[0])):
+        preds = [model.predict(xi) for xi in x]
+        result.update({
+            "mae": mean_absolute_error(y, preds),
+            "rmse": root_mean_squared_error(y, preds),
+            "mape": mean_absolute_percentage_error(y, preds),
+            "r2": r2_score(y, preds),
+        })
+        return result
+
+    # 分类：一次前向拿到概率行
+    probs = [model.forward(xi) for xi in x]
+    n_cls = max(len(row) for row in probs)
+    for i, row in enumerate(probs):
+        if len(row) != n_cls:
+            raise ValueError(
+                f"evaluate_all: 第 {i} 个样本输出 {len(row)} 维，其它样本是 {n_cls} 维"
+            )
+    preds = [max(range(len(row)), key=lambda c: (row[c], -c)) for row in probs]
+    labels = [_metric_label(v, "evaluate_all.y", i) for i, v in enumerate(y)]
+    for i, t in enumerate(labels):
+        if t >= n_cls:
+            raise ValueError(
+                f"evaluate_all: 第 {i} 个真实类别 {t} 超出输出维度 {n_cls}"
+            )
+
+    prf = precision_recall_f1(labels, preds, average="macro")
+    result.update({
+        "accuracy": accuracy_score(labels, preds),
+        "precision": prf["precision"],
+        "recall": prf["recall"],
+        "f1": prf["f1"],
+        "confusion_matrix": confusion_matrix(labels, preds, n_cls),
+        "mcc": matthews_corrcoef(labels, preds, n_cls),
+    })
+    if n_cls > 1:
+        result["top_k_accuracy"] = top_k_accuracy(labels, probs, k=min(2, n_cls))
+    if n_cls == 2:
+        result["roc_auc"] = roc_auc_score(labels, [row[1] for row in probs])
+    return result
+
+
+def _looks_like_probs(model, sample) -> bool:
+    """模型没有 task 时，靠输出和是否为 1、是否非负来判断「像不像概率」。"""
+    out = model.forward(sample)
+    if not isinstance(out, (list, tuple)) or len(out) < 2:
+        return False
+    total = sum(float(v) for v in out)
+    return all(float(v) >= 0.0 for v in out) and abs(total - 1.0) < 1e-9
+
+
+
+# ============================================================================
 #  模型保存 / 加载 (JSON)
 # ============================================================================
 
@@ -8140,6 +8567,13 @@ class Model:
                 else:
                     scores.append(1 - ss_res / ss_tot)
             return sum(scores) / len(scores)
+
+# ── 评估指标
+
+    def evaluate_all(self, x, y):
+        """一次算出常用指标：回归给 mae/rmse/mape/r2，分类给 accuracy/precision/recall/f1、
+        confusion_matrix、mcc，二分类另给 roc_auc。详见模块级 `evaluate_all`。"""
+        return evaluate_all(self, x, y)
 
 # ── 持久化
 

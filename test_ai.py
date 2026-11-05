@@ -6143,3 +6143,109 @@ class TestReviewFixes:
 
         with pytest.raises(ValueError, match="forward"):
             AI.Sequential(object())
+
+
+class TestMetrics:
+    """分类 / 回归 / 序列 / 生成指标。"""
+
+    def test_confusion_and_accuracy(self):
+        yt, yp = [0, 0, 1, 1, 2, 2], [0, 1, 1, 2, 2, 2]
+        assert AI.confusion_matrix(yt, yp) == [[1, 1, 0], [0, 1, 1], [0, 0, 2]]
+        assert abs(AI.accuracy_score(yt, yp) - 4 / 6) < 1e-12
+        # num_classes 可以补零列
+        mat = AI.confusion_matrix([0], [0], num_classes=3)
+        assert mat == [[1, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+    def test_precision_recall_f1_averages(self):
+        yt, yp = [0, 0, 1, 1, 2, 2], [0, 1, 1, 2, 2, 2]
+        macro = AI.precision_recall_f1(yt, yp)
+        assert abs(macro["precision"] - (1 + 0.5 + 2 / 3) / 3) < 1e-12
+        assert abs(macro["recall"] - (0.5 + 0.5 + 1) / 3) < 1e-12
+        assert abs(macro["f1"] - (2 / 3 + 0.5 + 0.8) / 3) < 1e-12
+        micro = AI.precision_recall_f1(yt, yp, average="micro")
+        assert abs(micro["precision"] - 4 / 6) < 1e-12
+        weighted = AI.precision_recall_f1(yt, yp, average="weighted")
+        assert abs(weighted["recall"] - (0.5 + 0.5 + 1) / 3) < 1e-12
+        none = AI.precision_recall_f1(yt, yp, average="none")
+        assert len(none["per_class"]) == 3
+
+    def test_mcc_and_auc(self):
+        # tp=2 tn=1 fp=1 fn=0 → (2*1-1*0)/sqrt(3*2*2*1)=2/sqrt(12)
+        assert abs(AI.matthews_corrcoef([0, 0, 1, 1], [0, 1, 1, 1]) - 2 / math.sqrt(12)) < 1e-12
+        assert abs(AI.roc_auc_score([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]) - 1.0) < 1e-12
+        assert abs(AI.roc_auc_score([0, 1, 0, 1], [0.5] * 4) - 0.5) < 1e-12
+        assert abs(AI.roc_auc_score([0, 0, 1, 1], [0.9, 0.8, 0.2, 0.1])) < 1e-12
+
+    def test_top_k_and_sequence(self):
+        scores = [[0.7, 0.2, 0.1], [0.1, 0.6, 0.3], [0.2, 0.3, 0.5]]
+        assert AI.top_k_accuracy([0, 1, 2], scores, 1) == 1.0
+        assert abs(AI.top_k_accuracy([0, 2, 2], scores, 1) - 2 / 3) < 1e-12
+        assert AI.top_k_accuracy([0, 1, 2], scores, 2) == 1.0
+        assert abs(AI.sequence_accuracy([[1, 2], [1, 3], [2, 2]],
+                                        [[1, 2], [1, 3], [2, 3]]) - 2 / 3) < 1e-12
+
+    def test_regression_metrics(self):
+        yt, yp = [1.0, 2.0, 3.0, 4.0], [1.1, 1.9, 3.2, 3.8]
+        assert abs(AI.mean_absolute_error(yt, yp) - 0.15) < 1e-12
+        assert abs(AI.root_mean_squared_error(yt, yp) - math.sqrt(0.025)) < 1e-12
+        assert abs(AI.mean_absolute_percentage_error(yt, yp)
+                   - 100 * (0.1 + 0.05 + 0.2 / 3 + 0.05) / 4) < 1e-9
+        ss_tot = sum((v - 2.5) ** 2 for v in yt)
+        ss_res = sum((a - b) ** 2 for a, b in zip(yt, yp))
+        assert abs(AI.r2_score(yt, yp) - (1 - ss_res / ss_tot)) < 1e-12
+        # 常数目标：全对 1.0、有偏 0.0（不是 -1e15）
+        assert AI.r2_score([2.0, 2.0], [2.0, 2.0]) == 1.0
+        assert AI.r2_score([2.0, 2.0], [2.0, 2.5]) == 0.0
+        # 单输出模型给 [v]、标签给标量也要能比
+        assert abs(AI.mean_absolute_error([1.0], [[1.5]]) - 0.5) < 1e-12
+
+    def test_bleu_and_rouge(self):
+        assert AI.bleu_score([1, 2, 3, 4, 5], [1, 2, 3, 4, 5]) > 0.99
+        assert 0 < AI.bleu_score([1, 2], [1, 2, 3, 4]) < 1
+        # 一个词都不重叠时必须是 0（否则 add-1 平滑会给出 0.3+）
+        assert AI.bleu_score([9, 9, 9, 9], [1, 2, 3, 4]) == 0.0
+        assert abs(AI.rouge_l([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-12
+        assert abs(AI.rouge_l([1, 2, 9], [1, 2, 3]) - 2 / 3) < 1e-12
+
+    def test_evaluate_all_classification(self):
+        random.seed(7)
+        xs = [[random.uniform(-1, 1), random.uniform(-1, 1)] for _ in range(40)]
+        ys = [1 if a + b > 0 else 0 for a, b in xs]
+        model = AI.Model(AI.MLP([2, 8, 2], activations=["relu", "softmax"]),
+                         task="classification", loss_fn="cross_entropy", lr=0.1)
+        model.fit(data=list(zip(xs, ys)), epochs=60, verbose=False, seed=1)
+        res = model.evaluate_all(xs, ys)
+        for key in ("accuracy", "precision", "recall", "f1", "confusion_matrix",
+                    "roc_auc", "mcc", "top_k_accuracy"):
+            assert key in res
+        assert res["accuracy"] > 0.85
+        assert res["n_samples"] == 40
+
+    def test_evaluate_all_regression(self):
+        random.seed(8)
+        xs = [[random.uniform(-1, 1), random.uniform(-1, 1)] for _ in range(30)]
+        ys = [a - b for a, b in xs]
+        model = AI.Model(AI.MLP([2, 8, 1], activations=["relu", "linear"]),
+                         task="regression", lr=0.05)
+        model.fit(data=list(zip(xs, ys)), epochs=120, verbose=False, seed=2)
+        res = model.evaluate_all(xs, ys)
+        assert {"mae", "rmse", "mape", "r2"} <= set(res)
+        assert res["r2"] > 0.8
+
+    def test_metric_validation(self):
+        with pytest.raises(ValueError):
+            AI.accuracy_score([], [])
+        with pytest.raises(ValueError):
+            AI.accuracy_score([1], [])
+        with pytest.raises(ValueError):
+            AI.precision_recall_f1([0, 1], [0, 1], average="bogus")
+        with pytest.raises(ValueError):
+            AI.roc_auc_score([0, 0], [0.1, 0.2])
+        with pytest.raises(ValueError):
+            AI.roc_auc_score([0, 2], [0.1, 0.2])
+        with pytest.raises(ValueError):
+            AI.top_k_accuracy([1], [[0.5, 0.5]], k=0)
+        with pytest.raises(ValueError):
+            AI.confusion_matrix([0, 3], [0, 1], num_classes=2)
+        with pytest.raises(TypeError):
+            AI.evaluate_all(object(), [1], [1])
