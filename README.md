@@ -85,7 +85,7 @@ model2 = Model.load("model.json")
 | MLP.merge_weights(other, w1, w2) | 权重线性合并（K 折权重平均用，**各折需同初值**） |
 | distill(teacher, student, x, y) | 蒸馏：用教师输出当软目标训练学生，返回一致率 |
 
-`fit()` 新增 `early_stop_metric='val'|'train'`：默认盯验证损失；
+`fit()` 新增 `early_stop_metric='val'|'train'`：默认盯验证损失；
 选 'train' 时盯训练损失，**且不依赖验证集**（原来没有验证集时 patience 完全不生效）。
 
 ### 工厂函数
@@ -679,7 +679,7 @@ tok = AI.BytePairTokenizer.load("bpe.json")
 
 字节级的好处是**没有词表外字符**：中文、emoji、换行都落在 256 个基础字节 id 里。
 合并只在词块（字母数字 / 空白 / 其它符号的连续段）内部学习，所以不会学到
-「字母+空格」这种跨词 token；语料里重复片段耗尽时会提前停下，vocab_size 只是上限。
+「字母+空格」这种跨词 token；语料里重复片段耗尽时会提前停下，vocab_size 只是上限。
 
 WordPiece 走另一条路：词表里是**字符串**，词内非首字符带 `##` 前缀，
 所以 `playing` 能拆成 `play + ##ing`，而 `ing` 不会和它混为一谈。
