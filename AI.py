@@ -6968,6 +6968,201 @@ def augment_image(x, flip: bool = True, max_shift: int = 1, rng=None):
     return out
 
 
+def _aug_image(x, who):
+    """校验并返回 (C, H, W) 的副本（不修改入参）"""
+    if not isinstance(x, (list, tuple)) or len(x) < 1:
+        raise ValueError(f"{who}: 输入必须是 (C,H,W) 图像，收到 {type(x).__name__}")
+    out = []
+    h = None
+    for c in x:
+        if not isinstance(c, (list, tuple)) or not c:
+            raise ValueError(f"{who}: 每个通道必须是非空二维数组")
+        w = None
+        chan = []
+        for row in c:
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError(f"{who}: 每个通道必须是非空二维数组")
+            if w is None:
+                w = len(row)
+            elif len(row) != w:
+                raise ValueError(f"{who}: 同一通道内各行长度必须相同")
+            chan.append([float(v) for v in row])
+        if h is None:
+            h = len(c)
+        elif len(c) != h:
+            raise ValueError(f"{who}: 各通道高度必须相同")
+        out.append(chan)
+    return out
+
+
+def _beta_lam(alpha, rng, who):
+    """用两次 Gamma 抽样合成 Beta(alpha, alpha) 的 lam（与 mixup 一致）"""
+    alpha = float(alpha)
+    if alpha <= 0.0:
+        raise ValueError(f"{who}: alpha 必须 > 0，收到 {alpha!r}")
+
+    def gamma(a):
+        # Marsaglia-Tsang：a >= 1 用 squeeze；a < 1 用 x^(1/a) 提升
+        if a < 1.0:
+            u = rng.random()
+            while u == 0.0:
+                u = rng.random()
+            return gamma(a + 1.0) * (u ** (1.0 / a))
+        d = a - 1.0 / 3.0
+        c = 1.0 / math.sqrt(9.0 * d)
+        while True:
+            x = rng.gauss(0.0, 1.0)
+            v = (1.0 + c * x) ** 3
+            if v <= 0.0:
+                continue
+            u = rng.random()
+            if u < 1.0 - 0.0331 * x ** 4:
+                return d * v
+            if math.log(u) < 0.5 * x * x + d * (1.0 - v + math.log(v)):
+                return d * v
+
+    g1 = gamma(alpha)
+    g2 = gamma(alpha)
+    return g1 / (g1 + g2)
+
+
+def augment_cutmix(x1, y1, x2, y2, alpha: float = 1.0, rng=None):
+    """CutMix：从 x2 剪一块矩形贴到 x1 上，标签按面积比例混合
+
+    x1/x2: (C,H,W)；y1/y2: 标签（one-hot 或任意等长向量）。
+    返回 (image, label)，label 是「按面积加权的混合标签」，和仍为 1（输入是 one-hot 时）。
+    """
+    who = "augment_cutmix"
+    a = _aug_image(x1, who)
+    b = _aug_image(x2, who)
+    if len(a) != len(b) or len(a[0]) != len(b[0]) or len(a[0][0]) != len(b[0][0]):
+        raise ValueError(f"{who}: 两张图的形状必须相同")
+    if len(y1) != len(y2) or not y1:
+        raise ValueError(f"{who}: 两个标签长度必须相同且非空")
+    rng = rng or random
+    lam = _beta_lam(alpha, rng, who)
+
+    C, H, W = len(a), len(a[0]), len(a[0][0])
+    cut_w = int(round(W * math.sqrt(1.0 - lam)))
+    cut_h = int(round(H * math.sqrt(1.0 - lam)))
+    if cut_w > 0 and cut_h > 0:
+        cx = int(rng.randrange(W))
+        cy = int(rng.randrange(H))
+        x0, x1_ = max(0, cx - cut_w // 2), min(W, cx + cut_w // 2)
+        y0, y1_ = max(0, cy - cut_h // 2), min(H, cy + cut_h // 2)
+        for c in range(C):
+            for yy in range(y0, y1_):
+                for xx in range(x0, x1_):
+                    a[c][yy][xx] = b[c][yy][xx]
+        lam = 1.0 - ((x1_ - x0) * (y1_ - y0)) / float(H * W)
+    else:
+        lam = 1.0
+
+    label = [lam * float(u) + (1.0 - lam) * float(v) for u, v in zip(y1, y2)]
+    return a, label
+
+
+def augment_cutout(x, num_holes: int = 1, hole_size: float = 0.25, fill: float = 0.0,
+                   rng=None):
+    """Cutout：随机抹掉 num_holes 个正方形区域（填 fill）
+
+    hole_size 是相对短边的比例，(0,1)。返回新图像，不修改入参。
+    """
+    who = "augment_cutout"
+    img = _aug_image(x, who)
+    if isinstance(num_holes, bool) or not isinstance(num_holes, int) or num_holes < 0:
+        raise ValueError(f"{who}: num_holes 必须是 >= 0 的整数，收到 {num_holes!r}")
+    hole_size = float(hole_size)
+    if not 0.0 < hole_size < 1.0:
+        raise ValueError(f"{who}: hole_size 必须在 (0,1)，收到 {hole_size!r}")
+    rng = rng or random
+    C, H, W = len(img), len(img[0]), len(img[0][0])
+    side = max(1, int(round(min(H, W) * hole_size)))
+    for _ in range(num_holes):
+        x0 = int(rng.randrange(max(1, W - side + 1)))
+        y0 = int(rng.randrange(max(1, H - side + 1)))
+        for c in range(C):
+            for yy in range(y0, min(H, y0 + side)):
+                for xx in range(x0, min(W, x0 + side)):
+                    img[c][yy][xx] = float(fill)
+    return img
+
+
+def _aug_brightness(img, factor):
+    return [[[min(1.0, max(0.0, v * factor)) for v in row] for row in ch] for ch in img]
+
+
+def _aug_contrast(img, factor):
+    n = sum(sum(v for v in row) for ch in img for row in ch)
+    cnt = sum(len(row) for ch in img for row in ch)
+    mean = n / cnt
+    return [[[min(1.0, max(0.0, (v - mean) * factor + mean)) for v in row] for row in ch]
+            for ch in img]
+
+
+def _aug_shift(img, dy, dx):
+    C, H, W = len(img), len(img[0]), len(img[0][0])
+    out = []
+    for c in range(C):
+        chan = [[0.0] * W for _ in range(H)]
+        for y in range(H):
+            sy = y - dy
+            if not 0 <= sy < H:
+                continue
+            for x in range(W):
+                sx = x - dx
+                if 0 <= sx < W:
+                    chan[y][x] = img[c][sy][sx]
+        out.append(chan)
+    return out
+
+
+def _aug_rotate90(img, turns):
+    out = img
+    for _ in range(turns % 4):
+        C, H, W = len(out), len(out[0]), len(out[0][0])
+        out = [[[out[c][H - 1 - x][y] for x in range(H)] for y in range(W)]
+               for c in range(C)]
+    return out
+
+
+def augment_randaugment(x, n: int = 2, magnitude: float = 9.0, ops=None, rng=None):
+    """RandAugment：随机挑 n 个操作（可重复）依次应用
+
+    默认操作集：brightness / contrast / translate / rotate90 / identity。
+    magnitude ∈ [0, 10]，线性映射到各操作强度（1 = 弱，10 = 强）。
+    返回 (image, ops_applied) —— 应用了哪些操作，便于复现和记录。
+    """
+    who = "augment_randaugment"
+    img = _aug_image(x, who)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f"{who}: n 必须是 >= 0 的整数，收到 {n!r}")
+    magnitude = float(magnitude)
+    if not 0.0 <= magnitude <= 10.0:
+        raise ValueError(f"{who}: magnitude 必须在 [0,10]，收到 {magnitude!r}")
+    rng = rng or random
+    pool = list(ops) if ops else ["brightness", "contrast", "translate", "rotate90", "identity"]
+    for op in pool:
+        if op not in ("brightness", "contrast", "translate", "rotate90", "identity"):
+            raise ValueError(f"{who}: 不支持的操作 {op!r}")
+
+    scale = magnitude / 10.0
+    applied = []
+    for _ in range(n):
+        op = pool[int(rng.randrange(len(pool)))]
+        applied.append(op)
+        if op == "brightness":
+            img = _aug_brightness(img, 1.0 - 0.5 * scale + scale * rng.random())
+        elif op == "contrast":
+            img = _aug_contrast(img, 1.0 - 0.5 * scale + scale * rng.random())
+        elif op == "translate":
+            lim = max(1, int(round(scale * 0.25 * min(len(img[0]), len(img[0][0])))))
+            img = _aug_shift(img, int(rng.randint(-lim, lim)), int(rng.randint(-lim, lim)))
+        elif op == "rotate90":
+            img = _aug_rotate90(img, int(rng.randrange(4)))
+    return img, applied
+
+
 def mixup(x1, y1, x2, y2, alpha: float = 0.2, rng=None):
     """Mixup：返回 (混合后的 x, 混合后的软标签向量)。
 

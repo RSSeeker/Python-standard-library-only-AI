@@ -7199,3 +7199,124 @@ class TestCTCLoss:
             AI.ctc_loss([[math.log(0.5), math.log(0.5)]], [5], blank=0)
         with pytest.raises(TypeError):
             AI.ctc_loss([[math.log(0.5), math.log(0.5)]], [1.5], blank=0)
+
+
+class TestCutMix:
+    @staticmethod
+    def _img(c, h, w, base):
+        return [[[base + 0.01 * (y * w + x) for x in range(w)] for y in range(h)]
+                for _ in range(c)]
+
+    def test_shape_labels_and_no_mutation(self):
+        x1 = self._img(2, 6, 6, 0.2)
+        x2 = self._img(2, 6, 6, 0.8)
+        keep1, keep2 = [row[:] for row in x1[0]], [row[:] for row in x2[0]]
+        out, lab = AI.augment_cutmix(x1, [1.0, 0.0], x2, [0.0, 1.0],
+                                     alpha=1.0, rng=random.Random(7))
+        assert len(out) == 2 and len(out[0]) == 6 and len(out[0][0]) == 6
+        assert abs(sum(lab) - 1.0) < 1e-12
+        assert x1[0] == keep1 and x2[0] == keep2
+
+    def test_pasted_pixels_come_from_source(self):
+        x1 = self._img(1, 6, 6, 0.2)
+        x2 = self._img(1, 6, 6, 0.8)
+        out, lab = AI.augment_cutmix(x1, [1.0, 0.0], x2, [0.0, 1.0],
+                                     alpha=1.0, rng=random.Random(7))
+        changed = [(y, x) for y in range(6) for x in range(6) if out[0][y][x] != x1[0][y][x]]
+        assert changed, "应当至少贴入一格"
+        # 贴入比例（按面积）应与 1-lam 一致
+        assert abs(len(changed) / 36.0 - (1.0 - lab[0])) < 0.02
+        src_values = {x2[0][y][x] for y in range(6) for x in range(6)}
+        assert all(out[0][y][x] in src_values for y, x in changed)
+
+    def test_same_seed_reproducible(self):
+        x1 = self._img(2, 5, 5, 0.3)
+        x2 = self._img(2, 5, 5, 0.7)
+        o1, l1 = AI.augment_cutmix(x1, [1.0, 0.0], x2, [0.0, 1.0], rng=random.Random(11))
+        o2, l2 = AI.augment_cutmix(x1, [1.0, 0.0], x2, [0.0, 1.0], rng=random.Random(11))
+        assert o1 == o2 and l1 == l2
+
+    def test_invalid(self):
+        x1 = self._img(2, 4, 4, 0.2)
+        x2 = self._img(2, 4, 4, 0.8)
+        with pytest.raises(ValueError):
+            AI.augment_cutmix(x1, [1.0], x2, [1.0], alpha=0.0)
+        with pytest.raises(ValueError):
+            AI.augment_cutmix(x1, [1.0], x2, [1.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.augment_cutmix(self._img(2, 5, 5, 0.2), [1.0], x2, [1.0])
+
+
+class TestCutout:
+    @staticmethod
+    def _img(c, h, w, base=0.5):
+        return [[[base + 0.01 * (y * w + x) for x in range(w)] for y in range(h)]
+                for _ in range(c)]
+
+    def test_holes_are_zeroed(self):
+        x = self._img(3, 8, 8)
+        keep = [row[:] for row in x[0]]
+        out = AI.augment_cutout(x, num_holes=2, hole_size=0.25, rng=random.Random(3))
+        side = max(1, int(round(8 * 0.25)))
+        zeros = sum(1 for c in range(3) for y in range(8) for xx in range(8) if out[c][y][xx] == 0.0)
+        assert zeros == 3 * 2 * side * side
+        assert x[0] == keep
+
+    def test_zero_holes_is_copy(self):
+        x = self._img(2, 6, 6)
+        assert AI.augment_cutout(x, num_holes=0, hole_size=0.3, rng=random.Random(1)) == x
+
+    def test_same_seed_reproducible(self):
+        x = self._img(2, 6, 6)
+        assert (AI.augment_cutout(x, 1, 0.3, rng=random.Random(5))
+                == AI.augment_cutout(x, 1, 0.3, rng=random.Random(5)))
+
+    def test_invalid(self):
+        x = self._img(2, 6, 6)
+        for bad in (dict(hole_size=0.0), dict(hole_size=1.0), dict(num_holes=-1)):
+            with pytest.raises(ValueError):
+                AI.augment_cutout(x, **bad)
+
+
+class TestRandAugment:
+    @staticmethod
+    def _img(c, h, w, base=0.5):
+        return [[[base + 0.01 * (y * w + x) for x in range(w)] for y in range(h)]
+                for _ in range(c)]
+
+    def test_applies_n_ops(self):
+        x = self._img(2, 8, 8)
+        keep = [row[:] for row in x[0]]
+        out, applied = AI.augment_randaugment(x, n=3, magnitude=5.0, rng=random.Random(9))
+        assert len(applied) == 3
+        assert len(out) == 2 and len(out[0]) == 8 and len(out[0][0]) == 8
+        assert all(0.0 <= v <= 1.0 for ch in out for row in ch for v in row)
+        assert x[0] == keep
+
+    def test_identity_only_is_noop(self):
+        x = self._img(2, 5, 5)
+        out, applied = AI.augment_randaugment(x, n=3, magnitude=9.0, ops=["identity"],
+                                              rng=random.Random(1))
+        assert out == x and applied == ["identity"] * 3
+
+    def test_rotate90_four_times_is_identity(self):
+        x = self._img(2, 4, 6)
+        rot = x
+        for _ in range(4):
+            rot = AI._aug_rotate90(rot, 1)
+        assert rot == x
+
+    def test_same_seed_reproducible(self):
+        x = self._img(2, 8, 8)
+        o1, a1 = AI.augment_randaugment(x, 4, 7.0, rng=random.Random(21))
+        o2, a2 = AI.augment_randaugment(x, 4, 7.0, rng=random.Random(21))
+        assert o1 == o2 and a1 == a2
+
+    def test_invalid(self):
+        x = self._img(2, 6, 6)
+        with pytest.raises(ValueError):
+            AI.augment_randaugment(x, n=1, magnitude=11.0)
+        with pytest.raises(ValueError):
+            AI.augment_randaugment(x, n=1, ops=["blur"])
+        with pytest.raises(ValueError):
+            AI.augment_randaugment(x, n=-1)

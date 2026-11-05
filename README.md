@@ -616,6 +616,9 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `augment_noise(x, sigma=0.01)` | 加性高斯噪声（单样本或一批样本，不改入参） |
 | `augment_image(x, flip=True, max_shift=1)` | 图像 `(C,H,W)` 的随机翻转 / 平移（越界补 0） |
 | `mixup(x1, y1, x2, y2, alpha=0.2)` | Mixup：返回混合样本 + 软标签向量（可直接喂 CE 的软标签分支）；`lam ~ Beta(alpha, alpha)`，恒在 `[0,1]` 内 |
+| `augment_cutmix(x1, y1, x2, y2, alpha=1.0)` | CutMix：从 x2 剪一块矩形贴到 x1，`lam` 按**实际贴入面积**重算，标签同步混合 |
+| `augment_cutout(x, num_holes=1, hole_size=0.25)` | Cutout：随机抹掉若干个正方形区域（`hole_size` 是相对短边比例） |
+| `augment_randaugment(x, n=2, magnitude=9.0)` | RandAugment：随机挑 n 个操作（brightness / contrast / translate / rotate90 / identity）并返回实际用到的操作名 |
 
 > 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
 > （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
@@ -750,7 +753,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-601 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+614 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -774,6 +777,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCacheMatrix` | KV cache == 整段重算在 7 种组合下都成立（GQA/MQA × RoPE × 滑动窗口 × max_len 8/4），束搜索在这些组合下也确定性 |
 | `TestNewActivations` | SiLU/Mish/ELU/SELU 的前向数值、导数 vs 数值微分、`Layer.backward` 梯度、`FeedForward` 支持这四种激活、非法激活名仍报错 |
 | `TestSwiGLU` | 门控全 0 时退化成 `b2`、六个参数的梯度 vs 数值、`dx` vs 数值、梯度累加语义、参数校验 |
+| `TestCutMix` | 形状与标签混合 / 贴入像素来自第二张图且面积与 lam 一致 / 同 seed 可复现 / 非法参数 |
+| `TestCutout` | 抹掉的像素数 / `num_holes=0` 等同拷贝 / 同 seed 可复现 / 非法参数 |
+| `TestRandAugment` | 操作数与被修改值域 / identity 不动像素 / rotate90 四次复原 / 同 seed 可复现 / 非法参数 |
 | `TestTripletLoss` | 满足间隔 ⇒ 零梯度 / 三个梯度 vs 数值 / 非法 margin 与长度 |
 | `TestInfoNCELoss` | loss 与闭式公式一致 / 四个梯度 vs 数值 / 难负样本 loss 更大 / 非法参数 |
 | `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
@@ -834,6 +840,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 601 个单元测试
+├── test_ai.py       # 614 个单元测试
 └── README.md
 ```
