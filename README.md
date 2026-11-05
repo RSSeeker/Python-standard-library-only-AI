@@ -1001,11 +1001,14 @@ python test_ai.py     # 等价于 pytest test_ai.py
 
 CI（GitHub Actions）执行 flake8 + pytest。
 
+下一步的扩展计划（网络层 / 损失 / 优化器 / 数据管道 / 推理部署等 17 类，按 20 个波次排期）见 [ROADMAP.md](ROADMAP.md)。
+
 ## 文件结构
 
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
 ├── test_ai.py       # 677 个单元测试
+├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
