@@ -120,11 +120,13 @@
 - [ ] 已有项标注：`huber_loss`（SmoothL1）、`kl_divergence`、`dice_loss`、`ctc_loss`、`triplet_loss`、`info_nce_loss`
 
 ### W2 卷积与视觉块（P0/P1）
-- [ ] `DepthwiseSeparableConv`（= `Conv2d(groups=C)` + 1×1）
-- [ ] `ResNetBasicBlock` / `ResNetBottleneck`（1×1→3×3→1×1 + 残差）
+- [x] `DepthwiseSeparableConv2d`（W2-B：`Conv2d(groups=C)` + 1×1 点卷积，参数量 `C·k·k + C + C·out + out`；dx 中心差分 ≤1e-8，`sgd_step`/`adam_step` 真改权重）
+- [x] `BasicBlock2d`（W2-B：`conv3x3 → BN → ReLU → conv3x3 → BN → (+x) → ReLU`，stride=1 恒等捷径；全零卷积时退化为 `relu(x)`，eval 模式 dx 中心差分 ≤1e-7）
+- [ ] `ResNetBottleneck`（1×1→3×3→1×1 + 残差，含 stride>1 的 1×1 投影捷径）
 - [ ] `DenseBlock` / 稠密连接
 - [x] `SEBlock`（W2-A 提交：GAP → 瓶颈 MLP → sigmoid 乘回输入，dx 与四组参数梯度中心差分 ≤1e-9）
-- [ ] `ECABlock` / `CBAMBlock`（通道 + 空间注意力）
+- [x] `ECABlock`（W2-B：GAP 后一条奇数宽 1D 卷积跨通道混权重，只多 `kernel_size` 个参数；dx/`grad_w` 中心差分 ≤1e-8）
+- [ ] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支）
 - [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
 - [ ] 卷积家族：`Conv3d`、`ConvTranspose1d`、`ConvTranspose3d`
 - [x] 池化家族（部分，W2-A 提交）：`GlobalMaxPool2d`（只回传最大值位置）、`AdaptiveMaxPool2d`（分箱与

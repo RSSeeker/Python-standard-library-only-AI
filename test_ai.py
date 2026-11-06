@@ -9283,3 +9283,191 @@ class TestSEBlock:
             AI.SEBlock(4).forward([[[1.0]]])
         with pytest.raises(RuntimeError):
             AI.SEBlock(2).backward([[[1.0]]])
+
+
+# ============================================================================
+#  W2-B：ECA / 深度可分离卷积 / ResNet BasicBlock
+# ============================================================================
+class TestECABlock:
+    def test_forward_and_scale(self):
+        eca = AI.ECABlock(4, kernel_size=3)
+        x = [[[0.1 * (c + 1) + 0.2 * h + 0.3 * w for w in range(3)] for h in range(3)]
+             for c in range(4)]
+        out = eca.forward(x)
+        _, z, s = eca._cache
+        assert len(z) == 4
+        assert all(0.0 < v < 1.0 for v in s)
+        for c in range(4):
+            assert abs(out[c][1][2] - x[c][1][2] * s[c]) < 1e-15
+        assert eca.param_count() == 3
+
+    def test_backward_matches_finite_difference(self):
+        random.seed(11)
+        eca = AI.ECABlock(3)
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(3)]
+        dout = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(3)]
+        base = [[row[:] for row in ch] for ch in x]
+
+        def loss(xx):
+            o = eca.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w] for c in range(3) for h in range(3) for w in range(3))
+
+        eca.zero_grad()
+        eca.forward([[row[:] for row in ch] for ch in base])
+        dx = eca.backward(dout)
+        eps = 1e-6
+        for c in range(3):
+            for h in range(3):
+                for w in range(3):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    assert abs((vp - vm) / (2 * eps) - dx[c][h][w]) < 1e-8
+        eca.zero_grad()
+        eca.forward([[row[:] for row in ch] for ch in base])
+        eca.backward(dout)
+        g = eca.grads["w"][1]
+        base2 = [[row[:] for row in ch] for ch in base]
+        eca.w[1] = eca.w[1] + eps
+        vp = loss([[row[:] for row in ch] for ch in base2])
+        base2 = [[row[:] for row in ch] for ch in base]
+        eca.w[1] = eca.w[1] - 2 * eps
+        vm = loss([[row[:] for row in ch] for ch in base2])
+        eca.w[1] = eca.w[1] + eps
+        assert abs((vp - vm) / (2 * eps) - g) < 1e-8
+
+    def test_even_kernel_rejected(self):
+        with pytest.raises(ValueError):
+            AI.ECABlock(4, kernel_size=2)
+        with pytest.raises(ValueError):
+            AI.ECABlock(0)
+        eca = AI.ECABlock(3)
+        with pytest.raises(ValueError):
+            eca.forward([[[1.0]]])
+        with pytest.raises(RuntimeError):
+            eca.backward([[[1.0]]])
+
+
+class TestDepthwiseSeparableConv2d:
+    def test_shapes_and_param_count(self):
+        random.seed(21)
+        dsc = AI.DepthwiseSeparableConv2d(3, 5, 3, padding=1)
+        x = [[[random.uniform(-1, 1) for _ in range(4)] for _ in range(4)] for _ in range(3)]
+        out = dsc.forward(x)
+        assert (len(out), len(out[0]), len(out[0][0])) == (5, 4, 4)
+        assert dsc.param_count() == 3 * 9 + 3 + 5 * 3 + 5
+        assert dsc.param_count() < 3 * 5 * 9 + 5
+
+    def test_backward_and_steps(self):
+        random.seed(22)
+        dsc = AI.DepthwiseSeparableConv2d(2, 3, 3, padding=1)
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(2)]
+        dout = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(3)]
+        base = [[row[:] for row in ch] for ch in x]
+
+        def loss(xx):
+            o = dsc.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w] for c in range(3) for h in range(3) for w in range(3))
+
+        dsc.zero_grad()
+        dsc.forward([[row[:] for row in ch] for ch in base])
+        dx = dsc.backward(dout)
+        eps = 1e-6
+        for c in range(2):
+            for h in range(3):
+                for w in range(3):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    assert abs((vp - vm) / (2 * eps) - dx[c][h][w]) < 1e-7
+        w0 = dsc.dw.weights[0][0][0][0]
+        dsc.zero_grad()
+        dsc.forward([[row[:] for row in ch] for ch in base])
+        dsc.backward(dout)
+        dsc.sgd_step(0.1)
+        assert dsc.dw.weights[0][0][0][0] != w0
+        dsc.adam_step(0.01)
+        assert dsc.pw.biases is not None
+
+
+class TestBasicBlock2d:
+    def test_zero_conv_is_relu_identity(self):
+        random.seed(31)
+        blk = AI.BasicBlock2d(2)
+        for c in range(2):
+            for ic in range(2):
+                for a in range(3):
+                    for b in range(3):
+                        blk.conv1.weights[c][ic][a][b] = 0.0
+                        blk.conv2.weights[c][ic][a][b] = 0.0
+            blk.conv1.biases[c] = 0.0
+            blk.conv2.biases[c] = 0.0
+        x = [[[-1.0, 0.5], [2.0, -3.0]], [[0.0, 1.0], [-2.0, 4.0]]]
+        out = blk.forward(x)
+        for c in range(2):
+            for h in range(2):
+                for w in range(2):
+                    assert abs(out[c][h][w] - max(0.0, x[c][h][w])) < 1e-12
+
+    def test_eval_backward_matches_finite_difference(self):
+        random.seed(32)
+        blk = AI.BasicBlock2d(2)
+        blk.eval()
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(2)]
+        dout = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(2)]
+        base = [[row[:] for row in ch] for ch in x]
+
+        def loss(xx):
+            o = blk.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w] for c in range(2) for h in range(3) for w in range(3))
+
+        blk.zero_grad()
+        blk.forward([[row[:] for row in ch] for ch in base])
+        dx = blk.backward(dout)
+        eps = 1e-6
+        for c in range(2):
+            for h in range(3):
+                for w in range(3):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    assert abs((vp - vm) / (2 * eps) - dx[c][h][w]) < 1e-7
+        assert any(abs(v) > 0.0 for v in blk.bn_grads["bn2_gamma"])
+
+    def test_param_count_and_validation(self):
+        blk = AI.BasicBlock2d(3)
+        assert blk.param_count() == 2 * (3 * 3 * 9 + 3) + 4 * 3
+        with pytest.raises(ValueError):
+            AI.BasicBlock2d(0)
+        with pytest.raises(RuntimeError):
+            AI.BasicBlock2d(2).backward([[[1.0]]])
+
+
+class TestBatchNorm2dEvalBackward:
+    def test_eval_backward_is_elementwise(self):
+        bn = AI.BatchNorm2d(2)
+        bn.eval()
+        x = [[[0.5, -1.0], [2.0, 0.0]], [[1.0, 3.0], [-2.0, 0.5]]]
+        out = bn.forward(x)
+        assert out[0][0][0] == pytest.approx(x[0][0][0] / (1.0 + bn.eps) ** 0.5, rel=1e-9)
+        dout = [[[1.0, -0.5], [0.0, 2.0]], [[-1.0, 0.0], [0.5, 1.0]]]
+        dx, g_gamma, g_beta = bn.backward(dout)
+        inv = 1.0 / (1.0 + bn.eps) ** 0.5
+        for c in range(2):
+            for h in range(2):
+                for w in range(2):
+                    assert abs(dx[c][h][w] - dout[c][h][w] * inv) < 1e-12
+        for c in range(2):
+            flat = [dout[c][h][w] for h in range(2) for w in range(2)]
+            assert abs(g_beta[c] - sum(flat)) < 1e-12
+            xh = [x[c][h][w] * inv for h in range(2) for w in range(2)]
+            assert abs(g_gamma[c] - sum(d * a for d, a in zip(flat, xh))) < 1e-12

@@ -1617,6 +1617,321 @@ class SEBlock:
                 for w in range(W):
                     dx[c][h][w] = dout[c][h][w] * s[c] + g
         return dx
+class ECABlock:
+    """ECA 通道注意力：GAP 后用一条 `kernel_size` 宽的 1D 卷积（零填充）跨通道混权重，
+
+    再 sigmoid 乘回输入。比 SE 省掉降维 MLP，只多 `kernel_size` 个参数。
+    """
+
+    def __init__(self, channels, kernel_size=3):
+        for n, v in (("channels", channels), ("kernel_size", kernel_size)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"ECABlock: {n} 必须是正整数，收到 {v!r}")
+        if kernel_size % 2 == 0:
+            raise ValueError(f"ECABlock: kernel_size 必须是奇数（保证两侧对称填充），收到 {kernel_size}")
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.half = kernel_size // 2
+        self.w = [0.0] * kernel_size
+        for i in range(kernel_size):
+            self.w[i] = 1.0 / kernel_size
+        self.training = True
+        self.grads = {"w": [0.0] * kernel_size}
+        self._cache = None
+        self._adam_m = {"w": [0.0] * kernel_size}
+        self._adam_v = {"w": [0.0] * kernel_size}
+        self._adam_t = 0
+
+    def zero_grad(self):
+        self.grads = {"w": [0.0] * self.kernel_size}
+
+    def param_count(self):
+        return self.kernel_size
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("ECABlock: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.channels:
+            raise ValueError(f"ECABlock: 输入通道数 {C} 与 channels={self.channels} 不符")
+        z = _w2_channel_means(x)
+        e = []
+        for c in range(C):
+            acc = 0.0
+            for k in range(self.kernel_size):
+                src = c + k - self.half
+                if 0 <= src < C:
+                    acc += self.w[k] * z[src]
+            e.append(acc)
+        s = [_sigmoid_scalar(v) for v in e]
+        out = [[[x[c][h][w] * s[c] for w in range(W)] for h in range(H)] for c in range(C)]
+        self._cache = (x, z, s)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("ECABlock.backward: 必须先调用 forward")
+        x, z, s = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if len(dout) != C or len(dout[0]) != H or len(dout[0][0]) != W:
+            raise ValueError(
+                f"ECABlock.backward: dout 形状 {(len(dout), len(dout[0]), len(dout[0][0]))} "
+                f"与输入 {(C, H, W)} 不符")
+        area = float(H * W)
+        de = [0.0] * C
+        for c in range(C):
+            inner = 0.0
+            for h in range(H):
+                for w in range(W):
+                    inner += dout[c][h][w] * x[c][h][w]
+            de[c] = inner * s[c] * (1.0 - s[c])
+        for k in range(self.kernel_size):
+            acc = 0.0
+            for c in range(C):
+                src = c + k - self.half
+                if 0 <= src < C:
+                    acc += de[c] * z[src]
+            self.grads["w"][k] += acc
+        dz = [0.0] * C
+        for k in range(self.kernel_size):
+            for c in range(C):
+                src = c + k - self.half
+                if 0 <= src < C:
+                    dz[src] += de[c] * self.w[k]
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            g = dz[c] / area
+            for h in range(H):
+                for w in range(W):
+                    dx[c][h][w] = dout[c][h][w] * s[c] + g
+        return dx
+
+
+def _conv_param_count(layer):
+    """Conv2d / Conv1d / ConvTranspose2d 的参数量（权重 + 偏置）"""
+    w = layer.weights
+
+    def count(node):
+        if isinstance(node, list):
+            return sum(count(v) for v in node)
+        return 1
+
+    return count(w) + len(layer.biases)
+
+
+def _conv_sgd(layer, lr):
+    """原地 SGD 更新一个卷积层的 weights/biases"""
+    W, B, gw, gb = layer.weights, layer.biases, layer.grad_w, layer.grad_b
+    oc = len(W)
+    for o in range(oc):
+        B[o] -= lr * gb[o]
+        for ic in range(len(W[o])):
+            row_w, row_g = W[o][ic], gw[o][ic]
+            if isinstance(row_w, list) and row_w and isinstance(row_w[0], list):
+                for a in range(len(row_w)):
+                    for b in range(len(row_w[a])):
+                        row_w[a][b] -= lr * row_g[a][b]
+            else:
+                for k in range(len(row_w)):
+                    row_w[k] -= lr * row_g[k]
+
+
+def _conv_adam(layer, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    """原地 Adam 更新一个卷积层；步数记在 layer._conv_adam_t 上"""
+    t = getattr(layer, "_conv_adam_t", 0) + 1
+    layer._conv_adam_t = t
+    c1 = 1.0 - beta1 ** t
+    c2 = 1.0 - beta2 ** t
+    o1, o2 = 1.0 - beta1, 1.0 - beta2
+    W, B, gw, gb = layer.weights, layer.biases, layer.grad_w, layer.grad_b
+    mw, vw = layer.m_w, layer.v_w
+    mb, vb = layer.m_b, layer.v_b
+    for o in range(len(W)):
+        g = gb[o]
+        m = beta1 * mb[o] + o1 * g
+        v = beta2 * vb[o] + o2 * g * g
+        mb[o], vb[o] = m, v
+        B[o] -= lr * (m / c1) / (math.sqrt(v / c2) + eps)
+        for ic in range(len(W[o])):
+            row_w, row_g = W[o][ic], gw[o][ic]
+            row_m, row_v = mw[o][ic], vw[o][ic]
+            if isinstance(row_w, list) and row_w and isinstance(row_w[0], list):
+                for a in range(len(row_w)):
+                    for b in range(len(row_w[a])):
+                        g = row_g[a][b]
+                        m = beta1 * row_m[a][b] + o1 * g
+                        v = beta2 * row_v[a][b] + o2 * g * g
+                        row_m[a][b], row_v[a][b] = m, v
+                        row_w[a][b] -= lr * (m / c1) / (math.sqrt(v / c2) + eps)
+            else:
+                for k in range(len(row_w)):
+                    g = row_g[k]
+                    m = beta1 * row_m[k] + o1 * g
+                    v = beta2 * row_v[k] + o2 * g * g
+                    row_m[k], row_v[k] = m, v
+                    row_w[k] -= lr * (m / c1) / (math.sqrt(v / c2) + eps)
+
+
+class DepthwiseSeparableConv2d:
+    """深度可分离卷积：`depthwise Conv2d(groups=in_channels)` + `pointwise 1x1 Conv2d`
+
+    参数量约为标准卷积的 `1/out_channels + 1/(k*k)`；两个子卷积各自维护
+    `grad_w`/`grad_b`，本层的 `zero_grad`/`sgd_step`/`adam_step` 转发给它们。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dw = Conv2d(in_channels, in_channels, kernel_size,
+                         stride=stride, padding=padding, groups=in_channels)
+        self.pw = Conv2d(in_channels, out_channels, 1, stride=1, padding=0)
+        self.training = True
+
+    @property
+    def grads(self):
+        return self.grads_dict()
+
+    def grads_dict(self):
+        return {"dw_w": self.dw.grad_w, "dw_b": self.dw.grad_b,
+                "pw_w": self.pw.grad_w, "pw_b": self.pw.grad_b}
+
+    def zero_grad(self):
+        self.dw.zero_grad()
+        self.pw.zero_grad()
+
+    def param_count(self):
+        return _conv_param_count(self.dw) + _conv_param_count(self.pw)
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+    def sgd_step(self, lr):
+        _conv_sgd(self.dw, lr)
+        _conv_sgd(self.pw, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        _conv_adam(self.dw, lr, beta1, beta2, eps)
+        _conv_adam(self.pw, lr, beta1, beta2, eps)
+
+    def forward(self, x):
+        return self.pw.forward(self.dw.forward(x))
+
+    def backward(self, dout):
+        return self.dw.backward(self.pw.backward(dout))
+
+
+class BasicBlock2d:
+    """ResNet BasicBlock：`conv3x3 -> BN -> ReLU -> conv3x3 -> BN -> (+x) -> ReLU`
+
+    只支持 stride=1 的恒等捷径（通道与尺寸不变）——stride>1 时需要 1x1 投影，
+    那个留给 Bottleneck。BN 的 gamma/beta 梯度收在 `self.bn_grads` 里。
+    """
+
+    def __init__(self, channels, kernel_size=3, use_bn=True):
+        for n, v in (("channels", channels), ("kernel_size", kernel_size)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"BasicBlock2d: {n} 必须是正整数，收到 {v!r}")
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.use_bn = bool(use_bn)
+        pad = kernel_size // 2
+        self.conv1 = Conv2d(channels, channels, kernel_size, stride=1, padding=pad)
+        self.conv2 = Conv2d(channels, channels, kernel_size, stride=1, padding=pad)
+        self.bn1 = BatchNorm2d(channels) if self.use_bn else None
+        self.bn2 = BatchNorm2d(channels) if self.use_bn else None
+        self.training = True
+        self.bn_grads = {"bn1_gamma": [0.0] * channels, "bn1_beta": [0.0] * channels,
+                         "bn2_gamma": [0.0] * channels, "bn2_beta": [0.0] * channels}
+        self._cache = None
+
+    def zero_grad(self):
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        for k in self.bn_grads:
+            self.bn_grads[k] = [0.0] * self.channels
+
+    def param_count(self):
+        total = _conv_param_count(self.conv1) + _conv_param_count(self.conv2)
+        if self.use_bn:
+            total += 4 * self.channels
+        return total
+
+    def train(self):
+        self.training = True
+        if self.bn1 is not None:
+            self.bn1.train()
+            self.bn2.train()
+
+    def eval(self):
+        self.training = False
+        if self.bn1 is not None:
+            self.bn1.eval()
+            self.bn2.eval()
+
+    def sgd_step(self, lr):
+        _conv_sgd(self.conv1, lr)
+        _conv_sgd(self.conv2, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        _conv_adam(self.conv1, lr, beta1, beta2, eps)
+        _conv_adam(self.conv2, lr, beta1, beta2, eps)
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("BasicBlock2d: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.channels:
+            raise ValueError(f"BasicBlock2d: 输入通道数 {C} 与 channels={self.channels} 不符")
+        h1 = self.conv1.forward(x)
+        a1 = self.bn1.forward(h1) if self.use_bn else h1
+        r1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a1]
+        h2 = self.conv2.forward(r1)
+        a2 = self.bn2.forward(h2) if self.use_bn else h2
+        pre = [[[a2[c][h][w] + x[c][h][w] for w in range(W)] for h in range(H)] for c in range(C)]
+        out = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in pre]
+        self._cache = (x, a1, r1, pre)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("BasicBlock2d.backward: 必须先调用 forward")
+        x, a1, r1, pre = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if len(dout) != C or len(dout[0]) != H or len(dout[0][0]) != W:
+            raise ValueError(
+                f"BasicBlock2d.backward: dout 形状 {(len(dout), len(dout[0]), len(dout[0][0]))} "
+                f"与输入 {(C, H, W)} 不符")
+        dpre = [[[dout[c][h][w] if pre[c][h][w] > 0.0 else 0.0 for w in range(W)]
+                 for h in range(H)] for c in range(C)]
+        if self.use_bn:
+            da2, g2, b2 = self.bn2.backward(dpre)
+            for c in range(C):
+                self.bn_grads["bn2_gamma"][c] += g2[c]
+                self.bn_grads["bn2_beta"][c] += b2[c]
+        else:
+            da2 = dpre
+        dh2 = self.conv2.backward(da2)
+        dr1 = [[[dh2[c][h][w] if a1[c][h][w] > 0.0 else 0.0 for w in range(W)]
+                for h in range(H)] for c in range(C)]
+        if self.use_bn:
+            da1, g1, b1 = self.bn1.backward(dr1)
+            for c in range(C):
+                self.bn_grads["bn1_gamma"][c] += g1[c]
+                self.bn_grads["bn1_beta"][c] += b1[c]
+        else:
+            da1 = dr1
+        dh1 = self.conv1.backward(da1)
+        return [[[dh1[c][h][w] + dpre[c][h][w] for w in range(W)] for h in range(H)]
+                for c in range(C)]
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
@@ -2020,10 +2335,16 @@ class BatchNorm2d:
             grad_gamma[c] = sum(d * a for d, a in zip(d_flat, xh))
             grad_beta[c] = sum(d_flat)
             dxh = [d * g for d in d_flat]
-            sum_dxh = sum(dxh)
-            sum_dxh_xh = sum(r * a for r, a in zip(dxh, xh))
-            d_flat_out = [inv * (m_size * r - sum_dxh - a * sum_dxh_xh) / m_size
-                          for r, a in zip(dxh, xh)]
+            if self._cache_mode == 'eval':
+                # 推理模式的 mean/var 来自 running 统计量，与当前样本无关，
+                # 反向就是逐元素的 inv*gamma（没有 m_size 那几项）——
+                # 与 BatchNorm1d 的 eval 分支一致
+                d_flat_out = [inv * d for d in dxh]
+            else:
+                sum_dxh = sum(dxh)
+                sum_dxh_xh = sum(r * a for r, a in zip(dxh, xh))
+                d_flat_out = [inv * (m_size * r - sum_dxh - a * sum_dxh_xh) / m_size
+                              for r, a in zip(dxh, xh)]
             dx.append([[d_flat_out[hh * w + ww] for ww in range(w)] for hh in range(h)])
         return dx, grad_gamma, grad_beta
 
