@@ -18862,3 +18862,163 @@ class TestNoiseCurriculumEnsemble:
             AI.manifold_mixup([[1.0]], [2.0], 0.5)
         with pytest.raises(TypeError):
             AI.SnapshotCallback("3")
+
+
+# ============================================================================
+#  W10-E：半监督（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+# ============================================================================
+
+class TestSemiSupervised:
+    """半监督相关工具：纯函数 + 批级接口。"""
+
+    @staticmethod
+    def _net(sizes=(3, 4, 2), seed=7):
+        random.seed(seed)
+        return AI.MLP(list(sizes), activations=["relu"] * (len(sizes) - 2) + ["linear"])
+
+    def test_softmax_rows(self):
+        rows = [[0.5, -0.2, 0.1], [1.0, 0.0, -1.0]]
+        probs = AI.softmax_rows(rows)
+        for r in probs:
+            assert abs(sum(r) - 1.0) < 1e-12
+        assert probs[0] == AI._softmax_row(list(rows[0]))
+        assert rows[0] != probs[0]
+        for bad in ([], [[]], [[1.0], []]):
+            with pytest.raises(ValueError):
+                AI.softmax_rows(bad)
+
+    def test_consistency_loss(self):
+        la = [[0.5, -0.2, 0.1], [1.0, 0.0, -1.0]]
+        lb = [[0.1, 0.3, -0.4], [0.2, 0.2, 0.2]]
+        assert AI.consistency_loss(la, la, "mse") == 0.0
+        assert AI.consistency_loss(la, la, "kl") == 0.0
+        assert abs(AI.consistency_loss(la, lb, "mse")
+                   - AI.consistency_loss(lb, la, "mse")) < 1e-15
+        pa, pb = AI.softmax_rows(la), AI.softmax_rows(lb)
+        manual = sum((a - b) ** 2 for ra, rb in zip(pa, pb) for a, b in zip(ra, rb)) / 6.0
+        assert abs(AI.consistency_loss(la, lb, "mse") - manual) < 1e-15
+        with pytest.raises(ValueError):
+            AI.consistency_loss(la, lb, "cos")
+
+    def test_consistency_regularizer(self):
+        net = self._net()
+        xs = [[0.3, -0.4, 0.8], [0.1, 0.2, -0.3]]
+        aug = lambda x: [v * 0.5 for v in x]  # noqa: E731
+
+        def loss_fn():
+            za = [net.forward(list(x)) for x in xs]
+            zb = [net.forward(aug(list(x))) for x in xs]
+            return AI.consistency_loss(za, zb, "mse")
+
+        val, grads = AI.consistency_regularizer(net, xs, kind="mse", aug=aug)
+        assert abs(val - loss_fn()) < 1e-12
+        layer = net.layers[0]
+        old = layer.weights[0][0]
+        layer.weights[0][0] = old + 1e-6
+        up = loss_fn()
+        layer.weights[0][0] = old - 1e-6
+        dn = loss_fn()
+        layer.weights[0][0] = old
+        num = (up - dn) / 2e-6
+        assert abs(grads[0][0][0][0] - num) < 1e-6
+        v0, _ = AI.consistency_regularizer(net, xs, kind="mse", sigma=0.0)
+        assert v0 == 0.0
+
+    def test_vat(self):
+        net = self._net()
+        xs = [[0.3, -0.4, 0.8], [0.1, 0.2, -0.3]]
+        adv = AI.vat_perturbation(net, xs, eps=0.5, seed=3)
+        for x, a in zip(xs, adv):
+            n = sum((p - q) ** 2 for p, q in zip(a, x)) ** 0.5
+            assert abs(n - 0.5) < 1e-9
+        assert AI.vat_perturbation(net, xs, eps=0.0, seed=1) == [list(x) for x in xs]
+        val, grads = AI.vat_regularizer(net, xs, eps=0.5, seed=3)
+        assert val > 0.0
+        assert len(grads) == len(net.layers)
+
+    def test_pseudo_labels(self):
+        probs = [[0.9, 0.05, 0.05], [0.4, 0.35, 0.25]]
+        assert AI.pseudo_label_targets(probs, 0.5) == ([0, 0], [1.0, 0.0])
+        assert AI.pseudo_label_targets(probs, 0.0) == ([0, 0], [1.0, 1.0])
+        assert AI.fixmatch_targets(probs, 0.95) == ([0, 0], [0.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.pseudo_label_targets([], 0.5)
+        with pytest.raises(ValueError):
+            AI.pseudo_label_targets(probs, 1.5)
+
+    def test_soft_target_ce(self):
+        lg = [0.2, -0.1, 0.5]
+        one = AI.soft_target_ce([lg], [[0.0, 0.0, 1.0]])[0]
+        ce = AI.cross_entropy_loss(AI._softmax_row(list(lg)), [0.0, 0.0, 1.0])[0]
+        assert abs(one - ce) < 1e-12
+        loss, dlg = AI.soft_target_ce([lg], [[0.0, 0.0, 1.0]])
+        h = 1e-6
+        num = (AI.soft_target_ce([[0.2 + h, -0.1, 0.5]], [[0.0, 0.0, 1.0]])[0]
+               - AI.soft_target_ce([[0.2 - h, -0.1, 0.5]], [[0.0, 0.0, 1.0]])[0]) / (2 * h)
+        assert abs(dlg[0][0] - num) < 1e-6
+        z_loss, z_grad = AI.soft_target_ce([lg], [[0.0, 0.0, 1.0]], weights=[0.0])
+        assert z_loss == 0.0 and z_grad[0] == [0.0, 0.0, 0.0]
+
+    def test_fixmatch_regularizer(self):
+        net = self._net()
+        xs_w = [[0.3, -0.4, 0.8], [0.1, 0.2, -0.3], [0.9, 0.9, 0.9]]
+        xs_s = [[v * 0.9 for v in x] for x in xs_w]
+        val, grads = AI.fixmatch_regularizer(net, xs_w, xs_s, confidence=0.0)
+        assert val > 0.0
+        assert len(grads) == len(net.layers)
+        val0, _ = AI.fixmatch_regularizer(net, xs_w, xs_s, confidence=1.0)
+        assert val0 == 0.0
+
+    def test_mixmatch_targets(self):
+        assert AI.mixmatch_targets([[[0.5, 0.5]]], temperature=1.0) == [[0.5, 0.5]]
+        sharp = AI.mixmatch_targets([[[0.6, 0.4]]], temperature=0.5)
+        assert sharp[0][0] > 0.6 and abs(sum(sharp[0]) - 1.0) < 1e-12
+        avg = AI.mixmatch_targets([[[1.0, 0.0], [0.0, 1.0]],
+                                   [[0.0, 1.0], [1.0, 0.0]]], 1.0)
+        assert avg == [[0.5, 0.5], [0.5, 0.5]]
+        with pytest.raises(ValueError):
+            AI.mixmatch_targets([[[0.5, 0.5]]], temperature=0.0)
+        with pytest.raises(ValueError):
+            AI.mixmatch_targets([[[0.5, 0.5]], [[0.5, 0.5], [0.5, 0.5]]])
+
+    def test_mean_teacher(self):
+        net = self._net(seed=11)
+        x = [0.2, -0.1, 0.4]
+        mt = AI.MeanTeacher(net, decay=0.999)
+        base = list(net.forward(list(x)))
+        assert mt.forward(list(x)) == base
+        for row in net.layers[0].weights:
+            for k in range(len(row)):
+                row[k] += 0.5
+        changed = list(net.forward(list(x)))
+        mt.update(decay=0.0)
+        assert mt.forward(list(x)) == changed
+        # 教师前向不能污染学生权重
+        after_teacher = list(net.forward(list(x)))
+        for row in net.layers[0].weights:
+            for k in range(len(row)):
+                row[k] += 1.0
+        mt.update(decay=0.5)
+        val, grads = AI.mean_teacher_regularizer(net, mt, [x], kind="mse")
+        assert val > 0.0
+        assert len(grads) == len(net.layers)
+        assert list(net.forward(list(x))) != after_teacher
+
+    def test_validation(self):
+        net = self._net()
+        bad_calls = [
+            (lambda: AI.consistency_regularizer(net, [], kind="mse"), ValueError),
+            (lambda: AI.consistency_regularizer(net, [[0.1]], kind="cos"), ValueError),
+            (lambda: AI.consistency_regularizer(net, [[0.1]], sigma=-1.0), ValueError),
+            (lambda: AI.consistency_regularizer(net, [[0.1]], aug="no"), TypeError),
+            (lambda: AI.vat_perturbation(net, [], eps=0.5), ValueError),
+            (lambda: AI.vat_perturbation(net, [[0.1]], eps=-0.5), ValueError),
+            (lambda: AI.vat_perturbation(net, [[0.1]], eps=0.5, xi=0.0), ValueError),
+            (lambda: AI.vat_perturbation(net, [[0.1]], eps=0.5, power=0), ValueError),
+            (lambda: AI.fixmatch_regularizer(net, [[0.1]], []), ValueError),
+            (lambda: AI.soft_target_ce([[1.0]], [[1.0]], weights=[-1.0]), ValueError),
+            (lambda: AI.MeanTeacher(net, decay=1.0), ValueError),
+        ]
+        for fn, exc in bad_calls:
+            with pytest.raises(exc):
+                fn()

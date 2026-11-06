@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1163 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1173 项）
 
 ## 特性
 
@@ -245,6 +245,35 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 诚实边界：TRADES 的攻击目标应当是最大化 KL，而 `pgd_examples` 用的是任务损失
 （PGD-AT 的写法），两者不等价；SMART 只实现输出项；FreeLB 只做扰动累积。
+
+### 半监督与一致性正则（W10-E）
+
+| 函数 / 类 | 说明 |
+|---|---|
+| `softmax_rows(logits)` | 逐行 softmax（返回新列表、不改入参） |
+| `consistency_loss(logits_a, logits_b, kind='mse'\|'kl')` | 两分支的一致性损失（纯函数）：`mse` 按元素、`kl` 按行 |
+| `consistency_regularizer(model, xs, kind='mse', sigma=0.05, seed=None, aug=None)` | 同一样本两个视图（默认加 `N(0, sigma²)` 噪声）的一致性正则，返回 `(loss, grads)` |
+| `vat_perturbation(model, xs, eps=2.0, xi=1e-6, power=1, seed=None)` | VAT 的对抗扰动：随机方向 + `power` 次幂迭代，长度归一到 `eps`（L2） |
+| `vat_regularizer(model, xs, eps=2.0, xi=1e-6, power=1, seed=None)` | VAT 正则：`mean KL(p(x) \|\| p(x+r_adv))`，返回 `(loss, grads)` |
+| `pseudo_label_targets(probs, confidence=0.0)` / `fixmatch_targets(...)` | 取 argmax 当硬标签，置信度不足的样本权重记 0 |
+| `fixmatch_regularizer(model, xs_weak, xs_strong, confidence=0.95)` | FixMatch：弱增强出伪标签、强增强学习，返回 `(loss, grads)` |
+| `soft_target_ce(logits, soft_targets, weights=None)` | 软标签交叉熵及对 logits 的梯度（`(loss, dlogits)`），可做 MixMatch 的混合目标 |
+| `mixmatch_targets(probs_list, temperature=0.5)` | 多次增强的概率取平均后按 `T` 锐化 |
+| `MeanTeacher(model, decay=0.999)` | 教师权重的 EMA；`update(student=None, decay=None)`、`forward(x)`、`logits(xs)` |
+| `mean_teacher_regularizer(student, teacher, xs, kind='mse')` | 学生向教师看齐的一致性损失，返回 `(loss, grads)` |
+
+`grads` 与 `_mlp_backward` 同形（每层 `(grad_w, grad_b)`，无参层是 `None`），可以直接
+`optimizer.step(grads)`，也可以与监督梯度逐项相加后一起更新。典型用法：
+
+```python
+loss, grads = model._loss(pred, y)                 # 监督分支由 fit 内部完成
+unsup_loss, unsup_grads = AI.vat_regularizer(model, xs_unlabeled, eps=2.0)
+for (gw, gb), (uw, ub) in zip(grads, unsup_grads):  # 手动累加时注意形状
+    ...
+```
+
+这些是**批级**接口（签名里要模型），不能直接传给 `Model(loss_fn=)`；`fit` 目前没有
+半监督开关，需要自己在训练循环里把两份梯度加起来（与 `ohem_loss` 同类限制）。
 
 ### 训练正则与集成（W10-D）
 
@@ -1203,7 +1232,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1163 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1173 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1362,6 +1391,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStructuredRegularization` | DropBlock2d 的丢弃比例与连块性、缩放保期望、反向用掩码；DropConnect 的 `eval()` 逐位退化、`grad_w` 掩码与 `next_delta` 有限差分、能进 `MLP` 训练 |
 | `TestAdversarialTraining` | FGSM 闭式解、L∞ 球与取值裁剪、单步 PGD = FGSM、对抗样本抬高损失、TRADES/MART 的手算 KL、`adv_eps=0` 逐位不变、对抗训练能降 loss、4 类非法超参 |
 | `TestNoiseCurriculumEnsemble` | 权重/梯度/输入噪声的零均值零方差与可复现、`curriculum_fraction` 三种 schedule、采样器「只取最简比例」且同种子可复现、manifold mixup 端点与中点、快照集成的单快照=普通前向与无副作用、13 类非法参数 |
+| `TestSemiSupervised` | `softmax_rows` 与手算 softmax 一致、一致性损失的自身为 0/对称性/手算核对、`consistency_regularizer` 梯度对有限差分、VAT 扰动 L2 范数 = eps 与 `eps=0` 恒等、伪标签置信度过滤、`soft_target_ce` 与 CE 一致 + 梯度差分 + 零权重、FixMatch 置信度阈值 1.0 时损失 0、MixMatch 平均与锐化、MeanTeacher 的 EMA 与「教师前向不污染学生权重」、11 类非法参数 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1415,7 +1445,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1163 个单元测试
+├── test_ai.py       # 1173 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -26577,6 +26577,549 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
 
 
 # ============================================================================
+#  W10-E：半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+# ============================================================================
+
+def softmax_rows(logits):
+    """把若干行 logits 转成概率（逐行 softmax，返回新列表、不改入参）"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("softmax_rows: logits 必须是非空的行列表")
+    out = []
+    for row in logits:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("softmax_rows: 每一行都必须是非空序列")
+        out.append(_softmax_row(list(row)))
+    return out
+
+
+def _semi_check_confidence(confidence, who):
+    """校验置信度阈值"""
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) \
+            or confidence != confidence or not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"{who}: confidence 必须是 [0, 1] 内的实数，收到 {confidence!r}")
+
+
+def _semi_check_temperature(temperature, who):
+    """校验锐化温度"""
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or temperature != temperature or temperature <= 0.0 \
+            or temperature == float("inf"):
+        raise ValueError(f"{who}: temperature 必须是正的有限实数，收到 {temperature!r}")
+
+
+def _semi_argmax(row):
+    """返回 (最大值下标, 最大值)"""
+    best = 0
+    for i in range(1, len(row)):
+        if row[i] > row[best]:
+            best = i
+    return best, row[best]
+
+
+def _semi_norm(v):
+    return math.sqrt(sum(x * x for x in v))
+
+
+def _semi_copy(x):
+    """内部工具：嵌套 list 深拷贝（权重是二维、偏置是一维）"""
+    if isinstance(x, list):
+        return [_semi_copy(v) for v in x]
+    return x
+
+
+def _semi_backward(model, pairs):
+    """内部工具：逐个 ``(x, dlogits)`` 前向 + 反向并累加每层梯度
+
+    返回与 ``layers`` 等长的列表，每项 ``(grad_w, grad_b)``，无参数层为
+    ``(None, None)`` —— 与 ``_mlp_backward`` 同形，可直接喂给 ``optimizer.step``。
+    """
+    net = getattr(model, "model", model)
+    acc = [(None, None) for _ in net.layers]
+    for x, dlogits in pairs:
+        net.forward(list(x))
+        delta = list(dlogits)
+        for i in range(len(net.layers) - 1, -1, -1):
+            gw, gb, delta = net.layers[i].backward(delta)
+            if gw is None and gb is None:
+                continue
+            aw, ab = acc[i]
+            if gw is not None:
+                if aw is None:
+                    aw = [[0.0] * len(r) for r in gw]
+                for j, row in enumerate(gw):
+                    for k, v in enumerate(row):
+                        aw[j][k] += v
+            if gb is not None:
+                if ab is None:
+                    ab = [0.0] * len(gb)
+                for j, v in enumerate(gb):
+                    ab[j] += v
+            acc[i] = (aw, ab)
+    return acc
+
+
+def _semi_mse_parts(pa, pb):
+    """MSE 一致性：返回 (loss, dpa, dpb) —— 对**概率**的梯度"""
+    rows = len(pa)
+    cols = len(pa[0])
+    n = float(rows * cols)
+    lp = 0.0
+    dpa = []
+    dpb = []
+    for ra, rb in zip(pa, pb):
+        da = []
+        db = []
+        for a, b in zip(ra, rb):
+            d = a - b
+            lp += d * d
+            da.append(2.0 * d / n)
+            db.append(-2.0 * d / n)
+        dpa.append(da)
+        dpb.append(db)
+    return lp / n, dpa, dpb
+
+
+def _semi_kl_parts(la, lb):
+    """KL(pa || pb)：返回 (loss, dla, dlb) —— 对 **logits** 的梯度（闭式）"""
+    rows = len(la)
+    loss = 0.0
+    dla = []
+    dlb = []
+    for ra, rb in zip(la, lb):
+        lp = _log_softmax_row(list(ra))
+        lq = _log_softmax_row(list(rb))
+        kl = 0.0
+        for a, b in zip(lp, lq):
+            kl += math.exp(a) * (a - b)
+        loss += kl
+        da = []
+        db = []
+        for a, b in zip(lp, lq):
+            p = math.exp(a)
+            da.append(p * (a - b - kl) / rows)
+            db.append((math.exp(b) - p) / rows)
+        dla.append(da)
+        dlb.append(db)
+    return loss / rows, dla, dlb
+
+
+def _semi_dlogits(la, lb, kind):
+    """两个分支的一致性损失与其对各自 logits 的梯度"""
+    if kind == "kl":
+        return _semi_kl_parts(la, lb)
+    pa = [_softmax_row(list(r)) for r in la]
+    pb = [_softmax_row(list(r)) for r in lb]
+    loss, dpa, dpb = _semi_mse_parts(pa, pb)
+    dla = []
+    dlb = []
+    for r, pa_r, dpa_r in zip(la, pa, dpa):
+        s = sum(a * b for a, b in zip(pa_r, dpa_r))
+        dla.append([pa_i * (d_i - s) for pa_i, d_i in zip(pa_r, dpa_r)])
+    for r, pb_r, dpb_r in zip(lb, pb, dpb):
+        s = sum(a * b for a, b in zip(pb_r, dpb_r))
+        dlb.append([pb_i * (d_i - s) for pb_i, d_i in zip(pb_r, dpb_r)])
+    return loss, dla, dlb
+
+
+def consistency_loss(logits_a, logits_b, kind="mse"):
+    """两个分支的**一致性损失**（纯函数，返回标量）
+
+    ``kind='mse'``：``mean((softmax(a) - softmax(b))²)``，逐元素、按元素总个数取均值；
+    ``kind='kl'``：``mean_rows(KL(softmax(a) || softmax(b)))``，逐行 KL 再按行取均值。
+    同一组 logits 传给两边时损失恒为 0。
+    """
+    if kind not in ("mse", "kl"):
+        raise ValueError(f"consistency_loss: kind 只能是 'mse' 或 'kl'，收到 {kind!r}")
+    if not logits_a or not logits_b:
+        raise ValueError("consistency_loss: logits 不能为空")
+    if len(logits_a) != len(logits_b):
+        raise ValueError(
+            f"consistency_loss: 两组 logits 行数不一致（{len(logits_a)} vs {len(logits_b)}）"
+        )
+    for ra, rb in zip(logits_a, logits_b):
+        if len(ra) != len(rb):
+            raise ValueError(
+                f"consistency_loss: 同一行长度不一致（{len(ra)} vs {len(rb)}）"
+            )
+    loss, _, _ = _semi_dlogits([list(r) for r in logits_a],
+                               [list(r) for r in logits_b], kind)
+    return loss
+
+
+def consistency_regularizer(model, xs, kind="mse", sigma=0.05, seed=None, aug=None):
+    """一致性正则：同一样本的两个视图预测应当一致，返回 ``(loss, grads)``
+
+    视图二默认是「输入加 ``N(0, sigma²)`` 噪声」，也可以传 ``aug(x) -> x'`` 自己
+    定义（如翻转、缩放）。``grads`` 与 ``_mlp_backward`` 同形，可以直接
+    ``optimizer.step(grads)``，或与监督梯度逐项相加后再更新。
+
+    这是**批级**接口（签名要模型），不能直接传给 ``Model(loss_fn=)``。
+    """
+    if kind not in ("mse", "kl"):
+        raise ValueError(f"consistency_regularizer: kind 只能是 'mse' 或 'kl'，收到 {kind!r}")
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)) \
+            or sigma != sigma or sigma < 0.0 or sigma == float("inf"):
+        raise ValueError(f"consistency_regularizer: sigma 必须是非负有限实数，收到 {sigma!r}")
+    if aug is not None and not callable(aug):
+        raise TypeError("consistency_regularizer: aug 必须可调用或 None")
+    if not xs:
+        raise ValueError("consistency_regularizer: xs 不能为空")
+    net = getattr(model, "model", model)
+    rng = random.Random(seed) if seed is not None else random
+    xs_b = []
+    for x in xs:
+        xb = list(aug(list(x))) if aug is not None else \
+            [v + rng.gauss(0.0, sigma) for v in x]
+        if len(xb) != len(x):
+            raise ValueError(
+                f"consistency_regularizer: aug 改变了样本长度（{len(x)} -> {len(xb)}）"
+            )
+        xs_b.append(xb)
+    za = [net.forward(list(x)) for x in xs]
+    zb = [net.forward(xb) for xb in xs_b]
+    loss, dla, dlb = _semi_dlogits(za, zb, kind)
+    n = float(len(xs))
+    pairs = [(x, [v / n for v in d]) for x, d in zip(xs, dla)]
+    pairs += [(xb, [v / n for v in d]) for xb, d in zip(xs_b, dlb)]
+    return loss, _semi_backward(model, pairs)
+
+
+def _vat_r_adv(model, x, eps, xi, power, rng):
+    """内部工具：单样本的 VAT 对抗扰动（power 次幂迭代）"""
+    net = getattr(model, "model", model)
+    p = _softmax_row(list(net.forward(list(x))))
+    r = [rng.gauss(0.0, 1.0) for _ in x]
+    n = _semi_norm(r)
+    if n <= 0.0:
+        return [0.0] * len(x)
+    r = [xi * v / n for v in r]
+    for _ in range(power):
+        q = _softmax_row(list(net.forward([a + b for a, b in zip(x, r)])))
+        g = _adv_input_grad(model, [qi - pi for pi, qi in zip(p, q)])
+        gn = _semi_norm(g)
+        if gn <= 0.0:
+            return [0.0] * len(x)
+        r = [eps * v / gn for v in g]
+    return r
+
+
+def vat_perturbation(model, xs, eps=2.0, xi=1e-6, power=1, seed=None):
+    """VAT 的对抗扰动：返回 ``x + r_adv`` 的列表（``eps=0`` 时原样返回）
+
+    ``r_adv`` 的求法：先在半径 ``xi`` 上取随机方向，再用 ``power`` 次幂迭代把它
+    转到「使 KL(p(x) || p(x+r)) 最大」的方向，长度归一到 ``eps``（L2）。
+    """
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) \
+            or eps != eps or eps < 0.0 or eps == float("inf"):
+        raise ValueError(f"vat_perturbation: eps 必须是非负有限实数，收到 {eps!r}")
+    if isinstance(xi, bool) or not isinstance(xi, (int, float)) \
+            or xi != xi or xi <= 0.0 or xi == float("inf"):
+        raise ValueError(f"vat_perturbation: xi 必须是正的有限实数，收到 {xi!r}")
+    if isinstance(power, bool) or not isinstance(power, int) or power < 1:
+        raise ValueError(f"vat_perturbation: power 必须是 >=1 的整数，收到 {power!r}")
+    if not xs:
+        raise ValueError("vat_perturbation: xs 不能为空")
+    if eps == 0.0:
+        return [list(x) for x in xs]
+    rng = random.Random(seed) if seed is not None else random
+    out = []
+    for x in xs:
+        r = _vat_r_adv(model, list(x), eps, xi, power, rng)
+        out.append([a + b for a, b in zip(x, r)])
+    return out
+
+
+def vat_regularizer(model, xs, eps=2.0, xi=1e-6, power=1, seed=None):
+    """VAT（虚拟对抗训练）正则项，返回 ``(loss, grads)``
+
+    ``loss = mean_rows(KL(p(x) || p(x + r_adv)))``；参数梯度按「干净分支」与
+    「对抗分支」分别反传后累加（两个分支的闭式梯度都已用有限差分核对）。
+
+    注意：每算一个样本要 4~5 次前向（求扰动 + 两个分支），比普通损失贵。
+    """
+    if not xs:
+        raise ValueError("vat_regularizer: xs 不能为空")
+    adv = vat_perturbation(model, xs, eps=eps, xi=xi, power=power, seed=seed)
+    net = getattr(model, "model", model)
+    pairs = []
+    total = 0.0
+    n = float(len(xs))
+    for x, xa in zip(xs, adv):
+        la = net.forward(list(x))
+        lb = net.forward(list(xa))
+        kl, dla, dlb = _semi_kl_parts([la], [lb])
+        total += kl
+        pairs.append((list(x), [v / n for v in dla[0]]))
+        pairs.append((list(xa), [v / n for v in dlb[0]]))
+    return total / n, _semi_backward(model, pairs)
+
+
+def pseudo_label_targets(probs, confidence=0.0):
+    """伪标签：取每行 argmax 作为硬标签，置信度低于阈值的位置权重记 0
+
+    返回 ``(labels, weights)``；``weights`` 可直接当样本权重用于后面的
+    ``soft_target_ce`` / ``fixmatch_regularizer``。
+    """
+    _semi_check_confidence(confidence, "pseudo_label_targets")
+    if not probs:
+        raise ValueError("pseudo_label_targets: probs 不能为空")
+    labels = []
+    weights = []
+    for row in probs:
+        if not row:
+            raise ValueError("pseudo_label_targets: 每一行都必须非空")
+        idx, best = _semi_argmax(list(row))
+        labels.append(idx)
+        weights.append(1.0 if best >= confidence else 0.0)
+    return labels, weights
+
+
+def fixmatch_targets(probs_weak, confidence=0.95):
+    """FixMatch 的伪标签（与 ``pseudo_label_targets`` 同义，语义更明确）"""
+    _semi_check_confidence(confidence, "fixmatch_targets")
+    return pseudo_label_targets(probs_weak, confidence=confidence)
+
+
+def _semi_onehot(label, n):
+    out = [0.0] * n
+    out[label] = 1.0
+    return out
+
+
+def soft_target_ce(logits, soft_targets, weights=None):
+    """软标签交叉熵及其对 logits 的梯度（纯函数，返回 ``(loss, dlogits)``）
+
+    ``loss = -Σ_i w_i Σ_c t_ic log p_ic / Σ_i w_i``；``weights=None`` 时等权。
+    给定 ``weights`` 全 0 时返回 ``(0.0, 全零梯度)`` 而不是报错。
+    """
+    if not logits or not soft_targets:
+        raise ValueError("soft_target_ce: logits 与 soft_targets 不能为空")
+    if len(logits) != len(soft_targets):
+        raise ValueError(
+            f"soft_target_ce: 行数不一致（{len(logits)} vs {len(soft_targets)}）"
+        )
+    if weights is not None and len(weights) != len(logits):
+        raise ValueError(
+            f"soft_target_ce: weights 长度 {len(weights)} 与行数 {len(logits)} 不一致"
+        )
+    w = list(weights) if weights is not None else [1.0] * len(logits)
+    wsum = 0.0
+    for v in w:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0.0:
+            raise ValueError(f"soft_target_ce: 权重必须是非负实数，收到 {v!r}")
+        wsum += v
+    rows = len(logits)
+    loss = 0.0
+    dlogits = []
+    if wsum <= 0.0:
+        for la in logits:
+            dlogits.append([0.0] * len(la))
+        return 0.0, dlogits
+    for la, ta, wi in zip(logits, soft_targets, w):
+        if len(la) != len(ta):
+            raise ValueError(
+                f"soft_target_ce: 同一行长度不一致（{len(la)} vs {len(ta)}）"
+            )
+        lp = _log_softmax_row(list(la))
+        p = [math.exp(v) for v in lp]
+        row_loss = 0.0
+        for t, v in zip(ta, lp):
+            if t:
+                row_loss -= t * v
+        loss += wi * row_loss
+        dlogits.append([wi * (pi - ti) / wsum for pi, ti in zip(p, ta)])
+    return loss / wsum, dlogits
+
+
+def fixmatch_regularizer(model, xs_weak, xs_strong, confidence=0.95):
+    """FixMatch：弱增强分支出伪标签，强增强分支学习它，返回 ``(loss, grads)``
+
+    ``xs_strong`` 由调用方用强增强（如大幅平移/旋转）生成；置信度不足的样本
+    权重为 0（不计入 loss 也不贡献梯度）。``xs_weak`` 用当前模型前向取标签，
+    因此调用前模型应处于 ``eval()``（否则 Dropout/BatchNorm 会污染伪标签）。
+    """
+    _semi_check_confidence(confidence, "fixmatch_regularizer")
+    if not xs_weak or not xs_strong:
+        raise ValueError("fixmatch_regularizer: xs_weak / xs_strong 不能为空")
+    if len(xs_weak) != len(xs_strong):
+        raise ValueError(
+            f"fixmatch_regularizer: 两个分支样本数不一致"
+            f"（{len(xs_weak)} vs {len(xs_strong)}）"
+        )
+    net = getattr(model, "model", model)
+    probs = [_softmax_row(list(net.forward(list(x)))) for x in xs_weak]
+    labels, weights = fixmatch_targets(probs, confidence=confidence)
+    logits_strong = [net.forward(list(x)) for x in xs_strong]
+    targets = [_semi_onehot(lb, len(lg)) for lb, lg in zip(labels, logits_strong)]
+    loss, dlogits = soft_target_ce(logits_strong, targets, weights=weights)
+    return loss, _semi_backward(model, list(zip(xs_strong, dlogits)))
+
+
+def mixmatch_targets(probs_list, temperature=0.5):
+    """MixMatch 的目标分布：多个增强的平均概率按 ``temperature`` 锐化（纯函数）
+
+    ``p̄ = mean_k p_k``，``q_c = p̄_c^(1/T) / Σ p̄^(1/T)``；注意这里直接对
+    **概率**锐化（与 ``_softmax_with_temp`` 对 logits 锐化的写法不同）。
+    """
+    _semi_check_temperature(temperature, "mixmatch_targets")
+    if not isinstance(probs_list, (list, tuple)) or not probs_list:
+        raise ValueError("mixmatch_targets: probs_list 必须是非空的列表")
+    rows = len(probs_list[0]) if isinstance(probs_list[0], (list, tuple)) else 0
+    if rows == 0:
+        raise ValueError("mixmatch_targets: 每条增强结果必须是非空的行列表")
+    cols = len(probs_list[0][0])
+    if cols == 0:
+        raise ValueError("mixmatch_targets: 概率行不能为空")
+    for probs in probs_list:
+        if len(probs) != rows:
+            raise ValueError(
+                f"mixmatch_targets: 各次增强的样本数不一致（{len(probs)} vs {rows}）"
+            )
+        for row in probs:
+            if len(row) != cols:
+                raise ValueError(
+                    f"mixmatch_targets: 同一行类别数不一致（{len(row)} vs {cols}）"
+                )
+    out = []
+    for i in range(rows):
+        avg = [0.0] * cols
+        for probs in probs_list:
+            for c in range(cols):
+                avg[c] += probs[i][c]
+        for c in range(cols):
+            avg[c] /= float(len(probs_list))
+        powered = []
+        for v in avg:
+            if v < 0.0:
+                raise ValueError("mixmatch_targets: 概率不能为负")
+            powered.append(0.0 if v == 0.0 else v ** (1.0 / temperature))
+        s = sum(powered)
+        if s <= 0.0:
+            out.append([1.0 / cols] * cols)
+        else:
+            out.append([v / s for v in powered])
+    return out
+
+
+class MeanTeacher:
+    """Mean Teacher：在**学生**之外维护一份教师权重的指数滑动平均
+
+    ``update(student=None, decay=None)`` 把学生当前权重混进教师
+    （``t = decay * t + (1 - decay) * s``）；``forward(x)`` / ``logits(xs)`` 用
+    教师权重前向。教师前向的做法是「临时换上教师权重 → 前向 → 换回学生权重」，
+    因此调用会覆盖学生的 ``Layer`` 缓存（下一次前向会重建，不影响正确性）；
+    也正因如此，不要在给教师打分与用学生反向之间穿插别的前向。
+    """
+
+    def __init__(self, model, decay=0.999):
+        self._check_decay(decay, "MeanTeacher")
+        net = getattr(model, "model", model)
+        self.model = model
+        self.decay = float(decay)
+        self._state = []
+        for layer in net.layers:
+            if hasattr(layer, "weights"):
+                self._state.append([_semi_copy(layer.weights), list(layer.biases)])
+            else:
+                self._state.append(None)
+
+    @staticmethod
+    def _check_decay(decay, who):
+        if isinstance(decay, bool) or not isinstance(decay, (int, float)) \
+                or decay != decay or not 0.0 <= decay < 1.0:
+            raise ValueError(f"{who}: decay 必须是 [0, 1) 内的实数，收到 {decay!r}")
+
+    def update(self, student=None, decay=None):
+        """把学生的当前权重混进教师（``student`` 省略时用构造时的模型）"""
+        d = self.decay if decay is None else decay
+        self._check_decay(d, "MeanTeacher.update")
+        src = getattr(student if student is not None else self.model, "model",
+                      student if student is not None else self.model)
+        for i, layer in enumerate(src.layers):
+            t = self._state[i]
+            if t is None:
+                continue
+            if not hasattr(layer, "weights"):
+                raise ValueError(
+                    f"MeanTeacher.update: 第 {i} 层在教师里有权重、在学生里没有"
+                )
+            for j, row in enumerate(layer.weights):
+                for k, v in enumerate(row):
+                    t[0][j][k] = d * t[0][j][k] + (1.0 - d) * v
+            for j, v in enumerate(layer.biases):
+                t[1][j] = d * t[1][j] + (1.0 - d) * v
+        return self
+
+    def _swap_in(self, net):
+        saved = []
+        for i, layer in enumerate(net.layers):
+            t = self._state[i]
+            if t is None:
+                saved.append(None)
+                continue
+            saved.append([_semi_copy(layer.weights), list(layer.biases)])
+            for j in range(len(layer.weights)):
+                layer.weights[j][:] = t[0][j]
+            layer.biases[:] = t[1]
+        return saved
+
+    @staticmethod
+    def _swap_out(net, saved):
+        for i, layer in enumerate(net.layers):
+            s = saved[i]
+            if s is None:
+                continue
+            for j in range(len(layer.weights)):
+                layer.weights[j][:] = s[0][j]
+            layer.biases[:] = s[1]
+
+    def forward(self, x):
+        """用教师权重前向一个样本（返回 logits）"""
+        net = getattr(self.model, "model", self.model)
+        saved = self._swap_in(net)
+        try:
+            return net.forward(list(x))
+        finally:
+            self._swap_out(net, saved)
+
+    def logits(self, xs):
+        """用教师权重前向一批样本"""
+        if not xs:
+            raise ValueError("MeanTeacher.logits: xs 不能为空")
+        return [self.forward(x) for x in xs]
+
+
+def mean_teacher_regularizer(student, teacher, xs, kind="mse"):
+    """Mean Teacher 的一致性损失：学生向教师看齐，返回 ``(loss, grads)``
+
+    教师一侧不传梯度（它靠 EMA 更新，不参与反向）。``kind`` 语义同
+    ``consistency_loss``。
+    """
+    if kind not in ("mse", "kl"):
+        raise ValueError(
+            f"mean_teacher_regularizer: kind 只能是 'mse' 或 'kl'，收到 {kind!r}"
+        )
+    if not xs:
+        raise ValueError("mean_teacher_regularizer: xs 不能为空")
+    net = getattr(student, "model", student)
+    lg_t = teacher.logits(xs) if hasattr(teacher, "logits") else list(teacher)
+    lg_s = [net.forward(list(x)) for x in xs]
+    n = float(len(xs))
+    if kind == "kl":
+        loss, dla, _ = _semi_kl_parts(lg_s, lg_t)
+        pairs = [(x, [v / n for v in d]) for x, d in zip(xs, dla)]
+        return loss, _semi_backward(student, pairs)
+    ps = [_softmax_row(list(r)) for r in lg_s]
+    pt = [_softmax_row(list(r)) for r in lg_t]
+    loss, dps, _ = _semi_mse_parts(ps, pt)
+    pairs = []
+    for x, p, dp in zip(xs, ps, dps):
+        s = sum(a * b for a, b in zip(p, dp))
+        pairs.append((x, [p_i * (d_i - s) / n for p_i, d_i in zip(p, dp)]))
+    return loss, _semi_backward(student, pairs)
+
+
+# ============================================================================
 #  W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
 # ============================================================================
 

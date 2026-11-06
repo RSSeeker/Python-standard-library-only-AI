@@ -286,7 +286,13 @@
       - `manifold_mixup(fa, fb, lam)`：嵌套结构校验 + 端点/中点闭式核对；
       - `SnapshotEnsemble` + `SnapshotCallback(every=)`：单快照预测与普通前向逐位相同，`predict` 结束后权重恢复（无副作用）；
       - 探针 `probe_w10d.py` 全绿，`TestNoiseCurriculumEnsemble` 10 例，全库 1163 passed。
-- [ ] 半监督：VAT、伪标签、FixMatch、MixMatch、MeanTeacher、一致性正则
+- [x] 半监督：VAT、伪标签、FixMatch、MixMatch、MeanTeacher、一致性正则
+      - `consistency_loss` / `consistency_regularizer`（`mse` / `kl`）+ `softmax_rows`：两个视图的预测互相靠拢，`sigma` 噪声或自定义 `aug`；
+      - `vat_perturbation` / `vat_regularizer`：随机方向 + `power` 次幂迭代求扰动（`K L(p(x)‖p(x+r_adv))`），两条分支分别反传累加；实测扰动 L2 范数恰为 `eps`，冻结扰动后权重梯度 vs 有限差分 2.808382e-04 / 2.808381e-04；
+      - `pseudo_label_targets` / `fixmatch_targets` / `fixmatch_regularizer`：argmax 硬标签 + 置信度阈值（不足则权重 0，全部丢弃时损失 0、梯度全零）；
+      - `mixmatch_targets`（多次增强平均后按 `T` 锐化）+ `soft_target_ce`（软标签 CE 与梯度）；
+      - `MeanTeacher` + `mean_teacher_regularizer`：教师权重 EMA（`update`）、教师前向用「换入 → 前向 → 换回」实现；**真 bug**：`_swap_in` 原先用 `list(layer.weights)` 保存现场，行对象是同一份引用，换回时学生权重已被教师权重覆盖 —— 改成 `_semi_copy` 深拷贝后修复；
+      - 探针 `probe_w10e.py` 全绿（闭式梯度 vs 有限差分：`mse` 1.0e-11、`kl` 4.6e-11），`TestSemiSupervised` 10 例，全库 1173 passed。
 - [ ] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）
 
 ### W11 数据管道（§7）
