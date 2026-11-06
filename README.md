@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（736 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（746 项）
 
 ## 特性
 
@@ -153,6 +153,10 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `AdaptiveAvgPool2d` | 自适应平均池化：`(C,H,W) → (C,out_h,out_w)`，任意输入尺寸都能固定输出（PyTorch 分箱规则，`(1,1)` 等价于 `GlobalAvgPool2d`） |
 | `Flatten` | 展平（CNN → MLP） |
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
+| `GlobalMaxPool2d` | 全局最大池化：`(C,H,W) → (C,)`，反向只回传给最大值位置 |
+| `AdaptiveMaxPool2d` | 自适应最大池化：`(C,H,W) → (C,out_h,out_w)`，分箱与 `AdaptiveAvgPool2d` 一致（`(1,1)` 与 `GlobalMaxPool2d` 逐位相同） |
+| `LPPool2d` | Lp 池化：`(Σ\|x\|^p / area)^(1/p)`；`p=1` 在非负输入上等于 `AvgPool2d`，`p` 越大越接近 `MaxPool2d` |
+| `SEBlock` | Squeeze-and-Excitation 通道注意力：GAP → 瓶颈 MLP → sigmoid 通道权重乘回输入；自带 `grads`/`sgd_step`/`adam_step`/`param_count` |
 | `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `BatchNorm2d` | 二维批归一化：按通道在 H×W 上归一化，训练更新 running 统计量、`eval()` 用 running；`backward` 返回 `(dx, grad_gamma, grad_beta)` |
@@ -1020,7 +1024,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-736 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+746 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1078,6 +1082,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTopPSampling` | `top_p=1.0` 与旧行为逐位相同、nucleus 只留头部集合、cache 与重算路径一致、非法 `top_p` 报错 |
 | `TestAvgPool2d` | 平均池化前向值、反向均分、`dx` vs 数值梯度、`GlobalAvgPool2d` 形状、非法 kernel/stride |
 | `TestAdaptiveAvgPool2d` | 非整除分箱手算值、`(1,1)` 与 `GlobalAvgPool2d` 逐位相同、整除时与 `AvgPool2d` 一致、`dx` vs 数值梯度、非法 `out_size` |
+| `TestPoolingExtras` | `GlobalMaxPool2d` 取最大与回传位置、`AdaptiveMaxPool2d` 与 `MaxPool2d`/`GlobalMaxPool2d` 逐位一致、反向、`LPPool2d` 的 `p=1` 退化为平均池化与 `p→∞` 逼近最大、梯度差分、7 类非法构造 |
+| `TestSEBlock` | 形状与 `x*s` 缩放、通道权重在 `(0,1)`、`param_count`、`zero_grad`、`dx` 与参数梯度中心差分、通道数/未 `forward` 的报错 |
 | `TestGQA` | KV 头形状、`num_kv_heads` 缺省与显式传等值逐位一致、**共享 KV 下 `W_k`/`W_v` 梯度 vs 数值梯度**、`forward_step` == 整段前向、参数确实变少、非法取值 |
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
@@ -1134,7 +1140,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 736 个单元测试
+├── test_ai.py       # 746 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

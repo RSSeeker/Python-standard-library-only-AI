@@ -123,11 +123,14 @@
 - [ ] `DepthwiseSeparableConv`（= `Conv2d(groups=C)` + 1×1）
 - [ ] `ResNetBasicBlock` / `ResNetBottleneck`（1×1→3×3→1×1 + 残差）
 - [ ] `DenseBlock` / 稠密连接
-- [ ] `SEBlock` / `ECABlock` / `CBAMBlock`（通道 + 空间注意力）
+- [x] `SEBlock`（W2-A 提交：GAP → 瓶颈 MLP → sigmoid 乘回输入，dx 与四组参数梯度中心差分 ≤1e-9）
+- [ ] `ECABlock` / `CBAMBlock`（通道 + 空间注意力）
 - [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
 - [ ] 卷积家族：`Conv3d`、`ConvTranspose1d`、`ConvTranspose3d`
-- [ ] 池化家族：`MaxPool1d/3d`、`AvgPool1d/3d`、`LPPool2d`、`AdaptiveMaxPool2d`、`GlobalMaxPool2d`、
-      `FractionalMaxPool2d`、`StochasticPool2d`
+- [x] 池化家族（部分，W2-A 提交）：`GlobalMaxPool2d`（只回传最大值位置）、`AdaptiveMaxPool2d`（分箱与
+      `AdaptiveAvgPool2d` 一致，`(1,1)` 与全局最大逐位相同）、`LPPool2d`（`p=1` 在非负输入上等于
+      `AvgPool2d`，随 p 增大单调逼近 `MaxPool2d`，梯度差分 ≤1e-9）
+- [ ] 池化家族（剩余）：`MaxPool1d/3d`、`AvgPool1d/3d`、`FractionalMaxPool2d`、`StochasticPool2d`
 - [ ] `AdaIN` / `FiLM` / `ConditionalNorm`
 
 ### W3 归一化·激活·初始化（P1 + §6）

@@ -9139,3 +9139,147 @@ class TestMultiTaskWeighting:
             AI.pcgrad([1.0], [1.0, 2.0])
         with pytest.raises(ValueError):
             AI.pcgrad([1.0], [1.0], eps=0)
+
+
+# ============================================================================
+#  W2-A：池化家族与 SEBlock
+# ============================================================================
+class TestPoolingExtras:
+    def test_global_max_pool(self):
+        x = [[[1.0, 5.0], [3.0, 2.0]], [[-1.0, -4.0], [-2.0, -3.0]]]
+        pool = AI.GlobalMaxPool2d()
+        out = pool.forward(x)
+        assert out == [5.0, -1.0]
+        dx = pool.backward([1.0, -2.0])
+        assert dx[0][0][1] == 1.0
+        assert dx[1][0][0] == -2.0
+        assert sum(abs(v) for ch in dx for row in ch for v in row) == 3.0
+
+    def test_adaptive_max_pool_matches_maxpool(self):
+        x = [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0],
+              [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]]]
+        amp = AI.AdaptiveMaxPool2d(2).forward(x)
+        mp = AI.MaxPool2d(2).forward(x)
+        assert amp == mp
+        one = AI.AdaptiveMaxPool2d((1, 1)).forward(x)
+        assert one[0][0][0] == AI.GlobalMaxPool2d().forward(x)[0]
+
+    def test_adaptive_max_pool_backward(self):
+        x = [[[1.0, 4.0, 2.0, 8.0]]]
+        pool = AI.AdaptiveMaxPool2d((1, 2))
+        out = pool.forward(x)
+        assert out[0][0] == [4.0, 8.0]
+        dx = pool.backward([[[0.5, -1.5]]])
+        assert dx[0][0][1] == 0.5
+        assert dx[0][0][3] == -1.5
+        assert dx[0][0][0] == 0.0 and dx[0][0][2] == 0.0
+
+    def test_lp_pool_special_cases(self):
+        pos = [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0],
+                [1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]]]
+        lp1 = AI.LPPool2d(1, 2).forward(pos)
+        avg = AI.AvgPool2d(2).forward(pos)
+        for c in range(len(lp1)):
+            for h in range(len(lp1[c])):
+                for w in range(len(lp1[c][h])):
+                    assert abs(lp1[c][h][w] - avg[c][h][w]) < 1e-15
+        big = AI.LPPool2d(64, 2).forward(pos)
+        mx = AI.MaxPool2d(2).forward(pos)
+        for c in range(len(big)):
+            for h in range(len(big[c])):
+                for w in range(len(big[c][h])):
+                    assert big[c][h][w] <= mx[c][h][w] + 1e-12
+
+    def test_lp_pool_gradient(self):
+        x = [[[0.5, -1.2, 2.0, 0.3], [-0.7, 1.1, -0.4, 1.8],
+              [1.3, 0.2, -1.5, 0.9], [0.4, -0.6, 1.7, -1.1]]]
+        pool = AI.LPPool2d(2, 2)
+        pool.forward(x)
+        dx = pool.backward([[[0.4, -0.7], [0.2, 0.9]]])
+        eps = 1e-6
+        for h in range(4):
+            for w in range(4):
+                old = x[0][h][w]
+                x[0][h][w] = old + eps
+                vp = sum(pool.forward(x)[0][i][j] * c for i, row in enumerate([[0.4, -0.7], [0.2, 0.9]])
+                         for j, c in enumerate(row))
+                x[0][h][w] = old - eps
+                vm = sum(pool.forward(x)[0][i][j] * c for i, row in enumerate([[0.4, -0.7], [0.2, 0.9]])
+                         for j, c in enumerate(row))
+                x[0][h][w] = old
+                num = (vp - vm) / (2 * eps)
+                assert abs(num - dx[0][h][w]) < 1e-8
+
+    def test_pool_validation(self):
+        for ctor in (lambda: AI.AdaptiveMaxPool2d(0),
+                     lambda: AI.AdaptiveMaxPool2d((2, -1)),
+                     lambda: AI.LPPool2d(0, 2),
+                     lambda: AI.LPPool2d(2, 0),
+                     lambda: AI.LPPool2d(2, 2, stride=-1)):
+            with pytest.raises(ValueError):
+                ctor()
+        with pytest.raises(ValueError):
+            AI.GlobalMaxPool2d().forward([])
+        with pytest.raises(RuntimeError):
+            AI.GlobalMaxPool2d().backward([1.0])
+
+
+class TestSEBlock:
+    def test_forward_shape_and_scale(self):
+        random.seed(1)
+        se = AI.SEBlock(3, reduction=2)
+        x = [[[0.1 * (c + 1) + 0.2 * h + 0.3 * w for w in range(2)] for h in range(2)] for c in range(3)]
+        out = se.forward(x)
+        assert len(out) == 3 and len(out[0]) == 2 and len(out[0][0]) == 2
+        _, s, _, _ = se._cache
+        assert all(0.0 < v < 1.0 for v in s)
+        for c in range(3):
+            assert abs(out[c][1][0] - x[c][1][0] * s[c]) < 1e-12
+
+    def test_param_count_and_zero_grad(self):
+        random.seed(2)
+        se = AI.SEBlock(4, reduction=2)
+        h = se.hidden
+        assert se.param_count() == h * 4 + h + 4 * h + 4
+        x = [[[1.0, 2.0], [3.0, 4.0]] for _ in range(4)]
+        se.forward(x)
+        se.backward([[[1.0, 0.0], [0.0, 0.0]] for _ in range(4)])
+        assert any(abs(v) > 0.0 for row in se.grads["W1"] for v in row)
+        se.zero_grad()
+        assert all(v == 0.0 for row in se.grads["W1"] for v in row)
+        assert se.grads["b2"] == [0.0] * 4
+
+    def test_se_backward_matches_finite_difference(self):
+        random.seed(3)
+        se = AI.SEBlock(2, reduction=1)
+        x = [[[0.3, -0.7], [0.5, 1.1]], [[-0.2, 0.9], [0.4, -1.3]]]
+        dout = [[[1.0, 0.5], [-0.4, 0.2]], [[0.3, -0.8], [0.6, 0.1]]]
+        base = [[row[:] for row in ch] for ch in x]
+
+        def loss(xx):
+            o = se.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w] for c in range(2) for h in range(2) for w in range(2))
+
+        se.zero_grad()
+        se.forward([row[:] for row in base])
+        dx = se.backward(dout)
+        eps = 1e-6
+        for c in range(2):
+            for h in range(2):
+                for w in range(2):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    num = (vp - vm) / (2 * eps)
+                    assert abs(num - dx[c][h][w]) < 1e-8
+
+    def test_se_validation(self):
+        with pytest.raises(ValueError):
+            AI.SEBlock(0)
+        with pytest.raises(ValueError):
+            AI.SEBlock(4).forward([[[1.0]]])
+        with pytest.raises(RuntimeError):
+            AI.SEBlock(2).backward([[[1.0]]])

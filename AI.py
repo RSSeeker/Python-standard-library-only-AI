@@ -1334,6 +1334,289 @@ class AdaptiveAvgPool2d:
         return dx
 
 
+def _w2_channel_means(x):
+    """(C, H, W) -> 每个通道的均值列表"""
+    C, H, W = len(x), len(x[0]), len(x[0][0])
+    area = float(H * W)
+    return [sum(sum(row) for row in x[c]) / area for c in range(C)]
+
+
+def _w2_count(params):
+    """统计 (name, 参数) 序列里的元素个数（支持二维/一维）"""
+    total = 0
+    for _, v in params:
+        if v and isinstance(v[0], list):
+            for row in v:
+                total += len(row)
+        else:
+            total += len(v)
+    return total
+
+
+class GlobalMaxPool2d:
+    """全局最大池化：(C, H, W) -> (C,)，反向只把梯度给最大值那个位置"""
+
+    def __init__(self):
+        self.x_shape = None
+        self._arg = None
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("GlobalMaxPool2d: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        self.x_shape = (C, H, W)
+        out, arg = [], []
+        for c in range(C):
+            best, where = None, (0, 0)
+            for h in range(H):
+                row = x[c][h]
+                for w in range(W):
+                    if best is None or row[w] > best:
+                        best, where = row[w], (h, w)
+            out.append(best)
+            arg.append(where)
+        self._arg = arg
+        return out
+
+    def backward(self, dout):
+        if self.x_shape is None:
+            raise RuntimeError("GlobalMaxPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            h, w = self._arg[c]
+            dx[c][h][w] = dout[c]
+        return dx
+
+
+class AdaptiveMaxPool2d:
+    """自适应最大池化：(C, H, W) -> (C, out_h, out_w)，分箱规则与 AdaptiveAvgPool2d 一致"""
+
+    def __init__(self, out_size):
+        if isinstance(out_size, int):
+            out_size = (out_size, out_size)
+        out_size = tuple(out_size)
+        if len(out_size) != 2:
+            raise ValueError(f"AdaptiveMaxPool2d: out_size 必须是 1 个或 2 个整数，收到 {out_size}")
+        oh, ow = out_size
+        for n, v in (("out_h", oh), ("out_w", ow)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValueError(f"AdaptiveMaxPool2d: {n} 必须是整数，收到 {v!r}")
+            if v <= 0:
+                raise ValueError(f"AdaptiveMaxPool2d: {n} 必须为正，收到 {v}")
+        self.out_size = (oh, ow)
+        self.x_shape = None
+        self._arg = None
+
+    _bin_range = staticmethod(AdaptiveAvgPool2d._bin_range)
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("AdaptiveMaxPool2d: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        oh, ow = self.out_size
+        self.x_shape = (C, H, W)
+        row_bins = [self._bin_range(H, oh, i) for i in range(oh)]
+        col_bins = [self._bin_range(W, ow, i) for i in range(ow)]
+        out = [[[0.0] * ow for _ in range(oh)] for _ in range(C)]
+        arg = [[[None] * ow for _ in range(oh)] for _ in range(C)]
+        for c in range(C):
+            for i, (h0, h1) in enumerate(row_bins):
+                for j, (w0, w1) in enumerate(col_bins):
+                    best, where = None, None
+                    for h in range(h0, h1):
+                        row = x[c][h]
+                        for w in range(w0, w1):
+                            if best is None or row[w] > best:
+                                best, where = row[w], (h, w)
+                    out[c][i][j] = best
+                    arg[c][i][j] = where
+        self._arg = arg
+        return out
+
+    def backward(self, dout):
+        if self.x_shape is None:
+            raise RuntimeError("AdaptiveMaxPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        oh, ow = self.out_size
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for i in range(oh):
+                for j in range(ow):
+                    h, w = self._arg[c][i][j]
+                    dx[c][h][w] += dout[c][i][j]
+        return dx
+
+
+class LPPool2d:
+    """Lp 池化：(Σ|x|^p / area)^(1/p)；p=1 为「平均绝对值」，p 很大时逼近最大池化"""
+
+    def __init__(self, norm_type, kernel_size, stride=None):
+        if isinstance(norm_type, bool) or not isinstance(norm_type, (int, float)):
+            raise ValueError(f"LPPool2d: norm_type 必须是正数，收到 {norm_type!r}")
+        v = float(norm_type)
+        if not (v > 0) or v != v or v == float("inf"):
+            raise ValueError(f"LPPool2d: norm_type 必须是有限正数，收到 {norm_type!r}")
+        self.norm_type = v
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        for n, k in (("kernel_size", self.kernel_size), ("stride", self.stride)):
+            if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+                raise ValueError(f"LPPool2d: {n} 必须是正整数，收到 {k!r}")
+        self.x_shape = None
+        self._out_shape = None
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("LPPool2d: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        k, st, pw = self.kernel_size, self.stride, self.norm_type
+        oh = (H - k) // st + 1
+        ow = (W - k) // st + 1
+        if oh <= 0 or ow <= 0:
+            raise ValueError(f"LPPool2d: 输入 {H}x{W} 容不下 kernel {k}")
+        self.x_shape = (C, H, W)
+        self._out_shape = (oh, ow)
+        self._x = [[[x[c][h][w] for w in range(W)] for h in range(H)] for c in range(C)]
+        inv_p = 1.0 / pw
+        out = [[[0.0] * ow for _ in range(oh)] for _ in range(C)]
+        for c in range(C):
+            for i in range(oh):
+                for j in range(ow):
+                    acc = 0.0
+                    for h in range(i * st, i * st + k):
+                        row = x[c][h]
+                        for w in range(j * st, j * st + k):
+                            acc += abs(row[w]) ** pw
+                    out[c][i][j] = (acc / float(k * k)) ** inv_p
+        return out
+
+    def backward(self, dout):
+        if self.x_shape is None:
+            raise RuntimeError("LPPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        oh, ow = self._out_shape
+        x = self._x
+        k, st, pw = self.kernel_size, self.stride, self.norm_type
+        area = float(k * k)
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for i in range(oh):
+                for j in range(ow):
+                    acc = 0.0
+                    for h in range(i * st, i * st + k):
+                        row = x[c][h]
+                        for w in range(j * st, j * st + k):
+                            acc += abs(row[w]) ** pw
+                    y = (acc / area) ** (1.0 / pw)
+                    if y == 0.0:
+                        continue
+                    coef = dout[c][i][j] / (area * (y ** (pw - 1.0)))
+                    for h in range(i * st, i * st + k):
+                        row = x[c][h]
+                        drow = dx[c][h]
+                        for w in range(j * st, j * st + k):
+                            v = row[w]
+                            drow[w] += coef * (abs(v) ** (pw - 1.0)) * (1.0 if v >= 0 else -1.0)
+        return dx
+
+
+class SEBlock:
+    """Squeeze-and-Excitation：GAP -> 瓶颈 MLP -> sigmoid 得到通道权重，逐通道乘回输入
+
+    `forward((C,H,W)) -> (C,H,W)`；`backward(dout) -> dx`，四个参数的梯度留在
+    `self.grads`（`W1/b1/W2/b2`），`sgd_step`/`adam_step` 只更新这四个。
+    """
+
+    def __init__(self, channels, reduction=16):
+        for n, v in (("channels", channels), ("reduction", reduction)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"SEBlock: {n} 必须是正整数，收到 {v!r}")
+        self.channels = channels
+        self.reduction = reduction
+        self.hidden = max(1, channels // reduction)
+        std1 = (2.0 / channels) ** 0.5
+        std2 = (2.0 / self.hidden) ** 0.5
+        self.W1 = [[random.gauss(0.0, std1) for _ in range(channels)] for _ in range(self.hidden)]
+        self.b1 = [0.0] * self.hidden
+        self.W2 = [[random.gauss(0.0, std2) for _ in range(self.hidden)] for _ in range(channels)]
+        self.b2 = [0.0] * channels
+        self.training = True
+        self._cache = None
+        self._init_adam()
+        self.zero_grad()
+
+    def _params(self):
+        return (("W1", self.W1), ("b1", self.b1), ("W2", self.W2), ("b2", self.b2))
+
+    def _init_adam(self):
+        self._adam_m = {k: _zeros_like(v) for k, v in self._params()}
+        self._adam_v = {k: _zeros_like(v) for k, v in self._params()}
+        self._adam_t = 0
+
+    def zero_grad(self):
+        self.grads = {k: _zeros_like(v) for k, v in self._params()}
+
+    def param_count(self):
+        return _w2_count(self._params())
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("SEBlock: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.channels:
+            raise ValueError(f"SEBlock: 输入通道数 {C} 与 channels={self.channels} 不符")
+        z = _w2_channel_means(x)
+        a1 = [sum(map(_mul, self.W1[k], z)) + self.b1[k] for k in range(self.hidden)]
+        r1 = [v if v > 0.0 else 0.0 for v in a1]
+        a2 = [sum(map(_mul, self.W2[c], r1)) + self.b2[c] for c in range(C)]
+        s = [_sigmoid_scalar(v) for v in a2]
+        out = [[[x[c][h][w] * s[c] for w in range(W)] for h in range(H)] for c in range(C)]
+        self._cache = (x, s, r1, a1)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("SEBlock.backward: 必须先调用 forward")
+        x, s, r1, a1 = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if (len(dout) != C or len(dout[0]) != H or len(dout[0][0]) != W):
+            raise ValueError(
+                f"SEBlock.backward: dout 形状 {(len(dout), len(dout[0]), len(dout[0][0]))} "
+                f"与输入 {(C, H, W)} 不符")
+        area = float(H * W)
+        da2 = [0.0] * C
+        for c in range(C):
+            inner = 0.0
+            for h in range(H):
+                for w in range(W):
+                    inner += dout[c][h][w] * x[c][h][w]
+            da2[c] = inner * s[c] * (1.0 - s[c])
+            for k in range(self.hidden):
+                self.grads["W2"][c][k] += da2[c] * r1[k]
+            self.grads["b2"][c] += da2[c]
+        dz = [0.0] * C
+        for k in range(self.hidden):
+            dr1 = sum(da2[c] * self.W2[c][k] for c in range(C))
+            da1 = dr1 if a1[k] > 0.0 else 0.0
+            for c in range(C):
+                self.grads["W1"][k][c] += da1 * _w2_channel_means(x)[c]
+            self.grads["b1"][k] += da1
+            for c in range(C):
+                dz[c] += da1 * self.W1[k][c]
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            g = dz[c] / area
+            for h in range(H):
+                for w in range(W):
+                    dx[c][h][w] = dout[c][h][w] * s[c] + g
+        return dx
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
