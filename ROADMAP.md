@@ -180,8 +180,9 @@
       `W_q/W_k/W_v/W_o` 与输入梯度中心差分 ≤1e-5，120 步 Adam 收敛）
 - [x] `LinformerAttention`（K/V 低秩投影 `E`/`F`，O(T·k·d)；不支持 causal；
       `k=T` 且 `E=F=I` 时与标准注意力逐位等价 <1e-12）
-- [ ] 线性注意力族剩余：`Performer`（随机特征）、`BigBird`（稀疏）、
-      `Longformer`（滑窗+全局）、`Reformer`（LSH）
+- [x] `PerformerAttention`（FAVOR+ 随机特征 `phi(x)=exp(Wx-|x|²/2)/sqrt(m)`，O(T·d·m)；
+      iid 高斯特征，实测 m=4 误差 92% / m=64 误差 35%，是省算力而非逼近 softmax）**W5-B3**
+- [ ] 线性注意力族剩余：`BigBird`（稀疏）、`Longformer`（滑窗+全局）、`Reformer`（LSH）
 - [ ] `FlashAttention` 分块算法（模拟，明确「不更快」）
 
 ### W6 图神经网络（§1 全新范式）

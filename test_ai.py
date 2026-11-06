@@ -13843,3 +13843,166 @@ class TestLinformerAttention:
             pass
         else:
             raise AssertionError("未 forward 就 backward 没有报错")
+
+
+# ==== W5-B3：PerformerAttention ====
+
+class TestPerformerAttention:
+    def _setup(self, D=8, H=2, M=8, T=5, causal=False):
+        random.seed(7)
+        p = AI.PerformerAttention(D, H, num_features=M, causal=causal)
+        x = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        dout = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        return p, x, dout
+
+    def _scalar(self, p, x, dout):
+        p.zero_grad()
+        y = p.forward(x)
+        return sum(dout[t][j] * y[t][j] for t in range(len(y))
+                   for j in range(len(y[0])))
+
+    def test_shape_params_and_features(self):
+        p, x, dout = self._setup()
+        y = p.forward(x)
+        assert len(y) == 5 and len(y[0]) == 8
+        assert p.param_count() == 4 * 8 * 8 + 4 * 8
+        # phi 的长度是特征数 m，不是 d_k
+        assert len(p._cache[0]["pq"][0]) == 8
+        assert len(p._cache[0]["pk"][0]) == 8
+        # 随机特征矩阵不参与训练
+        assert "omega" not in p.grads
+        assert len(p.omega) == 2 and len(p.omega[0]) == 8 and len(p.omega[0][0]) == 4
+
+    def test_gradients_vs_finite_difference(self):
+        eps = 1e-5
+        for causal in (False, True):
+            p, x, dout = self._setup(causal=causal)
+
+            def rel_param(name, i, j):
+                obj = getattr(p, name)
+                old = obj[i][j]
+                p.zero_grad()
+                p.forward(x)
+                p.backward(dout)
+                ana = p.grads[name][i][j]
+                obj[i][j] = old + eps
+                up = self._scalar(p, x, dout)
+                obj[i][j] = old - eps
+                dn = self._scalar(p, x, dout)
+                obj[i][j] = old
+                num = (up - dn) / (2 * eps)
+                return abs(ana - num) / max(abs(ana), abs(num), 1e-8)
+
+            for name in ("W_q", "W_k", "W_v", "W_o"):
+                for (i, j) in ((0, 0), (7, 7)):
+                    assert rel_param(name, i, j) < 1e-5, (causal, name, i, j)
+
+            p.zero_grad()
+            p.forward(x)
+            dx = p.backward(dout)
+            for (t, j) in ((0, 0), (4, 7)):
+                xp = [list(r) for r in x]
+                xm = [list(r) for r in x]
+                xp[t][j] += eps
+                xm[t][j] -= eps
+                num = (self._scalar(p, xp, dout) - self._scalar(p, xm, dout)) / (2 * eps)
+                assert abs(dx[t][j] - num) / max(abs(dx[t][j]), abs(num), 1e-8) < 1e-5
+
+    def test_causality(self):
+        p, x, _ = self._setup(causal=True)
+        x2 = [list(r) for r in x]
+        x2[4][0] += 5.0
+        y1 = p.forward(x)
+        y2 = p.forward(x2)
+        for t in range(4):
+            for j in range(8):
+                assert abs(y1[t][j] - y2[t][j]) < 1e-12
+        assert max(abs(y1[4][j] - y2[4][j]) for j in range(8)) > 1e-9
+
+    def test_more_features_improve_approximation(self):
+        D = 8
+        random.seed(3)
+        xs = [[random.gauss(0, 1) for _ in range(D)] for _ in range(4)]
+        mha = AI.MultiHeadAttention(D, 2)
+        de = [[1.0 if i == j else 0.0 for j in range(D)] for i in range(D)]
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            setattr(mha, name, [list(r) for r in de])
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            setattr(mha, name, [0.0] * D)
+        ref = mha.forward(xs)
+
+        def err(m):
+            pf = AI.PerformerAttention(D, 2, num_features=m, seed=5)
+            for name in ("W_q", "W_k", "W_v", "W_o"):
+                setattr(pf, name, [list(r) for r in de])
+            for name in ("b_q", "b_k", "b_v", "b_o"):
+                setattr(pf, name, [0.0] * D)
+            ys = pf.forward(xs)
+            num = sum((ys[t][j] - ref[t][j]) ** 2 for t in range(4) for j in range(D))
+            den = sum(ref[t][j] ** 2 for t in range(4) for j in range(D))
+            return math.sqrt(num / den)
+
+        small = err(4)
+        big = err(64)
+        assert big < small
+        assert big < 0.5
+
+    def test_accumulate_optimizers_and_validation(self):
+        p, x, dout = self._setup()
+        p.zero_grad()
+        p.forward(x)
+        p.backward(dout)
+        g1 = p.grads["W_q"][0][0]
+        p.forward(x)
+        p.backward(dout)
+        g2 = p.grads["W_q"][0][0]
+        assert abs(g2 - 2 * g1) < 1e-12 * max(1.0, abs(g2))
+        p.zero_grad()
+        left = [v for name in ("W_q", "W_k", "W_v", "W_o")
+                for row in p.grads[name] for v in row]
+        assert max(abs(v) for v in left) == 0.0
+
+        before = [list(r) for r in p.W_v]
+        p.forward(x)
+        p.backward(dout)
+        p.sgd_step(0.1)
+        assert p.W_v != before
+        before = [list(r) for r in p.W_v]
+        p.zero_grad()
+        p.forward(x)
+        p.backward(dout)
+        p.adam_step(0.01)
+        assert p.W_v != before
+
+        for bad in (lambda: AI.PerformerAttention(8, 3),
+                    lambda: AI.PerformerAttention(8, 2, 0),
+                    lambda: AI.PerformerAttention(8, 2, 4, 1),
+                    lambda: AI.PerformerAttention(8, 2, 4, False, 0.0),
+                    lambda: AI.PerformerAttention(8, 2, 4, False, 1e-6, 1.5),
+                    lambda: AI.PerformerAttention(0, 2),
+                    lambda: AI.PerformerAttention(8, 0)):
+            try:
+                bad()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("非法构造没有报错")
+        q = AI.PerformerAttention(8, 2)
+        try:
+            q.forward([])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("空序列没有报错")
+        try:
+            q.forward([[0.0] * 3] * 4)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("token 维度不符没有报错")
+        try:
+            q.backward([[0.0] * 8] * 4)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 没有报错")
