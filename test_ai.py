@@ -8860,3 +8860,80 @@ class TestImbalanceLosses:
             AI.ohem_loss([], [])
         with pytest.raises(ValueError):
             AI.ohem_loss([[0.5, 0.5]], [0], keep_ratio=1.0)
+
+class TestDistillAndHint:
+    """知识蒸馏：软目标 KL（含 T^2 缩放）与隐藏层对齐。"""
+
+    def test_distill_matches_scaled_kl(self):
+        zs = [0.5, -1.0, 2.0]
+        zt = [1.2, 0.1, -0.7]
+        loss, grad = AI.distill_loss(zs, zt, T=2.0)
+        ps = AI._softmax_with_temp(zs, 2.0)
+        pt = AI._softmax_with_temp(zt, 2.0)
+        ref = 4.0 * sum(b * math.log(b / a) for a, b in zip(ps, pt))
+        assert abs(loss - ref) < 1e-12
+        assert max(abs(g - 2.0 * (a - b)) for g, a, b in zip(grad, ps, pt)) < 1e-12
+
+    def test_distill_zero_when_equal_and_numeric_grad(self):
+        z = [0.3, 0.1, -0.4]
+        loss, grad = AI.distill_loss(z, z, T=1.5)
+        assert abs(loss) < 1e-15
+        assert all(abs(g) < 1e-15 for g in grad)
+
+        zs = [0.5, -1.0, 2.0]
+        zt = [1.2, 0.1, -0.7]
+        _, g = AI.distill_loss(zs, zt, T=0.7)
+        eps = 1e-6
+        for i in range(len(zs)):
+            up = list(zs)
+            dn = list(zs)
+            up[i] += eps
+            dn[i] -= eps
+            num = (AI.distill_loss(up, zt, T=0.7)[0] - AI.distill_loss(dn, zt, T=0.7)[0]) / (2 * eps)
+            assert abs(g[i] - num) < 1e-8
+
+    def test_distill_rejects_bad_temperature(self):
+        zs = [0.1, 0.2]
+        zt = [0.3, 0.4]
+        for bad in (0.0, -1.0, float("inf"), float("nan"), True, "2"):
+            with pytest.raises((ValueError, TypeError)):
+                AI.distill_loss(zs, zt, T=bad)
+        with pytest.raises(ValueError):
+            AI.distill_loss([0.1, 0.2], [0.1], T=1.0)
+
+    def test_hint_loss_mse_and_weight(self):
+        a = [0.5, -1.0, 2.0, 0.0]
+        b = [0.2, -0.4, 1.5, 0.3]
+        loss, grad = AI.hint_loss(a, b)
+        ref = sum((x - y) ** 2 for x, y in zip(a, b)) / len(a)
+        assert abs(loss - ref) < 1e-12
+        assert max(abs(g - 2.0 * (x - y) / len(a)) for g, x, y in zip(grad, a, b)) < 1e-12
+
+        loss2, grad2 = AI.hint_loss(a, b, weight=2.5)
+        assert abs(loss2 - 2.5 * ref) < 1e-12
+        assert max(abs(g - 2.5 * h) for g, h in zip(grad2, grad)) < 1e-12
+        assert AI.hint_loss(a, b, weight=0.0)[0] == 0.0
+        for bad in (-1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                AI.hint_loss(a, b, weight=bad)
+        with pytest.raises(TypeError):
+            AI.hint_loss(a, b, weight="x")
+        with pytest.raises(ValueError):
+            AI.hint_loss([], [])
+
+    def test_model_wiring_and_activation_guard(self):
+        assert AI.Model._LOSS_MAP["distill"] is AI.distill_loss
+        assert "distill" in AI.Model._NUMERIC_LOSSES
+
+        random.seed(31)
+        mlp = AI.MLP([4, 8, 3], activations=["relu", "linear"])
+        model = AI.Model(mlp, loss_fn="distill", task="classification", lr=0.02)
+        teacher = [[1.5, -0.5, 0.2], [0.3, 1.2, -0.9]]
+        data = [([random.uniform(-1, 1) for _ in range(4)], teacher[i % 2]) for i in range(20)]
+        model.fit(data=data, epochs=20, batch_size=5, verbose=False, seed=3)
+        losses = [v for _, v in model.history["train_loss"]]
+        assert losses[-1] < losses[0]
+
+        bad = AI.MLP([4, 8, 3], activations=["relu", "softmax"])
+        with pytest.raises(ValueError):
+            AI.Model(bad, loss_fn="distill", task="classification")

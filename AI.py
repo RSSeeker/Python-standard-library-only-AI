@@ -12,6 +12,7 @@
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / L1 / Log-Cosh / Quantile / Smooth-L1 / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   + 类别不平衡损失（Class-Balanced / LDAM / OHEM）
+  + 知识蒸馏（distill_loss 软目标 KL + T² 缩放 / hint_loss 隐藏层对齐）
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
@@ -6688,6 +6689,54 @@ def ohem_loss(preds, targets, keep_ratio: float = 0.7):
     return mean_loss, out
 
 
+def distill_loss(student_logits, teacher_logits, T: float = 2.0):
+    """知识蒸馏（soft-target KL）：`T^2 * KL(teacher_T || student_T)`
+
+    对学生 logits 求导得到 `T * (p_student - p_teacher)`（p 是温度为 T 时的 softmax）。
+    乘以 T^2 是为了让不同温度下的梯度量级可比（Hinton 等人的做法）。
+
+    `teacher_logits` 直接作为 `Model(loss_fn='distill')` 的 target 传入即可；
+    学生的输出层必须是 `linear`（本函数吃 logits，不吃概率）。
+    """
+    if not isinstance(T, (int, float)) or isinstance(T, bool) or not (T > 0.0):
+        raise ValueError(f"distill_loss: T 必须是 > 0 的数字，收到 {T!r}")
+    if not (T == T and T != float("inf")):
+        raise ValueError("distill_loss: T 必须是有限数字")
+    tgt, stud = _numeric_pair(student_logits, teacher_logits, "distill_loss")
+    ps = _softmax_with_temp(stud, float(T))
+    pt = _softmax_with_temp(tgt, float(T))
+    loss = 0.0
+    for a, b in zip(ps, pt):
+        if b > 0.0:
+            loss += b * math.log(b / max(a, 1e-300))
+    loss *= T * T
+    grad = [T * (a - b) for a, b in zip(ps, pt)]
+    return loss, grad
+
+
+def hint_loss(student_feat, teacher_feat, weight: float = 1.0):
+    """隐藏层对齐（hint）：学生特征与教师特征的均方误差
+
+    用于 FitNet 式的中间层蒸馏；两层维度必须一致（需要投影时自己套一层 `Layer`）。
+    返回 `(loss, grad)`，`grad` 相对 `student_feat`；`weight` 用来调节与主损失的配比。
+    """
+    if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+        raise TypeError(f"hint_loss: weight 必须是数字，收到 {weight!r}")
+    if not (weight >= 0.0 and weight == weight and weight != float("inf")):
+        raise ValueError(f"hint_loss: weight 必须是非负有限数字，收到 {weight!r}")
+    tgt, stud = _numeric_pair(student_feat, teacher_feat, "hint_loss")
+    n = len(stud)
+    if n == 0:
+        raise ValueError("hint_loss: 特征不能为空")
+    total = 0.0
+    for a, b in zip(stud, tgt):
+        d = a - b
+        total += d * d
+    loss = weight * total / n
+    grad = [weight * 2.0 * (a - b) / n for a, b in zip(stud, tgt)]
+    return loss, grad
+
+
 def mse_loss(pred: List[float], target):
     """MSE 损失 + 对 pred 的梯度
 
@@ -11261,13 +11310,14 @@ class Model:
         'log_cosh': log_cosh_loss,
         'quantile': quantile_loss,
         'class_balanced': class_balanced_loss,
+        'distill': distill_loss,
         'ldam': ldam_loss,
     }
 
     # 目标按「类别索引」解释的损失（其余按数值向量解释）
     _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal', 'class_balanced', 'ldam')
     # 目标按数值向量解释的损失（标量会被包成 [target]）
-    _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber', 'smooth_l1',
+    _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber', 'distill', 'smooth_l1',
                        'l1', 'log_cosh', 'quantile')
 
     def __init__(self, model, loss_fn=None, optimizer=None, lr=0.01,
@@ -11431,6 +11481,7 @@ class Model:
             'smooth_l1': ('linear', "smooth_l1_loss 是回归损失，输出层激活请用 'linear'"),
             'class_balanced': ('softmax', "class_balanced_loss 期望 softmax 概率，输出层激活请用 'softmax'"),
             'ldam': ('linear', "ldam_loss 直接吃 logits，输出层激活请用 'linear'"),
+            'distill': ('linear', "distill_loss 吃学生 logits，输出层激活请用 'linear'"),
         }
         want_act = _LOSS_ACT_C.get(self._loss_name)
         if want_act is not None and last_act != want_act[0]:
