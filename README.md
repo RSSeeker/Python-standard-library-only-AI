@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1110 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1121 项）
 
 ## 特性
 
@@ -610,6 +610,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套（W9-A）；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
 | `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套（W9-B）：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
 | `Adan` / `Prodigy` / `CAME` | 进阶三件套（W9-E）：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
+| `Shampoo` / `Sophia` / `LBFGS` | 二阶近似三件套（W9-E）：Shampoo 用 `L=GGᵀ`/`R=GᵀG` 的 `L^{-1/4} G R^{-1/4}` 预条件（`max(fan_out,fan_in) > max_dim` 的层退化为逐元素 Adam）；Sophia 用 `clip(m / max(ρh, ε), ±1)`（`h` 来自 `hessian_diags` / `hessian_fn` / `g²` 三者之一，**不是真 Hessian**）；L-BFGS 是逐层分块的两循环递归、无 line search，`lr` 要比 SGD 小一个量级 |
 | `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族（W9-C）：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
@@ -1151,7 +1152,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1110 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1121 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1210,6 +1211,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestEMASWACallbacks` | 回调每 epoch 更新一次（6 轮 → `step=6`/`n=6`）、SWA 平均恰为逐 epoch 快照的算术平均、`apply_to` 生效 |
 | `TestSchedulerFamily` | 12 个调度器的闭式解逐点对照、周期/里程碑边界、`step(0)` 夹到第 1 轮、`epoch` 非整数/布尔报错、旧调度器（Step/Exponential/Cosine）回归锁、与 `Model.fit(lr_scheduler=)` 的 12 种集成 |
 | `TestAdvancedOptimizers` | Adan/Prodigy/CAME 同时更新权重与**扁平偏置**（回归锁，偏置曾按 `param[j]` 取 float 崩掉）、三个名字能被 `Model(optimizer=...)` 认到并降 loss、`state_dict` 往后续训逐位一致、`state_dict` 不与实例共享状态、Prodigy 的 `d` 只按 growth/shrink 走且首步不动、CAME 的 `clip_threshold` 确实改变轨迹且不发散、9 条非法超参 + `r` 长度校验 |
+| `TestAdvancedOptimizers2` | Shampoo 的 1×1 闭式解（`W -= lr·sign(g)`）、Jacobi 特征分解重建原矩阵且特征向量正交、超过 `max_dim` 退化为逐元素 Adam、Sophia 闭式解与 `hessian_diags` 覆盖（大曲率 ⇒ 步长被压到 1e-2 以下）、L-BFGS 首步等于 SGD、次步按 `gamma=s·y/y·y` 缩放、三者 `state_dict` 往后续训逐位一致、快照不与实例共享状态、10 条非法超参、三者都能降 loss、`Model(optimizer=...)` 注册 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -1358,7 +1360,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1110 个单元测试
+├── test_ai.py       # 1121 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

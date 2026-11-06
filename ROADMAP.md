@@ -245,7 +245,15 @@
   - `LARS` 的 `local_lr = lr·tc·‖W‖/(‖g‖+wd·‖W‖+eps)`、`LAMB` 的 `trust = ‖W‖/‖u‖`（截到 `trust_clip`）、`Ranger` = RAdam + Lookahead（每 `k` 步 `slow += alpha(fast-slow)` 再 `fast = slow`）
   - 三个都与手写参考**两步逐位一致**；`Ranger` 第一步每个参数满足 `p-p0 = -lr·g`（纯动量，worst 8.674e-17）；三者 `state_dict()` 续训逐位一致
   - 已知边界：只支持二维 `Layer` 权重（与 `Adam` 一致）；`LARS` 偏置恒用 `lr`；`LAMB` 的 `trust_clip` 默认 10.0 是经验值（更小时收敛更慢但更稳）
-- [ ] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
+- [x] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
+  - Shampoo：`L^{-1/4} G R^{-1/4}` 预条件；超过 `max_dim` 的层退化为逐元素 Adam；
+    逆根用循环 Jacobi（`_jacobi_eigh`，重建误差 8.9e-16、`A·M⁴ == I` 5.6e-16）。
+  - Sophia：`clip(m / max(ρh, ε), ±1)`；`h` 依次取 `hessian_diags` > `hessian_fn` >
+    `β₂h + (1-β₂)g²`，并明写「不是真 Hessian」（纯梯度接口拿不到二阶信息）。
+  - L-BFGS：逐层分块的两循环递归 + 固定步长（无 line search）；位移对（`s`/`y`）与 `prev_p`/`prev_g` 一并进 `state_dict`，往后续训逐位一致。
+  - 探针 `probe_w9e2.py` 28 项、`TestAdvancedOptimizers2` 11 例；找到两个真 bug：
+    L-BFGS 的 `prev_p` 建成嵌套矩阵（`_advance` 要扁平列表，直接 TypeError）、
+    状态校验按嵌套形状校验扁平列表（`load_state_dict` 把合法存档判成形状错）。
   - E1（已完成）：`Adan` / `Prodigy` / `CAME` —— Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr，`d` 按「上一步是否真的下降」乘性自适应（与原论文的累积投影估计不同，docstring 与 README 都写明）；CAME 用 `r`/`c` 行/列**向量**因子化二阶矩。
   - 三个都与手写参考 5 步**逐位一致**（maxdiff 0.000e+00）；`state_dict()` 往返续训逐位一致（Prodigy 额外存 `d`/`p_prev`/`g_prev`）；400 步 XOR 收敛到 9.4e-4 / 5e-6 / 8.3e-4。
   - 踩坑：CAME 最初把 `r`/`c` 都做成逐元素矩阵，`v = r·c` 只有 `|g|⁴` 量级 ⇒ 步长被放大 `1/|g|` 倍，`clip_threshold=1e6`（等于关掉校正）时参数飞到 9.68e+02；改成 Adafactor 式行/列均值 `v_ij = r_i·c_j/mean(r)` 才把量纲对齐。另：偏置是扁平 `list[float]`，`param[j]` 的嵌套写法会直接 `TypeError`。

@@ -21531,6 +21531,507 @@ class CAME(_LayerwiseOptimizer):
             layer.biases[j] -= lr * mb[j] / (math.sqrt(vb[j]) + eps)
 
 
+
+
+# ==== 进阶优化器（W9-E2）：Shampoo / Sophia / L-BFGS ====
+#
+# 这三个都需要「整层」的信息（矩阵逆根 / Hessian 对角 / 历史位移对），
+# 因此同样挂在 `_LayerwiseOptimizer` 上；只支持二维 `Layer` 权重。
+
+
+def _w9b_check_sq(arr, n, who):
+    """校验一个 n×n 方阵状态字段（Shampoo 的 L / R）"""
+    if not isinstance(arr, list) or len(arr) != n:
+        got = len(arr) if isinstance(arr, list) else type(arr).__name__
+        raise ValueError(f"{who}: 必须是 {n}×{n} 方阵，收到的行数是 {got}")
+    for row in arr:
+        if not isinstance(row, list) or len(row) != n:
+            got = len(row) if isinstance(row, list) else type(row).__name__
+            raise ValueError(f"{who}: 每行必须是长度 {n} 的列表，收到 {got}")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 元素必须是数字，收到 {v!r}")
+
+
+def _w9_sq_zeros(n):
+    return [[0.0] * n for _ in range(n)]
+
+
+def _mat_t(a):
+    """转置（空矩阵返回空）"""
+    if not a or not a[0]:
+        return []
+    return [[a[i][j] for i in range(len(a))] for j in range(len(a[0]))]
+
+
+def _mat_mul(a, b):
+    """普通矩阵乘（小矩阵；顺序固定即可，不做补偿求和）"""
+    if not a or not b:
+        return []
+    n, k, m = len(a), len(b), len(b[0])
+    out = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        ai = a[i]
+        oi = out[i]
+        for p in range(k):
+            aip = ai[p]
+            if aip == 0.0:
+                continue
+            bp = b[p]
+            for j in range(m):
+                oi[j] += aip * bp[j]
+    return out
+
+
+def _jacobi_eigh(a, tol=1e-12, max_sweeps=60):
+    """对称矩阵的 Jacobi 特征分解，返回 ``(eigvals, V)``，列为特征向量
+
+    只用标准库：循环 Jacobi（Gauss 旋转）。输入按上三角对称化——调用方只会传
+    ``G Gᵀ`` 这种本来就对称的矩阵。
+    """
+    n = len(a)
+    if n == 0:
+        return [], []
+    A = [[0.5 * (a[i][j] + a[j][i]) for j in range(n)] for i in range(n)]
+    V = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    scale = max(1.0, max(abs(A[i][i]) for i in range(n)))
+    for _ in range(max_sweeps):
+        off = 0.0
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                off += A[i][j] * A[i][j]
+        if math.sqrt(off) <= tol * scale:
+            break
+        for p in range(n - 1):
+            for q in range(p + 1, n):
+                apq = A[p][q]
+                if abs(apq) <= 1e-18 * scale:
+                    continue
+                theta = (A[q][q] - A[p][p]) / (2.0 * apq)
+                t = (1.0 if theta >= 0.0 else -1.0) / (
+                    abs(theta) + math.sqrt(theta * theta + 1.0))
+                c = 1.0 / math.sqrt(t * t + 1.0)
+                s = t * c
+                for k in range(n):
+                    akp, akq = A[k][p], A[k][q]
+                    A[k][p] = c * akp - s * akq
+                    A[k][q] = s * akp + c * akq
+                for k in range(n):
+                    apk, aqk = A[p][k], A[q][k]
+                    A[p][k] = c * apk - s * aqk
+                    A[q][k] = s * apk + c * aqk
+                for k in range(n):
+                    vkp, vkq = V[k][p], V[k][q]
+                    V[k][p] = c * vkp - s * vkq
+                    V[k][q] = s * vkp + c * vkq
+    return [A[i][i] for i in range(n)], V
+
+
+def _sym_inv_root4(m, eps=1e-12):
+    """对称半正定矩阵的 ``M^{-1/4} = V diag(max(λ,eps)^{-1/4}) Vᵀ``"""
+    n = len(m)
+    if n == 0:
+        return []
+    vals, V = _jacobi_eigh(m)
+    d = [max(v, eps) ** (-0.25) for v in vals]
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        vi = V[i]
+        oi = out[i]
+        for j in range(n):
+            vj = V[j]
+            s = 0.0
+            for k in range(n):
+                s += vi[k] * d[k] * vj[k]
+            oi[j] = s
+    return out
+
+
+class Shampoo(_LayerwiseOptimizer):
+    """Shampoo（2018）：对每层梯度矩阵做 ``L^{-1/4} G R^{-1/4}`` 预条件
+
+    ``L = Σ G Gᵀ``（fan_out × fan_out）、``R = Σ Gᵀ G``（fan_in × fan_in）是
+    二阶矩的矩阵形式；逆 1/4 次根用 Jacobi 特征分解算（纯标准库）。
+
+    工程折中（docstring 与 README 都写明）：
+      * 维度超过 ``max_dim`` 的层退化成**逐元素** Adam 预条件（论文的 diagonal
+        版本），否则 64 维以上的 Jacobi 会拖慢训练；
+      * 没有实现论文的 grafting（把 Adam 更新范数嫁接回来），所以**lr 要自己给
+        合适**；矩阵分支的 lr 与 Adam 分支不是同一量纲；
+      * ``precondition_every`` 控制逆根重算频率（默认每步算一次，调大可省时间）。
+    """
+
+    name = "shampoo"
+
+    def __init__(self, model, lr=1e-2, beta1=0.9, beta2=0.999, eps=1e-8,
+                 precondition_every=1, max_dim=64, weight_decay=0.0):
+        _w9_check("Shampoo", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
+        _w9b_check("Shampoo", "weight_decay", weight_decay, 0.0)
+        if isinstance(precondition_every, bool) or not isinstance(precondition_every, int):
+            raise TypeError(f"Shampoo: precondition_every 必须是整数，收到 "
+                            f"{type(precondition_every).__name__}")
+        if precondition_every < 1:
+            raise ValueError(
+                f"Shampoo: precondition_every 必须 >= 1，收到 {precondition_every!r}")
+        if isinstance(max_dim, bool) or not isinstance(max_dim, int):
+            raise TypeError(f"Shampoo: max_dim 必须是整数，收到 {type(max_dim).__name__}")
+        if max_dim < 1:
+            raise ValueError(f"Shampoo: max_dim 必须 >= 1，收到 {max_dim!r}")
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.precondition_every = precondition_every
+        self.max_dim = max_dim
+        self.weight_decay = float(weight_decay)
+        self._inv = {}          # idx -> (L^{-1/4}, R^{-1/4})
+
+    def _use_matrix(self, layer):
+        return max(layer.fan_out, layer.fan_in) <= self.max_dim
+
+    def _new_state(self, layer, kind):
+        if kind == "w" and self._use_matrix(layer):
+            return {"L": _w9_sq_zeros(layer.fan_out),
+                    "R": _w9_sq_zeros(layer.fan_in)}
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
+
+    def _check_state_field(self, key, field, arr, layer, kind):
+        if field == "L":
+            _w9b_check_sq(arr, layer.fan_out,
+                          f"{self.name}.load_state_dict[{key}.L]")
+            return
+        if field == "R":
+            _w9b_check_sq(arr, layer.fan_in,
+                          f"{self.name}.load_state_dict[{key}.R]")
+            return
+        _w9_check_state(arr, layer, kind,
+                        f"{self.name}.load_state_dict[{key}.{field}]")
+
+    def load_state_dict(self, blob):
+        _LayerwiseOptimizer.load_state_dict(self, blob)
+        self._inv = {}
+        return self
+
+    def _bias_corr(self):
+        t = self.step_count
+        return (1.0 - self.beta1 ** t, 1.0 - self.beta2 ** t)
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        n, k = layer.fan_out, layer.fan_in
+        wd = self.weight_decay
+        c1, c2 = self._bias_corr()
+        if "L" in st_w:
+            L, R = st_w["L"], st_w["R"]
+            G = [[grad_w[i][j] + wd * layer.weights[i][j] for j in range(k)]
+                 for i in range(n)]
+            for a in range(n):
+                La, Ga = L[a], G[a]
+                for b in range(a, n):
+                    Gb = G[b]
+                    s = 0.0
+                    for j in range(k):
+                        s += Ga[j] * Gb[j]
+                    La[b] += s
+                    L[b][a] = La[b]
+            for a in range(k):
+                Ra = R[a]
+                for b in range(a, k):
+                    s = 0.0
+                    for i in range(n):
+                        s += G[i][a] * G[i][b]
+                    Ra[b] += s
+                    R[b][a] = Ra[b]
+            if idx not in self._inv or (self.step_count - 1) % self.precondition_every == 0:
+                self._inv[idx] = (_sym_inv_root4(L, self.eps),
+                                  _sym_inv_root4(R, self.eps))
+            Li, Ri = self._inv[idx]
+            U = _mat_mul(_mat_mul(Li, G), Ri)
+            for i in range(n):
+                Wi, Ui = layer.weights[i], U[i]
+                for j in range(k):
+                    Wi[j] -= self.lr * Ui[j]
+        else:
+            m, v = st_w["m"], st_w["v"]
+            for i in range(n):
+                Wi, gi, mi, vi = layer.weights[i], grad_w[i], m[i], v[i]
+                for j in range(k):
+                    g = gi[j] + wd * Wi[j]
+                    mi[j] = self.beta1 * mi[j] + (1.0 - self.beta1) * g
+                    vi[j] = self.beta2 * vi[j] + (1.0 - self.beta2) * g * g
+                    Wi[j] -= self.lr * (mi[j] / c1) / (
+                        math.sqrt(vi[j] / c2) + self.eps)
+
+        mb, vb = st_b["m"], st_b["v"]
+        for j in range(n):
+            g = grad_b[j]
+            mb[j] = self.beta1 * mb[j] + (1.0 - self.beta1) * g
+            vb[j] = self.beta2 * vb[j] + (1.0 - self.beta2) * g * g
+            layer.biases[j] -= self.lr * (mb[j] / c1) / (
+                math.sqrt(vb[j] / c2) + self.eps)
+
+
+class Sophia(_LayerwiseOptimizer):
+    """Sophia-G（2023）：按曲率裁剪动量后再更新
+
+    更新式：``p -= lr · clip(m / max(rho·h, eps), -1, 1)``。``h`` 是曲率对角；
+    标准 Sophia 要用 Hessian-vector product（Hutchinson 估计）来维护它，而本库的
+    层接口只拿得到一阶梯度，因此：
+
+      * 默认 ``h ← β2·h + (1-β2)·g²``（Gauss-Newton 对角的廉价近似，即
+        Sophia-G）。**这不等于真 Hessian**，docstring 与 README 都如实标注；
+      * 需要更准的曲率时传 ``hessian_fn``（签名 ``hessian_fn(层号, 层)``，返回与
+        权重同形状的对角估计，``None`` 表示该层退回 ``g²`` 近似）；
+      * 也可以直接调 ``step(grads, hessian_diags=[(权重对角, 偏置对角), ...])``。
+
+    ``clip`` 让每个元素一步最多走 ``lr``，所以 lr 是**步长上限**而不是学习率。
+    """
+
+    name = "sophia"
+
+    def __init__(self, model, lr=1e-3, beta1=0.9, beta2=0.999, rho=0.04,
+                 eps=1e-8, weight_decay=0.0, hessian_fn=None):
+        _w9_check("Sophia", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
+        _w9b_check("Sophia", "weight_decay", weight_decay, 0.0)
+        if isinstance(rho, bool) or not isinstance(rho, (int, float)) or float(rho) <= 0.0:
+            raise ValueError(f"Sophia: rho 必须是正数，收到 {rho!r}")
+        if hessian_fn is not None and not callable(hessian_fn):
+            raise TypeError("Sophia: hessian_fn 必须可调用（或 None）")
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.rho = float(rho)
+        self.eps = float(eps)
+        self.weight_decay = float(weight_decay)
+        self.hessian_fn = hessian_fn
+        self._h_ext = None
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "h": _w9_zeros(layer, kind)}
+
+    def step(self, all_grads, hessian_diags=None):
+        """``hessian_diags``：可选的逐层曲率对角（形如 ``[(对角_w, 对角_b), ...]``）"""
+        self._h_ext = hessian_diags
+        try:
+            return _LayerwiseOptimizer.step(self, all_grads)
+        finally:
+            self._h_ext = None
+
+    def _curvature(self, idx, layer, kind):
+        """显式入参 > ``hessian_fn`` > ``None``（None 表示退回 ``g²`` 近似）"""
+        if self._h_ext is not None:
+            ext = self._h_ext[idx][0 if kind == "w" else 1]
+            if ext is not None:
+                return ext
+        if self.hessian_fn is not None:
+            ext = self.hessian_fn(idx, layer)
+            if ext is not None:
+                return ext
+        return None
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        n, k = layer.fan_out, layer.fan_in
+        wd = self.weight_decay
+        b1, b2, rho, eps = self.beta1, self.beta2, self.rho, self.eps
+
+        h_ext = self._curvature(idx, layer, "w")
+        m, h = st_w["m"], st_w["h"]
+        for i in range(n):
+            Wi, gi = layer.weights[i], grad_w[i]
+            mi, hi = m[i], h[i]
+            he = h_ext[i] if h_ext is not None else None
+            for j in range(k):
+                g = gi[j] + wd * Wi[j]
+                mi[j] = b1 * mi[j] + (1.0 - b1) * g
+                if he is not None:
+                    hi[j] = b2 * hi[j] + (1.0 - b2) * he[j]
+                else:
+                    hi[j] = b2 * hi[j] + (1.0 - b2) * g * g
+                u = mi[j] / max(rho * hi[j], eps)
+                if u > 1.0:
+                    u = 1.0
+                elif u < -1.0:
+                    u = -1.0
+                Wi[j] -= self.lr * u
+
+        hb_ext = self._curvature(idx, layer, "b")
+        mb, hb = st_b["m"], st_b["h"]
+        for j in range(n):
+            g = grad_b[j]
+            mb[j] = b1 * mb[j] + (1.0 - b1) * g
+            if hb_ext is not None:
+                hb[j] = b2 * hb[j] + (1.0 - b2) * hb_ext[j]
+            else:
+                hb[j] = b2 * hb[j] + (1.0 - b2) * g * g
+            u = mb[j] / max(rho * hb[j], eps)
+            if u > 1.0:
+                u = 1.0
+            elif u < -1.0:
+                u = -1.0
+            layer.biases[j] -= self.lr * u
+
+
+def _lb_flat_w(weights):
+    out = []
+    for row in weights:
+        out.extend(row)
+    return out
+
+
+def _lb_write_w(weights, flat):
+    p = 0
+    for row in weights:
+        for j in range(len(row)):
+            row[j] = flat[p]
+            p += 1
+
+
+def _lb_two_loop(g, pairs, gamma):
+    """L-BFGS 两循环递归，返回 ``H g``（pairs 按时间升序、元素是扁平列表）"""
+    q = list(g)
+    alphas = []
+    for s, y in reversed(pairs):
+        sy = 0.0
+        for a, b in zip(s, y):
+            sy += a * b
+        if sy <= 0.0:
+            alphas.append(0.0)
+            continue
+        a_i = 0.0
+        for qi, si in zip(q, s):
+            a_i += qi * si
+        a_i /= sy
+        alphas.append(a_i)
+        for j in range(len(q)):
+            q[j] -= a_i * y[j]
+    for j in range(len(q)):
+        q[j] *= gamma
+    for (s, y), a_i in zip(pairs, reversed(alphas)):
+        sy = 0.0
+        for a, b in zip(s, y):
+            sy += a * b
+        if sy <= 0.0:
+            continue
+        beta = 0.0
+        for qj, yj in zip(q, y):
+            beta += qj * yj
+        beta /= sy
+        for j in range(len(q)):
+            q[j] += s[j] * (a_i - beta)
+    return q
+
+
+class LBFGS(_LayerwiseOptimizer):
+    """L-BFGS（有限内存拟牛顿）：两循环递归算方向，**固定步长、无 line search**
+
+    本库的优化器接口按层更新，所以历史位移对是**逐层**保存的——等价于一个块对角
+    L-BFGS，而不是全局那一个。每层：
+
+        s_k = x_k - x_{k-1},  y_k = g_k - g_{k-1},  H₀ = (s·y)/(y·y)·I
+        d = -H g（两循环递归），x ← x + lr·d
+
+    曲率条件 ``s·y > eps`` 不满足时丢弃该对（标准保护，避免 H 非正定）。
+
+    已知边界（docstring 与 README 都写明）：
+      * 没有 line search，``lr`` 要自己调小（默认 0.1 已比 SGD 小一个量级）；
+      * 逐层分块会忽略跨层耦合，比真 L-BFGS 弱、比 SGD 强；
+      * 不支持 ``line_search_fn``（没有目标函数闭包可用）。
+    """
+
+    name = "lbfgs"
+
+    def __init__(self, model, lr=0.1, history_size=10, eps=1e-12, weight_decay=0.0):
+        _w9_check("LBFGS", lr)
+        _w9b_check("LBFGS", "weight_decay", weight_decay, 0.0)
+        _w9b_check("LBFGS", "eps", eps, 0.0)
+        if isinstance(history_size, bool) or not isinstance(history_size, int):
+            raise TypeError(f"LBFGS: history_size 必须是整数，收到 "
+                            f"{type(history_size).__name__}")
+        if history_size < 1:
+            raise ValueError(f"LBFGS: history_size 必须 >= 1，收到 {history_size!r}")
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.history_size = history_size
+        self.eps = float(eps)
+        self.weight_decay = float(weight_decay)
+
+    def _new_state(self, layer, kind):
+        base = _w9_zeros(layer, kind)
+        flat = _lb_flat_w(base) if kind == "w" else list(base)
+        return {"s": [], "y": [], "prev_p": list(flat), "prev_g": list(flat)}
+
+    def _check_state_field(self, key, field, arr, layer, kind):
+        who = f"{self.name}.load_state_dict[{key}.{field}]"
+        want = layer.fan_out * layer.fan_in if kind == "w" else layer.fan_out
+        if field in ("s", "y"):
+            if not isinstance(arr, list):
+                raise ValueError(f"{who}: 必须是列表，收到 {type(arr).__name__}")
+            for item in arr:
+                if not isinstance(item, list) or len(item) != want:
+                    raise ValueError(f"{who}: 每个位移对必须是长度 {want} 的扁平列表")
+                for v in item:
+                    if isinstance(v, bool) or not isinstance(v, (int, float)):
+                        raise ValueError(f"{who}: 元素必须是数字，"
+                                         f"收到 {type(v).__name__}")
+            return
+        if field in ("prev_p", "prev_g"):
+            if not isinstance(arr, list) or len(arr) != want:
+                raise ValueError(f"{who}: 必须是长度 {want} 的扁平列表")
+            for v in arr:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"{who}: 元素必须是数字，收到 {type(v).__name__}")
+            return
+        _w9_check_state(arr, layer, kind, who)
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        wd = self.weight_decay
+        n, k = layer.fan_out, layer.fan_in
+
+        g = []
+        for i in range(n):
+            Wi, gi = layer.weights[i], grad_w[i]
+            g.extend(gi[j] + wd * Wi[j] for j in range(k))
+        p = _lb_flat_w(layer.weights)
+        self._advance(g, p, st_w)
+        _lb_write_w(layer.weights, p)
+
+        gb = [grad_b[j] for j in range(n)]
+        pb = list(layer.biases)
+        self._advance(gb, pb, st_b)
+        layer.biases[:] = pb
+
+    def _advance(self, g, p, st):
+        """推进一层：用上一步位移对更新历史 → 两循环算方向 → 原地改 ``p``"""
+        prev_g = st["prev_g"]
+        prev_p = st["prev_p"]
+        s = [p[j] - prev_p[j] for j in range(len(p))]
+        y = [g[j] - prev_g[j] for j in range(len(p))]
+        sy = 0.0
+        yy = 0.0
+        for a, b in zip(s, y):
+            sy += a * b
+            yy += b * b
+        if self.step_count > 1 and sy > self.eps and yy > 0.0:
+            st["s"].append(s)
+            st["y"].append(y)
+            if len(st["s"]) > self.history_size:
+                st["s"].pop(0)
+                st["y"].pop(0)
+        pairs = list(zip(st["s"], st["y"]))
+        gamma = 1.0
+        if pairs:
+            s_last, y_last = pairs[-1]
+            sy_last = 0.0
+            yy_last = 0.0
+            for a, b in zip(s_last, y_last):
+                sy_last += a * b
+                yy_last += b * b
+            if yy_last > 0.0:
+                gamma = sy_last / yy_last
+        d = _lb_two_loop(g, pairs, gamma)
+        before = [p[j] for j in range(len(p))]
+        for j in range(len(p)):
+            p[j] -= self.lr * d[j]
+        st["prev_g"] = list(g)
+        st["prev_p"] = before
 # ============================================================================
 #  Gradient Clipping / LR Scheduler
 # ============================================================================
@@ -25683,6 +26184,9 @@ class Model:
         'adan': Adan,
         'prodigy': Prodigy,
         'came': CAME,
+        'shampoo': Shampoo,
+        'sophia': Sophia,
+        'lbfgs': LBFGS,
     }
 
     _LOSS_MAP = {

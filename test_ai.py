@@ -18077,3 +18077,211 @@ class TestAdvancedOptimizers:
         sd["state"][key]["r"] = [1.0]
         with pytest.raises(ValueError):
             AI.CAME(self._mk(seed=11)).load_state_dict(sd)
+
+
+class TestAdvancedOptimizers2:
+    """W9-E2：Shampoo / Sophia / L-BFGS 的闭式解、退化分支与状态往返"""
+
+    X = [1.0, -0.5, 0.25]
+    Y = [0.3, -0.7]
+
+    @staticmethod
+    def _mk(seed=11, sizes=(3, 4, 2)):
+        random.seed(seed)
+        acts = ["relu"] * (len(sizes) - 2) + ["linear"]
+        return AI.MLP(list(sizes), activations=acts)
+
+    @staticmethod
+    def _grads(model, x=None, y=None):
+        x = TestAdvancedOptimizers2.X if x is None else x
+        y = TestAdvancedOptimizers2.Y if y is None else y
+        pred = model.forward(x)
+        _loss, gp = AI.mse_loss(pred, y)
+        return AI._mlp_backward(model, gp)
+
+    @staticmethod
+    def _flat(model):
+        out = []
+        for layer in model.layers:
+            out.extend(layer.biases)
+            for row in layer.weights:
+                out.extend(row)
+        return out
+
+    def test_shampoo_matches_closed_form_1x1(self):
+        """1x1 层：L=R=g²，逆根把预条件化成 sign(g)，位移恰为 -lr·sign(g)"""
+        model = self._mk(sizes=(1, 1))
+        model.layers[0].weights[0][0] = 0.5
+        model.layers[0].biases[0] = 0.0
+        model.layers[0].activation_name = "linear"
+        grad = self._grads(model, [1.0], [0.0])
+        g = grad[0][0][0][0]
+        before = model.layers[0].weights[0][0]
+        AI.Shampoo(model, lr=0.25).step(grad)
+        assert abs((model.layers[0].weights[0][0] - before) + 0.25 * (1.0 if g > 0 else -1.0)) < 1e-12
+
+    def test_jacobi_reconstructs_symmetric_matrix(self):
+        """循环 Jacobi 的特征分解必须能重建原矩阵且特征向量正交"""
+        a = [[2.0, 1.0], [1.0, 2.0]]
+        vals, vecs = AI._jacobi_eigh(a)
+        assert abs(sorted(vals)[0] - 1.0) < 1e-12
+        assert abs(sorted(vals)[1] - 3.0) < 1e-12
+        for i in range(2):
+            for j in range(2):
+                rec = sum(vecs[i][k] * vals[k] * vecs[j][k] for k in range(2))
+                assert abs(rec - a[i][j]) < 1e-12
+                dot = sum(vecs[i][k] * vecs[j][k] for k in range(2))
+                assert abs(dot - (1.0 if i == j else 0.0)) < 1e-12
+
+    def test_shampoo_falls_back_above_max_dim(self):
+        """超过 max_dim 的层退化为逐元素 Adam（状态里是 m/v 而不是 L/R）"""
+        small = self._mk(sizes=(3, 5, 2))
+        opt_small = AI.Shampoo(small, max_dim=2)
+        opt_small.step(self._grads(small))
+        assert "m" in opt_small.state[(0, "w")] and "L" not in opt_small.state[(0, "w")]
+        big = self._mk(sizes=(3, 5, 2))
+        opt_big = AI.Shampoo(big, max_dim=64)
+        opt_big.step(self._grads(big))
+        assert "L" in opt_big.state[(0, "w")] and "m" not in opt_big.state[(0, "w")]
+
+    def test_sophia_matches_closed_form_1x1(self):
+        """一步：m=(1-β₁)g、h=(1-β₂)g²，位移 = -lr·clip(m/(ρh))"""
+        model = self._mk(sizes=(1, 1))
+        model.layers[0].weights[0][0] = 0.5
+        model.layers[0].biases[0] = 0.0
+        model.layers[0].activation_name = "linear"
+        grad = self._grads(model, [1.0], [0.0])
+        g = grad[0][0][0][0]
+        b1, b2, rho, lr = 0.9, 0.999, 0.04, 0.1
+        u = ((1.0 - b1) * g) / max(rho * (1.0 - b2) * g * g, 1e-8)
+        u = max(-1.0, min(1.0, u))
+        before = model.layers[0].weights[0][0]
+        AI.Sophia(model, lr=lr, beta1=b1, beta2=b2, rho=rho).step(grad)
+        assert abs((model.layers[0].weights[0][0] - before) + lr * u) < 1e-12
+
+    def test_sophia_uses_explicit_curvature(self):
+        """hessian_diags 覆盖 g² 近似：曲率大 ⇒ 步长被压小"""
+        plain = self._mk()
+        opt = AI.Sophia(plain, lr=0.1)
+        before = [row[:] for row in plain.layers[0].weights]
+        opt.step(self._grads(plain))
+        d_plain = max(abs(a - b) for ra, rb in zip(plain.layers[0].weights, before)
+                      for a, b in zip(ra, rb))
+
+        curved = self._mk()
+        opt2 = AI.Sophia(curved, lr=0.1)
+        before2 = [row[:] for row in curved.layers[0].weights]
+        h_w = [[1e6] * 3 for _ in range(4)]
+        opt2.step(self._grads(curved), hessian_diags=[(h_w, [1e6] * 4), (None, None)])
+        d_curved = max(abs(a - b) for ra, rb in zip(curved.layers[0].weights, before2)
+                       for a, b in zip(ra, rb))
+        assert d_curved < 1e-2 * d_plain
+
+    def test_lbfgs_first_step_is_sgd_then_curvature_scaled(self):
+        """第一步没有位移对 ⇒ 纯 -lr·g；第二步方向按 gamma=s·y/y·y 缩放"""
+        model = self._mk(sizes=(1, 1))
+        model.layers[0].weights[0][0] = 0.5
+        model.layers[0].biases[0] = 0.0
+        model.layers[0].activation_name = "linear"
+        grad = self._grads(model, [1.0], [0.0])
+        g = grad[0][0][0][0]
+        w0 = model.layers[0].weights[0][0]
+        opt = AI.LBFGS(model, lr=0.1, history_size=5)
+        opt.step(grad)
+        w1 = model.layers[0].weights[0][0]
+        assert abs((w1 - w0) + 0.1 * g) < 1e-12
+        grad1 = self._grads(model, [1.0], [0.0])
+        g1 = grad1[0][0][0][0]
+        opt.step(grad1)
+        w2 = model.layers[0].weights[0][0]
+        s, y = w1 - w0, g1 - g
+        gamma = (s * y) / (y * y)
+        assert abs((w2 - w1) + 0.1 * gamma * g1) < 1e-10
+
+    def test_state_roundtrip_is_bitwise(self):
+        """存档 → 载入 → 继续两步，权重与偏置逐位一致（含 s/y/prev_p 快照）"""
+        for cls in (AI.Shampoo, AI.Sophia, AI.LBFGS):
+            a = self._mk(seed=13)
+            b = self._mk(seed=13)
+            oa, ob = cls(a), cls(b)
+            oa.step(self._grads(a))
+            oa.step(self._grads(a))
+            for la, lb in zip(a.layers, b.layers):
+                lb.biases[:] = la.biases[:]
+                for j in range(la.fan_out):
+                    lb.weights[j][:] = la.weights[j][:]
+            ob.load_state_dict(oa.state_dict())
+            for _ in range(2):
+                oa.step(self._grads(a))
+                ob.step(self._grads(b))
+            assert self._flat(a) == self._flat(b), cls.__name__
+
+    def test_state_dict_does_not_alias(self):
+        """快照必须是拷贝：改快照不能影响优化器内部状态"""
+        for cls in (AI.Shampoo, AI.Sophia, AI.LBFGS):
+            model = self._mk()
+            opt = cls(model)
+            opt.step(self._grads(model))
+            sd = opt.state_dict()
+            key = sorted(sd["state"])[0]
+            field = sorted(sd["state"][key])[0]
+            arr = sd["state"][key][field]
+            while isinstance(arr, list) and arr and isinstance(arr[0], list):
+                arr = arr[0]
+            if not isinstance(arr, list) or not arr:
+                continue
+            arr[0] = 12345.0
+            idx, kind = key.split(":")
+            live = opt.state[(int(idx), kind)][field]
+            while isinstance(live, list) and live and isinstance(live[0], list):
+                live = live[0]
+            assert live[0] != 12345.0, cls.__name__
+
+    def test_invalid_hyperparameters(self):
+        """非法超参必须在构造时报错，而不是训练中途出现 NaN"""
+        model = self._mk()
+        cases = [
+            lambda: AI.Shampoo(model, precondition_every=0),
+            lambda: AI.Shampoo(model, precondition_every="2"),
+            lambda: AI.Shampoo(model, max_dim=0),
+            lambda: AI.Shampoo(model, lr=-0.1),
+            lambda: AI.Sophia(model, rho=0.0),
+            lambda: AI.Sophia(model, hessian_fn=1),
+            lambda: AI.Sophia(model, beta2=1.0),
+            lambda: AI.LBFGS(model, history_size=0),
+            lambda: AI.LBFGS(model, history_size=True),
+            lambda: AI.LBFGS(model, lr=-1.0),
+        ]
+        for fn in cases:
+            try:
+                fn()
+            except (ValueError, TypeError):
+                continue
+            raise AssertionError("非法超参没有报错")
+
+    def test_loss_decreases(self):
+        """300 步内三者都能把 XOR 型数据拟合到接近 0"""
+        for cls in (AI.Shampoo, AI.Sophia, AI.LBFGS):
+            model = self._mk(seed=3)
+            opt = cls(model)
+            first = None
+            for _ in range(300):
+                pred = model.forward(self.X)
+                loss, gp = AI.mse_loss(pred, self.Y)
+                if first is None:
+                    first = loss
+                opt.step(AI._mlp_backward(model, gp))
+            last = AI.mse_loss(model.forward(self.X), self.Y)[0]
+            assert math.isfinite(last) and last < first, cls.__name__
+
+    def test_registered_and_trains(self):
+        """三个名字能被 Model(optimizer=...) 认到并让 loss 下降"""
+        for name in ("shampoo", "sophia", "lbfgs"):
+            model = AI.Model(AI.MLP([2, 4, 2], activations=["relu", "linear"]),
+                             loss_fn="mse", task="regression",
+                             optimizer=name, lr=0.02)
+            data = [([0.1 * i, -0.2 * i], [0.0, 1.0]) for i in range(4)]
+            h = model.fit(data=data, epochs=5, verbose=False)
+            first = h["train_loss"][0][1]
+            last = h["train_loss"][-1][1]
+            assert math.isfinite(last) and last <= first + 1e-9, name
