@@ -147,7 +147,10 @@
       —— 两处推导坑：`dx` 的 layer 项必须对**全部通道**求和（只算本通道时误差 1.503），
       而 `grad_logits` 的 `S`/`Sx` 只需**本通道**（用全局量时 `dL/dw2` 差 2.03×）。
 - [x] 激活族（W3-B）：`PReLU`（逐特征可学习斜率，负分支才累计 `da`）、`Snake`（`y = x + sin²(ax)/a`，`a→0` 走极限分支；`dx`/`da` 中心差分 ≤1e-7）
-- [ ] 激活族（剩余）：`Maxout`、`DynamicReLU`、`FReLU`
+- [x] 激活族（W3-E）：`Maxout`（k 条仿射支路取最大，argmax 路由，`dx`/`grad_a` 中心差分 ≤7.1e-11）、
+      `DynamicReLU`（斜率由 `mean(x)` 线性预测；`dx` 的耦合项是 `(1/d)Σ_{x_i≤0} dout_i·x_i·w_i`，
+      对**所有**特征都非零 —— 我第一版把它写成 `w_j` 且只加到负分支，差分误差 1.017）、
+      `FReLU`（`y = max(x, T(x))`，`T` 是逐通道 k×k 深度卷积；零初始化严格等于 ReLU）
 - [x] GLU 族（W3-B）：`SwiGLU(gate="swish|silu|gelu|relu|bilinear")` → SwiGLU / GeGLU / ReGLU / Bilinear GLU；默认 `swish` 与原实现逐位一致，各 gate 的 `grad_Wg` 中心差分 ≤1e-6
 - [x] 初始化族：`init_lecun_normal`/`init_lecun_uniform`、`init_orthogonal`、`init_sparse`、
       `init_trunc_normal`、`zero_bias`、`zero_init_residual`（W3-C）

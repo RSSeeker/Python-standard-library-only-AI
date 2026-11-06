@@ -4283,6 +4283,405 @@ class Snake:
         self.zero_grad()
 
 
+class Maxout:
+    """Maxout：out_i = max_k (a_ki * x_i + b_ki)
+
+    每个特征位置上并行 `num_pieces` 条仿射支路，取最大。凸的、分段线性，
+    可以逼近任何凸函数。梯度只流向被选中的那条支路（argmax 路由）。
+    """
+
+    def __init__(self, num_features: int, num_pieces: int = 2):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(
+                f"Maxout: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(f"Maxout: num_features 必须 >= 1，收到 {num_features!r}")
+        if isinstance(num_pieces, bool) or not isinstance(num_pieces, int):
+            raise TypeError(
+                f"Maxout: num_pieces 必须是 int，收到 {type(num_pieces).__name__}")
+        if num_pieces < 2:
+            raise ValueError(
+                f"Maxout: num_pieces 必须 >= 2（否则退化成单条仿射），收到 {num_pieces!r}")
+        self.d = num_features
+        self.k = num_pieces
+        # 第 0 条支路是恒等（a=1,b=0），其余是 0.5 斜率 —— 确定性初始化，
+        # 相当于一个"软" LeakyReLU 起点
+        self.a = [[1.0 if k == 0 else 0.5 for _ in range(self.d)]
+                  for k in range(self.k)]
+        self.b = [[0.0] * self.d for _ in range(self.k)]
+        self.x = None
+        self.arg = None
+        self.grad_a = [[0.0] * self.d for _ in range(self.k)]
+        self.grad_b = [[0.0] * self.d for _ in range(self.k)]
+        self.m_a = [[0.0] * self.d for _ in range(self.k)]
+        self.v_a = [[0.0] * self.d for _ in range(self.k)]
+        self.m_b = [[0.0] * self.d for _ in range(self.k)]
+        self.v_b = [[0.0] * self.d for _ in range(self.k)]
+        self._adam_t = 0
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"Maxout.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        out = [0.0] * self.d
+        arg = [0] * self.d
+        for i in range(self.d):
+            best = self.a[0][i] * x[i] + self.b[0][i]
+            best_k = 0
+            for k in range(1, self.k):
+                v = self.a[k][i] * x[i] + self.b[k][i]
+                if v > best:
+                    best = v
+                    best_k = k
+            out[i] = best
+            arg[i] = best_k
+        self.arg = arg
+        return out
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("Maxout.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"Maxout.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致")
+        self.zero_grad()
+        dx = [0.0] * self.d
+        for i in range(self.d):
+            k = self.arg[i]
+            self.grad_a[k][i] += dout[i] * self.x[i]
+            self.grad_b[k][i] += dout[i]
+            dx[i] = dout[i] * self.a[k][i]
+        return dx
+
+    def zero_grad(self):
+        self.grad_a = [[0.0] * self.d for _ in range(self.k)]
+        self.grad_b = [[0.0] * self.d for _ in range(self.k)]
+
+    def param_count(self):
+        return 2 * self.d * self.k
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def _check_lr(self, lr, who):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"{who}: lr 必须是非负数，收到 {lr!r}")
+        return float(lr)
+
+    def sgd_step(self, lr):
+        lr = self._check_lr(lr, "Maxout.sgd_step")
+        for k in range(self.k):
+            for i in range(self.d):
+                self.a[k][i] -= lr * self.grad_a[k][i]
+                self.b[k][i] -= lr * self.grad_b[k][i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        lr = self._check_lr(lr, "Maxout.adam_step")
+        self._adam_t += 1
+        for k in range(self.k):
+            for i in range(self.d):
+                ga = self.grad_a[k][i]
+                gb = self.grad_b[k][i]
+                self.m_a[k][i] = beta1 * self.m_a[k][i] + (1 - beta1) * ga
+                self.v_a[k][i] = beta2 * self.v_a[k][i] + (1 - beta2) * ga * ga
+                mh = self.m_a[k][i] / (1 - beta1 ** self._adam_t)
+                vh = self.v_a[k][i] / (1 - beta2 ** self._adam_t)
+                self.a[k][i] -= lr * mh / (math.sqrt(vh) + eps)
+                self.m_b[k][i] = beta1 * self.m_b[k][i] + (1 - beta1) * gb
+                self.v_b[k][i] = beta2 * self.v_b[k][i] + (1 - beta2) * gb * gb
+                mh = self.m_b[k][i] / (1 - beta1 ** self._adam_t)
+                vh = self.v_b[k][i] / (1 - beta2 ** self._adam_t)
+                self.b[k][i] -= lr * mh / (math.sqrt(vh) + eps)
+        self.zero_grad()
+
+
+class DynamicReLU:
+    """动态 ReLU（DY-ReLU-A 的逐特征简化版）
+
+    负分支的斜率不是固定参数，而是由**输入自身的全局上下文**（各特征均值）
+    线性预测：`a_i = w_i * z + b_i`，`z = mean(x)`。于是 `a` 随样本而变，
+    这是它和 PReLU 的本质区别。
+
+    注意 dx 耦合：改 x_j 会改变 z，进而改变**所有**负分支的斜率，所以
+    `dx_j` 里有一项 `w_j * x_j/d * sum_{i: x_i<=0} dout_i * x_i`。
+    """
+
+    def __init__(self, num_features: int, init_slope: float = 0.25):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(
+                f"DynamicReLU: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(
+                f"DynamicReLU: num_features 必须 >= 1，收到 {num_features!r}")
+        if isinstance(init_slope, bool) or not isinstance(init_slope, (int, float)):
+            raise TypeError(
+                f"DynamicReLU: init_slope 必须是数字，收到 {type(init_slope).__name__}")
+        if not math.isfinite(float(init_slope)):
+            raise ValueError(
+                f"DynamicReLU: init_slope 必须是有限数，收到 {init_slope!r}")
+        self.d = num_features
+        # w=0、b=init_slope ⇒ 初始时 a 恒为 init_slope（退化成一个 LeakyReLU 起点）
+        self.w = [0.0] * self.d
+        self.b = [float(init_slope)] * self.d
+        self.x = None
+        self.z = 0.0
+        self.slope = None
+        self.grad_w = [0.0] * self.d
+        self.grad_b = [0.0] * self.d
+        self.m_w = [0.0] * self.d
+        self.v_w = [0.0] * self.d
+        self.m_b = [0.0] * self.d
+        self.v_b = [0.0] * self.d
+        self._adam_t = 0
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"DynamicReLU.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        self.z = sum(x) / self.d
+        self.slope = [self.w[i] * self.z + self.b[i] for i in range(self.d)]
+        return [x[i] if x[i] > 0.0 else self.slope[i] * x[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("DynamicReLU.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"DynamicReLU.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致")
+        self.zero_grad()
+        # 负分支的斜率 a_i = w_i*z + b_i 依赖 z = mean(x)，所以 ∂y_i/∂x_j 里有
+        # x_i*w_i/d 这一项 —— 它对**所有** j 都非零（不只是 i == j）。
+        # 聚合起来：dx_j = (正分支 ? dout_j : dout_j*a_j) + (1/d)*Σ_{i∈负} dout_i*x_i*w_i
+        s_coup = 0.0
+        for i in range(self.d):
+            if self.x[i] <= 0.0:
+                s_coup += dout[i] * self.x[i] * self.w[i]
+        dx = [0.0] * self.d
+        for i in range(self.d):
+            if self.x[i] > 0.0:
+                dx[i] = dout[i]
+            else:
+                dx[i] = dout[i] * self.slope[i]
+                self.grad_w[i] += dout[i] * self.x[i] * self.z
+                self.grad_b[i] += dout[i] * self.x[i]
+        for i in range(self.d):
+            dx[i] += s_coup / self.d
+        return dx
+
+    def zero_grad(self):
+        self.grad_w = [0.0] * self.d
+        self.grad_b = [0.0] * self.d
+
+    def param_count(self):
+        return 2 * self.d
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"DynamicReLU.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.d):
+            self.w[i] -= lr * self.grad_w[i]
+            self.b[i] -= lr * self.grad_b[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"DynamicReLU.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        for i in range(self.d):
+            for holder, grad, m, v in ((self.w, self.grad_w[i], self.m_w, self.v_w),
+                                       (self.b, self.grad_b[i], self.m_b, self.v_b)):
+                m[i] = beta1 * m[i] + (1 - beta1) * grad
+                v[i] = beta2 * v[i] + (1 - beta2) * grad * grad
+                mh = m[i] / (1 - beta1 ** self._adam_t)
+                vh = v[i] / (1 - beta2 ** self._adam_t)
+                holder[i] -= lr * mh / (math.sqrt(vh) + eps)
+        self.zero_grad()
+
+
+class FReLU:
+    """FReLU（漏斗激活）：y = max(x, T(x))
+
+    `T` 是逐通道的 k×k 深度卷积（零填充、边界保持），于是激活形状是
+    **二维漏斗**而不是一条直线。`w`/`b` 全零初始化时 `T(x) == 0`，
+    本层严格退化成 ReLU —— 这是可测的恒等性质。
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 3):
+        if isinstance(channels, bool) or not isinstance(channels, int):
+            raise TypeError(
+                f"FReLU: channels 必须是 int，收到 {type(channels).__name__}")
+        if channels < 1:
+            raise ValueError(f"FReLU: channels 必须 >= 1，收到 {channels!r}")
+        if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
+            raise TypeError(
+                f"FReLU: kernel_size 必须是 int，收到 {type(kernel_size).__name__}")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError(
+                f"FReLU: kernel_size 必须是正奇数，收到 {kernel_size!r}")
+        self.c = channels
+        self.k = kernel_size
+        self.pad = kernel_size // 2
+        self.w = [[[0.0] * self.k for _ in range(self.k)] for _ in range(self.c)]
+        self.b = [0.0] * self.c
+        self.x = None
+        self.mask = None
+        self.grad_w = [[[0.0] * self.k for _ in range(self.k)] for _ in range(self.c)]
+        self.grad_b = [0.0] * self.c
+        self.m_w = [[[0.0] * self.k for _ in range(self.k)] for _ in range(self.c)]
+        self.v_w = [[[0.0] * self.k for _ in range(self.k)] for _ in range(self.c)]
+        self.m_b = [0.0] * self.c
+        self.v_b = [0.0] * self.c
+        self._adam_t = 0
+        self.training = True
+
+    def _pad(self, x):
+        h = len(x[0])
+        w = len(x[0][0])
+        p = self.pad
+        out = [[[0.0] * (w + 2 * p) for _ in range(h + 2 * p)] for _ in range(self.c)]
+        for c in range(self.c):
+            for i in range(h):
+                for j in range(w):
+                    out[c][i + p][j + p] = x[c][i][j]
+        return out, h, w
+
+    def forward(self, x):
+        if len(x) != self.c:
+            raise ValueError(
+                f"FReLU.forward: 通道数 {len(x)} 与本层 {self.c} 不一致")
+        h = len(x[0])
+        w = len(x[0][0])
+        for c in range(self.c):
+            if len(x[c]) != h or len(x[c][0]) != w:
+                raise ValueError("FReLU.forward: 各通道空间尺寸必须一致")
+        self.x = x
+        xp, _, _ = self._pad(x)
+        out = [[[0.0] * w for _ in range(h)] for _ in range(self.c)]
+        mask = [[[False] * w for _ in range(h)] for _ in range(self.c)]
+        for c in range(self.c):
+            for i in range(h):
+                for j in range(w):
+                    t = self.b[c]
+                    for a in range(self.k):
+                        for bb in range(self.k):
+                            t += self.w[c][a][bb] * xp[c][i + a][j + bb]
+                    xv = x[c][i][j]
+                    if t > xv:
+                        out[c][i][j] = t
+                        mask[c][i][j] = True
+                    else:
+                        out[c][i][j] = xv
+        self.mask = mask
+        return out
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("FReLU.backward: 必须先调用 forward()")
+        h = len(self.x[0])
+        w = len(self.x[0][0])
+        if len(dout) != self.c or len(dout[0]) != h or len(dout[0][0]) != w:
+            raise ValueError("FReLU.backward: dout 形状必须与 forward 的输入一致")
+        self.zero_grad()
+        xp, _, _ = self._pad(self.x)
+        dx = [[[0.0] * w for _ in range(h)] for _ in range(self.c)]
+        dz = [[[0.0] * w for _ in range(h)] for _ in range(self.c)]
+        for c in range(self.c):
+            for i in range(h):
+                for j in range(w):
+                    if self.mask[c][i][j]:
+                        dz[c][i][j] = dout[c][i][j]
+                    else:
+                        dx[c][i][j] += dout[c][i][j]
+        for c in range(self.c):
+            for i in range(h):
+                for j in range(w):
+                    g = dz[c][i][j]
+                    if g == 0.0:
+                        continue
+                    self.grad_b[c] += g
+                    for a in range(self.k):
+                        for bb in range(self.k):
+                            self.grad_w[c][a][bb] += g * xp[c][i + a][j + bb]
+        # 把卷积支路的梯度散射回输入
+        for c in range(self.c):
+            for i in range(h):
+                for j in range(w):
+                    g = dz[c][i][j]
+                    if g == 0.0:
+                        continue
+                    for a in range(self.k):
+                        for bb in range(self.k):
+                            xi = i + a - self.pad
+                            xj = j + bb - self.pad
+                            if 0 <= xi < h and 0 <= xj < w:
+                                dx[c][xi][xj] += g * self.w[c][a][bb]
+        return dx
+
+    def zero_grad(self):
+        self.grad_w = [[[0.0] * self.k for _ in range(self.k)] for _ in range(self.c)]
+        self.grad_b = [0.0] * self.c
+
+    def param_count(self):
+        return self.c * self.k * self.k + self.c
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"FReLU.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for c in range(self.c):
+            for a in range(self.k):
+                for bb in range(self.k):
+                    self.w[c][a][bb] -= lr * self.grad_w[c][a][bb]
+            self.b[c] -= lr * self.grad_b[c]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"FReLU.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        for c in range(self.c):
+            for a in range(self.k):
+                for bb in range(self.k):
+                    g = self.grad_w[c][a][bb]
+                    self.m_w[c][a][bb] = beta1 * self.m_w[c][a][bb] + (1 - beta1) * g
+                    self.v_w[c][a][bb] = beta2 * self.v_w[c][a][bb] + (1 - beta2) * g * g
+                    mh = self.m_w[c][a][bb] / (1 - beta1 ** self._adam_t)
+                    vh = self.v_w[c][a][bb] / (1 - beta2 ** self._adam_t)
+                    self.w[c][a][bb] -= lr * mh / (math.sqrt(vh) + eps)
+            g = self.grad_b[c]
+            self.m_b[c] = beta1 * self.m_b[c] + (1 - beta1) * g
+            self.v_b[c] = beta2 * self.v_b[c] + (1 - beta2) * g * g
+            mh = self.m_b[c] / (1 - beta1 ** self._adam_t)
+            vh = self.v_b[c] / (1 - beta2 ** self._adam_t)
+            self.b[c] -= lr * mh / (math.sqrt(vh) + eps)
+        self.zero_grad()
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 

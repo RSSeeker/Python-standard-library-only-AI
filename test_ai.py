@@ -11584,3 +11584,300 @@ class TestFRN:
                 pass
             else:
                 raise AssertionError("非法输入应该报错")
+
+
+# ==== W3-E：Maxout / DynamicReLU / FReLU ====
+
+class TestMaxout:
+    """逐特征多仿射支路取最大：前向、argmax 路由、梯度差分、优化器步"""
+
+    def test_forward_and_routing(self):
+        mo = AI.Maxout(3, num_pieces=3)
+        mo.a = [[1.0, -2.0, 0.5], [0.5, 3.0, -1.0], [-1.0, 0.0, 2.0]]
+        mo.b = [[0.0, 0.1, 0.0], [0.2, -0.3, 0.0], [0.0, 0.0, 0.5]]
+        x = [1.0, -0.5, 0.25]
+        got = mo.forward(x)
+        ref = [max(mo.a[k][i] * x[i] + mo.b[k][i] for k in range(3)) for i in range(3)]
+        assert all(abs(g - r) < 1e-15 for g, r in zip(got, ref))
+        for i in range(3):
+            best = max(mo.a[k][i] * x[i] + mo.b[k][i] for k in range(3))
+            assert abs(mo.a[mo.arg[i]][i] * x[i] + mo.b[mo.arg[i]][i] - best) < 1e-15
+        assert mo.param_count() == 2 * 3 * 3
+        # 只给选中支路发梯度
+        dout = [0.7, -1.3, 0.4]
+        mo.forward(x)
+        dx = mo.backward(dout)
+        assert all(abs(dx[i] - dout[i] * mo.a[mo.arg[i]][i]) < 1e-15 for i in range(3))
+        for i in range(3):
+            for k in range(3):
+                if k == mo.arg[i]:
+                    assert abs(mo.grad_a[k][i] - dout[i] * x[i]) < 1e-15
+                    assert abs(mo.grad_b[k][i] - dout[i]) < 1e-15
+                else:
+                    assert mo.grad_a[k][i] == 0.0 and mo.grad_b[k][i] == 0.0
+
+    def test_gradients_vs_finite_difference(self):
+        mo = AI.Maxout(3, num_pieces=3)
+        mo.a = [[1.0, -2.0, 0.5], [0.4, 3.0, -1.0], [-1.0, 0.2, 2.0]]
+        mo.b = [[0.0, 0.1, 0.0], [0.2, -0.3, 0.0], [0.0, 0.0, 0.5]]
+        x = [1.0, -0.5, 0.25]
+        coef = [0.7, -1.3, 0.4]
+
+        def loss():
+            o = mo.forward(x)
+            return sum(o[i] * coef[i] for i in range(3))
+
+        mo.forward(x)
+        dx = mo.backward(coef)
+        for i in range(3):
+            old = x[i]
+            h = 1e-6
+            x[i] = old + h
+            lp = loss()
+            x[i] = old - h
+            lmm = loss()
+            x[i] = old
+            num = (lp - lmm) / (2 * h)
+            assert abs(num - dx[i]) <= 1e-7 * max(1.0, abs(num)), \
+                f"Maxout dx[{i}] 差分误差 {abs(num - dx[i]):.3e}"
+        for k in range(3):
+            for i in range(3):
+                old = mo.a[k][i]
+                h = 1e-6
+                mo.a[k][i] = old + h
+                lp = loss()
+                mo.a[k][i] = old - h
+                lmm = loss()
+                mo.a[k][i] = old
+                num = (lp - lmm) / (2 * h)
+                mo.forward(x)
+                mo.backward(coef)
+                assert abs(num - mo.grad_a[k][i]) <= 1e-7 * max(1.0, abs(num)), \
+                    f"Maxout grad_a[{k}][{i}] 差分误差 {abs(num - mo.grad_a[k][i]):.3e}"
+
+    def test_steps_and_errors(self):
+        mo = AI.Maxout(2, num_pieces=2)
+        mo.forward([1.0, -1.0])
+        mo.backward([0.5, 0.5])
+        a0 = [row[:] for row in mo.a]
+        mo.sgd_step(0.1)
+        assert any(abs(a - b) > 1e-12 for r0, r1 in zip(a0, mo.a) for a, b in zip(r0, r1))
+        assert all(v == 0.0 for row in mo.grad_a for v in row)
+        mo.forward([1.0, -1.0])
+        mo.backward([0.5, 0.5])
+        b0 = [row[:] for row in mo.b]
+        mo.adam_step(0.01)
+        assert any(abs(a - b) > 1e-12 for r0, r1 in zip(b0, mo.b) for a, b in zip(r0, r1))
+        for fn in (lambda: AI.Maxout(0), lambda: AI.Maxout(True),
+                   lambda: AI.Maxout(2, num_pieces=1),
+                   lambda: AI.Maxout(2).forward([1.0]),
+                   lambda: AI.Maxout(2).backward([1.0, 2.0]),
+                   lambda: AI.Maxout(2).sgd_step(-1.0)):
+            try:
+                fn()
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+
+
+class TestDynamicReLU:
+    """斜率由输入上下文线性预测：闭式解、跨特征耦合的 dx、优化器步"""
+
+    def test_forward_closed_form(self):
+        dr = AI.DynamicReLU(3, init_slope=0.25)
+        # w=0 ⇒ 斜率恒等于 init_slope（退化 LeakyReLU）
+        assert dr.forward([-1.0, 2.0, -0.5]) == [-0.25, 2.0, -0.125]
+        dr.w = [0.8, -1.2, 0.5]
+        dr.b = [0.3, -0.1, 0.6]
+        x = [-1.0, 2.0, -0.5]
+        z = sum(x) / 3
+        got = dr.forward(x)
+        ref = [x[i] if x[i] > 0 else (dr.w[i] * z + dr.b[i]) * x[i] for i in range(3)]
+        assert all(abs(g - r) < 1e-15 for g, r in zip(got, ref))
+        assert dr.param_count() == 6
+        # 换一个样本，斜率应随之变化（这正是 vs PReLU 的区别）
+        s1 = dr.forward([-1.0, 2.0, -0.5])[0]
+        s2 = dr.forward([-1.0, -2.0, -3.0])[0]
+        assert abs(s1 - s2) > 1e-12
+
+    def test_coupled_dx_and_grads(self):
+        dr = AI.DynamicReLU(3)
+        dr.w = [0.8, -1.2, 0.5]
+        dr.b = [0.3, -0.1, 0.6]
+        x = [-1.0, 2.0, -0.5]
+        dout = [0.5, -0.7, 1.1]
+        z = sum(x) / 3
+        s_coup = sum(dout[i] * x[i] * dr.w[i] for i in range(3) if x[i] <= 0)
+        ref = []
+        for i in range(3):
+            if x[i] > 0:
+                ref.append(dout[i] + s_coup / 3)
+            else:
+                ref.append(dout[i] * (dr.w[i] * z + dr.b[i]) + s_coup / 3)
+        dr.forward(x)
+        dx = dr.backward(dout)
+        assert all(abs(a - b) < 1e-14 for a, b in zip(dx, ref))
+        # 正分支特征也吃到耦合项（因为改 x_j 会改 z，从而改所有负分支斜率）
+        assert abs(dx[1] - dout[1]) > 1e-9
+
+        base_w, base_b = dr.w[:], dr.b[:]
+
+        def loss():
+            o = dr.forward(x)
+            return sum(o[j] * dout[j] for j in range(3))
+
+        for i in range(3):
+            for holder, ana, nm in ((base_w, dr.grad_w, "w"), (base_b, dr.grad_b, "b")):
+                keep = holder[i]
+                h = 1e-6
+                holder[i] = keep + h
+                dr.w, dr.b = base_w, base_b
+                lp = loss()
+                holder[i] = keep - h
+                dr.w, dr.b = base_w, base_b
+                lmm = loss()
+                holder[i] = keep
+                dr.w, dr.b = base_w, base_b
+                dr.forward(x)
+                dr.backward(dout)
+                num = (lp - lmm) / (2 * h)
+                assert abs(num - ana[i]) <= 1e-7 * max(1.0, abs(num)), \
+                    f"DynamicReLU grad_{nm}[{i}] 差分误差 {abs(num - ana[i]):.3e}"
+        # dx 也要过差分（含耦合项）
+        for i in range(3):
+            old = x[i]
+            h = 1e-6
+            x[i] = old + h
+            lp = loss()
+            x[i] = old - h
+            lmm = loss()
+            x[i] = old
+            dr.forward(x)
+            dr.backward(dout)
+            num = (lp - lmm) / (2 * h)
+            assert abs(num - dx[i]) <= 1e-7 * max(1.0, abs(num)), \
+                f"DynamicReLU dx[{i}] 差分误差 {abs(num - dx[i]):.3e}"
+
+    def test_steps_and_errors(self):
+        dr = AI.DynamicReLU(2)
+        dr.forward([-1.0, 0.5])
+        dr.backward([1.0, 1.0])
+        w0 = dr.w[:]
+        dr.sgd_step(0.1)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(w0, dr.w))
+        dr.forward([-1.0, 0.5])
+        dr.backward([1.0, 1.0])
+        w1 = dr.w[:]
+        dr.adam_step(0.01)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(w1, dr.w))
+        for fn in (lambda: AI.DynamicReLU(0),
+                   lambda: AI.DynamicReLU(2, init_slope=float("inf")),
+                   lambda: AI.DynamicReLU(2).forward([1.0]),
+                   lambda: AI.DynamicReLU(2).backward([1.0, 2.0])):
+            try:
+                fn()
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+
+
+class TestFReLU:
+    """漏斗激活 max(x, T(x))：零初始化退化为 ReLU、闭式解、梯度差分"""
+
+    def test_zero_init_is_relu(self):
+        import random as _random
+        _random.seed(41)
+        fr = AI.FReLU(2, kernel_size=3)
+        x = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(3)]
+             for _ in range(2)]
+        o = fr.forward(x)
+        assert all(o[c][i][j] == max(0.0, x[c][i][j])
+                   for c in range(2) for i in range(3) for j in range(4))
+        assert fr.param_count() == 2 * 9 + 2
+
+    def test_forward_closed_form(self):
+        import random as _random
+        _random.seed(42)
+        fr = AI.FReLU(2, kernel_size=3)
+        fr.w = [[[0.1, 0.0, -0.1], [0.0, 0.2, 0.0], [0.05, 0.0, 0.15]] for _ in range(2)]
+        fr.b = [0.05, -0.05]
+        x = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(3)]
+             for _ in range(2)]
+        o = fr.forward(x)
+        for c in range(2):
+            for i in range(3):
+                for j in range(4):
+                    t = fr.b[c]
+                    for a in range(3):
+                        for bb in range(3):
+                            ii, jj = i + a - 1, j + bb - 1
+                            if 0 <= ii < 3 and 0 <= jj < 4:
+                                t += fr.w[c][a][bb] * x[c][ii][jj]
+                    assert abs(o[c][i][j] - max(x[c][i][j], t)) < 1e-13
+
+    def test_gradients_and_steps(self):
+        import random as _random
+        _random.seed(43)
+        fr = AI.FReLU(1, kernel_size=3)
+        fr.w = [[[0.2, 0.1, 0.0], [0.0, -0.3, 0.1], [0.05, 0.0, 0.25]]]
+        fr.b = [0.1]
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]]
+        coef = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]]
+
+        def loss():
+            o = fr.forward(x)
+            return sum(o[c][i][j] * coef[c][i][j]
+                       for c in range(1) for i in range(3) for j in range(3))
+
+        fr.forward(x)
+        dx = fr.backward(coef)
+        for i in range(3):
+            for j in range(3):
+                old = x[0][i][j]
+                h = 1e-6
+                x[0][i][j] = old + h
+                lp = loss()
+                x[0][i][j] = old - h
+                lmm = loss()
+                x[0][i][j] = old
+                num = (lp - lmm) / (2 * h)
+                assert abs(num - dx[0][i][j]) <= 1e-7 * max(1.0, abs(num)), \
+                    f"FReLU dx[{i}][{j}] 差分误差 {abs(num - dx[0][i][j]):.3e}"
+        for a in range(3):
+            for bb in range(3):
+                keep = fr.w[0][a][bb]
+                h = 1e-6
+                fr.w[0][a][bb] = keep + h
+                lp = loss()
+                fr.w[0][a][bb] = keep - h
+                lmm = loss()
+                fr.w[0][a][bb] = keep
+                fr.forward(x)
+                fr.backward(coef)
+                num = (lp - lmm) / (2 * h)
+                assert abs(num - fr.grad_w[0][a][bb]) <= 1e-7 * max(1.0, abs(num)), \
+                    f"FReLU grad_w[{a}][{bb}] 差分误差 {abs(num - fr.grad_w[0][a][bb]):.3e}"
+        fr.forward(x)
+        fr.backward(coef)
+        w0 = [[row[:] for row in ch] for ch in fr.w]
+        fr.sgd_step(0.1)
+        assert any(abs(w0[c][a][bb] - fr.w[c][a][bb]) > 1e-12
+                   for c in range(1) for a in range(3) for bb in range(3))
+        fr.forward(x)
+        fr.backward(coef)
+        w1 = [[row[:] for row in ch] for ch in fr.w]
+        fr.adam_step(0.01)
+        assert any(abs(w1[c][a][bb] - fr.w[c][a][bb]) > 1e-12
+                   for c in range(1) for a in range(3) for bb in range(3))
+        for fn in (lambda: AI.FReLU(0), lambda: AI.FReLU(2, kernel_size=2),
+                   lambda: AI.FReLU(2).forward([[[1.0]]]),
+                   lambda: AI.FReLU(2).forward([[[1.0, 2.0]], [[1.0]]]),
+                   lambda: AI.FReLU(2).backward([[[0.0]]])):
+            try:
+                fn()
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
