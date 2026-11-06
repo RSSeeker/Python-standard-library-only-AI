@@ -1932,6 +1932,296 @@ class BasicBlock2d:
         dh1 = self.conv1.backward(da1)
         return [[[dh1[c][h][w] + dpre[c][h][w] for w in range(W)] for h in range(H)]
                 for c in range(C)]
+class Bottleneck2d:
+    """ResNet Bottleneck：`1x1 降维 -> 3x3 -> 1x1 升维` + 残差
+
+    `mid = max(1, out_channels // 4)`；捷径在 `stride=1 且 in==out` 时是恒等，
+    否则用 `1x1 Conv2d + BatchNorm2d` 投影。三个 BN 的 gamma/beta 梯度收在
+    `self.bn_grads`（键 `bn1_*`/`bn2_*`/`bn3_*`/`short_*`，没有捷径 BN 时没有 `short_*`）。
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        for n, v in (("in_channels", in_channels), ("out_channels", out_channels),
+                     ("stride", stride)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"Bottleneck2d: {n} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.mid = max(1, out_channels // 4)
+        self.conv1 = Conv2d(in_channels, self.mid, 1, stride=1, padding=0)
+        self.bn1 = BatchNorm2d(self.mid)
+        self.conv2 = Conv2d(self.mid, self.mid, 3, stride=stride, padding=1)
+        self.bn2 = BatchNorm2d(self.mid)
+        self.conv3 = Conv2d(self.mid, out_channels, 1, stride=1, padding=0)
+        self.bn3 = BatchNorm2d(out_channels)
+        self.proj = None
+        self.short_bn = None
+        if not (stride == 1 and in_channels == out_channels):
+            self.proj = Conv2d(in_channels, out_channels, 1, stride=stride, padding=0)
+            self.short_bn = BatchNorm2d(out_channels)
+        self.training = True
+        keys = ["bn1_gamma", "bn1_beta", "bn2_gamma", "bn2_beta", "bn3_gamma", "bn3_beta"]
+        if self.short_bn is not None:
+            keys += ["short_gamma", "short_beta"]
+        self.bn_grads = {k: [0.0] * (self.mid if "bn1" in k or "bn2" in k else out_channels)
+                         for k in keys}
+        self._cache = None
+
+    def zero_grad(self):
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        self.conv3.zero_grad()
+        if self.proj is not None:
+            self.proj.zero_grad()
+        for k in self.bn_grads:
+            self.bn_grads[k] = [0.0] * len(self.bn_grads[k])
+
+    def param_count(self):
+        total = (_conv_param_count(self.conv1) + _conv_param_count(self.conv2)
+                 + _conv_param_count(self.conv3))
+        total += 4 * self.mid + 2 * self.out_channels
+        if self.proj is not None:
+            total += _conv_param_count(self.proj) + 2 * self.out_channels
+        return total
+
+    def train(self):
+        self.training = True
+        for bn in (self.bn1, self.bn2, self.bn3, self.short_bn):
+            if bn is not None:
+                bn.train()
+
+    def eval(self):
+        self.training = False
+        for bn in (self.bn1, self.bn2, self.bn3, self.short_bn):
+            if bn is not None:
+                bn.eval()
+
+    def sgd_step(self, lr):
+        for c in (self.conv1, self.conv2, self.conv3, self.proj):
+            if c is not None:
+                _conv_sgd(c, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        for c in (self.conv1, self.conv2, self.conv3, self.proj):
+            if c is not None:
+                _conv_adam(c, lr, beta1, beta2, eps)
+
+    @staticmethod
+    def _relu(x):
+        return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("Bottleneck2d: 输入不能为空")
+        C = len(x)
+        if C != self.in_channels:
+            raise ValueError(
+                f"Bottleneck2d: 输入通道数 {C} 与 in_channels={self.in_channels} 不符")
+        h1 = self.bn1.forward(self.conv1.forward(x))
+        r1 = self._relu(h1)
+        h2 = self.bn2.forward(self.conv2.forward(r1))
+        r2 = self._relu(h2)
+        h3 = self.bn3.forward(self.conv3.forward(r2))
+        if self.proj is None:
+            short = x
+        else:
+            short = self.short_bn.forward(self.proj.forward(x))
+        H, W = len(h3[0]), len(h3[0][0])
+        SH, SW = len(short[0]), len(short[0][0])
+        if (SH, SW) != (H, W):
+            raise ValueError(
+                f"Bottleneck2d: 捷径空间尺寸 {(SH, SW)} 与主干 {(H, W)} 不符")
+        pre = [[[h3[c][h][w] + short[c][h][w] for w in range(W)] for h in range(H)]
+               for c in range(self.out_channels)]
+        out = self._relu(pre)
+        self._cache = (x, h1, r1, h2, r2, h3, short, pre)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("Bottleneck2d.backward: 必须先调用 forward")
+        x, h1, r1, h2, r2, h3, short, pre = self._cache
+        C_out, H, W = len(pre), len(pre[0]), len(pre[0][0])
+        if len(dout) != C_out or len(dout[0]) != H or len(dout[0][0]) != W:
+            raise ValueError(
+                f"Bottleneck2d.backward: dout 形状 {(len(dout), len(dout[0]), len(dout[0][0]))} "
+                f"与输出 {(C_out, H, W)} 不符")
+        dpre = [[[dout[c][h][w] if pre[c][h][w] > 0.0 else 0.0 for w in range(W)]
+                 for h in range(H)] for c in range(C_out)]
+        dh3, g3, b3 = self.bn3.backward(dpre)
+        for c in range(C_out):
+            self.bn_grads["bn3_gamma"][c] += g3[c]
+            self.bn_grads["bn3_beta"][c] += b3[c]
+        dr2 = self.conv3.backward(dh3)
+        dh2 = [[[dr2[c][h][w] if r2[c][h][w] > 0.0 else 0.0 for w in range(len(r2[0][0]))]
+                for h in range(len(r2[0]))] for c in range(self.mid)]
+        dr2b, g2, b2 = self.bn2.backward(dh2)
+        for c in range(self.mid):
+            self.bn_grads["bn2_gamma"][c] += g2[c]
+            self.bn_grads["bn2_beta"][c] += b2[c]
+        dr1 = self.conv2.backward(dr2b)
+        dh1 = [[[dr1[c][h][w] if r1[c][h][w] > 0.0 else 0.0 for w in range(W)]
+                for h in range(H)] for c in range(self.mid)]
+        dxc, g1, b1 = self.bn1.backward(dh1)
+        for c in range(self.mid):
+            self.bn_grads["bn1_gamma"][c] += g1[c]
+            self.bn_grads["bn1_beta"][c] += b1[c]
+        dx_main = self.conv1.backward(dxc)
+        if self.proj is None:
+            d_short = dpre
+        else:
+            dshort_bn, gs, bs = self.short_bn.backward(dpre)
+            for c in range(C_out):
+                self.bn_grads["short_gamma"][c] += gs[c]
+                self.bn_grads["short_beta"][c] += bs[c]
+            d_short = self.proj.backward(dshort_bn)
+        return [[[dx_main[c][h][w] + d_short[c][h][w] for w in range(len(dx_main[0][0]))]
+                 for h in range(len(dx_main[0]))] for c in range(self.in_channels)]
+
+
+class AdaIN:
+    """Adaptive Instance Normalization：按通道做实例归一化，再用外部给的
+    `gamma`/`beta`（风格向量）缩放平移：`y = gamma_c * (x-mean_c)/sqrt(var_c+eps) + beta_c`
+
+    `x` 可以是 `(C,H,W)` 或长度为 `C` 的特征向量；`set_style(gamma, beta)` 换风格。
+    `backward` 返回 `(dx, d_gamma, d_beta)` —— 梯度按「外部参数」返回，不内部累积。
+    """
+
+    def __init__(self, channels, eps=1e-5):
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            raise ValueError(f"AdaIN: channels 必须是正整数，收到 {channels!r}")
+        if not (eps > 0):
+            raise ValueError(f"AdaIN: eps 必须 > 0，收到 {eps!r}")
+        self.channels = channels
+        self.eps = eps
+        self.gamma = [1.0] * channels
+        self.beta = [0.0] * channels
+        self._cache = None
+
+    def set_style(self, gamma, beta):
+        if len(gamma) != self.channels or len(beta) != self.channels:
+            raise ValueError(
+                f"AdaIN.set_style: gamma/beta 长度必须都是 {self.channels}，"
+                f"收到 {len(gamma)}/{len(beta)}")
+        self.gamma = [float(g) for g in gamma]
+        self.beta = [float(b) for b in beta]
+
+    def forward(self, x):
+        if not x:
+            raise ValueError("AdaIN.forward: 输入不能为空")
+        if len(x) != self.channels:
+            raise ValueError(f"AdaIN: 通道数 {len(x)} 与 channels={self.channels} 不符")
+        out = []
+        stats = []
+        if isinstance(x[0], list):
+            H, W = len(x[0]), len(x[0][0])
+            n = H * W
+            for c in range(self.channels):
+                flat = [x[c][h][w] for h in range(H) for w in range(W)]
+                mean = sum(flat) / n
+                var = sum((v - mean) ** 2 for v in flat) / n
+                inv = 1.0 / math.sqrt(var + self.eps)
+                stats.append((mean, inv, flat))
+                out.append([[self.gamma[c] * (x[c][h][w] - mean) * inv + self.beta[c]
+                             for w in range(W)] for h in range(H)])
+        else:
+            n = 1
+            for c in range(self.channels):
+                flat = [x[c]]
+                mean = x[c]
+                var = 0.0
+                inv = 1.0 / math.sqrt(var + self.eps)
+                stats.append((mean, inv, flat))
+                out.append(self.gamma[c] * (x[c] - mean) * inv + self.beta[c])
+        self._cache = (x, stats)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("AdaIN.backward: 必须先调用 forward")
+        x, stats = self._cache
+        d_gamma = [0.0] * self.channels
+        d_beta = [0.0] * self.channels
+        nested = isinstance(x[0], list)
+        if not nested:
+            # 单向量时 mean=x、var=0 ⇒ x_hat ≡ 0，输出恒为 beta[c]：
+            # dx 与 d_gamma 都是 0，只有 d_beta 有梯度
+            return [0.0] * self.channels, [0.0] * self.channels, [dout[c] for c in range(self.channels)]
+        H, W = len(x[0]), len(x[0][0])
+        n = H * W
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(self.channels)]
+        for c in range(self.channels):
+            mean, inv, flat = stats[c]
+            dh = [[dout[c][h][w] * self.gamma[c] for w in range(W)] for h in range(H)]
+            d_gamma[c] = sum(dout[c][h][w] * (x[c][h][w] - mean) * inv
+                             for h in range(H) for w in range(W))
+            d_beta[c] = sum(dout[c][h][w] for h in range(H) for w in range(W))
+            dflat = [dh[h][w] for h in range(H) for w in range(W)]
+            s1 = sum(dflat)
+            s2 = sum(d * (x[c][h][w] - mean) for d, h, w in
+                     ((dflat[h * W + w], h, w) for h in range(H) for w in range(W)))
+            for h in range(H):
+                for w in range(W):
+                    dx[c][h][w] = inv * (dflat[h * W + w]
+                                         - s1 / n
+                                         - (x[c][h][w] - mean) * inv * inv * s2 / n)
+        return dx, d_gamma, d_beta
+
+
+class FiLM:
+    """Feature-wise Linear Modulation：`y = gamma * x + beta`（逐特征，可选分组）
+
+    `groups=1` 时 gamma/beta 是整向量；`groups>1` 时把特征切成若干段、各段共享
+    一组 gamma/beta（条件向量比特征维度短时用）。
+    """
+
+    def __init__(self, features, groups=1):
+        for n, v in (("features", features), ("groups", groups)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"FiLM: {n} 必须是正整数，收到 {v!r}")
+        if features % groups != 0:
+            raise ValueError(f"FiLM: features={features} 必须能被 groups={groups} 整除")
+        self.features = features
+        self.groups = groups
+        self.group_size = features // groups
+        self.gamma = [1.0] * groups
+        self.beta = [0.0] * groups
+        self._x = None
+
+    def set_params(self, gamma, beta):
+        if len(gamma) != self.groups or len(beta) != self.groups:
+            raise ValueError(
+                f"FiLM.set_params: gamma/beta 长度必须都是 {self.groups}，"
+                f"收到 {len(gamma)}/{len(beta)}")
+        self.gamma = [float(g) for g in gamma]
+        self.beta = [float(b) for b in beta]
+
+    def forward(self, x):
+        if len(x) != self.features:
+            raise ValueError(f"FiLM: 输入长度 {len(x)} 与 features={self.features} 不符")
+        self._x = list(x)
+        out = [0.0] * self.features
+        for i in range(self.features):
+            g = self.gamma[i // self.group_size]
+            b = self.beta[i // self.group_size]
+            out[i] = g * x[i] + b
+        return out
+
+    def backward(self, dout):
+        if self._x is None:
+            raise RuntimeError("FiLM.backward: 必须先调用 forward")
+        if len(dout) != self.features:
+            raise ValueError(f"FiLM.backward: dout 长度 {len(dout)} != {self.features}")
+        dx = [0.0] * self.features
+        d_gamma = [0.0] * self.groups
+        d_beta = [0.0] * self.groups
+        for i in range(self.features):
+            g_i = i // self.group_size
+            dx[i] = dout[i] * self.gamma[g_i]
+            d_gamma[g_i] += dout[i] * self._x[i]
+            d_beta[g_i] += dout[i]
+        return dx, d_gamma, d_beta
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 

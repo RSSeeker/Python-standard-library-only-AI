@@ -122,7 +122,7 @@
 ### W2 卷积与视觉块（P0/P1）
 - [x] `DepthwiseSeparableConv2d`（W2-B：`Conv2d(groups=C)` + 1×1 点卷积，参数量 `C·k·k + C + C·out + out`；dx 中心差分 ≤1e-8，`sgd_step`/`adam_step` 真改权重）
 - [x] `BasicBlock2d`（W2-B：`conv3x3 → BN → ReLU → conv3x3 → BN → (+x) → ReLU`，stride=1 恒等捷径；全零卷积时退化为 `relu(x)`，eval 模式 dx 中心差分 ≤1e-7）
-- [ ] `ResNetBottleneck`（1×1→3×3→1×1 + 残差，含 stride>1 的 1×1 投影捷径）
+- [x] `Bottleneck2d`（W2-C：`1x1 降维(mid=out//4) → 3x3 → 1x1 升维` + 残差；stride≠1 或通道变化时用 `1x1 Conv + BN` 投影捷径，BN 梯度收在 `bn_grads`，eval 模式 dx 中心差分 ≤1e-7）
 - [ ] `DenseBlock` / 稠密连接
 - [x] `SEBlock`（W2-A 提交：GAP → 瓶颈 MLP → sigmoid 乘回输入，dx 与四组参数梯度中心差分 ≤1e-9）
 - [x] `ECABlock`（W2-B：GAP 后一条奇数宽 1D 卷积跨通道混权重，只多 `kernel_size` 个参数；dx/`grad_w` 中心差分 ≤1e-8）
@@ -133,7 +133,9 @@
       `AdaptiveAvgPool2d` 一致，`(1,1)` 与全局最大逐位相同）、`LPPool2d`（`p=1` 在非负输入上等于
       `AvgPool2d`，随 p 增大单调逼近 `MaxPool2d`，梯度差分 ≤1e-9）
 - [ ] 池化家族（剩余）：`MaxPool1d/3d`、`AvgPool1d/3d`、`FractionalMaxPool2d`、`StochasticPool2d`
-- [ ] `AdaIN` / `FiLM` / `ConditionalNorm`
+- [x] `AdaIN`（W2-C：按通道实例归一化后乘风格向量，`set_style()`；`d_gamma`/`d_beta`/`dx` 中心差分 ≤1e-6，单向量输入 mean=x ⇒ `dx=0`）
+- [x] `FiLM`（W2-C：`y = gamma ⊙ x + beta`，`groups>1` 时特征分段共享调制参数）
+- [ ] `ConditionalNorm`（条件归一化：把条件向量投影成 gamma/beta 的完整模块，AdaIN/FiLM 已提供其数学核）
 
 ### W3 归一化·激活·初始化（P1 + §6）
 - [ ] 归一化族：`WeightNorm`、`SpectralNorm`（幂迭代）、`SwitchNorm`、`FilterResponseNorm`、`ScaleNorm`

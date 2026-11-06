@@ -9471,3 +9471,150 @@ class TestBatchNorm2dEvalBackward:
             assert abs(g_beta[c] - sum(flat)) < 1e-12
             xh = [x[c][h][w] * inv for h in range(2) for w in range(2)]
             assert abs(g_gamma[c] - sum(d * a for d, a in zip(flat, xh))) < 1e-12
+
+
+class TestBottleneck2d:
+    def test_shapes_and_params(self):
+        b = AI.Bottleneck2d(4, 8)
+        assert b.mid == 2
+        assert b.proj is not None
+        # conv1 10 + bn1 4 + conv2 38 + bn2 4 + conv3 24 + bn3 16 + proj 40 + short_bn 16
+        assert b.param_count() == 152
+        assert AI.Bottleneck2d(4, 4).proj is None
+
+    def test_eval_backward_matches_finite_difference(self):
+        random.seed(41)
+        b = AI.Bottleneck2d(3, 6)
+        b.eval()
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(3)]
+        dout = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)] for _ in range(6)]
+        base = [[row[:] for row in ch] for ch in x]
+
+        def loss(xx):
+            o = b.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w]
+                       for c in range(6) for h in range(3) for w in range(3))
+
+        b.zero_grad()
+        b.forward([[row[:] for row in ch] for ch in base])
+        dx = b.backward(dout)
+        eps = 1e-6
+        for c in range(3):
+            for h in range(3):
+                for w in range(3):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    assert abs((vp - vm) / (2 * eps) - dx[c][h][w]) < 1e-7
+        assert any(abs(v) > 0 for v in b.bn_grads["short_gamma"])
+        assert any(abs(v) > 0 for v in b.proj.grad_w[0][0][0])
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.Bottleneck2d(0, 4)
+        with pytest.raises(ValueError):
+            AI.Bottleneck2d(4, 8, stride=0)
+        b = AI.Bottleneck2d(2, 4)
+        with pytest.raises(RuntimeError):
+            b.backward([[[1.0]]])
+
+
+class TestAdaIN:
+    def test_normalizes_to_style_stats(self):
+        ad = AI.AdaIN(2)
+        ad.set_style([1.5, 0.5], [0.1, -0.3])
+        x = [[[1.0, 3.0], [5.0, 7.0]], [[-1.0, 0.0], [1.0, 2.0]]]
+        out = ad.forward(x)
+        for c in range(2):
+            vals = [out[c][h][w] for h in range(2) for w in range(2)]
+            mean = sum(vals) / 4
+            assert abs(mean - ad.beta[c]) < 1e-9
+            std = (sum((v - mean) ** 2 for v in vals) / 4) ** 0.5
+            assert abs(std - abs(ad.gamma[c])) < 1e-4
+
+    def test_gradients_match_finite_difference(self):
+        random.seed(42)
+        ad = AI.AdaIN(2)
+        ad.set_style([0.7, -1.2], [0.2, 0.4])
+        x = [[[random.uniform(-1, 1) for _ in range(2)] for _ in range(2)] for _ in range(2)]
+        dout = [[[random.uniform(-1, 1) for _ in range(2)] for _ in range(2)] for _ in range(2)]
+
+        def loss():
+            o = ad.forward(x)
+            return sum(o[c][h][w] * dout[c][h][w] for c in range(2) for h in range(2) for w in range(2))
+
+        ad.forward(x)
+        dx, dg, db = ad.backward(dout)
+        eps = 1e-6
+        for c in range(2):
+            old = ad.gamma[c]
+            ad.gamma[c] = old + eps
+            vp = loss()
+            ad.gamma[c] = old - eps
+            vm = loss()
+            ad.gamma[c] = old
+            assert abs((vp - vm) / (2 * eps) - dg[c]) < 1e-6
+            old = ad.beta[c]
+            ad.beta[c] = old + eps
+            vp = loss()
+            ad.beta[c] = old - eps
+            vm = loss()
+            ad.beta[c] = old
+            assert abs((vp - vm) / (2 * eps) - db[c]) < 1e-6
+        def loss_of(xx):
+            o = ad.forward(xx)
+            return sum(o[c][h][w] * dout[c][h][w]
+                       for c in range(2) for h in range(2) for w in range(2))
+
+        base = [[row[:] for row in ch] for ch in x]
+        for c in range(2):
+            for h in range(2):
+                for w in range(2):
+                    old = base[c][h][w]
+                    base[c][h][w] = old + eps
+                    vp = loss_of([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old - eps
+                    vm = loss_of([[row[:] for row in ch] for ch in base])
+                    base[c][h][w] = old
+                    assert abs((vp - vm) / (2 * eps) - dx[c][h][w]) < 1e-6
+
+    def test_vector_input_and_validation(self):
+        ad = AI.AdaIN(3)
+        ad.set_style([2.0, 2.0, 2.0], [0.5, 0.5, 0.5])
+        ad.forward([1.0, 2.0, 3.0])
+        dx, dg, db = ad.backward([1.0, 1.0, 1.0])
+        assert dx == [0.0, 0.0, 0.0]
+        assert db == [1.0, 1.0, 1.0]
+        with pytest.raises(ValueError):
+            ad.set_style([1.0], [0.0])
+        with pytest.raises(ValueError):
+            ad.forward([1.0])
+
+
+class TestFiLM:
+    def test_forward_and_groups(self):
+        f = AI.FiLM(6, groups=2)
+        f.set_params([2.0, -1.0], [0.5, 0.0])
+        out = f.forward([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        assert out == [2.5, 4.5, 6.5, -4.0, -5.0, -6.0]
+
+    def test_backward(self):
+        f = AI.FiLM(6, groups=2)
+        f.set_params([2.0, -1.0], [0.5, 0.0])
+        f.forward([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        dx, dg, db = f.backward([1.0, 0.5, 0.0, -1.0, 2.0, 0.0])
+        assert dx[0] == 2.0 and dx[3] == 1.0
+        assert abs(dg[0] - 2.0) < 1e-12
+        assert abs(db[1] - 1.0) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.FiLM(6, groups=4)
+        with pytest.raises(ValueError):
+            AI.FiLM(0)
+        f = AI.FiLM(4)
+        with pytest.raises(ValueError):
+            f.forward([1.0])

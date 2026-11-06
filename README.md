@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（755 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（764 项）
 
 ## 特性
 
@@ -160,6 +160,9 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `ECABlock` | ECA 通道注意力：GAP 后用一条奇数宽的 1D 卷积（零填充）跨通道混权重，比 SE 少降维 MLP，只多 `kernel_size` 个参数 |
 | `DepthwiseSeparableConv2d` | 深度可分离卷积：`Conv2d(groups=in_channels)` + 1x1 点卷积；参数量约为标准卷积的 `1/out_channels + 1/(k*k)` |
 | `BasicBlock2d` | ResNet BasicBlock：`conv3x3 → BN → ReLU → conv3x3 → BN → (+x) → ReLU`（stride=1 恒等捷径），BN 梯度收在 `bn_grads` |
+| `Bottleneck2d` | ResNet Bottleneck：`1x1 降维 → 3x3 → 1x1 升维` + 残差；`stride≠1` 或通道变化时用 `1x1 Conv + BN` 投影捷径 |
+| `AdaIN` | 自适应实例归一化：按通道做实例归一化后用风格向量 `gamma`/`beta` 缩放平移，`set_style()` 换风格 |
+| `FiLM` | 特征级线性调制：`y = gamma ⊙ x + beta`，`groups>1` 时把特征分段共享一组调制参数 |
 | `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `BatchNorm2d` | 二维批归一化：按通道在 H×W 上归一化，训练更新 running 统计量、`eval()` 用 running；`backward` 返回 `(dx, grad_gamma, grad_beta)`，**反向也分模式**（eval 时统计量来自 running，dx 为逐元素 `gamma/sqrt(var+eps)`） |
@@ -1027,7 +1030,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-755 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+764 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1091,6 +1094,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDepthwiseSeparableConv2d` | 输出形状与参数量公式（比标准卷积省）、`dx` 中心差分、`sgd_step`/`adam_step` 真的改权重 |
 | `TestBasicBlock2d` | 全零卷积退化为 `relu(x)`（恒等捷径）、eval 模式 `dx` 中心差分、BN 拿到梯度、`param_count` 与非法参数 |
 | `TestBatchNorm2dEvalBackward` | eval 模式 `dx` 是逐元素 `gamma/sqrt(var+eps)`（回归测试：曾误用训练公式）、`grad_gamma`/`grad_beta` 正确 |
+| `TestBottleneck2d` | 输出形状与参数量（含投影捷径）、eval 模式 `dx` 中心差分、投影卷积与 `short_*` BN 拿到梯度、非法参数 |
+| `TestAdaIN` | 输出逐通道均值=beta/std=gamma、`dx`/`d_gamma`/`d_beta` 中心差分、单向量输入（mean=x ⇒ dx=0）、长度校验 |
+| `TestFiLM` | `gamma ⊙ x + beta` 与分组映射、`dx`/`d_gamma`/`d_beta` 解析值、`features % groups` 校验 |
 | `TestGQA` | KV 头形状、`num_kv_heads` 缺省与显式传等值逐位一致、**共享 KV 下 `W_k`/`W_v` 梯度 vs 数值梯度**、`forward_step` == 整段前向、参数确实变少、非法取值 |
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
@@ -1147,7 +1153,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 755 个单元测试
+├── test_ai.py       # 764 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
