@@ -15530,3 +15530,283 @@ class TestPackingAndPrefixCache:
             AI.PrefixCache(2, 2).set(5, [], [])
         with pytest.raises(ValueError):
             AI.PrefixCache(2, 2).set(0, [[1.0]], [[1.0, 2.0]])
+
+
+# ============================================================
+#  W7-B：DoRA / AdaLoRA / 采样扩展
+# ============================================================
+
+def _w7b_layer(seed=7):
+    random.seed(seed)
+    return AI.Layer(3, 2, "linear")
+
+
+def _w7b_fill(obj, seed=11, scale=0.35):
+    rng = random.Random(seed)
+    for j in range(obj.fan_out):
+        for r in range(obj.rank):
+            obj.B[j][r] = rng.gauss(0.0, scale)
+    for r in range(obj.rank):
+        for i in range(obj.fan_in):
+            obj.A[r][i] = rng.gauss(0.0, scale)
+    return obj
+
+
+def _w7b_num(fwd, getter, setter, eps=1e-6):
+    """中心差分：只比较 loss，返回数值梯度"""
+    old = getter()
+    setter(old + eps)
+    up = fwd()
+    setter(old - eps)
+    dn = fwd()
+    setter(old)
+    return (up - dn) / (2.0 * eps)
+
+
+def _w7b_replace(row, i, v):
+    new = list(row)
+    new[i] = v
+    return new
+
+
+class TestDoRALinear:
+    def test_zero_lora_equals_layer(self):
+        layer = _w7b_layer()
+        x = [0.3, -0.7, 1.1]
+        dora = AI.DoRALinear(layer, rank=2)
+        assert dora.forward(x) == layer.forward(x)
+        assert dora.param_count() == 2 + 2 * 3 + 2 * 2
+
+    def test_gradients_finite_difference(self):
+        layer = _w7b_layer()
+        dora = _w7b_fill(AI.DoRALinear(layer, rank=2))
+        x = [0.3, -0.7, 1.1]
+        dout = [0.6, -0.9]
+
+        def fwd():
+            o = dora.forward(x)
+            return sum(o[j] * dout[j] for j in range(2))
+
+        def bwd():
+            dora.forward(x)
+            dora.zero_grad()
+            dora.backward(dout)
+
+        def rel(a, b):
+            return abs(a - b) / max(1.0, abs(a), abs(b))
+
+        worst_v = 0.0
+        for j in range(2):
+            for i in range(3):
+                bwd()
+                ana = dora.g_V[j][i]
+                num = _w7b_num(
+                    fwd,
+                    lambda j=j, i=i: dora.V[j][i],
+                    lambda v, j=j, i=i: dora.V.__setitem__(
+                        j, _w7b_replace(dora.V[j], i, v)))
+                worst_v = max(worst_v, rel(ana, num))
+        assert worst_v < 1e-5, worst_v
+
+        worst_m = 0.0
+        for j in range(2):
+            bwd()
+            ana = dora.g_m[j]
+            num = _w7b_num(
+                fwd,
+                lambda j=j: dora.m[j],
+                lambda v, j=j: dora.m.__setitem__(j, v))
+            worst_m = max(worst_m, rel(ana, num))
+        assert worst_m < 1e-5, worst_m
+
+        worst_a = 0.0
+        worst_b = 0.0
+        for r in range(2):
+            for i in range(3):
+                bwd()
+                ana = dora.g_A[r][i]
+                num = _w7b_num(
+                    fwd,
+                    lambda r=r, i=i: dora.A[r][i],
+                    lambda v, r=r, i=i: dora.A.__setitem__(
+                        r, _w7b_replace(dora.A[r], i, v)))
+                worst_a = max(worst_a, rel(ana, num))
+        for j in range(2):
+            for r in range(2):
+                bwd()
+                ana = dora.g_B[j][r]
+                num = _w7b_num(
+                    fwd,
+                    lambda j=j, r=r: dora.B[j][r],
+                    lambda v, j=j, r=r: dora.B.__setitem__(
+                        j, _w7b_replace(dora.B[j], r, v)))
+                worst_b = max(worst_b, rel(ana, num))
+        assert worst_a < 1e-5, worst_a
+        assert worst_b < 1e-5, worst_b
+
+    def test_denormalized_and_merge(self):
+        layer = _w7b_layer()
+        dora = _w7b_fill(AI.DoRALinear(layer, rank=2))
+        x = [0.3, -0.7, 1.1]
+        out = dora.forward(x)
+        w = dora.denormalized()
+        man = [sum(w[j][i] * x[i] for i in range(3)) + dora.b[j] for j in range(2)]
+        assert all(abs(out[j] - man[j]) < 1e-12 for j in range(2))
+        dora.merge()
+        merged = layer.forward(x)
+        assert all(abs(merged[j] - out[j]) < 1e-12 for j in range(2))
+
+
+class TestAdaLoRALinear:
+    def test_zero_lora_equals_layer(self):
+        layer = _w7b_layer(8)
+        x = [0.3, -0.7, 1.1]
+        ada = AI.AdaLoRALinear(layer, rank=4, seed=3)
+        assert ada.forward(x) == layer.forward(x)
+        assert ada.param_count() == 4 * 3 + 2 * 4
+
+    def test_gradients_finite_difference(self):
+        layer = _w7b_layer(8)
+        ada = _w7b_fill(AI.AdaLoRALinear(layer, rank=4, seed=3), seed=5, scale=0.3)
+        x = [0.3, -0.7, 1.1]
+        dout = [0.6, -0.9]
+
+        def fwd():
+            o = ada.forward(x)
+            return sum(o[j] * dout[j] for j in range(2))
+
+        def bwd():
+            ada.forward(x)
+            ada.zero_grad()
+            ada.backward(dout)
+
+        def rel(a, b):
+            return abs(a - b) / max(1.0, abs(a), abs(b))
+
+        worst_a = 0.0
+        worst_b = 0.0
+        for r in range(4):
+            for i in range(3):
+                bwd()
+                ana = ada.g_A[r][i]
+                num = _w7b_num(
+                    fwd,
+                    lambda r=r, i=i: ada.A[r][i],
+                    lambda v, r=r, i=i: ada.A.__setitem__(
+                        r, _w7b_replace(ada.A[r], i, v)))
+                worst_a = max(worst_a, rel(ana, num))
+        for j in range(2):
+            for r in range(4):
+                bwd()
+                ana = ada.g_B[j][r]
+                num = _w7b_num(
+                    fwd,
+                    lambda j=j, r=r: ada.B[j][r],
+                    lambda v, j=j, r=r: ada.B.__setitem__(
+                        j, _w7b_replace(ada.B[j], r, v)))
+                worst_b = max(worst_b, rel(ana, num))
+        assert worst_a < 1e-5, worst_a
+        assert worst_b < 1e-5, worst_b
+
+    def test_prune_and_active_ranks(self):
+        layer = _w7b_layer(9)
+        ada = _w7b_fill(AI.AdaLoRALinear(layer, rank=4, seed=4), seed=6, scale=0.4)
+        x = [0.3, -0.7, 1.1]
+        dout = [0.6, -0.9]
+        ada.forward(x)
+        ada.zero_grad()
+        ada.backward(dout)
+        top2 = sorted(sorted(range(4), key=lambda r: -ada.imp[r])[:2])
+        assert sorted(ada.prune(2)) == top2
+        dead = [r for r in range(4) if r not in top2]
+        assert all(abs(ada.A[r][i]) == 0.0 for r in dead for i in range(3))
+        assert all(abs(ada.B[j][r]) == 0.0 for r in dead for j in range(2))
+        base = layer.forward(x)
+        o = ada.forward(x)
+        man = list(base)
+        for r in ada.active_ranks():
+            h = sum(ada.A[r][i] * x[i] for i in range(3))
+            for j in range(2):
+                man[j] += ada.scaling * ada.B[j][r] * h
+        assert all(abs(o[j] - man[j]) < 1e-12 for j in range(2))
+        with pytest.raises(ValueError):
+            ada.prune(0)
+        with pytest.raises(ValueError):
+            ada.prune(9)
+
+
+class TestSamplingExtras:
+    def test_typical_filter(self):
+        logits = [2.0, 1.0, 0.1, -1.0]
+        probs = AI._softmax_row(logits)
+        for mass in (0.3, 0.7, 1.0):
+            masked = AI.typical_filter(logits, mass)
+            kept = [i for i, v in enumerate(masked) if v != float("-inf")]
+            assert 0 in kept
+            assert sum(probs[i] for i in kept) >= mass - 1e-12
+            assert all(masked[i] == logits[i] for i in kept)
+        n_small = len([v for v in AI.typical_filter(logits, 0.3) if v != float("-inf")])
+        n_big = len([v for v in AI.typical_filter(logits, 1.0) if v != float("-inf")])
+        assert n_small <= n_big
+
+    def test_top_a_and_eta_monotone(self):
+        logits = [2.0, 1.0, 0.1, -1.0]
+        prev = None
+        for ta in (0.01, 0.1, 0.5, 1.0):
+            masked = AI.top_a_filter(logits, ta)
+            kept = [i for i, v in enumerate(masked) if v != float("-inf")]
+            assert 0 in kept
+            if prev is not None:
+                assert len(kept) <= prev
+            prev = len(kept)
+        assert AI.top_a_filter(logits, 0.0) == list(logits)
+
+        prev = None
+        for eta in (0.0, 0.2, 0.4, 0.6):
+            masked = AI.eta_filter(logits, eta)
+            kept = [i for i, v in enumerate(masked) if v != float("-inf")]
+            assert 0 in kept
+            if prev is not None:
+                assert len(kept) <= prev
+            prev = len(kept)
+
+    def test_mirostat(self):
+        logits = [2.0, 1.0, 0.1, -1.0]
+        prev = None
+        for mu in (0.5, 1.0, 2.0, 6.0):
+            masked, ent = AI.mirostat_filter(logits, mu)
+            kept = [i for i, v in enumerate(masked) if v != float("-inf")]
+            assert 0 in kept
+            assert 0.0 <= ent <= math.log(len(logits)) + 1e-12
+            if prev is not None:
+                assert len(kept) >= prev
+            prev = len(kept)
+        assert AI.mirostat_update(3.0, 5.0, 2.0, 0.2) < 3.0
+        assert AI.mirostat_update(3.0, 0.5, 2.0, 0.2) > 3.0
+        assert AI.mirostat_update(0.1, 100.0, 2.0, 1.0) == 0.0
+
+    def test_invalid_inputs(self):
+        layer = _w7b_layer()
+        logits = [1.0, 0.0]
+        for args in ((layer, True), (layer, 0), (layer, 2, 0.0), ("x", 2)):
+            with pytest.raises((ValueError, TypeError)):
+                AI.DoRALinear(*args)
+        with pytest.raises((ValueError, TypeError)):
+            AI.DoRALinear(layer, 2, None, 0.0)
+        for args in ((layer, -1), (layer, 2, 0.0)):
+            with pytest.raises((ValueError, TypeError)):
+                AI.AdaLoRALinear(*args)
+        with pytest.raises((ValueError, TypeError)):
+            AI.AdaLoRALinear(layer, 4, None, 1.0)
+        for fn, bad in ((AI.typical_filter, 0.0), (AI.typical_filter, 1.5),
+                        (AI.top_a_filter, -0.1), (AI.top_a_filter, 2.0),
+                        (AI.eta_filter, 1.0), (AI.eta_filter, -0.5),
+                        (AI.mirostat_filter, -1.0)):
+            with pytest.raises((ValueError, TypeError)):
+                fn(logits, bad)
+        with pytest.raises((ValueError, TypeError)):
+            AI.typical_filter(logits, True)
+        with pytest.raises((ValueError, TypeError)):
+            AI.mirostat_update(1.0, 1.0, -1.0)
+        with pytest.raises((ValueError, TypeError)):
+            AI.mirostat_update(1.0, 1.0, 2.0, -0.5)

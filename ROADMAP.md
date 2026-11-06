@@ -197,7 +197,8 @@
 
 ### W7 LLM 微调与推理（P0/P1）
 - [x] 提示微调：`PromptTuning`（软提示）/ `P_Tuning`（MLP 生成前缀）——`g_prompt` 与 `anchor`/`W1`/`W2` 全部中心差分 ≤2.2e-11；`PrefixTuning`（每层 KV 前缀）留到接进 MHA 时再做，当前用 `PrefixCache` 承载缓存
-- [ ] 参数高效：`QLoRA`（量化基座 + LoRA 接口）/ `DoRA`（幅度+方向分解）/ `AdaLoRA`（重要性分配秩）
+- [x] 参数高效：`DoRALinear`（幅度+方向分解，`B=0` 与原层逐位一致，`g_V/g_m/g_A/g_B` 中心差分 ≤9.4e-7）/ `AdaLoRALinear`（每秩重要性 EMA + `prune(keep)` 剪秩，剪后前向等于存活秩之和）
+- [ ] 参数高效剩余：`QLoRA`（量化基座 + LoRA 接口；本库只有 float32 张量，留作接口与说明）
 - [ ] 采样扩展：typical / mirostat / eta / top-a / tail-free / contrastive search / diverse beam
 - [ ] 约束解码：JSON Schema / 正则 / CFG（`_sample` 接 mask 回调）
 - [ ] 解码加速：投机解码（草稿模型 + 验证）、自投机/Medusa/EAGLE（概念）、连续批处理、`PagedAttention`（数据结构演示）

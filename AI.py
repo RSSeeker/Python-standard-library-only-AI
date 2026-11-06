@@ -9092,6 +9092,400 @@ class PrefixCache:
         return out
 
 
+class DoRALinear:
+    """DoRA：把权重拆成「幅度 × 方向」，LoRA 只作用在方向上
+
+    ``Weff = V + scaling*B A``、``W' = m / (||Weff||_row + eps) * Weff``、
+    ``y = W' x + b``。``V`` 初始化为原层权重、``m`` 初始化为原层行范数，所以
+    ``B=0`` 时输出与原层**逐位相同**。相比纯 LoRA，幅度与方向解耦后小秩也有足够
+    的表达能力。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 4, alpha: float = None,
+                 eps: float = 1e-8):
+        if not isinstance(layer, Layer):
+            raise TypeError('DoRALinear: layer 必须是 Layer 实例，收到 %s'
+                            % type(layer).__name__)
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            raise ValueError('DoRALinear: rank 必须是正整数，收到 %r' % (rank,))
+        if not _is_num(eps) or eps <= 0.0:
+            raise ValueError('DoRALinear: eps 必须 > 0，收到 %r' % (eps,))
+        self.layer = layer
+        self.rank = rank
+        self.fan_in = layer.fan_in
+        self.fan_out = layer.fan_out
+        self.alpha = float(rank if alpha is None else alpha)
+        if self.alpha <= 0.0:
+            raise ValueError('DoRALinear: alpha 必须 > 0，收到 %r' % (alpha,))
+        self.scaling = self.alpha / rank
+        self.eps = float(eps)
+        self.V = [list(row) for row in layer.weights]
+        self.b = list(layer.biases)
+        self.m = [math.sqrt(sum(v * v for v in row)) for row in self.V]
+        std = 1.0 / math.sqrt(self.fan_in)
+        self.A = [[random.gauss(0.0, std) for _ in range(self.fan_in)]
+                  for _ in range(self.rank)]
+        self.B = [[0.0] * self.rank for _ in range(self.fan_out)]
+        self.zero_grad()
+        self._cache = None
+
+    def _den(self, n):
+        """归一化分母：只在范数为 0 时用 eps 兜底（不污染正常路径，保证 B=0 逐位一致）"""
+        return n if n > self.eps else self.eps
+
+    def _weff(self):
+        out = []
+        norms = []
+        for j in range(self.fan_out):
+            row = list(self.V[j])
+            for r in range(self.rank):
+                g = self.scaling * self.B[j][r]
+                if g == 0.0:
+                    continue
+                ar = self.A[r]
+                for i in range(self.fan_in):
+                    row[i] += g * ar[i]
+            out.append(row)
+            norms.append(math.sqrt(sum(v * v for v in row)))
+        return out, norms
+
+    def denormalized(self):
+        """当前的有效权重 ``W'``"""
+        weff, norms = self._weff()
+        return [[self.m[j] * weff[j][i] / self._den(norms[j])
+                 for i in range(self.fan_in)] for j in range(self.fan_out)]
+
+    def forward(self, x):
+        weff, norms = self._weff()
+        c = [self.m[j] / self._den(norms[j]) for j in range(self.fan_out)]
+        w = [[c[j] * weff[j][i] for i in range(self.fan_in)]
+             for j in range(self.fan_out)]
+        out = [sum(map(_mul, w[j], x)) + self.b[j] for j in range(self.fan_out)]
+        self._cache = (x, weff, norms, c, w)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('DoRALinear.backward: 必须先调用 forward()')
+        x, weff, norms, c, w = self._cache
+        dweff = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        for j in range(self.fan_out):
+            dj = dout[j]
+            n_j = self._den(norms[j])
+            proj = sum(map(_mul, weff[j], x))
+            coef = c[j] * dj
+            dcoe = dj * proj
+            self.g_m[j] += dcoe / n_j
+            k = -dcoe * self.m[j] / (n_j ** 3)
+            row = dweff[j]
+            for i in range(self.fan_in):
+                row[i] = coef * x[i] + k * weff[j][i]
+                self.g_V[j][i] += row[i]
+        for j in range(self.fan_out):
+            for r in range(self.rank):
+                if self.B[j][r] == 0.0:
+                    continue
+                acc = 0.0
+                for i in range(self.fan_in):
+                    acc += self.scaling * self.A[r][i] * dweff[j][i]
+                self.g_B[j][r] += acc
+        for r in range(self.rank):
+            for i in range(self.fan_in):
+                acc = 0.0
+                for j in range(self.fan_out):
+                    acc += self.scaling * self.B[j][r] * dweff[j][i]
+                self.g_A[r][i] += acc
+        dx = [0.0] * self.fan_in
+        for j in range(self.fan_out):
+            dj = dout[j]
+            row = w[j]
+            for i in range(self.fan_in):
+                dx[i] += row[i] * dj
+        return dx
+
+    def zero_grad(self):
+        self.g_V = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        self.g_m = [0.0] * self.fan_out
+        self.g_A = [[0.0] * self.fan_in for _ in range(self.rank)]
+        self.g_B = [[0.0] * self.rank for _ in range(self.fan_out)]
+
+    def params(self):
+        return [(self.V, self.g_V), (self.m, self.g_m),
+                (self.A, self.g_A), (self.B, self.g_B)]
+
+    def param_count(self) -> int:
+        return (self.fan_out + self.rank * self.fan_in
+                + self.fan_out * self.rank)
+
+    def trainable_count(self) -> int:
+        return self.param_count()
+
+    def merge(self):
+        """把幅度与方向折回原层权重（之后 ``forward`` 走原层）"""
+        w = self.denormalized()
+        for j in range(self.fan_out):
+            for i in range(self.fan_in):
+                self.layer.weights[j][i] = w[j][i]
+        self.merged = True
+        return self
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class AdaLoRALinear:
+    """AdaLoRA（简化版）：按秩重要性自适应收缩秩预算
+
+    ``y = layer(x) + scaling * B A x``，每秩维护重要性 ``imp[r]``（``|A_r|`` 与
+    ``|B_:,r|`` 范数乘积的 EMA）。``prune(keep)`` 只保留最重要的 ``keep`` 个秩，
+    其余把 A 的行与 B 的列整体置零并停止接收梯度；``active_ranks()`` 返回存活秩。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 8, alpha: float = None,
+                 ema: float = 0.9, seed: int = 0):
+        if not isinstance(layer, Layer):
+            raise TypeError('AdaLoRALinear: layer 必须是 Layer 实例，收到 %s'
+                            % type(layer).__name__)
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            raise ValueError('AdaLoRALinear: rank 必须是正整数，收到 %r' % (rank,))
+        if not _is_num(ema) or not (0.0 <= float(ema) < 1.0):
+            raise ValueError('AdaLoRALinear: ema 必须在 [0,1) 内，收到 %r' % (ema,))
+        self.layer = layer
+        self.rank = rank
+        self.fan_in = layer.fan_in
+        self.fan_out = layer.fan_out
+        self.alpha = float(rank if alpha is None else alpha)
+        if self.alpha <= 0.0:
+            raise ValueError('AdaLoRALinear: alpha 必须 > 0，收到 %r' % (alpha,))
+        self.scaling = self.alpha / rank
+        self.ema = float(ema)
+        rng = random.Random(seed)
+        std = 1.0 / math.sqrt(self.fan_in)
+        self.A = [[rng.gauss(0.0, std) for _ in range(self.fan_in)]
+                  for _ in range(rank)]
+        self.B = [[0.0] * rank for _ in range(self.fan_out)]
+        self.imp = [0.0] * rank
+        self.seen = [False] * rank
+        self.alive = [True] * rank
+        self.zero_grad()
+        self._cache = None
+
+    def active_ranks(self):
+        return [r for r in range(self.rank) if self.alive[r]]
+
+    def forward(self, x):
+        base = self.layer.forward(x)
+        h = [sum(map(_mul, self.A[r], x)) if self.alive[r] else 0.0
+             for r in range(self.rank)]
+        out = []
+        for j in range(self.fan_out):
+            acc = base[j]
+            for r in range(self.rank):
+                if not self.alive[r]:
+                    continue
+                acc += self.scaling * self.B[j][r] * h[r]
+            out.append(acc)
+        self._cache = (x, h)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('AdaLoRALinear.backward: 必须先调用 forward()')
+        x, h = self._cache
+        dx = self.layer.backward(dout)[-1]
+        for j in range(self.fan_out):
+            for r in range(self.rank):
+                if not self.alive[r]:
+                    continue
+                self.g_B[j][r] += self.scaling * dout[j] * h[r]
+        for r in range(self.rank):
+            if not self.alive[r]:
+                continue
+            for i in range(self.fan_in):
+                acc = 0.0
+                for j in range(self.fan_out):
+                    acc += self.scaling * self.B[j][r] * dout[j]
+                self.g_A[r][i] += acc * x[i]
+            na = math.sqrt(sum(v * v for v in self.A[r]))
+            nb = math.sqrt(sum(self.B[j][r] ** 2 for j in range(self.fan_out)))
+            cur = na * nb
+            if self.seen[r]:
+                self.imp[r] = self.ema * self.imp[r] + (1.0 - self.ema) * cur
+            else:
+                self.imp[r] = cur
+                self.seen[r] = True
+        for r in range(self.rank):
+            if not self.alive[r]:
+                continue
+            for i in range(self.fan_in):
+                acc = 0.0
+                for j in range(self.fan_out):
+                    acc += self.scaling * self.B[j][r] * dout[j]
+                dx[i] += acc * self.A[r][i]
+        return dx
+
+    def prune(self, keep: int):
+        """只保留重要性最高的 ``keep`` 个秩（其余 A 行、B 列置零）"""
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+            raise ValueError('AdaLoRALinear.prune: keep 必须是正整数，收到 %r'
+                             % (keep,))
+        if keep > self.rank:
+            raise ValueError('AdaLoRALinear.prune: keep 不能超过 rank=%d'
+                             % self.rank)
+        order = sorted(range(self.rank), key=lambda r: (-self.imp[r], r))
+        keep_set = set(order[:keep])
+        for r in range(self.rank):
+            if r in keep_set:
+                self.alive[r] = True
+                continue
+            self.alive[r] = False
+            for i in range(self.fan_in):
+                self.A[r][i] = 0.0
+                self.g_A[r][i] = 0.0
+            for j in range(self.fan_out):
+                self.B[j][r] = 0.0
+                self.g_B[j][r] = 0.0
+        return self.active_ranks()
+
+    def zero_grad(self):
+        self.g_A = [[0.0] * self.fan_in for _ in range(self.rank)]
+        self.g_B = [[0.0] * self.rank for _ in range(self.fan_out)]
+
+    def params(self):
+        return [(self.A, self.g_A), (self.B, self.g_B)]
+
+    def param_count(self) -> int:
+        return self.rank * self.fan_in + self.fan_out * self.rank
+
+    def merge(self):
+        W = self.layer.weights
+        for r in range(self.rank):
+            if not self.alive[r]:
+                continue
+            for j in range(self.fan_out):
+                g = self.scaling * self.B[j][r]
+                if g == 0.0:
+                    continue
+                for i in range(self.fan_in):
+                    W[j][i] += g * self.A[r][i]
+        self.merged = True
+        return self
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+def _check_mass(mass, who):
+    if isinstance(mass, bool) or not isinstance(mass, (int, float)):
+        raise ValueError('%s: mass 必须是数字，收到 %r' % (who, mass))
+    mass = float(mass)
+    if mass != mass or not (0.0 < mass <= 1.0):
+        raise ValueError('%s: mass 必须在 (0,1] 内，收到 %r' % (who, mass))
+    return mass
+
+
+def _apply_keep_mask(logits, keep):
+    if not keep:
+        raise ValueError('_apply_keep_mask: 过滤后没有任何 token 可用')
+    return [v if i in keep else float('-inf') for i, v in enumerate(logits)]
+
+
+def typical_filter(logits, mass: float = 0.9):
+    """typical sampling：保留「惊讶度最接近条件熵」的 token 直到累计概率 >= mass"""
+    mass = _check_mass(mass, 'typical_filter(mass)')
+    probs = _softmax_row(logits)
+    entropy = -sum(p * math.log(p) for p in probs if p > 0.0)
+    cand = sorted((abs(-math.log(p) - entropy), i)
+                  for i, p in enumerate(probs) if p > 0.0)
+    keep = set()
+    acc = 0.0
+    for _score, i in cand:
+        keep.add(i)
+        acc += probs[i]
+        if acc >= mass:
+            break
+    return _apply_keep_mask(logits, keep)
+
+
+def top_a_filter(logits, top_a: float = 0.1):
+    """top-a：阈值 ``top_a * p_max²``（``top_a=0`` 时不过滤）"""
+    if isinstance(top_a, bool) or not isinstance(top_a, (int, float)):
+        raise ValueError('top_a_filter: top_a 必须是数字，收到 %r' % (top_a,))
+    top_a = float(top_a)
+    if top_a != top_a or not (0.0 <= top_a <= 1.0):
+        raise ValueError('top_a_filter: top_a 必须在 [0,1] 内，收到 %r' % (top_a,))
+    if top_a == 0.0:
+        return list(logits)
+    probs = _softmax_row(logits)
+    peak = max(probs)
+    thresh = top_a * peak * peak
+    keep = set(i for i, p in enumerate(probs) if p >= thresh)
+    return _apply_keep_mask(logits, keep)
+
+
+def eta_filter(logits, eta: float = 0.3):
+    """eta 采样：丢弃概率 <= eta 的 token（至少保留 argmax）"""
+    if isinstance(eta, bool) or not isinstance(eta, (int, float)):
+        raise ValueError('eta_filter: eta 必须是数字，收到 %r' % (eta,))
+    eta = float(eta)
+    if eta != eta or not (0.0 <= eta < 1.0):
+        raise ValueError('eta_filter: eta 必须在 [0,1) 内，收到 %r' % (eta,))
+    probs = _softmax_row(logits)
+    top = max(range(len(probs)), key=lambda i: probs[i])
+    keep = set(i for i, p in enumerate(probs) if p > eta)
+    keep.add(top)
+    return _apply_keep_mask(logits, keep)
+
+
+def mirostat_filter(logits, mu: float = 5.0):
+    """Mirostat 掩码：保留 ``-log p <= mu`` 的 token（至少保留 argmax）
+
+    返回 ``(masked_logits, 保留集的熵)``，配合 ``mirostat_update`` 迭代即可。
+    """
+    if isinstance(mu, bool) or not isinstance(mu, (int, float)):
+        raise ValueError('mirostat_filter: mu 必须是数字，收到 %r' % (mu,))
+    mu = float(mu)
+    if mu != mu or mu < 0.0:
+        raise ValueError('mirostat_filter: mu 必须 >= 0，收到 %r' % (mu,))
+    probs = _softmax_row(logits)
+    top = max(range(len(probs)), key=lambda i: probs[i])
+    keep = set(i for i, p in enumerate(probs) if p > 0.0 and -math.log(p) <= mu)
+    keep.add(top)
+    total = sum(probs[i] for i in keep)
+    ent = 0.0
+    for i in keep:
+        q = probs[i] / total
+        ent -= q * math.log(q)
+    return _apply_keep_mask(logits, keep), ent
+
+
+def mirostat_update(mu: float, observed_surprisal: float,
+                    target_entropy: float = 2.0, strength: float = 0.2) -> float:
+    """Mirostat 的 mu 更新：``mu -= strength * (observed - target)``，下限 0"""
+    for name, val in (('mu', mu), ('observed_surprisal', observed_surprisal),
+                      ('target_entropy', target_entropy),
+                      ('strength', strength)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError('mirostat_update: %s 必须是数字，收到 %r'
+                             % (name, val))
+        val = float(val)
+        if val != val or val in (float('inf'), float('-inf')):
+            raise ValueError('mirostat_update: %s 必须是有限值，收到 %r'
+                             % (name, val))
+    if target_entropy < 0.0:
+        raise ValueError('mirostat_update: target_entropy 必须 >= 0')
+    if strength < 0.0:
+        raise ValueError('mirostat_update: strength 必须 >= 0')
+    return max(0.0, float(mu) - float(strength)
+               * (float(observed_surprisal) - float(target_entropy)))
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
