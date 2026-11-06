@@ -20521,6 +20521,362 @@ class RAdam(_StatefulOptimizer):
 
 
 # ============================================================================
+#  Layer-wise Optimizers: LARS / LAMB / Ranger（W9-B）
+# ============================================================================
+
+def _w9b_check(who, name, value, minimum=None):
+    """W9-B 用的标量校验：有限数字，可选下界（bool 不算数字）"""
+    if not _is_num(value):
+        raise ValueError(f"{who}: {name} 必须是有限数字，收到 {value!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{who}: {name} 必须 >= {minimum}，收到 {value!r}")
+    return float(value)
+
+
+def _w9b_sqsum(obj):
+    """嵌套 list 的平方和（优化器只对数值求范数，不关心结构）"""
+    if isinstance(obj, list):
+        acc = 0.0
+        for v in obj:
+            acc += _w9b_sqsum(v)
+        return acc
+    return float(obj) * float(obj)
+
+
+class _LayerwiseOptimizer:
+    """按「整层」决定步长的优化器基类（W9-B）
+
+    与 `_StatefulOptimizer` 的区别：LARS / LAMB 要先看这一层的权重范数与梯度
+    范数，才能算出「信任比」，所以不能逐标量独立更新。状态同样存在优化器实例
+    上，键是 `(层号, 'w'|'b')`，值是若干与参数同形状的嵌套列表。
+
+    约定：信任比只按**权重**算，偏置用未缩放的 `lr`（LARS 原文就是这样做的）。
+    """
+
+    name = "layerwise"
+
+    def __init__(self, model, lr):
+        self.model = model
+        self.lr = float(lr)
+        self.step_count = 0
+        self.state = {}
+
+    def _new_state(self, layer, kind):
+        raise NotImplementedError
+
+    def _state_for(self, idx, kind, layer):
+        key = (idx, kind)
+        st = self.state.get(key)
+        if st is None:
+            st = self._new_state(layer, kind)
+            self.state[key] = st
+        return st
+
+    def step(self, all_grads):
+        if not isinstance(all_grads, list):
+            raise ValueError(
+                f"{self.name}.step: all_grads 必须是列表，收到 "
+                f"{type(all_grads).__name__}")
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError(
+                f"{self.name}.step: 梯度层数 {len(all_grads)} 与模型层数 "
+                f"{len(self.model.layers)} 不一致")
+        self.step_count += 1
+        for idx, (layer, (grad_w, grad_b)) in enumerate(
+                zip(self.model.layers, all_grads)):
+            self._update_layer(layer, grad_w, grad_b,
+                               self._state_for(idx, 'w', layer),
+                               self._state_for(idx, 'b', layer), idx)
+        self._after_step()
+
+    def _after_step(self):
+        """每步结束后的钩子（Ranger 用它做 Lookahead 慢权重同步）"""
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        raise NotImplementedError
+
+    def state_dict(self):
+        items = sorted(self.state.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+        return {
+            "optimizer": self.name,
+            "lr": self.lr,
+            "step_count": self.step_count,
+            "state": {f"{idx}:{kind}": _w9_copy(st)
+                      for (idx, kind), st in items},
+        }
+
+    def load_state_dict(self, blob):
+        if not isinstance(blob, dict):
+            raise ValueError(
+                f"{self.name}: state_dict 必须是 dict，收到 {type(blob).__name__}")
+        owner = blob.get("optimizer")
+        if owner not in (None, self.name):
+            raise ValueError(f"{self.name}: state_dict 属于 {owner!r} 的优化器")
+        state = blob.get("state", {})
+        if not isinstance(state, dict):
+            raise ValueError(f"{self.name}: state 字段必须是 dict")
+        parsed = {}
+        for key, st in state.items():
+            idx_s, _, kind = str(key).partition(":")
+            try:
+                idx = int(idx_s)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 不是 '层号:w|b' 形式")
+            if kind not in ("w", "b"):
+                raise ValueError(f"{self.name}: 状态键 {key!r} 的参数类型必须是 w/b")
+            if not 0 <= idx < len(self.model.layers):
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 指向不存在的层（共 "
+                    f"{len(self.model.layers)} 层）")
+            copied = _w9_copy(st)
+            if not isinstance(copied, dict) or not copied:
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 的值必须是非空 dict")
+            layer = self.model.layers[idx]
+            for field, arr in copied.items():
+                _w9_check_state(arr, layer, kind,
+                                f"{self.name}.load_state_dict[{key}.{field}]")
+            parsed[(idx, kind)] = copied
+        t = blob.get("step_count", 0)
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+            raise ValueError(f"{self.name}: step_count 必须是非负整数，收到 {t!r}")
+        self.state = parsed
+        self.step_count = t
+        if "lr" in blob:
+            self.lr = float(blob["lr"])
+        return self
+
+
+class LARS(_LayerwiseOptimizer):
+    """LARS（2017）：按「权重范数 / 梯度范数」给每层单独缩放学习率
+
+    ``trust = trust_coef * ||w|| / (||g|| + wd*||w|| + eps)``，``local_lr = lr*trust``；
+    然后 ``vel = momentum*vel + local_lr*(g + wd*w)``、``p -= vel``（`nesterov`
+    时改成 ``p -= momentum*vel + local_lr*(g + wd*w)``）。
+
+    信任比让各层的相对前进量大致相同，所以大 batch 训练可以把 lr 放大到 0.1~10
+    量级而不炸。`||w||` 或 `||g||` 为 0（例如该层梯度恰好全零）时退化成普通
+    动量 SGD（`local_lr = lr`）。
+    """
+
+    name = "lars"
+
+    def __init__(self, model, lr=0.1, momentum=0.9, weight_decay=0.0,
+                 trust_coef=0.001, eps=1e-8, nesterov=False):
+        _w9_check("LARS", lr, betas=(("momentum", momentum),), eps=eps)
+        super().__init__(model, lr)
+        self.momentum = float(momentum)
+        self.weight_decay = _w9b_check("LARS", "weight_decay", weight_decay, 0.0)
+        self.trust_coef = _w9b_check("LARS", "trust_coef", trust_coef, 0.0)
+        self.eps = float(eps)
+        if not isinstance(nesterov, bool):
+            raise ValueError("LARS: nesterov 必须是 bool")
+        self.nesterov = nesterov
+
+    def _new_state(self, layer, kind):
+        return {"vel": _w9_zeros(layer, kind)}
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        lr, mom, wd, tc, eps = (self.lr, self.momentum, self.weight_decay,
+                                self.trust_coef, self.eps)
+        w_sq = _w9b_sqsum(layer.weights)
+        g_sq = _w9b_sqsum(grad_w)
+        w_norm = math.sqrt(w_sq)
+        g_norm = math.sqrt(g_sq)
+        denom = g_norm + wd * w_norm + eps
+        if w_norm > 0.0 and denom > 0.0:
+            local_lr = lr * tc * w_norm / denom
+        else:
+            local_lr = lr
+        vel = st_w["vel"]
+        for j in range(layer.fan_out):
+            Wj, gwj, vj = layer.weights[j], grad_w[j], vel[j]
+            for i in range(layer.fan_in):
+                g = gwj[i] + wd * Wj[i]
+                vj[i] = mom * vj[i] + local_lr * g
+                if self.nesterov:
+                    Wj[i] -= mom * vj[i] + local_lr * g
+                else:
+                    Wj[i] -= vj[i]
+        vel_b = st_b["vel"]
+        for j in range(layer.fan_out):
+            g = grad_b[j] + wd * layer.biases[j]
+            vel_b[j] = mom * vel_b[j] + lr * g
+            if self.nesterov:
+                layer.biases[j] -= mom * vel_b[j] + lr * g
+            else:
+                layer.biases[j] -= vel_b[j]
+
+
+class LAMB(_LayerwiseOptimizer):
+    """LAMB（2019）：Adam 的逐参数自适应 + LARS 的逐层信任比
+
+    每层先算标准 Adam 更新 ``u = m_hat/(sqrt(v_hat)+eps) + wd*w``，再用
+    ``trust = ||w|| / ||u||``（截断到 ``trust_clip``）缩放：``p -= lr*trust*u``。
+    这样 BERT 那种「大 batch + 大 lr」的预训练不会因为某层梯度大就爆掉。
+    """
+
+    name = "lamb"
+
+    def __init__(self, model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-6,
+                 weight_decay=0.0, trust_clip=10.0):
+        _w9_check("LAMB", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
+        super().__init__(model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.weight_decay = _w9b_check("LAMB", "weight_decay", weight_decay, 0.0)
+        self.trust_clip = _w9b_check("LAMB", "trust_clip", trust_clip, 1e-12)
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        b1, b2, lr, eps = self.beta1, self.beta2, self.lr, self.eps
+        wd, clip = self.weight_decay, self.trust_clip
+        t = self.step_count
+        c1 = 1.0 - b1 ** t
+        c2 = 1.0 - b2 ** t
+        om1 = 1.0 - b1
+        om2 = 1.0 - b2
+        m_w, v_w = st_w["m"], st_w["v"]
+        # 1) 先按 Adam 算「未缩放」的整层更新量 u（含解耦权重衰减）
+        u = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+        u_sq = 0.0
+        for j in range(layer.fan_out):
+            gwj, mj, vj, uj = grad_w[j], m_w[j], v_w[j], u[j]
+            Wj = layer.weights[j]
+            for i in range(layer.fan_in):
+                g = gwj[i]
+                mj[i] = b1 * mj[i] + om1 * g
+                vj[i] = b2 * vj[i] + om2 * g * g
+                step_i = (mj[i] / c1) / (math.sqrt(vj[i] / c2) + eps)
+                uj[i] = step_i + wd * Wj[i]
+                u_sq += uj[i] * uj[i]
+        # 2) 信任比：||w|| / ||u||，截断到 trust_clip
+        w_sq = _w9b_sqsum(layer.weights)
+        u_norm = math.sqrt(u_sq)
+        w_norm = math.sqrt(w_sq)
+        if w_norm > 0.0 and u_norm > 0.0:
+            trust = w_norm / u_norm
+            if trust > clip:
+                trust = clip
+        else:
+            trust = 1.0
+        scale = lr * trust
+        # 3) 应用
+        for j in range(layer.fan_out):
+            Wj, uj = layer.weights[j], u[j]
+            for i in range(layer.fan_in):
+                Wj[i] -= scale * uj[i]
+        m_b, v_b = st_b["m"], st_b["v"]
+        for j in range(layer.fan_out):
+            g = grad_b[j]
+            m_b[j] = b1 * m_b[j] + om1 * g
+            v_b[j] = b2 * v_b[j] + om2 * g * g
+            step_j = (m_b[j] / c1) / (math.sqrt(v_b[j] / c2) + eps)
+            layer.biases[j] -= lr * (step_j + wd * layer.biases[j])
+
+
+class Ranger(_LayerwiseOptimizer):
+    """Ranger（2020）= RAdam + Lookahead
+
+    内层是 RAdam 的修正步长（前几步只有动量、之后才打开自适应缩放），外层是
+    Lookahead：维护一份「慢权重」，每 `k` 步做 ``slow += alpha*(fast-slow)`` 再把
+    快权重重置成慢权重。好处是 RAdam 的稳启动 + Lookahead 的低方差收敛。
+    """
+
+    name = "ranger"
+
+    def __init__(self, model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8,
+                 alpha=0.5, k=6):
+        _w9_check("Ranger", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
+        if not 0.0 < float(beta2) < 1.0:
+            raise ValueError(f"Ranger: beta2 必须在 (0,1)，收到 {beta2!r}")
+        rho_inf = 2.0 / (1.0 - float(beta2)) - 1.0
+        if rho_inf <= 4.0:
+            raise ValueError(
+                f"Ranger: beta2={beta2!r} 太小（rho_inf={rho_inf:.3f} <= 4），"
+                "修正因子无定义；请用 beta2 >= 0.8 左右")
+        super().__init__(model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.rho_inf = rho_inf
+        if not _is_num(alpha) or not 0.0 < alpha <= 1.0:
+            raise ValueError(f"Ranger: alpha 必须在 (0,1]，收到 {alpha!r}")
+        self.alpha = float(alpha)
+        if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+            raise ValueError(f"Ranger: k 必须是 >=1 的整数，收到 {k!r}")
+        self.k = k
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind),
+                "slow": _w9_copy(layer.biases if kind == 'b' else layer.weights)}
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        b1, b2, lr, eps = self.beta1, self.beta2, self.lr, self.eps
+        t = self.step_count
+        c1 = 1.0 - b1 ** t
+        c2 = 1.0 - b2 ** t
+        om1 = 1.0 - b1
+        om2 = 1.0 - b2
+        rho_t = self.rho_inf - 2.0 * t * (b2 ** t) / c2
+        if rho_t > 4.0:
+            r_t = math.sqrt(((rho_t - 4.0) * (rho_t - 2.0) * self.rho_inf)
+                            / ((self.rho_inf - 4.0) * (self.rho_inf - 2.0) * rho_t))
+        else:
+            r_t = 0.0
+        m_w, v_w = st_w["m"], st_w["v"]
+        for j in range(layer.fan_out):
+            gwj, mj, vj, Wj = grad_w[j], m_w[j], v_w[j], layer.weights[j]
+            for i in range(layer.fan_in):
+                g = gwj[i]
+                mj[i] = b1 * mj[i] + om1 * g
+                vj[i] = b2 * vj[i] + om2 * g * g
+                m_hat = mj[i] / c1
+                if r_t == 0.0:
+                    Wj[i] -= lr * m_hat
+                else:
+                    v_hat = vj[i] / c2
+                    Wj[i] -= lr * r_t * m_hat / (math.sqrt(v_hat) + eps)
+        m_b, v_b = st_b["m"], st_b["v"]
+        for j in range(layer.fan_out):
+            g = grad_b[j]
+            m_b[j] = b1 * m_b[j] + om1 * g
+            v_b[j] = b2 * v_b[j] + om2 * g * g
+            m_hat = m_b[j] / c1
+            if r_t == 0.0:
+                layer.biases[j] -= lr * m_hat
+            else:
+                v_hat = v_b[j] / c2
+                layer.biases[j] -= lr * r_t * m_hat / (math.sqrt(v_hat) + eps)
+
+    def _after_step(self):
+        """Lookahead：每 k 步把慢权重向快权重靠一步，再让快权重回跳"""
+        if self.step_count % self.k != 0:
+            return
+        alpha = self.alpha
+        for idx, layer in enumerate(self.model.layers):
+            for kind, param in (('w', layer.weights), ('b', layer.biases)):
+                st = self.state.get((idx, kind))
+                if st is None:
+                    continue
+                slow = st["slow"]
+                if kind == 'b':
+                    for j in range(layer.fan_out):
+                        slow[j] += alpha * (param[j] - slow[j])
+                        param[j] = slow[j]
+                else:
+                    for j in range(layer.fan_out):
+                        srow, prow = slow[j], param[j]
+                        for i in range(layer.fan_in):
+                            srow[i] += alpha * (prow[i] - srow[i])
+                            prow[i] = srow[i]
+
+
+# ============================================================================
 #  Gradient Clipping / LR Scheduler
 # ============================================================================
 
@@ -24200,6 +24556,9 @@ class Model:
         'adadelta': AdaDelta,
         'nadam': Nadam,
         'radam': RAdam,
+        'lars': LARS,
+        'lamb': LAMB,
+        'ranger': Ranger,
     }
 
     _LOSS_MAP = {

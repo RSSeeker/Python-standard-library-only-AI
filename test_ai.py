@@ -17205,3 +17205,242 @@ class TestClassicOptimizers:
             h = model.fit(data=data, epochs=5, verbose=False)
             assert math.isfinite(h["train_loss"][-1][1])
             assert h["train_loss"][-1][1] <= h["train_loss"][0][1] + 1e-9
+
+
+# ============================================================================
+#  W9-B：层粒度优化器（LARS / LAMB / Ranger）
+# ============================================================================
+
+class TestLayerwiseOptimizers:
+    """LARS / LAMB / Ranger 的数值与状态一致性"""
+
+    X = [1.0, -0.5, 0.25]
+    Y = [0.3, -0.7]
+
+    @staticmethod
+    def _mk(seed=7, sizes=(3, 4, 2)):
+        random.seed(seed)
+        return AI.MLP(list(sizes), activations=["relu", "linear"])
+
+    @staticmethod
+    def _grads(model, x=None, y=None):
+        x = TestLayerwiseOptimizers.X if x is None else x
+        y = TestLayerwiseOptimizers.Y if y is None else y
+        pred = model.forward(x)
+        _loss, gp = AI.mse_loss(pred, y)
+        return AI._mlp_backward(model, gp)
+
+    @staticmethod
+    def _close(a, b, tol=1e-13):
+        return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+    @staticmethod
+    def _snapshot(model):
+        return [(layer.biases[:], [row[:] for row in layer.weights])
+                for layer in model.layers]
+
+    @staticmethod
+    def _total_drift(model, opt):
+        snap = TestLayerwiseOptimizers._snapshot(model)
+        g = TestLayerwiseOptimizers._grads(model)
+        opt.step(g)
+        tot = 0.0
+        for (b0, w0), layer in zip(snap, model.layers):
+            for j in range(layer.fan_out):
+                tot += abs(layer.biases[j] - b0[j])
+                for i in range(layer.fan_in):
+                    tot += abs(layer.weights[j][i] - w0[j][i])
+        return tot
+
+    def test_lars_matches_hand_computation(self):
+        m = self._mk()
+        ref = self._mk()
+        opt = AI.LARS(m, lr=0.05, momentum=0.9, trust_coef=0.02, eps=1e-8)
+        vel_w = [[[0.0] * l.fan_in for _ in range(l.fan_out)] for l in ref.layers]
+        vel_b = [[0.0] * l.fan_out for l in ref.layers]
+        for _ in range(2):
+            g = self._grads(m)
+            opt.step(g)
+            for li, layer in enumerate(ref.layers):
+                gw, gb = g[li]
+                w_norm = math.sqrt(sum(v * v for row in layer.weights for v in row))
+                g_norm = math.sqrt(sum(v * v for row in gw for v in row))
+                denom = g_norm + 1e-8
+                local_lr = 0.05 * 0.02 * w_norm / denom if (w_norm > 0.0 and denom > 0.0) else 0.05
+                for j in range(layer.fan_out):
+                    for i in range(layer.fan_in):
+                        vel_w[li][j][i] = 0.9 * vel_w[li][j][i] + local_lr * gw[j][i]
+                        layer.weights[j][i] -= vel_w[li][j][i]
+                    vel_b[li][j] = 0.9 * vel_b[li][j] + 0.05 * gb[j]
+                    layer.biases[j] -= vel_b[li][j]
+        for li, layer in enumerate(ref.layers):
+            for j in range(layer.fan_out):
+                assert self._close(layer.biases[j], m.layers[li].biases[j])
+                for i in range(layer.fan_in):
+                    assert self._close(layer.weights[j][i], m.layers[li].weights[j][i])
+        assert opt.step_count == 2
+
+    def test_lars_zero_weights_falls_back_to_lr(self):
+        m = self._mk()
+        for layer in m.layers:
+            layer.biases = [0.0] * layer.fan_out
+            layer.weights = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+        opt = AI.LARS(m, lr=0.03, trust_coef=0.5)
+        g = self._grads(m)
+        opt.step(g)
+        for li, layer in enumerate(m.layers):
+            gw, gb = g[li]
+            for j in range(layer.fan_out):
+                assert self._close(layer.biases[j], -0.03 * gb[j])
+                for i in range(layer.fan_in):
+                    assert self._close(layer.weights[j][i], -0.03 * gw[j][i])
+
+    def test_lamb_matches_hand_computation(self):
+        m = self._mk(seed=11)
+        ref = self._mk(seed=11)
+        opt = AI.LAMB(m, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-6,
+                      weight_decay=0.01)
+        mw = [[[[0.0] * l.fan_in for _ in range(l.fan_out)],
+               [[0.0] * l.fan_in for _ in range(l.fan_out)]] for l in ref.layers]
+        mb = [[[0.0] * l.fan_out, [0.0] * l.fan_out] for l in ref.layers]
+        for step in range(1, 3):
+            g = self._grads(m)
+            opt.step(g)
+            c1 = 1.0 - 0.9 ** step
+            c2 = 1.0 - 0.999 ** step
+            for li, layer in enumerate(ref.layers):
+                gw, gb = g[li]
+                u = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                for j in range(layer.fan_out):
+                    for i in range(layer.fan_in):
+                        gg = gw[j][i]
+                        mw[li][0][j][i] = 0.9 * mw[li][0][j][i] + 0.1 * gg
+                        mw[li][1][j][i] = 0.999 * mw[li][1][j][i] + 0.001 * gg * gg
+                        u[j][i] = ((mw[li][0][j][i] / c1)
+                                   / (math.sqrt(mw[li][1][j][i] / c2) + 1e-6)
+                                   + 0.01 * layer.weights[j][i])
+                w_norm = math.sqrt(sum(v * v for row in layer.weights for v in row))
+                u_norm = math.sqrt(sum(v * v for row in u for v in row))
+                trust = min(w_norm / u_norm, 10.0) if (w_norm > 0.0 and u_norm > 0.0) else 1.0
+                for j in range(layer.fan_out):
+                    for i in range(layer.fan_in):
+                        layer.weights[j][i] -= 0.01 * trust * u[j][i]
+                    gg = gb[j]
+                    mb[li][0][j] = 0.9 * mb[li][0][j] + 0.1 * gg
+                    mb[li][1][j] = 0.999 * mb[li][1][j] + 0.001 * gg * gg
+                    st = ((mb[li][0][j] / c1)
+                          / (math.sqrt(mb[li][1][j] / c2) + 1e-6))
+                    layer.biases[j] -= 0.01 * (st + 0.01 * layer.biases[j])
+        for li, layer in enumerate(ref.layers):
+            for j in range(layer.fan_out):
+                assert self._close(layer.biases[j], m.layers[li].biases[j])
+                for i in range(layer.fan_in):
+                    assert self._close(layer.weights[j][i], m.layers[li].weights[j][i])
+
+    def test_lamb_trust_clip_bounds_step(self):
+        m1 = self._mk(seed=3)
+        small = self._total_drift(m1, AI.LAMB(m1, lr=0.01, trust_clip=1e-6))
+        m2 = self._mk(seed=3)
+        big = self._total_drift(m2, AI.LAMB(m2, lr=0.01, trust_clip=1e6))
+        assert small > 0.0
+        assert small < big
+
+    def test_ranger_first_step_is_pure_momentum(self):
+        m = self._mk(seed=5)
+        opt = AI.Ranger(m, lr=0.01, beta2=0.999, k=999)
+        g = self._grads(m)
+        snap = self._snapshot(m)
+        opt.step(g)
+        for li, layer in enumerate(m.layers):
+            b0, w0 = snap[li]
+            gw, gb = g[li]
+            for j in range(layer.fan_out):
+                assert self._close(layer.biases[j] - b0[j], -0.01 * gb[j], 1e-12)
+                for i in range(layer.fan_in):
+                    assert self._close(layer.weights[j][i] - w0[j][i],
+                                       -0.01 * gw[j][i], 1e-12)
+
+    def test_ranger_lookahead_syncs_slow_weights(self):
+        m = self._mk(seed=9)
+        opt = AI.Ranger(m, lr=0.02, alpha=0.5, k=2)
+        for _ in range(2):
+            opt.step(self._grads(m))
+        for idx, layer in enumerate(m.layers):
+            st = opt.state[(idx, "w")]
+            for j in range(layer.fan_out):
+                assert self._close(st["slow"][j][0], layer.weights[j][0])
+        # α=1 时 slow 直接等于 fast（即 fast 不动）
+        m2 = self._mk(seed=9)
+        opt2 = AI.Ranger(m2, lr=0.02, alpha=1.0, k=1)
+        before = self._snapshot(m2)
+        opt2.step(self._grads(m2))
+        moved = 0.0
+        for (b0, w0), layer in zip(before, m2.layers):
+            for j in range(layer.fan_out):
+                moved = max(moved, abs(layer.biases[j] - b0[j]))
+                for i in range(layer.fan_in):
+                    moved = max(moved, abs(layer.weights[j][i] - w0[j][i]))
+        assert moved > 0.0
+
+    def test_state_dict_roundtrip_is_bit_exact(self):
+        for cls, kw in ((AI.LARS, dict(lr=0.05, momentum=0.9, trust_coef=0.01)),
+                        (AI.LAMB, dict(lr=0.01, weight_decay=0.01)),
+                        (AI.Ranger, dict(lr=0.01, k=2))):
+            a = self._mk(seed=21)
+            b = self._mk(seed=21)
+            oa = cls(a, **kw)
+            ob = cls(b, **kw)
+            g = self._grads(a)
+            for _ in range(3):
+                oa.step(g)
+            # 断点续训的前提：权重也要回到断点
+            for la, lb in zip(a.layers, b.layers):
+                lb.biases = la.biases[:]
+                lb.weights = [row[:] for row in la.weights]
+            ob.load_state_dict(oa.state_dict())
+            for _ in range(2):
+                oa.step(g)
+                ob.step(g)
+            fa, fb = a.forward(self.X), b.forward(self.X)
+            for p, q in zip(fa, fb):
+                assert self._close(p, q)
+            assert oa.step_count == ob.step_count == 5
+
+    def test_validation(self):
+        m = AI.MLP([2, 2])
+        with pytest.raises(ValueError):
+            AI.LARS(m, lr=-1)
+        with pytest.raises(ValueError):
+            AI.LARS(m, momentum=1.0)
+        with pytest.raises(ValueError):
+            AI.LARS(m, trust_coef=-0.1)
+        with pytest.raises(ValueError):
+            AI.LARS(m, nesterov="yes")
+        with pytest.raises(ValueError):
+            AI.LAMB(m, beta2=1.0)
+        with pytest.raises(ValueError):
+            AI.LAMB(m, weight_decay=-1)
+        with pytest.raises(ValueError):
+            AI.LAMB(m, trust_clip=0)
+        with pytest.raises(ValueError):
+            AI.Ranger(m, beta2=0.5)
+        with pytest.raises(ValueError):
+            AI.Ranger(m, alpha=0.0)
+        with pytest.raises(ValueError):
+            AI.Ranger(m, k=0)
+        with pytest.raises(ValueError):
+            AI.LARS(m).load_state_dict("nope")
+        with pytest.raises(ValueError):
+            AI.LARS(m).load_state_dict({"optimizer": "lamb", "state": {}})
+
+    def test_model_wiring(self):
+        data = [([1.0, 2.0, 3.0], [0.5, 0.1]), ([0.1, 0.2, 0.3], [0.0, 1.0]),
+                ([0.5, 0.5, 0.5], [0.3, 0.3])]
+        for name in ("lars", "lamb", "ranger"):
+            m = AI.Model(AI.MLP([3, 4, 2], activations=["relu", "linear"]),
+                         task="regression", loss_fn="mse", optimizer=name,
+                         lr=0.01)
+            m.fit(data=data, epochs=40, verbose=False, seed=2)
+            first = m.history["train_loss"][0][1]
+            last = m.history["train_loss"][-1][1]
+            assert last < first, (name, first, last)

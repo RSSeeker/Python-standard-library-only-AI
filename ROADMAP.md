@@ -235,7 +235,10 @@
     两个优化器共享同一批 list，一方 `step` 会改掉另一方要用的状态（续训不再逐位一致）。
   - 已知：状态挂在优化器实例上，`save_model(optimizer=...)` 只序列化 Adam 一族的 layer 状态，
     这四个要走 `state_dict()` / `load_state_dict()` 单独存。
-- [ ] 自适应族后半：Ranger / LAMB / LARS
+- [x] 自适应族后半：Ranger / LAMB / LARS（W9-B，`LARS`/`LAMB`/`Ranger` 三个类）
+  - `LARS` 的 `local_lr = lr·tc·‖W‖/(‖g‖+wd·‖W‖+eps)`、`LAMB` 的 `trust = ‖W‖/‖u‖`（截到 `trust_clip`）、`Ranger` = RAdam + Lookahead（每 `k` 步 `slow += alpha(fast-slow)` 再 `fast = slow`）
+  - 三个都与手写参考**两步逐位一致**；`Ranger` 第一步每个参数满足 `p-p0 = -lr·g`（纯动量，worst 8.674e-17）；三者 `state_dict()` 续训逐位一致
+  - 已知边界：只支持二维 `Layer` 权重（与 `Adam` 一致）；`LARS` 偏置恒用 `lr`；`LAMB` 的 `trust_clip` 默认 10.0 是经验值（更小时收敛更慢但更稳）
 - [ ] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
 - [ ] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
       Polynomial / Lambda / MultiStep / Multiplicative / WSD / ChainedScheduler / SequentialLR

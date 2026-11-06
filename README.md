@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1070 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1079 项）
 
 ## 特性
 
@@ -364,6 +364,9 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `AdaGrad(model, lr=0.01, eps=1e-8)` | 累积梯度平方 `s += g²`，步长 `lr·g/(√s+eps)` **单调不增**；稀疏梯度友好，但训练中期容易过早停滞 |
 | `AdaDelta(model, lr=1.0, rho=0.95, eps=1e-6)` | 用「更新量平方的滑动平均」替掉学习率：`dx = √(u+eps)/√(s+eps)·g`，对梯度整体缩放不变，所以默认 `lr=1.0` 就有意义 |
 | `Nadam(model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)` | Adam + Nesterov 动量：分子是 `b1·m̂ + (1-b1)·g/(1-b1^t)`；`b1=0` 时退化成 RMSprop 式 |
+| `LARS(model, lr=0.1, momentum=0.9, trust_coef=0.001, nesterov=False)` | 层粒度信任比：`local_lr = lr·tc·‖W‖/(‖g‖+wd·‖W‖+eps)`，再用动量更新；`‖W‖=0`（或分母为 0）时回落成 `lr`。偏置恒用 `lr`，与原文一致 |
+| `LAMB(model, lr=1e-3, beta1=0.9, beta2=0.999, weight_decay=0.0, trust_clip=10.0)` | Adam 的层粒度版：先算整层更新 `u = m̂/(√v̂+eps) + wd·W`，再乘 `trust = ‖W‖/‖u‖`（截到 `trust_clip`）；大 batch 训练常用 |
+| `Ranger(model, lr=1e-3, alpha=0.5, k=6)` | RAdam + Lookahead：RAdam 的动量相→修正相，再每 `k` 步把快权重按 `alpha` 混入慢权重并同步回去 |
 | `RAdam(model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)` | 用 `rho_t = rho_inf - 2t·b2^t/(1-b2^t)` 判断二阶矩够不够可信：`rho_t<=4` 时只走纯动量，之后才按 `r_t` 缩放自适应步长（免手工 warmup） |
 | `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
 | `ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=0.0, mode='min')` | 指标停滞 `patience+1` 次就把 lr 乘 `factor`（可反复降档，与 PyTorch 一致）；`step()` 要传指标 |
@@ -603,6 +606,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `Adam` | Adam（默认） |
 | `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
 | `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套（W9-A）；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
+| `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套（W9-B）：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
@@ -1126,7 +1130,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1070 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1079 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1178,7 +1182,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInfoNCELoss` | loss 与闭式公式一致 / 四个梯度 vs 数值 / 难负样本 loss 更大 / 非法参数 |
 | `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
 | `TestCTCLoss` | loss 与穷举所有对齐路径一致 / 梯度 vs 数值 / 不可达与非法标签 |
-| `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
+| `TestLayerwiseOptimizers` | LARS/LAMB 与手写参考逐步逐位一致、LARS 零权重回落 `lr`、LAMB 的 `trust_clip` 单调、Ranger 第一步是纯动量且 Lookahead 后 `fast == slow`、三者 `state_dict` 往返续训逐位一致（需连权重一起搬）、非法超参 || `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -1327,7 +1331,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1070 个单元测试
+├── test_ai.py       # 1079 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
