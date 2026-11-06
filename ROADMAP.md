@@ -163,7 +163,7 @@
 - [x] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway（ReZero/SkipInit/PreNormResidual/PostNormResidual/Highway；dx/参数梯度中心差分 ≤1e-6，ReZero 的 lpha=0 逐位恒等；顺带补了 _dense_param_count/_dense_apply_sgd/_dense_apply_adam/_norm_* 六个助手，因为 Layer/LayerNorm 本身没有 param_count()/sgd_step()）
 
 ### W4 视觉骨干（P0/P1）
-- [ ] `PatchEmbedding` [x]（`Conv2d(kernel=stride=p)` + 行优先摊平，`backward` 还原特征图；`dx`/`conv.grad_w` 中心差分 ≤1e-7）+ `ViT`（含 CLS token、位置编码、分类头）**待做**
+- [x] `PatchEmbedding`（`Conv2d(kernel=stride=p)` + 行优先摊平，`backward` 还原特征图；`dx`/`conv.grad_w` 中心差分 ≤1e-7）+ `ViT`（CLS token + 位置编码 + 2 层编码器 + 分类头；`dx` 与 CLS/`pos`/head/`LayerNorm` 四组梯度中心差分 ≤1e-7；梯度累加语义与 `zero_grad`；2 类小任务 15 轮收敛并全对；只有 `sgd_step`，与 Transformer 系列一致）
 - [ ] `UNet`（编码-解码 + 跳跃连接）、`FPN`、`SegNet`（简化）
 - [ ] `SwinTransformer`（窗口注意力，简化）、`MLPMixer`
 - [x] `AttentionPooling`（`q` 可学，`q=0` 退化为平均；`dx`/`grad_q` 中心差分 ≤1e-9）、`GeMPooling`（`p=1` 平均 / `p=2` 均方根 / `p=2000` 仍不溢出，log 空间实现）

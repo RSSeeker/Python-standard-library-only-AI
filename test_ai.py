@@ -12444,3 +12444,158 @@ class TestGeMPooling:
             AI.GeMPooling(2.0).forward([[[-1.0, 2.0]]])
         with pytest.raises(RuntimeError):
             AI.GeMPooling(2.0).backward([1.0])
+
+class TestViT:
+    """ViT：patch 化 + CLS + 位置编码 + Transformer + 分类头"""
+
+    @staticmethod
+    def _img():
+        return [[[float(i * 4 + j + 1) / 16.0 for j in range(4)] for i in range(4)]]
+
+    @staticmethod
+    def _make(classes=3):
+        return AI.ViT(in_channels=1, image_size=4, patch_size=2, d_model=8,
+                      num_heads=2, d_ff=16, num_layers=1, num_classes=classes)
+
+    def test_forward_shape_and_params(self):
+        v = self._make()
+        out = v.forward(self._img())
+        assert len(out) == 3
+        assert v.num_patches == 4
+        assert v.grid == (2, 2)
+        manual = v.patch_embed.param_count() + sum(
+            AI._count_floats(t) for _n, t in v._layer_params())
+        assert v.param_count() == manual
+        dx = v.backward([1.0, 0.0, 0.0])
+        assert len(dx) == 1 and len(dx[0]) == 4 and len(dx[0][0]) == 4
+
+    def test_gradients_match_finite_difference(self):
+        v = self._make(classes=2)
+        img = self._img()
+        coef = [0.7, -0.4]
+
+        def loss():
+            o = v.forward(img)
+            return o[0] * coef[0] + o[1] * coef[1]
+
+        v.zero_grad()
+        v.forward(img)
+        analytic_dx = v.backward(coef)
+        analytic_cls = list(v.grad_cls)
+        analytic_pos = [list(r) for r in v.grad_pos]
+        analytic_head = [list(r) for r in v.head.grad_w]
+        analytic_gamma = list(v.norm_grads[0])
+
+        def numeric(get, setv, step=1e-6):
+            old = get()
+            setv(old + step)
+            lp = loss()
+            setv(old - step)
+            lm = loss()
+            setv(old)
+            return (lp - lm) / (2 * step)
+
+        worst = 0.0
+        for i in range(4):
+            for j in range(4):
+                num = numeric(lambda _i=i, _j=j: img[0][_i][_j],
+                              lambda val, _i=i, _j=j: img[0].__setitem__(
+                                  _i, img[0][_i][: _j] + [val] + img[0][_i][_j + 1:]))
+                worst = max(worst, abs(num - analytic_dx[0][i][j]))
+        assert worst < 1e-7
+
+        worst = 0.0
+        for j in range(8):
+            num = numeric(lambda _j=j: v.cls[_j],
+                          lambda val, _j=j: v.cls.__setitem__(_j, val))
+            worst = max(worst, abs(num - analytic_cls[j]))
+        assert worst < 1e-7
+
+        worst = 0.0
+        for t in (0, 4):
+            for j in (1, 5):
+                num = numeric(lambda _t=t, _j=j: v.pos[_t][_j],
+                              lambda val, _t=t, _j=j: v.pos[_t].__setitem__(_j, val))
+                worst = max(worst, abs(num - analytic_pos[t][j]))
+        assert worst < 1e-6
+
+        worst = 0.0
+        for k in range(2):
+            for j in range(8):
+                num = numeric(lambda _k=k, _j=j: v.head.weights[_k][_j],
+                              lambda val, _k=k, _j=j: v.head.weights[_k].__setitem__(_j, val))
+                worst = max(worst, abs(num - analytic_head[k][j]))
+        assert worst < 1e-6
+
+        worst = 0.0
+        for j in range(8):
+            num = numeric(lambda _j=j: v.norm.gamma[_j],
+                          lambda val, _j=j: v.norm.gamma.__setitem__(_j, val))
+            worst = max(worst, abs(num - analytic_gamma[j]))
+        assert worst < 1e-6
+
+    def test_gradients_accumulate_and_zero(self):
+        v = self._make(classes=2)
+        img = self._img()
+        v.zero_grad()
+        v.forward(img)
+        v.backward([1.0, 0.0])
+        h1 = v.head.grad_w[0][0]
+        c1 = v.grad_cls[0]
+        n1 = v.norm_grads[0][0]
+        v.forward(img)
+        v.backward([1.0, 0.0])
+        assert abs(v.head.grad_w[0][0] - 2 * h1) < 1e-12
+        assert abs(v.grad_cls[0] - 2 * c1) < 1e-12
+        assert abs(v.norm_grads[0][0] - 2 * n1) < 1e-12
+        v.zero_grad()
+        assert v.head.grad_w[0][0] == 0.0
+        assert v.grad_cls[0] == 0.0
+        assert v.norm_grads[0][0] == 0.0
+        assert v.grad_pos[0][0] == 0.0
+
+    def test_training_reduces_loss(self):
+        v = self._make(classes=2)
+        xs = [[[[1.0 if (i + j) % 2 == 0 else 0.0 for j in range(4)]
+                for i in range(4)]],
+              [[[0.0 if (i + j) % 2 == 0 else 1.0 for j in range(4)]
+                for i in range(4)]]]
+        ys = [0, 1]
+
+        def mean_loss():
+            return sum(AI.cross_entropy_loss(v.forward(xi), yi)[0]
+                       for xi, yi in zip(xs, ys)) / len(xs)
+
+        first = mean_loss()
+        for _epoch in range(15):
+            for xi, yi in zip(xs, ys):
+                v.zero_grad()
+                _l, dlogits = AI.cross_entropy_loss(v.forward(xi), yi)
+                v.backward(dlogits)
+                v.sgd_step(0.05)
+        assert mean_loss() < first * 0.6
+        preds = [max(range(2), key=lambda k: v.forward(xi)[k]) for xi in xs]
+        assert preds == ys
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.ViT(image_size=(5, 4), patch_size=2)
+        with pytest.raises(TypeError):
+            AI.ViT(image_size=(4,))
+        with pytest.raises(ValueError):
+            AI.ViT(d_model=8, num_heads=3)
+        with pytest.raises(ValueError):
+            AI.ViT(num_classes=0)
+        with pytest.raises(ValueError):
+            AI.ViT(in_channels=3).forward(self._img())
+        with pytest.raises(ValueError):
+            self._make().forward([[[1.0, 2.0]]])
+        with pytest.raises(RuntimeError):
+            self._make().backward([1.0, 2.0, 3.0])
+        v = self._make()
+        v.forward(self._img())
+        with pytest.raises(ValueError):
+            v.backward([1.0])
+        with pytest.raises(ValueError):
+            self._make().sgd_step(-0.1)
+

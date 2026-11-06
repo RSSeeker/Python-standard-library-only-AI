@@ -22,7 +22,7 @@
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
-  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling；残差变体：
+  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT；残差变体：
     ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
@@ -5408,6 +5408,15 @@ class Highway:
         self.zero_grad()
 
 
+def _count_floats(obj):
+    """递归统计嵌套列表里 float/int 的个数（用于 param_count）"""
+    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        return 1
+    if isinstance(obj, (list, tuple)):
+        return sum(_count_floats(v) for v in obj)
+    return 0
+
+
 class PatchEmbedding:
     """把 `(C,H,W)` 图像切成不重叠的 patch，每个 patch 映射成一个 `d_model` 维 token
 
@@ -5715,6 +5724,190 @@ class GeMPooling:
     def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
         if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
             raise ValueError(f"GeMPooling.adam_step: lr 必须是非负数，收到 {lr!r}")
+
+
+class ViT:
+    """视觉 Transformer（编码器式）：patch 化 → CLS + 位置编码 → N 层编码器 → 分类头
+
+    结构：
+    `PatchEmbedding` 切出 `n` 个 patch token → 前面拼一个可学习的 `CLS` → 加可学习
+    位置编码 → `TransformerEncoder`（非因果）→ 取 `CLS` 那一位 → `LayerNorm` →
+    线性分类头（输出 logits，配 `cross_entropy` 用）。
+
+    `backward` 接收 logits 的梯度、返回 `(C,H,W)` 的输入梯度，所有内部梯度就地填好。
+    **梯度是累加的**（与 `TransformerEncoder` 等组件一致）：一个 batch 里连续调用多次
+    `backward` 会累加，更新前先 `zero_grad()`，或按 batch 大小自行缩放学习率。
+    参数更新走 `sgd_step()`（Transformer 系列在本项目里只提供 SGD；需要 Adam 时由
+    外部循环自己组合 `Model` 之外的部分）。
+    """
+
+    def __init__(self, in_channels: int = 3, image_size=8, patch_size: int = 4,
+                 d_model: int = 16, num_heads: int = 4, d_ff: int = 32,
+                 num_layers: int = 2, num_classes: int = 10, dropout: float = 0.0):
+        if isinstance(image_size, int) and not isinstance(image_size, bool):
+            image_size = (image_size, image_size)
+        if not isinstance(image_size, (tuple, list)) or len(image_size) != 2:
+            raise TypeError(
+                f"ViT: image_size 必须是 int 或 (H, W)，收到 {image_size!r}")
+        img_h, img_w = int(image_size[0]), int(image_size[1])
+        if img_h < 1 or img_w < 1:
+            raise ValueError(f"ViT: image_size 必须为正，收到 {image_size!r}")
+        if img_h % patch_size != 0 or img_w % patch_size != 0:
+            raise ValueError(
+                f"ViT: image_size={(img_h, img_w)} 必须能被 patch_size="
+                f"{patch_size} 整除")
+        for name, val in (("in_channels", in_channels), ("d_model", d_model),
+                          ("num_heads", num_heads), ("num_layers", num_layers),
+                          ("num_classes", num_classes)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"ViT: {name} 必须是 >=1 的整数，收到 {val!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"ViT: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        self.in_channels = in_channels
+        self.image_size = (img_h, img_w)
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.num_classes = num_classes
+        self.grid = (img_h // patch_size, img_w // patch_size)
+        self.num_patches = self.grid[0] * self.grid[1]
+
+        self.patch_embed = PatchEmbedding(in_channels, patch_size, d_model)
+        rng = random.Random(20240501)
+        std = math.sqrt(1.0 / d_model)
+        self.cls = [rng.gauss(0.0, std) for _ in range(d_model)]
+        self.pos = [[rng.gauss(0.0, std) for _ in range(d_model)]
+                    for _ in range(self.num_patches + 1)]
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff,
+                                          num_layers=num_layers, dropout=dropout)
+        self.norm = LayerNorm(d_model)
+        self.head = Layer(d_model, num_classes, "linear")
+        self.head.grad_w = [[0.0] * d_model for _ in range(num_classes)]
+        self.head.grad_b = [0.0] * num_classes
+
+        self.grad_cls = [0.0] * d_model
+        self.grad_pos = [[0.0] * d_model for _ in range(self.num_patches + 1)]
+        self.norm_grads = ([0.0] * d_model, [0.0] * d_model)
+        self.seq = None
+        self.logits = None
+        self.training = True
+
+    def forward(self, x):
+        """`(C,H,W)` → 长度 num_classes 的 logits"""
+        c = len(x)
+        if c != self.in_channels:
+            raise ValueError(
+                f"ViT.forward: 输入通道数 {c} 与 in_channels={self.in_channels} 不符")
+        if (len(x[0]), len(x[0][0])) != self.image_size:
+            raise ValueError(
+                f"ViT.forward: 输入尺寸 {(len(x[0]), len(x[0][0]))} 与 "
+                f"image_size={self.image_size} 不符")
+        patches = self.patch_embed.forward(x)
+        if len(patches) != self.num_patches:
+            raise ValueError(
+                f"ViT.forward: patch 数 {len(patches)} 与预期 {self.num_patches} 不符")
+        seq = [list(self.cls)] + [list(t) for t in patches]
+        for i in range(len(seq)):
+            row = seq[i]
+            pos_i = self.pos[i]
+            for j in range(self.d_model):
+                row[j] += pos_i[j]
+        self.seq = seq
+        out = self.encoder.forward(seq)
+        h = self.norm.forward(out[0])
+        self.logits = self.head.forward(h)
+        return self.logits
+
+    def backward(self, dlogits):
+        if self.seq is None:
+            raise RuntimeError("ViT.backward: 必须先调用 forward()")
+        if len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"ViT.backward: dlogits 长度 {len(dlogits)} 与 num_classes="
+                f"{self.num_classes} 不一致")
+        gw, gb, dh = self.head.backward(dlogits)
+        for i in range(self.num_classes):
+            row = self.head.grad_w[i]
+            grow = gw[i]
+            for j in range(self.d_model):
+                row[j] += grow[j]
+            self.head.grad_b[i] += gb[i]
+        gg, gbeta, dcls = self.norm.backward(dh)
+        for j in range(self.d_model):
+            self.norm_grads[0][j] += gg[j]
+            self.norm_grads[1][j] += gbeta[j]
+        dseq = [[0.0] * self.d_model for _ in range(len(self.seq))]
+        dseq[0] = dcls
+        dseq = self.encoder.backward(dseq)
+        for j in range(self.d_model):
+            self.grad_cls[j] += dseq[0][j]
+        for t in range(self.num_patches + 1):
+            row = self.grad_pos[t]
+            grow = dseq[t]
+            for j in range(self.d_model):
+                row[j] += grow[j]
+        return self.patch_embed.backward(dseq[1:])
+
+    def zero_grad(self):
+        self.patch_embed.zero_grad()
+        self.encoder.zero_grad()
+        self.head.grad_w = [[0.0] * self.d_model for _ in range(self.num_classes)]
+        self.head.grad_b = [0.0] * self.num_classes
+        self.norm_grads = ([0.0] * self.d_model, [0.0] * self.d_model)
+        self.grad_cls = [0.0] * self.d_model
+        self.grad_pos = [[0.0] * self.d_model for _ in range(self.num_patches + 1)]
+
+    def _layer_params(self):
+        """[(名字, 参数张量)]，用于统计与 SGD 更新"""
+        out = [("head.w", self.head.weights), ("head.b", self.head.biases),
+               ("norm.gamma", self.norm.gamma), ("norm.beta", self.norm.beta),
+               ("cls", self.cls), ("pos", self.pos)]
+        for li, layer in enumerate(self.encoder.layers):
+            mha = layer.self_attn
+            out += [(f"L{li}.W_q", mha.W_q), (f"L{li}.b_q", mha.b_q),
+                    (f"L{li}.W_k", mha.W_k), (f"L{li}.b_k", mha.b_k),
+                    (f"L{li}.W_v", mha.W_v), (f"L{li}.b_v", mha.b_v),
+                    (f"L{li}.W_o", mha.W_o), (f"L{li}.b_o", mha.b_o),
+                    (f"L{li}.W1", layer.ffn.W1), (f"L{li}.b1", layer.ffn.b1),
+                    (f"L{li}.W2", layer.ffn.W2), (f"L{li}.b2", layer.ffn.b2),
+                    (f"L{li}.ln1.gamma", layer.ln1.gamma),
+                    (f"L{li}.ln1.beta", layer.ln1.beta),
+                    (f"L{li}.ln2.gamma", layer.ln2.gamma),
+                    (f"L{li}.ln2.beta", layer.ln2.beta)]
+        return out
+
+    def param_count(self):
+        total = self.patch_embed.param_count()
+        for _name, tensor in self._layer_params():
+            total += _count_floats(tensor)
+        return total
+
+    def train(self):
+        self.training = True
+        self.encoder.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        self.encoder.eval()
+        return self
+
+    def sgd_step(self, lr):
+        """对编码器、patch 卷积、位置编码、CLS 与分类头做一次 SGD"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ViT.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        lr = float(lr)
+        self.patch_embed.sgd_step(lr)
+        self.encoder.sgd_step(lr)
+        _dense_apply_sgd(self.head, (self.head.grad_w, self.head.grad_b), lr)
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+        for i in range(self.d_model):
+            self.cls[i] -= lr * self.grad_cls[i]
+        for t in range(self.num_patches + 1):
+            row = self.pos[t]
+            grow = self.grad_pos[t]
+            for j in range(self.d_model):
+                row[j] -= lr * grow[j]
 
 
 class Flatten:
