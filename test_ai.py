@@ -13693,3 +13693,153 @@ class TestLinearAttention:
         assert raises(lambda: m.backward([[1.0] * 6]))
         assert raises(lambda: m.sgd_step(-0.1))
         assert raises(lambda: m.adam_step(0.1, beta1=1.0))
+
+
+# ==== W5-B2：LinformerAttention ====
+
+class TestLinformerAttention:
+    def _setup(self, D=8, H=2, T=6, K=2):
+        random.seed(11)
+        la = AI.LinformerAttention(D, H, T, K)
+        x = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        dout = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        return la, x, dout
+
+    def _loss(self, la, x, dout):
+        y = la.forward(x)
+        return sum(dout[t][j] * y[t][j] for t in range(len(y))
+                   for j in range(len(y[0])))
+
+    def test_shape_params_and_scores(self):
+        la, x, dout = self._setup()
+        y = la.forward(x)
+        assert len(y) == 6 and len(y[0]) == 8
+        assert la.param_count() == 4 * 8 * 8 + 4 * 8 + 2 * 2 * 6
+        # 分数矩阵是 T x K（低秩投影的核心）
+        assert len(la._cache[0]["probs"]) == 6
+        assert len(la._cache[0]["probs"][0]) == 2
+        # 每个头的 k_proj/v_proj 都是 K x d_k
+        assert len(la._cache[0]["k_proj"]) == 2
+        assert len(la._cache[0]["k_proj"][0]) == 4
+        dx = la.backward(dout)
+        assert len(dx) == 6 and len(dx[0]) == 8
+
+    def test_gradients_vs_finite_difference(self):
+        la, x, dout = self._setup()
+        eps = 1e-5
+
+        def param_rel(name, i, j):
+            obj = getattr(la, name)
+            old = obj[i][j]
+            la.zero_grad()
+            la.forward(x)
+            la.backward(dout)
+            ana = la.grads[name][i][j]
+            obj[i][j] = old + eps
+            up = self._loss(la, x, dout)
+            obj[i][j] = old - eps
+            dn = self._loss(la, x, dout)
+            obj[i][j] = old
+            num = (up - dn) / (2 * eps)
+            return abs(ana - num) / max(abs(ana), abs(num), 1e-8)
+
+        for name in ("W_q", "W_k", "W_v", "W_o", "E", "F"):
+            obj = getattr(la, name)
+            idxs = [(0, 0), (len(obj) - 1, len(obj[0]) - 1)]
+            for (i, j) in idxs:
+                assert param_rel(name, i, j) < 1e-5, (name, i, j)
+
+        la.zero_grad()
+        la.forward(x)
+        dx = la.backward(dout)
+        for (t, j) in ((0, 0), (5, 7)):
+            xp = [list(r) for r in x]
+            xm = [list(r) for r in x]
+            xp[t][j] += eps
+            xm[t][j] -= eps
+            num = (self._loss(la, xp, dout) - self._loss(la, xm, dout)) / (2 * eps)
+            assert abs(dx[t][j] - num) / max(abs(dx[t][j]), abs(num), 1e-8) < 1e-5
+
+    def test_reduces_to_standard_attention(self):
+        """num_proj == seq_len 且 E = F = I 时，低秩投影不丢信息"""
+        D, H, T = 8, 2, 4
+        la = AI.LinformerAttention(D, H, T, T)
+        eye = [[1.0 if i == j else 0.0 for j in range(T)] for i in range(T)]
+        la.E = [list(r) for r in eye]
+        la.F = [list(r) for r in eye]
+        mha = AI.MultiHeadAttention(D, H)
+        de = [[1.0 if i == j else 0.0 for j in range(D)] for i in range(D)]
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            setattr(la, name, [list(r) for r in de])
+            setattr(mha, name, [list(r) for r in de])
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            setattr(la, name, [0.0] * D)
+            setattr(mha, name, [0.0] * D)
+        x = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        y_la = la.forward(x)
+        y_mha = mha.forward(x)
+        assert max(abs(a - b) for ra, rb in zip(y_la, y_mha) for a, b in zip(ra, rb)) < 1e-12
+
+    def test_accumulate_and_zero_grad(self):
+        la, x, dout = self._setup()
+        la.zero_grad()
+        la.forward(x)
+        la.backward(dout)
+        g1 = la.grads["E"][0][0]
+        la.forward(x)
+        la.backward(dout)
+        g2 = la.grads["E"][0][0]
+        assert abs(g2 - 2 * g1) < 1e-12 * max(1.0, abs(g2))
+        la.zero_grad()
+        left = [v for name in ("W_q", "W_k", "W_v", "W_o", "E", "F")
+                for row in la.grads[name] for v in row]
+        assert max(abs(v) for v in left) == 0.0
+
+    def test_training_and_validation(self):
+        random.seed(0)
+        la = AI.LinformerAttention(8, 2, 4, 2)
+        xs = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        first = None
+        for _ in range(120):
+            la.zero_grad()
+            y = la.forward(xs)
+            if first is None:
+                first = 0.5 * sum(v * v for row in y for v in row)
+            la.backward([[y[t][j] for j in range(8)] for t in range(4)])
+            la.adam_step(0.02)
+        assert first is not None and first > 1.0
+        assert 0.5 * sum(v * v for row in y for v in row) < first * 0.05
+
+        for bad in (lambda: AI.LinformerAttention(8, 3, 6),
+                    lambda: AI.LinformerAttention(8, 2, 6, 7),
+                    lambda: AI.LinformerAttention(8, 2, 6, 0),
+                    lambda: AI.LinformerAttention(0, 2, 6),
+                    lambda: AI.LinformerAttention(8, 0, 6),
+                    lambda: AI.LinformerAttention(8, 2, 0),
+                    lambda: AI.LinformerAttention(True, 2, 6),
+                    lambda: AI.LinformerAttention(8, 2, 6, 1.5)):
+            try:
+                bad()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("非法构造没有报错")
+        small = AI.LinformerAttention(8, 2, 6)
+        try:
+            small.forward([])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("空序列没有报错")
+        try:
+            small.forward([[0.0] * 8 for _ in range(5)])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("序列长度不符没有报错")
+        try:
+            small.backward([[0.0] * 8 for _ in range(6)])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 没有报错")

@@ -178,7 +178,9 @@
 - [ ] 位置编码剩余：T5 相对位置偏置、xPos、MLA 低秩 KV 压缩
 - [x] `LinearAttention`（`phi=elu+1`，O(T·d²)；`causal=True` 用前缀和、非 causal 用全长和；
       `W_q/W_k/W_v/W_o` 与输入梯度中心差分 ≤1e-5，120 步 Adam 收敛）
-- [ ] 线性注意力族剩余：`Performer`（随机特征）、`Linformer`（低秩 K/V）、`BigBird`（稀疏）、
+- [x] `LinformerAttention`（K/V 低秩投影 `E`/`F`，O(T·k·d)；不支持 causal；
+      `k=T` 且 `E=F=I` 时与标准注意力逐位等价 <1e-12）
+- [ ] 线性注意力族剩余：`Performer`（随机特征）、`BigBird`（稀疏）、
       `Longformer`（滑窗+全局）、`Reformer`（LSH）
 - [ ] `FlashAttention` 分块算法（模拟，明确「不更快」）
 

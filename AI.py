@@ -11424,6 +11424,337 @@ def _la_apply_adam(param, grad, m, v, lr, c1, c2, beta1, beta2, eps):
             param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
 
 
+class LinformerAttention:
+    """Linformer（Wang et al. 2020）：把 K/V 沿**序列维**压到 k 个 token
+
+    标准注意力要算 T×T 的分数矩阵。Linformer 的观察是：注意力矩阵实际是低秩的，
+    所以可以先用两个可学习投影 `E`/`F`（形状都是 `k×T`，T 是序列长度）把 K/V
+    投影成 `k×d_k`，再算 `q·(E k)^T`——分数矩阵变成 `T×k`：
+
+        out = softmax(q (E k)^T / sqrt(d_k)) · (F v)
+
+    代价从 O(T²·d) 降到 O(T·k·d)，k << T 时常数很小。
+
+    限制（文档明确）：
+    - **不支持 causal**：E/F 用了整条序列的信息，做自回归会泄漏未来。
+      构造时传 `causal=True` 直接报 `ValueError`。
+    - `E`/`F` 的形状依赖序列长度 T，所以**同一个实例只能处理固定长度**；
+      forward 发现 T 与构造时（或首次 forward）不一致会报错，不会静默截断。
+    - 无注意力 dropout（与线性注意力一致）；`train()`/`eval()` 是空操作。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, seq_len: int,
+                 num_proj: int = None):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise ValueError("LinformerAttention: d_model 必须是正整数，收到 %r"
+                             % (d_model,))
+        if d_model < 1:
+            raise ValueError("LinformerAttention: d_model 必须 >= 1，收到 %r"
+                             % (d_model,))
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int):
+            raise ValueError("LinformerAttention: num_heads 必须是正整数，收到 %r"
+                             % (num_heads,))
+        if num_heads < 1:
+            raise ValueError("LinformerAttention: num_heads 必须 >= 1，收到 %r"
+                             % (num_heads,))
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "LinformerAttention: d_model=%d 必须能被 num_heads=%d 整除"
+                % (d_model, num_heads))
+        if isinstance(seq_len, bool) or not isinstance(seq_len, int):
+            raise ValueError("LinformerAttention: seq_len 必须是正整数，收到 %r"
+                             % (seq_len,))
+        if seq_len < 1:
+            raise ValueError("LinformerAttention: seq_len 必须 >= 1，收到 %r"
+                             % (seq_len,))
+        if num_proj is None:
+            num_proj = max(1, seq_len // 4)
+        if isinstance(num_proj, bool) or not isinstance(num_proj, int):
+            raise ValueError("LinformerAttention: num_proj 必须是正整数，收到 %r"
+                             % (num_proj,))
+        if num_proj < 1:
+            raise ValueError("LinformerAttention: num_proj 必须 >= 1，收到 %r"
+                             % (num_proj,))
+        if num_proj > seq_len:
+            raise ValueError(
+                "LinformerAttention: num_proj=%d 不能大于 seq_len=%d"
+                % (num_proj, seq_len))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.seq_len = seq_len
+        self.num_proj = num_proj
+        self.causal = False
+        std = math.sqrt(2.0 / d_model)
+        self.W_q = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_k = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_v = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_o = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.b_q = [0.0] * d_model
+        self.b_k = [0.0] * d_model
+        self.b_v = [0.0] * d_model
+        self.b_o = [0.0] * d_model
+        # E / F：(k, T)，k<<T；用 1/sqrt(T) 缩放，初始接近「平均池化」
+        pstd = 1.0 / math.sqrt(float(seq_len))
+        self.E = [[random.gauss(0, pstd) for _ in range(seq_len)]
+                  for _ in range(num_proj)]
+        self.F = [[random.gauss(0, pstd) for _ in range(seq_len)]
+                  for _ in range(num_proj)]
+        self._init_adam()
+        self.zero_grad()
+        self.x = None
+        self.concat = None
+        self._cache = None
+
+    def zero_grad(self):
+        """清零所有参数梯度"""
+        d = self.d_model
+        k = self.num_proj
+        T = self.seq_len
+
+        def zeros_2d(r, c):
+            return [[0.0] * c for _ in range(r)]
+
+        self.grads = {
+            "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
+            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
+            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
+            "E": zeros_2d(k, T), "F": zeros_2d(k, T),
+        }
+
+    def _init_adam(self):
+        d = self.d_model
+        k = self.num_proj
+        T = self.seq_len
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            setattr(self, "m_" + name, [[0.0] * d for _ in range(d)])
+            setattr(self, "v_" + name, [[0.0] * d for _ in range(d)])
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            setattr(self, "m_" + name, [0.0] * d)
+            setattr(self, "v_" + name, [0.0] * d)
+        for name in ("E", "F"):
+            setattr(self, "m_" + name, [[0.0] * T for _ in range(k)])
+            setattr(self, "v_" + name, [[0.0] * T for _ in range(k)])
+        self._adam_t = 0
+
+    def train(self):
+        """无 dropout，空操作（保持接口统一）"""
+        return self
+
+    def eval(self):
+        """无 dropout，空操作（保持接口统一）"""
+        return self
+
+    def _proj(self, W, b, x_t):
+        return [sum(map(_mul, W[r], x_t)) + b[r] for r in range(self.d_model)]
+
+    def forward(self, x_seq):
+        """x_seq: (seq_len, d_model) → (seq_len, d_model)"""
+        if not x_seq:
+            raise ValueError("LinformerAttention.forward: 输入序列不能为空")
+        d = self.d_model
+        T = len(x_seq)
+        if T != self.seq_len:
+            raise ValueError(
+                "LinformerAttention.forward: 本层构造时 seq_len=%d，收到长度 %d"
+                "（E/F 的形状依赖序列长度，不能变长）" % (self.seq_len, T))
+        for t, row in enumerate(x_seq):
+            if len(row) != d:
+                raise ValueError(
+                    "LinformerAttention.forward: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (t, len(row), d))
+        q_all = [self._proj(self.W_q, self.b_q, xt) for xt in x_seq]
+        k_all = [self._proj(self.W_k, self.b_k, xt) for xt in x_seq]
+        v_all = [self._proj(self.W_v, self.b_v, xt) for xt in x_seq]
+        d_k = self.d_k
+        kk = self.num_proj
+        scale = 1.0 / math.sqrt(d_k)
+        cache = []
+        concat = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            qh = [q_all[t][off:off + d_k] for t in range(T)]
+            kh = [k_all[t][off:off + d_k] for t in range(T)]
+            vh = [v_all[t][off:off + d_k] for t in range(T)]
+            # 低秩投影：k_proj[i][j] = sum_t E[i][t] * kh[t][j]
+            k_proj = [[sum(self.E[i][t] * kh[t][j] for t in range(T))
+                       for j in range(d_k)] for i in range(kk)]
+            v_proj = [[sum(self.F[i][t] * vh[t][j] for t in range(T))
+                       for j in range(d_k)] for i in range(kk)]
+            scores = [[sum(qh[t][j] * k_proj[i][j] for j in range(d_k)) * scale
+                       for i in range(kk)] for t in range(T)]
+            probs = []
+            for t in range(T):
+                m = max(scores[t])
+                ex = [math.exp(s - m) for s in scores[t]]
+                # softmax 分母至少含 exp(0)=1，恒 >= 1，不需要 eps 平滑
+                tot = sum(ex)
+                probs.append([e / tot for e in ex])
+            outs = [[sum(probs[t][i] * v_proj[i][j] for i in range(kk)) * 1.0
+                     for j in range(d_k)] for t in range(T)]
+            for t in range(T):
+                for j in range(d_k):
+                    concat[t][off + j] = outs[t][j]
+            cache.append({"q": qh, "k": kh, "v": vh, "k_proj": k_proj,
+                          "v_proj": v_proj, "probs": probs, "out": outs})
+        y = [[sum(map(_mul, self.W_o[r], concat[t])) + self.b_o[r] for r in range(d)]
+             for t in range(T)]
+        self.x = [list(row) for row in x_seq]
+        self.concat = concat
+        self._cache = cache
+        return y
+
+    def backward(self, dout_seq):
+        """dout_seq: (seq_len, d_model) → (seq_len, d_model) 输入梯度"""
+        if self._cache is None:
+            raise RuntimeError("LinformerAttention.backward: 必须先 forward")
+        d = self.d_model
+        T = self.seq_len
+        if len(dout_seq) != T:
+            raise ValueError(
+                "LinformerAttention.backward: dout 长度 %d 与 forward 的 %d 不一致"
+                % (len(dout_seq), T))
+        d_k = self.d_k
+        kk = self.num_proj
+        scale = 1.0 / math.sqrt(d_k)
+        dconcat = [[sum(dout_seq[t][j] * self.W_o[j][r] for j in range(d))
+                    for r in range(d)] for t in range(T)]
+        for r in range(d):
+            wrow = self.grads["W_o"][r]
+            for t in range(T):
+                dt = dout_seq[t][r]
+                if dt != 0.0:
+                    crow = self.concat[t]
+                    for c in range(d):
+                        wrow[c] += dt * crow[c]
+            self.grads["b_o"][r] += sum(dout_seq[t][r] for t in range(T))
+        dq_all = [[0.0] * d for _ in range(T)]
+        dk_all = [[0.0] * d for _ in range(T)]
+        dv_all = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            c = self._cache[head]
+            qh, kh, vh = c["q"], c["k"], c["v"]
+            k_proj, v_proj = c["k_proj"], c["v_proj"]
+            probs = c["probs"]
+            dout = [dconcat[t][off:off + d_k] for t in range(T)]
+            dv_proj = [[sum(probs[t][i] * dout[t][j] for t in range(T))
+                        for j in range(d_k)] for i in range(kk)]
+            dprobs = [[sum(dout[t][j] * v_proj[i][j] for j in range(d_k))
+                       for i in range(kk)] for t in range(T)]
+            dscores = [[0.0] * kk for _ in range(T)]
+            for t in range(T):
+                dot = sum(probs[t][i] * dprobs[t][i] for i in range(kk))
+                for i in range(kk):
+                    dscores[t][i] = probs[t][i] * (dprobs[t][i] - dot)
+            dq = [[sum(dscores[t][i] * k_proj[i][j] for i in range(kk)) * scale
+                   for j in range(d_k)] for t in range(T)]
+            dk_proj = [[sum(dscores[t][i] * qh[t][j] for t in range(T)) * scale
+                        for j in range(d_k)] for i in range(kk)]
+            for i in range(kk):
+                erow = self.grads["E"][i]
+                frow = self.grads["F"][i]
+                for t in range(T):
+                    if dscores:
+                        pass
+                    erow[t] += sum(dk_proj[i][j] * kh[t][j] for j in range(d_k))
+                    frow[t] += sum(dv_proj[i][j] * vh[t][j] for j in range(d_k))
+            dkh = [[sum(self.E[i][t] * dk_proj[i][j] for i in range(kk))
+                    for j in range(d_k)] for t in range(T)]
+            dvh = [[sum(self.F[i][t] * dv_proj[i][j] for i in range(kk))
+                    for j in range(d_k)] for t in range(T)]
+            for t in range(T):
+                for j in range(d_k):
+                    dq_all[t][off + j] = dq[t][j]
+                    dk_all[t][off + j] = dkh[t][j]
+                    dv_all[t][off + j] = dvh[t][j]
+        for r in range(d):
+            wq = self.grads["W_q"][r]
+            wk = self.grads["W_k"][r]
+            wv = self.grads["W_v"][r]
+            sbq = sbk = sbv = 0.0
+            for t in range(T):
+                xt = self.x[t]
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                sbq += dqr
+                sbk += dkr
+                sbv += dvr
+                if dqr != 0.0:
+                    for c2 in range(d):
+                        wq[c2] += dqr * xt[c2]
+                if dkr != 0.0:
+                    for c2 in range(d):
+                        wk[c2] += dkr * xt[c2]
+                if dvr != 0.0:
+                    for c2 in range(d):
+                        wv[c2] += dvr * xt[c2]
+            self.grads["b_q"][r] += sbq
+            self.grads["b_k"][r] += sbk
+            self.grads["b_v"][r] += sbv
+        dx = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            xrow = dx[t]
+            for r in range(d):
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                if dqr == 0.0 and dkr == 0.0 and dvr == 0.0:
+                    continue
+                wq = self.W_q[r]
+                wk = self.W_k[r]
+                wv = self.W_v[r]
+                for c2 in range(d):
+                    xrow[c2] += dqr * wq[c2] + dkr * wk[c2] + dvr * wv[c2]
+        return dx
+
+    def param_count(self):
+        """参数量：四个 d×d 投影 + 四个偏置 + E/F（各 k×T）"""
+        d = self.d_model
+        return 4 * d * d + 4 * d + 2 * self.num_proj * self.seq_len
+
+    def sgd_step(self, lr: float):
+        """SGD 更新"""
+        lr = _la_check_lr(lr, "LinformerAttention.sgd_step")
+        for name in ("W_q", "W_k", "W_v", "W_o", "E", "F"):
+            _la_apply_sgd(getattr(self, name), self.grads[name], lr)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            for i in range(len(param)):
+                param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """Adam 更新"""
+        lr = _la_check_lr(lr, "LinformerAttention.adam_step")
+        _check_adam_betas(beta1, beta2, "LinformerAttention.adam_step")
+        self._adam_t += 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for name in ("W_q", "W_k", "W_v", "W_o", "E", "F"):
+            _la_apply_adam(getattr(self, name), self.grads[name],
+                           getattr(self, "m_" + name), getattr(self, "v_" + name),
+                           lr, c1, c2, beta1, beta2, eps)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            m = getattr(self, "m_" + name)
+            v = getattr(self, "v_" + name)
+            for i in range(len(param)):
+                g = grad[i]
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
+                param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
 class LearnedPositionalEncoding:
     """可学习的位置编码表（BERT / GPT-2 式）：`out[t] = x[t] + table[t]`
 
