@@ -186,7 +186,7 @@
       iid 高斯特征，实测 m=4 误差 92% / m=64 误差 35%，是省算力而非逼近 softmax）**W5-B3**
 - [x] 稀疏注意力族（W5-C）：`BigBirdAttention`（窗口+全局+随机连边）、`LongformerAttention`（滑窗+全局 token，全局位看全序列）、`ReformerAttention`（随机投影 argmax 分桶，桶内注意力）——全连通时与手写稠密注意力逐位等价，参数/输入梯度中心差分 ≤1e-5；
       修掉一个只有 causal 才暴露的真 bug：`ds == 0` 的短路把 `dv` 累加也跳过了（causal 下 t=0 只有一个可见位置，ds 恒为 0 而 dv 非零）
-- [ ] `FlashAttention` 分块算法（模拟，明确「不更快」）
+- [x] `FlashAttention` 分块算法（模拟，明确「不更快」）—— 在线 softmax + cache 只存 `q/k/v/m/l`（不物化 T×T）；反向按 `(m,l)` 重算概率；`block_size` 1/2/3/4/8 与稠密一致 <1e-12、块大小不影响结果 <1e-15。踩过的坑：`tot = Σ_j p_ij dp_ij` 原来只在单个键块内累加，单块恰好对、多块漏项（梯度差 6.55e-02），改成每个查询块两遍扫描后归零
 
 ### W6 图神经网络（§1 全新范式）
 - [ ] `GCNLayer` / `GATLayer` / `GINLayer` / `GraphSAGELayer` / `MPNNLayer` / `GCNIILayer` / `APPNPLayer` / `JKNet`

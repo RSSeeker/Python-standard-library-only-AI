@@ -14264,6 +14264,43 @@ def _w5c_grad_ok(model, eps=1e-5, tol=1e-5):
     return worst, dworst
 
 
+def _w5c_dense(model, data, heads, causal):
+    """手写稠密 softmax 注意力，用来核对稀疏/分块实现"""
+    import math as _m
+    d = model.d_model
+    d_k = d // heads
+    T = len(data)
+
+    def proj(W, b, x):
+        return [sum(W[r][c] * x[c] for c in range(d)) + b[r] for r in range(d)]
+
+    Q = [proj(model.W_q, model.b_q, x) for x in data]
+    K = [proj(model.W_k, model.b_k, x) for x in data]
+    V = [proj(model.W_v, model.b_v, x) for x in data]
+    scale = 1.0 / _m.sqrt(d_k)
+    concat = [[0.0] * d for _ in range(T)]
+    for h in range(heads):
+        off = h * d_k
+        for t in range(T):
+            idx = list(range(t + 1)) if causal else list(range(T))
+            sc = []
+            for j in idx:
+                acc = 0.0
+                for r in range(d_k):
+                    acc += Q[t][off + r] * K[j][off + r]
+                sc.append(acc * scale)
+            mx = max(sc)
+            ex = [_m.exp(v - mx) for v in sc]
+            tot = sum(ex)
+            for r in range(d_k):
+                acc = 0.0
+                for pos, j in enumerate(idx):
+                    acc += (ex[pos] / tot) * V[j][off + r]
+                concat[t][off + r] = acc
+    return [[sum(model.W_o[r][c] * concat[t][c] for c in range(d)) + model.b_o[r]
+             for r in range(d)] for t in range(T)]
+
+
 class TestBigBirdAttention:
     def test_shape_and_params(self):
         m = AI.BigBirdAttention(4, 2, window_size=1, num_global=1, num_random=1,
@@ -14459,3 +14496,78 @@ class TestReformerAttention:
                    lambda: AI.ReformerAttention(4, 2, seed=1.5)):
             with pytest.raises((ValueError, TypeError)):
                 fn()
+
+
+class TestFlashAttention:
+    def test_block_sizes_match_dense(self):
+        m = AI.FlashAttention(4, 2, block_size=4)
+        out = m.forward(X4C)
+        # 单块时应与手写稠密 softmax 完全一致（只差求和顺序，1e-15 内）
+        ref = _w5c_dense(m, X4C, 2, False)
+        worst = max(abs(out[t][r] - ref[t][r]) for t in range(4) for r in range(4))
+        assert worst < 1e-12, worst
+
+    def test_block_invariance(self):
+        base = AI.FlashAttention(4, 2, block_size=1)
+        o1 = base.forward(X4C)
+        for bs in (2, 3, 4):
+            m = AI.FlashAttention(4, 2, block_size=bs)
+            for name in ('W_q', 'W_k', 'W_v', 'W_o'):
+                setattr(m, name, [list(r) for r in getattr(base, name)])
+            ob = m.forward(X4C)
+            worst = max(abs(ob[t][r] - o1[t][r])
+                        for t in range(4) for r in range(4))
+            assert worst < 1e-15, (bs, worst)
+
+    def test_no_quadratic_cache(self):
+        m = AI.FlashAttention(4, 2, block_size=2)
+        m.forward(X4C)
+        assert sorted(m._cache[0].keys()) == ['k', 'l', 'm', 'q', 'v']
+        assert len(m._cache[0]['m']) == 4 and len(m._cache[0]['l']) == 4
+        assert m.param_count() == 80
+
+    def test_causal_prefix_bitwise(self):
+        m = AI.FlashAttention(4, 2, causal=True, block_size=2)
+        a = m.forward(X4C)
+        X2 = [list(r) for r in X4C]
+        X2[3] = [9.0, -3.0, 4.0, 2.0]
+        b = m.forward(X2)
+        # 因果性：改最后一个 token 不该影响前三个输出（逐位）
+        assert all(a[t] == b[t] for t in range(3))
+        # 因果 + 分块：与稠密 causal 一致
+        ref = _w5c_dense(m, X4C, 2, True)
+        a2 = m.forward(X4C)
+        worst = max(abs(a2[t][r] - ref[t][r]) for t in range(4) for r in range(4))
+        assert worst < 1e-12, worst
+
+    def test_gradients(self):
+        for causal, bs in ((False, 2), (True, 3)):
+            m = AI.FlashAttention(4, 2, causal=causal, block_size=bs)
+            wp, wd = _w5c_grad_ok(m)
+            assert wp < 1e-5, (causal, bs, wp)
+            assert wd < 1e-5, (causal, bs, wd)
+
+    def test_accumulate_and_errors(self):
+        m = AI.FlashAttention(4, 2, block_size=2)
+        m.zero_grad()
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        g1 = m.grads['W_q'][0][0]
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        assert abs(m.grads['W_q'][0][0] - 2 * g1) < 1e-12
+        m.zero_grad()
+        assert m.grads['W_q'][0][0] == 0.0
+        before = [list(r) for r in m.W_q]
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        m.sgd_step(0.01)
+        assert m.W_q != before
+        for fn in (lambda: AI.FlashAttention(4, 2, block_size=0),
+                   lambda: AI.FlashAttention(4, 2, block_size=-1),
+                   lambda: AI.FlashAttention(4, 2, block_size=1.5),
+                   lambda: AI.FlashAttention(4, 2, block_size=True)):
+            with pytest.raises((ValueError, TypeError)):
+                fn()
+        with pytest.raises(RuntimeError):
+            AI.FlashAttention(4, 2).backward(DOUT4C)

@@ -11598,6 +11598,309 @@ class ReformerAttention(_SparseAttention):
         return allow
 
 
+class FlashAttention(_SparseAttention):
+    """FlashAttention 的分块 + 在线 softmax（Dao et al. 2022）
+
+    **先说清楚：在纯 Python 里它不会更快，反而更慢。** 这里实现的是算法的
+    *数据流*——把 `softmax(QK^T)V` 拆成若干块，边扫边归一化，从而**不需要
+    物化 T×T 的注意力矩阵**。真实 GPU 上的收益来自「矩阵块常驻 SRAM、
+    减少 HBM 往返」，纯 Python 的循环开销远大于省下的内存访问，所以
+    这里的价值是「把算法讲对、并且能验证」，不是加速。
+
+    核心是「在线 softmax」：设已经扫过的键块给出的行最大值为 `m`、指数和为
+    `l`、未归一化输出为 `acc`，遇到新块时
+
+        m_new = max(m, rowmax(S_block))
+        acc  *= exp(m - m_new)          # 把旧累积量按新最大值重新缩放
+        l    *= exp(m - m_new)
+        p     = exp(S_block - m_new)
+        l    += rowsum(p)
+        acc  += p @ V_block
+
+    扫完后 `out = acc / l`。数值上它和稠密 softmax 只差**求和顺序**，
+    所以不是逐位相同（实测相对差 ~1e-16 量级），这一点在文档里如实写。
+
+    反向不保存 T×T 概率矩阵，而是用缓存的 `(m, l)` **重算**每个块的 `p`
+    ——这正是原论文「backward 重算」的做法：
+
+        dv_j = sum_i p_ij dout_i
+        dp_ij = dout_i·v_j
+        ds_ij = p_ij (dp_ij - sum_j p_ij dp_ij)
+        dq_i = scale * sum_j ds_ij k_j      dk_j = scale * sum_i ds_ij q_i
+
+    `block_size` 只影响内存占用与求和顺序，不影响数学结果。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, causal: bool = False,
+                 block_size: int = 2):
+        super(FlashAttention, self).__init__(d_model, num_heads, causal)
+        if isinstance(block_size, bool) or not isinstance(block_size, int):
+            raise ValueError("FlashAttention: block_size 必须是正整数，收到 %r"
+                             % (block_size,))
+        if block_size < 1:
+            raise ValueError("FlashAttention: block_size 必须 >= 1，收到 %r"
+                             % (block_size,))
+        self.block_size = block_size
+
+    def _allow(self, x_seq, T):
+        """FlashAttention 不稀疏：全连通（causal 时下三角）"""
+        if self.causal:
+            return [list(range(t + 1)) for t in range(T)]
+        return [list(range(T)) for _ in range(T)]
+
+    def forward(self, x_seq):
+        """分块 + 在线 softmax，不物化 T×T"""
+        who = 'FlashAttention'
+        if not x_seq:
+            raise ValueError("%s.forward: 输入序列不能为空" % who)
+        d = self.d_model
+        for t, row in enumerate(x_seq):
+            if len(row) != d:
+                raise ValueError(
+                    "%s.forward: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (who, t, len(row), d))
+        T = len(x_seq)
+        q_all = [self._proj(self.W_q, self.b_q, xt) for xt in x_seq]
+        k_all = [self._proj(self.W_k, self.b_k, xt) for xt in x_seq]
+        v_all = [self._proj(self.W_v, self.b_v, xt) for xt in x_seq]
+        d_k = self.d_k
+        scale = 1.0 / math.sqrt(d_k)
+        bs = self.block_size
+        concat = [[0.0] * d for _ in range(T)]
+        cache = []
+        for head in range(self.num_heads):
+            off = head * d_k
+            qh = [q_all[t][off:off + d_k] for t in range(T)]
+            kh = [k_all[t][off:off + d_k] for t in range(T)]
+            vh = [v_all[t][off:off + d_k] for t in range(T)]
+            m_row = [0.0] * T
+            l_row = [1.0] * T
+            for qs in range(0, T, bs):
+                qe = min(qs + bs, T)
+                rows = list(range(qs, qe))
+                nb = len(rows)
+                m = [float('-inf')] * nb
+                l = [0.0] * nb
+                acc = [[0.0] * d_k for _ in range(nb)]
+                if self.causal:
+                    ks_end = qe
+                else:
+                    ks_end = T
+                for ks in range(0, ks_end, bs):
+                    ke = min(ks + bs, ks_end)
+                    keys = list(range(ks, ke))
+                    nk = len(keys)
+                    # 本块分数
+                    sblk = []
+                    for a, qi in enumerate(rows):
+                        qt = qh[qi]
+                        srow = []
+                        for kb in range(nk):
+                            kj = kh[keys[kb]]
+                            acc2 = 0.0
+                            for r in range(d_k):
+                                acc2 += qt[r] * kj[r]
+                            sc = acc2 * scale
+                            if self.causal and keys[kb] > qi:
+                                sc = float('-inf')
+                            srow.append(sc)
+                        sblk.append(srow)
+                    # 在线更新
+                    for a in range(nb):
+                        srow = sblk[a]
+                        finite = [v for v in srow if v != float('-inf')]
+                        if not finite:
+                            continue
+                        rowmax = max(finite)
+                        m_new = m[a] if m[a] > rowmax else rowmax
+                        corr = math.exp(m[a] - m_new) if m[a] != float('-inf') else 0.0
+                        if corr != 1.0:
+                            l[a] *= corr
+                            accrow = acc[a]
+                            for r in range(d_k):
+                                accrow[r] *= corr
+                        m[a] = m_new
+                        accrow = acc[a]
+                        for kb in range(nk):
+                            sc = srow[kb]
+                            if sc == float('-inf'):
+                                continue
+                            pv = math.exp(sc - m_new)
+                            l[a] += pv
+                            vj = vh[keys[kb]]
+                            for r in range(d_k):
+                                accrow[r] += pv * vj[r]
+                for a, qi in enumerate(rows):
+                    m_row[qi] = m[a]
+                    l_row[qi] = l[a]
+                    denom = l[a] if l[a] != 0.0 else 1.0
+                    for r in range(d_k):
+                        concat[qi][off + r] = acc[a][r] / denom
+            cache.append({"q": qh, "k": kh, "v": vh,
+                          "m": m_row, "l": l_row})
+        y = [[sum(map(_mul, self.W_o[r], concat[t])) + self.b_o[r] for r in range(d)]
+             for t in range(T)]
+        self.seq_len = T
+        self.x = [list(row) for row in x_seq]
+        self.concat = concat
+        self._cache = cache
+        return y
+
+    def backward(self, dout_seq):
+        """用缓存的 (m, l) 逐块**重算** p，不保存 T×T"""
+        who = 'FlashAttention'
+        if self._cache is None:
+            raise RuntimeError("%s.backward: 必须先 forward" % who)
+        if len(dout_seq) != self.seq_len:
+            raise ValueError(
+                "%s.backward: dout 长度 %d 与 forward 的 %d 不一致"
+                % (who, len(dout_seq), self.seq_len))
+        d = self.d_model
+        T = self.seq_len
+        d_k = self.d_k
+        scale = 1.0 / math.sqrt(d_k)
+        bs = self.block_size
+        dconcat = [[sum(dout_seq[t][j] * self.W_o[j][r] for j in range(d))
+                    for r in range(d)] for t in range(T)]
+        for r in range(d):
+            wrow = self.grads["W_o"][r]
+            sb = 0.0
+            for t in range(T):
+                dt = dout_seq[t][r]
+                sb += dt
+                if dt == 0.0:
+                    continue
+                crow = self.concat[t]
+                for c in range(d):
+                    wrow[c] += dt * crow[c]
+            self.grads["b_o"][r] += sb
+        dq_all = [[0.0] * d for _ in range(T)]
+        dk_all = [[0.0] * d for _ in range(T)]
+        dv_all = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            c = self._cache[head]
+            qh, kh, vh = c["q"], c["k"], c["v"]
+            m_row, l_row = c["m"], c["l"]
+            dqh = [[0.0] * d_k for _ in range(T)]
+            dkh = [[0.0] * d_k for _ in range(T)]
+            dvh = [[0.0] * d_k for _ in range(T)]
+            for qs in range(0, T, bs):
+                qe = min(qs + bs, T)
+                rows = list(range(qs, qe))
+                ks_end = qe if self.causal else T
+                # 第一遍：把 tot_i = sum_j p_ij dp_ij 跨**所有**键块累加起来。
+                # （原来算在单个键块里，单块时恰好对，多块就漏了其它块。）
+                tot_row = [0.0] * len(rows)
+                for ks in range(0, ks_end, bs):
+                    ke = min(ks + bs, ks_end)
+                    keys = list(range(ks, ke))
+                    for a, qi in enumerate(rows):
+                        qt = qh[qi]
+                        mi = m_row[qi]
+                        li = l_row[qi] if l_row[qi] != 0.0 else 1.0
+                        dout = dconcat[qi][off:off + d_k]
+                        acc_tot = 0.0
+                        for kj in keys:
+                            if self.causal and kj > qi:
+                                continue
+                            kvec = kh[kj]
+                            acc2 = 0.0
+                            for r in range(d_k):
+                                acc2 += qt[r] * kvec[r]
+                            pv = math.exp(acc2 * scale - mi) / li
+                            if pv == 0.0:
+                                continue
+                            dp = 0.0
+                            vj = vh[kj]
+                            for r in range(d_k):
+                                dp += dout[r] * vj[r]
+                            acc_tot += pv * dp
+                        tot_row[a] += acc_tot
+                # 第二遍：逐块重算 p，用全局 tot 算 ds 并累加梯度
+                for ks in range(0, ks_end, bs):
+                    ke = min(ks + bs, ks_end)
+                    keys = list(range(ks, ke))
+                    for a, qi in enumerate(rows):
+                        qt = qh[qi]
+                        mi = m_row[qi]
+                        li = l_row[qi] if l_row[qi] != 0.0 else 1.0
+                        dout = dconcat[qi][off:off + d_k]
+                        dqt = dqh[qi]
+                        tot = tot_row[a]
+                        for kb in range(len(keys)):
+                            kj = keys[kb]
+                            if self.causal and kj > qi:
+                                continue
+                            kvec = kh[kj]
+                            acc2 = 0.0
+                            for r in range(d_k):
+                                acc2 += qt[r] * kvec[r]
+                            pv = math.exp(acc2 * scale - mi) / li
+                            if pv == 0.0:
+                                continue
+                            vj = vh[kj]
+                            dvj = dvh[kj]
+                            for r in range(d_k):
+                                dvj[r] += pv * dout[r]
+                            dp = 0.0
+                            for r in range(d_k):
+                                dp += dout[r] * vj[r]
+                            ds = pv * (dp - tot)
+                            if ds == 0.0:
+                                continue
+                            for r in range(d_k):
+                                dqt[r] += scale * ds * kvec[r]
+                            dkt = dkh[kj]
+                            for r in range(d_k):
+                                dkt[r] += scale * ds * qt[r]
+            for t in range(T):
+                for r in range(d_k):
+                    dq_all[t][off + r] = dqh[t][r]
+                    dk_all[t][off + r] = dkh[t][r]
+                    dv_all[t][off + r] = dvh[t][r]
+        for r in range(d):
+            wq = self.grads["W_q"][r]
+            wk = self.grads["W_k"][r]
+            wv = self.grads["W_v"][r]
+            sbq = sbk = sbv = 0.0
+            for t in range(T):
+                xt = self.x[t]
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                sbq += dqr
+                sbk += dkr
+                sbv += dvr
+                if dqr != 0.0:
+                    for cc in range(d):
+                        wq[cc] += dqr * xt[cc]
+                if dkr != 0.0:
+                    for cc in range(d):
+                        wk[cc] += dkr * xt[cc]
+                if dvr != 0.0:
+                    for cc in range(d):
+                        wv[cc] += dvr * xt[cc]
+            self.grads["b_q"][r] += sbq
+            self.grads["b_k"][r] += sbk
+            self.grads["b_v"][r] += sbv
+        dx = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            xrow = dx[t]
+            for r in range(d):
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                if dqr == 0.0 and dkr == 0.0 and dvr == 0.0:
+                    continue
+                wq = self.W_q[r]
+                wk = self.W_k[r]
+                wv = self.W_v[r]
+                for cc in range(d):
+                    xrow[cc] += dqr * wq[cc] + dkr * wk[cc] + dvr * wv[cc]
+        return dx
+
+
 class LinearAttention:
     """线性注意力（Katharopoulos et al. 2020）：`phi(x) = elu(x) + 1`
 
