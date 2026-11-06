@@ -3543,6 +3543,371 @@ class ConvNeXtBlock:
                 for c in range(C)]
 
 
+class FractionalMaxPool2d:
+    """分数最大池化：输出尺寸由比例决定，每个输出格在一个**重叠的随机窗口**里取最大值
+
+    `FractionalMaxPool2d(output_ratio=(0.5, 0.5), rng=None)`
+    `forward((C,H,W)) -> (C, max(1,int(H*rh)), max(1,int(W*rw)))`
+
+    每个输出位置对应的输入跨度是 `alpha = H/out_h`（一般非整数），窗口长度取
+    `floor(alpha)`，起点在 `[oh*alpha, (oh+1)*alpha - k]` 里均匀随机取整 —— 相邻窗口
+    因此重叠，这一点与 `AdaptiveMaxPool2d`（不重叠、确定性）不同。随机源可注入
+    `random.Random` 实例以保证可复现；不给就用全局 `random`（与 `Dropout` 一致）。
+    """
+
+    def __init__(self, output_ratio=(0.5, 0.5), rng=None):
+        if isinstance(output_ratio, (int, float)) and not isinstance(output_ratio, bool):
+            output_ratio = (output_ratio, output_ratio)
+        if not isinstance(output_ratio, (tuple, list)) or len(output_ratio) != 2:
+            raise ValueError(
+                "FractionalMaxPool2d: output_ratio 必须是数字或二元组，收到 %r"
+                % (output_ratio,))
+        for v in output_ratio:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 < v <= 1.0):
+                raise ValueError(
+                    "FractionalMaxPool2d: output_ratio 每项必须在 (0, 1] 内，收到 %r" % (v,))
+        self.output_ratio = (float(output_ratio[0]), float(output_ratio[1]))
+        self.rng = random if rng is None else rng
+        self.mask = None
+        self.x_shape = None
+        self.out_shape = None
+
+    def forward(self, x):
+        """x: (C, H, W) -> (C, Ho, Wo)"""
+        if not x or not x[0] or not x[0][0] or isinstance(x[0][0][0], (list, tuple)):
+            raise ValueError("FractionalMaxPool2d: 输入必须是 (C,H,W) 非空嵌套 list")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        rh, rw = self.output_ratio
+        ho = max(1, int(H * rh))
+        wo = max(1, int(W * rw))
+        alpha_h = H / float(ho)
+        alpha_w = W / float(wo)
+        kh = max(1, int(alpha_h))
+        kw = max(1, int(alpha_w))
+        self.x_shape = (C, H, W)
+        self.out_shape = (ho, wo)
+        self.mask = [[[(0, 0)] * wo for _ in range(ho)] for _ in range(C)]
+        out = [[[0.0] * wo for _ in range(ho)] for _ in range(C)]
+        starts_h = []
+        for oh in range(ho):
+            lo = oh * alpha_h
+            hi = min(float(H - kh), (oh + 1) * alpha_h - kh)
+            start = int(lo + self.rng.random() * max(0.0, hi - lo))
+            if start < 0:
+                start = 0
+            if start > H - kh:
+                start = H - kh
+            starts_h.append(start)
+        starts_w = []
+        for ow in range(wo):
+            lo = ow * alpha_w
+            hi = min(float(W - kw), (ow + 1) * alpha_w - kw)
+            start = int(lo + self.rng.random() * max(0.0, hi - lo))
+            if start < 0:
+                start = 0
+            if start > W - kw:
+                start = W - kw
+            starts_w.append(start)
+        for c in range(C):
+            for oh in range(ho):
+                sh = starts_h[oh]
+                for ow in range(wo):
+                    sw = starts_w[ow]
+                    best = None
+                    best_pos = (sh, sw)
+                    for i in range(kh):
+                        for j in range(kw):
+                            v = x[c][sh + i][sw + j]
+                            if best is None or v > best:
+                                best = v
+                                best_pos = (sh + i, sw + j)
+                    out[c][oh][ow] = best
+                    self.mask[c][oh][ow] = best_pos
+        return out
+
+    def backward(self, dout):
+        """只把梯度回传给每个窗口里被选中的那个位置"""
+        if self.mask is None:
+            raise RuntimeError("FractionalMaxPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        ho, wo = self.out_shape
+        if len(dout) != C or len(dout[0]) != ho or len(dout[0][0]) != wo:
+            raise ValueError(
+                "FractionalMaxPool2d.backward: dout 形状与输出 (%d, %d, %d) 不符"
+                % (C, ho, wo))
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for oh in range(ho):
+                for ow in range(wo):
+                    ih, iw = self.mask[c][oh][ow]
+                    dx[c][ih][iw] += dout[c][oh][ow]
+        return dx
+
+
+class StochasticPool2d:
+    """随机池化：每个窗口按激活值归一化后的概率**采样一个元素**（Zeiler & Fergus 2013）
+
+    `StochasticPool2d(kernel_size, stride=None, rng=None)`
+    `forward((C,H,W)) -> (C,Ho,Wo)`
+
+    训练时窗口内权重 `p_i = relu(x_i) / Σ relu(x_j)`（全非正时退化为均匀），按 p 采样
+    一个位置、输出它的**原值**，反向只回传该位置并乘上 `p_i`。
+    `eval()` 关闭随机性：输出是概率加权期望 `Σ p_i x_i`，反向对每个位置都乘 `p_i`。
+    """
+
+    def __init__(self, kernel_size, stride=None, rng=None, eps=1e-12):
+        ks = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        if not isinstance(ks, (tuple, list)) or len(ks) != 2:
+            raise ValueError("StochasticPool2d: kernel_size 非法，收到 %r" % (kernel_size,))
+        self.kh, self.kw = int(ks[0]), int(ks[1])
+        if self.kh <= 0 or self.kw <= 0:
+            raise ValueError("StochasticPool2d: kernel_size 必须为正，收到 %r" % (ks,))
+        st = ks if stride is None else (
+            (stride, stride) if isinstance(stride, int) else stride)
+        self.sh, self.sw = int(st[0]), int(st[1])
+        if self.sh <= 0 or self.sw <= 0:
+            raise ValueError("StochasticPool2d: stride 必须为正，收到 %r" % (st,))
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError("StochasticPool2d: eps 必须是正数，收到 %r" % (eps,))
+        self.eps = float(eps)
+        self.rng = random if rng is None else rng
+        self.training = True
+        self.x_shape = None
+        self.out_shape = None
+        self.tag = None
+        self.probs = None
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def _window_probs(self, x, c, oh, ow):
+        vals = []
+        for i in range(self.kh):
+            for j in range(self.kw):
+                v = x[c][oh * self.sh + i][ow * self.sw + j]
+                vals.append(v if v > 0.0 else 0.0)
+        total = 0.0
+        for v in vals:
+            total += v
+        n = len(vals)
+        if total <= self.eps:
+            return [1.0 / n] * n
+        return [v / total for v in vals]
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0] or isinstance(x[0][0][0], (list, tuple)):
+            raise ValueError("StochasticPool2d: 输入必须是 (C,H,W) 非空嵌套 list")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        ho = (H - self.kh) // self.sh + 1
+        wo = (W - self.kw) // self.sw + 1
+        if ho <= 0 or wo <= 0:
+            raise ValueError(
+                "StochasticPool2d: 输入 %dx%d 配 kernel %dx%d、stride %d/%d 得到输出 "
+                "%dx%d，必须都 > 0" % (H, W, self.kh, self.kw, self.sh, self.sw, ho, wo))
+        self.x_shape = (C, H, W)
+        self.out_shape = (ho, wo)
+        self.probs = [[[None] * wo for _ in range(ho)] for _ in range(C)]
+        self.tag = [[[0] * wo for _ in range(ho)] for _ in range(C)]
+        out = [[[0.0] * wo for _ in range(ho)] for _ in range(C)]
+        for c in range(C):
+            for oh in range(ho):
+                for ow in range(wo):
+                    probs = self._window_probs(x, c, oh, ow)
+                    self.probs[c][oh][ow] = probs
+                    vals = [x[c][oh * self.sh + i][ow * self.sw + j]
+                            for i in range(self.kh) for j in range(self.kw)]
+                    if self.training:
+                        r = self.rng.random()
+                        acc = 0.0
+                        pick = len(probs) - 1
+                        for idx in range(len(probs)):
+                            acc += probs[idx]
+                            if r < acc:
+                                pick = idx
+                                break
+                        self.tag[c][oh][ow] = pick
+                        out[c][oh][ow] = vals[pick]
+                    else:
+                        acc = 0.0
+                        for idx in range(len(probs)):
+                            acc += probs[idx] * vals[idx]
+                        out[c][oh][ow] = acc
+        return out
+
+    def backward(self, dout):
+        if self.probs is None:
+            raise RuntimeError("StochasticPool2d.backward: 必须先调用 forward")
+        C, H, W = self.x_shape
+        ho, wo = self.out_shape
+        if len(dout) != C or len(dout[0]) != ho or len(dout[0][0]) != wo:
+            raise ValueError(
+                "StochasticPool2d.backward: dout 形状与输出 (%d, %d, %d) 不符"
+                % (C, ho, wo))
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            for oh in range(ho):
+                for ow in range(wo):
+                    probs = self.probs[c][oh][ow]
+                    d = dout[c][oh][ow]
+                    if self.training:
+                        idx = self.tag[c][oh][ow]
+                        i, j = divmod(idx, self.kw)
+                        dx[c][oh * self.sh + i][ow * self.sw + j] += d * probs[idx]
+                    else:
+                        idx = 0
+                        for i in range(self.kh):
+                            for j in range(self.kw):
+                                dx[c][oh * self.sh + i][ow * self.sw + j] += d * probs[idx]
+                                idx += 1
+        return dx
+
+
+class ConditionalNorm:
+    """条件归一化：把条件向量投影成 gamma/beta，再对特征做层归一化后仿射
+
+    `ConditionalNorm(features, cond_dim, eps=1e-5)`；
+    用法：`set_cond(cond)` 之后 `forward(x)`，`x` 是长度 `features` 的一维向量。
+    `gamma = 1 + W_g·cond + b_g`，`beta = W_b·cond + b_b`，`y = gamma ⊙ xhat + beta`
+    （`xhat` 是 x 的层归一化）。
+
+    梯度留在 `self.grads`（`W_g`/`b_g`/`W_b`/`b_b`），对条件向量的梯度在 `self.grad_cond`。
+    """
+
+    def __init__(self, features, cond_dim, eps=1e-5):
+        for n, v in (("features", features), ("cond_dim", cond_dim)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError("ConditionalNorm: %s 必须是正整数，收到 %r" % (n, v))
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError("ConditionalNorm: eps 必须是正数，收到 %r" % (eps,))
+        self.features = features
+        self.cond_dim = cond_dim
+        self.eps = float(eps)
+        std = (1.0 / cond_dim) ** 0.5
+        self.W_g = [[random.gauss(0.0, std) for _ in range(cond_dim)]
+                    for _ in range(features)]
+        self.b_g = [0.0] * features
+        self.W_b = [[random.gauss(0.0, std) for _ in range(cond_dim)]
+                    for _ in range(features)]
+        self.b_b = [0.0] * features
+        self.cond = None
+        self._cache = None
+        self._adam_m = {k: _zeros_like(v) for k, v in self._params()}
+        self._adam_v = {k: _zeros_like(v) for k, v in self._params()}
+        self._adam_t = 0
+        self.zero_grad()
+
+    def _params(self):
+        return (("W_g", self.W_g), ("b_g", self.b_g),
+                ("W_b", self.W_b), ("b_b", self.b_b))
+
+    def zero_grad(self):
+        self.grads = {k: _zeros_like(v) for k, v in self._params()}
+        self.grad_cond = [0.0] * self.cond_dim
+
+    def param_count(self):
+        return _w2_count(self._params())
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError("ConditionalNorm: lr 必须是非负数字，收到 %r" % (lr,))
+        for key, param in self._params():
+            _sgd_apply(param, self.grads[key], float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError("ConditionalNorm: lr 必须是非负数字，收到 %r" % (lr,))
+        self._adam_t += 1
+        for key, param in self._params():
+            _adam_apply(param, self.grads[key], self._adam_m[key],
+                        self._adam_v[key], self._adam_t, float(lr),
+                        beta1, beta2, eps)
+
+    def set_cond(self, cond):
+        if not isinstance(cond, (list, tuple)) or len(cond) != self.cond_dim:
+            raise ValueError(
+                "ConditionalNorm.set_cond: 条件向量长度必须是 %d，收到 %r"
+                % (self.cond_dim, cond))
+        self.cond = [float(v) for v in cond]
+        return self
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != self.features:
+            raise ValueError(
+                "ConditionalNorm.forward: 输入长度必须是 %d" % self.features)
+        for v in x:
+            if isinstance(v, (list, tuple)):
+                raise ValueError("ConditionalNorm.forward: 只支持一维特征向量")
+        if self.cond is None:
+            raise RuntimeError("ConditionalNorm.forward: 必须先调用 set_cond")
+        n = float(self.features)
+        mu = 0.0
+        for v in x:
+            mu += v
+        mu /= n
+        var = 0.0
+        for v in x:
+            d = v - mu
+            var += d * d
+        var /= n
+        inv = 1.0 / math.sqrt(var + self.eps)
+        xhat = [(v - mu) * inv for v in x]
+        gamma = []
+        beta = []
+        for c in range(self.features):
+            acc_g = 1.0 + self.b_g[c]
+            acc_b = self.b_b[c]
+            row_g = self.W_g[c]
+            row_b = self.W_b[c]
+            for j in range(self.cond_dim):
+                acc_g += row_g[j] * self.cond[j]
+                acc_b += row_b[j] * self.cond[j]
+            gamma.append(acc_g)
+            beta.append(acc_b)
+        out = [gamma[c] * xhat[c] + beta[c] for c in range(self.features)]
+        self._cache = (xhat, inv, gamma)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("ConditionalNorm.backward: 必须先调用 forward")
+        xhat, inv, gamma = self._cache
+        n = self.features
+        if len(dout) != n:
+            raise ValueError(
+                "ConditionalNorm.backward: dout 长度必须是 %d，收到 %d" % (n, len(dout)))
+        for c in range(n):
+            dg = dout[c] * xhat[c]
+            db = dout[c]
+            self.grads["b_g"][c] += dg
+            self.grads["b_b"][c] += db
+            row_g = self.grads["W_g"][c]
+            row_b = self.grads["W_b"][c]
+            for j in range(self.cond_dim):
+                row_g[j] += dg * self.cond[j]
+                row_b[j] += db * self.cond[j]
+        for j in range(self.cond_dim):
+            acc = 0.0
+            for c in range(n):
+                acc += (dout[c] * xhat[c] * self.W_g[c][j]
+                        + dout[c] * self.W_b[c][j])
+            self.grad_cond[j] = acc
+        dxhat = [dout[c] * gamma[c] for c in range(n)]
+        total = 0.0
+        for v in dxhat:
+            total += v
+        total_x = 0.0
+        for c in range(n):
+            total_x += dxhat[c] * xhat[c]
+        mean_d = total / n
+        mean_dx = total_x / n
+        return [(dxhat[c] - mean_d - xhat[c] * mean_dx) * inv for c in range(n)]
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 

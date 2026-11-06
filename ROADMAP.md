@@ -134,10 +134,10 @@
       `AdaptiveAvgPool2d` 一致，`(1,1)` 与全局最大逐位相同）、`LPPool2d`（`p=1` 在非负输入上等于
       `AvgPool2d`，随 p 增大单调逼近 `MaxPool2d`，梯度差分 ≤1e-9）
 - [x] 池化家族（1D / 3D，W2-D）：`MaxPool1d` / `AvgPool1d` / `MaxPool3d` / `AvgPool3d`（floor 语义丢弃尾窗、最大池化只回传最大值位置、平均池化均分、padding 不接收梯度）
-- [ ] 池化家族（2D 特殊）：`FractionalMaxPool2d`、`StochasticPool2d`
+- [x] 池化家族（2D 特殊，W2-H）：`FractionalMaxPool2d`（比例重叠窗口、起点随机可注入 `rng`，alpha 为整数时窗口与 seed 无关）、`StochasticPool2d`（训练按 `relu(x)/Σrelu` 采样并乘 `p`，`eval()` 取概率加权期望；非正窗口退化为均匀）；梯度总量守恒 32/非零位置 32、反向 `d*p` 差分 ≤1e-12
 - [x] `AdaIN`（W2-C：按通道实例归一化后乘风格向量，`set_style()`；`d_gamma`/`d_beta`/`dx` 中心差分 ≤1e-6，单向量输入 mean=x ⇒ `dx=0`）
 - [x] `FiLM`（W2-C：`y = gamma ⊙ x + beta`，`groups>1` 时特征分段共享调制参数）
-- [ ] `ConditionalNorm`（条件归一化：把条件向量投影成 gamma/beta 的完整模块，AdaIN/FiLM 已提供其数学核）
+- [x] `ConditionalNorm`（W2-H：`gamma = 1 + W_g·c + b_g`、`beta = W_b·c + b_b`，`set_cond()` 设条件；`dx`/`b_g,b_b`/`W_g,W_b`/`grad_cond` 五组中心差分 ≤1e-7）
 
 ### W3 归一化·激活·初始化（P1 + §6）
 - [ ] 归一化族：`WeightNorm`、`SpectralNorm`（幂迭代）、`SwitchNorm`、`FilterResponseNorm`、`ScaleNorm`

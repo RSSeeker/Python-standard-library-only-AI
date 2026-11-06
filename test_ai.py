@@ -10338,3 +10338,304 @@ class TestConvNeXtBlock:
             pass
         else:
             raise AssertionError("未 forward 就 backward 应该报错")
+
+
+# ==== W2-H：分数池化 / 随机池化 / 条件归一化 ====
+
+class TestFractionalPooling:
+    """FractionalMaxPool2d：比例决定输出尺寸，窗口重叠且可注入随机源"""
+
+    def test_output_size_and_values(self):
+        import random as _random
+        rng = _random.Random(41)
+        x = [[[rng.uniform(-1, 1) for _ in range(8)] for _ in range(8)] for _ in range(2)]
+        fp = AI.FractionalMaxPool2d((0.5, 0.5), rng=_random.Random(7))
+        out = fp.forward(x)
+        assert len(out) == 2 and len(out[0]) == 4 and len(out[0][0]) == 4
+        for c in range(2):
+            for h in range(4):
+                for w in range(4):
+                    ih, iw = fp.mask[c][h][w]
+                    assert abs(out[c][h][w] - x[c][ih][iw]) < 1e-12
+        full = AI.FractionalMaxPool2d(1.0)
+        assert len(full.forward(x)[0]) == 8 and len(full.forward(x)[0][0]) == 8
+
+    def test_reproducible_and_backward(self):
+        """同 seed 逐位相同；反向只回传被选位置且总量守恒"""
+        import random as _random
+        rng = _random.Random(42)
+        x = [[[rng.uniform(-1, 1) for _ in range(10)] for _ in range(10)]
+             for _ in range(2)]
+        a = AI.FractionalMaxPool2d((0.6, 0.6), rng=_random.Random(1))
+        b = AI.FractionalMaxPool2d((0.6, 0.6), rng=_random.Random(1))
+        c = AI.FractionalMaxPool2d((0.6, 0.6), rng=_random.Random(2))
+        oa, ob = a.forward(x), b.forward(x)
+        c.forward(x)
+        assert all(abs(oa[i][j][k] - ob[i][j][k]) < 1e-12
+                   for i in range(2) for j in range(len(oa[0]))
+                   for k in range(len(oa[0][0])))
+        assert any(a.mask[i][j][k] != c.mask[i][j][k]
+                   for i in range(2) for j in range(len(a.mask[0]))
+                   for k in range(len(a.mask[0][0])))
+        # alpha 为整数时没有自由度，窗口与 seed 无关
+        i1 = AI.FractionalMaxPool2d((0.5, 0.5), rng=_random.Random(1))
+        i2 = AI.FractionalMaxPool2d((0.5, 0.5), rng=_random.Random(2))
+        i1.forward(x)
+        i2.forward(x)
+        assert all(i1.mask[p][q][r] == i2.mask[p][q][r]
+                   for p in range(2) for q in range(len(i1.mask[0]))
+                   for r in range(len(i1.mask[0][0])))
+        dout = [[[1.0] * len(oa[0][0]) for _ in range(len(oa[0]))] for _ in range(2)]
+        dx = a.backward(dout)
+        total = sum(sum(sum(row) for row in ch) for ch in dx)
+        expect = 2 * len(oa[0]) * len(oa[0][0])
+        assert abs(total - expect) < 1e-12
+        nz = sum(1 for ch in dx for row in ch for v in row if abs(v) > 0)
+        assert nz == expect
+
+    def test_errors(self):
+        for bad in ((0.0, 0.5), (1.5, 0.5), ("a", 0.5), (0.5,)):
+            try:
+                AI.FractionalMaxPool2d(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"FractionalMaxPool2d({bad!r}) 应该报错")
+        try:
+            AI.FractionalMaxPool2d(0.5).backward([[[1.0]]])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+        fp = AI.FractionalMaxPool2d(0.5)
+        try:
+            fp.forward([1.0, 2.0])
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("一维输入应该报错")
+
+
+class TestStochasticPooling:
+    """StochasticPool2d：训练采样、eval 取期望、反向按概率缩放"""
+
+    def test_train_and_eval(self):
+        import random as _random
+        rng = _random.Random(51)
+        x = [[[rng.uniform(0.1, 1.0) for _ in range(4)] for _ in range(4)]
+             for _ in range(2)]
+        sp = AI.StochasticPool2d(2, rng=_random.Random(5))
+        out = sp.forward(x)
+        assert len(out) == 2 and len(out[0]) == 2 and len(out[0][0]) == 2
+        probs = sp.probs[0][0][0]
+        assert abs(sum(probs) - 1.0) < 1e-12
+        pick = sp.tag[0][0][0]
+        i, j = divmod(pick, 2)
+        assert abs(out[0][0][0] - x[0][i][j]) < 1e-12
+        dout = [[[2.0] * 2 for _ in range(2)] for _ in range(2)]
+        dx = sp.backward(dout)
+        assert abs(dx[0][i][j] - 2.0 * probs[pick]) < 1e-12
+        nz = sum(1 for ch in dx for row in ch for v in row if abs(v) > 0)
+        assert nz == 8
+
+        sp.eval()
+        out_eval = sp.forward(x)
+        vals = [x[0][h][k] for h in range(2) for k in range(2)]
+        weights = [v if v > 0 else 0.0 for v in vals]
+        total = sum(weights)
+        pexp = [v / total for v in weights]
+        assert abs(out_eval[0][0][0] - sum(p * v for p, v in zip(pexp, vals))) < 1e-12
+        dx_eval = sp.backward(dout)
+        assert abs(dx_eval[0][0][0] - 2.0 * pexp[0]) < 1e-12
+        sp.train()
+
+        # 同一 seed 采样相同
+        a = AI.StochasticPool2d(2, rng=_random.Random(11))
+        b = AI.StochasticPool2d(2, rng=_random.Random(11))
+        oa, ob = a.forward(x), b.forward(x)
+        assert all(abs(oa[i][j][k] - ob[i][j][k]) < 1e-12
+                   for i in range(2) for j in range(2) for k in range(2))
+
+    def test_probabilities_uniform_when_nonpositive(self):
+        """窗口全非正时退化为均匀分布（不会 0/0）"""
+        x = [[[-1.0, -2.0], [-3.0, -4.0]]]
+        sp = AI.StochasticPool2d(2, rng=__import__("random").Random(3))
+        sp.forward(x)
+        probs = sp.probs[0][0][0]
+        assert all(abs(p - 0.25) < 1e-12 for p in probs)
+
+    def test_errors(self):
+        for bad in (0, -1, (2, 0)):
+            try:
+                AI.StochasticPool2d(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"StochasticPool2d({bad!r}) 应该报错")
+        try:
+            AI.StochasticPool2d(2).backward([[[1.0]]])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+        try:
+            AI.StochasticPool2d(5).forward([[[1.0, 2.0], [3.0, 4.0]]])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("kernel 大于输入应该报错")
+
+
+class TestConditionalNorm:
+    """ConditionalNorm：条件投影出 gamma/beta，梯度覆盖全部参数与条件向量"""
+
+    def test_forward_closed_form(self):
+        import random as _random
+        _random.seed(61)
+        cn = AI.ConditionalNorm(4, 3)
+        cond = [0.5, -0.2, 0.8]
+        cn.set_cond(cond)
+        x = [0.3, -1.1, 0.7, 2.0]
+        out = cn.forward(x)
+        mu = sum(x) / 4.0
+        var = sum((v - mu) ** 2 for v in x) / 4.0
+        inv = 1.0 / (var + cn.eps) ** 0.5
+        for c in range(4):
+            gamma = 1.0 + sum(cn.W_g[c][j] * cond[j] for j in range(3)) + cn.b_g[c]
+            beta = sum(cn.W_b[c][j] * cond[j] for j in range(3)) + cn.b_b[c]
+            xhat = (x[c] - mu) * inv
+            assert abs(out[c] - (gamma * xhat + beta)) < 1e-12
+        assert cn.param_count() == 4 * 3 + 4 + 4 * 3 + 4
+
+    def test_gradients(self):
+        import math as _math
+        import random as _random
+        _random.seed(62)
+        cn = AI.ConditionalNorm(4, 3)
+        cond = [0.5, -0.2, 0.8]
+        cn.set_cond(cond)
+        x = [0.3, -1.1, 0.7, 2.0]
+        dout = [0.7, -0.4, 1.2, 0.3]
+
+        def loss():
+            return sum(a * b for a, b in zip(cn.forward(x), dout))
+
+        cn.zero_grad()
+        cn.forward(x)
+        dx = cn.backward(dout)
+        eps = 1e-6
+        worst = 0.0
+        for c in range(4):
+            old = x[c]
+            x[c] = old + eps
+            vp = loss()
+            x[c] = old - eps
+            vm = loss()
+            x[c] = old
+            worst = max(worst, abs((vp - vm) / (2 * eps) - dx[c]))
+        assert worst < 1e-7, f"dx 差分 {worst:.3e}"
+
+        cn.zero_grad()
+        cn.forward(x)
+        cn.backward(dout)
+        worst = 0.0
+        for c in range(4):
+            for c_ in range(4):
+                pass
+        for c in range(4):
+            for arr, key in ((cn.b_g, "b_g"), (cn.b_b, "b_b")):
+                old = arr[c]
+                arr[c] = old + eps
+                vp = loss()
+                arr[c] = old - eps
+                vm = loss()
+                arr[c] = old
+                worst = max(worst, abs((vp - vm) / (2 * eps) - cn.grads[key][c]))
+        assert worst < 1e-7, f"b_g/b_b 差分 {worst:.3e}"
+
+        worst = 0.0
+        for c in range(4):
+            for j in range(3):
+                for mat, key in ((cn.W_g, "W_g"), (cn.W_b, "W_b")):
+                    old = mat[c][j]
+                    mat[c][j] = old + eps
+                    vp = loss()
+                    mat[c][j] = old - eps
+                    vm = loss()
+                    mat[c][j] = old
+                    worst = max(worst, abs((vp - vm) / (2 * eps) - cn.grads[key][c][j]))
+        assert worst < 1e-7, f"W_g/W_b 差分 {worst:.3e}"
+
+        cn.zero_grad()
+        cn.forward(x)
+        cn.backward(dout)
+        worst = 0.0
+        for j in range(3):
+            old = cond[j]
+            cond[j] = old + eps
+            cn.set_cond(cond)
+            vp = loss()
+            cond[j] = old - eps
+            cn.set_cond(cond)
+            vm = loss()
+            cond[j] = old
+            cn.set_cond(cond)
+            worst = max(worst, abs((vp - vm) / (2 * eps) - cn.grad_cond[j]))
+        assert worst < 1e-7, f"grad_cond 差分 {worst:.3e}"
+        _math.isclose(1.0, 1.0)
+
+    def test_optimizer_steps_and_errors(self):
+        import random as _random
+        _random.seed(63)
+        cn = AI.ConditionalNorm(4, 3)
+        cn.set_cond([0.5, -0.2, 0.8])
+        x = [0.3, -1.1, 0.7, 2.0]
+        cn.forward(x)
+        cn.backward([0.7, -0.4, 1.2, 0.3])
+        before = list(cn.b_b)
+        cn.sgd_step(0.1)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(before, cn.b_b))
+        cn.forward(x)
+        cn.backward([0.7, -0.4, 1.2, 0.3])
+        before = list(cn.b_b)
+        cn.adam_step(0.05)
+        assert cn._adam_t == 1
+        assert any(abs(a - b) > 1e-12 for a, b in zip(before, cn.b_b))
+        for bad in (-0.1, True, "0.1"):
+            try:
+                cn.sgd_step(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"sgd_step({bad!r}) 应该报错")
+        try:
+            AI.ConditionalNorm(4, 3).forward([1.0, 2.0, 3.0, 4.0])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 set_cond 就 forward 应该报错")
+        try:
+            cn.set_cond([1.0, 2.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("条件向量长度不符应该报错")
+        try:
+            cn.forward([1.0, 2.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("特征长度不符应该报错")
+        try:
+            cn.forward([[1.0], [2.0], [3.0], [4.0]])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("二维输入应该报错")
+        for bad in (0, -1, 1.5, True):
+            try:
+                AI.ConditionalNorm(bad, 3)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"ConditionalNorm({bad!r}, 3) 应该报错")
