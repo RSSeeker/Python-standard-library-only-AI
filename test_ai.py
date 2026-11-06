@@ -13539,3 +13539,157 @@ class TestLearnedPositionalEncoding:
         assert raises(lambda: pe.backward([[0.0] * 4] * 2))
         assert raises(lambda: pe.sgd_step(-0.1))
         assert raises(lambda: pe.adam_step(0.1, beta1=1.0))
+
+
+class TestLinearAttention:
+    """线性注意力：elu+1 核，O(T*d^2)，causal / 非 causal 两条路径"""
+
+    XS = [[math.sin(0.4 * t + 0.3 * j) + 0.2 * j for j in range(6)]
+          for t in range(5)]
+    DOUT = [[math.cos(0.2 * t + 0.1 * j) for j in range(6)] for t in range(5)]
+
+    def _model(self, causal, seed=11):
+        random.seed(seed)
+        return AI.LinearAttention(6, 2, causal=causal)
+
+    def _loss(self, m):
+        m.zero_grad()
+        out = m.forward([list(r) for r in self.XS])
+        return sum(self.DOUT[t][j] * out[t][j]
+                   for t in range(5) for j in range(6))
+
+    def test_shapes_and_param_count(self):
+        for causal in (False, True):
+            m = self._model(causal)
+            out = m.forward([list(r) for r in self.XS])
+            assert len(out) == 5 and len(out[0]) == 6
+            assert all(v == v and abs(v) < 1e6 for row in out for v in row)
+            assert m.param_count() == 4 * 36 + 4 * 6
+
+    def test_closed_form_and_causality(self):
+        m = AI.LinearAttention(2, 1, causal=False)
+        for name in ('W_q', 'W_k', 'W_v', 'W_o'):
+            setattr(m, name, [[1.0, 0.0], [0.0, 1.0]])
+        xs = [[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]]
+        out = m.forward([list(r) for r in xs])
+        phi = AI.LinearAttention.phi
+        S = [[0.0, 0.0], [0.0, 0.0]]
+        for x in xs:
+            pk = phi(x)
+            for i in range(2):
+                for j in range(2):
+                    S[i][j] += pk[i] * x[j]
+        for t, x in enumerate(xs):
+            pq = phi(x)
+            num = [sum(pq[i] * S[i][j] for i in range(2)) for j in range(2)]
+            den = sum(pq[i] * sum(phi(y)[i] for y in xs) for i in range(2)) + m.eps
+            for j in range(2):
+                assert abs(out[t][j] - num[j] / den) < 1e-12
+
+        mc = self._model(True)
+        base = mc.forward([list(r) for r in self.XS])
+        changed = [list(r) for r in self.XS]
+        changed[-1] = [v + 5.0 for v in changed[-1]]
+        out2 = mc.forward(changed)
+        assert abs(out2[0][0] - base[0][0]) < 1e-15
+        assert abs(out2[4][0] - base[4][0]) > 1e-6
+
+    def test_weight_gradients_finite_difference(self):
+        eps = 1e-6
+        for causal in (False, True):
+            m = self._model(causal)
+            for name, i, j in (('W_q', 1, 2), ('W_k', 0, 3),
+                               ('W_v', 2, 4), ('W_o', 3, 1)):
+                mat = getattr(m, name)
+                m.zero_grad()
+                m.forward([list(r) for r in self.XS])
+                m.backward([list(r) for r in self.DOUT])
+                ana = m.grads[name][i][j]
+                old = mat[i][j]
+                mat[i][j] = old + eps
+                lp = self._loss(m)
+                mat[i][j] = old - eps
+                lm = self._loss(m)
+                mat[i][j] = old
+                num = (lp - lm) / (2 * eps)
+                assert abs(ana - num) / max(1.0, abs(num)) < 1e-5, (causal, name)
+
+    def test_input_gradient_finite_difference(self):
+        eps = 1e-6
+        for causal in (False, True):
+            m = self._model(causal)
+            m.zero_grad()
+            m.forward([list(r) for r in self.XS])
+            dx = m.backward([list(r) for r in self.DOUT])
+            for (t, j) in ((0, 0), (2, 3), (4, 5)):
+                xs = [list(r) for r in self.XS]
+                xs[t][j] += eps
+                m.zero_grad()
+                out = m.forward(xs)
+                lp = sum(self.DOUT[a][b] * out[a][b]
+                         for a in range(5) for b in range(6))
+                xs[t][j] -= 2 * eps
+                m.zero_grad()
+                out = m.forward(xs)
+                lm = sum(self.DOUT[a][b] * out[a][b]
+                         for a in range(5) for b in range(6))
+                num = (lp - lm) / (2 * eps)
+                assert abs(dx[t][j] - num) / max(1.0, abs(num)) < 1e-5
+
+    def test_accumulation_and_optimizers(self):
+        m = self._model(True)
+        m.zero_grad()
+        m.forward([list(r) for r in self.XS])
+        m.backward([list(r) for r in self.DOUT])
+        g1 = m.grads['W_q'][0][0]
+        m.forward([list(r) for r in self.XS])
+        m.backward([list(r) for r in self.DOUT])
+        assert abs(m.grads['W_q'][0][0] - 2 * g1) < 1e-12
+        m.zero_grad()
+        assert all(v == 0.0 for row in m.grads['W_q'] for v in row)
+
+        before = [row[:] for row in m.W_q]
+        m.forward([list(r) for r in self.XS])
+        m.backward([list(r) for r in self.DOUT])
+        m.sgd_step(0.05)
+        assert any(abs(m.W_q[i][j] - before[i][j]) > 1e-15
+                   for i in range(6) for j in range(6))
+        m.adam_step(0.01)
+        assert m._adam_t == 1
+
+    def test_training_converges(self):
+        random.seed(0)
+        xs = [[0.1 * t] * 4 for t in range(3)]
+        m = AI.LinearAttention(4, 2, causal=True)
+        target = [0.5, -0.25, 1.0, 0.0]
+        losses = []
+        for _ in range(120):
+            m.zero_grad()
+            out = m.forward([list(r) for r in xs])
+            diff = [[out[t][j] - target[j] * (t + 1) / 3 for j in range(4)]
+                    for t in range(3)]
+            losses.append(sum(v * v for row in diff for v in row) / 12.0)
+            m.backward([[2 * v / 12.0 for v in row] for row in diff])
+            m.adam_step(0.05)
+        assert losses[-1] < losses[0] * 0.2
+
+    def test_invalid_arguments(self):
+        def raises(fn, exc=ValueError):
+            try:
+                fn()
+            except exc:
+                return True
+            return False
+
+        assert raises(lambda: AI.LinearAttention(0, 1))
+        assert raises(lambda: AI.LinearAttention(6, 0))
+        assert raises(lambda: AI.LinearAttention(6, 4))
+        assert raises(lambda: AI.LinearAttention(6, 2, eps=-1.0))
+        m = self._model(False)
+        assert raises(lambda: m.forward([]))
+        assert raises(lambda: m.forward([[0.0] * 5]))
+        assert raises(lambda: m.backward([[1.0] * 6]), RuntimeError)
+        m.forward([list(r) for r in self.XS])
+        assert raises(lambda: m.backward([[1.0] * 6]))
+        assert raises(lambda: m.sgd_step(-0.1))
+        assert raises(lambda: m.adam_step(0.1, beta1=1.0))

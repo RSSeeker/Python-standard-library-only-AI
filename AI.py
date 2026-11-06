@@ -11022,6 +11022,408 @@ class PositionalEncoding:
 #  Embedding / Residual / Sequential
 # ============================================================================
 
+class LinearAttention:
+    """线性注意力（Katharopoulos et al. 2020）：`phi(x) = elu(x) + 1`
+
+    标准注意力是 `softmax(QK^T)V`，要显式算 T×T 矩阵，代价 O(T^2·d)。
+    这里把 softmax 换成核函数 `phi`，利用「先求和再相乘」的加法结合律：
+
+        out_t = phi(q_t)^T · sum_{s<=t} phi(k_s) v_s^T
+                / (phi(q_t)^T · sum_{s<=t} phi(k_s))
+
+    分子/分母都是**前缀累加**（d_k×d_k 矩阵与 d_k 维向量），代价降到 O(T·d^2)，
+    与序列长度线性相关。`causal=True` 时用前缀和（自回归可用），否则用全长和。
+
+    `phi = elu + 1` 保证特征非负（分母才是正数），这也是敢直接除的前提；
+    分母带 `eps` 兜底。逐头独立计算，拼回 d_model 后过输出投影。
+
+    不支持注意力 dropout（线性注意力的权重不显式存在），`train()`/`eval()`
+    是空操作——保留只为和别的层统一调用。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, causal: bool = False,
+                 eps: float = 1e-6):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise ValueError("LinearAttention: d_model 必须是正整数，收到 %r" % (d_model,))
+        if d_model < 1:
+            raise ValueError("LinearAttention: d_model 必须 >= 1，收到 %r" % (d_model,))
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int):
+            raise ValueError(
+                "LinearAttention: num_heads 必须是正整数，收到 %r" % (num_heads,))
+        if num_heads < 1:
+            raise ValueError("LinearAttention: num_heads 必须 >= 1，收到 %r" % (num_heads,))
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "LinearAttention: d_model=%d 必须能被 num_heads=%d 整除"
+                % (d_model, num_heads))
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise ValueError("LinearAttention: eps 必须是正数，收到 %r" % (eps,))
+        eps = float(eps)
+        if not (eps > 0.0) or eps != eps:
+            raise ValueError("LinearAttention: eps 必须是有限正数，收到 %r" % (eps,))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.causal = bool(causal)
+        self.eps = eps
+        std = math.sqrt(2.0 / d_model)
+        self.W_q = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_k = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_v = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_o = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.b_q = [0.0] * d_model
+        self.b_k = [0.0] * d_model
+        self.b_v = [0.0] * d_model
+        self.b_o = [0.0] * d_model
+        self._init_adam()
+        self.zero_grad()
+        self.seq_len = 0
+        self.x = None
+        self.concat = None
+        self._cache = None
+
+    def zero_grad(self):
+        """清零所有参数梯度"""
+        d = self.d_model
+
+        def zeros_2d(r, c):
+            return [[0.0] * c for _ in range(r)]
+
+        self.grads = {
+            "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
+            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
+            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
+        }
+
+    def _init_adam(self):
+        d = self.d_model
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            setattr(self, "m_" + name, [[0.0] * d for _ in range(d)])
+            setattr(self, "v_" + name, [[0.0] * d for _ in range(d)])
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            setattr(self, "m_" + name, [0.0] * d)
+            setattr(self, "v_" + name, [0.0] * d)
+        self._adam_t = 0
+
+    def train(self):
+        """线性注意力没有 dropout，这里是空操作（保持接口统一）"""
+        return self
+
+    def eval(self):
+        """线性注意力没有 dropout，这里是空操作（保持接口统一）"""
+        return self
+
+    @staticmethod
+    def phi(x):
+        """特征映射 phi(x) = elu(x) + 1：非负、单射"""
+        return [(math.exp(xi) - 1.0 if xi <= 0.0 else xi) + 1.0 for xi in x]
+
+    @staticmethod
+    def _dphi(x, dy):
+        """phi 的反向：d elu/dx = 1 (x>0) / exp(x) (x<=0)"""
+        return [(1.0 if xi > 0.0 else math.exp(xi)) * di for xi, di in zip(x, dy)]
+
+    def _proj(self, W, b, x_t):
+        return [sum(map(_mul, W[r], x_t)) + b[r] for r in range(self.d_model)]
+
+    def forward(self, x_seq):
+        """x_seq: (seq_len, d_model) → (seq_len, d_model)"""
+        if not x_seq:
+            raise ValueError("LinearAttention.forward: 输入序列不能为空")
+        d = self.d_model
+        for t, row in enumerate(x_seq):
+            if len(row) != d:
+                raise ValueError(
+                    "LinearAttention.forward: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (t, len(row), d))
+        T = len(x_seq)
+        q_all = [self._proj(self.W_q, self.b_q, xt) for xt in x_seq]
+        k_all = [self._proj(self.W_k, self.b_k, xt) for xt in x_seq]
+        v_all = [self._proj(self.W_v, self.b_v, xt) for xt in x_seq]
+        d_k = self.d_k
+        cache = []
+        concat = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            qh = [q_all[t][off:off + d_k] for t in range(T)]
+            kh = [k_all[t][off:off + d_k] for t in range(T)]
+            vh = [v_all[t][off:off + d_k] for t in range(T)]
+            phi_q = [self.phi(q) for q in qh]
+            phi_k = [self.phi(k) for k in kh]
+            if self.causal:
+                S_use = []
+                z_use = []
+                acc = [[0.0] * d_k for _ in range(d_k)]
+                zacc = [0.0] * d_k
+                for t in range(T):
+                    pk = phi_k[t]
+                    vt = vh[t]
+                    for i in range(d_k):
+                        pki = pk[i]
+                        arow = acc[i]
+                        for j in range(d_k):
+                            arow[j] += pki * vt[j]
+                        zacc[i] += pki
+                    S_use.append([list(r) for r in acc])
+                    z_use.append(list(zacc))
+            else:
+                acc = [[0.0] * d_k for _ in range(d_k)]
+                zacc = [0.0] * d_k
+                for t in range(T):
+                    pk = phi_k[t]
+                    vt = vh[t]
+                    for i in range(d_k):
+                        pki = pk[i]
+                        arow = acc[i]
+                        for j in range(d_k):
+                            arow[j] += pki * vt[j]
+                        zacc[i] += pki
+                S_use = [acc] * T
+                z_use = [zacc] * T
+            outs = []
+            denoms = []
+            for t in range(T):
+                S = S_use[t]
+                pq = phi_q[t]
+                num = [sum(pq[i] * S[i][j] for i in range(d_k)) for j in range(d_k)]
+                den = sum(pq[i] * z_use[t][i] for i in range(d_k)) + self.eps
+                denoms.append(den)
+                outs.append([v / den for v in num])
+            for t in range(T):
+                for j in range(d_k):
+                    concat[t][off + j] = outs[t][j]
+            cache.append({
+                "phi_q": phi_q, "phi_k": phi_k, "v": vh,
+                "S": S_use, "z": z_use, "denom": denoms, "out": outs,
+            })
+        y = [[sum(map(_mul, self.W_o[r], concat[t])) + self.b_o[r] for r in range(d)]
+             for t in range(T)]
+        self.seq_len = T
+        self.x = [list(row) for row in x_seq]
+        self.concat = concat
+        self._cache = cache
+        return y
+
+    def backward(self, dout_seq):
+        """dout_seq: (seq_len, d_model) → (seq_len, d_model) 输入梯度"""
+        if self._cache is None:
+            raise RuntimeError("LinearAttention.backward: 必须先 forward")
+        if len(dout_seq) != self.seq_len:
+            raise ValueError(
+                "LinearAttention.backward: dout 长度 %d 与 forward 的 %d 不一致"
+                % (len(dout_seq), self.seq_len))
+        d = self.d_model
+        T = self.seq_len
+        d_k = self.d_k
+        dconcat = [[sum(dout_seq[t][j] * self.W_o[j][r] for j in range(d))
+                    for r in range(d)] for t in range(T)]
+        for r in range(d):
+            wrow = self.grads["W_o"][r]
+            for t in range(T):
+                dt = dout_seq[t][r]
+                if dt != 0.0:
+                    crow = self.concat[t]
+                    for c in range(d):
+                        wrow[c] += dt * crow[c]
+            self.grads["b_o"][r] += sum(dout_seq[t][r] for t in range(T))
+        dq_all = [[0.0] * d for _ in range(T)]
+        dk_all = [[0.0] * d for _ in range(T)]
+        dv_all = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            c = self._cache[head]
+            phi_q, phi_k, vh = c["phi_q"], c["phi_k"], c["v"]
+            S_use, z_use, denom, outs = c["S"], c["z"], c["denom"], c["out"]
+            dphi_q = [[0.0] * d_k for _ in range(T)]
+            dphi_k = [[0.0] * d_k for _ in range(T)]
+            dvh = [[0.0] * d_k for _ in range(T)]
+            dS = []
+            dz = []
+            for t in range(T):
+                dout = dconcat[t][off:off + d_k]
+                den = denom[t]
+                out = outs[t]
+                dnum = [v / den for v in dout]
+                dden = -sum(dout[j] * out[j] for j in range(d_k)) / den
+                S = S_use[t]
+                pq = phi_q[t]
+                dS.append([[pq[i] * dnum[j] for j in range(d_k)] for i in range(d_k)])
+                for i in range(d_k):
+                    dphi_q[t][i] += sum(S[i][j] * dnum[j] for j in range(d_k))
+                    dphi_q[t][i] += dden * z_use[t][i]
+                dz.append([dden * pq[i] for i in range(d_k)])
+            if self.causal:
+                # 前缀和：S_t 依赖 s<=t，所以 dS 要**从后往前**累加（后缀和）
+                accS = [[0.0] * d_k for _ in range(d_k)]
+                accz = [0.0] * d_k
+                for t in range(T - 1, -1, -1):
+                    dSt = dS[t]
+                    for i in range(d_k):
+                        arow = accS[i]
+                        srow = dSt[i]
+                        for j in range(d_k):
+                            arow[j] += srow[j]
+                        accz[i] += dz[t][i]
+                    pk = phi_k[t]
+                    vt = vh[t]
+                    for i in range(d_k):
+                        arow = accS[i]
+                        dphi_k[t][i] += (sum(arow[j] * vt[j] for j in range(d_k))
+                                         + accz[i])
+                    for j in range(d_k):
+                        dvh[t][j] += sum(accS[i][j] * pk[i] for i in range(d_k))
+            else:
+                # 全长和：所有位置共用同一个 S，先把 dS/dz 全加起来再一次性回传
+                totS = [[0.0] * d_k for _ in range(d_k)]
+                totz = [0.0] * d_k
+                for t in range(T):
+                    dSt = dS[t]
+                    for i in range(d_k):
+                        trow = totS[i]
+                        srow = dSt[i]
+                        for j in range(d_k):
+                            trow[j] += srow[j]
+                        totz[i] += dz[t][i]
+                for t in range(T):
+                    pk = phi_k[t]
+                    vt = vh[t]
+                    for i in range(d_k):
+                        trow = totS[i]
+                        dphi_k[t][i] += (sum(trow[j] * vt[j] for j in range(d_k))
+                                         + totz[i])
+                    for j in range(d_k):
+                        dvh[t][j] += sum(totS[i][j] * pk[i] for i in range(d_k))
+            for t in range(T):
+                xt = self.x[t]
+                qh = [sum(map(_mul, self.W_q[r], xt)) + self.b_q[r]
+                      for r in range(off, off + d_k)]
+                kh = [sum(map(_mul, self.W_k[r], xt)) + self.b_k[r]
+                      for r in range(off, off + d_k)]
+                dq = self._dphi(qh, dphi_q[t])
+                dk = self._dphi(kh, dphi_k[t])
+                for j in range(d_k):
+                    dq_all[t][off + j] = dq[j]
+                    dk_all[t][off + j] = dk[j]
+                    dv_all[t][off + j] = dvh[t][j]
+        for r in range(d):
+            wq = self.grads["W_q"][r]
+            wk = self.grads["W_k"][r]
+            wv = self.grads["W_v"][r]
+            sbq = sbk = sbv = 0.0
+            for t in range(T):
+                xt = self.x[t]
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                sbq += dqr
+                sbk += dkr
+                sbv += dvr
+                if dqr != 0.0:
+                    for c in range(d):
+                        wq[c] += dqr * xt[c]
+                if dkr != 0.0:
+                    for c in range(d):
+                        wk[c] += dkr * xt[c]
+                if dvr != 0.0:
+                    for c in range(d):
+                        wv[c] += dvr * xt[c]
+            self.grads["b_q"][r] += sbq
+            self.grads["b_k"][r] += sbk
+            self.grads["b_v"][r] += sbv
+        dx = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            xrow = dx[t]
+            for r in range(d):
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                if dqr == 0.0 and dkr == 0.0 and dvr == 0.0:
+                    continue
+                wq = self.W_q[r]
+                wk = self.W_k[r]
+                wv = self.W_v[r]
+                for c in range(d):
+                    xrow[c] += dqr * wq[c] + dkr * wk[c] + dvr * wv[c]
+        return dx
+
+    def param_count(self):
+        """参数量：四个 d×d 投影 + 四个 d 维偏置"""
+        d = self.d_model
+        return 4 * d * d + 4 * d
+
+    def sgd_step(self, lr: float):
+        """SGD 更新"""
+        lr = _la_check_lr(lr, "LinearAttention.sgd_step")
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _la_apply_sgd(getattr(self, name), self.grads[name], lr)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            for i in range(len(param)):
+                param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """Adam 更新"""
+        lr = _la_check_lr(lr, "LinearAttention.adam_step")
+        _check_adam_betas(beta1, beta2, "LinearAttention.adam_step")
+        self._adam_t += 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _la_apply_adam(getattr(self, name), self.grads[name],
+                           getattr(self, "m_" + name), getattr(self, "v_" + name),
+                           lr, c1, c2, beta1, beta2, eps)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            m = getattr(self, "m_" + name)
+            v = getattr(self, "v_" + name)
+            for i in range(len(param)):
+                g = grad[i]
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
+                param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
+def _la_check_lr(lr, who):
+    """线性注意力族的 lr 校验，返回 float（与别处优化器步同口径）"""
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise ValueError("%s: lr 必须是数字，收到 %r" % (who, lr))
+    lr = float(lr)
+    if not (lr >= 0.0) or lr != lr:
+        raise ValueError("%s: lr 必须是非负有限数，收到 %r" % (who, lr))
+    return lr
+
+
+def _la_apply_sgd(param, grad, lr):
+    """逐叶 SGD（就地修改嵌套 list）"""
+    for i in range(len(param)):
+        if isinstance(param[i], list):
+            _la_apply_sgd(param[i], grad[i], lr)
+        else:
+            param[i] -= lr * grad[i]
+
+
+def _la_apply_adam(param, grad, m, v, lr, c1, c2, beta1, beta2, eps):
+    """逐叶 Adam（就地修改嵌套 list）"""
+    for i in range(len(param)):
+        if isinstance(param[i], list):
+            _la_apply_adam(param[i], grad[i], m[i], v[i], lr, c1, c2,
+                           beta1, beta2, eps)
+        else:
+            g = grad[i]
+            m[i] = beta1 * m[i] + (1.0 - beta1) * g
+            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
+            param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
 class LearnedPositionalEncoding:
     """可学习的位置编码表（BERT / GPT-2 式）：`out[t] = x[t] + table[t]`
 
