@@ -8661,3 +8661,55 @@ class TestBuiltinCallbacks:
         assert len(hc.records) == 2
         assert set(hc.records[-1]) == {'epoch', 'train_loss', 'val_loss',
                                        'grad_norm', 'layer_grad_norm', 'lr'}
+
+
+class TestRegressionLosses:
+    """W1-A：l1 / log_cosh / quantile / smooth_l1"""
+
+    def test_l1_loss_value_and_grad(self):
+        loss, grad = AI.l1_loss([0.9, -0.7, 2.4], [0.5, -1.2, 3.0])
+        expected = (0.4 + 0.5 + 0.6) / 3
+        assert abs(loss - expected) < 1e-15
+        assert grad == [1 / 3, 1 / 3, -1 / 3]
+
+    def test_log_cosh_stable_for_large_error(self):
+        loss, grad = AI.log_cosh_loss([1000.0], [0.0])
+        assert math.isfinite(loss)
+        assert abs(loss - (1000.0 - math.log(2.0))) < 1e-9
+        assert abs(grad[0] - 1.0) < 1e-12
+
+    def test_quantile_half_equals_half_l1(self):
+        y = [0.5, -1.2, 3.0, 2.2]
+        p = [0.9, -0.7, 2.4, 2.55]
+        l1_l, l1_g = AI.l1_loss(p, y)
+        q_l, q_g = AI.quantile_loss(p, y, quantile=0.5)
+        assert q_l == l1_l / 2.0
+        assert q_g == [v / 2.0 for v in l1_g]
+
+    def test_smooth_l1_is_huber_alias(self):
+        p, y = [0.9, -0.7], [0.5, -1.2]
+        for delta in (0.3, 1.0, 5.0):
+            assert AI.smooth_l1_loss(p, y, delta=delta) == AI.huber_loss(p, y, delta=delta)
+
+    def test_regression_losses_through_model(self):
+        m = AI.Model(AI.MLP([2, 3, 1], activations=["relu", "linear"]),
+                     loss_fn="quantile", loss_kwargs={"quantile": 0.9},
+                     optimizer="adam", lr=0.05, task="regression")
+        loss, _grad = m._loss([0.4], [0.0])
+        assert abs(loss - 0.36) < 1e-12
+        assert m._loss_name == "quantile"
+
+    def test_regression_losses_reject_softmax_output(self):
+        for name in ("l1", "log_cosh", "quantile", "smooth_l1"):
+            with pytest.raises(ValueError):
+                AI.Model(AI.MLP([2, 3, 2], activations=["relu", "softmax"]),
+                         loss_fn=name, optimizer="adam", task="classification")
+
+    def test_invalid_targets_and_quantile(self):
+        with pytest.raises(ValueError):
+            AI.l1_loss([1.0, 2.0], 1.0)          # 标量 target 配多输出
+        with pytest.raises(ValueError):
+            AI.l1_loss([1.0, 2.0], [1.0])        # 长度不符
+        for q in (0.0, 1.0, -0.1, 1.5):
+            with pytest.raises(ValueError):
+                AI.quantile_loss([1.0], [0.0], quantile=q)

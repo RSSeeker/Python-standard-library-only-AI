@@ -10,7 +10,7 @@
   - Dropout / DropPath / BatchNorm1d / BatchNorm2d / LayerNorm / RMSNorm / GroupNorm / InstanceNorm（正则化与归一化）
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
-  - MSE / CrossEntropy / Focal / BCE / Huber / KL 损失函数
+  - MSE / L1 / Log-Cosh / Quantile / Smooth-L1 / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
@@ -6476,6 +6476,79 @@ def lr_finder(model, data=None, x=None, y=None, start_lr: float = 1e-5,
 #  Loss Functions
 # ============================================================================
 
+def _numeric_pair(pred, target, who):
+    """把 (pred, target) 规范成等长 float 列表；target 允许标量（只能配单输出）"""
+    if isinstance(target, (list, tuple)):
+        if len(target) != len(pred):
+            raise ValueError(f"{who}: target 长度 {len(target)} != pred 长度 {len(pred)}")
+        return [float(t) for t in target], [float(p) for p in pred]
+    ps = [float(p) for p in pred]
+    if len(ps) != 1:
+        raise ValueError(f"{who}: 标量 target 只能配单个输出，pred 长度是 {len(ps)}")
+    return [float(target)], ps
+
+
+def l1_loss(pred, target):
+    """L1（MAE）损失：逐元素 |p-y| 的平均值；梯度是 sign(p-y)/n
+
+    对离群点不敏感，但在 0 附近不可导（本实现取 sign，两侧极限一致）。
+    返回 (loss, grad)，grad 相对 pred。
+    """
+    ts, ps = _numeric_pair(pred, target, "l1_loss")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    for y, p in zip(ts, ps):
+        e = p - y
+        loss += abs(e)
+        grad.append((1.0 if e > 0 else (-1.0 if e < 0 else 0.0)) / n)
+    return loss / n, grad
+
+
+def log_cosh_loss(pred, target):
+    """Log-Cosh 损失：log(cosh(p-y)) 的平均值；梯度 tanh(p-y)/n
+
+    兼具 MSE 的平滑与 L1 的抗离群（对大误差近似 |e|-log2），数值实现用
+    `|e| + log1p(exp(-2|e|)) - log2` 避免 cosh 溢出。返回 (loss, grad)。
+    """
+    ts, ps = _numeric_pair(pred, target, "log_cosh_loss")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    log2 = math.log(2.0)
+    for y, p in zip(ts, ps):
+        e = p - y
+        ae = abs(e)
+        loss += ae + math.log1p(math.exp(-2.0 * ae)) - log2
+        grad.append(math.tanh(e) / n)
+    return loss / n, grad
+
+
+def quantile_loss(pred, target, quantile: float = 0.5):
+    """分位数（pinball）损失：q=0.5 就是 MAE 的一半，q>0.5 偏保守（高估代价小）
+
+    逐元素 `max(q*e, (q-1)*e)` 的平均，其中 `e = p - y`；梯度
+    `-(1-q)/n`（e<0）或 `q/n`（e>=0）。返回 (loss, grad)。
+    """
+    q = float(quantile)
+    if not 0.0 < q < 1.0:
+        raise ValueError(f"quantile_loss: quantile 必须在 (0,1) 内，收到 {quantile!r}")
+    ts, ps = _numeric_pair(pred, target, "quantile_loss")
+    n = len(ts)
+    loss = 0.0
+    grad = []
+    for y, p in zip(ts, ps):
+        e = p - y
+        loss += q * e if e >= 0 else (q - 1.0) * e
+        grad.append((q if e >= 0 else (q - 1.0)) / n)
+    return loss / n, grad
+
+
+def smooth_l1_loss(pred, target, delta: float = 1.0):
+    """Smooth L1 = Huber 的别名（PyTorch 叫法），实现直接复用 `huber_loss`"""
+    return huber_loss(pred, target, delta=delta)
+
+
 def mse_loss(pred: List[float], target):
     """MSE 损失 + 对 pred 的梯度
 
@@ -11044,12 +11117,17 @@ class Model:
         'bce': bce_loss,
         'bce_with_logits': bce_with_logits_loss,
         'huber': huber_loss,
+        'smooth_l1': smooth_l1_loss,
+        'l1': l1_loss,
+        'log_cosh': log_cosh_loss,
+        'quantile': quantile_loss,
     }
 
     # 目标按「类别索引」解释的损失（其余按数值向量解释）
     _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal')
     # 目标按数值向量解释的损失（标量会被包成 [target]）
-    _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber')
+    _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber', 'smooth_l1',
+                       'l1', 'log_cosh', 'quantile')
 
     def __init__(self, model, loss_fn=None, optimizer=None, lr=0.01,
                  opt_kwargs=None, task='auto', loss_kwargs=None):
@@ -11206,6 +11284,10 @@ class Model:
         _LOSS_ACT_C = {
             'bce': ('sigmoid', "bce_loss 期望 pred 是概率（[0,1]），输出层激活请用 'sigmoid'"),
             'bce_with_logits': ('linear', "bce_with_logits_loss 期望 logits，输出层激活请用 'linear'"),
+            'l1': ('linear', "l1_loss 是回归损失，输出层激活请用 'linear'"),
+            'log_cosh': ('linear', "log_cosh_loss 是回归损失，输出层激活请用 'linear'"),
+            'quantile': ('linear', "quantile_loss 是回归损失，输出层激活请用 'linear'"),
+            'smooth_l1': ('linear', "smooth_l1_loss 是回归损失，输出层激活请用 'linear'"),
         }
         want_act = _LOSS_ACT_C.get(self._loss_name)
         if want_act is not None and last_act != want_act[0]:

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（699 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（706 项）
 
 ## 特性
 
@@ -521,6 +521,10 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `bce_loss(pred, target)` | 二元交叉熵，`pred` 是概率（配 `sigmoid` 输出层）；返回的梯度相对概率 |
 | `bce_with_logits_loss(logits, target)` | 数值稳定的 BCE：`max(z,0) - z·y + log1p(exp(-\|z\|))`，直接吃 logits |
 | `huber_loss(pred, target, delta=1.0)` | Huber / Smooth L1，对离群点比 MSE 稳 |
+| `smooth_l1_loss(pred, target, delta=1.0)` | `huber_loss` 的别名（PyTorch 的叫法），逐位等价 |
+| `l1_loss(pred, target)` | L1 / MAE：`\|p-y\|` 的平均，梯度是 `sign(p-y)/n`（对离群点不敏感） |
+| `log_cosh_loss(pred, target)` | Log-Cosh：`log(cosh(p-y))` 的平均，平滑又抗离群；实现用 `\|e\|+log1p(exp(-2\|e\|))-log2` 防溢出 |
+| `quantile_loss(pred, target, quantile=0.5)` | 分位数（pinball）损失：`quantile=0.5` 恰为 MAE 的一半，取大分位数即「宁高勿低」 |
 | `kl_divergence(pred, target)` | `KL(target ‖ pred) = Σ t·log(t/p)`，蒸馏/软目标常用 |
 | `triplet_loss(anchor, pos, neg, margin=1.0)` | `max(0, d(a,p) − d(a,n) + margin)`（欧氏距离），返回三个梯度；已满足间隔时梯度全 0 |
 | `info_nce_loss(anchor, pos, negs, temperature=0.07)` | 对比学习：余弦相似度 + 交叉熵，1 正 + N 负；返回 anchor / 正 / 每个负的梯度 |
@@ -535,6 +539,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `'bce'` | `sigmoid` | 0/1 数值 |
 | `'bce_with_logits'` | `linear` | 0/1 数值（喂 logits） |
 | `'huber'` | 任意 | 数值向量 / 标量 |
+| `'smooth_l1'` / `'l1'` / `'log_cosh'` / `'quantile'` | `linear` | 数值向量 / 标量 |
 
 `kl_divergence` **不在**上面的映射里：它要求 `pred` 是概率分布，而 `softmax` 层的
 反向是 softmax+CE 的联合梯度，任何非 CE 损失叠在 softmax 上都拿到不自洽的梯度
@@ -545,7 +550,8 @@ m = AI.Seq2SeqLM.load("s2s.json")
 
 > 所有损失都遵循和 `mse_loss` 相同的返回约定：`(loss, grad)`，
 > 也都可以当成 `Model(loss_fn=...)` 的自定义可调用对象用。
-> 额外超参（`focal` 的 `gamma`/`alpha`、`ce` 的 `label_smoothing`、`huber` 的 `delta`）
+> 额外超参（`focal` 的 `gamma`/`alpha`、`ce` 的 `label_smoothing`、`huber`/`smooth_l1` 的 `delta`、
+> `quantile` 的 `quantile`）
 > 通过 `Model(..., loss_kwargs={"gamma": 1.5})` 传入，会被转发到损失函数上。
 
 > 搭配约束：`softmax` 输出层的反向使用的是 **softmax + cross_entropy 的联合梯度**，
@@ -966,7 +972,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-699 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+706 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1016,6 +1022,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestALiBi` | 输入全 0 时注意力权重等于 `softmax(slope·(t-j))` 的闭式解、因果掩码仍生效、`forward_step` 与 `forward` 末行逐位一致、`W_q` 梯度 vs 数值、`CausalLM(alibi=True)` 端到端训练、默认为关 |
 | `TestFeedForwardActivation` | `FeedForward` 换 GELU/sigmoid 后的 `d_x` vs 数值梯度，`relu` 路径与旧实现逐位一致 |
 | `TestGradCheck` | `grad_check` 对 MLP / Model / CausalLM 都返回 `ok`，且人为改坏梯度时能识别 |
+| `TestRegressionLosses` | l1 / log-cosh / 分位数 / smooth-l1 的取值与梯度、`q=0.5` 等于半个 MAE、配 softmax 被拒 |
 | `TestSeq2SeqPaddedBatch` | `Seq2SeqLM` 的 `pad_mask`：补齐后 loss/梯度逐位不变、`batch_size` 一步等于手工按 token 加权、mask 校验 |
 | `TestGradCheckSeq2Seq` | `Seq2SeqLM` 的 `grad_check` 通过、覆盖解码器与输出层、零梯度（`b_k`）不误报、检查后模式复原 |
 | `TestOptimizerPersistence` | 不传 `optimizer` 时存档与旧格式逐字段相同、Adam 状态往返、**续训与一次训完权重逐位相同**、类型/形状不匹配报错 |
@@ -1075,7 +1082,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 699 个单元测试
+├── test_ai.py       # 706 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
