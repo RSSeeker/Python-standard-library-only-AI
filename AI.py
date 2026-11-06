@@ -10048,6 +10048,252 @@ class Dropout:
         return [delta[i] * self.mask[i] for i in range(len(delta))]
 
 
+class SpatialDropout1d:
+    """按**通道**丢弃（1D 序列）：整条时间轴上同一个通道一起丢
+
+    输入形如 ``(T, C)``（每个时间步一个 ``C`` 维向量）。与 ``Dropout`` 的区别：
+    ``Dropout`` 每个元素独立掷硬币，这里一个通道只有一个掩码值 —— 同一个通道在
+    所有时间步上要么全留、要么全丢，等价于 Keras 的 ``SpatialDropout1D``。
+    训练时保留通道乘 ``1/(1-p)``（inverted），``eval()`` 后恒等。
+    """
+
+    def __init__(self, p: float = 0.2):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"SpatialDropout1d: p 必须在 [0, 1) 内，收到 {p!r}")
+        self.p = float(p)
+        self.mask = None
+        self.channels = None
+        self.training = True
+
+    def train(self):
+        """训练模式：按通道丢弃"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    def forward(self, x):
+        if not x:
+            raise ValueError("SpatialDropout1d.forward: 输入不能为空")
+        if not isinstance(x[0], list):
+            raise ValueError("SpatialDropout1d.forward: 输入形状必须是 (T, C)")
+        c = len(x[0])
+        if c == 0 or any(len(step) != c for step in x):
+            raise ValueError(f"SpatialDropout1d.forward: 每个时间步长度必须一致且非空，"
+                             f"收到首步 {c} 维")
+        self.channels = c
+        if not self.training:
+            self.mask = [1.0] * c
+            return x
+        scale = 1.0 / (1.0 - self.p)
+        self.mask = [scale if random.random() > self.p else 0.0 for _ in range(c)]
+        return [[v * m for v, m in zip(step, self.mask)] for step in x]
+
+    def backward(self, dout):
+        if self.mask is None:
+            raise ValueError("SpatialDropout1d.backward: 先调用 forward")
+        return [[v * m for v, m in zip(step, self.mask)] for step in dout]
+
+
+class SpatialDropout2d:
+    """按**通道**丢弃（2D 特征图）：``(C, H, W)`` 上每个通道只有一个掩码值
+
+    等价于 Keras 的 ``SpatialDropout2D``：整张特征图一起丢，而不是逐像素丢，
+    这样相邻像素不会各自独立掷硬币（那种情况下噪声会被后续卷积平滑掉）。
+    """
+
+    def __init__(self, p: float = 0.2):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"SpatialDropout2d: p 必须在 [0, 1) 内，收到 {p!r}")
+        self.p = float(p)
+        self.mask = None
+        self.channels = None
+        self.training = True
+
+    def train(self):
+        """训练模式：按通道丢弃"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    def _check(self, x, who):
+        if not x or not isinstance(x[0], list):
+            raise ValueError(f"SpatialDropout2d.{who}: 输入形状必须是 (C, H, W)")
+        c = len(x)
+        h = len(x[0])
+        if h == 0 or any(not isinstance(row, list) or len(row) != h for row in x[0]):
+            raise ValueError(f"SpatialDropout2d.{who}: 每个通道必须是 {h}×{h} 的方阵，"
+                             f"且所有通道同形")
+        for ci in range(1, c):
+            if len(x[ci]) != h:
+                raise ValueError(f"SpatialDropout2d.{who}: 通道 {ci} 的高与通道 0 不一致")
+            for r in range(h):
+                if not isinstance(x[ci][r], list) or len(x[ci][r]) != h:
+                    raise ValueError(f"SpatialDropout2d.{who}: 通道 {ci} 第 {r} 行宽度不是 {h}")
+        return c, h
+
+    def forward(self, x):
+        c, h = self._check(x, "forward")
+        self.channels = c
+        if not self.training:
+            self.mask = [1.0] * c
+            return x
+        scale = 1.0 / (1.0 - self.p)
+        self.mask = [scale if random.random() > self.p else 0.0 for _ in range(c)]
+        out = []
+        for ci in range(c):
+            m = self.mask[ci]
+            out.append([[v * m for v in row] for row in x[ci]])
+        return out
+
+    def backward(self, dout):
+        if self.mask is None:
+            raise ValueError("SpatialDropout2d.backward: 先调用 forward")
+        c = len(dout)
+        out = []
+        for ci in range(c):
+            m = self.mask[ci]
+            out.append([[v * m for v in row] for row in dout[ci]])
+        return out
+
+
+class AlphaDropout:
+    """SELU 自归一化网络里的 dropout：丢弃值不是一个 0，而是 ``α'``，再整体仿射
+
+    普通 dropout 把神经元置 0 会破坏 SELU 的零均值/单位方差性质。AlphaDropout 丢
+    弃时填 ``α' = -λ·α ≈ -1.7581``，再做仿射 ``y = a·v + b`` 把一阶、二阶矩拉回：
+
+        a = (1 - p + p·α'²)^(-1/2),   b = -a·α'·p
+
+    于是 ``E[y] = 0``、``Var[y] ≈ 1``（输入已标准化时）。``eval()`` 后恒等。
+    """
+
+    def __init__(self, p: float = 0.2, alpha: float = -1.6732632423543772,
+                 scale: float = 1.0507009873554805):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"AlphaDropout: p 必须在 [0, 1) 内，收到 {p!r}")
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or alpha >= 0.0:
+            raise ValueError(f"AlphaDropout: alpha 必须是负数（SELU 的 α），收到 {alpha!r}")
+        if not isinstance(scale, (int, float)) or isinstance(scale, bool) or scale <= 0.0:
+            raise ValueError(f"AlphaDropout: scale 必须为正，收到 {scale!r}")
+        self.p = float(p)
+        self.alpha = float(alpha)
+        self.scale = float(scale)
+        self.alpha_p = self.alpha * self.scale
+        self.a = (1.0 - self.p + self.p * self.alpha_p * self.alpha_p) ** -0.5
+        self.b = -self.a * self.alpha_p * self.p
+        self.mask = None
+        self.training = True
+
+    def train(self):
+        """训练模式：按 p 丢弃并做自适应仿射"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    def forward(self, x):
+        if not isinstance(x, list) or not x:
+            raise ValueError("AlphaDropout.forward: 输入必须是非空 list")
+        if not self.training or self.p == 0.0:
+            self.mask = [1.0] * len(x)
+            return x
+        self.mask = [1.0 if random.random() > self.p else 0.0 for _ in x]
+        a, b, ap = self.a, self.b, self.alpha_p
+        return [a * (xi if m > 0.0 else ap) + b for xi, m in zip(x, self.mask)]
+
+    def backward(self, delta):
+        if self.mask is None:
+            raise ValueError("AlphaDropout.backward: 先调用 forward")
+        a = self.a
+        return [d * a * m for d, m in zip(delta, self.mask)]
+
+
+class GaussianDropout:
+    """乘性高斯噪声：``y = x · N(1, σ)``，``σ = sqrt(p/(1-p))``
+
+    与 ``Dropout`` 的期望和方差完全一致（``E[y]=x``、``Var[y]=x²·p/(1-p)``），
+    但不再产生精确的 0 —— 梯度永远非零，适合容易卡在死区的小模型。
+    ``eval()`` 后恒等。
+    """
+
+    def __init__(self, p: float = 0.2):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"GaussianDropout: p 必须在 [0, 1) 内，收到 {p!r}")
+        self.p = float(p)
+        self.sigma = (self.p / (1.0 - self.p)) ** 0.5 if self.p > 0.0 else 0.0
+        self.factor = None
+        self.training = True
+
+    def train(self):
+        """训练模式：乘高斯噪声"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    def forward(self, x):
+        if not isinstance(x, list) or not x:
+            raise ValueError("GaussianDropout.forward: 输入必须是非空 list")
+        if not self.training or self.sigma == 0.0:
+            self.factor = [1.0] * len(x)
+            return x
+        self.factor = [random.gauss(1.0, self.sigma) for _ in x]
+        return [xi * fi for xi, fi in zip(x, self.factor)]
+
+    def backward(self, delta):
+        if self.factor is None:
+            raise ValueError("GaussianDropout.backward: 先调用 forward")
+        return [d * f for d, f in zip(delta, self.factor)]
+
+
+def r_drop_loss(logits_a: list, logits_b: list, alpha: float = 0.5) -> float:
+    """R-Drop 的对称 KL 正则项（同一输入做两次 dropout 后的两个分布）
+
+    R-Drop 的完整损失是 ``CE + alpha/2 · (KL(p‖q) + KL(q‖p))``；本函数只算后面
+    那个正则项，加进自己的损失即可::
+
+        loss = cross_entropy_loss(y1, target) + alpha * r_drop_loss(y1, y2)
+
+    参数
+    ----
+    logits_a, logits_b : 两次前向（不同 dropout 掩码）的 logits，长度一致
+    alpha : 正则权重（本函数返回的已经是 ``alpha/2·(KL+KL)``，直接相加即可）
+
+    注意这里用 **logits** 而不是概率：内部自己取 log-softmax，数值更稳。
+    """
+    if not isinstance(logits_a, list) or not isinstance(logits_b, list):
+        raise TypeError("r_drop_loss: logits 必须是 list")
+    if len(logits_a) != len(logits_b):
+        raise ValueError(f"r_drop_loss: 两个 logits 长度不一致（{len(logits_a)} vs "
+                         f"{len(logits_b)}）")
+    if not logits_a:
+        raise ValueError("r_drop_loss: logits 不能为空")
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or alpha < 0.0:
+        raise ValueError(f"r_drop_loss: alpha 必须是非负数，收到 {alpha!r}")
+    la = _log_softmax_row(logits_a)
+    lb = _log_softmax_row(logits_b)
+    kl_ab = 0.0
+    kl_ba = 0.0
+    for x, y in zip(la, lb):
+        kl_ab += math.exp(x) * (x - y)
+        kl_ba += math.exp(y) * (y - x)
+    return 0.5 * alpha * (kl_ab + kl_ba)
+
+
 def _scale_nested(x, k: float):
     """把嵌套 list（向量 / 序列 / (C,H,W)）整体乘 k；k == 1.0 时原样返回"""
     if k == 1.0:

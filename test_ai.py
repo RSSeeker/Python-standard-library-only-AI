@@ -18285,3 +18285,129 @@ class TestAdvancedOptimizers2:
             first = h["train_loss"][0][1]
             last = h["train_loss"][-1][1]
             assert math.isfinite(last) and last <= first + 1e-9, name
+
+
+class TestDropoutVariants:
+    """W10-A：SpatialDropout1d/2d、AlphaDropout、GaussianDropout、R-Drop"""
+
+    SEQ = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    IMG = [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]
+    VEC = [1.0, -2.0, 3.0]
+
+    def test_identity_when_p_zero_or_eval(self):
+        """p=0 与 eval() 都必须逐元素恒等（推理不缩放）"""
+        for mod, data in ((AI.SpatialDropout1d(0.0), self.SEQ),
+                          (AI.SpatialDropout2d(0.0), self.IMG),
+                          (AI.AlphaDropout(0.0), self.VEC),
+                          (AI.GaussianDropout(0.0), self.VEC)):
+            assert mod.forward(data) == data, type(mod).__name__
+            other = type(mod)(0.5).eval()
+            assert other.forward(data) == data, type(mod).__name__
+
+    def test_spatial1d_shares_mask_across_time(self):
+        """一个通道整条时间轴共用一个掩码，保留通道乘 1/(1-p)"""
+        random.seed(7)
+        mod = AI.SpatialDropout1d(0.5)
+        out = mod.forward(self.SEQ)
+        scale = 1.0 / (1.0 - 0.5)
+        for c in range(3):
+            assert mod.mask[c] in (0.0, scale)
+            for t in range(2):
+                assert out[t][c] == self.SEQ[t][c] * mod.mask[c]
+        back = mod.backward(self.SEQ)
+        for t in range(2):
+            for c in range(3):
+                assert back[t][c] == self.SEQ[t][c] * mod.mask[c]
+
+    def test_spatial2d_drops_whole_channels(self):
+        """2D 版本按通道丢：整通道同时为 0"""
+        random.seed(9)
+        mod = AI.SpatialDropout2d(0.5)
+        out = mod.forward(self.IMG)
+        scale = 1.0 / (1.0 - 0.5)
+        for c in range(2):
+            assert mod.mask[c] in (0.0, scale)
+            for r in range(2):
+                for k in range(2):
+                    assert out[c][r][k] == self.IMG[c][r][k] * mod.mask[c]
+
+    def test_alpha_dropout_affine_closed_form(self):
+        """保留 = a·x+b，丢弃 = a·α'+b；反向是 a·mask"""
+        for seed in (0, 1, 2, 3):
+            random.seed(seed)
+            mod = AI.AlphaDropout(0.5)
+            x = 0.75
+            y = mod.forward([x])[0]
+            want = mod.a * x + mod.b if mod.mask[0] > 0.0 else mod.a * mod.alpha_p + mod.b
+            assert abs(y - want) < 1e-15
+            assert abs(mod.backward([1.0])[0] - mod.a * mod.mask[0]) < 1e-15
+
+    def test_alpha_dropout_keeps_moments(self):
+        """输入标准正态时输出均值 ~0、方差 ~1（SELU 自归一化的前提）"""
+        random.seed(11)
+        mod = AI.AlphaDropout(0.2)
+        vals = [mod.forward([random.gauss(0.0, 1.0)])[0] for _ in range(8000)]
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        assert abs(mean) < 0.05
+        assert 0.85 < var < 1.05
+
+    def test_gaussian_dropout_moments(self):
+        """乘性因子均值 1、方差 p/(1-p)"""
+        random.seed(13)
+        mod = AI.GaussianDropout(0.2)
+        facs = [mod.forward([1.0])[0] for _ in range(8000)]
+        mean = sum(facs) / len(facs)
+        var = sum((f - mean) ** 2 for f in facs) / len(facs)
+        assert abs(mean - 1.0) < 0.05
+        assert abs(var - 0.25) < 0.05
+
+    def test_gaussian_dropout_reproducible(self):
+        """同种子 → 同因子（不能偷偷用别的 RNG 源）"""
+        random.seed(21)
+        a = AI.GaussianDropout(0.3)
+        out_a = a.forward([2.0, 3.0])
+        random.seed(21)
+        b = AI.GaussianDropout(0.3)
+        assert out_a == b.forward([2.0, 3.0])
+
+    def test_r_drop_loss_properties(self):
+        """同分布 0、对称、alpha 线性、alpha=0 恒 0"""
+        la = [1.0, 2.0, 0.5]
+        lb = [0.3, -1.0, 2.0]
+        assert abs(AI.r_drop_loss(la, la)) < 1e-15
+        assert abs(AI.r_drop_loss(la, lb) - AI.r_drop_loss(lb, la)) < 1e-15
+        assert abs(AI.r_drop_loss(la, lb, alpha=0.5)
+                   - 0.5 * AI.r_drop_loss(la, lb, alpha=1.0)) < 1e-15
+        assert AI.r_drop_loss(la, lb, alpha=0.0) == 0.0
+        assert AI.r_drop_loss(la, lb) > 0.0
+
+    def test_invalid_arguments(self):
+        """越界 p、非负 α、非方阵特征图都必须在入口报错"""
+        for fn in (lambda: AI.SpatialDropout1d(1.0),
+                   lambda: AI.SpatialDropout1d(True),
+                   lambda: AI.SpatialDropout2d(-0.1),
+                   lambda: AI.AlphaDropout(0.2, alpha=0.0),
+                   lambda: AI.AlphaDropout(0.2, scale=0.0),
+                   lambda: AI.GaussianDropout(1.5),
+                   lambda: AI.SpatialDropout1d(0.5).forward([[1.0, 2.0], [3.0]]),
+                   lambda: AI.SpatialDropout2d(0.5).forward([[[1.0, 2.0], [3.0, 4.0]],
+                                                           [[1.0]]]),
+                   lambda: AI.r_drop_loss([1.0], [1.0, 2.0]),
+                   lambda: AI.r_drop_loss([], []),
+                   lambda: AI.r_drop_loss([1.0], [1.0], alpha=-1.0)):
+            try:
+                fn()
+            except (ValueError, TypeError):
+                continue
+            raise AssertionError("非法参数没有报错")
+
+    def test_backward_before_forward_raises(self):
+        """没走 forward 就 backward 必须报错，而不是拿 None 崩在别处"""
+        for mod in (AI.SpatialDropout1d(0.5), AI.SpatialDropout2d(0.5),
+                    AI.AlphaDropout(0.5), AI.GaussianDropout(0.5)):
+            try:
+                mod.backward(self.VEC)
+            except ValueError:
+                continue
+            raise AssertionError(type(mod).__name__ + " 没有报错")

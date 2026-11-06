@@ -264,7 +264,12 @@
 - 明确不做：SparseAdam / SM3 —— 稀疏梯度在纯 Python 的稠密 `list` 表示下没有收益，保留为说明项，不计入完成度。
 
 ### W10 正则与训练技巧（§5）
-- [ ] Dropout 变体：SpatialDropout / AlphaDropout / GaussianDropout / R-Drop
+- [x] Dropout 变体：SpatialDropout / AlphaDropout / GaussianDropout / R-Drop
+  - `SpatialDropout1d`（`(T,C)` 按通道）、`SpatialDropout2d`（`(C,H,W)` 按通道）：一个通道一个掩码，保留通道乘 `1/(1-p)`；
+  - `AlphaDropout`：丢弃值填 `α' = -λα ≈ -1.7581`，再仿射 `a = (1-p+p·α'²)^(-1/2)`、`b = -a·α'·p`；实测输入标准正态时输出均值 -0.006、方差 0.914；
+  - `GaussianDropout`：`y = x·N(1, sqrt(p/(1-p)))`，实测 `E=1.0015`、`Var=0.2512`（理论 1 与 0.25）；
+  - `r_drop_loss(logits_a, logits_b, alpha=0.5)`：对称 KL 正则项，同分布为 0、对称、`alpha` 线性；
+  - 探针 `probe_w10a.py` 全绿，`TestDropoutVariants` 10 例；越界 `p`/非负 `α`/非方阵特征图都在入口报错，未 forward 就 backward 也报错。
 - [ ] 结构化：DropBlock / DropConnect
 - [ ] 对抗训练：FGSM / PGD / TRADES / MART / FreeLB / SMART
 - [ ] 噪声注入（权重/梯度/输入）、课程学习 `CurriculumSampler`、Manifold Mixup、Snapshot Ensembles
