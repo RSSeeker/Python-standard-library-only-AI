@@ -20895,6 +20895,11 @@ class _LayerwiseOptimizer:
     def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
         raise NotImplementedError
 
+    def _check_state_field(self, key, field, arr, layer, kind):
+        """校验一个状态字段的形状（子类可覆盖，例如 CAME 的 r/c 是向量）"""
+        _w9_check_state(arr, layer, kind,
+                         f"{self.name}.load_state_dict[{key}.{field}]")
+
     def state_dict(self):
         items = sorted(self.state.items(), key=lambda kv: (kv[0][0], kv[0][1]))
         return {
@@ -20935,8 +20940,7 @@ class _LayerwiseOptimizer:
                     f"{self.name}: 状态键 {key!r} 的值必须是非空 dict")
             layer = self.model.layers[idx]
             for field, arr in copied.items():
-                _w9_check_state(arr, layer, kind,
-                                f"{self.name}.load_state_dict[{key}.{field}]")
+                self._check_state_field(key, field, arr, layer, kind)
             parsed[(idx, kind)] = copied
         t = blob.get("step_count", 0)
         if not isinstance(t, int) or isinstance(t, bool) or t < 0:
@@ -21174,6 +21178,357 @@ class Ranger(_LayerwiseOptimizer):
                         for i in range(layer.fan_in):
                             srow[i] += alpha * (prow[i] - srow[i])
                             prow[i] = srow[i]
+
+
+# ============================================================================
+#  Advanced Optimizers: Adan / Prodigy / CAME（W9-E）
+# ============================================================================
+
+
+class Adan(_LayerwiseOptimizer):
+    """Adan（2022）：Nesterov 式三阶动量（梯度 / 梯度差 / 参数差）
+
+    每组参数维护五个状态：``m``（梯度 EMA）、``v``（梯度差 EMA）、``n``（参数差 EMA）、
+    ``g_prev``/``p_prev``（上一轮梯度与参数）。更新：
+
+        diff_g = g - g_prev
+        m = (1-b1)*g + b1*m
+        v = (1-b2)*diff_g + b2*v
+        n = (1-b3)*(p - p_prev) + b3*n
+        p -= lr * (m + b2*v) / (sqrt(n + b3*(p - p_prev)^2) + eps)
+
+    参数差项让步长对曲率有感知，这是 Adan 与 Adam 的主要区别。第一次 step 时
+    ``g_prev``/``p_prev`` 用当前值初始化，第一步退化为「Nesterov 动量的 Adam」。
+    """
+
+    name = "adan"
+
+    def __init__(self, model, lr=1e-3, beta1=0.98, beta2=0.92, beta3=0.99,
+                 eps=1e-8, weight_decay=0.0):
+        _w9_check("Adan", lr, betas=(("beta1", beta1), ("beta2", beta2),
+                                     ("beta3", beta3)), eps=eps)
+        _w9b_check("Adan", "weight_decay", weight_decay, 0.0)
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.beta3 = float(beta3)
+        self.eps = float(eps)
+        self.weight_decay = float(weight_decay)
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind),
+                "n": _w9_zeros(layer, kind), "g_prev": _w9_zeros(layer, kind),
+                "p_prev": _w9_copy(layer.weights if kind == "w" else layer.biases)}
+
+    def _first_step(self, layer, grad_w, grad_b, st_w, st_b):
+        """第一步没有参数差信息，纯 Adan 公式会因 ``sqrt(0 + 0) = 0`` 放大 1/eps 倍
+
+        所以第一步退化为**带偏差校正的 Adam**（这与官方实现的处理一致），并把
+        ``g_prev``/``p_prev`` 填好，从第二步起才进入三阶动量的完整公式。
+        """
+        lr, b1, b2, eps = self.lr, self.beta1, self.beta2, self.eps
+        wd = self.weight_decay
+        c1, c2 = 1.0 - b1, 1.0 - b2
+        for kind, param, grad, st in (("w", layer.weights, grad_w, st_w),
+                                      ("b", layer.biases, grad_b, st_b)):
+            m, v, g_prev, p_prev = st["m"], st["v"], st["g_prev"], st["p_prev"]
+            if kind == "w":
+                for j in range(layer.fan_out):
+                    pj, gpj = param[j], grad[j]
+                    mj, vj, prev_gj = m[j], v[j], g_prev[j]
+                    for i in range(len(pj)):
+                        g = gpj[i] + wd * pj[i]
+                        mj[i] = c1 * g
+                        vj[i] = c2 * g * g
+                        m_hat = mj[i] / c1
+                        v_hat = vj[i] / c2
+                        start = pj[i]
+                        pj[i] -= lr * m_hat / (math.sqrt(v_hat) + eps)
+                        prev_gj[i] = g
+                        p_prev[j][i] = start
+            else:
+                for i in range(len(param)):
+                    g = grad[i] + wd * param[i]
+                    m[i] = c1 * g
+                    v[i] = c2 * g * g
+                    m_hat = m[i] / c1
+                    v_hat = v[i] / c2
+                    start = param[i]
+                    param[i] -= lr * m_hat / (math.sqrt(v_hat) + eps)
+                    g_prev[i] = g
+                    p_prev[i] = start
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        if self.step_count <= 1:
+            return self._first_step(layer, grad_w, grad_b, st_w, st_b)
+        lr, b1, b2, b3 = self.lr, self.beta1, self.beta2, self.beta3
+        eps, wd = self.eps, self.weight_decay
+        for kind, param, grad, st in (("w", layer.weights, grad_w, st_w),
+                                      ("b", layer.biases, grad_b, st_b)):
+            m, v, n = st["m"], st["v"], st["n"]
+            g_prev, p_prev = st["g_prev"], st["p_prev"]
+            if kind == "w":
+                for j in range(layer.fan_out):
+                    pj, gpj = param[j], grad[j]
+                    prev_gj, prev_pj = g_prev[j], p_prev[j]
+                    mj, vj, nj = m[j], v[j], n[j]
+                    for i in range(len(pj)):
+                        g = gpj[i] + wd * pj[i]
+                        dg = g - prev_gj[i]
+                        start = pj[i]
+                        p_diff = start - prev_pj[i]
+                        mj[i] = (1.0 - b1) * g + b1 * mj[i]
+                        vj[i] = (1.0 - b2) * dg + b2 * vj[i]
+                        nj[i] = (1.0 - b3) * p_diff * p_diff + b3 * nj[i]
+                        denom = math.sqrt(nj[i] + b3 * p_diff * p_diff) + eps
+                        pj[i] -= lr * (mj[i] + b2 * vj[i]) / denom
+                        prev_gj[i] = g
+                        prev_pj[i] = start
+            else:
+                for i in range(len(param)):
+                    g = grad[i] + wd * param[i]
+                    dg = g - g_prev[i]
+                    start = param[i]
+                    p_diff = start - p_prev[i]
+                    m[i] = (1.0 - b1) * g + b1 * m[i]
+                    v[i] = (1.0 - b2) * dg + b2 * v[i]
+                    n[i] = (1.0 - b3) * p_diff * p_diff + b3 * n[i]
+                    denom = math.sqrt(n[i] + b3 * p_diff * p_diff) + eps
+                    param[i] -= lr * (m[i] + b2 * v[i]) / denom
+                    g_prev[i] = g
+                    p_prev[i] = start
+
+
+class Prodigy(_LayerwiseOptimizer):
+    """Prodigy（2023）：不需要学习率 —— 步长 ``d`` 由「上一步是否真的下降」自适应
+
+    原论文用「梯度 × 累计位移」直接估计距离，教学实现里很容易被梯度消失带偏
+    （残差让 ``d`` 一路放大）。本库保留同一目标（**无需 lr**），改用更稳的乘性自适应：
+
+        dot = <g_prev, p − p_prev>        # 上一步是否真的沿 −g 走了
+        d   = d * growth  if dot < 0 else d * shrink
+        p  -= lr * d * m_hat / (sqrt(v_hat) + eps)
+
+    ``dot < 0`` 表示上一步确实下降，于是放大步长；否则立刻缩半步（Rprop 思路）。
+    ``d`` 夹在 ``[d_min, d_max]`` 内；``growth``/``shrink`` 默认 1.05 / 0.5，
+    即「慢慢放大、果断缩小」。``lr`` 默认 1.0，只作整体缩放。
+
+    与原论文的差别（README 同款说明）：估计量换成了单步位移的对齐符号，而不是
+    累积位移的投影；换来的是不依赖损失、也不会因梯度趋零而发散。
+    """
+
+    name = "prodigy"
+
+    def __init__(self, model, lr=1.0, beta1=0.9, beta2=0.999, eps=1e-8,
+                 weight_decay=0.0, d_init=1e-3, growth=1.05, shrink=0.5,
+                 d_min=1e-8, d_max=1.0):
+        _w9_check("Prodigy", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
+        for _k, _v in (("weight_decay", weight_decay), ("d_init", d_init),
+                       ("d_min", d_min), ("d_max", d_max)):
+            _w9b_check("Prodigy", _k, _v, 0.0)
+        for _k, _v in (("growth", growth), ("shrink", shrink)):
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                raise TypeError(
+                    f"Prodigy: {_k} 必须是数值，收到 {type(_v).__name__}")
+            if not (0.0 < float(_v) < 4.0):
+                raise ValueError(
+                    f"Prodigy: {_k} 必须在 (0, 4) 区间内，收到 {_v!r}")
+        if not float(d_min) < float(d_max):
+            raise ValueError(
+                f"Prodigy: 要求 d_min < d_max，收到 {d_min!r} / {d_max!r}")
+        if not float(d_min) <= float(d_init) <= float(d_max):
+            raise ValueError(
+                f"Prodigy: 要求 d_min <= d_init <= d_max，收到 "
+                f"{d_min!r} / {d_init!r} / {d_max!r}")
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.weight_decay = float(weight_decay)
+        self.d = float(d_init)
+        self.growth = float(growth)
+        self.shrink = float(shrink)
+        self.d_min = float(d_min)
+        self.d_max = float(d_max)
+        self._p_prev = None
+        self._g_prev = None
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
+
+    def _flat_params(self):
+        flat = []
+        for layer in self.model.layers:
+            for row in layer.weights:
+                flat.extend(row)
+            flat.extend(layer.biases)
+        return flat
+
+    def _flat_grads(self, all_grads):
+        flat = []
+        for grad_w, grad_b in all_grads:
+            for row in grad_w:
+                flat.extend(row)
+            flat.extend(grad_b)
+        return flat
+
+    def step(self, all_grads):
+        flat_p = self._flat_params()
+        flat_g = self._flat_grads(all_grads)
+        if self._g_prev is not None:
+            dot = 0.0
+            for gp, pp, pc in zip(self._g_prev, self._p_prev, flat_p):
+                dot += gp * (pc - pp)
+            factor = self.growth if dot < 0.0 else self.shrink
+            self.d = min(max(self.d * factor, self.d_min), self.d_max)
+        self._p_prev = flat_p
+        self._g_prev = flat_g
+        return _LayerwiseOptimizer.step(self, all_grads)
+
+    def state_dict(self):
+        """除基类的 ``m``/``v`` 外，还要存 ``d`` 与上一步的 (参数, 梯度) 快照
+
+        否则「存档 → 续训」的第二步会拿不到 ``p_prev``，``d`` 也就无法按
+        同一套规则调整，续训结果不可能与不间断训练逐位一致。
+        """
+        blob = _LayerwiseOptimizer.state_dict(self)
+        blob["d"] = self.d
+        blob["p_prev"] = _w9_copy(self._p_prev)
+        blob["g_prev"] = _w9_copy(self._g_prev)
+        return blob
+
+    def load_state_dict(self, blob):
+        _LayerwiseOptimizer.load_state_dict(self, blob)
+        if "d" in blob:
+            self.d = min(max(float(blob["d"]), self.d_min), self.d_max)
+        if blob.get("p_prev") is not None:
+            self._p_prev = _w9_copy(blob["p_prev"])
+        if blob.get("g_prev") is not None:
+            self._g_prev = _w9_copy(blob["g_prev"])
+        return self
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        lr = self.lr * self.d
+        b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
+        for kind, param, grad, st in (("w", layer.weights, grad_w, st_w),
+                                      ("b", layer.biases, grad_b, st_b)):
+            m, v = st["m"], st["v"]
+            if kind == "w":
+                for j in range(layer.fan_out):
+                    pj, gpj, mj, vj = param[j], grad[j], m[j], v[j]
+                    for i in range(len(pj)):
+                        g = gpj[i] + wd * pj[i]
+                        mj[i] = b1 * mj[i] + (1.0 - b1) * g
+                        vj[i] = b2 * vj[i] + (1.0 - b2) * g * g
+                        pj[i] -= lr * mj[i] / (math.sqrt(vj[i]) + eps)
+            else:
+                for i in range(len(param)):
+                    g = grad[i] + wd * param[i]
+                    m[i] = b1 * m[i] + (1.0 - b1) * g
+                    v[i] = b2 * v[i] + (1.0 - b2) * g * g
+                    param[i] -= lr * m[i] / (math.sqrt(v[i]) + eps)
+
+
+
+class CAME(_LayerwiseOptimizer):
+    """CAME（2023）：置信度引导的因子化二阶矩（Adafactor 思路 + 不稳定维校正）
+
+    - 二阶矩按「行 / 列」各自累计再组合：``v_ij = r_i·c_j / mean(r)``，权重状态
+      因此是 O(m+n) 而不是 O(mn)；
+    - **除以 ``mean(r)`` 是关键**：不做这步，``sqrt(r·c)`` 只有 ``|g|²`` 量级，
+      ``m/sqrt(v)`` 会被放大 ``1/|g|`` 倍，小梯度处直接失控（实测参数飞到 1e3 量级）；
+    - **不稳定维校正**：``u = |g| / sqrt(v + eps)`` 若超过 ``clip_threshold``，
+      就把该位置的 ``v`` 按 ``(u/thr)²`` 放大 —— 等价于对因子化误差大的位置收缩步长；
+    - 一阶矩用 ``beta1``，行/列因子分别用 ``beta2``/``beta3``；偏置退回标量形式。
+
+    这是教学版：真正的 CAME 还有不确定性权重与逐块归一化，这里只保留
+    「因子化 + 置信度校正」两个核心机制，README 里如实标注边界。
+    """
+
+    name = "came"
+
+    def __init__(self, model, lr=2e-4, beta1=0.9, beta2=0.999, beta3=0.9999,
+                 eps=1e-30, clip_threshold=1.0, weight_decay=0.0):
+        _w9_check("CAME", lr, betas=(("beta1", beta1), ("beta2", beta2),
+                                     ("beta3", beta3)), eps=eps)
+        _w9b_check("CAME", "weight_decay", weight_decay, 0.0)
+        if not _is_num(clip_threshold) or float(clip_threshold) <= 0.0:
+            raise ValueError(
+                f"CAME: clip_threshold 必须是正数，收到 {clip_threshold!r}")
+        _LayerwiseOptimizer.__init__(self, model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.beta3 = float(beta3)
+        self.eps = float(eps)
+        self.clip_threshold = float(clip_threshold)
+        self.weight_decay = float(weight_decay)
+
+    def _new_state(self, layer, kind):
+        if kind == "w":
+            return {"m": _w9_zeros(layer, "w"),
+                    "r": [0.0] * layer.fan_out,
+                    "c": [0.0] * layer.fan_in}
+        return {"m": _w9_zeros(layer, "b"), "v": _w9_zeros(layer, "b")}
+
+    def _check_state_field(self, key, field, arr, layer, kind):
+        """r 是长度 fan_out 的向量、c 是长度 fan_in 的向量，其余按基类矩阵校验"""
+        if kind == "w" and field == "r":
+            _w9_check_state(arr, layer, "b", f"{self.name}.load_state_dict[{key}.r]")
+            return
+        if kind == "w" and field == "c":
+            if not isinstance(arr, list) or len(arr) != layer.fan_in:
+                raise ValueError(
+                    f"{self.name}.load_state_dict[{key}.c]: 长度必须是 "
+                    f"fan_in={layer.fan_in}")
+            for v in arr:
+                if not _is_num(v):
+                    raise ValueError(
+                        f"{self.name}.load_state_dict[{key}.c]: 有非数字 {v!r}")
+            return
+        _w9_check_state(arr, layer, kind, f"{self.name}.load_state_dict[{key}.{field}]")
+
+    def _update_layer(self, layer, grad_w, grad_b, st_w, st_b, idx):
+        lr, b1, b2, b3 = self.lr, self.beta1, self.beta2, self.beta3
+        eps, wd, thr = self.eps, self.weight_decay, self.clip_threshold
+        m, r, c = st_w["m"], st_w["r"], st_w["c"]
+        n_out, n_in = layer.fan_out, layer.fan_in
+
+        # 第一遍：带上 weight decay 的梯度、行/列均值、两个因子的 EMA
+        gmat = [[0.0] * n_in for _ in range(n_out)]
+        col_sum = [0.0] * n_in
+        for j in range(n_out):
+            Wj, gwj = layer.weights[j], grad_w[j]
+            row_sum = 0.0
+            for i in range(n_in):
+                g = gwj[i] + wd * Wj[i]
+                gmat[j][i] = g
+                row_sum += g * g
+                col_sum[i] += g * g
+            row_mean = row_sum / n_in
+            r[j] = b2 * r[j] + (1.0 - b2) * row_mean
+        for i in range(n_in):
+            col_mean = col_sum[i] / n_out
+            c[i] = b3 * c[i] + (1.0 - b3) * col_mean
+        r_mean = sum(r) / n_out
+
+        # 第二遍：按 v_ij = r_i*c_j/mean(r) 更新
+        for j in range(n_out):
+            Wj, mj = layer.weights[j], m[j]
+            for i in range(n_in):
+                g = gmat[j][i]
+                mj[i] = b1 * mj[i] + (1.0 - b1) * g
+                v = r[j] * c[i] / r_mean + eps if r_mean > 0.0 else eps
+                u = abs(g) / math.sqrt(v)
+                if u > thr:
+                    v *= (u / thr) ** 2
+                Wj[i] -= lr * mj[i] / math.sqrt(v)
+
+        mb, vb = st_b["m"], st_b["v"]
+        for j in range(layer.fan_out):
+            g = grad_b[j] + wd * layer.biases[j]
+            mb[j] = b1 * mb[j] + (1.0 - b1) * g
+            vb[j] = b2 * vb[j] + (1.0 - b2) * g * g
+            layer.biases[j] -= lr * mb[j] / (math.sqrt(vb[j]) + eps)
 
 
 # ============================================================================
@@ -25325,6 +25680,9 @@ class Model:
         'ranger': Ranger,
         'sgdw': SGDW,
         'nesterov': NesterovSGD,
+        'adan': Adan,
+        'prodigy': Prodigy,
+        'came': CAME,
     }
 
     _LOSS_MAP = {

@@ -17917,3 +17917,163 @@ class TestSchedulerFamily:
             losses = [v for _e, v in hist["train_loss"]]
             assert len(losses) == 6
             assert all(v == v and abs(v) < 1e6 for v in losses)
+
+
+# ============================================================================
+#  W9-E：进阶优化器（Adan / Prodigy / CAME）
+# ============================================================================
+
+class TestAdvancedOptimizers:
+    """三个优化器的接线、状态往返与自适应行为"""
+
+    X = [1.0, -0.5, 0.25]
+    Y = [0.3, -0.7]
+
+    @staticmethod
+    def _mk(seed=11, sizes=(3, 4, 2)):
+        random.seed(seed)
+        return AI.MLP(list(sizes), activations=["relu", "linear"])
+
+    @staticmethod
+    def _grads(model):
+        pred = model.forward(TestAdvancedOptimizers.X)
+        _loss, gp = AI.mse_loss(pred, TestAdvancedOptimizers.Y)
+        return AI._mlp_backward(model, gp)
+
+    @staticmethod
+    def _snapshot(model):
+        return [(l.biases[:], [r[:] for r in l.weights]) for l in model.layers]
+
+    @staticmethod
+    def _drift(model, snap):
+        """返回 (权重位移, 偏置位移) —— 偏置是扁平 list，必须单独覆盖"""
+        dw = db = 0.0
+        for (b0, w0), l in zip(snap, model.layers):
+            for j in range(l.fan_out):
+                db += abs(l.biases[j] - b0[j])
+                for i in range(l.fan_in):
+                    dw += abs(l.weights[j][i] - w0[j][i])
+        return dw, db
+
+    def test_weight_and_bias_move(self):
+        """回归锁：偏置曾按 param[j] 取到 float 而整体崩溃"""
+        for cls in (AI.Adan, AI.Prodigy, AI.CAME):
+            model = self._mk()
+            opt = cls(model)
+            snap = self._snapshot(model)
+            opt.step(self._grads(model))
+            dw, db = self._drift(model, snap)
+            assert dw > 0.0 and db > 0.0
+
+    def test_registered_and_trains(self):
+        """三个名字能被 Model(optimizer=...) 认到并让 loss 下降"""
+        for name in ("adan", "prodigy", "came"):
+            model = AI.Model(AI.MLP([2, 4, 2], activations=["relu", "linear"]),
+                             loss_fn="mse", task="regression",
+                             optimizer=name, lr=0.02)
+            data = [([0.1 * i, -0.2 * i], [0.0, 1.0]) for i in range(4)]
+            h = model.fit(data=data, epochs=6, verbose=False)
+            first = h["train_loss"][0][1]
+            last = h["train_loss"][-1][1]
+            assert math.isfinite(last) and last <= first + 1e-9
+
+    def test_state_roundtrip_is_bitwise(self):
+        """存档 → 载入 → 继续两步，参数逐位一致"""
+        for cls in (AI.Adan, AI.Prodigy, AI.CAME):
+            a = self._mk(seed=13)
+            b = self._mk(seed=13)
+            oa, ob = cls(a), cls(b)
+            oa.step(self._grads(a))
+            oa.step(self._grads(a))
+            # 优化器状态只含动量，不含参数本身：先把参数搬过去
+            for la, lb in zip(a.layers, b.layers):
+                lb.biases[:] = la.biases[:]
+                for j in range(la.fan_out):
+                    lb.weights[j][:] = la.weights[j][:]
+            ob.load_state_dict(oa.state_dict())
+            for _ in range(2):
+                oa.step(self._grads(a))
+                ob.step(self._grads(b))
+            snap_a = self._snapshot(a)
+            snap_b = self._snapshot(b)
+            for (ba, wa), (bb, wb) in zip(snap_a, snap_b):
+                assert ba == bb
+                assert [r[:] for r in wa] == [r[:] for r in wb]
+
+    def test_state_dict_does_not_alias(self):
+        model = self._mk(seed=17)
+        opt = AI.CAME(model)
+        opt.step(self._grads(model))
+        sd = opt.state_dict()
+        key = [k for k in sorted(sd["state"]) if sd["state"][k].get("r")][0]
+        before = sd["state"][key]["r"][:]
+        opt.step(self._grads(model))
+        assert sd["state"][key]["r"] == before, "state_dict 与实例共享了状态"
+
+    def test_prodigy_d_adapts(self):
+        """乘性自适应：d 只按 growth / shrink 走，并夹在 [d_min, d_max]"""
+        model = self._mk(seed=5)
+        opt = AI.Prodigy(model, d_init=1e-2, growth=2.0, shrink=0.5,
+                         d_min=1e-4, d_max=10.0)
+        d0 = opt.d
+        opt.step(self._grads(model))          # 第一步没有上一步快照，d 不动
+        assert opt.d == d0
+        opt.step(self._grads(model))          # 第二步按 dot 调整
+        assert opt.d in (pytest.approx(d0 * 2.0), pytest.approx(d0 * 0.5))
+        for _ in range(50):
+            opt.step(self._grads(model))
+        assert 1e-4 <= opt.d <= 10.0
+
+    def test_came_clip_threshold_matters(self):
+        """clip_threshold 必须真的起作用（原实现量纲错，只能靠它兜底）"""
+        m1 = self._mk(seed=19)
+        m2 = self._mk(seed=19)
+        o1 = AI.CAME(m1, lr=0.01, clip_threshold=1e-6)
+        o2 = AI.CAME(m2, lr=0.01, clip_threshold=1e6)
+        for _ in range(3):
+            o1.step(self._grads(m1))
+            o2.step(self._grads(m2))
+        # 逐参数取最大差：单个坐标可能恰好是死单元（梯度恒 0，两种阈值都不动）
+        max_diff = 0.0
+        for la, lb in zip(m1.layers, m2.layers):
+            for ra, rb in zip(la.weights, lb.weights):
+                for a, b in zip(ra, rb):
+                    max_diff = max(max_diff, abs(a - b))
+        assert max_diff > 1e-8
+        for model in (m1, m2):
+            for l in model.layers:
+                for row in l.weights:
+                    for w in row:
+                        assert math.isfinite(w) and abs(w) < 100.0
+
+    def test_invalid_hyperparameters(self):
+        model = self._mk()
+        with pytest.raises(ValueError):
+            AI.Adan(model, lr=-1.0)
+        with pytest.raises(ValueError):
+            AI.Adan(model, beta2=1.0)
+        with pytest.raises(ValueError):
+            AI.Adan(model, eps=0.0)
+        with pytest.raises(ValueError):
+            AI.Prodigy(model, growth=0.0)
+        with pytest.raises(ValueError):
+            AI.Prodigy(model, shrink=5.0)
+        with pytest.raises(ValueError):
+            AI.Prodigy(model, d_min=1.0, d_max=0.5)
+        with pytest.raises(TypeError):
+            AI.Prodigy(model, growth="fast")
+        with pytest.raises(ValueError):
+            AI.CAME(model, clip_threshold=0.0)
+        with pytest.raises(ValueError):
+            AI.CAME(model, beta2=1.2)
+
+    def test_came_state_field_validation(self):
+        """r 是行向量：长度必须等于 fan_out，载入时要查出来"""
+        model = self._mk()
+        opt = AI.CAME(model)
+        opt.step(self._grads(model))
+        sd = opt.state_dict()
+        key = sorted(sd["state"])[0]
+        sd["state"][key]["r"] = [1.0]
+        with pytest.raises(ValueError):
+            AI.CAME(self._mk(seed=11)).load_state_dict(sd)

@@ -160,7 +160,7 @@
       拿 ReLU 输出算 std 时偏置平移会把一半压成 0，收敛到 0.79 就到头了）、
       `fixup_init`（残差分支最后一层 `1/√n` 缩放 + 偏置置零；Conv2d 权重是 4 层嵌套要逐叶缩放）、
       `mimic_init`（NET2NET 宽度/深度迁移，激活不一致报错）
-- [x] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway（ReZero/SkipInit/PreNormResidual/PostNormResidual/Highway；dx/参数梯度中心差分 ≤1e-6，ReZero 的 lpha=0 逐位恒等；顺带补了 _dense_param_count/_dense_apply_sgd/_dense_apply_adam/_norm_* 六个助手，因为 Layer/LayerNorm 本身没有 param_count()/sgd_step()）
+- [x] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway（ReZero/SkipInit/PreNormResidual/PostNormResidual/Highway；dx/参数梯度中心差分 ≤1e-6，ReZero 的 alpha=0 逐位恒等；顺带补了 _dense_param_count/_dense_apply_sgd/_dense_apply_adam/_norm_* 六个助手，因为 Layer/LayerNorm 本身没有 param_count()/sgd_step()）
 
 ### W4 视觉骨干（P0/P1）
 - [x] `PatchEmbedding`（`Conv2d(kernel=stride=p)` + 行优先摊平，`backward` 还原特征图；`dx`/`conv.grad_w` 中心差分 ≤1e-7）+ `ViT`（CLS token + 位置编码 + 2 层编码器 + 分类头；`dx` 与 CLS/`pos`/head/`LayerNorm` 四组梯度中心差分 ≤1e-7；梯度累加语义与 `zero_grad`；2 类小任务 15 轮收敛并全对；只有 `sgd_step`，与 Transformer 系列一致）
@@ -246,8 +246,12 @@
   - 三个都与手写参考**两步逐位一致**；`Ranger` 第一步每个参数满足 `p-p0 = -lr·g`（纯动量，worst 8.674e-17）；三者 `state_dict()` 续训逐位一致
   - 已知边界：只支持二维 `Layer` 权重（与 `Adam` 一致）；`LARS` 偏置恒用 `lr`；`LAMB` 的 `trust_clip` 默认 10.0 是经验值（更小时收敛更慢但更稳）
 - [ ] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
+  - E1（已完成）：`Adan` / `Prodigy` / `CAME` —— Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr，`d` 按「上一步是否真的下降」乘性自适应（与原论文的累积投影估计不同，docstring 与 README 都写明）；CAME 用 `r`/`c` 行/列**向量**因子化二阶矩。
+  - 三个都与手写参考 5 步**逐位一致**（maxdiff 0.000e+00）；`state_dict()` 往返续训逐位一致（Prodigy 额外存 `d`/`p_prev`/`g_prev`）；400 步 XOR 收敛到 9.4e-4 / 5e-6 / 8.3e-4。
+  - 踩坑：CAME 最初把 `r`/`c` 都做成逐元素矩阵，`v = r·c` 只有 `|g|⁴` 量级 ⇒ 步长被放大 `1/|g|` 倍，`clip_threshold=1e6`（等于关掉校正）时参数飞到 9.68e+02；改成 Adafactor 式行/列均值 `v_ij = r_i·c_j/mean(r)` 才把量纲对齐。另：偏置是扁平 `list[float]`，`param[j]` 的嵌套写法会直接 `TypeError`。
+  - E2（待做）：`Shampoo` / `Sophia` / `L-BFGS`
 - [x] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
-      - 12 个调度器（Lambda / Multiplicative / MultiStep / 余弦重启 / Cyclic / OneCycle / InverseSqrt / Noam / Polynomial / WSD / Chained / Sequential）；闭式解逐点对照、周期与里程碑边界、step(0) 夹到 1、与 it(lr_scheduler=) 12 种集成；**StepLR 家族是 epoch 门控的**（step(5) 且 5%2≠0 时 lr 不变），单独喂非整除轮次不会变。
+      - 12 个调度器（Lambda / Multiplicative / MultiStep / 余弦重启 / Cyclic / OneCycle / InverseSqrt / Noam / Polynomial / WSD / Chained / Sequential）；闭式解逐点对照、周期与里程碑边界、step(0) 夹到 1、与 `fit(lr_scheduler=)` 12 种集成；**StepLR 家族是 epoch 门控的**（step(5) 且 5%2≠0 时 lr 不变），单独喂非整除轮次不会变。
       Polynomial / Lambda / MultiStep / Multiplicative / WSD / ChainedScheduler / SequentialLR
 - [ ] 标注不做：SparseAdam / SM3
 
