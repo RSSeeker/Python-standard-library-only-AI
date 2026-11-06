@@ -22,7 +22,7 @@
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
-  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT；残差变体：
+  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / UNet；残差变体：
     ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
@@ -1422,6 +1422,52 @@ class ConvTranspose2d:
         self.grad_w = [[[[0.0] * self.kw for _ in range(self.kh)]
                         for _ in range(self.og)] for _ in range(self.in_channels)]
         self.grad_b = [0.0] * self.out_channels
+
+    def sgd_step(self, lr):
+        """按当前梯度做一次 SGD（权重布局 `[cin][og][kh][kw]`，与 `Conv2d` 不同）"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"ConvTranspose2d.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        lr = float(lr)
+        for ci in range(self.in_channels):
+            w_ci = self.weights[ci]
+            g_ci = self.grad_w[ci]
+            for og in range(self.og):
+                w_og = w_ci[og]
+                g_og = g_ci[og]
+                for a in range(self.kh):
+                    for b in range(self.kw):
+                        w_og[a][b] -= lr * g_og[a][b]
+        for o in range(self.out_channels):
+            self.biases[o] -= lr * self.grad_b[o]
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        """按当前梯度做一次 Adam（矩估计复用 `m_w`/`v_w`/`m_b`/`v_b`）"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"ConvTranspose2d.adam_step: lr 必须是非负数，收到 {lr!r}")
+        lr = float(lr)
+        self._adam_t = getattr(self, '_adam_t', 0) + 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for ci in range(self.in_channels):
+            for og in range(self.og):
+                for a in range(self.kh):
+                    for b in range(self.kw):
+                        g = self.grad_w[ci][og][a][b]
+                        self.m_w[ci][og][a][b] = beta1 * self.m_w[ci][og][a][b] + (1 - beta1) * g
+                        self.v_w[ci][og][a][b] = beta2 * self.v_w[ci][og][a][b] + (1 - beta2) * g * g
+                        mh = self.m_w[ci][og][a][b] / c1
+                        vh = self.v_w[ci][og][a][b] / c2
+                        self.weights[ci][og][a][b] -= lr * mh / (math.sqrt(vh) + eps)
+        for o in range(self.out_channels):
+            g = self.grad_b[o]
+            self.m_b[o] = beta1 * self.m_b[o] + (1 - beta1) * g
+            self.v_b[o] = beta2 * self.v_b[o] + (1 - beta2) * g * g
+            mh = self.m_b[o] / c1
+            vh = self.v_b[o] / c2
+            self.biases[o] -= lr * mh / (math.sqrt(vh) + eps)
 
     def _out_shape(self, H, W):
         ho = (H - 1) * self.sh - 2 * self.ph + self.kh + self.oph
@@ -5908,6 +5954,225 @@ class ViT:
             grow = self.grad_pos[t]
             for j in range(self.d_model):
                 row[j] -= lr * grow[j]
+
+
+class UNet:
+    """U-Net（简化版，2 级下采样）：编码 → 瓶颈 → 解码 + 跳跃连接
+
+    结构（输入 `(Cin,H,W)`，要求 `H`、`W` 能被 4 整除）：
+
+        e0: Conv(Cin→c0, 3x3)  → relu       h0: (c0, H, W)
+        p0: MaxPool2d(2)                    (c0, H/2, W/2)
+        e1: Conv(c0→2c0, 3x3)  → relu       h1: (2c0, H/2, W/2)
+        p1: MaxPool2d(2)                    (2c0, H/4, W/4)
+        bot: Conv(2c0→4c0, 3x3) → relu      (4c0, H/4, W/4)
+        up1: ConvTranspose2d(4c0→2c0, 2, s=2) → 与 h1 通道拼接 → Conv(4c0→2c0,3x3)→relu
+        up0: ConvTranspose2d(2c0→c0, 2, s=2) → 与 h0 通道拼接 → Conv(2c0→c0,3x3)→relu
+        out: Conv(c0→num_classes, 1x1)
+
+    `use_bn=True` 时每个卷积后接 `BatchNorm2d`（训练/推理模式由 `train()`/`eval()` 控制）。
+    返回 `(num_classes, H, W)` 的 logits；`backward` 返回输入梯度，内部梯度就地累加。
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 2,
+                 base_channels: int = 4, use_bn: bool = False):
+        for name, val in (("in_channels", in_channels),
+                          ("num_classes", num_classes),
+                          ("base_channels", base_channels)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"UNet: {name} 必须是 >=1 的整数，收到 {val!r}")
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.base_channels = base_channels
+        self.use_bn = bool(use_bn)
+
+        c0 = base_channels
+        c1 = base_channels * 2
+        c2 = base_channels * 4
+        self.e0 = Conv2d(in_channels, c0, 3, padding=1)
+        self.e1 = Conv2d(c0, c1, 3, padding=1)
+        self.bot = Conv2d(c1, c2, 3, padding=1)
+        self.d1 = Conv2d(c2, c1, 3, padding=1)
+        self.d0 = Conv2d(c1, c0, 3, padding=1)
+        self.out = Conv2d(c0, num_classes, 1)
+        self.up1 = ConvTranspose2d(c2, c1, 2, stride=2)
+        self.up0 = ConvTranspose2d(c1, c0, 2, stride=2)
+        self.pool0 = MaxPool2d(2)
+        self.pool1 = MaxPool2d(2)
+
+        self._convs = [self.e0, self.e1, self.bot, self.d1, self.d0, self.out]
+        self._ups = [self.up1, self.up0]
+        self._pools = [self.pool0, self.pool1]
+        self.bns = []
+        if self.use_bn:
+            self.bn0 = BatchNorm2d(c0)
+            self.bn1 = BatchNorm2d(c1)
+            self.bn2 = BatchNorm2d(c2)
+            self.bn3 = BatchNorm2d(c1)
+            self.bn4 = BatchNorm2d(c0)
+            self.bns = [self.bn0, self.bn1, self.bn2, self.bn3, self.bn4]
+        self.bn_grads = {}
+        self._cache = None
+        self.training = True
+
+    def train(self):
+        self.training = True
+        for bn in self.bns:
+            bn.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        for bn in self.bns:
+            bn.eval()
+        return self
+
+    def _norm(self, bn, h, backward_grad=None):
+        """BN + relu 的 forward/backward 小工具（bn 为 None 时只做 relu）"""
+        if bn is None:
+            if backward_grad is None:
+                return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in h]
+            raise RuntimeError("UNet: 内部错误（bn 为 None 时不应走反向）")
+        return None
+
+    def forward(self, x):
+        c = len(x)
+        if c != self.in_channels:
+            raise ValueError(
+                f"UNet.forward: 输入通道数 {c} 与 in_channels={self.in_channels} 不符")
+        h, w = len(x[0]), len(x[0][0])
+        if h % 4 != 0 or w % 4 != 0:
+            raise ValueError(
+                f"UNet.forward: 输入尺寸 {(h, w)} 必须能被 4 整除")
+        z0 = self.e0.forward(x)
+        if self.use_bn:
+            z0 = self.bn0.forward(z0)
+        h0 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in z0]
+
+        p0 = self.pool0.forward(h0)
+        z1 = self.e1.forward(p0)
+        if self.use_bn:
+            z1 = self.bn1.forward(z1)
+        h1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in z1]
+
+        p1 = self.pool1.forward(h1)
+        zb = self.bot.forward(p1)
+        if self.use_bn:
+            zb = self.bn2.forward(zb)
+        hb = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in zb]
+
+        u1 = self.up1.forward(hb)
+        cat1 = [list(ch) for ch in h1] + [list(ch) for ch in u1]
+        z2 = self.d1.forward(cat1)
+        if self.use_bn:
+            z2 = self.bn3.forward(z2)
+        hd1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in z2]
+
+        u0 = self.up0.forward(hd1)
+        cat0 = [list(ch) for ch in h0] + [list(ch) for ch in u0]
+        z3 = self.d0.forward(cat0)
+        if self.use_bn:
+            z3 = self.bn4.forward(z3)
+        hd0 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in z3]
+
+        logits = self.out.forward(hd0)
+        self._cache = (z0, h0, p0, z1, h1, p1, zb, hb, u1, cat1, z2, hd1,
+                       u0, cat0, z3, hd0)
+        return logits
+
+    @staticmethod
+    def _relu_back(dv, z):
+        return [[[dv[c][i][j] if z[c][i][j] > 0.0 else 0.0
+                  for j in range(len(z[0][0]))]
+                 for i in range(len(z[0]))] for c in range(len(z))]
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("UNet.backward: 必须先调用 forward()")
+        (z0, h0, p0, z1, h1, p1, zb, hb, u1, cat1, z2, hd1,
+         u0, cat0, z3, hd0) = self._cache
+        n_out = len(dlogits)
+        if n_out != self.num_classes:
+            raise ValueError(
+                f"UNet.backward: dlogits 通道数 {n_out} 与 num_classes="
+                f"{self.num_classes} 不符")
+        c0 = self.base_channels
+        c1 = c0 * 2
+
+        dhd0 = self.out.backward(dlogits)
+        dz3 = self._relu_back(dhd0, z3)
+        if self.use_bn:
+            dz3, _g, _b = self.bn4.backward(dz3)
+            self.bn_grads[4] = (_g, _b)
+        dcat0 = self.d0.backward(dz3)
+        dh0 = dcat0[:c0]
+        du0 = dcat0[c0:]
+        dhd1 = self.up0.backward(du0)
+
+        dz2 = self._relu_back(dhd1, z2)
+        if self.use_bn:
+            dz2, _g, _b = self.bn3.backward(dz2)
+            self.bn_grads[3] = (_g, _b)
+        dcat1 = self.d1.backward(dz2)
+        dh1 = dcat1[:c1]
+        du1 = dcat1[c1:]
+        dhb = self.up1.backward(du1)
+
+        dzb = self._relu_back(dhb, zb)
+        if self.use_bn:
+            dzb, _g, _b = self.bn2.backward(dzb)
+            self.bn_grads[2] = (_g, _b)
+        dp1 = self.bot.backward(dzb)
+        dh1 = [[[dh1[c][i][j] + g for j, g in enumerate(row)]
+                for i, row in enumerate(ch)] for c, ch in enumerate(self.pool1.backward(dp1))]
+
+        dz1 = self._relu_back(dh1, z1)
+        if self.use_bn:
+            dz1, _g, _b = self.bn1.backward(dz1)
+            self.bn_grads[1] = (_g, _b)
+        dp0 = self.e1.backward(dz1)
+        dp0u = self.pool0.backward(dp0)
+        dh0 = [[[dh0[c][i][j] + g for j, g in enumerate(row)]
+                for i, row in enumerate(ch)] for c, ch in enumerate(dp0u)]
+
+        dz0 = self._relu_back(dh0, z0)
+        if self.use_bn:
+            dz0, _g, _b = self.bn0.backward(dz0)
+            self.bn_grads[0] = (_g, _b)
+        return self.e0.backward(dz0)
+
+    def zero_grad(self):
+        for layer in self._convs + self._ups:
+            layer.zero_grad()
+        self.bn_grads = {}
+
+    def param_count(self):
+        total = sum(_conv_param_count(layer) for layer in self._convs + self._ups)
+        for bn in self.bns:
+            total += 2 * len(bn.gamma)
+        return total
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"UNet.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self._convs:
+            _conv_sgd(layer, float(lr))
+        for layer in self._ups:
+            layer.sgd_step(float(lr))
+        for i, bn in enumerate(self.bns):
+            if i in self.bn_grads:
+                _norm_apply_sgd(bn, self.bn_grads[i], float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"UNet.adam_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self._convs:
+            _conv_adam(layer, float(lr), beta1, beta2, eps)
+        for layer in self._ups:
+            layer.adam_step(float(lr), beta1, beta2, eps)
+        for i, bn in enumerate(self.bns):
+            if i in self.bn_grads:
+                _norm_apply_adam(bn, self.bn_grads[i], float(lr), beta1, beta2, eps)
 
 
 class Flatten:

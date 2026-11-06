@@ -12599,3 +12599,150 @@ class TestViT:
         with pytest.raises(ValueError):
             self._make().sgd_step(-0.1)
 
+class TestUNet:
+    """UNet：编码-解码 + 跳跃连接"""
+
+    @staticmethod
+    def _img():
+        return [[[float(i * 8 + j) / 64.0 for j in range(8)] for i in range(8)]]
+
+    @staticmethod
+    def _dlogits():
+        return [[[1.0 if (i + j) % 2 else -0.5 for j in range(8)] for i in range(8)]
+                for _ in range(2)]
+
+    def test_shapes_and_params(self):
+        u = AI.UNet(in_channels=1, num_classes=2, base_channels=2)
+        out = u.forward(self._img())
+        assert (len(out), len(out[0]), len(out[0][0])) == (2, 8, 8)
+        manual = sum(AI._conv_param_count(c) for c in u._convs + u._ups)
+        assert u.param_count() == manual
+        dx = u.backward(self._dlogits())
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
+
+    def test_input_gradient(self):
+        u = AI.UNet(in_channels=1, num_classes=2, base_channels=2)
+        img = self._img()
+        d = self._dlogits()
+
+        def loss():
+            o = u.forward(img)
+            return sum(o[k][i][j] * d[k][i][j]
+                       for k in range(2) for i in range(8) for j in range(8))
+
+        u.forward(img)
+        dx = u.backward(d)
+        worst = 0.0
+        for i in range(0, 8, 2):
+            for j in range(0, 8, 2):
+                old = img[0][i][j]
+                img[0][i][j] = old + 1e-6
+                lp = loss()
+                img[0][i][j] = old - 1e-6
+                lm = loss()
+                img[0][i][j] = old
+                worst = max(worst, abs((lp - lm) / 2e-6 - dx[0][i][j]))
+        assert worst < 1e-7
+
+    def test_input_gradient_with_bn_eval(self):
+        u = AI.UNet(in_channels=1, num_classes=2, base_channels=2, use_bn=True)
+        u.eval()
+        img = self._img()
+        d = self._dlogits()
+
+        def loss():
+            o = u.forward(img)
+            return sum(o[k][i][j] * d[k][i][j]
+                       for k in range(2) for i in range(8) for j in range(8))
+
+        u.forward(img)
+        dx = u.backward(d)
+        worst = 0.0
+        for i in range(0, 8, 2):
+            for j in range(0, 8, 2):
+                old = img[0][i][j]
+                img[0][i][j] = old + 1e-6
+                lp = loss()
+                img[0][i][j] = old - 1e-6
+                lm = loss()
+                img[0][i][j] = old
+                worst = max(worst, abs((lp - lm) / 2e-6 - dx[0][i][j]))
+        assert worst < 1e-7
+
+    def test_parameter_gradients(self):
+        u = AI.UNet(in_channels=1, num_classes=2, base_channels=2, use_bn=True)
+        img = self._img()
+        d = self._dlogits()
+
+        def loss():
+            o = u.forward(img)
+            return sum(o[k][i][j] * d[k][i][j]
+                       for k in range(2) for i in range(8) for j in range(8))
+
+        u.zero_grad()
+        u.forward(img)
+        u.backward(d)
+
+        old = u.e0.weights[0][0][0][0]
+        u.e0.weights[0][0][0][0] = old + 1e-6
+        lp = loss()
+        u.e0.weights[0][0][0][0] = old - 1e-6
+        lm = loss()
+        u.e0.weights[0][0][0][0] = old
+        assert abs((lp - lm) / 2e-6 - u.e0.grad_w[0][0][0][0]) < 1e-6
+
+        old = u.up0.weights[0][0][1][1]
+        u.up0.weights[0][0][1][1] = old + 1e-6
+        lp = loss()
+        u.up0.weights[0][0][1][1] = old - 1e-6
+        lm = loss()
+        u.up0.weights[0][0][1][1] = old
+        assert abs((lp - lm) / 2e-6 - u.up0.grad_w[0][0][1][1]) < 1e-6
+
+        old = u.bn4.gamma[0]
+        u.bn4.gamma[0] = old + 1e-6
+        lp = loss()
+        u.bn4.gamma[0] = old - 1e-6
+        lm = loss()
+        u.bn4.gamma[0] = old
+        assert abs((lp - lm) / 2e-6 - u.bn_grads[4][0][0]) < 1e-6
+
+    def test_training_with_adam(self):
+        random.seed(0)
+        x = self._img()
+        y = [[1.0 if (i + j) % 2 else 0.0 for j in range(8)] for i in range(8)]
+        u = AI.UNet(in_channels=1, num_classes=2, base_channels=4)
+
+        def mse():
+            o = u.forward(x)
+            return sum((o[k][i][j] - y[i][j]) ** 2
+                       for k in range(2) for i in range(8) for j in range(8)) / 128.0
+
+        first = mse()
+        for _step in range(40):
+            u.zero_grad()
+            o = u.forward(x)
+            g = [[[(o[k][i][j] - y[i][j]) for j in range(8)] for i in range(8)]
+                 for k in range(2)]
+            u.backward(g)
+            u.adam_step(0.01)
+        assert mse() < first / 3.0
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.UNet(base_channels=0)
+        with pytest.raises(ValueError):
+            AI.UNet(in_channels=2).forward(self._img())
+        with pytest.raises(ValueError):
+            AI.UNet().forward([[[1.0, 2.0]]])
+        with pytest.raises(RuntimeError):
+            AI.UNet().backward(self._dlogits())
+        u = AI.UNet(in_channels=1, num_classes=2)
+        u.forward(self._img())
+        with pytest.raises(ValueError):
+            u.backward([[[0.0] * 8 for _ in range(8)] for _ in range(3)])
+        with pytest.raises(ValueError):
+            AI.UNet().sgd_step(-1)
+        with pytest.raises(ValueError):
+            AI.UNet().adam_step('x')
+
