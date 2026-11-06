@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（799 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（808 项）
 
 ## 特性
 
@@ -182,6 +182,9 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `GroupNorm` / `InstanceNorm` | 分组归一化（`(C,H,W)`，小 batch 稳定）；`InstanceNorm` 是组数等于通道数的特例 |
 | `LayerNorm` | 层归一化 |
 | `RMSNorm` | RMS 归一化（Llama 系）：不减均值、无 beta，`y = gamma·x/sqrt(mean(x²)+eps)` |
+| `ScaleNorm(num_features, eps=1e-6)` | 尺度归一化：只有标量 `g`，`y = g·x/(‖x‖/√d+eps)`（整向量缩放，不是逐特征归一化） |
+| `WeightNorm(layer)` | 权重归一化：`w = g ⊙ v/‖v‖_row`，把权重的尺度与方向解耦；反向精确传到 `v`/`g`/`b`（含 `dv` 里的解耦项） |
+| `SpectralNorm(layer, power_iter=1)` | 谱归一化：`w = v/σ(v)`，σ 用幂迭代估计；默认把 σ 视为常量（`freeze_sigma()` 可冻结以获得严格端到端梯度） |
 | `Embedding` | 嵌入层 |
 | `ResidualBlock` | 残差块 |
 | `Sequential` | 层序列容器；`Sequential(a, b)` 与 `Sequential([a, b])` 都接受，不是模块（没有 `forward`）的会在构造时报错；不含 train/eval，内部的 Dropout 需自行切换 |
@@ -1043,7 +1046,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-799 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+808 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1118,6 +1121,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCBAMBlock` | 空间支路退化时通道支路与 `SEBlock` 逐位相同、空间权重逐位置不同、`dx`/`sp_w`/`sp_b` 中心差分、参数量 20、`sgd_step`/`adam_step` 真的改参数、非法构造与二维输入报错 |
 | `TestDenseBlock` | 拼接后通道数与前 `Cin` 通道原样保留、`dx`/conv `grad_w`/BN `gamma,beta` 中心差分、eval 用 running 统计量、非法参数与二维输入报错 |
 | `TestConvNeXtBlock` | 逐位置 `xhat` 均值 0 且方差 `var/(var+eps)`、`pw2` 全零时输出等于输入、`dx`/LN `gamma,beta`/depthwise 权重中心差分、参数量公式与校验 |
+| `TestScaleNorm` | 前向闭式解、`dx`/`dg` 中心差分、全零输入不崩、优化器步与 7 类非法输入 |
+| `TestWeightNorm` | 初始化即等于原层、`dv`（含 `v`/`g` 解耦项）/`dg`/`db` 中心差分、`dx = wᵀdout`、forward 不永久改写内层权重 |
+| `TestSpectralNorm` | 前向 `(v/σ)x+b`、冻结 σ 时 `dv` 中心差分、未冻结时 σ 随权重变化、`power_iter`/维度/未 forward 校验 |
 | `TestFractionalPooling` | 输出尺寸随比例、每个输出等于被选位置原值、同 seed 逐位相同、反向只回传被选位置且总量守恒 |
 | `TestStochasticPooling` | 概率和为 1、训练输出等于采样值且反向乘 `p`、`eval()` 取期望、非正窗口退化为均匀、同 seed 可复现 |
 | `TestConditionalNorm` | `gamma/beta` 闭式解、`dx`/`b_g,b_b`/`W_g,W_b`/`grad_cond` 四组中心差分、优化器步与 8 类非法输入 |
@@ -1177,7 +1183,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 799 个单元测试
+├── test_ai.py       # 808 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

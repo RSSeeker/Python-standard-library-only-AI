@@ -4534,6 +4534,380 @@ class RMSNorm:
         return grad_gamma, dx  # 约定: 最后一个元素为传播的 delta
 
 
+class ScaleNorm:
+    """尺度归一化（ScaleNorm）：y = g * x / (||x||/sqrt(d) + eps)
+
+    只有一个标量参数 `g`（无 beta），比 LayerNorm 少一组参数与一次减均值。
+    `||x||` 为整条样本的 L2 范数，所以它做的是"整向量缩放"而不是逐特征归一化。
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-6):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(f"ScaleNorm: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(f"ScaleNorm: num_features 必须 >= 1，收到 {num_features!r}")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or eps < 0:
+            raise ValueError(f"ScaleNorm: eps 必须是非负数，收到 {eps!r}")
+        self.d = num_features
+        self.eps = float(eps)
+        self.g = 1.0
+        self.x = None
+        self.norm = None
+        self._den = None
+        self.grad_g = 0.0
+        self.m_g = 0.0
+        self.v_g = 0.0
+        self._adam_t = 0
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"ScaleNorm.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致"
+            )
+        self.x = x
+        self.norm = math.sqrt(sum(v * v for v in x))
+        self._den = self.norm / math.sqrt(self.d) + self.eps
+        den = self._den
+        return [self.g * v / den for v in x]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("ScaleNorm.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"ScaleNorm.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致"
+            )
+        x = self.x
+        den = self._den
+        norm = self.norm
+        d = self.d
+        # dg = Σ dout_i * x_i / den
+        self.grad_g = sum(dout[i] * x[i] for i in range(d)) / den
+        s = sum(dout[j] * x[j] for j in range(d))
+        if norm > 0.0:
+            k = self.g * s / (den * den * math.sqrt(d) * norm)
+            dx = [self.g * dout[i] / den - k * x[i] for i in range(d)]
+        else:
+            # ||x||=0 时方向无定义，只保留 1/den 这一项（极限行为）
+            dx = [self.g * dout[i] / den for i in range(d)]
+        return self.grad_g, dx
+
+    def zero_grad(self):
+        self.grad_g = 0.0
+
+    def param_count(self):
+        return 1
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"ScaleNorm.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.g -= lr * self.grad_g
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"ScaleNorm.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        # _adam_apply 就地改列表，标量参数要先装进单元素列表再取回
+        holder = [self.g]
+        m_holder = [self.m_g]
+        v_holder = [self.v_g]
+        _adam_apply(holder, [self.grad_g], m_holder, v_holder, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self.g = holder[0]
+        self.m_g = m_holder[0]
+        self.v_g = v_holder[0]
+        self.zero_grad()
+
+
+class WeightNorm:
+    """权重归一化（Salimans & Kingma 2016）：w = g ⊙ (v / ||v||_row)
+
+    包装带 `weights` / `biases` / `act_fn` / `act_deriv` 的内层（`Layer` / `Linear`）。
+    反向**精确**传到 `v`、`g`、`b`（不把缩放视为常量）：
+
+        dv[i][j] = g_i/n_i * dW[i][j] - g_i/n_i^3 * v[i][j] * Σ_k dW[i][k] v[i][k]
+        dg[i]    = (Σ_k dW[i][k] v[i][k]) / n_i
+
+    其中 `n_i = ||v_i||`。参数从 `w` 变成 `v`+`g`，所以 `w` 的尺度与方向解耦，
+    训练动力学与普通全连接层不同（这是它唯一的目的）。
+    """
+
+    def __init__(self, layer):
+        for attr in ("weights", "biases", "act_fn", "act_deriv"):
+            if not hasattr(layer, attr):
+                raise TypeError(
+                    f"WeightNorm: 内层必须提供 {attr!r}（Layer / Linear 都满足），"
+                    f"收到 {type(layer).__name__}"
+                )
+        self.inner = layer
+        self.fan_out = len(layer.weights)
+        self.fan_in = len(layer.weights[0]) if self.fan_out else 0
+        self.v = [list(row) for row in layer.weights]
+        # 初始化 g_i = ||v_i||，使 w 一开始就等于原权重（不扰动已训练模型）
+        self.g = [math.sqrt(sum(c * c for c in row)) for row in self.v]
+        self.b = list(layer.biases)
+        self._w = None
+        self._norms = None
+        self.grad_v = None
+        self.grad_g = None
+        self.grad_b = None
+        self.zero_grad()
+        self.m_v = _zeros_like(self.v)
+        self.v_v = _zeros_like(self.v)
+        self.m_g = [0.0] * self.fan_out
+        self.v_g = [0.0] * self.fan_out
+        self.m_b = [0.0] * self.fan_out
+        self.v_b = [0.0] * self.fan_out
+        self._adam_t = 0
+
+    def _effective(self):
+        norms = []
+        for row in self.v:
+            n = math.sqrt(sum(c * c for c in row))
+            norms.append(n if n > 1e-12 else 1e-12)
+        w = [[self.g[i] * self.v[i][j] / norms[i] for j in range(self.fan_in)]
+             for i in range(self.fan_out)]
+        return w, norms
+
+    def forward(self, x):
+        if len(x) != self.fan_in:
+            raise ValueError(
+                f"WeightNorm.forward: 输入维度 {len(x)} 与 fan_in={self.fan_in} 不一致"
+            )
+        w, norms = self._effective()
+        self._w, self._norms = w, norms
+        saved = self.inner.weights
+        self.inner.weights = w
+        try:
+            return self.inner.forward(x)
+        finally:
+            self.inner.weights = saved
+
+    def backward(self, dout):
+        if self._w is None:
+            raise RuntimeError("WeightNorm.backward: 必须先调用 forward()")
+        saved = self.inner.weights
+        self.inner.weights = self._w
+        try:
+            dW, db, dx = self.inner.backward(dout)
+        finally:
+            self.inner.weights = saved
+        dv = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        dg = [0.0] * self.fan_out
+        for i in range(self.fan_out):
+            n = self._norms[i]
+            dot = sum(dW[i][k] * self.v[i][k] for k in range(self.fan_in))
+            coef = self.g[i] / (n * n * n)
+            for j in range(self.fan_in):
+                dv[i][j] = self.g[i] / n * dW[i][j] - coef * self.v[i][j] * dot
+            dg[i] = dot / n
+        self.grad_v = dv
+        self.grad_g = dg
+        self.grad_b = list(db)
+        return dx
+
+    def zero_grad(self):
+        self.grad_v = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        self.grad_g = [0.0] * self.fan_out
+        self.grad_b = [0.0] * self.fan_out
+
+    def param_count(self):
+        return len(_param_leaves(self.v)) + self.fan_out + self.fan_out
+
+    def train(self):
+        self.training = True
+        if hasattr(self.inner, "train"):
+            self.inner.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        if hasattr(self.inner, "eval"):
+            self.inner.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"WeightNorm.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.fan_out):
+            for j in range(self.fan_in):
+                self.v[i][j] -= lr * self.grad_v[i][j]
+            self.g[i] -= lr * self.grad_g[i]
+            self.b[i] -= lr * self.grad_b[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"WeightNorm.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.v, self.grad_v, self.m_v, self.v_v, self._adam_t,
+                    lr, beta1, beta2, eps)
+        _adam_apply(self.g, self.grad_g, self.m_g, self.v_g, self._adam_t,
+                    lr, beta1, beta2, eps)
+        _adam_apply(self.b, self.grad_b, self.m_b, self.v_b, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class SpectralNorm:
+    """谱归一化（Miyato et al. 2018）：w = v / sigma(v)
+
+    `sigma(v)` 用幂迭代（`power_iter` 次）估计最大奇异值，逐次 forward 里更新
+    `u`/`v_hat` 两个方向向量（它们不是参数，是缓存）。
+
+    梯度约定：默认把 `sigma` 视为**常量**（`detach_sigma=True`），这是谱归一化在
+    实践中的常见做法 —— `dv = dW / sigma`。若需要严格的端到端梯度，先调用
+    `freeze_sigma()` 冻结当前的 sigma，此时 `v` 是唯一变量、反向与中心差分逐位一致。
+    """
+
+    def __init__(self, layer, power_iter: int = 1, eps: float = 1e-12):
+        for attr in ("weights", "biases", "act_fn", "act_deriv"):
+            if not hasattr(layer, attr):
+                raise TypeError(
+                    f"SpectralNorm: 内层必须提供 {attr!r}（Layer / Linear 都满足），"
+                    f"收到 {type(layer).__name__}"
+                )
+        if isinstance(power_iter, bool) or not isinstance(power_iter, int):
+            raise TypeError(f"SpectralNorm: power_iter 必须是 int，收到 {type(power_iter).__name__}")
+        if power_iter < 0:
+            raise ValueError(f"SpectralNorm: power_iter 必须 >= 0，收到 {power_iter!r}")
+        self.inner = layer
+        self.power_iter = power_iter
+        self.eps = float(eps)
+        self.fan_out = len(layer.weights)
+        self.fan_in = len(layer.weights[0]) if self.fan_out else 0
+        self.v = [list(row) for row in layer.weights]
+        self.b = list(layer.biases)
+        # u 长度 fan_out，vh 长度 fan_in（随机单位向量，只做幂迭代起点）
+        self.u = [random.gauss(0.0, 1.0) for _ in range(self.fan_out)]
+        self.vh = [random.gauss(0.0, 1.0) for _ in range(self.fan_in)]
+        self._unit(self.u)
+        self._unit(self.vh)
+        self.sigma = 1.0
+        self._frozen = False
+        self._w = None
+        self.grad_v = None
+        self.grad_b = None
+        self.zero_grad()
+        self.m_v = _zeros_like(self.v)
+        self.v_v = _zeros_like(self.v)
+        self.m_b = [0.0] * self.fan_out
+        self.v_b = [0.0] * self.fan_out
+        self._adam_t = 0
+        self._estimate()
+
+    def _unit(self, vec):
+        n = math.sqrt(sum(c * c for c in vec))
+        if n > 0.0:
+            for i in range(len(vec)):
+                vec[i] /= n
+
+    def _estimate(self):
+        """幂迭代估计最大奇异值；把 u/vh 更新到收敛方向"""
+        if self.fan_out == 0 or self.fan_in == 0:
+            self.sigma = 1.0
+            return self.sigma
+        for _ in range(self.power_iter):
+            # u <- v·vh ; vh <- vᵀ·u
+            self.u = [sum(self.v[i][j] * self.vh[j] for j in range(self.fan_in))
+                      for i in range(self.fan_out)]
+            self._unit(self.u)
+            self.vh = [sum(self.v[i][j] * self.u[i] for i in range(self.fan_out))
+                       for j in range(self.fan_in)]
+            self._unit(self.vh)
+        s = sum(self.u[i] * sum(self.v[i][j] * self.vh[j] for j in range(self.fan_in))
+                for i in range(self.fan_out))
+        self.sigma = max(abs(s), self.eps)
+        return self.sigma
+
+    def freeze_sigma(self):
+        """冻结当前 sigma：此后 forward 不再估计，反向可精确对齐中心差分"""
+        self._estimate()
+        self._frozen = True
+        return self.sigma
+
+    def _effective(self):
+        if not self._frozen:
+            self._estimate()
+        s = self.sigma
+        return [[c / s for c in row] for row in self.v]
+
+    def forward(self, x):
+        if len(x) != self.fan_in:
+            raise ValueError(
+                f"SpectralNorm.forward: 输入维度 {len(x)} 与 fan_in={self.fan_in} 不一致"
+            )
+        w = self._effective()
+        self._w = w
+        saved = self.inner.weights
+        self.inner.weights = w
+        try:
+            return self.inner.forward(x)
+        finally:
+            self.inner.weights = saved
+
+    def backward(self, dout):
+        if self._w is None:
+            raise RuntimeError("SpectralNorm.backward: 必须先调用 forward()")
+        saved = self.inner.weights
+        self.inner.weights = self._w
+        try:
+            dW, db, dx = self.inner.backward(dout)
+        finally:
+            self.inner.weights = saved
+        s = self.sigma
+        self.grad_v = [[c / s for c in row] for row in dW]
+        self.grad_b = list(db)
+        return dx
+
+    def zero_grad(self):
+        self.grad_v = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        self.grad_b = [0.0] * self.fan_out
+
+    def param_count(self):
+        return self.fan_out * self.fan_in + self.fan_out
+
+    def train(self):
+        self.training = True
+        if hasattr(self.inner, "train"):
+            self.inner.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        if hasattr(self.inner, "eval"):
+            self.inner.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"SpectralNorm.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.fan_out):
+            for j in range(self.fan_in):
+                self.v[i][j] -= lr * self.grad_v[i][j]
+            self.b[i] -= lr * self.grad_b[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"SpectralNorm.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.v, self.grad_v, self.m_v, self.v_v, self._adam_t,
+                    lr, beta1, beta2, eps)
+        _adam_apply(self.b, self.grad_b, self.m_b, self.v_b, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
 # ============================================================================
 #  RNN / LSTM
 # ============================================================================

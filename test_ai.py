@@ -10639,3 +10639,296 @@ class TestConditionalNorm:
                 pass
             else:
                 raise AssertionError(f"ConditionalNorm({bad!r}, 3) 应该报错")
+
+
+# ==== W3-A：ScaleNorm / WeightNorm / SpectralNorm ====
+
+class TestScaleNorm:
+    """ScaleNorm：只有标量 g，``y = g*x/(||x||/sqrt(d)+eps)``"""
+
+    def test_forward_closed_form(self):
+        import math as _math
+        sn = AI.ScaleNorm(4)
+        x = [0.3, -1.1, 0.7, 2.0]
+        out = sn.forward(x)
+        den = _math.sqrt(sum(v * v for v in x)) / _math.sqrt(4) + sn.eps
+        assert all(abs(out[i] - sn.g * x[i] / den) < 1e-12 for i in range(4))
+        assert sn.param_count() == 1
+        assert abs(sn.g - 1.0) < 1e-12
+
+    def test_gradients(self):
+        import math as _math
+        sn = AI.ScaleNorm(4)
+        x = [0.3, -1.1, 0.7, 2.0]
+        dout = [0.7, -0.4, 1.2, 0.3]
+
+        def loss(xx, g):
+            den = _math.sqrt(sum(v * v for v in xx)) / _math.sqrt(4) + sn.eps
+            return sum(g * xx[i] / den * dout[i] for i in range(4))
+
+        sn.forward(x)
+        dg, dx = sn.backward(dout)
+        eps = 1e-6
+        for i in range(4):
+            old = x[i]
+            x[i] = old + eps
+            vp = loss(x, sn.g)
+            x[i] = old - eps
+            vm = loss(x, sn.g)
+            x[i] = old
+            assert abs((vp - vm) / (2 * eps) - dx[i]) <= 1e-7
+        g0 = sn.g
+        sn.g = g0 + eps
+        vp = loss(x, sn.g)
+        sn.g = g0 - eps
+        vm = loss(x, sn.g)
+        sn.g = g0
+        assert abs((vp - vm) / (2 * eps) - dg) <= 1e-7
+
+    def test_optimizer_and_errors(self):
+        sn = AI.ScaleNorm(3)
+        x = [0.5, -0.2, 0.9]
+        sn.forward(x)
+        dg, _ = sn.backward([1.0, -1.0, 0.5])
+        g0 = sn.g
+        sn.sgd_step(0.1)
+        assert abs(sn.g - (g0 - 0.1 * dg)) < 1e-12
+        sn.forward(x)
+        sn.backward([1.0, -1.0, 0.5])
+        g1 = sn.g
+        sn.adam_step(0.05)
+        assert sn._adam_t == 1 and abs(sn.g - g1) > 1e-12
+        # 全零输入：方向无定义但不崩、梯度有限
+        z = AI.ScaleNorm(3)
+        z.forward([0.0, 0.0, 0.0])
+        zg, zdx = z.backward([1.0, 1.0, 1.0])
+        assert all(abs(v) < 1e9 for v in zdx) and abs(zg) < 1e9
+        for bad in (0, -1, 1.5, True):
+            try:
+                AI.ScaleNorm(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"ScaleNorm({bad!r}) 应该报错")
+        try:
+            AI.ScaleNorm(4, -1.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("eps 为负应该报错")
+        try:
+            AI.ScaleNorm(4).forward([1.0, 2.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("维度不符应该报错")
+        try:
+            AI.ScaleNorm(4).backward([1.0, 2.0, 3.0, 4.0])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+        try:
+            AI.ScaleNorm(3).sgd_step(-1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("负 lr 应该报错")
+
+
+class TestWeightNorm:
+    """WeightNorm：``w = g ⊙ v/||v||``，反向精确传到 v/g/b"""
+
+    def test_init_equals_original_layer(self):
+        import random as _random
+        _random.seed(71)
+        lin = AI.Linear(3, 2)
+        orig = [list(r) for r in lin.weights]
+        wn = AI.WeightNorm(lin)
+        assert all(abs(wn.v[i][j] - orig[i][j]) < 1e-12 for i in range(2) for j in range(3))
+        x = [0.5, -0.3, 0.8]
+        out = wn.forward(x)
+        ref = [sum(orig[i][j] * x[j] for j in range(3)) + lin.biases[i] for i in range(2)]
+        assert all(abs(out[i] - ref[i]) < 1e-12 for i in range(2))
+        assert wn.param_count() == 6 + 2 + 2
+        # forward 不永久改写内层权重
+        assert all(abs(lin.weights[i][j] - orig[i][j]) < 1e-12
+                   for i in range(2) for j in range(3))
+
+    def test_gradients(self):
+        import math as _math
+        import random as _random
+        _random.seed(72)
+        lin = AI.Linear(3, 2)
+        wn = AI.WeightNorm(lin)
+        wn.g = [0.4, 1.7]   # 让 w != v，梯度才含解耦项
+        x = [0.5, -0.3, 0.8]
+        dout = [0.9, -0.6]
+        wn.forward(x)
+        dx = wn.backward(dout)
+
+        def loss(vv, gg):
+            tot = 0.0
+            for i in range(2):
+                n = _math.sqrt(sum(c * c for c in vv[i]))
+                z = sum(gg[i] * vv[i][j] / n * x[j] for j in range(3)) + wn.b[i]
+                tot += z * dout[i]
+            return tot
+
+        eps = 1e-6
+        worst = 0.0
+        for i in range(2):
+            for j in range(3):
+                old = wn.v[i][j]
+                wn.v[i][j] = old + eps
+                vp = loss(wn.v, wn.g)
+                wn.v[i][j] = old - eps
+                vm = loss(wn.v, wn.g)
+                wn.v[i][j] = old
+                worst = max(worst, abs((vp - vm) / (2 * eps) - wn.grad_v[i][j]))
+        assert worst <= 1e-7, f"dv 差分 {worst:.3e}"
+
+        for i in range(2):
+            old = wn.g[i]
+            wn.g[i] = old + eps
+            vp = loss(wn.v, wn.g)
+            wn.g[i] = old - eps
+            vm = loss(wn.v, wn.g)
+            wn.g[i] = old
+            assert abs((vp - vm) / (2 * eps) - wn.grad_g[i]) <= 1e-7
+
+        norms = [_math.sqrt(sum(c * c for c in row)) for row in wn.v]
+        w_eff = [[wn.g[i] * wn.v[i][j] / norms[i] for j in range(3)] for i in range(2)]
+        for j in range(3):
+            assert abs(dx[j] - sum(w_eff[i][j] * dout[i] for i in range(2))) < 1e-12
+
+    def test_optimizer_and_errors(self):
+        import random as _random
+        _random.seed(73)
+        lin = AI.Linear(3, 2)
+        wn = AI.WeightNorm(lin)
+        x = [0.5, -0.3, 0.8]
+        wn.forward(x)
+        wn.backward([0.9, -0.6])
+        before = [list(r) for r in wn.v]
+        wn.sgd_step(0.1)
+        assert any(abs(wn.v[i][j] - before[i][j]) > 1e-12 for i in range(2) for j in range(3))
+        wn.forward(x)
+        wn.backward([0.9, -0.6])
+        before = [list(r) for r in wn.v]
+        wn.adam_step(0.05)
+        assert wn._adam_t == 1
+        assert any(abs(wn.v[i][j] - before[i][j]) > 1e-12 for i in range(2) for j in range(3))
+        try:
+            AI.WeightNorm(123)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("非层对象应该报错")
+        try:
+            AI.WeightNorm(AI.Linear(3, 2)).forward([1.0, 2.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("输入维度不符应该报错")
+        try:
+            AI.WeightNorm(AI.Linear(3, 2)).backward([1.0, 1.0])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+        try:
+            wn.sgd_step(-1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("负 lr 应该报错")
+
+
+class TestSpectralNorm:
+    """SpectralNorm：``w = v/sigma``，冻结 sigma 时反向与中心差分一致"""
+
+    def test_forward_and_sigma(self):
+        import math as _math
+        import random as _random
+        _random.seed(81)
+        lin = AI.Linear(3, 2)
+        orig = [list(r) for r in lin.weights]
+        sp = AI.SpectralNorm(lin, power_iter=20)
+        sig = sp.freeze_sigma()
+        assert sig > 0 and _math.isfinite(sig)
+        x = [0.5, -0.3, 0.8]
+        out = sp.forward(x)
+        w = [[c / sig for c in row] for row in sp.v]
+        ref = [sum(w[i][j] * x[j] for j in range(3)) + sp.b[i] for i in range(2)]
+        assert all(abs(out[i] - ref[i]) < 1e-12 for i in range(2))
+        assert sp.param_count() == 6 + 2
+        assert all(abs(lin.weights[i][j] - orig[i][j]) < 1e-12
+                   for i in range(2) for j in range(3))
+
+    def test_frozen_sigma_gradient(self):
+        import random as _random
+        _random.seed(82)
+        lin = AI.Linear(3, 2)
+        sp = AI.SpectralNorm(lin, power_iter=20)
+        sig = sp.freeze_sigma()
+        x = [0.5, -0.3, 0.8]
+        dout = [0.9, -0.6]
+        sp.forward(x)
+        dx = sp.backward(dout)
+
+        def loss(vv):
+            tot = 0.0
+            for i in range(2):
+                z = sum(vv[i][j] / sig * x[j] for j in range(3)) + sp.b[i]
+                tot += z * dout[i]
+            return tot
+
+        eps = 1e-6
+        worst = 0.0
+        for i in range(2):
+            for j in range(3):
+                old = sp.v[i][j]
+                sp.v[i][j] = old + eps
+                vp = loss(sp.v)
+                sp.v[i][j] = old - eps
+                vm = loss(sp.v)
+                sp.v[i][j] = old
+                worst = max(worst, abs((vp - vm) / (2 * eps) - sp.grad_v[i][j]))
+        assert worst <= 1e-7, f"dv 差分 {worst:.3e}"
+        w = [[c / sig for c in row] for row in sp.v]
+        for j in range(3):
+            assert abs(dx[j] - sum(w[i][j] * dout[i] for i in range(2))) < 1e-12
+
+    def test_unfrozen_sigma_and_errors(self):
+        import random as _random
+        _random.seed(83)
+        sp = AI.SpectralNorm(AI.Linear(3, 2), power_iter=5)
+        s0 = sp.sigma
+        sp.v[0][0] += 5.0
+        sp.forward([0.5, -0.3, 0.8])
+        assert abs(sp.sigma - s0) > 1e-9
+        try:
+            AI.SpectralNorm(AI.Linear(3, 2), power_iter=-1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("power_iter 为负应该报错")
+        try:
+            AI.SpectralNorm(AI.Linear(3, 2), power_iter=1.5)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("power_iter 非整数应该报错")
+        try:
+            AI.SpectralNorm(AI.Linear(3, 2)).forward([1.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("输入维度不符应该报错")
+        try:
+            AI.SpectralNorm(AI.Linear(3, 2)).backward([1.0, 1.0])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")

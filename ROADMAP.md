@@ -140,7 +140,8 @@
 - [x] `ConditionalNorm`（W2-H：`gamma = 1 + W_g·c + b_g`、`beta = W_b·c + b_b`，`set_cond()` 设条件；`dx`/`b_g,b_b`/`W_g,W_b`/`grad_cond` 五组中心差分 ≤1e-7）
 
 ### W3 归一化·激活·初始化（P1 + §6）
-- [ ] 归一化族：`WeightNorm`、`SpectralNorm`（幂迭代）、`SwitchNorm`、`FilterResponseNorm`、`ScaleNorm`
+- [x] 归一化族（W3-A）：`ScaleNorm`（只有标量 g）、`WeightNorm`（`w = g⊙v/‖v‖`，反向含解耦项，`dv`/`dg`/`db` 中心差分 ≤1e-7）、`SpectralNorm`（幂迭代估计 σ，默认 σ 视为常量，`freeze_sigma()` 后 `dv` 与中心差分一致）
+- [ ] 归一化族（剩余）：`SwitchNorm`（批/实例/层三种统计量软加权）、`FilterResponseNorm`（FRN + 阈值 τ）
 - [ ] 激活族：`PReLU`（可学习斜率）、`Maxout`、`DynamicReLU`、`FReLU`、`Snake`
 - [ ] GLU 族：`SwiGLU` 加 `gate="swish|gelu|relu|bilinear"`（GeGLU / ReGLU / Bilinear GLU）
 - [ ] 初始化族：`init_lecun`、`init_orthogonal`、`init_sparse`、`init_trunc_normal`、零初始化 bias、
