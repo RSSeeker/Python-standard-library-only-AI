@@ -219,7 +219,10 @@
   - R1/R2 只返回数值：手写单阶反向没有二阶图，无法把罚项回传进参数，故为诊断量（PyTorch 的 `autograd.grad` 才行）
   - 实测样本平均最近距离（4 角点 / hidden=16 / 1200 步）：hinge 1.03、lsgan 1.30、wgan 2.41–2.61（小容量下几乎学不动）、bce 1.21
 - [ ] GAN 变体剩余：DCGAN / WGAN-GP / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive
-- [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、RealNVP·Glow、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
+- [x] `RealNVP` 仿射耦合流：`log|det J| = Σs` **精确**、`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 是真密度（2 维网格积分 0.9989）、`nll` 最大似然训练 3.2951 → 1.4170（120 轮 lr=3e-3）
+  - 实现坑：`Layer` 不支持 `tanh`（改用 sigmoid 打底、外面再套 `tanh` 限幅）；`Layer` 没有 `rng` 参数（临时 `random.seed` 再恢复 `getstate`）
+  - `nll = 0.5|y|² + 0.5d·log2π − logdet` ⇒ `dL/dlogdet = -1`，符号写反会让训练朝反方向走
+- [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、Glow（actnorm + 可逆 1×1 卷积）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
 
 ### W9 优化器与调度（§3/§4）
 - [ ] `SGDSGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`

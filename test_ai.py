@@ -16662,3 +16662,121 @@ class TestGANVariants:
             raise AssertionError("variant 非法应当报错")
         except ValueError:
             pass
+
+# ============================================================================
+#  RealNVP（精确似然的仿射耦合流）
+# ============================================================================
+class TestRealNVP:
+    def _model(self, dim=2, **kw):
+        kw.setdefault("hidden_dim", 8)
+        kw.setdefault("num_layers", 3)
+        return AI.RealNVP(dim, **kw)
+
+    def test_forward_inverse_roundtrip_and_masks(self):
+        for dim in (2, 3, 4, 5):
+            m = AI.RealNVP(dim, hidden_dim=6, num_layers=3, seed=dim)
+            r = random.Random(dim)
+            for _ in range(3):
+                x = [r.uniform(-2.0, 2.0) for _ in range(dim)]
+                y, logdet = m.forward(x)
+                back = m.inverse(y)
+                assert max(abs(back[i] - x[i]) for i in range(dim)) < 1e-12
+                assert math.isfinite(logdet)
+        m4 = AI.RealNVP(4, hidden_dim=4, num_layers=4, seed=1)
+        assert m4.masks[0] == [1, 0, 1, 0]
+        assert m4.masks[1] == [0, 1, 0, 1]
+        m5 = AI.RealNVP(5, hidden_dim=4, num_layers=2, seed=1)
+        assert m5.masks[0] == [1, 1, 0, 0, 0]
+        assert m5.masks[1] == [0, 0, 1, 1, 1]
+
+    def test_logdet_matches_numeric_jacobian(self):
+        m = AI.RealNVP(2, hidden_dim=8, num_layers=3, seed=7)
+        r = random.Random(3)
+        eps = 1e-6
+        for _ in range(3):
+            x = [r.uniform(-1.5, 1.5) for _ in range(2)]
+            _, logdet = m.forward(x)
+            cols = []
+            for j in range(2):
+                xp = list(x)
+                xm = list(x)
+                xp[j] += eps
+                xm[j] -= eps
+                yp, _ = m.forward(xp)
+                ym, _ = m.forward(xm)
+                cols.append([(yp[i] - ym[i]) / (2 * eps) for i in range(2)])
+            det = cols[0][0] * cols[1][1] - cols[0][1] * cols[1][0]
+            assert abs(logdet - math.log(abs(det))) < 1e-6
+
+    def test_gradients_match_finite_difference(self):
+        m = AI.RealNVP(2, hidden_dim=6, num_layers=2, seed=5)
+        x = [0.4, 0.8]
+        w = [0.7, -1.1]
+        g = 0.9
+
+        def loss(xx):
+            y, logdet = m.forward(xx)
+            return sum(w[i] * y[i] for i in range(2)) + g * logdet
+
+        y, _ = m.forward(x)
+        dx = m.backward(list(w), g)
+        eps = 1e-6
+        for j in range(2):
+            xp = list(x)
+            xm = list(x)
+            xp[j] += eps
+            xm[j] -= eps
+            num = (loss(xp) - loss(xm)) / (2 * eps)
+            assert abs(dx[j] - num) < 1e-7
+        order = ["s1", "s2", "t1", "t2"]
+        for li, key in ((0, "s1"), (0, "t1"), (1, "s2"), (1, "t2")):
+            layer = m.layers[li][key]
+            gw, _gb = m._grads[li * 4 + order.index(key)]
+            old = layer.weights[0][0]
+            layer.weights[0][0] = old + eps
+            lp = loss(x)
+            layer.weights[0][0] = old - eps
+            lm = loss(x)
+            layer.weights[0][0] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(gw[0][0] - num) < 1e-6, (li, key, gw[0][0], num)
+
+    def test_training_and_sampling(self):
+        r = random.Random(1)
+        data = [[1.0 * z + 0.15 * r.gauss(0, 1), 1.0 * z + 0.15 * r.gauss(0, 1)]
+                for z in (-2, -1, 0, 1, 2) for _ in range(4)]
+        m = AI.RealNVP(2, hidden_dim=16, num_layers=4, seed=0)
+        before = sum(m.nll(q) for q in data) / len(data)
+        after = m.fit(data, epochs=100, lr=3e-3, seed=0)
+        assert after <= 0.75 * before
+        pts = m.sample(3, random.Random(0))
+        assert len(pts) == 3
+        assert all(math.isfinite(v) for p in pts for v in p)
+        assert m.sample(2, random.Random(42)) == m.sample(2, random.Random(42))
+
+    def test_errors(self):
+        for kwargs in ({"data_dim": 1}, {"data_dim": 2, "hidden_dim": 0},
+                       {"data_dim": 2, "num_layers": True},
+                       {"data_dim": 2, "scale_limit": 0.0},
+                       {"data_dim": 2, "seed": 1.5}):
+            with pytest.raises(ValueError):
+                AI.RealNVP(**kwargs)
+        m = AI.RealNVP(2, hidden_dim=4, num_layers=2, seed=0)
+        with pytest.raises(RuntimeError):
+            m.backward([1.0, 0.0])
+        m.forward([0.2, 0.3])
+        with pytest.raises(ValueError):
+            m.backward([1.0])
+        with pytest.raises(RuntimeError):
+            m.sgd_step(0.01)
+        m.backward([1.0, 0.0])
+        with pytest.raises(ValueError):
+            m.sgd_step(-1.0)
+        with pytest.raises(ValueError):
+            m.sample(0)
+        with pytest.raises(ValueError):
+            m.fit([])
+        with pytest.raises(ValueError):
+            m.log_prob([1.0])
+        with pytest.raises(ValueError):
+            m.log_prob(["a", "b"])

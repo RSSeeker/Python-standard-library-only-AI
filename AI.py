@@ -25263,6 +25263,326 @@ def r1_penalty(d_scores, lam=10.0):
     return 0.5 * lam * total / len(d_scores)
 
 
+_LOG_2PI = math.log(2.0 * math.pi)
+
+
+def _realnvp_masks(data_dim, num_layers):
+    """交替掩码：偶数维用棋盘格，奇数维用前后半区轮换"""
+    if data_dim < 2:
+        raise ValueError("RealNVP: data_dim 必须 >= 2")
+    masks = []
+    if data_dim % 2 == 0:
+        a = [1 if i % 2 == 0 else 0 for i in range(data_dim)]
+        b = [1 - v for v in a]
+    else:
+        h = data_dim // 2
+        a = [1 if i < h else 0 for i in range(data_dim)]
+        b = [1 - v for v in a]
+    for layer in range(num_layers):
+        masks.append(a if layer % 2 == 0 else b)
+    return masks
+
+
+class RealNVP:
+    """RealNVP：仿射耦合流，可逆且能算**精确**对数似然。
+
+    ``y`` 的构造（每层，掩码 ``m`` 选出「被保留」的那一半 ``x_a``）：
+
+        s = scale_limit * tanh(W_s2 sigmoid(W_s1 x_a + b_s1) + b_s2)
+        t = W_t2 tanh(W_t1 x_a + b_t1) + b_t2
+        y_a = x_a,  y_b = x_b * exp(s) + t
+
+    因此 ``log|det J| = sum(s)``（三角雅可比，精确无近似）；``inverse`` 用
+    ``x_b = (y_b - t) * exp(-s)`` 逐层逆推。``log_prob`` 把 ``y`` 当标准正态。
+
+    与 DDPM/FlowMatching 的区别：这两者是「采样器」，只能在积分意义上近似
+    似然；RealNVP 是**精确似然模型**，可直接做最大似然训练与密度评估。
+    ``tanh`` 把 scale 限制在 ±``scale_limit``，避免 exp 溢出（这是教学简化，
+    原论文用普通实值 scale）。
+    """
+
+    def __init__(self, data_dim: int = 2, hidden_dim: int = 16,
+                 num_layers: int = 4, scale_limit: float = 1.0, seed: int = 0):
+        for name, value in (("data_dim", data_dim), ("hidden_dim", hidden_dim),
+                            ("num_layers", num_layers)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"RealNVP: {name} 必须是 >= 1 的整数")
+        if isinstance(scale_limit, bool) or not isinstance(scale_limit, (int, float)):
+            raise ValueError("RealNVP: scale_limit 必须是正数")
+        if not (scale_limit > 0 and math.isfinite(scale_limit)):
+            raise ValueError(f"RealNVP: scale_limit 必须有限且 > 0，收到 {scale_limit!r}")
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.scale_limit = float(scale_limit)
+        self.masks = _realnvp_masks(data_dim, num_layers)
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("RealNVP: seed 必须是整数")
+        # Layer 用全局 random 初始化；这里临时播种再恢复状态，避免污染调用方
+        _saved = random.getstate()
+        random.seed(seed)
+        try:
+            self.layers = []
+            for mask in self.masks:
+                dim_a = sum(mask)
+                dim_b = data_dim - dim_a
+                self.layers.append({
+                    "mask": mask,
+                    "dim_a": dim_a,
+                    "dim_b": dim_b,
+                    "s1": Layer(dim_a, hidden_dim, activation="sigmoid"),
+                    "s2": Layer(hidden_dim, dim_b, activation="linear"),
+                    "t1": Layer(dim_a, hidden_dim, activation="sigmoid"),
+                    "t2": Layer(hidden_dim, dim_b, activation="linear"),
+                })
+        finally:
+            random.setstate(_saved)
+        self._grads = None
+        self._adam_t = 0
+        self._adam = None
+        self._init_adam()
+
+    # ---- 参数与状态 -------------------------------------------------
+    def _params(self):
+        out = []
+        for lay in self.layers:
+            for key in ("s1", "s2", "t1", "t2"):
+                out.append(lay[key])
+        return out
+
+    def _init_adam(self):
+        self._adam = []
+        for layer in self._params():
+            self._adam.append((_zeros_like(layer.weights),
+                               _zeros_like(layer.weights),
+                               [0.0] * len(layer.biases),
+                               [0.0] * len(layer.biases)))
+
+    def zero_grad(self):
+        self._grads = None
+
+    def param_count(self):
+        total = 0
+        for layer in self._params():
+            total += len(layer.weights) * len(layer.weights[0]) + len(layer.biases)
+        return total
+
+    # ---- 前向 / 反向 -----------------------------------------------
+    def _split(self, x, mask):
+        xa = [x[i] for i in range(len(x)) if mask[i]]
+        xb = [x[i] for i in range(len(x)) if not mask[i]]
+        return xa, xb
+
+    def _merge(self, xa, xb, mask):
+        out = [0.0] * len(mask)
+        ia = ib = 0
+        for i in range(len(mask)):
+            if mask[i]:
+                out[i] = xa[ia]
+                ia += 1
+            else:
+                out[i] = xb[ib]
+                ib += 1
+        return out
+
+    def _coupling_forward(self, lay, x):
+        mask = lay["mask"]
+        xa, xb = self._split(x, mask)
+        hs = lay["s1"].forward(xa)
+        pre_s = lay["s2"].forward(hs)
+        lim = self.scale_limit
+        s = [lim * math.tanh(v) for v in pre_s]
+        ht = lay["t1"].forward(xa)
+        t = lay["t2"].forward(ht)
+        yb = [xb[i] * math.exp(s[i]) + t[i] for i in range(lay["dim_b"])]
+        return self._merge(xa, yb, mask), s, t, xa, xb, hs, ht, pre_s
+
+    def forward(self, x):
+        """返回 ``(y, logdet)``"""
+        self._check_x(x)
+        y = list(x)
+        logdet = 0.0
+        caches = []
+        for lay in self.layers:
+            y, s, t, xa, xb, hs, ht, pre_s = self._coupling_forward(lay, y)
+            logdet += sum(s)
+            caches.append((s, t, xa, xb, hs, ht, pre_s))
+        self._cache = caches
+        self._x = list(x)
+        return y, logdet
+
+    def _check_x(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != self.data_dim:
+            raise ValueError(f"RealNVP: x 维度应为 {self.data_dim}")
+        for v in x:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError("RealNVP: x 的元素必须是有限数字")
+
+    def backward(self, g_y, g_logdet=0.0):
+        """返回 ``(dL/dx, 参数梯度已累加到 self._grads)``"""
+        if getattr(self, "_cache", None) is None:
+            raise RuntimeError("RealNVP.backward: 必须先调用 forward()")
+        if len(g_y) != self.data_dim:
+            raise ValueError(
+                f"RealNVP.backward: g_y 长度 {len(g_y)} 与 data_dim {self.data_dim} 不一致")
+        grad = g_y
+        lim = self.scale_limit
+        grads = [] if self._grads is None else self._grads
+        acc = {}
+
+        def add(key, gw, gb):
+            if key not in acc:
+                acc[key] = ([row[:] for row in gw], list(gb))
+            else:
+                aw, ab = acc[key]
+                for i in range(len(gw)):
+                    for j in range(len(gw[0])):
+                        aw[i][j] += gw[i][j]
+                for i in range(len(gb)):
+                    ab[i] += gb[i]
+
+        for idx in range(len(self.layers) - 1, -1, -1):
+            lay = self.layers[idx]
+            mask = lay["mask"]
+            s, t, xa, xb, hs, ht, pre_s = self._cache[idx]
+            db = sum(mask)
+            g_a_in, g_b_in = self._split(grad, mask)
+            exp_s = [math.exp(v) for v in s]
+            dxb = [g_b_in[i] * exp_s[i] for i in range(db)]
+            # -1 来自 -logdet 对 s 的偏导；这里 g_logdet 是 dL/dlogdet
+            d_s = [g_b_in[i] * xb[i] * exp_s[i] + g_logdet for i in range(db)]
+            d_t = list(g_b_in)
+            # s = lim*tanh(pre_s) -> dpre = d_s*lim*(1-tanh^2)
+            d_pre_s = [d_s[i] * lim * (1.0 - (s[i] / lim) ** 2) for i in range(db)]
+            gw2s, gb2s, dhs_s = lay["s2"].backward(d_pre_s)
+            gw2t, gb2t, dht = lay["t2"].backward(d_t)
+            gw1s, gb1s, dxa_s = lay["s1"].backward(dhs_s)
+            gw1t, gb1t, dxa_t = lay["t1"].backward(dht)
+            add((idx, "s2"), gw2s, gb2s)
+            add((idx, "t2"), gw2t, gb2t)
+            add((idx, "s1"), gw1s, gb1s)
+            add((idx, "t1"), gw1t, gb1t)
+            dxa = [g_a_in[i] + dxa_s[i] + dxa_t[i] for i in range(len(g_a_in))]
+            grad = self._merge(dxa, dxb, mask)
+
+        self._grads = []
+        for idx, lay in enumerate(self.layers):
+            for key in ("s1", "s2", "t1", "t2"):
+                if (idx, key) in acc:
+                    self._grads.append(acc[(idx, key)])
+                else:
+                    layer = lay[key]
+                    self._grads.append(
+                        (_zeros_like(layer.weights), [0.0] * len(layer.biases)))
+        return grad
+
+    # ---- 逆变换 / 似然 ---------------------------------------------
+    def inverse(self, y):
+        """把 ``y`` 映射回数据空间（与 ``forward`` 精确互逆，误差 ~1e-15）"""
+        self._check_x(y)
+        x = list(y)
+        for idx in range(len(self.layers) - 1, -1, -1):
+            lay = self.layers[idx]
+            mask = lay["mask"]
+            ya, yb = self._split(x, mask)
+            hs = lay["s1"].forward(ya)
+            pre_s = lay["s2"].forward(hs)
+            lim = self.scale_limit
+            s = [lim * math.tanh(v) for v in pre_s]
+            ht = lay["t1"].forward(ya)
+            t = lay["t2"].forward(ht)
+            xb = [(yb[i] - t[i]) * math.exp(-s[i]) for i in range(lay["dim_b"])]
+            x = self._merge(ya, xb, mask)
+        return x
+
+    def log_prob(self, x):
+        """标准正态基分布 + 精确 log|det J|"""
+        y, logdet = self.forward(x)
+        base = -0.5 * sum(v * v for v in y) - 0.5 * self.data_dim * _LOG_2PI
+        return base + logdet
+
+    def nll(self, x):
+        return -self.log_prob(x)
+
+    def sample(self, n=1, rng=None):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("RealNVP.sample: n 必须是 >= 1 的整数")
+        r = rng or random
+        out = []
+        for _ in range(n):
+            z = [r.gauss(0.0, 1.0) for _ in range(self.data_dim)]
+            out.append(self.inverse(z))
+        return out
+
+    # ---- 训练 -------------------------------------------------------
+    def train_step(self, x, lr=1e-3):
+        """一步最大似然：最小化 nll = -log_prob(x)"""
+        y, logdet = self.forward(x)
+        # nll = 0.5|y|^2 + 0.5*d*log(2pi) - logdet
+        # 所以 dL/dy = y、dL/dlogdet = -1
+        self.backward(y, -1.0)
+        self.adam_step(lr)
+        return -(-0.5 * sum(v * v for v in y)
+                 - 0.5 * self.data_dim * _LOG_2PI + logdet)
+
+    def fit(self, data, epochs=200, lr=1e-2, seed=None, verbose=False):
+        if not data:
+            raise ValueError("RealNVP.fit: data 不能为空")
+        r = random.Random(seed) if seed is not None else random
+        order = list(range(len(data)))
+        last = 0.0
+        for epoch in range(epochs):
+            r.shuffle(order)
+            total = 0.0
+            for i in order:
+                total += self.train_step(data[i], lr=lr)
+            last = total / len(data)
+            if verbose and (epoch % 50 == 0 or epoch == epochs - 1):
+                print(f"  RealNVP epoch {epoch + 1}/{epochs}: nll={last:.4f}")
+        return last
+
+    def sgd_step(self, lr=1e-3):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError("RealNVP.sgd_step: lr 必须是 >= 0 的数")
+        if self._grads is None:
+            raise RuntimeError("RealNVP.sgd_step: 没有梯度（先 backward）")
+        for (gw, gb), layer in zip(self._grads, self._params()):
+            for i in range(len(layer.weights)):
+                wi = layer.weights[i]
+                gi = gw[i]
+                for j in range(len(wi)):
+                    wi[j] -= lr * gi[j]
+                layer.biases[i] -= lr * gb[i]
+
+    def adam_step(self, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        _check_adam_betas(beta1, beta2, "RealNVP.adam_step")
+        c1, c2 = 1.0 - beta1, 1.0 - beta2
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError("RealNVP.adam_step: lr 必须是 >= 0 的数")
+        if self._grads is None:
+            raise RuntimeError("RealNVP.adam_step: 没有梯度（先 backward）")
+        self._adam_t += 1
+        t = self._adam_t
+        bc1 = 1.0 - beta1 ** t
+        bc2 = 1.0 - beta2 ** t
+        for k, ((gw, gb), layer) in enumerate(zip(self._grads, self._params())):
+            mw, vw, mb, vb = self._adam[k]
+            for i in range(len(layer.weights)):
+                wi = layer.weights[i]
+                for j in range(len(wi)):
+                    g = gw[i][j]
+                    mw[i][j] = beta1 * mw[i][j] + (1 - beta1) * g
+                    vw[i][j] = beta2 * vw[i][j] + (1 - beta2) * g * g
+                    wi[j] -= lr * (mw[i][j] / bc1) / (
+                        math.sqrt(vw[i][j] / bc2) + eps)
+                g = gb[i]
+                mb[i] = beta1 * mb[i] + (1 - beta1) * g
+                vb[i] = beta2 * vb[i] + (1 - beta2) * g * g
+                layer.biases[i] -= lr * (mb[i] / bc1) / (
+                    math.sqrt(vb[i] / bc2) + eps)
+
+
 class GAN:
     """最小可训练 GAN（MLP 生成器 / 判别器，BCE 损失）
 
