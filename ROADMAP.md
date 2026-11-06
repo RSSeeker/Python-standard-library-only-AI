@@ -200,8 +200,10 @@
 - [x] 参数高效：`DoRALinear`（幅度+方向分解，`B=0` 与原层逐位一致，`g_V/g_m/g_A/g_B` 中心差分 ≤9.4e-7）/ `AdaLoRALinear`（每秩重要性 EMA + `prune(keep)` 剪秩，剪后前向等于存活秩之和）
 - [ ] 参数高效剩余：`QLoRA`（量化基座 + LoRA 接口；本库只有 float32 张量，留作接口与说明）
 - [ ] 采样扩展：typical / mirostat / eta / top-a / tail-free / contrastive search / diverse beam
-- [ ] 约束解码：JSON Schema / 正则 / CFG（`_sample` 接 mask 回调）
-- [ ] 解码加速：投机解码（草稿模型 + 验证）、自投机/Medusa/EAGLE（概念）、连续批处理、`PagedAttention`（数据结构演示）
+- [x] 约束解码：`token_id_mask`（任意 id 白名单）+ `token_prefix_mask`（合法序列前缀约束，含 `eos_id` 收尾）；JSON Schema / 正则 / CFG 的完整语法器留作后续
+- [ ] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
+- [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）
+- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）、连续批处理、`PagedAttention`（数据结构演示）
 - [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）

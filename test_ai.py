@@ -15810,3 +15810,107 @@ class TestSamplingExtras:
             AI.mirostat_update(1.0, 1.0, -1.0)
         with pytest.raises((ValueError, TypeError)):
             AI.mirostat_update(1.0, 1.0, 2.0, -0.5)
+
+
+# ============================================================
+#  W7-C：约束解码 + 投机解码接受判定
+# ============================================================
+
+class TestConstrainedDecoding:
+    def test_token_id_mask(self):
+        logits = [2.0, 1.0, 0.1, -1.0]
+        masked = AI.token_id_mask(logits, [0, 2])
+        assert masked[0] == 2.0 and masked[2] == 0.1
+        assert masked[1] == float("-inf") and masked[3] == float("-inf")
+        assert logits == [2.0, 1.0, 0.1, -1.0]
+        probs = AI._softmax_row(masked)
+        assert probs[1] == 0.0 and probs[3] == 0.0
+        assert abs(sum(probs) - 1.0) < 1e-12
+
+    def test_token_prefix_mask(self):
+        seqs = [[1, 2, 3], [1, 4]]
+        logits = [0.0] * 10
+
+        def kept(masked):
+            return [i for i, v in enumerate(masked) if v != float("-inf")]
+
+        assert kept(AI.token_prefix_mask(logits, [], seqs)) == [1]
+        assert kept(AI.token_prefix_mask(logits, [1], seqs)) == [2, 4]
+        assert kept(AI.token_prefix_mask(logits, [1, 2], seqs)) == [3]
+        assert kept(AI.token_prefix_mask(logits, [1, 2, 3], seqs, eos_id=9)) == [9]
+        assert kept(AI.token_prefix_mask(logits, [1, 4], seqs, eos_id=9)) == [9]
+        with pytest.raises(ValueError):
+            AI.token_prefix_mask(logits, [4], seqs)
+        with pytest.raises(ValueError):
+            AI.token_prefix_mask(logits, [1, 2, 3], seqs)
+
+    def test_mask_composes_with_sampling(self):
+        logits = [2.0, 1.0, 0.5, 0.2, -0.3]
+        masked = AI.token_id_mask(logits, {2, 4})
+        probs = AI._softmax_row(masked)
+        assert probs[0] == 0.0 and probs[1] == 0.0 and probs[3] == 0.0
+        assert abs(probs[2] + probs[4] - 1.0) < 1e-12
+        best = max(range(len(probs)), key=lambda i: probs[i])
+        assert best == 2
+
+    def test_invalid_inputs(self):
+        logits = [1.0, 0.0, 0.0]
+        for bad in ([], [3], [-1], [True], "x"):
+            with pytest.raises((ValueError, TypeError)):
+                AI.token_id_mask(logits, bad)
+        seqs = [[1, 2]]
+        with pytest.raises((ValueError, TypeError)):
+            AI.token_prefix_mask([0.0] * 5, [1], [])
+        with pytest.raises((ValueError, TypeError)):
+            AI.token_prefix_mask([0.0] * 5, [1], [[1, -2]])
+        with pytest.raises((ValueError, TypeError)):
+            AI.token_prefix_mask([0.0] * 5, [1], [[1, 99]])
+
+
+class TestSpeculativeAccept:
+    def test_identical_distributions_accept_all(self):
+        probs = [[0.6, 0.4], [0.3, 0.7]]
+        acc, tok = AI.speculative_accept([0, 1], probs, probs,
+                                         uniforms=[0.999, 0.999])
+        assert acc == 2 and tok is None
+
+    def test_rejection_and_residual_resample(self):
+        draft = [[0.5, 0.5]]
+        target = [[0.9, 0.1]]
+        acc, tok = AI.speculative_accept([1], draft, target,
+                                        uniforms=[0.99], rng=random.Random(1))
+        assert acc == 0 and tok == 0
+        # p_target=0 的位置必被拒绝
+        acc, tok = AI.speculative_accept(
+            [0], [[0.5, 0.5, 0.0]], [[0.0, 0.6, 0.4]],
+            uniforms=[0.0], rng=random.Random(3))
+        assert acc == 0 and tok in (1, 2)
+
+    def test_acceptance_rate_matches_sum_min(self):
+        rng = random.Random(42)
+        trials = 3000
+        hits = 0
+        for _ in range(trials):
+            t = 0 if rng.random() < 0.5 else 1
+            a, _tok = AI.speculative_accept([t], [[0.5, 0.5]], [[0.3, 0.7]],
+                                            rng=rng)
+            hits += a
+        rate = hits / trials
+        # Σ min(p, q) = min(0.3,0.5) + min(0.7,0.5) = 0.8
+        assert abs(rate - 0.8) < 0.04, rate
+
+    def test_invalid_inputs(self):
+        for args in (([], [[0.5, 0.5]], [[0.5, 0.5]]),
+                     ([-1], [[0.5, 0.5]], [[0.5, 0.5]]),
+                     ([5], [[0.5, 0.5]], [[0.5, 0.5]])):
+            with pytest.raises((ValueError, TypeError)):
+                AI.speculative_accept(*args)
+        with pytest.raises((ValueError, TypeError)):
+            AI.speculative_accept([0], [[0.4, 0.4]], [[0.5, 0.5]])
+        with pytest.raises((ValueError, TypeError)):
+            AI.speculative_accept([0], [[-0.5, 1.5]], [[0.5, 0.5]])
+        with pytest.raises((ValueError, TypeError)):
+            AI.speculative_accept([0], [[0.5, 0.5]], [[0.5, 0.6]])
+        with pytest.raises((ValueError, TypeError)):
+            AI.speculative_accept([0], [[0.5, 0.5]], [[0.5, 0.5]],
+                                  uniforms=[1.5])

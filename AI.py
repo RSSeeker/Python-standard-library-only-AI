@@ -9486,6 +9486,170 @@ def mirostat_update(mu: float, observed_surprisal: float,
                * (float(observed_surprisal) - float(target_entropy)))
 
 
+def token_id_mask(logits, allowed):
+    """约束解码：只保留 ``allowed`` 里的 token id，其余置 ``-inf``
+
+    返回新的 logits 列表，不修改入参；``allowed`` 为空、越界或元素不是整数都报
+    ``ValueError``。与现有采样器（``top_k`` / ``top_p`` / ``min_p`` …）可直接叠加。
+    """
+    n = len(logits)
+    ids = _check_allowed_ids(allowed, n, 'token_id_mask(allowed)')
+    if not ids:
+        raise ValueError('token_id_mask: allowed 不能为空')
+    return [v if i in ids else float('-inf') for i, v in enumerate(logits)]
+
+
+def token_prefix_mask(logits, generated, sequences, eos_id=None):
+    """约束解码：只允许「仍然可能是 ``sequences`` 之一的前缀」的下一个 token
+
+    ``sequences`` 是若干 token-id 列表。``generated`` 必须已经是某条序列的前缀，
+    否则报 ``ValueError``；当 ``generated`` 已等于某条完整序列时，若给了 ``eos_id``
+    就只允许它，否则抛出 ``ValueError``（说明该收尾了）。
+    """
+    ids = _check_allowed_ids(generated, len(logits), 'token_prefix_mask(generated)')
+    if not ids and generated:
+        raise ValueError('token_prefix_mask: generated 里没有合法的 token id')
+    seqs = _check_token_sequences(sequences)
+    hits = [q for q in seqs if len(q) >= len(ids) and q[:len(ids)] == ids]
+    if not hits:
+        raise ValueError('token_prefix_mask: generated 不是任何序列的前缀')
+    allowed = set()
+    done = False
+    for q in hits:
+        if len(q) == len(ids):
+            done = True
+            if eos_id is not None:
+                allowed.add(int(eos_id))
+        else:
+            allowed.add(q[len(ids)])
+    if not allowed:
+        raise ValueError('token_prefix_mask: 序列已完整且未提供 eos_id，'
+                         '没有可继续的 token（done=%s）' % done)
+    for i in allowed:
+        if i < 0 or i >= len(logits):
+            raise ValueError('token_prefix_mask: 允许的 token id %d 越界（词表 %d）'
+                             % (i, len(logits)))
+    return [v if i in allowed else float('-inf') for i, v in enumerate(logits)]
+
+
+def speculative_accept(draft_ids, draft_probs, target_probs, uniforms=None,
+                       rng=None):
+    """投机解码的接受判定（拒绝采样）
+
+    对草稿模型给出的每个 token 位置，按 ``min(1, p_target/p_draft)`` 接受；遇到第一个
+    被拒的位置时，从残差分布 ``max(0, p_target - p_draft)`` 重采样一个新 token。
+
+    返回 ``(接受个数, 重采样出的 token 或 None)``。``uniforms`` 可注入（逐位置的
+    ``[0,1)`` 均匀数）以便确定性测试，缺省用 ``rng``（默认全局 ``random``）。
+    """
+    if not isinstance(draft_ids, (list, tuple)):
+        raise ValueError('speculative_accept: draft_ids 必须是列表')
+    n = len(draft_ids)
+    if n == 0:
+        raise ValueError('speculative_accept: draft_ids 不能为空')
+    for i, t in enumerate(draft_ids):
+        if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+            raise ValueError('speculative_accept: draft_ids[%d] 必须是非负整数，'
+                             '收到 %r' % (i, t))
+    for name, seq in (('draft_probs', draft_probs), ('target_probs', target_probs)):
+        if not isinstance(seq, (list, tuple)) or len(seq) != n:
+            raise ValueError('speculative_accept: %s 长度必须等于 draft_ids（%d）'
+                             % (name, n))
+    for i in range(n):
+        for name, seq in (('draft_probs', draft_probs), ('target_probs', target_probs)):
+            row = seq[i]
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError('speculative_accept: %s[%d] 必须是非空概率向量'
+                                 % (name, i))
+            for j, p in enumerate(row):
+                if isinstance(p, bool) or not isinstance(p, (int, float)):
+                    raise ValueError('speculative_accept: %s[%d][%d] 必须是数字'
+                                     % (name, i, j))
+                if p != p or p < 0.0:
+                    raise ValueError('speculative_accept: %s[%d][%d] 必须是有限'
+                                     '非负数，收到 %r' % (name, i, j, p))
+            if abs(sum(row) - 1.0) > 1e-6:
+                raise ValueError('speculative_accept: %s[%d] 概率和必须为 1，'
+                                 '实测 %.6f' % (name, i, sum(row)))
+    for i, t in enumerate(draft_ids):
+        for name, seq in (('draft_probs', draft_probs),
+                          ('target_probs', target_probs)):
+            if t >= len(seq[i]):
+                raise ValueError('speculative_accept: draft_ids[%d]=%d 超出 %s[%d] '
+                                 '的类别数 %d' % (i, t, name, i, len(seq[i])))
+    if uniforms is None:
+        src = random if rng is None else rng
+        uniforms = [src.random() for _ in range(n)]
+    else:
+        if len(uniforms) != n:
+            raise ValueError('speculative_accept: uniforms 长度必须等于 draft_ids')
+        for u in uniforms:
+            if isinstance(u, bool) or not isinstance(u, (int, float)):
+                raise ValueError('speculative_accept: uniforms 必须是数字')
+            if not (0.0 <= float(u) < 1.0):
+                raise ValueError('speculative_accept: uniforms 必须在 [0,1) 内')
+    accepted = 0
+    for i in range(n):
+        t = draft_ids[i]
+        q = draft_probs[i][t]
+        p = target_probs[i][t]
+        if p < 0.0 or q < 0.0:
+            raise ValueError('speculative_accept: 概率不能为负')
+        if q == 0.0:
+            ratio = float('inf') if p > 0.0 else 0.0
+        else:
+            ratio = p / q
+        if uniforms[i] < min(1.0, ratio):
+            accepted += 1
+            continue
+        resid = [max(0.0, target_probs[i][j] - draft_probs[i][j])
+                 for j in range(len(target_probs[i]))]
+        total = sum(resid)
+        if total <= 0.0:
+            continue
+        src = random if rng is None else rng
+        u = src.random() * total
+        acc = 0.0
+        for j, w in enumerate(resid):
+            acc += w
+            if u <= acc:
+                return accepted, j
+        return accepted, len(resid) - 1
+    return accepted, None
+
+
+def _check_allowed_ids(ids, vocab_size, who):
+    if not isinstance(ids, (list, tuple, set)):
+        raise ValueError('%s: 必须是列表 / 元组 / 集合，收到 %s'
+                         % (who, type(ids).__name__))
+    out = []
+    for v in ids:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError('%s: 元素必须是非负整数，收到 %r' % (who, v))
+        if v < 0 or v >= vocab_size:
+            raise ValueError('%s: token id %d 越界（词表 %d）' % (who, v, vocab_size))
+        out.append(v)
+    return out
+
+
+def _check_token_sequences(sequences):
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError('_check_token_sequences: sequences 必须是非空列表')
+    out = []
+    for k, q in enumerate(sequences):
+        if not isinstance(q, (list, tuple)) or not q:
+            raise ValueError('_check_token_sequences: sequences[%d] 必须是非空列表'
+                             % k)
+        row = []
+        for v in q:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError('_check_token_sequences: sequences[%d] 的元素必须是'
+                                 '非负整数，收到 %r' % (k, v))
+            row.append(v)
+        out.append(row)
+    return out
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
