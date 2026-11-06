@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1045 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1050 项）
 
 ## 特性
 
@@ -257,7 +257,7 @@ model.train()     # 回到训练
 | `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN；`gate="swish|silu|gelu|relu|bilinear"` 对应 GeGLU / ReGLU / Bilinear GLU |
 | `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
 | `VAE(input_dim, hidden_dim=32, latent_dim=2, beta=1.0)` | 变分自编码器：重参数化采样 `z = mu + eps·std`，损失 = 重构 MSE + `beta·KL`；`fit` / `sample` |
-| `GAN(input_dim, hidden_dim=32, latent_dim=2)` | 生成对抗网络：D 用 sigmoid + BCE，G 的梯度经 D 反传（`d_out = -1/p`）；`step` 一次更新 D 与 G |
+| `GAN(input_dim, hidden_dim=32, latent_dim=2, variant="bce")` | 生成对抗网络：`variant` 选判别器损失 `bce` / `lsgan` / `wgan` / `hinge`（非 bce 时 `d2` 输出裸分数，`score()` 拿原始值、`discriminate()` 仍返回概率）；G 的梯度经 D 反传；`step` 一次更新 D 与 G，`wgan` 每步把判别器权重裁到 `±clip_value`（默认 0.01，不裁会发散）；`r1_penalty` 是**诊断量**（单阶反向没有二阶图，不参与更新） |
 | `DDPM(data_dim, hidden_dim=32, steps=50, prediction="eps")` | 扩散模型：线性 beta 表 + 累积 `abar`；`prediction` 可选 `eps`/`v`/`x0`（`target()` 与 `pred_to_x0_eps()` 互为反函数）；`q_sample` 加噪、`sample` DDPM 反向去噪、`ddim_sample(steps=, eta=)` 确定性 DDIM（可只走子序列）；`train_step(..., min_snr_gamma=)` 按 `min(SNR, γ)/SNR` 加权 |
 | `VQVAE(input_dim, hidden_dim=32, latent_dim=2, num_codes=8, beta=0.25)` | 向量量化自编码器：`encode` / `quantize` / `decode`，重构 + 码本 + commitment 三项损失，straight-through 反向；`codebook_histogram()` 看码字使用 |
 | `FlowMatching(data_dim, hidden_dim=32, t_dim=8)` | Flow Matching / Rectified Flow：直线路径 `x_t=(1-t)x0+t·noise`、目标速度 `noise-x0`，`velocity` / `train_step` / `fit`；`sample(steps, solver="euler"\|"heun")` 从 t=1 积分到 t=0 |
@@ -1119,7 +1119,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1045 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1050 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1149,6 +1149,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMinSNR` | 权重 ∈ (0,1] 且随 t 单调、`γ` 越小越不放大、加权后 loss 恰为 `w×` 原 loss、非法 `γ` |
 | `TestVQVAE` | `quantize` 最近邻与平局、三项损失闭式解、straight-through 与 `beta=0` 退化、码本与 decoder 梯度中心差分、warmup 不动码本、`histogram`、优化器、训练与非法输入 |
 | `TestFlowMatching` | 直线路径与目标速度、时间编码、速度场输入梯度、三层参数梯度中心差分、训练收敛与两种采样器的确定性、优化器与 15 类非法输入 |
+| `TestGANVariants` | 四种变体的损失/梯度闭式解、sigmoid 大幅值不溢出、`bce` 与旧实现 20 步逐位一致、非 bce 的 d2 为 linear 且 `score`/`discriminate` 一致、WGAN 裁剪上界、`r1_penalty` 数值与非法输入 |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -1315,7 +1316,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1045 个单元测试
+├── test_ai.py       # 1050 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -25196,34 +25196,123 @@ class VQVAE:
         return history
 
 
+_GAN_VARIANTS = ("bce", "lsgan", "wgan", "hinge")
+
+
+def _gan_check_variant(variant, who):
+    if variant not in _GAN_VARIANTS:
+        raise ValueError(f"{who}: variant 只能是 {_GAN_VARIANTS} 之一，"
+                         f"收到 {variant!r}")
+    return variant
+
+
+def _gan_d_loss(score, is_real, variant="bce"):
+    """判别器在**单个样本**上的损失与 dL/d(score)。
+
+    ``score`` 是判别器的原始输出（bce 变体下是 logit，其余变体是裸分数）。
+    - ``bce``：``-log sigma(s)`` / ``-log(1-sigma(s))``
+    - ``lsgan``：最小二乘，真样本 ``0.5(s-1)^2``、假样本 ``0.5 s^2``
+    - ``wgan``：Wasserstein，真样本 ``-s``、假样本 ``s``
+    - ``hinge``：真样本 ``max(0, 1-s)``、假样本 ``max(0, 1+s)``
+    """
+    _gan_check_variant(variant, "_gan_d_loss")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ValueError("_gan_d_loss: score 必须是数字")
+    if variant == "bce":
+        p = _sigmoid_scalar(score)
+        if is_real:
+            return -math.log(max(p, 1e-12)), p - 1.0
+        return -math.log(max(1.0 - p, 1e-12)), p
+    if variant == "lsgan":
+        if is_real:
+            return 0.5 * (score - 1.0) ** 2, score - 1.0
+        return 0.5 * score ** 2, score
+    if variant == "wgan":
+        return (-score, -1.0) if is_real else (score, 1.0)
+    # hinge
+    if is_real:
+        return (max(0.0, 1.0 - score), -1.0 if score < 1.0 else 0.0)
+    return (max(0.0, 1.0 + score), 1.0 if score > -1.0 else 0.0)
+
+
+def _gan_g_loss(score, variant="bce"):
+    """生成器损失与 dL/d(score)（score 是假样本的判别器原始输出）。"""
+    _gan_check_variant(variant, "_gan_g_loss")
+    if variant == "bce":
+        p = _sigmoid_scalar(score)
+        return -math.log(max(p, 1e-12)), -(1.0 - p)
+    if variant == "lsgan":
+        return 0.5 * (score - 1.0) ** 2, score - 1.0
+    return -score, -1.0            # wgan / hinge 同形
+
+
+def r1_penalty(d_scores, lam=10.0):
+    """R1（或把点换成插值点即 R2）罚项值 ``lam/2 * mean(||dD/dx||^2)``。
+
+    只返回**数值**：本库的反向传播是手写的单阶实现，没有二阶图，
+    无法把罚项再回传进参数（PyTorch 的 ``autograd.grad`` 可以）。因此它在这里
+    是**诊断量** —— 训练时打印/记录，判断判别器是否过于陡峭，而不是加进损失。
+    """
+    if not d_scores:
+        raise ValueError("r1_penalty: d_scores 不能为空")
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)) or lam < 0:
+        raise ValueError("r1_penalty: lam 必须是 >= 0 的数")
+    total = 0.0
+    for g in d_scores:
+        total += sum(v * v for v in g)
+    return 0.5 * lam * total / len(d_scores)
+
+
 class GAN:
     """最小可训练 GAN（MLP 生成器 / 判别器，BCE 损失）
 
     判别器：D(x) = sigmoid(MLP(x))；生成器：G(z) 直接输出样本。
-    训练时 D 用「真实样本 + 生成样本」各一次 BCE，G 只走判别器的生成分支
+    训练时 D 用「真实样本 + 生成样本」各一次损失，G 只走判别器的生成分支
     （梯度穿过 D 但不更新 D 的参数）。
+
+    ``variant`` 选判别器损失：``bce``（默认，与原实现逐位一致）/ ``lsgan`` /
+    ``wgan`` / ``hinge``。非 bce 时 ``d2`` 输出裸分数，``score(x)`` 拿原始输出、
+    ``discriminate(x)`` 仍然返回 ``sigmoid(score)``（便于统一观察）。
+    ``wgan`` 变体在每步更新判别器后把权重裁到 ``[-clip_value, clip_value]``
+    （默认 0.01）——没有这个约束 WGAN 的分数会一路发散，实测 400 步后
+    判别器损失到 -71。R1/R2 罚项见模块函数 ``r1_penalty``：只手写单阶反向、
+    没有二阶图，因此是**诊断量**（训练时监控判别器陡峭程度），不参与参数更新。
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int = 32, latent_dim: int = 2):
+    def __init__(self, input_dim: int, hidden_dim: int = 32, latent_dim: int = 2,
+                 variant: str = "bce"):
         for name, value in (("input_dim", input_dim), ("hidden_dim", hidden_dim),
                             ("latent_dim", latent_dim)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"GAN: {name} 必须是 >= 1 的整数")
+        self.variant = _gan_check_variant(variant, "GAN")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.d1 = Layer(input_dim, hidden_dim, activation="leaky_relu")
-        self.d2 = Layer(hidden_dim, 1, activation="sigmoid")
+        # bce 变体保留 sigmoid 输出（与原实现逐位一致）；其余变体要裸分数
+        self.d2 = Layer(hidden_dim, 1,
+                        activation="sigmoid" if self.variant == "bce" else "linear")
         self.g1 = Layer(latent_dim, hidden_dim, activation="relu")
         self.g2 = Layer(hidden_dim, input_dim, activation="linear")
 
     # ---- 判别器
     def discriminate(self, x):
+        """判别器输出概率：bce 变体直接用 sigmoid 层，其余变体对裸分数取 sigmoid"""
         if not isinstance(x, (list, tuple)) or len(x) != self.input_dim:
             raise ValueError(f"GAN.discriminate: x 维度应为 {self.input_dim}")
         h = self.d1.forward(x)
         out = self.d2.forward(h)
-        return out[0]
+        if self.variant == "bce":
+            return out[0]
+        return _sigmoid_scalar(out[0])
+
+    def score(self, x):
+        """判别器的**原始输出**（bce 变体是 logit，其余变体是裸分数）。"""
+        if not isinstance(x, (list, tuple)) or len(x) != self.input_dim:
+            raise ValueError(f"GAN.score: x 维度应为 {self.input_dim}")
+        self.d2.forward(self.d1.forward(x))
+        return self.d2.z[0]
 
     def _d_grads(self, x, target):
         p = self.discriminate(x)
@@ -25252,9 +25341,38 @@ class GAN:
         gw_g1, gb_g1, _ = self.g1.backward(d_h1)
         return (gw_g1, gb_g1), (gw_g2, gb_g2)
 
-    def step(self, real_batch, rng=None, lr_d=1e-3, lr_g=1e-3, adam=True):
+    def _d_grads_ex(self, x, is_real):
+        """变体路径的判别器梯度：返回 (loss, (gw1, gb1), (gw2, gb2), d_x)"""
+        _ = self.d1.forward(x)
+        _ = self.d2.forward(_)
+        score = self.d2.z[0]
+        loss, d_score = _gan_d_loss(score, is_real, self.variant)
+        gw2, gb2, d_h = self.d2.backward([d_score])
+        gw1, gb1, d_x = self.d1.backward(d_h)
+        return loss, (gw1, gb1), (gw2, gb2), d_x
+
+    def _g_grads_ex(self, z):
+        """变体路径的生成器梯度：返回 ((gw_g1, gb_g1), (gw_g2, gb_g2))"""
+        x_fake = self.generate(z)
+        _ = self.d1.forward(x_fake)
+        _ = self.d2.forward(_)
+        score = self.d2.z[0]
+        _loss, d_score = _gan_g_loss(score, self.variant)
+        gw2, gb2, d_h = self.d2.backward([d_score])
+        _gw1, _gb1, d_x = self.d1.backward(d_h)
+        gw_g2, gb_g2, d_h1 = self.g2.backward(d_x)
+        gw_g1, gb_g1, _ = self.g1.backward(d_h1)
+        return (gw_g1, gb_g1), (gw_g2, gb_g2)
+
+    def step(self, real_batch, rng=None, lr_d=1e-3, lr_g=1e-3, adam=True,
+             variant=None, clip_value=None):
         if not real_batch:
             raise ValueError("GAN.step: real_batch 不能为空")
+        v = _gan_check_variant(variant or self.variant, "GAN.step")
+        if v != "bce":
+            return self._step_variant(real_batch, v, rng=rng, lr_d=lr_d,
+                                      lr_g=lr_g, adam=adam,
+                                      clip_value=clip_value)
         r = rng or random
         # 1) 判别器：真实 + 生成各一次
         d_loss = 0.0
@@ -25287,6 +25405,57 @@ class GAN:
         self._apply(self.g1, gaccs["g1"], lr_g, scale_g, adam, "g1")
         self._apply(self.g2, gaccs["g2"], lr_g, scale_g, adam, "g2")
         return d_loss / (2 * len(real_batch)), g_loss / len(real_batch)
+
+    def _step_variant(self, real_batch, variant, rng=None, lr_d=1e-3,
+                      lr_g=1e-3, adam=True, clip_value=None):
+        """LSGAN / WGAN / Hinge 的一步：损失不同，梯度结构相同"""
+        r = rng or random
+        d_loss = 0.0
+        accs = {"d1": None, "d2": None}
+        for x in real_batch:
+            loss, (w1, b1), (w2, b2), _dx = self._d_grads_ex(x, True)
+            d_loss += loss
+            self._acc_pair(accs, "d1", w1, b1)
+            self._acc_pair(accs, "d2", w2, b2)
+        for _ in real_batch:
+            z = _gauss_vec(self.latent_dim, r)
+            loss, (w1, b1), (w2, b2), _dx = self._d_grads_ex(
+                self.generate(z), False)
+            d_loss += loss
+            self._acc_pair(accs, "d1", w1, b1)
+            self._acc_pair(accs, "d2", w2, b2)
+        scale = 1.0 / (2 * len(real_batch))
+        self._apply(self.d1, accs["d1"], lr_d, scale, adam, "d1")
+        self._apply(self.d2, accs["d2"], lr_d, scale, adam, "d2")
+
+        # WGAN 的 Lipschitz 约束：默认把判别器权重裁到 [-0.01, 0.01]
+        if variant == "wgan":
+            c = 0.01 if clip_value is None else clip_value
+            if isinstance(c, bool) or not isinstance(c, (int, float)) or c <= 0:
+                raise ValueError(
+                    "GAN.step: WGAN 的 clip_value 必须是 > 0 的数")
+            self._clip_weights(self.d1, c)
+            self._clip_weights(self.d2, c)
+
+        g_loss = 0.0
+        gaccs = {"g1": None, "g2": None}
+        for _ in real_batch:
+            z = _gauss_vec(self.latent_dim, r)
+            (w1, b1), (w2, b2) = self._g_grads_ex(z)
+            g_loss += _gan_g_loss(self.score(self.generate(z)), variant)[0]
+            self._acc_pair(gaccs, "g1", w1, b1)
+            self._acc_pair(gaccs, "g2", w2, b2)
+        scale_g = 1.0 / len(real_batch)
+        self._apply(self.g1, gaccs["g1"], lr_g, scale_g, adam, "g1")
+        self._apply(self.g2, gaccs["g2"], lr_g, scale_g, adam, "g2")
+        return d_loss / (2 * len(real_batch)), g_loss / len(real_batch)
+
+    @staticmethod
+    def _clip_weights(layer, clip):
+        """把层权重逐元素夹到 [-clip, clip]（WGAN 的原始 Lipschitz 约束）"""
+        for row in layer.weights:
+            for i in range(len(row)):
+                row[i] = min(clip, max(-clip, row[i]))
 
     @staticmethod
     def _acc_pair(accs, key, gw, gb):

@@ -16545,3 +16545,120 @@ class TestFlowMatching:
         assert raises(lambda: self._mk().adam_step(0.01, eps=0.0))
         assert raises(lambda: self._mk().adam_step(0.01, b2=1.0))
         assert raises(lambda: self._mk().train_step([0.0, 0.0], t=2.0))
+
+# ====
+#  TestGANVariants：GAN 损失变体（BCE / LSGAN / WGAN / Hinge）
+# ====
+class TestGANVariants:
+    DATA = [[2.0, 2.0], [-2.0, -2.0], [2.0, -2.0], [-2.0, 2.0]]
+
+    def test_d_loss_and_grad_closed_form(self):
+        sig = AI._sigmoid_scalar
+        for s in (0.7, -0.3):
+            p = sig(s)
+            loss, g = AI._gan_d_loss(s, True, "bce")
+            assert abs(loss + math.log(p)) < 1e-12
+            assert abs(g - (p - 1.0)) < 1e-12
+            loss, g = AI._gan_d_loss(s, False, "bce")
+            assert abs(loss + math.log(1.0 - p)) < 1e-12
+            assert abs(g - p) < 1e-12
+            loss, g = AI._gan_d_loss(s, True, "lsgan")
+            assert abs(loss - 0.5 * (s - 1.0) ** 2) < 1e-12
+            assert abs(g - (s - 1.0)) < 1e-12
+            loss, g = AI._gan_d_loss(s, True, "wgan")
+            assert abs(loss + s) < 1e-12 and abs(g + 1.0) < 1e-12
+            loss, g = AI._gan_d_loss(s, False, "hinge")
+            assert abs(loss - max(0.0, 1.0 + s)) < 1e-12
+        # hinge 越过边界后损失与梯度都为 0
+        loss, g = AI._gan_d_loss(2.0, True, "hinge")
+        assert loss == 0.0 and g == 0.0
+        # 生成器侧
+        for s in (0.7, 3.0):
+            loss, g = AI._gan_g_loss(s, "bce")
+            assert abs(loss + math.log(AI._sigmoid_scalar(s))) < 1e-12
+            assert abs(g + (1.0 - AI._sigmoid_scalar(s))) < 1e-12
+            loss, g = AI._gan_g_loss(s, "wgan")
+            assert abs(loss + s) < 1e-12 and abs(g + 1.0) < 1e-12
+
+    def test_bce_variant_matches_default(self):
+        random.seed(0)
+        a = AI.GAN(2, hidden_dim=8, latent_dim=2)
+        random.seed(0)
+        b = AI.GAN(2, hidden_dim=8, latent_dim=2, variant="bce")
+        ra, rb = random.Random(7), random.Random(7)
+        for _ in range(20):
+            la = a.step(self.DATA, rng=ra, lr_d=0.01, lr_g=0.01)
+            lb = b.step(self.DATA, rng=rb, lr_d=0.01, lr_g=0.01)
+            assert la == lb
+        for i in range(len(a.d1.weights)):
+            for j in range(len(a.d1.weights[0])):
+                assert a.d1.weights[i][j] == b.d1.weights[i][j]
+        assert b.d2.activation_name == "sigmoid"
+
+    def test_variants_train_and_score(self):
+        for v in ("lsgan", "wgan", "hinge"):
+            g = AI.GAN(2, hidden_dim=4, latent_dim=2, variant=v)
+            assert g.d2.activation_name == "linear"
+            raw = g.score([0.3, -0.2])
+            assert abs(g.discriminate([0.3, -0.2]) - AI._sigmoid_scalar(raw)) < 1e-12
+            before = [row[:] for row in g.g1.weights]
+            r = random.Random(0)
+            for _ in range(60):
+                dl, gl = g.step(self.DATA, rng=r, lr_d=0.01, lr_g=0.01)
+            assert math.isfinite(dl) and math.isfinite(gl)
+            moved = any(before[i][j] != g.g1.weights[i][j]
+                        for i in range(len(before)) for j in range(len(before[0])))
+            assert moved
+
+    def test_wgan_weight_clipping(self):
+        for clip in (None, 0.02):
+            random.seed(0)
+            g = AI.GAN(2, hidden_dim=8, latent_dim=2, variant="wgan")
+            r = random.Random(0)
+            for _ in range(30):
+                g.step(self.DATA, rng=r, lr_d=0.01, lr_g=0.01, clip_value=clip)
+            c = 0.01 if clip is None else clip
+            worst = max(abs(v) for layer in (g.d1, g.d2)
+                        for row in layer.weights for v in row)
+            assert worst <= c + 1e-15
+        # 不裁剪的变体权重能超过 0.01
+        random.seed(0)
+        g = AI.GAN(2, hidden_dim=8, latent_dim=2, variant="lsgan")
+        r = random.Random(0)
+        for _ in range(30):
+            g.step(self.DATA, rng=r, lr_d=0.01, lr_g=0.01)
+        worst = max(abs(v) for layer in (g.d1, g.d2)
+                    for row in layer.weights for v in row)
+        assert worst > 0.01
+
+    def test_r1_penalty_and_errors(self):
+        assert abs(AI.r1_penalty([[3.0, 4.0]], 10.0) - 125.0) < 1e-12
+        assert abs(AI.r1_penalty([[3.0, 4.0], [1.0, 0.0]], 10.0) - 65.0) < 1e-12
+        assert AI.r1_penalty([[3.0, 4.0]], 0.0) == 0.0
+        for fn, args in [
+            (AI._gan_d_loss, (0.5, True, "nope")),
+            (AI._gan_d_loss, ("x", True, "bce")),
+            (AI._gan_d_loss, (True, True, "bce")),
+            (AI._gan_g_loss, (0.5, "nope")),
+            (AI.r1_penalty, ([], 1.0)),
+            (AI.r1_penalty, ([[1.0]], -1.0)),
+            (AI.GAN, (2, 4, 2, "nope")),
+            (AI.GAN, (2, 4, 2, True)),
+        ]:
+            try:
+                fn(*args)
+                raise AssertionError(f"{fn.__name__}{args} 应当报错")
+            except (ValueError, TypeError):
+                pass
+        random.seed(0)
+        g = AI.GAN(2, hidden_dim=4, latent_dim=2, variant="wgan")
+        try:
+            g.step(self.DATA, rng=random.Random(0), clip_value=-1.0)
+            raise AssertionError("clip_value<0 应当报错")
+        except ValueError:
+            pass
+        try:
+            g.step(self.DATA, rng=random.Random(0), variant="nope")
+            raise AssertionError("variant 非法应当报错")
+        except ValueError:
+            pass
