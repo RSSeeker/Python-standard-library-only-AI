@@ -9741,3 +9741,169 @@ class TestPool3d:
             AI.AvgPool3d(2).forward([])
         with pytest.raises(RuntimeError):
             AI.MaxPool3d(2).backward([[[[1.0]]]])
+
+
+class TestConv3d:
+    def test_shape_and_center_tap(self):
+        conv = AI.Conv3d(1, 1, 3, stride=1, padding=1)
+        for a in range(3):
+            for b in range(3):
+                for c in range(3):
+                    conv.weights[0][0][a][b][c] = 1.0 if (a, b, c) == (1, 1, 1) else 0.0
+        x = [[[[0.0] * 2 for _ in range(2)] for _ in range(2)]]
+        x[0][0][0][0] = 5.0
+        out = conv.forward(x)
+        assert (len(out), len(out[0]), len(out[0][0]), len(out[0][0][0])) == (1, 2, 2, 2)
+        # 只留中心 tap 时前向是平移不变的恒等映射
+        assert abs(out[0][0][0][0] - 5.0) < 1e-15
+        assert conv.param_count() == 1 * 1 * 27 + 1
+
+    def test_gradients_match_finite_difference(self):
+        random.seed(81)
+        conv = AI.Conv3d(2, 2, 3, stride=1, padding=1)
+        x = [[[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+              for _ in range(3)] for _ in range(2)]
+        dout = [[[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                 for _ in range(3)] for _ in range(2)]
+
+        def loss(xx):
+            out = conv.forward(xx)
+            return sum(out[o][a][b][c] * dout[o][a][b][c]
+                       for o in range(2) for a in range(3)
+                       for b in range(3) for c in range(3))
+
+        conv.zero_grad()
+        conv.forward([[[[v for v in r] for r in p2] for p2 in p1] for p1 in x])
+        dx = conv.backward(dout)
+        eps = 1e-6
+        for ic in range(2):
+            for a in range(3):
+                for b in range(3):
+                    for c in range(3):
+                        old = x[ic][a][b][c]
+                        x[ic][a][b][c] = old + eps
+                        vp = loss(x)
+                        x[ic][a][b][c] = old - eps
+                        vm = loss(x)
+                        x[ic][a][b][c] = old
+                        assert abs((vp - vm) / (2 * eps) - dx[ic][a][b][c]) < 1e-8
+        conv.zero_grad()
+        conv.forward(x)
+        conv.backward(dout)
+        for oc in range(2):
+            for ic in range(2):
+                for a in range(3):
+                    for b in range(3):
+                        for c in range(3):
+                            old = conv.weights[oc][ic][a][b][c]
+                            conv.weights[oc][ic][a][b][c] = old + eps
+                            vp = loss(x)
+                            conv.weights[oc][ic][a][b][c] = old - eps
+                            vm = loss(x)
+                            conv.weights[oc][ic][a][b][c] = old
+                            assert abs((vp - vm) / (2 * eps)
+                                       - conv.grad_w[oc][ic][a][b][c]) < 1e-8
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.Conv3d(0, 2, 3)
+        with pytest.raises(ValueError):
+            AI.Conv3d(2, 2, 0)
+        with pytest.raises(ValueError):
+            AI.Conv3d(2, 2, 3, stride=0)
+        with pytest.raises(ValueError):
+            AI.Conv3d(2, 2, 3, padding=-1)
+        conv = AI.Conv3d(1, 1, 3)
+        with pytest.raises(RuntimeError):
+            conv.backward([[[[1.0]]]])
+        with pytest.raises(ValueError):
+            AI.Conv3d(2, 1, 3).forward([[[[1.0]]]])
+        # kernel 3 > 输入 1 且无 padding，输出维度为负
+        with pytest.raises(ValueError):
+            AI.Conv3d(1, 1, 3).forward([[[[1.0]]]])
+
+
+class TestConvTranspose3d:
+    def test_shape_formula(self):
+        t = AI.ConvTranspose3d(1, 1, 3, stride=2, padding=1)
+        # (D-1)*s - 2p + k = (2-1)*2 - 2 + 3 = 3
+        assert t._out_shape(2, 2, 2) == (3, 3, 3)
+        # (D-1)*s - 2p + k + op = (2-1)*2 - 0 + 3 + 1 = 6
+        t2 = AI.ConvTranspose3d(1, 1, 3, stride=2, padding=0, output_padding=1)
+        assert t2._out_shape(2, 2, 2) == (6, 6, 6)
+        x = [[[[0.0] * 2 for _ in range(2)] for _ in range(2)]]
+        out = t2.forward(x)
+        assert (len(out), len(out[0]), len(out[0][0]), len(out[0][0][0])) == (1, 6, 6, 6)
+        assert t2.param_count() == 1 * 1 * 27 + 1
+
+    def test_single_point_scatter_and_gradients(self):
+        t = AI.ConvTranspose3d(1, 1, 3, stride=2, padding=1)
+        for a in range(3):
+            for b in range(3):
+                for c in range(3):
+                    t.weights[0][0][a][b][c] = 1.0 if (a, b, c) == (2, 2, 2) else 0.0
+        x = [[[[0.0] * 2 for _ in range(2)] for _ in range(2)]]
+        x[0][0][0][0] = 7.0
+        out = t.forward(x)
+        # i=0,k=2,s=2,p=1 -> o = 0*2-1+2 = 1
+        assert abs(out[0][1][1][1] - 7.0) < 1e-15
+
+        random.seed(82)
+        tt = AI.ConvTranspose3d(2, 2, 3, stride=2, padding=1)
+        xt = [[[[random.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+               for _ in range(2)] for _ in range(2)]
+        dout = [[[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                 for _ in range(3)] for _ in range(2)]
+
+        def loss(xx):
+            out = tt.forward(xx)
+            return sum(out[o][a][b][c] * dout[o][a][b][c]
+                       for o in range(2) for a in range(3)
+                       for b in range(3) for c in range(3))
+
+        eps = 1e-6
+        tt.zero_grad()
+        tt.forward(xt)
+        dx = tt.backward(dout)
+        for ic in range(2):
+            for a in range(2):
+                for b in range(2):
+                    for c in range(2):
+                        old = xt[ic][a][b][c]
+                        xt[ic][a][b][c] = old + eps
+                        vp = loss(xt)
+                        xt[ic][a][b][c] = old - eps
+                        vm = loss(xt)
+                        xt[ic][a][b][c] = old
+                        assert abs((vp - vm) / (2 * eps) - dx[ic][a][b][c]) < 1e-8
+        tt.zero_grad()
+        tt.forward(xt)
+        tt.backward(dout)
+        for oc in range(2):
+            for ic in range(2):
+                for a in range(3):
+                    for b in range(3):
+                        for c in range(3):
+                            old = tt.weights[oc][ic][a][b][c]
+                            tt.weights[oc][ic][a][b][c] = old + eps
+                            vp = loss(xt)
+                            tt.weights[oc][ic][a][b][c] = old - eps
+                            vm = loss(xt)
+                            tt.weights[oc][ic][a][b][c] = old
+                            assert abs((vp - vm) / (2 * eps)
+                                       - tt.grad_w[oc][ic][a][b][c]) < 1e-8
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.ConvTranspose3d(0, 2, 3)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose3d(2, 2, 3, stride=2, output_padding=2)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose3d(2, 2, 3, output_padding=-1)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose3d(2, 2, 3, padding=-1)
+        t = AI.ConvTranspose3d(1, 1, 3)
+        with pytest.raises(RuntimeError):
+            t.backward([[[[1.0]]]])
+        with pytest.raises(ValueError):
+            AI.ConvTranspose3d(2, 1, 3).forward([[[[1.0]]]])

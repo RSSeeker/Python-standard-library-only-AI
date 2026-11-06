@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（773 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（779 项）
 
 ## 特性
 
@@ -166,6 +166,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `ConvTranspose1d` | 一维转置卷积：`(Cin,L) → (Cout, (L-1)*s-2p+k+op)`，前向把每个输入点按 stride 摆到输出网格累加，反向对 dx 与 `grad_w` 做同样的散射 |
 | `MaxPool1d` / `AvgPool1d` | 一维池化：`(C,L) → (C,(L+2p-k)//s+1)`；最大池化只回传最大值位置，平均池化把梯度均分回窗口 |
 | `MaxPool3d` / `AvgPool3d` | 三维池化：`(C,D,H,W) → (C,Do,Ho,Wo)`，同样按窗口回传/均分，padding 位置不接收梯度 |
+| `Conv3d` | 三维卷积：`(C,D,H,W) → (Cout,Od,Oh,Ow)`，三轴独立 kernel/stride/padding；直接滑动窗口累加（不做 im2col，小体数据更省内存） |
+| `ConvTranspose3d` | 三维转置卷积：每轴 `(D-1)*s-2p+k+op`，前向按 stride 散射累加，`output_padding` 只改输出尺寸 |
 | `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `BatchNorm2d` | 二维批归一化：按通道在 H×W 上归一化，训练更新 running 统计量、`eval()` 用 running；`backward` 返回 `(dx, grad_gamma, grad_beta)`，**反向也分模式**（eval 时统计量来自 running，dx 为逐元素 `gamma/sqrt(var+eps)`） |
@@ -1033,7 +1035,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-773 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+779 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1103,6 +1105,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConvTranspose1d` | 输出长度公式与单点铺开、`dx` 与 `grad_w` 中心差分、`output_padding >= stride` 报错 |
 | `TestPool1d` | 最大/平均池化数值、floor 语义（长度不整除时丢弃尾窗）、梯度路由（最大只回一个位置、平均均分） |
 | `TestPool3d` | 三维形状、第一窗口等于窗口最大/均值、两个方向梯度总量守恒、非法参数与未 forward 报错 |
+| `TestConv3d` | 中心 tap 退化为平移不变的恒等映射、`param_count`、`dx` 与 `grad_w` 中心差分、非法 kernel/stride/padding 与通道数不符 |
+| `TestConvTranspose3d` | 输出尺寸公式（含 `output_padding`）、单点散射位置、`dx` 与 `grad_w` 中心差分、`output_padding >= stride` 报错 |
 | `TestGQA` | KV 头形状、`num_kv_heads` 缺省与显式传等值逐位一致、**共享 KV 下 `W_k`/`W_v` 梯度 vs 数值梯度**、`forward_step` == 整段前向、参数确实变少、非法取值 |
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
@@ -1159,7 +1163,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 773 个单元测试
+├── test_ai.py       # 779 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

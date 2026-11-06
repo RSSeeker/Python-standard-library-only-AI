@@ -129,7 +129,7 @@
 - [ ] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支）
 - [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
 - [x] `ConvTranspose1d`（W2-D）：`(Cin,L) -> (Cout,(L-1)*s-2p+k+op)`，前向把每个输入点按 stride 摆到输出网格累加，`dx` 与 `grad_w` 中心差分 ≤1e-8
-- [ ] `Conv3d` / `ConvTranspose3d`（三维卷积与转置，形状推导同上但多一维）
+- [x] `Conv3d` / `ConvTranspose3d`（W2-E）：三轴独立 `kernel/stride/padding`，`(D-1)*s-2p+k+op` 的输出尺寸，`dx` 与 `grad_w` 中心差分 ≤1e-8，中心 tap 退化为恒等映射、单点散射位置逐个校验
 - [x] 池化家族（部分，W2-A 提交）：`GlobalMaxPool2d`（只回传最大值位置）、`AdaptiveMaxPool2d`（分箱与
       `AdaptiveAvgPool2d` 一致，`(1,1)` 与全局最大逐位相同）、`LPPool2d`（`p=1` 在非负输入上等于
       `AvgPool2d`，随 p 增大单调逼近 `MaxPool2d`，梯度差分 ≤1e-9）

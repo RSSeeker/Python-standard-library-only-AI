@@ -2604,6 +2604,427 @@ class AvgPool3d:
                                     if 0 <= w < W:
                                         dx[c][d][h][w] += g
         return dx
+def _conv3d_zeros(out_channels, in_channels, kd, kh, kw):
+    """构造 [oc][ic][kd][kh][kw] 的全零嵌套列表（用循环，避免推导式括号层数出错）"""
+    out = []
+    for _ in range(out_channels):
+        per_oc = []
+        for _ in range(in_channels):
+            per_ic = []
+            for _ in range(kd):
+                per_kd = []
+                for _ in range(kh):
+                    per_kd.append([0.0] * kw)
+                per_ic.append(per_kd)
+            per_oc.append(per_ic)
+        out.append(per_oc)
+    return out
+
+
+def _conv3d_random(out_channels, in_channels, kd, kh, kw, std):
+    """He 初始化用的随机核，结构与 _conv3d_zeros 相同"""
+    out = _conv3d_zeros(out_channels, in_channels, kd, kh, kw)
+    for oc in range(out_channels):
+        for ic in range(in_channels):
+            for a in range(kd):
+                for b in range(kh):
+                    for c in range(kw):
+                        out[oc][ic][a][b][c] = random.gauss(0, std)
+    return out
+
+
+class Conv3d:
+    """3D 卷积层（输入 (C, D, H, W)，权重 [oc][ic][kd][kh][kw]，He 初始化）
+
+    直接滑动窗口累加，不走 im2col：三维展开的矩阵通常是 im2col 的几十倍，
+    而这层主要处理小体数据（医学影像 patch、视频片段），直接循环更省内存。
+    不做 groups —— 分组三维卷积用不到，先不引入这层复杂度。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size,
+                 stride=1, padding=0):
+        for name, v in (("in_channels", in_channels),
+                        ("out_channels", out_channels)):
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise ValueError(f"Conv3d: {name} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = ((kernel_size, ) * 3 if isinstance(kernel_size, int)
+                            else tuple(kernel_size))
+        self.stride = ((stride, ) * 3 if isinstance(stride, int) else tuple(stride))
+        self.padding = ((padding, ) * 3 if isinstance(padding, int)
+                        else tuple(padding))
+        if len(self.kernel_size) != 3 or min(self.kernel_size) <= 0:
+            raise ValueError(
+                f"Conv3d: kernel_size 必须是三个正数，收到 {kernel_size!r}")
+        if len(self.stride) != 3 or min(self.stride) <= 0:
+            raise ValueError(f"Conv3d: stride 必须是三个正数，收到 {stride!r}")
+        if len(self.padding) != 3 or min(self.padding) < 0:
+            raise ValueError(f"Conv3d: padding 必须是三个非负数，收到 {padding!r}")
+        self.kd, self.kh, self.kw = self.kernel_size
+        self.sd, self.sh, self.sw = self.stride
+        self.pd, self.ph, self.pw = self.padding
+
+        fan_in = in_channels * self.kd * self.kh * self.kw
+        std = math.sqrt(2.0 / fan_in)
+        self.weights = _conv3d_random(out_channels, in_channels,
+                                      self.kd, self.kh, self.kw, std)
+        self.biases = [0.0] * out_channels
+        self.m_w = _conv3d_zeros(out_channels, in_channels,
+                                 self.kd, self.kh, self.kw)
+        self.v_w = _conv3d_zeros(out_channels, in_channels,
+                                 self.kd, self.kh, self.kw)
+        self.m_b = [0.0] * out_channels
+        self.v_b = [0.0] * out_channels
+        self.x_shape = None
+        self.out_shape = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        """清零梯度缓冲区（保留 x_shape/out_shape 供 backward 使用）"""
+        self.grad_w = _conv3d_zeros(self.out_channels, self.in_channels,
+                                    self.kd, self.kh, self.kw)
+        self.grad_b = [0.0] * self.out_channels
+
+    def param_count(self):
+        """可训练参数个数（权重 + 偏置）"""
+        return (self.out_channels * self.in_channels * self.kd * self.kh * self.kw
+                + self.out_channels)
+
+    def _out_shape(self, D, H, W):
+        od = (D + 2 * self.pd - self.kd) // self.sd + 1
+        oh = (H + 2 * self.ph - self.kh) // self.sh + 1
+        ow = (W + 2 * self.pw - self.kw) // self.sw + 1
+        if od <= 0 or oh <= 0 or ow <= 0:
+            raise ValueError(
+                f"Conv3d: 输入 {D}x{H}x{W} 配 kernel {self.kernel_size}、"
+                f"padding {self.padding}、stride {self.stride} 得到输出 "
+                f"{od}x{oh}x{ow}，必须都 > 0"
+            )
+        return od, oh, ow
+
+    def _pad(self, x):
+        """对 (C, D, H, W) 做 zero-padding"""
+        C, D, H, W = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        Dp, Hp, Wp = D + 2 * self.pd, H + 2 * self.ph, W + 2 * self.pw
+        padded = []
+        for _ in range(C):
+            per_c = []
+            for _ in range(Dp):
+                per_d = []
+                for _ in range(Hp):
+                    per_d.append([0.0] * Wp)
+                per_c.append(per_d)
+            padded.append(per_c)
+        for c in range(C):
+            for d in range(D):
+                for h in range(H):
+                    for w in range(W):
+                        padded[c][d + self.pd][h + self.ph][w + self.pw] = x[c][d][h][w]
+        return padded
+
+    def forward(self, x):
+        """x: (C, D, H, W) -> (out_channels, Od, Oh, Ow)"""
+        if not x or not isinstance(x[0], list) or not isinstance(x[0][0], list):
+            raise ValueError("Conv3d.forward: 输入必须是 (C, D, H, W) 嵌套列表")
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"Conv3d.forward: 输入通道 {len(x)} != in_channels={self.in_channels}"
+            )
+        C, D, H, W = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        od, oh, ow = self._out_shape(D, H, W)
+        self.x_shape = (C, D, H, W)
+        self.out_shape = (self.out_channels, od, oh, ow)
+        xp = self._pad(x)
+        self._xp = xp
+
+        out = []
+        for oc in range(self.out_channels):
+            woc = self.weights[oc]
+            bias = self.biases[oc]
+            plane = []
+            for o_d in range(od):
+                slab = []
+                for o_h in range(oh):
+                    row = []
+                    for o_w in range(ow):
+                        acc = 0.0
+                        for ic in range(C):
+                            wic = woc[ic]
+                            xc = xp[ic]
+                            for kd in range(self.kd):
+                                xd = xc[o_d * self.sd + kd]
+                                wd = wic[kd]
+                                for kh in range(self.kh):
+                                    xh = xd[o_h * self.sh + kh]
+                                    wh = wd[kh]
+                                    for kw in range(self.kw):
+                                        acc += wh[kw] * xh[o_w * self.sw + kw]
+                        row.append(acc + bias)
+                    slab.append(row)
+                plane.append(slab)
+            out.append(plane)
+        return out
+
+    def backward(self, dout):
+        """dout: (out_channels, Od, Oh, Ow) -> dx: (C, D, H, W)"""
+        if self.x_shape is None:
+            raise RuntimeError("Conv3d.backward: 需要先调用 forward")
+        C, D, H, W = self.x_shape
+        _, od, oh, ow = self.out_shape
+        Dp, Hp, Wp = D + 2 * self.pd, H + 2 * self.ph, W + 2 * self.pw
+        xp = self._xp
+        dxp = []
+        for _ in range(C):
+            per_c = []
+            for _ in range(Dp):
+                per_d = []
+                for _ in range(Hp):
+                    per_d.append([0.0] * Wp)
+                per_c.append(per_d)
+            dxp.append(per_c)
+
+        for oc in range(self.out_channels):
+            woc = self.weights[oc]
+            doc = dout[oc]
+            for o_d in range(od):
+                for o_h in range(oh):
+                    row = doc[o_d][o_h]
+                    self.grad_b[oc] += sum(row)
+                    for o_w in range(ow):
+                        g = row[o_w]
+                        for ic in range(C):
+                            wic = woc[ic]
+                            gic = self.grad_w[oc][ic]
+                            xc = xp[ic]
+                            dc = dxp[ic]
+                            for kd in range(self.kd):
+                                i_d = o_d * self.sd + kd
+                                xd = xc[i_d]
+                                dd = dc[i_d]
+                                gd = gic[kd]
+                                wd = wic[kd]
+                                for kh in range(self.kh):
+                                    i_h = o_h * self.sh + kh
+                                    xh = xd[i_h]
+                                    dh = dd[i_h]
+                                    gh = gd[kh]
+                                    wh = wd[kh]
+                                    for kw in range(self.kw):
+                                        i_w = o_w * self.sw + kw
+                                        gh[kw] += g * xh[i_w]
+                                        dh[i_w] += g * wh[kw]
+
+        if min(self.padding) == 0:
+            return dxp
+        dx = []
+        for _ in range(C):
+            per_c = []
+            for _ in range(D):
+                per_d = []
+                for _ in range(H):
+                    per_d.append([0.0] * W)
+                per_c.append(per_d)
+            dx.append(per_c)
+        for c in range(C):
+            for d in range(D):
+                for h in range(H):
+                    for w in range(W):
+                        dx[c][d][h][w] = dxp[c][d + self.pd][h + self.ph][w + self.pw]
+        return dx
+
+
+class ConvTranspose3d:
+    """3D 转置卷积（输入 (Cin, D, H, W) -> (Cout, Od, Oh, Ow)）
+
+    每个维度的输出尺寸 `(D-1)*sd - 2*pd + kd + opd`（三轴独立）。前向把每个
+    输入点乘上卷积核后按 stride 摆到输出网格累加，反向对 dx 与 grad_w 做同样
+    的散射；`output_padding` 只影响输出尺寸，不引入额外参数。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size,
+                 stride=1, padding=0, output_padding=0):
+        for name, v in (("in_channels", in_channels),
+                        ("out_channels", out_channels)):
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise ValueError(f"ConvTranspose3d: {name} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = ((kernel_size, ) * 3 if isinstance(kernel_size, int)
+                            else tuple(kernel_size))
+        self.stride = ((stride, ) * 3 if isinstance(stride, int) else tuple(stride))
+        self.padding = ((padding, ) * 3 if isinstance(padding, int)
+                        else tuple(padding))
+        self.output_padding = ((output_padding, ) * 3
+                               if isinstance(output_padding, int)
+                               else tuple(output_padding))
+        if len(self.kernel_size) != 3 or min(self.kernel_size) <= 0:
+            raise ValueError(
+                f"ConvTranspose3d: kernel_size 必须是三个正数，收到 {kernel_size!r}")
+        if len(self.stride) != 3 or min(self.stride) <= 0:
+            raise ValueError(
+                f"ConvTranspose3d: stride 必须是三个正数，收到 {stride!r}")
+        if len(self.padding) != 3 or min(self.padding) < 0:
+            raise ValueError(
+                f"ConvTranspose3d: padding 必须是三个非负数，收到 {padding!r}")
+        if len(self.output_padding) != 3 or min(self.output_padding) < 0:
+            raise ValueError(
+                f"ConvTranspose3d: output_padding 必须是三个非负数，"
+                f"收到 {output_padding!r}")
+        self.kd, self.kh, self.kw = self.kernel_size
+        self.sd, self.sh, self.sw = self.stride
+        self.pd, self.ph, self.pw = self.padding
+        self.opd, self.oph, self.opw = self.output_padding
+        for name, op, st in (("D", self.opd, self.sd), ("H", self.oph, self.sh),
+                             ("W", self.opw, self.sw)):
+            if op >= st:
+                raise ValueError(
+                    f"ConvTranspose3d: 维度 {name} 的 output_padding={op} "
+                    f"必须小于 stride={st}"
+                )
+
+        fan_in = in_channels * self.kd * self.kh * self.kw
+        std = math.sqrt(2.0 / fan_in)
+        self.weights = _conv3d_random(out_channels, in_channels,
+                                      self.kd, self.kh, self.kw, std)
+        self.biases = [0.0] * out_channels
+        self.m_w = _conv3d_zeros(out_channels, in_channels,
+                                 self.kd, self.kh, self.kw)
+        self.v_w = _conv3d_zeros(out_channels, in_channels,
+                                 self.kd, self.kh, self.kw)
+        self.m_b = [0.0] * out_channels
+        self.v_b = [0.0] * out_channels
+        self.x_shape = None
+        self.out_shape = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_w = _conv3d_zeros(self.out_channels, self.in_channels,
+                                    self.kd, self.kh, self.kw)
+        self.grad_b = [0.0] * self.out_channels
+
+    def param_count(self):
+        return (self.out_channels * self.in_channels * self.kd * self.kh * self.kw
+                + self.out_channels)
+
+    def _out_shape(self, D, H, W):
+        od = (D - 1) * self.sd - 2 * self.pd + self.kd + self.opd
+        oh = (H - 1) * self.sh - 2 * self.ph + self.kh + self.oph
+        ow = (W - 1) * self.sw - 2 * self.pw + self.kw + self.opw
+        if od <= 0 or oh <= 0 or ow <= 0:
+            raise ValueError(
+                f"ConvTranspose3d: 输入 {D}x{H}x{W} 得到输出 {od}x{oh}x{ow}，"
+                f"必须都 > 0（检查 kernel/stride/padding/output_padding）"
+            )
+        return od, oh, ow
+
+    def forward(self, x):
+        """x: (Cin, D, H, W) -> (Cout, Od, Oh, Ow)"""
+        if not x or not isinstance(x[0], list) or not isinstance(x[0][0], list):
+            raise ValueError(
+                "ConvTranspose3d.forward: 输入必须是 (Cin, D, H, W) 嵌套列表")
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"ConvTranspose3d.forward: 输入通道 {len(x)} "
+                f"!= in_channels={self.in_channels}"
+            )
+        C, D, H, W = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        od, oh, ow = self._out_shape(D, H, W)
+        self.x_shape = (C, D, H, W)
+        self.out_shape = (self.out_channels, od, oh, ow)
+        self._x = x
+
+        # 每个输出位置先放上偏置，再把输入点散射累加进去
+        out = []
+        for oc in range(self.out_channels):
+            b = float(self.biases[oc])
+            per_oc = []
+            for _ in range(od):
+                per_d = []
+                for _ in range(oh):
+                    per_d.append([b] * ow)
+                per_oc.append(per_d)
+            out.append(per_oc)
+
+        for ic in range(C):
+            xc = x[ic]
+            for i_d in range(D):
+                for i_h in range(H):
+                    for i_w in range(W):
+                        v = xc[i_d][i_h][i_w]
+                        if v == 0.0:
+                            continue
+                        for oc in range(self.out_channels):
+                            woc = self.weights[oc][ic]
+                            for kd in range(self.kd):
+                                o_d = i_d * self.sd - self.pd + kd
+                                if o_d < 0 or o_d >= od:
+                                    continue
+                                for kh in range(self.kh):
+                                    o_h = i_h * self.sh - self.ph + kh
+                                    if o_h < 0 or o_h >= oh:
+                                        continue
+                                    dd = out[oc][o_d][o_h]
+                                    wr = woc[kd][kh]
+                                    for kw in range(self.kw):
+                                        o_w = i_w * self.sw - self.pw + kw
+                                        if 0 <= o_w < ow:
+                                            dd[o_w] += v * wr[kw]
+        return out
+
+    def backward(self, dout):
+        """dout: (Cout, Od, Oh, Ow) -> dx: (Cin, D, H, W)"""
+        if self.x_shape is None:
+            raise RuntimeError("ConvTranspose3d.backward: 需要先调用 forward")
+        C, D, H, W = self.x_shape
+        _, od, oh, ow = self.out_shape
+        x = self._x
+
+        for oc in range(self.out_channels):
+            doc = dout[oc]
+            self.grad_b[oc] += sum(doc[d][h][w]
+                                   for d in range(od) for h in range(oh)
+                                   for w in range(ow))
+
+        dx = []
+        for _ in range(C):
+            per_c = []
+            for _ in range(D):
+                per_d = []
+                for _ in range(H):
+                    per_d.append([0.0] * W)
+                per_c.append(per_d)
+            dx.append(per_c)
+
+        for ic in range(C):
+            xc = x[ic]
+            for i_d in range(D):
+                for i_h in range(H):
+                    for i_w in range(W):
+                        acc = 0.0
+                        v = xc[i_d][i_h][i_w]
+                        for oc in range(self.out_channels):
+                            woc = self.weights[oc][ic]
+                            doc = dout[oc]
+                            wg = self.grad_w[oc][ic]
+                            for kd in range(self.kd):
+                                o_d = i_d * self.sd - self.pd + kd
+                                if o_d < 0 or o_d >= od:
+                                    continue
+                                for kh in range(self.kh):
+                                    o_h = i_h * self.sh - self.ph + kh
+                                    if o_h < 0 or o_h >= oh:
+                                        continue
+                                    for kw in range(self.kw):
+                                        o_w = i_w * self.sw - self.pw + kw
+                                        if 0 <= o_w < ow:
+                                            g = doc[o_d][o_h][o_w]
+                                            acc += g * woc[kd][kh][kw]
+                                            wg[kd][kh][kw] += g * v
+                        dx[ic][i_d][i_h][i_w] = acc
+        return dx
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
