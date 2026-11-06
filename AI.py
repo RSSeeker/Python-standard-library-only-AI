@@ -25283,6 +25283,252 @@ def _realnvp_masks(data_dim, num_layers):
     return masks
 
 
+def _glow_lu(a):
+    """对 n x n 矩阵做带部分主元的 LU，返回 (LU, perm, det_sign)"""
+    n = len(a)
+    m = [row[:] for row in a]
+    perm = list(range(n))
+    sign = 1.0
+    for k in range(n):
+        pivot = k
+        best = abs(m[k][k])
+        for i in range(k + 1, n):
+            if abs(m[i][k]) > best:
+                best = abs(m[i][k])
+                pivot = i
+        if best < 1e-14:
+            raise ValueError("Glow: 矩阵不可逆（主元过小）")
+        if pivot != k:
+            m[k], m[pivot] = m[pivot], m[k]
+            perm[k], perm[pivot] = perm[pivot], perm[k]
+            sign = -sign
+        for i in range(k + 1, n):
+            f = m[i][k] / m[k][k]
+            m[i][k] = f
+            for j in range(k + 1, n):
+                m[i][j] -= f * m[k][j]
+    return m, perm, sign
+
+
+def _glow_det(a):
+    m, _perm, sign = _glow_lu(a)
+    d = sign
+    for i in range(len(m)):
+        d *= m[i][i]
+    return d
+
+
+def _glow_solve(a, b):
+    """解 a x = b（a 为 n x n，b 为长度 n）"""
+    n = len(a)
+    m, perm, _sign = _glow_lu(a)
+    rhs = [b[perm[i]] for i in range(n)]
+    y = [0.0] * n
+    for i in range(n):
+        acc = rhs[i]
+        for j in range(i):
+            acc -= m[i][j] * y[j]
+        y[i] = acc
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        acc = y[i]
+        for j in range(i + 1, n):
+            acc -= m[i][j] * x[j]
+        x[i] = acc / m[i][i]
+    return x
+
+
+def _glow_inverse_matrix(a):
+    n = len(a)
+    cols = []
+    for j in range(n):
+        e = [0.0] * n
+        e[j] = 1.0
+        cols.append(_glow_solve(a, e))
+    return [[cols[j][i] for j in range(n)] for i in range(n)]
+
+
+class ActNorm:
+    """ActNorm：逐维仿射 ``y = (x - b) * exp(log_s)``，可数据初始化。
+
+    ``data_init(batch)`` 把 ``b`` 设成首批均值、``log_s`` 设成 ``-log(std)``，
+    这是 Glow 论文里的 data-dependent 初始化（让第一层输出零均值单位方差）。
+    ``logdet = sum(log_s)`` 与输入无关，所以整层的行列式是常数。
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-8):
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("ActNorm: dim 必须是 >= 1 的整数")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not (eps > 0):
+            raise ValueError("ActNorm: eps 必须是正数")
+        self.dim = dim
+        self.eps = float(eps)
+        self.b = [0.0] * dim
+        self.log_s = [0.0] * dim
+        self.g_b = [0.0] * dim
+        self.g_log_s = [0.0] * dim
+        self._initialized = False
+
+    def data_init(self, batch):
+        if not batch:
+            raise ValueError("ActNorm.data_init: batch 不能为空")
+        n = len(batch)
+        for j in range(self.dim):
+            mean = sum(row[j] for row in batch) / n
+            var = sum((row[j] - mean) ** 2 for row in batch) / n
+            self.b[j] = mean
+            self.log_s[j] = -0.5 * math.log(var + self.eps)
+        self._initialized = True
+        return self
+
+    def forward(self, x):
+        if len(x) != self.dim:
+            raise ValueError(f"ActNorm.forward: 输入维度应为 {self.dim}")
+        s = [math.exp(v) for v in self.log_s]
+        y = [(x[j] - self.b[j]) * s[j] for j in range(self.dim)]
+        self._cache = (list(x), s)
+        return y
+
+    def inverse(self, y):
+        if len(y) != self.dim:
+            raise ValueError(f"ActNorm.inverse: 输入维度应为 {self.dim}")
+        s = [math.exp(v) for v in self.log_s]
+        return [y[j] / s[j] + self.b[j] for j in range(self.dim)]
+
+    def logdet(self):
+        return sum(self.log_s)
+
+    def backward(self, g_y, g_logdet=0.0):
+        if getattr(self, "_cache", None) is None:
+            raise RuntimeError("ActNorm.backward: 必须先调用 forward()")
+        if len(g_y) != self.dim:
+            raise ValueError("ActNorm.backward: g_y 维度不符")
+        x, s = self._cache
+        dx = [g_y[j] * s[j] for j in range(self.dim)]
+        for j in range(self.dim):
+            self.g_b[j] += -g_y[j] * s[j]
+            self.g_log_s[j] += g_y[j] * s[j] * (x[j] - self.b[j]) + g_logdet
+        return dx
+
+    def zero_grad(self):
+        self.g_b = [0.0] * self.dim
+        self.g_log_s = [0.0] * self.dim
+
+    def param_count(self):
+        return 2 * self.dim
+
+    def sgd_step(self, lr=1e-3):
+        _sgd_apply(self.b, self.g_b, lr)
+        _sgd_apply(self.log_s, self.g_log_s, lr)
+
+    def adam_step(self, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        _check_adam_betas(beta1, beta2, "ActNorm.adam_step")
+        if not hasattr(self, "_am"):
+            self._am = ([0.0] * self.dim, [0.0] * self.dim,
+                        [0.0] * self.dim, [0.0] * self.dim, 0)
+        mb, vb, ms, vs, t = self._am
+        t += 1
+        c1, c2 = 1.0 - beta1 ** t, 1.0 - beta2 ** t
+        for j in range(self.dim):
+            for grad, par, m_, v_ in ((self.g_b[j], self.b, mb, vb),
+                                      (self.g_log_s[j], self.log_s, ms, vs)):
+                m_[j] = beta1 * m_[j] + (1 - beta1) * grad
+                v_[j] = beta2 * v_[j] + (1 - beta2) * grad * grad
+                par[j] -= lr * (m_[j] / c1) / (math.sqrt(v_[j] / c2) + eps)
+        self._am = (mb, vb, ms, vs, t)
+
+
+class InvertibleLinear:
+    """可逆线性层 ``y = W x``，``log|det J| = log|det W|``（精确）。
+
+    ``W`` 初始化为 ``I + 0.05·N(0,1)``（小扰动保证可逆、det 接近 1）。
+    ``inverse`` 用带部分主元的高斯消元求解（不是矩阵求逆再相乘，数值更稳）。
+    """
+
+    def __init__(self, dim: int, noise: float = 0.05, seed: int = 0):
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("InvertibleLinear: dim 必须是 >= 1 的整数")
+        if isinstance(noise, bool) or not isinstance(noise, (int, float))                 or not (0 <= noise < 1):
+            raise ValueError("InvertibleLinear: noise 必须在 [0,1) 内")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("InvertibleLinear: seed 必须是整数")
+        self.dim = dim
+        r = random.Random(seed)
+        self.W = [[(1.0 if i == j else 0.0) + noise * r.gauss(0.0, 1.0)
+                   for j in range(dim)] for i in range(dim)]
+        self.g_W = [[0.0] * dim for _ in range(dim)]
+
+    def forward(self, x):
+        if len(x) != self.dim:
+            raise ValueError(f"InvertibleLinear.forward: 输入维度应为 {self.dim}")
+        y = [sum(self.W[i][j] * x[j] for j in range(self.dim))
+             for i in range(self.dim)]
+        det = _glow_det(self.W)
+        if abs(det) < 1e-14:
+            raise ValueError("InvertibleLinear: W 不可逆")
+        self._cache = list(x)
+        self._logdet = math.log(abs(det))
+        return y
+
+    def inverse(self, y):
+        if len(y) != self.dim:
+            raise ValueError(f"InvertibleLinear.inverse: 输入维度应为 {self.dim}")
+        return _glow_solve(self.W, list(y))
+
+    def logdet(self):
+        if getattr(self, "_cache", None) is None:
+            raise RuntimeError("InvertibleLinear.logdet: 必须先调用 forward()")
+        return self._logdet
+
+    def backward(self, g_y, g_logdet=0.0):
+        if getattr(self, "_cache", None) is None:
+            raise RuntimeError("InvertibleLinear.backward: 必须先调用 forward()")
+        if len(g_y) != self.dim:
+            raise ValueError("InvertibleLinear.backward: g_y 维度不符")
+        x = self._cache
+        dx = [sum(self.W[i][j] * g_y[i] for i in range(self.dim))
+              for j in range(self.dim)]
+        for i in range(self.dim):
+            for j in range(self.dim):
+                self.g_W[i][j] += g_y[i] * x[j]
+        if g_logdet != 0.0:
+            winv_t = _glow_inverse_matrix(self.W)
+            for i in range(self.dim):
+                for j in range(self.dim):
+                    # d log|det W| / dW = (W^{-1})^T
+                    self.g_W[i][j] += g_logdet * winv_t[j][i]
+        return dx
+
+    def zero_grad(self):
+        self.g_W = [[0.0] * self.dim for _ in range(self.dim)]
+
+    def param_count(self):
+        return self.dim * self.dim
+
+    def sgd_step(self, lr=1e-3):
+        for i in range(self.dim):
+            row = self.W[i]
+            grow = self.g_W[i]
+            for j in range(self.dim):
+                row[j] -= lr * grow[j]
+
+    def adam_step(self, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        _check_adam_betas(beta1, beta2, "InvertibleLinear.adam_step")
+        if not hasattr(self, "_am"):
+            self._am = (_zeros_like(self.W), _zeros_like(self.W), 0)
+        mw, vw, t = self._am
+        t += 1
+        c1, c2 = 1.0 - beta1 ** t, 1.0 - beta2 ** t
+        for i in range(self.dim):
+            for j in range(self.dim):
+                g = self.g_W[i][j]
+                mw[i][j] = beta1 * mw[i][j] + (1 - beta1) * g
+                vw[i][j] = beta2 * vw[i][j] + (1 - beta2) * g * g
+                self.W[i][j] -= lr * (mw[i][j] / c1) / (
+                    math.sqrt(vw[i][j] / c2) + eps)
+        self._am = (mw, vw, t)
+
+
 class RealNVP:
     """RealNVP：仿射耦合流，可逆且能算**精确**对数似然。
 

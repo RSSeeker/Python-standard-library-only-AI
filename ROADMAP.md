@@ -222,7 +222,9 @@
 - [x] `RealNVP` 仿射耦合流：`log|det J| = Σs` **精确**、`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 是真密度（2 维网格积分 0.9989）、`nll` 最大似然训练 3.2951 → 1.4170（120 轮 lr=3e-3）
   - 实现坑：`Layer` 不支持 `tanh`（改用 sigmoid 打底、外面再套 `tanh` 限幅）；`Layer` 没有 `rng` 参数（临时 `random.seed` 再恢复 `getstate`）
   - `nll = 0.5|y|² + 0.5d·log2π − logdet` ⇒ `dL/dlogdet = -1`，符号写反会让训练朝反方向走
-- [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、Glow（actnorm + 可逆 1×1 卷积）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
+- [x] Glow 的两个可逆组件：`ActNorm(dim)`（`data_init` 按首批统计量初始化，`logdet=Σlog_s` 与输入无关）+ `InvertibleLinear(dim)`（`log|det J|=log|det W|` 精确，LU 部分主元求 det、高斯消元求逆，反向含 `g_logdet·W^{-T}` 项，实测 1e-5 内）
+  - 踩坑：`ActNorm.g_log_s` 的符号（`dy/dlog_s = y` 不是 `-y`），中心差分立刻抓到（解析 -3.64 vs 数值 5.24）
+- [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、多尺度 Glow 组合（把上面两件与 RealNVP 耦合串成完整 Glow）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
 
 ### W9 优化器与调度（§3/§4）
 - [ ] `SGDSGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`

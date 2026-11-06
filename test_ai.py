@@ -16780,3 +16780,192 @@ class TestRealNVP:
             m.log_prob([1.0])
         with pytest.raises(ValueError):
             m.log_prob(["a", "b"])
+
+# ============================================================================
+#  Glow 组件（ActNorm + 可逆线性）
+# ============================================================================
+class TestActNorm:
+    def test_data_init_gives_unit_variance(self):
+        a = AI.ActNorm(3)
+        batch = [[0.5 + 2.0 * i, -1.0 + 0.3 * i, 4.0 - 1.5 * i] for i in range(6)]
+        a.data_init(batch)
+        outs = [a.forward(row) for row in batch]
+        for j in range(3):
+            col = [o[j] for o in outs]
+            mean = sum(col) / len(col)
+            var = sum((v - mean) ** 2 for v in col) / len(col)
+            assert abs(mean) < 1e-12
+            assert abs(var - 1.0) < 1e-6
+
+    def test_inverse_and_logdet(self):
+        a = AI.ActNorm(2)
+        a.b = [0.3, -0.2]
+        a.log_s = [0.5, -1.0]
+        x = [1.5, -2.0]
+        y = a.forward(x)
+        back = a.inverse(y)
+        assert max(abs(back[j] - x[j]) for j in range(2)) < 1e-12
+        assert abs(a.logdet() - sum(a.log_s)) < 1e-15
+
+    def test_gradients(self):
+        a = AI.ActNorm(3)
+        a.b = [0.2, -0.4, 0.7]
+        a.log_s = [0.3, -0.2, 0.1]
+        x = [1.2, -0.8, 0.5]
+        w = [0.7, -1.3, 0.4]
+        g = 0.8
+
+        def loss(xx):
+            yy = a.forward(xx)
+            return sum(w[j] * yy[j] for j in range(3)) + g * a.logdet()
+
+        a.zero_grad()
+        a.forward(x)
+        dx = a.backward(list(w), g)
+        eps = 1e-6
+        for j in range(3):
+            xp = list(x)
+            xm = list(x)
+            xp[j] += eps
+            xm[j] -= eps
+            num = (loss(xp) - loss(xm)) / (2 * eps)
+            assert abs(dx[j] - num) < 1e-7
+        gb = list(a.g_b)
+        gls = list(a.g_log_s)
+        for j in (0, 2):
+            old = a.b[j]
+            a.b[j] = old + eps
+            lp = loss(x)
+            a.b[j] = old - eps
+            lm = loss(x)
+            a.b[j] = old
+            assert abs(gb[j] - (lp - lm) / (2 * eps)) < 1e-6
+            old = a.log_s[j]
+            a.log_s[j] = old + eps
+            lp = loss(x)
+            a.log_s[j] = old - eps
+            lm = loss(x)
+            a.log_s[j] = old
+            assert abs(gls[j] - (lp - lm) / (2 * eps)) < 1e-6
+
+    def test_errors_and_steps(self):
+        with pytest.raises(ValueError):
+            AI.ActNorm(0)
+        with pytest.raises(ValueError):
+            AI.ActNorm(2, eps=0.0)
+        a = AI.ActNorm(2)
+        with pytest.raises(RuntimeError):
+            a.backward([1.0, 0.0])
+        with pytest.raises(ValueError):
+            a.forward([1.0])
+        with pytest.raises(ValueError):
+            a.data_init([])
+        a.data_init([[1.0, 2.0], [3.0, 4.0]])
+        a.forward([2.0, 3.0])
+        a.backward([1.0, -1.0], 0.5)
+        b0 = list(a.b)
+        a.sgd_step(0.1)
+        assert a.b != b0
+        a.forward([2.0, 3.0])
+        a.backward([1.0, -1.0], 0.5)
+        b0 = list(a.b)
+        a.adam_step(0.1)
+        assert a.b != b0
+
+
+class TestInvertibleLinear:
+    def test_inverse_and_logdet(self):
+        L = AI.InvertibleLinear(3, seed=4)
+        x = [0.5, -1.0, 2.0]
+        y = L.forward(x)
+        back = L.inverse(y)
+        assert max(abs(back[j] - x[j]) for j in range(3)) < 1e-12
+        # 数值 Jacobian 的 det 应与 logdet 一致
+        eps = 1e-6
+        cols = []
+        for j in range(3):
+            xp = list(x)
+            xm = list(x)
+            xp[j] += eps
+            xm[j] -= eps
+            L.forward(xp)
+            yp = [sum(L.W[i][k] * xp[k] for k in range(3)) for i in range(3)]
+            L.forward(xm)
+            ym = [sum(L.W[i][k] * xm[k] for k in range(3)) for i in range(3)]
+            cols.append([(yp[i] - ym[i]) / (2 * eps) for i in range(3)])
+        J = cols
+        det = (J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1])
+               - J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0])
+               + J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]))
+        L.forward(x)
+        assert abs(L.logdet() - math.log(abs(det))) < 1e-6
+
+    def test_gradients_including_logdet_term(self):
+        L = AI.InvertibleLinear(3, seed=4)
+        x = [0.5, -1.0, 2.0]
+        wg = [0.3, -0.7, 1.1]
+        gl = 0.6
+
+        def loss(xx):
+            yy = L.forward(xx)
+            return sum(wg[i] * yy[i] for i in range(3)) + gl * L.logdet()
+
+        L.zero_grad()
+        L.forward(x)
+        dx = L.backward(list(wg), gl)
+        eps = 1e-6
+        for j in range(3):
+            xp = list(x)
+            xm = list(x)
+            xp[j] += eps
+            xm[j] -= eps
+            num = (loss(xp) - loss(xm)) / (2 * eps)
+            assert abs(dx[j] - num) < 1e-6
+        gW = [row[:] for row in L.g_W]
+        for i, j in ((0, 0), (1, 2), (2, 1)):
+            old = L.W[i][j]
+            L.W[i][j] = old + eps
+            lp = loss(x)
+            L.W[i][j] = old - eps
+            lm = loss(x)
+            L.W[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(gW[i][j] - num) < 1e-5, (i, j, gW[i][j], num)
+
+    def test_grad_without_logdet_is_outer_product(self):
+        L = AI.InvertibleLinear(2, seed=2)
+        x = [1.0, 2.0]
+        g = [0.5, -0.25]
+        L.zero_grad()
+        L.forward(x)
+        L.backward(list(g), 0.0)
+        for i in range(2):
+            for j in range(2):
+                assert abs(L.g_W[i][j] - g[i] * x[j]) < 1e-12
+
+    def test_errors_and_steps(self):
+        with pytest.raises(ValueError):
+            AI.InvertibleLinear(0)
+        with pytest.raises(ValueError):
+            AI.InvertibleLinear(2, noise=1.0)
+        with pytest.raises(ValueError):
+            AI.InvertibleLinear(2, seed=1.5)
+        L = AI.InvertibleLinear(2, seed=0)
+        with pytest.raises(RuntimeError):
+            L.logdet()
+        with pytest.raises(RuntimeError):
+            L.backward([1.0, 0.0])
+        L.W = [[0.0, 0.0], [1.0, 1.0]]
+        with pytest.raises(ValueError):
+            L.forward([1.0, 1.0])
+        L2 = AI.InvertibleLinear(2, seed=2)
+        L2.forward([1.0, 2.0])
+        L2.backward([1.0, 0.0], 0.0)
+        w0 = [row[:] for row in L2.W]
+        L2.sgd_step(0.01)
+        assert L2.W != w0
+        L2.forward([1.0, 2.0])
+        L2.backward([1.0, 0.0], 0.0)
+        w0 = [row[:] for row in L2.W]
+        L2.adam_step(0.01)
+        assert L2.W != w0
