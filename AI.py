@@ -14,6 +14,7 @@
   + 类别不平衡损失（Class-Balanced / LDAM / OHEM）
   + 知识蒸馏（distill_loss 软目标 KL + T² 缩放 / hint_loss 隐藏层对齐）
   + 偏好对齐（preference_loss：DPO / IPO / SimPO / CPO / ORPO；kto_loss）
+  + 多任务权重（uncertainty_weighting：Kendall 不确定性加权；gradnorm_weights；pcgrad 冲突投影）
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
@@ -6876,6 +6877,165 @@ def kto_loss(logp, ref_logp, desirable: bool = True, beta: float = 0.1,
     du = -sig * (1.0 - sig)
     d_logp = du * beta if desirable else -du * beta
     return loss, d_logp
+
+
+def _mt_vector(values, name, who):
+    """多任务权重工具的公共入参校验：非空、每个元素是有限数字（bool 不算）。"""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{who}: {name} 必须是非空序列")
+    out = []
+    for i, v in enumerate(values):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError(f"{who}: {name}[{i}] 必须是数字，收到 {type(v).__name__}")
+        f = float(v)
+        if not (f == f and -float("inf") < f < float("inf")):
+            raise ValueError(f"{who}: {name}[{i}] 必须是有限数，收到 {f!r}")
+        out.append(f)
+    return out
+
+
+def uncertainty_weighting(losses, log_vars):
+    """Kendall 等人的多任务不确定性加权。
+
+    ``L = Σ_i exp(-s_i)·L_i + s_i``，其中 ``s_i = log_vars[i]`` 是任务 i 的
+    对数方差（可学习参数）。返回 ``(total, weights, d_losses, d_log_vars)``：
+    ``weights[i] = exp(-s_i)``，``d_losses[i] = exp(-s_i)``，
+    ``d_log_vars[i] = 1 - exp(-s_i)·L_i``。
+    """
+    ls = _mt_vector(losses, "losses", "uncertainty_weighting")
+    ss = _mt_vector(log_vars, "log_vars", "uncertainty_weighting")
+    if len(ls) != len(ss):
+        raise ValueError(
+            f"uncertainty_weighting: losses 长度 {len(ls)} 与 log_vars 长度 {len(ss)} 不一致"
+        )
+    weights = []
+    total = 0.0
+    for li, si in zip(ls, ss):
+        w = math.exp(-si)
+        weights.append(w)
+        total += w * li + si
+    d_losses = list(weights)
+    d_log_vars = [1.0 - w * li for w, li in zip(weights, ls)]
+    return total, weights, d_losses, d_log_vars
+
+
+def gradnorm_weights(losses, grad_norms, alpha=1.5, lr=0.025,
+                     weights=None, G0=None):
+    """GradNorm 的一步权重更新（纯函数、无状态）。
+
+    ``r_i = (L_i / mean(L))^alpha``、``Ḡ = mean(G_i)``，
+    目标 ``target_i = Ḡ·r_i``；损失 ``L1 = Σ|G_i − target_i|``。
+    ``G0`` 是参考尺度（缺省用当前 ``Ḡ``），
+    权重更新 ``w_i −= lr·sign(G_i − target_i)·G0/r_i``，并归一化到均值为 1。
+
+    返回 ``{"weights", "targets", "loss", "gradients"}``（都是 list）。
+    """
+    ls = _mt_vector(losses, "losses", "gradnorm_weights")
+    gs = _mt_vector(grad_norms, "grad_norms", "gradnorm_weights")
+    if len(ls) != len(gs):
+        raise ValueError(
+            f"gradnorm_weights: losses 长度 {len(ls)} 与 grad_norms 长度 {len(gs)} 不一致"
+        )
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("gradnorm_weights: alpha 必须是数字")
+    if not (alpha > 0):
+        raise ValueError(f"gradnorm_weights: alpha 必须 > 0，收到 {alpha!r}")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise TypeError("gradnorm_weights: lr 必须是数字")
+    if not (lr > 0):
+        raise ValueError(f"gradnorm_weights: lr 必须 > 0，收到 {lr!r}")
+    for x in ls:
+        if x <= 0.0:
+            raise ValueError(f"gradnorm_weights: losses 必须全为正，收到 {x!r}")
+
+    if weights is None:
+        ws = [1.0] * len(ls)
+    else:
+        ws = _mt_vector(weights, "weights", "gradnorm_weights")
+        if len(ws) != len(ls):
+            raise ValueError(
+                f"gradnorm_weights: weights 长度 {len(ws)} 与 losses 长度 {len(ls)} 不一致"
+            )
+        for x in ws:
+            if x <= 0.0:
+                raise ValueError(f"gradnorm_weights: weights 必须全为正，收到 {x!r}")
+
+    mean_l = sum(ls) / len(ls)
+    mean_g = sum(gs) / len(gs)
+    ref = mean_g if G0 is None else float(G0)
+    if isinstance(G0, bool) or (G0 is not None and not isinstance(G0, (int, float))):
+        raise TypeError("gradnorm_weights: G0 必须是数字或 None")
+    if ref <= 0.0:
+        raise ValueError(f"gradnorm_weights: G0 必须 > 0，收到 {ref!r}")
+
+    ratios = [(li / mean_l) ** float(alpha) for li in ls]
+    targets = [mean_g * r for r in ratios]
+    loss = 0.0
+    for gi, ti in zip(gs, targets):
+        loss += abs(gi - ti)
+    gradients = []
+    new_w = []
+    for wi, gi, ti, r in zip(ws, gs, targets, ratios):
+        diff = gi - ti
+        sign = 0.0 if diff == 0.0 else (1.0 if diff > 0.0 else -1.0)
+        grad = sign * ref / r
+        gradients.append(grad)
+        new_w.append(wi - float(lr) * grad)
+    # 归一化到均值为 1（保持整体尺度，免得学习率被间接改变）
+    lo = min(new_w)
+    if lo <= 0.0:
+        shift = 1.0 - lo
+        new_w = [w + shift for w in new_w]
+    m = sum(new_w) / len(new_w)
+    new_w = [w / m for w in new_w]
+    return {"weights": new_w, "targets": targets, "loss": loss, "gradients": gradients}
+
+
+def _flat_dot(a, b):
+    if isinstance(a, (list, tuple)):
+        if not isinstance(b, (list, tuple)) or len(a) != len(b):
+            raise ValueError("pcgrad: 两个梯度的结构不一致")
+        return sum(_flat_dot(x, y) for x, y in zip(a, b))
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        raise TypeError("pcgrad: 梯度里只能是数字或数字列表")
+    return float(a) * float(b)
+
+
+def _flat_sub(a, b):
+    if isinstance(a, (list, tuple)):
+        return [_flat_sub(x, y) for x, y in zip(a, b)]
+    return float(a) - float(b)
+
+
+def _flat_scale(a, k):
+    if isinstance(a, (list, tuple)):
+        return [_flat_scale(x, k) for x in a]
+    return float(a) * k
+
+
+def pcgrad(grad_a, grad_b, eps=1e-12):
+    """PCGrad：两个任务梯度冲突（内积 < 0）时互相投影掉冲突分量。
+
+    返回 ``(grad_a_projected, grad_b_projected)``；不冲突时原样返回副本。
+    梯度用「数字的嵌套 list」表示（与 ``Model.backward`` 的返回同构）。
+    """
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        raise TypeError("pcgrad: eps 必须是数字")
+    if not (eps > 0):
+        raise ValueError(f"pcgrad: eps 必须 > 0，收到 {eps!r}")
+    dot_ab = _flat_dot(grad_a, grad_b)
+    ga = [_flat_scale(x, 1.0) for x in grad_a] if isinstance(grad_a, list) else grad_a
+    gb = [_flat_scale(x, 1.0) for x in grad_b] if isinstance(grad_b, list) else grad_b
+    if dot_ab < 0.0:
+        n_b = _flat_dot(grad_b, grad_b)
+        n_a = _flat_dot(grad_a, grad_a)
+        if n_b > eps:
+            coef_a = dot_ab / n_b
+            ga = _flat_sub(grad_a, _flat_scale(grad_b, coef_a))
+        if n_a > eps:
+            coef_b = dot_ab / n_a
+            gb = _flat_sub(grad_b, _flat_scale(grad_a, coef_b))
+    return ga, gb
 
 
 def mse_loss(pred: List[float], target):

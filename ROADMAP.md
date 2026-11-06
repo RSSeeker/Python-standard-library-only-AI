@@ -116,7 +116,7 @@
       ORPO 在 logit 空间做、`p>=1` 报错；**不进 `_LOSS_MAP`**——吃一对 logp 而非逐样本 `(pred, target)`）
 - [x] 蒸馏：`distill_loss(student_logits, teacher_logits, T=2.0)`（`T²·KL`，对学生 logits 的梯度 `T·(p_s−p_t)`）+ `hint_loss(student_feat, teacher_feat, weight)`（隐藏层均方误差）；`_LOSS_MAP` 增 `'distill'`、输出层要求 `linear`（梯度差分 ≤9.4e-10，`T=1` 时与手算 KL 逐位一致）
 - [x] 类别不平衡族：`ohem_loss`（批级，不进 `Model`）、`class_balanced_loss`、`ldam_loss`；`soft_ce` **不再单独实现**——`cross_entropy_loss` 已支持任意软标签与 `label_smoothing`，再写一个只是重复（W1-B 提交；CB/LDAM 梯度差分 ≤3.5e-9）
-- [ ] 多任务权重：`uncertainty_weighting`、`gradnorm`、`pcgrad`
+- [x] 多任务权重：`uncertainty_weighting`（Kendall，`d_log_vars = 1 - exp(-s_i)·L_i`）、`gradnorm_weights`（`target_i = Ḡ·r_i`，权重归一化均值 1；只有 `r_i ≡ 1` 时才有不动点，一般情形用返回的 `gradients = sign(G-target)·G0/r`）、`pcgrad`（两两冲突投影，嵌套 list 支持）；W1-E 提交，双向差分 worst_rel 1.54e-10，11 类非法输入全报错
 - [ ] 已有项标注：`huber_loss`（SmoothL1）、`kl_divergence`、`dice_loss`、`ctc_loss`、`triplet_loss`、`info_nce_loss`
 
 ### W2 卷积与视觉块（P0/P1）

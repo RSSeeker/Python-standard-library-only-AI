@@ -9032,3 +9032,110 @@ class TestPreferenceLoss:
             AI.kto_loss(-1.0, -1.6, desirable=1)
         with pytest.raises(ValueError):
             AI.kto_loss(-1.0, -1.6, beta=-1.0)
+
+class TestMultiTaskWeighting:
+    """W1-E：多任务权重（不确定性加权 / GradNorm / PCGrad）。"""
+
+    def test_uncertainty_weighting_closed_form(self):
+        losses = [1.0, 2.0, 0.5]
+        log_vars = [0.0, math.log(2.0), -1.0]
+        total, weights, d_losses, d_log_vars = AI.uncertainty_weighting(losses, log_vars)
+        expect_w = [math.exp(-s) for s in log_vars]
+        expect_total = sum(
+            wi * li + si for wi, li, si in zip(expect_w, losses, log_vars)
+        )
+        assert abs(total - expect_total) <= 1e-12 * max(1.0, abs(expect_total))
+        for got, want in zip(weights, expect_w):
+            assert abs(got - want) <= 1e-12
+        for got, want in zip(d_losses, weights):
+            assert abs(got - want) <= 1e-12
+        for got, w, li in zip(d_log_vars, expect_w, losses):
+            assert abs(got - (1.0 - w * li)) <= 1e-12
+
+    def test_uncertainty_weighting_gradients_match_numeric(self):
+        losses = [1.0, 2.0, 0.5]
+        log_vars = [0.0, math.log(2.0), -1.0]
+        _, _, d_losses, d_log_vars = AI.uncertainty_weighting(losses, log_vars)
+        eps = 1e-6
+        worst = 0.0
+        for i in range(len(losses)):
+            up = list(losses); up[i] += eps
+            dn = list(losses); dn[i] -= eps
+            num = (AI.uncertainty_weighting(up, log_vars)[0]
+                   - AI.uncertainty_weighting(dn, log_vars)[0]) / (2 * eps)
+            worst = max(worst, abs(num - d_losses[i]) / max(1e-12, abs(num) + abs(d_losses[i])))
+        for i in range(len(log_vars)):
+            up = list(log_vars); up[i] += eps
+            dn = list(log_vars); dn[i] -= eps
+            num = (AI.uncertainty_weighting(losses, up)[0]
+                   - AI.uncertainty_weighting(losses, dn)[0]) / (2 * eps)
+            worst = max(worst, abs(num - d_log_vars[i]) / max(1e-12, abs(num) + abs(d_log_vars[i])))
+        assert worst < 1e-7
+
+    def test_gradnorm_fixed_point(self):
+        res = AI.gradnorm_weights([2.0, 2.0, 2.0], [3.0, 3.0, 3.0], alpha=1.5, lr=0.025, G0=3.0)
+        assert all(abs(t - 3.0) <= 1e-12 for t in res["targets"])
+        assert abs(res["loss"]) <= 1e-12
+        assert all(abs(w - 1.0) <= 1e-12 for w in res["weights"])
+        assert all(abs(g) <= 1e-12 for g in res["gradients"])
+
+    def test_gradnorm_updates_and_normalizes(self):
+        losses = [1.0, 2.0, 4.0]
+        gs = [3.0, 3.0, 3.0]
+        res = AI.gradnorm_weights(losses, gs, alpha=1.5, G0=3.0)
+        assert res["targets"][0] < res["targets"][1] < res["targets"][2]
+        assert res["loss"] > 0.0
+        assert all(w > 0.0 for w in res["weights"])
+        assert abs(sum(res["weights"]) / 3.0 - 1.0) <= 1e-9
+        mean_l = sum(losses) / 3.0
+        r = [(x / mean_l) ** 1.5 for x in losses]
+        for g_i, t_i, r_i, grad in zip(gs, res["targets"], r, res["gradients"]):
+            sign = 1.0 if g_i > t_i else (-1.0 if g_i < t_i else 0.0)
+            assert abs(grad - sign * 3.0 / r_i) <= 1e-9
+
+    def test_pcgrad_projects_conflict(self):
+        a = [1.0, 0.0]
+        b = [-1.0, 1.0]
+        ga, gb = AI.pcgrad(a, b)
+        assert ga[0] * gb[0] + ga[1] * gb[1] >= -1e-12
+        assert abs(ga[0] * b[0] + ga[1] * b[1]) < 1e-12
+        assert abs(gb[0] * a[0] + gb[1] * a[1]) < 1e-12
+        assert a == [1.0, 0.0] and b == [-1.0, 1.0]
+
+    def test_pcgrad_no_conflict_unchanged(self):
+        c = [1.0, 1.0]
+        d = [1.0, 0.0]
+        gc, gd = AI.pcgrad(c, d)
+        assert gc == c and gd == d
+
+    def test_pcgrad_nested_structure(self):
+        a2 = [[1.0, 2.0], [3.0]]
+        b2 = [[-1.0, 0.0], [-2.0]]
+        ga2, gb2 = AI.pcgrad(a2, b2)
+        dot = sum(x * y for xs, ys in zip(ga2, gb2) for x, y in zip(xs, ys))
+        assert dot >= -1e-12
+        assert isinstance(ga2[0], list) and len(ga2[1]) == 1
+
+    def test_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.uncertainty_weighting([], [1.0])
+        with pytest.raises(ValueError):
+            AI.uncertainty_weighting([1.0], [1.0, 2.0])
+        with pytest.raises(ValueError):
+            AI.uncertainty_weighting([float("nan")], [0.0])
+        with pytest.raises(TypeError):
+            AI.uncertainty_weighting([True], [0.0])
+        with pytest.raises(ValueError):
+            AI.gradnorm_weights([1.0], [1.0], alpha=0)
+        with pytest.raises(ValueError):
+            AI.gradnorm_weights([1.0], [1.0], lr=-1)
+        with pytest.raises(ValueError):
+            AI.gradnorm_weights([0.0], [1.0])
+        with pytest.raises(ValueError):
+            AI.gradnorm_weights([1.0, 2.0], [1.0])
+        with pytest.raises(ValueError):
+            AI.gradnorm_weights([1.0], [1.0], G0=0)
+        with pytest.raises(ValueError):
+            AI.pcgrad([1.0], [1.0, 2.0])
+        with pytest.raises(ValueError):
+            AI.pcgrad([1.0], [1.0], eps=0)

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（728 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（736 项）
 
 ## 特性
 
@@ -683,10 +683,36 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `augment_cutmix(x1, y1, x2, y2, alpha=1.0)` | CutMix：从 x2 剪一块矩形贴到 x1，`lam` 按**实际贴入面积**重算，标签同步混合 |
 | `augment_cutout(x, num_holes=1, hole_size=0.25)` | Cutout：随机抹掉若干个正方形区域（`hole_size` 是相对短边比例） |
 | `augment_randaugment(x, n=2, magnitude=9.0)` | RandAugment：随机挑 n 个操作（brightness / contrast / translate / rotate90 / identity）并返回实际用到的操作名 |
+| `uncertainty_weighting(losses, log_vars)` | Kendall 多任务不确定性加权：`Σ exp(-s_i)·L_i + s_i`，返回 `(total, weights, d_losses, d_log_vars)` 可直接反传 |
+| `gradnorm_weights(losses, grad_norms, alpha=1.5, lr=0.025, weights=None, G0=None)` | GradNorm：按 loss 比例给出目标梯度范数并更新任务权重，最后归一化到均值 1；返回 `weights`/`targets`/`loss`/`gradients` |
+| `pcgrad(grad_a, grad_b, eps=1e-12)` | PCGrad 冲突投影：两任务梯度内积为负时互相投影掉冲突分量，返回投影后的两个梯度（嵌套 list 也支持） |
 
 > 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
 > （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
 > 会被当成回归模型，请显式传 `default_output_activation='softmax'`。
+
+### 多任务权重
+
+多任务训练里各任务 loss 量级不同，直接相加会被大 loss 主导。三个工具分别处理
+「量级」「平衡」「冲突」：
+
+```python
+# 1) 不确定性加权（Kendall & Gal）：让模型自己学每个任务该占多少权重
+total, w, d_losses, d_log_vars = AI.uncertainty_weighting([1.0, 2.0], [0.0, 0.0])
+# total = Σ exp(-s_i)·L_i + s_i；d_log_vars 可直接反传到 log_vars
+
+# 2) GradNorm：按各任务 loss 的相对大小定目标梯度范数，再更新权重
+res = AI.gradnorm_weights([1.0, 2.0, 4.0], [3.0, 3.0, 3.0], alpha=1.5)
+print(res["weights"], res["targets"])   # 权重均值恒为 1
+
+# 3) PCGrad：两个任务梯度打架时，把冲突分量投影掉
+ga, gb = AI.pcgrad([1.0, 0.0], [-1.0, 1.0])
+```
+
+要点：`uncertainty_weighting` 的 `d_log_vars` 是 `1 - exp(-s_i)·L_i`，反传前先
+`sigmoid`/`log` 变换到你自己的参数化；`gradnorm_weights` 的 `target_i = Ḡ·r_i`
+只在各任务 loss 相等时才和 `grad_norms` 重合，一般情形请用返回的 `gradients`
+（`sign(G-target)·G0/r`）而不是自己推；`pcgrad` 只处理**两两**冲突，多任务请循环合并。
 
 ### 学习率调度器
 
@@ -994,7 +1020,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-728 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+736 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1075,6 +1101,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestImbalanceLosses` | Class-Balanced 权重公式与归一化、CB 索引/软标签梯度、LDAM 闭式对齐与梯度、OHEM 选样、Model 接线与两个激活守卫、8 类非法输入 |
 | `TestDistillAndHint` | 蒸馏损失：T² 缩放与 KL 对齐、梯度差分、T 校验、hint 均方误差与 weight、Model 接线与激活守卫 |
 | `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
+| `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
 | `TestFlops` | `estimate_flops` 的 MACs / 参数量 / 逐层明细与手算一致、不认识的模块报 TypeError |
@@ -1107,7 +1134,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 728 个单元测试
+├── test_ai.py       # 736 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
