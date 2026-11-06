@@ -24995,6 +24995,207 @@ class VAE:
         return [self.decode(_gauss_vec(self.latent_dim, rng)) for _ in range(n)]
 
 
+class VQVAE:
+    """VQ-VAE（向量量化自编码器，1 维输入）
+
+    encoder 输出连续向量 ``z_e``，在码本里找**最近**的码字 ``e_k`` 替换成 ``z_q``，
+    decoder 从 ``z_q`` 重建。反向用 straight-through：``dL/dz_e = dL/dz_q``；
+    码本损失 ``||sg[z_e] - e_k||^2`` 与 commitment ``beta * ||z_e - sg[e_k]||^2``
+    分别把码字拉向编码、把编码拉向码字。
+
+    - ``encode(x)`` → ``z_e``；``quantize(z_e)`` → ``(z_q, idx, code)``
+    - ``decode(z_q)`` → 重建；``forward(x)`` → 重建（记住 ``idx``）
+    - ``loss_and_backward(x)`` → 总损失（重构 + 码本 + commitment），并累积梯度
+    - ``codebook_histogram()``：最近一次 forward 里码字的使用情况
+
+    已知限制：没有 EMA 码本更新、也没有 dead-code restart，小数据上码本容易
+    塌缩（多个样本落到同一个码字）。``fit(warmup=N)`` 前 N 轮只训重构、
+    不更新码本，能缓解但不根治。
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 32, latent_dim: int = 2,
+                 num_codes: int = 8, beta: float = 0.25, seed: int = 0):
+        for name, value in (("input_dim", input_dim), ("hidden_dim", hidden_dim),
+                            ("latent_dim", latent_dim), ("num_codes", num_codes)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"VQVAE: {name} 必须是 >= 1 的整数")
+        if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta < 0:
+            raise ValueError("VQVAE: beta 必须是 >= 0 的数")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_codes = num_codes
+        self.beta = float(beta)
+        self.enc1 = Layer(input_dim, hidden_dim, activation="relu")
+        self.enc2 = Layer(hidden_dim, latent_dim, activation="linear")
+        self.dec1 = Layer(latent_dim, hidden_dim, activation="relu")
+        self.dec2 = Layer(hidden_dim, input_dim, activation="linear")
+        self.layers = [self.enc1, self.enc2, self.dec1, self.dec2]
+
+        r = random.Random(seed)
+        self.codebook = [[r.gauss(0.0, 1.0) for _ in range(latent_dim)]
+                         for _ in range(num_codes)]
+        self._cb_m = [[0.0] * latent_dim for _ in range(num_codes)]
+        self._cb_v = [[0.0] * latent_dim for _ in range(num_codes)]
+        self.step_count = 0
+        self.zero_grad()
+
+    # ---------- 梯度缓冲 ----------
+    def zero_grad(self):
+        self._g = [None] * len(self.layers)
+        self._g_cb = [[0.0] * self.latent_dim for _ in range(self.num_codes)]
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+            return
+        cur_w, cur_b = self._g[i]
+        for r in range(len(cur_w)):
+            for c in range(len(cur_w[r])):
+                cur_w[r][c] += gw[r][c]
+        for k in range(len(cur_b)):
+            cur_b[k] += gb[k]
+
+    # ---------- 前向 ----------
+    @staticmethod
+    def _check_vec(v, n, name, who):
+        if not isinstance(v, (list, tuple)) or len(v) != n:
+            raise ValueError(f"{who}: {name} 维度应为 {n}")
+
+    def encode(self, x):
+        self._check_vec(x, self.input_dim, "x", "VQVAE.encode")
+        return self.enc2.forward(self.enc1.forward(x))
+
+    def quantize(self, z_e):
+        """返回 ``(z_q, idx, code)``：L2 距离最近的码字（平局取编号小的）"""
+        self._check_vec(z_e, self.latent_dim, "z_e", "VQVAE.quantize")
+        best, best_d = 0, None
+        for k in range(self.num_codes):
+            d = sum((z_e[i] - self.codebook[k][i]) ** 2
+                    for i in range(self.latent_dim))
+            if best_d is None or d < best_d:
+                best, best_d = k, d
+        return list(self.codebook[best]), best, list(self.codebook[best])
+
+    def decode(self, z_q):
+        self._check_vec(z_q, self.latent_dim, "z_q", "VQVAE.decode")
+        return self.dec2.forward(self.dec1.forward(z_q))
+
+    def forward(self, x):
+        z_e = self.encode(x)
+        z_q, idx, code = self.quantize(z_e)
+        x_hat = self.decode(z_q)
+        self._x = list(x)
+        self._z_e, self._z_q, self._idx, self._code = z_e, z_q, idx, code
+        return x_hat
+
+    # ---------- 损失与反向 ----------
+    def loss_and_backward(self, x, use_commitment: bool = True):
+        """重构 + 码本 + commitment 三项；返回总损失（各项另存在 ``self.last_parts``）"""
+        x_hat = self.forward(x)
+        n = self.input_dim
+        recon = sum((x_hat[j] - x[j]) ** 2 for j in range(n)) / n
+        code_loss = sum((self._code[i] - self._z_e[i]) ** 2
+                        for i in range(self.latent_dim))
+        commit = (self.beta * sum((self._z_e[i] - self._code[i]) ** 2
+                                  for i in range(self.latent_dim))
+                  if use_commitment else 0.0)
+        loss = recon + code_loss + commit
+        self.last_parts = {"recon": recon, "codebook": code_loss,
+                           "commitment": commit}
+
+        # 重构项 → decoder → z_q
+        d_x_hat = [2.0 * (x_hat[j] - x[j]) / n for j in range(n)]
+        gw2, gb2, d_h = self.dec2.backward(d_x_hat)
+        gw1, gb1, d_z_q = self.dec1.backward(d_h)
+
+        # straight-through：dL/dz_e = dL/dz_q，再加 commitment 项
+        d_z_e = list(d_z_q)
+        if use_commitment:
+            for i in range(self.latent_dim):
+                d_z_e[i] += 2.0 * self.beta * (self._z_e[i] - self._code[i])
+
+        # 码本：被选中的码字收到「解码器梯度 + 码本损失梯度」
+        for i in range(self.latent_dim):
+            self._g_cb[self._idx][i] += d_z_q[i] + 2.0 * (self._code[i] - self._z_e[i])
+
+        gwe, gbe, d_hidden = self.enc2.backward(d_z_e)
+        gw0, gb0, _ = self.enc1.backward(d_hidden)
+        self._acc(0, gw0, gb0)
+        self._acc(1, gwe, gbe)
+        self._acc(2, gw1, gb1)
+        self._acc(3, gw2, gb2)
+        return loss
+
+    def codebook_histogram(self):
+        """最近一次 forward 的码字使用情况（长度 num_codes 的计数）"""
+        hist = [0] * self.num_codes
+        idx = getattr(self, "_idx", None)
+        if isinstance(idx, int):
+            hist[idx] += 1
+        return hist
+
+    # ---------- 训练 ----------
+    def sgd_step(self, lr=1e-2):
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _sgd_apply(layer.weights, gw, lr)
+            _sgd_apply(layer.biases, gb, lr)
+        _sgd_apply(self.codebook, self._g_cb, lr)
+
+    def adam_step(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+        _check_adam_betas(b1, b2, "VQVAE.adam_step")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError("VQVAE.adam_step: eps 必须是 > 0 的数")
+        self.step_count += 1
+        t = self.step_count
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _adam_apply(layer.weights, gw, layer.m_w, layer.v_w, t, lr, b1, b2, eps)
+            _adam_apply(layer.biases, gb, layer.m_b, layer.v_b, t, lr, b1, b2, eps)
+        _adam_apply(self.codebook, self._g_cb, self._cb_m, self._cb_v,
+                    t, lr, b1, b2, eps)
+
+    def fit(self, data, epochs=200, lr=1e-3, seed=None, warmup=20, verbose=False):
+        """先只训重构（码本不动）``warmup`` 轮，让 encoder 先找到结构"""
+        if not data:
+            raise ValueError("VQVAE.fit: data 不能为空")
+        for row in data:
+            self._check_vec(row, self.input_dim, "data 行", "VQVAE.fit")
+        rng = random.Random(seed)
+        history = []
+        for epoch in range(epochs):
+            total = 0.0
+            self.zero_grad()
+            for x in data:
+                total += self.loss_and_backward(x, use_commitment=epoch >= warmup)
+            for item in self._g:
+                if item is None:
+                    continue
+                gw, gb = item
+                for row in gw:
+                    for c in range(len(row)):
+                        row[c] /= len(data)
+                for k in range(len(gb)):
+                    gb[k] /= len(data)
+            if epoch >= warmup:
+                for k in range(self.num_codes):
+                    for i in range(self.latent_dim):
+                        self._g_cb[k][i] /= len(data)
+            else:
+                # warmup：只训重构，码本一步不动
+                for k in range(self.num_codes):
+                    for i in range(self.latent_dim):
+                        self._g_cb[k][i] = 0.0
+            self.adam_step(lr)
+            history.append(total / len(data))
+        return history
+
+
 class GAN:
     """最小可训练 GAN（MLP 生成器 / 判别器，BCE 损失）
 

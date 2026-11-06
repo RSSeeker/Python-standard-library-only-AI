@@ -13,3 +13,6 @@ model.json
 *.exe
 *.out
 c/reference.txt
+
+# PowerShell 重定向误建的空文件
+0

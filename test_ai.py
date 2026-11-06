@@ -16211,3 +16211,211 @@ class TestMinSNR:
         for bad in (0.0, -1.0, True, "x"):
             with pytest.raises((ValueError, TypeError)):
                 m.min_snr_weight(0, bad)
+
+
+class TestVQVAE:
+    """VQ-VAE：码本量化 / 三项损失 / straight-through / warmup"""
+
+    def _mk(self, **kw):
+        random.seed(0)
+        return AI.VQVAE(3, hidden_dim=6, latent_dim=2, num_codes=4, beta=0.5,
+                        seed=3, **kw)
+
+    def test_quantize_nearest_and_tie(self):
+        m = AI.VQVAE(3, num_codes=4, latent_dim=2, seed=0)
+        m.codebook = [[0.0, 0.0], [1.0, 1.0], [0.0, 0.0], [2.0, 2.0]]
+        zq, idx, code = m.quantize([0.0, 0.0])
+        assert idx == 0                       # 平局取小编号
+        assert zq == [0.0, 0.0] and code == m.codebook[0]
+        zq, idx, _ = m.quantize([1.7, 1.9])
+        assert idx == 3 and zq == [2.0, 2.0]  # 最近邻
+
+    def test_loss_parts_closed_form(self):
+        m = self._mk()
+        x = [1.0, -0.5, 0.25]
+        x_hat = m.forward(x)
+        total = m.loss_and_backward(x)
+        n = 3
+        recon = sum((x_hat[j] - x[j]) ** 2 for j in range(n)) / n
+        code = sum((m._code[i] - m._z_e[i]) ** 2 for i in range(2))
+        commit = m.beta * sum((m._z_e[i] - m._code[i]) ** 2 for i in range(2))
+        assert abs(m.last_parts["recon"] - recon) < 1e-12
+        assert abs(m.last_parts["codebook"] - code) < 1e-12
+        assert abs(m.last_parts["commitment"] - commit) < 1e-12
+        assert abs(total - (recon + code + commit)) < 1e-12
+
+        m2 = self._mk()
+        m2.forward(x)
+        total2 = m2.loss_and_backward(x, use_commitment=False)
+        assert m2.last_parts["commitment"] == 0.0
+        assert abs(total2 - m2.last_parts["recon"] - m2.last_parts["codebook"]) < 1e-12
+
+    def test_straight_through_gradient(self):
+        """d_z_e = d_z_q + 2*beta*(z_e - e)：用参考实现逐项比对"""
+        m = self._mk()
+        x = [1.0, -0.5, 0.25]
+        m.forward(x)
+        m.zero_grad()
+        m.loss_and_backward(x)
+        w1, b1 = [r[:] for r in m._g[1][0]], m._g[1][1][:]
+        w0, b0 = [r[:] for r in m._g[0][0]], m._g[0][1][:]
+
+        x_hat = m.forward(x)
+        n = 3
+        d_x_hat = [2.0 * (x_hat[j] - x[j]) / n for j in range(n)]
+        _, _, d_h = m.dec2.backward(d_x_hat)
+        _, _, d_z_q = m.dec1.backward(d_h)
+        d_z_e = [d_z_q[i] + 2.0 * m.beta * (m._z_e[i] - m._code[i])
+                 for i in range(2)]
+        rwe, rbe, r_hidden = m.enc2.backward(d_z_e)
+        rw0, rb0, _ = m.enc1.backward(r_hidden)
+
+        for r in range(len(rwe)):
+            for c in range(len(rwe[r])):
+                assert abs(w1[r][c] - rwe[r][c]) < 1e-12
+        for r in range(len(rw0)):
+            for c in range(len(rw0[r])):
+                assert abs(w0[r][c] - rw0[r][c]) < 1e-12
+        for k in range(len(rbe)):
+            assert abs(b1[k] - rbe[k]) < 1e-12
+        for k in range(len(rb0)):
+            assert abs(b0[k] - rb0[k]) < 1e-12
+
+        # beta=0 时退化成纯 straight-through
+        m = self._mk()
+        m.beta = 0.0
+        m.forward(x)
+        m.zero_grad()
+        m.loss_and_backward(x)
+        x_hat = m.forward(x)
+        d_x_hat = [2.0 * (x_hat[j] - x[j]) / n for j in range(n)]
+        _, _, d_h = m.dec2.backward(d_x_hat)
+        _, _, d_z_q = m.dec1.backward(d_h)
+        rwe, _, _ = m.enc2.backward(d_z_q)
+        for r in range(len(rwe)):
+            for c in range(len(rwe[r])):
+                assert abs(m._g[1][0][r][c] - rwe[r][c]) < 1e-12
+
+    def test_codebook_and_decoder_finite_difference(self):
+        m = self._mk()
+        x = [1.0, -0.5, 0.25]
+        m.forward(x)
+        m.loss_and_backward(x, use_commitment=False)
+        idx = m._idx
+        ana = m._g_cb[idx][:]
+        # 未被选中的码字无梯度
+        for k, row in enumerate(m._g_cb):
+            if k != idx:
+                assert all(v == 0.0 for v in row)
+        eps = 1e-6
+        for i in range(2):
+            orig = m.codebook[idx][i]
+            m.codebook[idx][i] = orig + eps
+            m.forward(x)
+            m.zero_grad()
+            lp = m.loss_and_backward(x, use_commitment=False)
+            m.codebook[idx][i] = orig - eps
+            m.forward(x)
+            m.zero_grad()
+            lm = m.loss_and_backward(x, use_commitment=False)
+            m.codebook[idx][i] = orig
+            num = (lp - lm) / (2 * eps)
+            assert abs(ana[i] - num) < 1e-6
+
+        # 解析式 = d_z_q + 2*(e - z_e)
+        m = self._mk()
+        m.forward(x)
+        m.loss_and_backward(x, use_commitment=False)
+        x_hat = m.forward(x)
+        n = 3
+        d_x_hat = [2.0 * (x_hat[j] - x[j]) / n for j in range(n)]
+        _, _, d_h = m.dec2.backward(d_x_hat)
+        _, _, d_z_q = m.dec1.backward(d_h)
+        idx = m._idx
+        for i in range(2):
+            expect = d_z_q[i] + 2.0 * (m._code[i] - m._z_e[i])
+            assert abs(m._g_cb[idx][i] - expect) < 1e-12
+
+        # decoder 权重梯度 = 中心差分
+        m = self._mk()
+        m.forward(x)
+        m.loss_and_backward(x, use_commitment=False)
+        r, c = 0, 1
+        ana = m._g[3][0][r][c]
+        orig = m.dec2.weights[r][c]
+        m.dec2.weights[r][c] = orig + eps
+        m.forward(x)
+        m.zero_grad()
+        lp = m.loss_and_backward(x, use_commitment=False)
+        m.dec2.weights[r][c] = orig - eps
+        m.forward(x)
+        m.zero_grad()
+        lm = m.loss_and_backward(x, use_commitment=False)
+        m.dec2.weights[r][c] = orig
+        assert abs(ana - (lp - lm) / (2 * eps)) < 1e-6
+
+    def test_warmup_histogram_and_optimizers(self):
+        m = self._mk()
+        x = [1.0, -0.5, 0.25]
+        h = m.codebook_histogram()
+        assert len(h) == 4 and sum(h) == 0     # 还没 forward
+
+        m.forward(x)
+        h = m.codebook_histogram()
+        assert len(h) == 4 and sum(h) == 1 and h[m._idx] == 1
+
+        before = [row[:] for row in m.codebook]
+        data = [[1.0, 0.0, 0.5], [0.0, 1.0, -0.5], [0.5, 0.5, 0.0],
+                [0.2, 0.3, 0.9]] * 2
+        m.fit(data, epochs=8, lr=0.01, seed=0, warmup=100)
+        assert m.codebook == before            # warmup 未结束：码本一步不动
+
+        m = self._mk()
+        m.forward(x)
+        m.zero_grad()
+        m.loss_and_backward(x)
+        w_before = [row[:] for row in m.enc1.weights]
+        m.sgd_step(0.1)
+        assert m.enc1.weights != w_before
+
+        m.zero_grad()
+        m.loss_and_backward(x)
+        cb_before = [row[:] for row in m.codebook]
+        m.adam_step(0.05)
+        assert m.codebook != cb_before
+        assert m.step_count == 1
+
+        m.zero_grad()
+        assert all(g is None for g in m._g)
+        assert all(all(v == 0.0 for v in row) for row in m._g_cb)
+
+    def test_training_and_validation(self):
+        random.seed(1)
+        m = AI.VQVAE(3, hidden_dim=12, latent_dim=2, num_codes=6, beta=1.0, seed=3)
+        data = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]
+        hist = m.fit(data, epochs=300, lr=0.02, seed=0, warmup=20)
+        assert len(hist) == 300
+        assert hist[-1] < hist[0] * 0.3
+        used = {m.quantize(m.encode(x))[1] for x in data}
+        assert len(used) >= 2
+
+        def raises(fn):
+            try:
+                fn()
+            except (ValueError, TypeError):
+                return True
+            return False
+
+        assert raises(lambda: AI.VQVAE(0))
+        assert raises(lambda: AI.VQVAE(True))
+        assert raises(lambda: AI.VQVAE(3, num_codes=0))
+        assert raises(lambda: AI.VQVAE(3, latent_dim=-1))
+        assert raises(lambda: AI.VQVAE(3, beta=-0.1))
+        assert raises(lambda: self._mk().encode([1.0]))
+        assert raises(lambda: self._mk().quantize([1.0]))
+        assert raises(lambda: self._mk().decode([1.0, 2.0, 3.0]))
+        assert raises(lambda: self._mk().fit([]))
+        assert raises(lambda: self._mk().fit([[1.0, 2.0]]))
+        assert raises(lambda: self._mk().adam_step(0.01, eps=0.0))
+        assert raises(lambda: self._mk().adam_step(0.01, b1=1.0))
