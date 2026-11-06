@@ -156,7 +156,10 @@
       `init_trunc_normal`、`zero_bias`、`zero_init_residual`（W3-C）
       —— 正交实现里 Gram-Schmidt 曾漏除 `|prev|²`（行内积 3.997），且 `zero_init_residual` 曾零掉
       捷径的 `short_bn` 而不是分支的 `bn3`；两处都由中心差分/恒等性质测出。
-- [ ] 数据驱动初始化：LSUV、Fixup/T-Fixup、Mimic Init（NET2NET）
+- [x] 数据驱动初始化（W3-F）：`lsuv_init`（预激活拉成 mean 0 / std 1；**必须在预激活上做**，
+      拿 ReLU 输出算 std 时偏置平移会把一半压成 0，收敛到 0.79 就到头了）、
+      `fixup_init`（残差分支最后一层 `1/√n` 缩放 + 偏置置零；Conv2d 权重是 4 层嵌套要逐叶缩放）、
+      `mimic_init`（NET2NET 宽度/深度迁移，激活不一致报错）
 - [ ] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway
 
 ### W4 视觉骨干（P0/P1）

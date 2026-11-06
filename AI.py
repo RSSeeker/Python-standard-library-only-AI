@@ -570,6 +570,202 @@ def zero_init_residual(block):
     return block
 
 
+def lsuv_init(target, x, tol: float = 1e-2, max_iter: int = 20):
+    """LSUV（Layer-sequential unit-variance）初始化
+
+    数据驱动：逐层前向真实样本，把该层的**预激活**（`W·x + b`，激活函数之前）
+    整批拉成均值 0、标准差 1，然后再交给下一层。权重只整体缩放（保持方向），
+    所以不破坏已有的正交性。
+
+    为什么必须在预激活上做：如果拿 `relu(W·x)` 的输出算 std，偏置平移会把一半
+    值压成 0，scale 调到位后 std 仍小于 1（实测 0.79），永远收敛不到 1。标准的
+    LSUV 是在线性层输出上做的，本函数照此实现 —— 收敛后 `std_after` 应 ≈ 1。
+
+    `target` 可以是单个 `Layer`，也可以是 `MLP`（按层顺序处理）。
+    `x` 可以是单个样本，也可以是一批样本（`[[...], [...]]`）—— 用一批更稳，
+    单样本时「逐单元标准差」只有一个数，容易退化。
+
+    返回每层的 `{"layer", "scale", "bias_shift", "std_before", "std_after", "iters"}`。
+    """
+    if isinstance(target, MLP):
+        layers = list(target.layers)
+    elif isinstance(target, Layer):
+        layers = [target]
+    else:
+        raise TypeError(
+            f"lsuv_init: 只接受 Layer 或 MLP，收到 {type(target).__name__}")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError(f"lsuv_init: tol 必须是数字，收到 {type(tol).__name__}")
+    if not math.isfinite(float(tol)) or tol <= 0:
+        raise ValueError(f"lsuv_init: tol 必须是正有限数，收到 {tol!r}")
+    if isinstance(max_iter, bool) or not isinstance(max_iter, int):
+        raise TypeError(
+            f"lsuv_init: max_iter 必须是 int，收到 {type(max_iter).__name__}")
+    if max_iter < 1:
+        raise ValueError(f"lsuv_init: max_iter 必须 >= 1，收到 {max_iter!r}")
+
+    if x and isinstance(x[0], (list, tuple)):
+        batch = [list(sample) for sample in x]
+        if not batch:
+            raise ValueError("lsuv_init: 样本批不能为空")
+        width = len(batch[0])
+        if any(len(sample) != width for sample in batch):
+            raise ValueError("lsuv_init: 批里各样本长度必须一致")
+    else:
+        batch = [list(x)]
+
+    def _preact(layer, samples):
+        fan_in = len(layer.weights[0]) if layer.weights else 0
+        for sample in samples:
+            if len(sample) != fan_in:
+                raise ValueError(
+                    f"lsuv_init: 样本长度 {len(sample)} 与该层输入维度 {fan_in} 不一致")
+        vals = []
+        for sample in samples:
+            for i in range(len(layer.weights)):
+                acc = layer.biases[i]
+                wi = layer.weights[i]
+                for j in range(len(wi)):
+                    acc += wi[j] * sample[j]
+                vals.append(acc)
+        d = len(vals)
+        mean = sum(vals) / d
+        var = sum((v - mean) ** 2 for v in vals) / d
+        return math.sqrt(var), mean
+
+    report = []
+    for idx, layer in enumerate(layers):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"lsuv_init: 第 {idx} 层是 {type(layer).__name__}，"
+                "只有带 weights/biases 的 Layer 支持 LSUV")
+        std, mean = _preact(layer, batch)
+        before = std
+        scale = 1.0
+        iters = 0
+        while abs(std - 1.0) > tol and std > 1e-12 and iters < max_iter:
+            f = 1.0 / std
+            for i in range(len(layer.weights)):
+                for j in range(len(layer.weights[i])):
+                    layer.weights[i][j] *= f
+            scale *= f
+            std, mean = _preact(layer, batch)
+            iters += 1
+        shift = -mean
+        for i in range(len(layer.biases)):
+            layer.biases[i] += shift
+        std2, mean2 = _preact(layer, batch)
+        report.append({"layer": idx, "scale": scale, "bias_shift": shift,
+                       "std_before": before, "std_after": std2, "iters": iters})
+        batch = [layer.forward(sample) for sample in batch]
+    return report
+
+
+def fixup_init(target, num_blocks: Optional[int] = None):
+    """Fixup 初始化（残差分支缩放 + 该层偏置置零）
+
+    Fixup 的可移植内核是：残差分支的**最后一层**按 `1/sqrt(块数)` 缩放，且该层
+    偏置为 0（这样残差分支初始接近恒等，深层也能训）。本库的残差结构是
+    `BasicBlock2d`（conv2）、`Bottleneck2d`（conv3）、`DenseBlock`（每层的 conv）
+    与带 skip 的 `MLP` 无关，所以这里作用在块对象上。
+
+    `target` 可以是单个块、也可以是块的列表；`num_blocks` 不给时按 `sqrt(len(块))`
+    推断（传进来的块数就是总块数的常见用法）。返回 `{"scales": [...], "num_blocks"}`。
+    """
+    if isinstance(target, (BasicBlock2d, Bottleneck2d, DenseBlock)):
+        blocks = [target]
+    elif isinstance(target, (list, tuple)):
+        blocks = list(target)
+        if not blocks:
+            raise ValueError("fixup_init: 块列表不能为空")
+    else:
+        raise TypeError(
+            "fixup_init: 只接受 BasicBlock2d / Bottleneck2d / DenseBlock 或其列表，"
+            f"收到 {type(target).__name__}")
+    for b in blocks:
+        if not isinstance(b, (BasicBlock2d, Bottleneck2d, DenseBlock)):
+            raise TypeError(
+                f"fixup_init: 列表里出现了 {type(b).__name__}，"
+                "只支持 BasicBlock2d / Bottleneck2d / DenseBlock")
+    if num_blocks is None:
+        n = len(blocks)
+    else:
+        if isinstance(num_blocks, bool) or not isinstance(num_blocks, int):
+            raise TypeError(
+                f"fixup_init: num_blocks 必须是 int，收到 {type(num_blocks).__name__}")
+        if num_blocks < 1:
+            raise ValueError(f"fixup_init: num_blocks 必须 >= 1，收到 {num_blocks!r}")
+        n = num_blocks
+    scale = 1.0 / math.sqrt(n)
+    scales = []
+    for b in blocks:
+        if isinstance(b, BasicBlock2d):
+            last = b.conv2
+        elif isinstance(b, Bottleneck2d):
+            last = b.conv3
+        else:
+            last = b.convs[-1]
+        # Conv2d 的 weights 是 [out][in][kh][kw] 四层嵌套，得逐个叶子缩放
+        for i in range(len(last.weights)):
+            for j in range(len(last.weights[i])):
+                w = last.weights[i][j]
+                if isinstance(w, list):
+                    for a in range(len(w)):
+                        for b in range(len(w[a])):
+                            w[a][b] *= scale
+                else:
+                    last.weights[i][j] = w * scale
+        for i in range(len(last.biases)):
+            last.biases[i] = 0.0
+        scales.append(scale)
+    return {"scales": scales, "num_blocks": n}
+
+
+def mimic_init(student, teacher):
+    """Mimic Init（NET2NET 的宽度/深度迁移，只支持 MLP）
+
+    宽度：学生比老师宽时，把老师的权重块复制到左上角、其余用 `1/sqrt(fan_in)`
+    量级的小随机补齐（保持输出方差不炸）；比老师窄时截断。
+    深度：学生比老师深时，按顺序复制前 `len(teacher)` 层，多出的层用 Xavier 初始化。
+
+    两层 `Layer` 的激活必须一致，否则报错（复制权重但换激活没有意义）。
+    返回 `{"widths": [...], "depth_copied": k}`。
+    """
+    if not isinstance(student, MLP) or not isinstance(teacher, MLP):
+        raise TypeError("mimic_init: student 与 teacher 都必须是 MLP")
+    if len(student.layers) != len(teacher.layers):
+        n = min(len(student.layers), len(teacher.layers))
+    else:
+        n = len(student.layers)
+    widths = []
+    for k in range(n):
+        sl = student.layers[k]
+        tl = teacher.layers[k]
+        if sl.activation_name != tl.activation_name:
+            raise ValueError(
+                f"mimic_init: 第 {k} 层激活不一致（学生 {sl.activation_name} / "
+                f"老师 {tl.activation_name}），复制权重没有意义")
+        so = len(sl.weights)
+        si = len(sl.weights[0])
+        to = len(tl.weights)
+        ti = len(tl.weights[0])
+        fan_in = si
+        std = math.sqrt(1.0 / max(1, fan_in))
+        rng = random.Random(0)
+        for i in range(min(so, to)):
+            for j in range(min(si, ti)):
+                sl.weights[i][j] = tl.weights[i][j]
+            for j in range(ti, si):
+                sl.weights[i][j] = rng.gauss(0.0, std)
+        for i in range(to, so):
+            for j in range(si):
+                sl.weights[i][j] = rng.gauss(0.0, std)
+        for i in range(min(so, to)):
+            sl.biases[i] = tl.biases[i]
+        widths.append((so, si, to, ti))
+    return {"widths": widths, "depth_copied": n}
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

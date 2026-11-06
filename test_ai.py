@@ -11881,3 +11881,155 @@ class TestFReLU:
                 pass
             else:
                 raise AssertionError("非法输入应该报错")
+
+
+# ==== W3-F：数据驱动初始化（LSUV / Fixup / Mimic） ====
+
+def _flat(node, out=None):
+    if out is None:
+        out = []
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            _flat(item, out)
+    else:
+        out.append(node)
+    return out
+
+
+class TestLSUV:
+    """在预激活上做 unit-variance：std->1、mean->0、方向不变"""
+
+    def test_preactivation_unit_variance(self):
+        import random as _random
+        _random.seed(51)
+        batch = [[_random.uniform(-1, 1) for _ in range(4)] for _ in range(16)]
+        m = AI.MLP([4, 6, 3], activations=["relu", "relu"])
+        rep = AI.lsuv_init(m, batch)
+        assert len(rep) == 2
+        assert all(abs(r["std_after"] - 1.0) < 1e-12 for r in rep)
+        # 预激活均值应为 0
+        cur = batch
+        for layer in m.layers:
+            vals = []
+            for sample in cur:
+                for i in range(len(layer.weights)):
+                    acc = layer.biases[i]
+                    for j in range(len(layer.weights[i])):
+                        acc += layer.weights[i][j] * sample[j]
+                    vals.append(acc)
+            assert abs(sum(vals) / len(vals)) < 1e-12
+            cur = [layer.forward(s) for s in cur]
+
+    def test_weight_direction_preserved(self):
+        import random as _random
+        _random.seed(52)
+        batch = [[_random.uniform(-1, 1) for _ in range(3)] for _ in range(8)]
+        m = AI.MLP([3, 5], activations=["relu"])
+        before = _flat(m.layers[0].weights)
+        AI.lsuv_init(m, batch)
+        after = _flat(m.layers[0].weights)
+        ratios = [b / a for a, b in zip(before, after) if abs(a) > 1e-12]
+        assert max(ratios) - min(ratios) < 1e-12
+
+    def test_single_sample_and_errors(self):
+        m = AI.MLP([3, 4], activations=["relu"])
+        rep = AI.lsuv_init(m, [0.5, -1.0, 2.0])
+        assert len(rep) == 1 and rep[0]["std_after"] >= 0.0
+        single = AI.MLP([3, 4], activations=["relu"])
+        rep2 = AI.lsuv_init(single.layers[0], [[1.0, 2.0, 3.0], [0.5, -0.5, 0.0]])
+        assert len(rep2) == 1 and abs(rep2[0]["std_after"] - 1.0) < 1e-12
+        for fn in (lambda: AI.lsuv_init([[1.0]], [[1.0], [2.0]]),
+                   lambda: AI.lsuv_init(AI.Dropout(0.5), [1.0, 2.0]),
+                   lambda: AI.lsuv_init(AI.MLP([2, 2]), [1.0, 2.0], tol=0.0),
+                   lambda: AI.lsuv_init(AI.MLP([2, 2]), [1.0, 2.0], tol=float("nan")),
+                   lambda: AI.lsuv_init(AI.MLP([3, 2]), [1.0, 2.0]),
+                   lambda: AI.lsuv_init(AI.MLP([2, 2]), [1.0, 2.0], max_iter=0),
+                   lambda: AI.lsuv_init("x", [1.0])):
+            try:
+                fn()
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+
+
+class TestFixupInit:
+    """残差分支最后一层 1/sqrt(n) 缩放 + 偏置置零"""
+
+    def test_scales_last_conv_only(self):
+        b = AI.BasicBlock2d(2)
+        before = _flat(b.conv2.weights)
+        conv1_before = _flat(b.conv1.weights)
+        b.conv2.biases = [0.7, -0.3]
+        out = AI.fixup_init(b, num_blocks=4)
+        assert abs(out["scales"][0] - 0.5) < 1e-12
+        after = _flat(b.conv2.weights)
+        assert all(abs(a * 0.5 - c) < 1e-15 for a, c in zip(before, after))
+        assert all(v == 0.0 for v in b.conv2.biases)
+        assert _flat(b.conv1.weights) == conv1_before
+
+    def test_bottleneck_and_dense(self):
+        b = AI.Bottleneck2d(4, 8)
+        before = _flat(b.conv3.weights)
+        AI.fixup_init(b, num_blocks=9)
+        after = _flat(b.conv3.weights)
+        assert all(abs(a / 3.0 - c) < 1e-14 for a, c in zip(before, after))
+        d = AI.DenseBlock(2, growth_rate=2, num_layers=2)
+        dw = _flat(d.convs[-1].weights)
+        AI.fixup_init(d, num_blocks=1)
+        assert _flat(d.convs[-1].weights) == dw
+
+    def test_errors(self):
+        b = AI.BasicBlock2d(2)
+        for fn in (lambda: AI.fixup_init(b, num_blocks=0),
+                   lambda: AI.fixup_init(b, num_blocks=True),
+                   lambda: AI.fixup_init([]),
+                   lambda: AI.fixup_init(AI.MLP([2, 2])),
+                   lambda: AI.fixup_init([b, AI.MLP([2, 2])])):
+            try:
+                fn()
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+
+
+class TestMimicInit:
+    """NET2NET：宽度复制左上角块、变窄截断、激活不一致报错"""
+
+    def test_wider_copy_and_train(self):
+        t = AI.MLP([3, 4, 2], activations=["relu", "softmax"])
+        s = AI.MLP([3, 6, 2], activations=["relu", "softmax"])
+        tw = [row[:] for row in t.layers[0].weights]
+        res = AI.mimic_init(s, t)
+        assert res["depth_copied"] == 2
+        assert all(s.layers[0].weights[i][j] == tw[i][j] for i in range(4) for j in range(3))
+        assert any(abs(s.layers[0].weights[i][j]) > 1e-12 for i in range(4, 6) for j in range(3))
+        assert all(s.layers[0].biases[i] == t.layers[0].biases[i] for i in range(4))
+        # 迁移后能正常训练
+        model = AI.Model(s, loss_fn="cross_entropy", task="classification", lr=0.1)
+        data = [([1.0, 0.0, 0.5], 0), ([0.0, 1.0, 0.5], 1)] * 4
+        model.fit(data=data, epochs=30, verbose=False, batch_size=4)
+        assert model.history["train_loss"][-1][1] < model.history["train_loss"][0][1]
+
+    def test_narrower_truncates(self):
+        t = AI.MLP([3, 6, 2], activations=["relu", "softmax"])
+        s = AI.MLP([3, 4, 2], activations=["relu", "softmax"])
+        tw = [row[:] for row in t.layers[0].weights]
+        AI.mimic_init(s, t)
+        assert all(s.layers[0].weights[i][j] == tw[i][j] for i in range(4) for j in range(3))
+
+    def test_errors(self):
+        for fn in (lambda: AI.mimic_init(AI.MLP([3, 4], activations=["tanh"]),
+                                         AI.MLP([3, 4], activations=["relu"])),
+                   lambda: AI.mimic_init(AI.MLP([3, 4]), "x")):
+            try:
+                fn()
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+        # 深度不同时只复制前 min(len) 层
+        out = AI.mimic_init(AI.MLP([3, 4], activations=["relu"]),
+                            AI.MLP([3, 4, 2], activations=["relu", "relu"]))
+        assert out["depth_copied"] == 1

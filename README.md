@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（839 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（848 项）
 
 ## 特性
 
@@ -726,6 +726,9 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `init_trunc_normal(target, std=0.02, cutoff=2.0, max_tries=100)` | 截断正态（拒绝采样，全部落在 `±cutoff·std` 内），ViT 类模型的常用初始化 |
 | `zero_bias(target)` | 把所有层的 `biases` 清零 |
 | `zero_init_residual(block)` | 残差分支零初始化：把块里**最后一个**分支 BN 的 `gamma` 置零（`BasicBlock2d` 零 `bn2`、`Bottleneck2d` 零 `bn3`）；捷径投影的 `short_bn` 不动 |
+| `lsuv_init(target, x, tol=1e-2, max_iter=20)` | LSUV：逐层把**预激活**整批拉成均值 0 / std 1（权重只整体缩放，方向不变）；支持 `Layer`/`MLP` 与单样本/批输入 |
+| `fixup_init(target, num_blocks=None)` | Fixup：残差分支最后一层按 `1/√n` 缩放并把该层偏置置零；作用在 `BasicBlock2d`/`Bottleneck2d`/`DenseBlock` 上 |
+| `mimic_init(student, teacher)` | NET2NET 宽度/深度迁移（MLP）：老师权重块复制到左上角，新增行列用小随机补齐；激活不一致直接报错 |
 
 > 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
 > （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
@@ -1060,7 +1063,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-839 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+848 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1141,6 +1144,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMaxout` | 前向等于逐元素最大仿射值、argmax 路由（只有选中支路有梯度）、`dx`/`grad_a` 中心差分、优化器步与 6 类非法输入 |
 | `TestDynamicReLU` | 斜率随样本变化、含耦合项的 `dx` 闭式解、`dx`/`w`/`b` 三组中心差分、优化器步与 5 类非法输入 |
 | `TestFReLU` | 零初始化逐位等于 ReLU、`k×k` 卷积支路闭式解、`dx`/`grad_w` 中心差分、优化器步与 6 类非法输入 |
+| `TestLSUV` | 预激活 `std→1`/`mean→0`、权重方向不变（缩放因子全局一致）、单样本与单层输入、7 类非法输入 |
+| `TestFixupInit` | 只缩放残差分支最后一层且偏置置零、`1/√n` 系数（BasicBlock/Bottleneck/DenseBlock）、5 类非法输入 |
+| `TestMimicInit` | 宽度复制左上角块、新增行列非零、变窄截断、迁移后仍能训练、激活不一致报错 |
 | `TestSwiGLUGates` | 默认 swish 与旧实现逐位一致、gelu/relu/bilinear 门控值、各 gate 的 `grad_Wg` 中心差分、非法 gate 校验 |
 | `TestInitFamily` | LeCun 正态/均匀的 `std` 与界内、正交矩阵行模长 `==gain` 且两两正交（fat 矩阵改验列正交）、稀疏零比例、截断正态界内、`zero_bias`、残差零初始化后退化为 `relu(x)`（Bottleneck 零 `bn3` 而非 `short_bn`）、非法输入、默认 He 初始化未被改动 |
 | `TestWeightNorm` | 初始化即等于原层、`dv`（含 `v`/`g` 解耦项）/`dg`/`db` 中心差分、`dx = wᵀdout`、forward 不永久改写内层权重 |
@@ -1206,7 +1212,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 839 个单元测试
+├── test_ai.py       # 848 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
