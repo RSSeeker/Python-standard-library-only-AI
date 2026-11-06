@@ -142,8 +142,9 @@
 ### W3 归一化·激活·初始化（P1 + §6）
 - [x] 归一化族（W3-A）：`ScaleNorm`（只有标量 g）、`WeightNorm`（`w = g⊙v/‖v‖`，反向含解耦项，`dv`/`dg`/`db` 中心差分 ≤1e-7）、`SpectralNorm`（幂迭代估计 σ，默认 σ 视为常量，`freeze_sigma()` 后 `dv` 与中心差分一致）
 - [ ] 归一化族（剩余）：`SwitchNorm`（批/实例/层三种统计量软加权）、`FilterResponseNorm`（FRN + 阈值 τ）
-- [ ] 激活族：`PReLU`（可学习斜率）、`Maxout`、`DynamicReLU`、`FReLU`、`Snake`
-- [ ] GLU 族：`SwiGLU` 加 `gate="swish|gelu|relu|bilinear"`（GeGLU / ReGLU / Bilinear GLU）
+- [x] 激活族（W3-B）：`PReLU`（逐特征可学习斜率，负分支才累计 `da`）、`Snake`（`y = x + sin²(ax)/a`，`a→0` 走极限分支；`dx`/`da` 中心差分 ≤1e-7）
+- [ ] 激活族（剩余）：`Maxout`、`DynamicReLU`、`FReLU`
+- [x] GLU 族（W3-B）：`SwiGLU(gate="swish|silu|gelu|relu|bilinear")` → SwiGLU / GeGLU / ReGLU / Bilinear GLU；默认 `swish` 与原实现逐位一致，各 gate 的 `grad_Wg` 中心差分 ≤1e-6
 - [ ] 初始化族：`init_lecun`、`init_orthogonal`、`init_sparse`、`init_trunc_normal`、零初始化 bias、
       残差分支零初始化（`zero_init_residual`）
 - [ ] 数据驱动初始化：LSUV、Fixup/T-Fixup、Mimic Init（NET2NET）

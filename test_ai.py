@@ -10932,3 +10932,237 @@ class TestSpectralNorm:
             pass
         else:
             raise AssertionError("未 forward 就 backward 应该报错")
+
+
+# ==== W3-B：PReLU / Snake / SwiGLU 的 gate ====
+
+class TestPReLU:
+    """PReLU：逐特征可学习斜率，负分支才有 da"""
+
+    def test_forward_and_param(self):
+        pr = AI.PReLU(3, init=0.25)
+        out = pr.forward([0.7, -0.4, -1.2])
+        assert abs(out[0] - 0.7) < 1e-12
+        assert abs(out[1] - 0.25 * -0.4) < 1e-12
+        assert abs(out[2] - 0.25 * -1.2) < 1e-12
+        assert pr.param_count() == 3
+
+    def test_gradients(self):
+        pr = AI.PReLU(3, init=0.25)
+        x = [0.7, -0.4, -1.2]
+        dout = [1.0, 2.0, -1.5]
+        pr.zero_grad()
+        pr.forward(x)
+        dx = pr.backward(dout)
+        assert abs(dx[0] - 1.0) < 1e-12
+        assert abs(dx[1] - 2.0 * 0.25) < 1e-12
+        assert abs(pr.grad_a[0]) < 1e-12          # 正分支不产生 da
+        assert abs(pr.grad_a[1] - 2.0 * -0.4) < 1e-12
+        assert abs(pr.grad_a[2] - (-1.5) * -1.2) < 1e-12
+
+        def loss(aa, xx):
+            return sum((xx[i] if xx[i] > 0 else aa[i] * xx[i]) * dout[i]
+                       for i in range(3))
+
+        eps = 1e-6
+        for i in range(3):
+            a0 = pr.a[i]
+            pr.a[i] = a0 + eps
+            vp = loss(pr.a, x)
+            pr.a[i] = a0 - eps
+            vm = loss(pr.a, x)
+            pr.a[i] = a0
+            assert abs((vp - vm) / (2 * eps) - pr.grad_a[i]) <= 1e-7
+
+    def test_optimizer_and_errors(self):
+        pr = AI.PReLU(3, init=0.25)
+        x = [0.7, -0.4, -1.2]
+        dout = [1.0, 2.0, -1.5]
+        pr.forward(x)
+        pr.backward(dout)
+        a0 = list(pr.a)
+        pr.sgd_step(0.1)
+        assert any(abs(pr.a[i] - a0[i]) > 1e-12 for i in range(3))
+        pr.forward(x)
+        pr.backward(dout)
+        a1 = list(pr.a)
+        pr.adam_step(0.05)
+        assert pr._adam_t == 1
+        assert any(abs(pr.a[i] - a1[i]) > 1e-12 for i in range(3))
+        for bad in (0, -1, 1.5, True):
+            try:
+                AI.PReLU(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"PReLU({bad!r}) 应该报错")
+        try:
+            AI.PReLU(3, float("nan"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("init=nan 应该报错")
+        try:
+            AI.PReLU(3).forward([1.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("维度不符应该报错")
+        try:
+            AI.PReLU(3).backward([1.0, 1.0, 1.0])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+        try:
+            pr.sgd_step(-1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("负 lr 应该报错")
+
+
+class TestSnake:
+    """Snake：``y = x + sin²(ax)/a``，a→0 退化为恒等"""
+
+    def test_forward_closed_form(self):
+        import math as _math
+        sn = AI.Snake(3, init=1.0)
+        xs = [0.3, -0.8, 1.4]
+        out = sn.forward(xs)
+        for i in range(3):
+            ref = xs[i] + _math.sin(xs[i]) ** 2
+            assert abs(out[i] - ref) < 1e-12
+        assert sn.param_count() == 3
+
+    def test_gradients(self):
+        import math as _math
+        sn = AI.Snake(3, init=1.0)
+        xs = [0.3, -0.8, 1.4]
+        douts = [0.5, -1.0, 2.0]
+        sn.zero_grad()
+        sn.forward(xs)
+        dxs = sn.backward(douts)
+        for i in range(3):
+            assert abs(dxs[i] - douts[i] * (1.0 + _math.sin(2.0 * xs[i]))) < 1e-12
+
+        def loss(aa, xx):
+            tot = 0.0
+            for i in range(3):
+                a = aa[i]
+                y = xx[i] if abs(a) < 1e-8 else xx[i] + _math.sin(a * xx[i]) ** 2 / a
+                tot += y * douts[i]
+            return tot
+
+        eps = 1e-6
+        for i in range(3):
+            x0 = xs[i]
+            xs[i] = x0 + eps
+            vp = loss(sn.a, xs)
+            xs[i] = x0 - eps
+            vm = loss(sn.a, xs)
+            xs[i] = x0
+            assert abs((vp - vm) / (2 * eps) - dxs[i]) <= 1e-7
+        for i in range(3):
+            a0 = sn.a[i]
+            sn.a[i] = a0 + eps
+            vp = loss(sn.a, xs)
+            sn.a[i] = a0 - eps
+            vm = loss(sn.a, xs)
+            sn.a[i] = a0
+            assert abs((vp - vm) / (2 * eps) - sn.grad_a[i]) <= 1e-7
+
+    def test_zero_scale_limit_and_errors(self):
+        sn = AI.Snake(2, init=1.0)
+        sn.a = [0.0, 0.0]
+        sn.forward([0.5, -2.0])
+        d = sn.backward([1.0, 1.0])
+        assert abs(d[0] - 1.0) < 1e-12 and abs(d[1] - 1.0) < 1e-12
+        assert abs(sn.grad_a[0] - 0.25) < 1e-12
+        assert abs(sn.grad_a[1] - 4.0) < 1e-12
+        for bad in (0, -1, True):
+            try:
+                AI.Snake(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"Snake({bad!r}) 应该报错")
+        try:
+            AI.Snake(2).forward([1.0])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("维度不符应该报错")
+
+
+class TestSwiGLUGates:
+    """SwiGLU 的 gate：swish/silu/gelu/relu/bilinear"""
+
+    def test_default_is_swish_and_unchanged(self):
+        import random as _random
+        _random.seed(7)
+        base = AI.SwiGLU(4, 5)
+        assert base.gate == "swish"
+        base.forward([[0.1, -0.2, 0.3, 0.4]])
+        xr = [0.1, -0.2, 0.3, 0.4]
+        for j in range(5):
+            z = sum(base.Wg[j][k] * xr[k] for k in range(4)) + base.bg[j]
+            assert abs(base.g[0][j] - (AI._silu_scalar(z) + base.bg[j])) < 1e-12
+
+    def test_each_gate_forward(self):
+        import random as _random
+        xr = [0.1, -0.2, 0.3, 0.4]
+        for gate in ("gelu", "relu", "bilinear"):
+            _random.seed(7)
+            g = AI.SwiGLU(4, 5, gate=gate)
+            g.forward([xr])
+            for j in range(5):
+                z = sum(g.Wg[j][k] * xr[k] for k in range(4)) + g.bg[j]
+                if gate == "gelu":
+                    expect = AI._gelu_scalar(z)
+                elif gate == "relu":
+                    expect = max(0.0, z)
+                else:
+                    expect = z
+                assert abs(g.g[0][j] - (expect + g.bg[j])) < 1e-12
+
+    def test_gate_gradients(self):
+        import random as _random
+        eps = 1e-6
+        xseq = [[0.3, -0.5, 0.8]]
+        doutseq = [[0.7, -0.4, 0.2]]
+        for gate in ("gelu", "relu", "bilinear"):
+            _random.seed(11)
+            gl = AI.SwiGLU(3, 4, gate=gate)
+
+            def loss():
+                o = gl.forward(xseq)
+                return sum(o[0][j] * doutseq[0][j] for j in range(3))
+
+            gl.zero_grad()
+            loss()
+            gl.backward(doutseq)
+            for j in range(4):
+                for k in range(3):
+                    old = gl.Wg[j][k]
+                    gl.Wg[j][k] = old + eps
+                    vp = loss()
+                    gl.Wg[j][k] = old - eps
+                    vm = loss()
+                    gl.Wg[j][k] = old
+                    assert abs((vp - vm) / (2 * eps) - gl.grads["Wg"][j][k]) <= 1e-6
+
+    def test_invalid_gate(self):
+        try:
+            AI.SwiGLU(4, 5, gate="tanh")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("非法 gate 应该报错")
+        try:
+            AI.SwiGLU(4, 5, gate=3)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("非字符串 gate 应该报错")
+        assert AI.SwiGLU.GATES == ("swish", "silu", "gelu", "relu", "bilinear")

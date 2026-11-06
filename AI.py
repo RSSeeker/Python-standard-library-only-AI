@@ -3908,6 +3908,177 @@ class ConditionalNorm:
         return [(dxhat[c] - mean_d - xhat[c] * mean_dx) * inv for c in range(n)]
 
 
+class PReLU:
+    """参数化 ReLU：y_i = x_i (x_i > 0) 否则 a_i * x_i
+
+    `a` 逐特征（per-channel）可学习。`init` 是小正数（默认 0.25，与 PyTorch 一致），
+    负数输出不会被完全压死。x_i == 0 时按正分支处理（导数为 1）。
+    """
+
+    def __init__(self, num_features: int, init: float = 0.25):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(
+                f"PReLU: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(f"PReLU: num_features 必须 >= 1，收到 {num_features!r}")
+        if not isinstance(init, (int, float)) or isinstance(init, bool):
+            raise TypeError(f"PReLU: init 必须是数字，收到 {type(init).__name__}")
+        if not math.isfinite(float(init)):
+            raise ValueError(f"PReLU: init 必须是有限数，收到 {init!r}")
+        self.d = num_features
+        self.a = [float(init)] * self.d
+        self.x = None
+        self.grad_a = [0.0] * self.d
+        self.m_a = [0.0] * self.d
+        self.v_a = [0.0] * self.d
+        self._adam_t = 0
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"PReLU.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        return [x[i] if x[i] > 0.0 else self.a[i] * x[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("PReLU.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"PReLU.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致")
+        for i in range(self.d):
+            if self.x[i] > 0.0:
+                self.grad_a[i] += 0.0
+            else:
+                self.grad_a[i] += dout[i] * self.x[i]
+        return [dout[i] if self.x[i] > 0.0 else dout[i] * self.a[i]
+                for i in range(self.d)]
+
+    def zero_grad(self):
+        self.grad_a = [0.0] * self.d
+
+    def param_count(self):
+        return self.d
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"PReLU.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.d):
+            self.a[i] -= lr * self.grad_a[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"PReLU.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.a, self.grad_a, self.m_a, self.v_a, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class Snake:
+    """Snake 激活（Ziyin et al. 2020）：y_i = x_i + sin²(a_i·x_i)/a_i
+
+    周期激活，在周期性/音频类数据上比 GELU 更好。`a_i` 逐特征可学习，
+    `a → 0` 时退化为恒等映射（这里按极限 `y ≈ x + a·x²` 处理，避免 0/0）。
+
+    导数：dy/dx = 1 + sin(2 a x)，dy/da = 2 sin(a x)cos(a x)x/a − sin²(a x)/a²。
+    """
+
+    def __init__(self, num_features: int, init: float = 1.0):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(
+                f"Snake: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(f"Snake: num_features 必须 >= 1，收到 {num_features!r}")
+        if not isinstance(init, (int, float)) or isinstance(init, bool):
+            raise TypeError(f"Snake: init 必须是数字，收到 {type(init).__name__}")
+        if not math.isfinite(float(init)):
+            raise ValueError(f"Snake: init 必须是有限数，收到 {init!r}")
+        self.d = num_features
+        self.a = [float(init)] * self.d
+        self.x = None
+        self.grad_a = [0.0] * self.d
+        self.m_a = [0.0] * self.d
+        self.v_a = [0.0] * self.d
+        self._adam_t = 0
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"Snake.forward: 特征维度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        out = []
+        for i in range(self.d):
+            a = self.a[i]
+            if abs(a) < 1e-8:
+                out.append(x[i])
+            else:
+                sv = math.sin(a * x[i])
+                out.append(x[i] + sv * sv / a)
+        return out
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("Snake.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"Snake.backward: dout 长度 {len(dout)} 与本层维度 {self.d} 不一致")
+        dx = []
+        for i in range(self.d):
+            a = self.a[i]
+            xv = self.x[i]
+            if abs(a) < 1e-8:
+                dx.append(dout[i])
+                self.grad_a[i] += dout[i] * xv * xv
+            else:
+                sv = math.sin(a * xv)
+                cv = math.cos(a * xv)
+                dx.append(dout[i] * (1.0 + 2.0 * sv * cv))
+                self.grad_a[i] += dout[i] * (2.0 * sv * cv * xv / a
+                                             - sv * sv / (a * a))
+        return dx
+
+    def zero_grad(self):
+        self.grad_a = [0.0] * self.d
+
+    def param_count(self):
+        return self.d
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"Snake.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.d):
+            self.a[i] -= lr * self.grad_a[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"Snake.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.a, self.grad_a, self.m_a, self.v_a, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
@@ -6166,13 +6337,35 @@ class SwiGLU:
     与 `FeedForward` 的区别：多一路门控投影 `W_g`，两个分支逐元素相乘
     （SwiGLU = Swish-Gated Linear Unit）。表达力更强，LLaMA 用它替代 ReLU-FFN。
     d_ff 通常取 FeedForward 的 2/3 左右效果相当（这里由调用者决定）。
+
+    `gate` 可选 `"swish"`（默认，即 SwiGLU）/ `"silu"`（同 swish）/ `"gelu"`
+    （GeGLU）/ `"relu"`（ReGLU）/ `"bilinear"`（Bilinear GLU，门控就是恒等）。
     """
 
-    def __init__(self, d_model: int, d_ff: int):
+    #: 门控激活选择：名字 → (激活, 导数)
+    GATES = ("swish", "silu", "gelu", "relu", "bilinear")
+
+    def __init__(self, d_model: int, d_ff: int, gate: str = "swish"):
         if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
             raise ValueError(f"SwiGLU: d_model 必须是正整数，收到 {d_model!r}")
         if isinstance(d_ff, bool) or not isinstance(d_ff, int) or d_ff < 1:
             raise ValueError(f"SwiGLU: d_ff 必须是正整数，收到 {d_ff!r}")
+        if not isinstance(gate, str):
+            raise TypeError(f"SwiGLU: gate 必须是字符串，收到 {type(gate).__name__}")
+        if gate not in SwiGLU.GATES:
+            raise ValueError(
+                f"SwiGLU: gate 必须是 {SwiGLU.GATES} 之一，收到 {gate!r}")
+        # gate 表在 __init__ 里现查，避免依赖定义顺序（_gelu_scalar 在后面才定义）
+        table = {
+            "swish": (_silu_scalar, _dsilu_scalar),
+            "silu": (_silu_scalar, _dsilu_scalar),
+            "gelu": (_gelu_scalar, _dgelu_scalar),
+            "relu": (lambda z: z if z > 0.0 else 0.0,
+                     lambda z: 1.0 if z > 0.0 else 0.0),
+            "bilinear": (lambda z: z, lambda z: 1.0),
+        }
+        self.gate = gate
+        self._gate_fn, self._gate_deriv = table[gate]
         self.d_model = d_model
         self.d_ff = d_ff
         std1 = math.sqrt(2.0 / d_model)
@@ -6231,7 +6424,8 @@ class SwiGLU:
         self.h1 = _matmul(x_seq, _transpose(self.W1))
         zg = _matmul(x_seq, _transpose(self.Wg))
         self.zg = zg
-        self.g = [[_silu_scalar(zg[t][j]) + self.bg[j] for j in range(self.d_ff)]
+        gate_fn = self._gate_fn
+        self.g = [[gate_fn(zg[t][j]) + self.bg[j] for j in range(self.d_ff)]
                   for t in range(self.seq_len)]
         # 门控分支的 bias 加在 silu 之后（LLaMA 无 bias，这里是通用写法）
         for t in range(self.seq_len):
@@ -6258,10 +6452,11 @@ class SwiGLU:
         dg = [[dh[t][j] * self.h1[t][j] for j in range(self.d_ff)] for t in range(T)]
         # bg 是加在 silu 之后的（g = silu(z_g) + b_g），所以它的梯度不乘 silu'
         dg_pre = [row[:] for row in dg]
-        # 门控分支反向：d silu（只用于 W_g 与 dx）
+        # 门控分支反向：乘所选门控激活的导数（只用于 W_g 与 dx）
+        gate_deriv = self._gate_deriv
         for t in range(T):
             for j in range(self.d_ff):
-                dg[t][j] *= _dsilu_scalar(self.zg[t][j])
+                dg[t][j] *= gate_deriv(self.zg[t][j])
         grad_W1 = _matmul(_transpose(dh1), self.x)
         grad_b1 = [sum(dh1[t][j] for t in range(T)) for j in range(self.d_ff)]
         grad_Wg = _matmul(_transpose(dg), self.x)
