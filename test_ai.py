@@ -12994,3 +12994,173 @@ class TestSegNet:
             if first is None:
                 first = tot
         assert tot < first / 3.0
+
+
+class TestMLPMixer:
+    """MLP-Mixer：token 混合 + 通道混合（两段 pre-LN 残差）"""
+
+    BASE = dict(in_channels=1, image_size=8, patch_size=4, d_model=8,
+                num_layers=2, token_hidden=12, channel_hidden=12,
+                num_classes=3)
+
+    def _model(self, **kw):
+        cfg = dict(self.BASE)
+        cfg.update(kw)
+        random.seed(0)
+        return AI.MLPMixer(**cfg)
+
+    def _img(self, scale=1.0):
+        return [[[scale * (0.1 * a - 0.05 * b + 0.02 * a * b)
+                  for b in range(8)] for a in range(8)]]
+
+    def _loss(self, model, coef, img=None):
+        img = self._img() if img is None else img
+        model.zero_grad()
+        out = model.forward(img)
+        return sum(c * o for c, o in zip(coef, out))
+
+    def test_shapes_and_param_count(self):
+        m = self._model()
+        logits = m.forward(self._img())
+        assert len(logits) == 3
+        assert m.param_count() == 891
+        dx = m.backward([1.0, -0.5, 0.25])
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
+
+    def test_gradients_match_finite_difference(self):
+        m = self._model()
+        coef = [1.0, -0.5, 0.25]
+        eps = 1e-5
+        # 输入梯度
+        img = [row[:] for row in self._img()[0]]
+        m.zero_grad()
+        m.forward([img])
+        dx = m.backward(coef)
+        for (a, b) in [(0, 0), (3, 2), (7, 5)]:
+            old = img[a][b]
+            img[a][b] = old + eps
+            lp = self._loss(m, coef, [img])
+            img[a][b] = old - eps
+            lm = self._loss(m, coef, [img])
+            img[a][b] = old
+            num = (lp - lm) / (2 * eps)
+            denom = max(1.0, abs(num), abs(dx[0][a][b]))
+            assert abs(dx[0][a][b] - num) / denom < 1e-5
+        # block 内四组 MLP 的权重梯度
+        for bi in range(2):
+            for name in ('t1', 't2', 'c1', 'c2'):
+                m2 = self._model()
+                blk = m2.blocks[bi]
+                layer = getattr(blk, name)
+                m2.zero_grad()
+                m2.forward(self._img())
+                m2.backward(coef)
+                i = 1 if len(layer.weights) > 1 else 0
+                j = 2 if len(layer.weights[0]) > 2 else 0
+                ana = blk.grads[name][0][i][j]
+                old = layer.weights[i][j]
+                layer.weights[i][j] = old + eps
+                lp = self._loss(m2, coef)
+                layer.weights[i][j] = old - eps
+                lm = self._loss(m2, coef)
+                layer.weights[i][j] = old
+                num = (lp - lm) / (2 * eps)
+                denom = max(1.0, abs(num), abs(ana))
+                assert abs(ana - num) / denom < 1e-5, (bi, name, ana, num)
+
+    def test_norm_and_head_gradients(self):
+        m = self._model()
+        coef = [1.0, -0.5, 0.25]
+        eps = 1e-5
+        old = m.head.weights[1][2]
+        m.head.weights[1][2] = old + eps
+        lp = self._loss(m, coef)
+        m.head.weights[1][2] = old - eps
+        lm = self._loss(m, coef)
+        m.head.weights[1][2] = old
+        num = (lp - lm) / (2 * eps)
+        m.zero_grad()
+        m.forward(self._img())
+        m.backward(coef)
+        denom = max(1.0, abs(num))
+        assert abs(m.head_grads[0][1][2] - num) / denom < 1e-5
+
+        blk = m.blocks[1]
+        old = blk.ln2.beta[5]
+        blk.ln2.beta[5] = old + eps
+        lp = self._loss(m, coef)
+        blk.ln2.beta[5] = old - eps
+        lm = self._loss(m, coef)
+        blk.ln2.beta[5] = old
+        num = (lp - lm) / (2 * eps)
+        m.zero_grad()
+        m.forward(self._img())
+        m.backward(coef)
+        denom = max(1.0, abs(num))
+        assert abs(blk.norm_grads['ln2'][1][5] - num) / denom < 1e-5
+
+    def test_accumulation_and_zero_grad(self):
+        m = self._model()
+        coef = [1.0, -0.5, 0.25]
+        m.zero_grad()
+        m.forward(self._img())
+        m.backward(coef)
+        first = m.head_grads[0][1][2]
+        assert abs(first) > 1e-9
+        m.forward(self._img())
+        m.backward(coef)
+        assert abs(m.head_grads[0][1][2] - 2 * first) < 1e-9
+        m.zero_grad()
+        assert all(abs(v) < 1e-15 for row in m.head_grads[0] for v in row)
+        assert all(abs(v) < 1e-15 for v in m.norm_grads[0])
+        assert all(abs(v) < 1e-15
+                   for row in m.blocks[0].grads['t1'][0] for v in row)
+
+    def test_training_and_validation(self):
+        random.seed(1)
+        X = [[[0.1 * a - 0.1 * b for b in range(8)] for a in range(8)],
+             [[0.2 * a - 0.05 * b + 0.5 for b in range(8)] for a in range(8)],
+             [[0.05 * a + 0.3 * b - 0.4 for b in range(8)] for a in range(8)],
+             [[-0.2 * a + 0.1 * b for b in range(8)] for a in range(8)]]
+        Y = [0, 1, 0, 1]
+        m = AI.MLPMixer(in_channels=1, image_size=8, patch_size=4, d_model=8,
+                        num_layers=2, token_hidden=12, channel_hidden=12,
+                        num_classes=2)
+        losses = []
+        for _ in range(120):
+            total = 0.0
+            for img, y in zip(X, Y):
+                m.zero_grad()
+                out = m.forward([img])
+                loss, grads = AI.cross_entropy_loss(out, y)
+                total += loss
+                m.backward(grads)
+                m.adam_step(0.01)
+            losses.append(total / len(X))
+        assert losses[-1] < losses[0] * 0.5
+        pred = []
+        for img in X:
+            out = m.forward([img])
+            pred.append(0 if out[0] > out[1] else 1)
+        assert pred == Y
+
+        def raises(fn, exc):
+            try:
+                fn()
+            except exc:
+                return True
+            except Exception:
+                return False
+            return False
+
+        assert raises(lambda: AI.MLPMixer(in_channels=0), ValueError)
+        assert raises(lambda: AI.MLPMixer(image_size=7, patch_size=4), ValueError)
+        assert raises(lambda: AI.MLPMixer(patch_size=0), ValueError)
+        assert raises(lambda: AI.MLPMixer(num_layers=0), ValueError)
+        m2 = self._model()
+        assert raises(lambda: m2.forward([[0.0] * 8] * 8), ValueError)
+        assert raises(lambda: m2.forward([[[0.0] * 7] * 8] * 1), ValueError)
+        m2.forward(self._img())
+        assert raises(lambda: m2.backward([1.0, 0.0]), ValueError)
+        assert raises(lambda: m2.sgd_step(-0.1), ValueError)
+        assert raises(lambda: m2.adam_step(0.1, beta1=1.0), ValueError)

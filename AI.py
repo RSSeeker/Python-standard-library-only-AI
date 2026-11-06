@@ -22,7 +22,7 @@
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
-  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / UNet / FPN / SegNet；残差变体：
+  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / MLP-Mixer / UNet / FPN / SegNet；残差变体：
     ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
@@ -2207,8 +2207,18 @@ def _conv_sgd(layer, lr):
                     row_w[k] -= lr * row_g[k]
 
 
+def _check_adam_betas(beta1, beta2, who):
+    """校验 Adam 的 beta1/beta2 落在 [0,1)，否则偏差修正会除以 0"""
+    for name, v in (("beta1", beta1), ("beta2", beta2)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not 0.0 <= v < 1.0:
+            raise ValueError(
+                f"{who}: {name} 必须在 [0,1) 内，收到 {v!r}")
+
+
 def _conv_adam(layer, lr, beta1=0.9, beta2=0.999, eps=1e-8):
     """原地 Adam 更新一个卷积层；步数记在 layer._conv_adam_t 上"""
+    _check_adam_betas(beta1, beta2, "_conv_adam")
     t = getattr(layer, "_conv_adam_t", 0) + 1
     layer._conv_adam_t = t
     c1 = 1.0 - beta1 ** t
@@ -4948,6 +4958,7 @@ def _dense_apply_adam(layer, grads, lr, beta1=0.9, beta2=0.999, eps=1e-8):
     """把 `backward` 的梯度原地 Adam 到 `Layer`（矩复用 layer 自带的 `m_*`/`v_*`）"""
     if grads is None:
         raise RuntimeError("_dense_apply_adam: 必须先调用 backward()")
+    _check_adam_betas(beta1, beta2, "_dense_apply_adam")
     gw, gb = grads
     layer._dense_adam_t = getattr(layer, '_dense_adam_t', 0) + 1
     t = layer._dense_adam_t
@@ -4987,6 +4998,7 @@ def _norm_apply_sgd(norm, grads, lr):
 def _norm_apply_adam(norm, grads, lr, beta1=0.9, beta2=0.999, eps=1e-8):
     if grads is None:
         raise RuntimeError("_norm_apply_adam: 必须先调用 backward()")
+    _check_adam_betas(beta1, beta2, "_norm_apply_adam")
     gg, gbeta = grads
     norm._dense_adam_t = getattr(norm, '_dense_adam_t', 0) + 1
     t = norm._dense_adam_t
@@ -6503,6 +6515,328 @@ class SegNet:
             raise ValueError(f"SegNet.adam_step: lr 必须是非负数，收到 {lr!r}")
         for layer in self._convs:
             _conv_adam(layer, float(lr), beta1, beta2, eps)
+
+
+def _layer_zero_grads(layer):
+    """`Layer` 的零梯度缓冲：`(grad_w, grad_b)`"""
+    return ([[0.0] * len(row) for row in layer.weights],
+            [0.0] * len(layer.biases))
+
+
+def _layer_add_grads(acc, new):
+    """把 `backward` 返回的 `(gw, gb)` 累加进缓冲"""
+    gw, gb = acc
+    ngw, ngb = new
+    for i in range(len(gw)):
+        for j in range(len(gw[i])):
+            gw[i][j] += ngw[i][j]
+    for i in range(len(gb)):
+        gb[i] += ngb[i]
+
+
+def _dense_rows_forward(layer, rows):
+    """把 `layer` 逐行应用（不写 layer 的缓存），返回 (out_rows, cache)。
+
+    `MLPMixer` 这类"同一层按通道/按 token 复用"的结构必须用这个版本：
+    `Layer.forward` 只保留最后一次的 `input`/`z`，循环调用会让反向全用同一份缓存。
+    """
+    W, b = layer.weights, layer.biases
+    act = layer.act_fn
+    out, cache = [], []
+    for row in rows:
+        z = [sum(map(_mul, Wi, row)) + bi for Wi, bi in zip(W, b)]
+        out.append(act(z))
+        cache.append((row, z))
+    return out, cache
+
+
+def _dense_rows_backward(layer, cache, drows):
+    """`_dense_rows_forward` 的反向，返回 (grad_w, grad_b, dx_rows)"""
+    W = layer.weights
+    deriv = layer.act_deriv
+    grad_w = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+    grad_b = [0.0] * layer.fan_out
+    dx_rows = []
+    for (x, z), drow in zip(cache, drows):
+        if len(drow) != layer.fan_out:
+            raise ValueError(
+                f"{type(layer).__name__} 反向: 行梯度长度 {len(drow)} 与输出维度 "
+                f"{layer.fan_out} 不一致")
+        d_act = deriv(z)
+        w = [drow[j] * d_act[j] for j in range(layer.fan_out)]
+        for i in range(layer.fan_out):
+            wi = w[i]
+            grad_b[i] += wi
+            grow = grad_w[i]
+            for j in range(layer.fan_in):
+                grow[j] += wi * x[j]
+        dx_rows.append([sum(map(_mul, col, w)) for col in zip(*W)])
+    return grad_w, grad_b, dx_rows
+
+
+def _norm_rows_forward(norm, rows):
+    """把 `norm`（LayerNorm）逐行应用，返回 (out_rows, cache)。"""
+    d = norm.d
+    g, be, eps = norm.gamma, norm.beta, norm.eps
+    out, cache = [], []
+    for row in rows:
+        if len(row) != d:
+            raise ValueError(
+                f"LayerNorm 前向: 长度 {len(row)} 与特征数 {d} 不一致")
+        mean = sum(row) / d
+        var = sum((xi - mean) ** 2 for xi in row) / d
+        inv = 1.0 / math.sqrt(var + eps)
+        xhat = [(xi - mean) * inv for xi in row]
+        out.append([g[c] * xhat[c] + be[c] for c in range(d)])
+        cache.append((xhat, inv))
+    return out, cache
+
+
+def _norm_rows_backward(norm, cache, drows):
+    """`_norm_rows_forward` 的反向，返回 (grad_gamma, grad_beta, dx_rows)"""
+    d = norm.d
+    g = norm.gamma
+    grad_g = [0.0] * d
+    grad_b = [0.0] * d
+    dx_rows = []
+    for (xhat, inv), drow in zip(cache, drows):
+        if len(drow) != d:
+            raise ValueError(
+                f"LayerNorm 反向: 梯度长度 {len(drow)} 与特征数 {d} 不一致")
+        for c in range(d):
+            grad_g[c] += drow[c] * xhat[c]
+            grad_b[c] += drow[c]
+        dg = [drow[c] * g[c] for c in range(d)]
+        m1 = sum(dg) / d
+        m2 = sum(dg[c] * xhat[c] for c in range(d)) / d
+        dx_rows.append([inv * (dg[c] - m1 - xhat[c] * m2) for c in range(d)])
+    return grad_g, grad_b, dx_rows
+
+
+class _MixerBlock:
+    """MLP-Mixer 的一个 block：token 混合 + 通道混合，两段都是 pre-LN 残差"""
+
+    def __init__(self, d_model, n_tokens, token_hidden, channel_hidden, eps=1e-5):
+        self.d_model = d_model
+        self.n_tokens = n_tokens
+        self.ln1 = LayerNorm(d_model, eps)
+        self.t1 = Layer(n_tokens, token_hidden, "gelu")
+        self.t2 = Layer(token_hidden, n_tokens, "linear")
+        self.ln2 = LayerNorm(d_model, eps)
+        self.c1 = Layer(d_model, channel_hidden, "gelu")
+        self.c2 = Layer(channel_hidden, d_model, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grads = {"t1": _layer_zero_grads(self.t1),
+                      "t2": _layer_zero_grads(self.t2),
+                      "c1": _layer_zero_grads(self.c1),
+                      "c2": _layer_zero_grads(self.c2)}
+        self.norm_grads = {"ln1": ([0.0] * self.d_model, [0.0] * self.d_model),
+                           "ln2": ([0.0] * self.d_model, [0.0] * self.d_model)}
+
+    def forward(self, x):
+        n, d = len(x), len(x[0])
+        if n != self.n_tokens:
+            raise ValueError(
+                f"_MixerBlock.forward: token 数 {n} 与 n_tokens={self.n_tokens} 不符")
+        ln1, ln1_cache = _norm_rows_forward(self.ln1, x)
+        xt = [[ln1[t][c] for t in range(n)] for c in range(d)]
+        mixed_rows, t_cache = _dense_rows_forward(self.t1, xt)
+        rows, t2_cache = _dense_rows_forward(self.t2, mixed_rows)
+        mixed = [[rows[c][t] for c in range(d)] for t in range(n)]
+        x1 = [[x[t][c] + mixed[t][c] for c in range(d)] for t in range(n)]
+
+        ln2, ln2_cache = _norm_rows_forward(self.ln2, x1)
+        hid, c1_cache = _dense_rows_forward(self.c1, ln2)
+        ch, c2_cache = _dense_rows_forward(self.c2, hid)
+        out = [[x1[t][c] + ch[t][c] for c in range(d)] for t in range(n)]
+        self._cache = (ln1_cache, xt, t_cache, t2_cache, ln2_cache, c1_cache,
+                       c2_cache, x1)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("_MixerBlock.backward: 必须先调用 forward()")
+        (ln1_cache, xt, t_cache, t2_cache, ln2_cache, c1_cache, c2_cache,
+         x1) = self._cache
+        n, d = self.n_tokens, self.d_model
+        # 通道分支：逐 token 的 MLP
+        g2w, g2b, dch = _dense_rows_backward(self.c2, c2_cache, dout)
+        _layer_add_grads(self.grads["c2"], (g2w, g2b))
+        g1w, g1b, dhid = _dense_rows_backward(self.c1, c1_cache, dch)
+        _layer_add_grads(self.grads["c1"], (g1w, g1b))
+        ggn, gbn, dln2 = _norm_rows_backward(self.ln2, ln2_cache, dhid)
+        ng2 = self.norm_grads["ln2"]
+        for c in range(d):
+            ng2[0][c] += ggn[c]
+            ng2[1][c] += gbn[c]
+        dx1 = [[dout[t][c] + dln2[t][c] for c in range(d)] for t in range(n)]
+        # token 分支：逐通道的 MLP（输入是 ln1 的转置）
+        dmixed = [[dx1[t][c] for t in range(n)] for c in range(d)]
+        g2tw, g2tb, da = _dense_rows_backward(self.t2, t2_cache, dmixed)
+        _layer_add_grads(self.grads["t2"], (g2tw, g2tb))
+        g1tw, g1tb, dxt = _dense_rows_backward(self.t1, t_cache, da)
+        _layer_add_grads(self.grads["t1"], (g1tw, g1tb))
+        dln1 = [[dxt[c][t] for c in range(d)] for t in range(n)]
+        ggl, gbl, dpre = _norm_rows_backward(self.ln1, ln1_cache, dln1)
+        ng1 = self.norm_grads["ln1"]
+        for c in range(d):
+            ng1[0][c] += ggl[c]
+            ng1[1][c] += gbl[c]
+        return [[dx1[t][c] + dpre[t][c] for c in range(d)] for t in range(n)]
+
+    def param_count(self):
+        return (sum(_dense_param_count(layer)
+                    for layer in (self.t1, self.t2, self.c1, self.c2))
+                + _norm_param_count(self.ln1) + _norm_param_count(self.ln2))
+
+    def sgd_step(self, lr):
+        for name, layer in (("t1", self.t1), ("t2", self.t2),
+                            ("c1", self.c1), ("c2", self.c2)):
+            _dense_apply_sgd(layer, self.grads[name], lr)
+        _norm_apply_sgd(self.ln1, self.norm_grads["ln1"], lr)
+        _norm_apply_sgd(self.ln2, self.norm_grads["ln2"], lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        for name, layer in (("t1", self.t1), ("t2", self.t2),
+                            ("c1", self.c1), ("c2", self.c2)):
+            _dense_apply_adam(layer, self.grads[name], lr, beta1, beta2, eps)
+        _norm_apply_adam(self.ln1, self.norm_grads["ln1"], lr, beta1, beta2, eps)
+        _norm_apply_adam(self.ln2, self.norm_grads["ln2"], lr, beta1, beta2, eps)
+
+
+class MLPMixer:
+    """MLP-Mixer：patch 化 + 交替的 token 混合 / 通道混合 MLP
+
+    结构（输入 `(C,H,W)`，`H`、`W` 必须能被 `patch_size` 整除）：
+
+        `PatchEmbedding` -> `n` 个 `d_model` 维 token
+        每个 block：`x = x + tokenMLP(LN(x))` 然后 `x = x + channelMLP(LN(x))`
+        结尾：每个 token 过 `LayerNorm` -> 对 token 取平均 -> 线性分类头
+
+    token 混合在「token 轴」上做 MLP（把 `(n,d)` 转成 `(d,n)` 后逐行过 `n -> h -> n`），
+    与 `ViT` 的自注意力形成对照：这里**没有任何注意力**，只有 MLP。
+    梯度语义与 `ViT` 一致：`backward` 累加，更新前先 `zero_grad()`。
+    """
+
+    def __init__(self, in_channels: int = 3, image_size=8, patch_size: int = 4,
+                 d_model: int = 16, num_layers: int = 2, token_hidden: int = 32,
+                 channel_hidden: int = 32, num_classes: int = 10, eps: float = 1e-5):
+        for name, val in (("in_channels", in_channels), ("patch_size", patch_size),
+                          ("d_model", d_model), ("num_layers", num_layers),
+                          ("token_hidden", token_hidden),
+                          ("channel_hidden", channel_hidden),
+                          ("num_classes", num_classes)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"MLPMixer: {name} 必须是 >=1 的整数，收到 {val!r}")
+        if isinstance(image_size, (list, tuple)):
+            if len(image_size) != 2:
+                raise ValueError(
+                    f"MLPMixer: image_size 必须是 int 或 (H,W)，收到 {image_size!r}")
+            H, W = image_size
+        else:
+            H = W = image_size
+        for name, val in (("image_size.H", H), ("image_size.W", W)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"MLPMixer: {name} 必须是 >=1 的整数，收到 {val!r}")
+        if H % patch_size != 0 or W % patch_size != 0:
+            raise ValueError(
+                f"MLPMixer: 输入尺寸 {(H, W)} 必须能被 patch_size={patch_size} 整除")
+        self.in_channels = in_channels
+        self.image_size = (H, W)
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.num_classes = num_classes
+        self.num_layers = num_layers
+        self.patch_embed = PatchEmbedding(in_channels, patch_size, d_model)
+        self.n_tokens = (H // patch_size) * (W // patch_size)
+        self.blocks = [_MixerBlock(d_model, self.n_tokens, token_hidden,
+                                   channel_hidden, eps) for _ in range(num_layers)]
+        self.norm = LayerNorm(d_model, eps)
+        self.head = Layer(d_model, num_classes, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward(self, x):
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"MLPMixer.forward: 输入通道数 {len(x)} 与 in_channels="
+                f"{self.in_channels} 不符")
+        H, W = len(x[0]), len(x[0][0])
+        if (H, W) != self.image_size:
+            raise ValueError(
+                f"MLPMixer.forward: 输入尺寸 {(H, W)} 与 image_size="
+                f"{self.image_size} 不符")
+        tokens = self.patch_embed.forward(x)
+        for blk in self.blocks:
+            tokens = blk.forward(tokens)
+        normed, norm_cache = _norm_rows_forward(self.norm, tokens)
+        n = len(normed)
+        pooled = [sum(normed[t][c] for t in range(n)) / n
+                  for c in range(self.d_model)]
+        logits = self.head.forward(pooled)
+        self._cache = (tokens, normed, n, norm_cache)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("MLPMixer.backward: 必须先调用 forward()")
+        if len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"MLPMixer.backward: dlogits 长度 {len(dlogits)} 与 num_classes="
+                f"{self.num_classes} 不符")
+        tokens, normed, n, norm_cache = self._cache
+        gw, gb, dpooled = self.head.backward(dlogits)
+        _layer_add_grads(self.head_grads, (gw, gb))
+        dnormed = [[dpooled[c] / n for c in range(self.d_model)]
+                   for _ in range(n)]
+        ggn, gbn, dtokens = _norm_rows_backward(self.norm, norm_cache, dnormed)
+        for c in range(self.d_model):
+            self.norm_grads[0][c] += ggn[c]
+            self.norm_grads[1][c] += gbn[c]
+        for blk in reversed(self.blocks):
+            dtokens = blk.backward(dtokens)
+        return self.patch_embed.backward(dtokens)
+
+    def zero_grad(self):
+        self.head_grads = _layer_zero_grads(self.head)
+        self.norm_grads = ([0.0] * self.d_model, [0.0] * self.d_model)
+        for blk in self.blocks:
+            blk.zero_grad()
+        self.patch_embed.zero_grad()
+
+    def param_count(self):
+        total = _dense_param_count(self.head) + _norm_param_count(self.norm)
+        total += self.patch_embed.param_count()
+        for blk in self.blocks:
+            total += blk.param_count()
+        return total
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"MLPMixer.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.patch_embed.sgd_step(lr)
+        for blk in self.blocks:
+            blk.sgd_step(lr)
+        _dense_apply_sgd(self.head, self.head_grads, lr)
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"MLPMixer.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.patch_embed.adam_step(lr, beta1, beta2, eps)
+        for blk in self.blocks:
+            blk.adam_step(lr, beta1, beta2, eps)
+        _dense_apply_adam(self.head, self.head_grads, lr, beta1, beta2, eps)
+        _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
 
 
 class Flatten:
