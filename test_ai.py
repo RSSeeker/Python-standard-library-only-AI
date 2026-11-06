@@ -15914,3 +15914,96 @@ class TestSpeculativeAccept:
         with pytest.raises((ValueError, TypeError)):
             AI.speculative_accept([0], [[0.5, 0.5]], [[0.5, 0.5]],
                                   uniforms=[1.5])
+
+
+# ====  ======================================================================
+#   连续批处理调度器（W7-D）
+# ============================================================================
+
+class TestContinuousBatcher:
+    def test_capacity_and_refill(self):
+        b = AI.ContinuousBatcher(max_batch=2)
+        a = b.add([1, 2], max_new=2)
+        c = b.add([3], max_new=1)
+        d = b.add([4], max_new=1)
+        assert b.running == [a, c]
+        assert b.waiting == [d]
+        assert b.batch() == [(a, [1, 2]), (c, [3])]
+
+        assert b.step({a: 7, c: 8}) == [(a, 7), (c, 8)]
+        # c 的 max_new=1 已满，退休后 d 补位
+        assert b.finished == [c]
+        assert b.running == [a, d]
+        assert b.result(c) == [3, 8]
+
+        assert b.step({a: 9, d: 10}) == [(a, 9), (d, 10)]
+        assert b.finished == [c, a, d]
+        assert b.running == []
+        assert b.result(a) == [1, 2, 7, 9]
+        assert b.result(d) == [4, 10]
+
+    def test_total_token_budget(self):
+        b = AI.ContinuousBatcher(max_batch=4, max_total_tokens=5)
+        r1 = b.add([1, 2], max_new=1)
+        r2 = b.add([3, 4], max_new=1)
+        r3 = b.add([5, 6], max_new=1)
+        assert b.running == [r1, r2]
+        assert b.waiting == [r3]
+        assert b.stats()["used_tokens"] == 4
+
+        b.step({r1: 7, r2: 8})
+        # 两者 max_new=1，同一步内一起退休，r3 立刻补位；
+        # 记账只算提示词占用，因此剩下 r3 的 2 个 token
+        assert b.running == [r3]
+        assert b.waiting == []
+        assert b.stats()["used_tokens"] == 2
+        b.step({r3: 9})
+        assert b.finished == [r1, r2, r3]
+        assert b.stats()["used_tokens"] == 0
+
+    def test_stats_and_result(self):
+        b = AI.ContinuousBatcher(max_batch=1)
+        assert b.add([0], max_new=2, request_id="x") == "x"
+        assert b.running == ["x"]
+        b.step({"x": 1})
+        assert b.stats() == {"running": 1, "waiting": 0, "finished": 0,
+                             "used_tokens": 1, "generated": 1}
+        b.step({"x": 2})
+        assert b.stats() == {"running": 0, "waiting": 0, "finished": 1,
+                             "used_tokens": 0, "generated": 2}
+        assert b.result("x") == [0, 1, 2]
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.ContinuousBatcher(0)
+        with pytest.raises(ValueError):
+            AI.ContinuousBatcher(True)
+        with pytest.raises(ValueError):
+            AI.ContinuousBatcher(2, 0)
+
+        b = AI.ContinuousBatcher(max_batch=2)
+        b.add([1], max_new=2)
+        with pytest.raises(ValueError):
+            b.add([], 2)
+        with pytest.raises(ValueError):
+            b.add([1, -2], 2)
+        with pytest.raises(ValueError):
+            b.add([1], 0)
+        with pytest.raises(ValueError):
+            b.add([1], 2, 0)
+        with pytest.raises(ValueError):
+            b.step([])
+        with pytest.raises(ValueError):
+            b.step({99: 1})
+        with pytest.raises(ValueError):
+            b.step({})
+        with pytest.raises(ValueError):
+            b.step({0: -1})
+        with pytest.raises(ValueError):
+            b.result(99)
+
+        done = AI.ContinuousBatcher(max_batch=1)
+        done.add([1], max_new=1)
+        done.step({0: 2})
+        with pytest.raises(ValueError):
+            done.step({0: 3})

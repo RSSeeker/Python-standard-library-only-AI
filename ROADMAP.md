@@ -203,7 +203,8 @@
 - [x] 约束解码：`token_id_mask`（任意 id 白名单）+ `token_prefix_mask`（合法序列前缀约束，含 `eos_id` 收尾）；JSON Schema / 正则 / CFG 的完整语法器留作后续
 - [ ] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
 - [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）
-- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）、连续批处理、`PagedAttention`（数据结构演示）
+- [x] `ContinuousBatcher`：请求随时进出、每步按容量重组批与补位；记账按**准入时**的提示词长度（旧版扣生成后长度会让 `used_tokens` 变负数）；测试 4 例、计数 1014→1018
+- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）、`PagedAttention`（数据结构演示）
 - [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）
@@ -271,7 +272,7 @@
 - [ ] 结构化剪枝：通道 / 头 / 层（现有 `prune_magnitude` 是非结构化）
 - [ ] 特征蒸馏（hint layer）；QAT（量化感知训练）；PTQ / GPTQ / AWQ / SmoothQuant（教学，标注 int8 未真存）
 - [ ] 集成：Voting / Stacking / Bagging / Boosting
-- [ ] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理、并行概念（文档）
+- [ ] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理（W7 已实现 `ContinuousBatcher`）、并行概念（文档）
 
 ### W16 自监督·多模态·RL（§13）
 - [ ] 对比学习训练器：SimCLR / MoCo（队列）/ BYOL / BarlowTwins / VICReg / SwAV / DINO

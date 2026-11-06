@@ -9650,6 +9650,150 @@ def _check_token_sequences(sequences):
     return out
 
 
+class ContinuousBatcher:
+    """连续批处理调度器：请求随时进出，每步按容量重新组批
+
+    与「等一整批跑完再收下一批」的静态批处理不同，这里每步都会把已经结束的请求移出、
+    把排队的请求补进来，因此一条短请求不会被同批的长请求拖住。本类只做**调度与记账**，
+    真正的下一步 token 由调用方通过 ``step(tokens)`` 喂进来，所以它不依赖任何模型实现。
+
+    - ``add(prompt, max_new=4, request_id=None)``：入队，返回请求 id。
+    - ``batch()``：当前应当送进模型前向的 ``[(id, ids), ...]``（``ids`` 含提示词与已生成）。
+    - ``step(tokens)``：给每个运行中的请求喂一个 token（``{id: token}``），处理结束与补位，
+      返回 ``[(id, token), ...]``；缺 token、未知 id、重复 id 都报错。
+    - ``running`` / ``waiting`` / ``finished``：当前状态快照（列表副本）。
+    """
+
+    def __init__(self, max_batch: int = 2, max_total_tokens: int = None):
+        if isinstance(max_batch, bool) or not isinstance(max_batch, int) or max_batch < 1:
+            raise ValueError('ContinuousBatcher: max_batch 必须是正整数，收到 %r'
+                             % (max_batch,))
+        if max_total_tokens is not None:
+            if (isinstance(max_total_tokens, bool)
+                    or not isinstance(max_total_tokens, int)
+                    or max_total_tokens < 1):
+                raise ValueError('ContinuousBatcher: max_total_tokens 必须是正整数'
+                                 '或 None，收到 %r' % (max_total_tokens,))
+        self.max_batch = max_batch
+        self.max_total_tokens = max_total_tokens
+        self._seq = 0
+        self._running = []
+        self._waiting = []
+        self._finished = []
+        self._ids = {}
+        self._used = 0
+        self._generated = 0
+
+    # ---------- 内部 ----------
+    @staticmethod
+    def _check_ids(prompt, who):
+        if not isinstance(prompt, (list, tuple)) or not prompt:
+            raise ValueError('%s: prompt 必须是非空 token 列表' % who)
+        out = []
+        for v in prompt:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError('%s: prompt 元素必须是非负整数，收到 %r' % (who, v))
+            out.append(v)
+        return out
+
+    def _admit(self):
+        while self._waiting:
+            rid = self._waiting[0]
+            rec = self._ids[rid]
+            if len(self._running) >= self.max_batch:
+                break
+            if (self.max_total_tokens is not None
+                    and self._used + rec['base'] > self.max_total_tokens):
+                break
+            self._waiting.pop(0)
+            self._running.append(rid)
+            self._used += rec['base']
+
+    def _retire(self, rid):
+        self._running.remove(rid)
+        rec = self._ids[rid]
+        self._used -= rec['base']
+        self._finished.append(rid)
+
+    # ---------- 对外 ----------
+    def add(self, prompt, max_new: int = 4, request_id=None):
+        ids = self._check_ids(prompt, 'ContinuousBatcher.add(prompt)')
+        if isinstance(max_new, bool) or not isinstance(max_new, int) or max_new < 1:
+            raise ValueError('ContinuousBatcher.add: max_new 必须是正整数，收到 %r'
+                             % (max_new,))
+        if request_id is None:
+            request_id = self._seq
+            self._seq += 1
+        if request_id in self._ids:
+            raise ValueError('ContinuousBatcher.add: request_id %r 已存在'
+                             % (request_id,))
+        self._ids[request_id] = {'ids': list(ids), 'max_new': max_new,
+                                 'new': 0, 'base': len(ids)}
+        self._waiting.append(request_id)
+        self._admit()
+        return request_id
+
+    def batch(self):
+        return [(rid, list(self._ids[rid]['ids'])) for rid in self._running]
+
+    @property
+    def running(self):
+        return list(self._running)
+
+    @property
+    def waiting(self):
+        return list(self._waiting)
+
+    @property
+    def finished(self):
+        return list(self._finished)
+
+    def result(self, request_id):
+        if request_id in self._finished:
+            return list(self._ids[request_id]['ids'])
+        if request_id in self._ids:
+            raise ValueError('ContinuousBatcher.result: 请求 %r 尚未结束'
+                             % (request_id,))
+        raise ValueError('ContinuousBatcher.result: 未知请求 %r' % (request_id,))
+
+    def step(self, tokens):
+        if not isinstance(tokens, dict):
+            raise ValueError('ContinuousBatcher.step: tokens 必须是 {id: token} 字典')
+        if not self._running:
+            raise ValueError('ContinuousBatcher.step: 当前没有运行中的请求')
+        for rid in list(tokens):
+            if rid not in self._ids:
+                raise ValueError('ContinuousBatcher.step: 未知请求 %r' % (rid,))
+            if rid in self._finished:
+                raise ValueError('ContinuousBatcher.step: 请求 %r 已结束' % (rid,))
+            if rid not in self._running:
+                raise ValueError('ContinuousBatcher.step: 请求 %r 不在运行集中'
+                                 % (rid,))
+        out = []
+        for rid in list(self._running):
+            if rid not in tokens:
+                raise ValueError('ContinuousBatcher.step: 运行中的请求 %r 缺少 token'
+                                 % (rid,))
+            tok = tokens[rid]
+            if isinstance(tok, bool) or not isinstance(tok, int) or tok < 0:
+                raise ValueError('ContinuousBatcher.step: token 必须是非负整数，'
+                                 '收到 %r' % (tok,))
+            rec = self._ids[rid]
+            rec['ids'].append(tok)
+            rec['new'] += 1
+            self._generated += 1
+            out.append((rid, tok))
+            if rec['new'] >= rec['max_new']:
+                self._retire(rid)
+        self._admit()
+        return out
+
+    def stats(self):
+        return {'running': len(self._running), 'waiting': len(self._waiting),
+                'finished': len(self._finished), 'used_tokens': self._used,
+                'generated': self._generated}
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
