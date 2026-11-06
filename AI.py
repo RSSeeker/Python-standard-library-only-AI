@@ -25606,6 +25606,206 @@ class DDPM:
 
 # ── 工厂函数
 
+def _flow_time_features(t, dim=8):
+    """把连续时间 t∈[0,1] 编成 sin/cos 特征（每个频率一项，低频在前）。
+
+    与 ``_time_features`` 的区别：后者把整数扩散步当成「角度」，这里的输入是
+    **连续** 的 t，所以频率按 ``2π * 2^i`` 递增，保证 t=0 与 t=1 的编码差异明显。
+    """
+    out = []
+    for i in range(dim // 2):
+        f = 2.0 ** i
+        out.append(math.sin(math.pi * f * t))
+        out.append(math.cos(math.pi * f * t))
+    return out
+
+
+class FlowMatching:
+    """Flow Matching / Rectified Flow（学习速度场 v(x,t)，从噪声沿直线路径走到数据）
+
+    训练路径取最简单的**直线插值**：x_t = (1-t)*x0 + t*noise，目标速度
+    ``v* = noise - x0``（constant velocity，对应 Rectified Flow 的 1-rectified 形式）。
+    损失是速度的逐维 MSE；采样从 t=1 的噪声出发，用 ``solver`` 指定的积分器
+    解 dx/dt = v(x,t) 到 t=0。
+
+    - ``interpolate(x0, noise, t)`` → x_t；``flow_target(x0, noise)`` → noise - x0
+    - ``velocity(x_t, t)`` → 网络输出（同时缓存中间量供反向）
+    - ``train_step(x0, rng=None, t=None, noise=None)`` → 一步损失并累积梯度
+    - ``sample(n=1, steps=20, solver='euler'|'heun', rng=None)``
+    - ``fit(data, epochs=200, lr=1e-3, seed=None)``
+    """
+
+    def __init__(self, data_dim: int, hidden_dim: int = 32, t_dim: int = 8):
+        for name, value in (("data_dim", data_dim), ("hidden_dim", hidden_dim),
+                            ("t_dim", t_dim)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"FlowMatching: {name} 必须是 >= 1 的整数")
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.t_dim = t_dim if t_dim % 2 == 0 else t_dim + 1
+        self.l1 = Layer(data_dim + self.t_dim, hidden_dim, activation="relu")
+        self.l2 = Layer(hidden_dim, hidden_dim, activation="relu")
+        self.l3 = Layer(hidden_dim, data_dim, activation="linear")
+        self.layers = [self.l1, self.l2, self.l3]
+        self.step_count = 0
+        self.zero_grad()
+
+    # ---------- 梯度缓冲 ----------
+    def zero_grad(self):
+        self._g = [None] * len(self.layers)
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+            return
+        cur_w, cur_b = self._g[i]
+        for r in range(len(cur_w)):
+            for c in range(len(cur_w[r])):
+                cur_w[r][c] += gw[r][c]
+        for k in range(len(cur_b)):
+            cur_b[k] += gb[k]
+
+    # ---------- 校验 ----------
+    def _check_vec(self, v, name, who):
+        if not isinstance(v, (list, tuple)) or len(v) != self.data_dim:
+            raise ValueError(f"{who}: {name} 维度应为 {self.data_dim}")
+        return list(v)
+
+    @staticmethod
+    def _check_t(t, who):
+        if isinstance(t, bool) or not isinstance(t, (int, float)):
+            raise TypeError(f"{who}: t 必须是数字")
+        if not 0.0 <= float(t) <= 1.0:
+            raise ValueError(f"{who}: t 必须在 [0, 1] 内，收到 {t!r}")
+        return float(t)
+
+    # ---------- 路径与目标 ----------
+    def interpolate(self, x0, noise, t):
+        """直线插值：x_t = (1-t)*x0 + t*noise（t=0 是数据、t=1 是噪声）"""
+        x0 = self._check_vec(x0, "x0", "FlowMatching.interpolate")
+        noise = self._check_vec(noise, "noise", "FlowMatching.interpolate")
+        t = self._check_t(t, "FlowMatching.interpolate")
+        return [(1.0 - t) * x0[i] + t * noise[i] for i in range(self.data_dim)]
+
+    def flow_target(self, x0, noise):
+        """目标速度 v* = noise - x0（直线路径的导数，与 t 无关）"""
+        x0 = self._check_vec(x0, "x0", "FlowMatching.flow_target")
+        noise = self._check_vec(noise, "noise", "FlowMatching.flow_target")
+        return [noise[i] - x0[i] for i in range(self.data_dim)]
+
+    # ---------- 前向 ----------
+    def velocity(self, x_t, t):
+        """网络预测的速度场（缓存供反向用）"""
+        x_t = self._check_vec(x_t, "x_t", "FlowMatching.velocity")
+        t = self._check_t(t, "FlowMatching.velocity")
+        feat = x_t + _flow_time_features(t, self.t_dim)
+        h1 = self.l1.forward(feat)
+        h2 = self.l2.forward(h1)
+        out = self.l3.forward(h2)
+        self._t = t
+        return out
+
+    # ---------- 训练 ----------
+    def train_step(self, x0, rng=None, t=None, noise=None):
+        """一步训练：随机取 t 与噪声，回归速度场，累积梯度并返回 MSE"""
+        x0 = self._check_vec(x0, "x0", "FlowMatching.train_step")
+        r = rng or random
+        if t is None:
+            t = r.random()
+        t = self._check_t(t, "FlowMatching.train_step")
+        if noise is None:
+            noise = _gauss_vec(self.data_dim, r)
+        noise = self._check_vec(noise, "noise", "FlowMatching.train_step")
+        x_t = self.interpolate(x0, noise, t)
+        pred = self.velocity(x_t, t)
+        tgt = self.flow_target(x0, noise)
+        n = self.data_dim
+        loss = sum((pred[i] - tgt[i]) ** 2 for i in range(n)) / n
+        d_pred = [2.0 * (pred[i] - tgt[i]) / n for i in range(n)]
+        gw3, gb3, d2 = self.l3.backward(d_pred)
+        gw2, gb2, d1 = self.l2.backward(d2)
+        gw1, gb1, _ = self.l1.backward(d1)
+        self._acc(0, gw1, gb1)
+        self._acc(1, gw2, gb2)
+        self._acc(2, gw3, gb3)
+        return loss
+
+    def fit(self, data, epochs=200, lr=1e-3, seed=None, verbose=False):
+        if not data:
+            raise ValueError("FlowMatching.fit: data 不能为空")
+        for row in data:
+            self._check_vec(row, "data 行", "FlowMatching.fit")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        for _epoch in range(epochs):
+            total = 0.0
+            self.zero_grad()
+            for x in data:
+                total += self.train_step(x, rng=rng)
+            for item in self._g:
+                if item is None:
+                    continue
+                gw, gb = item
+                for row in gw:
+                    for c in range(len(row)):
+                        row[c] /= len(data)
+                for k in range(len(gb)):
+                    gb[k] /= len(data)
+            self.adam_step(lr)
+            history.append(total / len(data))
+        return history
+
+    # ---------- 优化器 ----------
+    def adam_step(self, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+        _check_adam_betas(b1, b2, "FlowMatching.adam_step")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError("FlowMatching.adam_step: eps 必须是 > 0 的数")
+        self.step_count += 1
+        t = self.step_count
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _adam_apply(layer.weights, gw, layer.m_w, layer.v_w, t, lr, b1, b2, eps)
+            _adam_apply(layer.biases, gb, layer.m_b, layer.v_b, t, lr, b1, b2, eps)
+
+    def sgd_step(self, lr=1e-2):
+        for i, layer in enumerate(self.layers):
+            if self._g[i] is None:
+                continue
+            gw, gb = self._g[i]
+            _sgd_apply(layer.weights, gw, lr)
+            _sgd_apply(layer.biases, gb, lr)
+
+    # ---------- 采样 ----------
+    def sample(self, n=1, steps=20, solver="euler", rng=None):
+        """从 t=1 的噪声积分到 t=0；``solver='heun'`` 是二阶（RK2）"""
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("FlowMatching.sample: n 必须是 >= 1 的整数")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError("FlowMatching.sample: steps 必须是 >= 1 的整数")
+        if solver not in ("euler", "heun"):
+            raise ValueError("FlowMatching.sample: solver 只能是 'euler' 或 'heun'，"
+                             f"收到 {solver!r}")
+        r = rng or random
+        dt = 1.0 / steps
+        out = []
+        for _ in range(n):
+            x = _gauss_vec(self.data_dim, r)
+            for k in range(steps):
+                t = 1.0 - k * dt
+                v1 = self.velocity(x, t)
+                if solver == "euler":
+                    x = [x[i] - dt * v1[i] for i in range(self.data_dim)]
+                else:
+                    mid = [x[i] - dt * v1[i] for i in range(self.data_dim)]
+                    v2 = self.velocity(mid, max(0.0, t - dt))
+                    x = [x[i] - 0.5 * dt * (v1[i] + v2[i])
+                         for i in range(self.data_dim)]
+            out.append(x)
+        return out
+
+
 def distill(teacher, student, x, y, epochs=400, batch_size=16,
             val_split=0.1, patience=50, verbose=True):
     """蒸馏：让 student 去拟合 teacher 的输出（软目标）

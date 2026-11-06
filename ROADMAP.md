@@ -212,7 +212,7 @@
 ### W8 生成模型（§12）
 - [x] 扩散：`DDPM(prediction="eps"|"v"|"x0")` + `target`/`pred_to_x0_eps` 互逆、`ddim_sample(steps=, eta=)` 确定性子序列采样、`train_step(min_snr_gamma=)` 的 `min(SNR,γ)/SNR` 加权（加权后 loss 恰为 `w×` 原 loss，实测 1.2174 → 0.8197）
 - [x] `VQVAE` 向量量化：最近邻码本 + straight-through 反向 + commitment + `warmup` 只训重构；**已知限制**：无 EMA 码本更新 / dead-code restart，小数据上码本会塌缩（`fit(warmup=)` 只缓解）
-- [ ] `FlowMatching` / `RectifiedFlow`
+- [x] `FlowMatching` / `RectifiedFlow`：直线插值 `x_t=(1-t)x0+t·noise` + 速度场回归（目标 `noise-x0`），`euler`/`heun` 两种积分器；梯度对中心差分全部通过
 - [ ] GAN 变体：DCGAN / WGAN / WGAN-GP / LSGAN / Hinge / R1-R2 / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive
 - [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、RealNVP·Glow、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
 

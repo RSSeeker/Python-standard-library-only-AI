@@ -16419,3 +16419,129 @@ class TestVQVAE:
         assert raises(lambda: self._mk().fit([[1.0, 2.0]]))
         assert raises(lambda: self._mk().adam_step(0.01, eps=0.0))
         assert raises(lambda: self._mk().adam_step(0.01, b1=1.0))
+
+
+class TestFlowMatching:
+    """Flow Matching / Rectified Flow：直线路径、速度场梯度、采样器"""
+
+    def _mk(self, **kw):
+        random.seed(0)
+        return AI.FlowMatching(2, hidden_dim=5, t_dim=4, **kw)
+
+    def test_path_and_target(self):
+        m = self._mk()
+        x0, noise = [1.0, -0.5], [0.3, 0.8]
+        assert m.interpolate(x0, noise, 0.0) == x0
+        assert m.interpolate(x0, noise, 1.0) == noise
+        mid = m.interpolate(x0, noise, 0.5)
+        for i in range(2):
+            assert abs(mid[i] - 0.5 * (x0[i] + noise[i])) < 1e-15
+        assert m.flow_target(x0, noise) == [noise[i] - x0[i] for i in range(2)]
+
+        # 时间编码：长度、端点可区分、t=0 的 cos 项为 1
+        f0 = AI._flow_time_features(0.0, 4)
+        f1 = AI._flow_time_features(1.0, 4)
+        assert len(f0) == 4 and len(f1) == 4 and f0 != f1
+        assert abs(f0[1] - 1.0) < 1e-15 and abs(f0[3] - 1.0) < 1e-15
+        f05 = AI._flow_time_features(0.5, 4)
+        assert abs(f05[0] - 1.0) < 1e-12 and abs(f05[3] + 1.0) < 1e-12
+
+    def test_velocity_input_gradient(self):
+        """速度场输出对输入的中心差分（经 l3→l2→l1 手写链）"""
+        m = self._mk()
+        t, eps = 0.37, 1e-6
+        m.velocity([0.4, -0.2], t)
+        _, _, d2 = m.l3.backward([1.0, 0.0])
+        _, _, d1 = m.l2.backward(d2)
+        _, _, din = m.l1.backward(d1)
+        for j in range(2):
+            up = [0.4, -0.2]
+            up[j] += eps
+            dn = [0.4, -0.2]
+            dn[j] -= eps
+            num = (m.velocity(up, t)[0] - m.velocity(dn, t)[0]) / (2 * eps)
+            assert abs(din[j] - num) < 1e-6
+
+    def test_parameter_gradients(self):
+        """三层权重与偏置的中心差分（train_step 固定 t 与 noise）"""
+        m = self._mk()
+        x0, t, noise, eps = [0.7, -0.3], 0.42, [0.2, -0.6], 1e-6
+        m.zero_grad()
+        m.train_step(x0, t=t, noise=noise)
+        ana = {li: (m._g[li][0][0][0], m._g[li][1][0]) for li in range(3)}
+        for li, lname in ((0, "l1"), (1, "l2"), (2, "l3")):
+            layer = getattr(m, lname)
+            ana_w, ana_b = ana[li]
+            ow, ob = layer.weights[0][0], layer.biases[0]
+            layer.weights[0][0] = ow + eps
+            lp = m.train_step(x0, t=t, noise=noise)
+            layer.weights[0][0] = ow - eps
+            lm = m.train_step(x0, t=t, noise=noise)
+            layer.weights[0][0] = ow
+            assert abs(ana_w - (lp - lm) / (2 * eps)) < 1e-6
+            layer.biases[0] = ob + eps
+            lp = m.train_step(x0, t=t, noise=noise)
+            layer.biases[0] = ob - eps
+            lm = m.train_step(x0, t=t, noise=noise)
+            layer.biases[0] = ob
+            assert abs(ana_b - (lp - lm) / (2 * eps)) < 1e-6
+
+    def test_training_and_sampling(self):
+        random.seed(0)
+        m = AI.FlowMatching(2, hidden_dim=16, t_dim=4)
+        data = [[2.0, 2.0], [-2.0, -2.0], [2.0, -2.0], [-2.0, 2.0]]
+        hist = m.fit(data, epochs=800, lr=0.02, seed=0)
+        assert len(hist) == 800
+        assert hist[-1] < hist[0] * 0.5
+
+        a = m.sample(2, steps=10, rng=random.Random(7))
+        b = m.sample(2, steps=10, rng=random.Random(7))
+        assert a == b                                   # 同 seed 逐位相同
+        c = m.sample(2, steps=10, rng=random.Random(8))
+        assert a != c
+        heun = m.sample(1, steps=10, solver="heun", rng=random.Random(7))
+        euler = m.sample(1, steps=10, solver="euler", rng=random.Random(7))
+        assert heun != euler
+        assert all(abs(v) < 1e6 for v in heun[0])
+
+        # 采样点应该靠近训练数据（四个角之一）
+        def nearest(pt):
+            return min(math.dist(pt, d) for d in data)
+
+        pts = m.sample(6, steps=20, rng=random.Random(3))
+        assert sum(nearest(p) for p in pts) / len(pts) < 1.0
+
+    def test_optimizers_and_validation(self):
+        m = self._mk()
+        m.train_step([0.1, 0.2], t=0.5, noise=[0.0, 0.0])
+        w0 = [row[:] for row in m.l1.weights]
+        m.sgd_step(0.1)
+        assert m.l1.weights != w0
+        m.zero_grad()
+        assert all(g is None for g in m._g)
+        m.train_step([0.1, 0.2], t=0.5, noise=[0.0, 0.0])
+        m.adam_step(0.01)
+        assert m.step_count == 1
+
+        def raises(fn):
+            try:
+                fn()
+            except (ValueError, TypeError):
+                return True
+            return False
+
+        assert raises(lambda: AI.FlowMatching(0))
+        assert raises(lambda: AI.FlowMatching(2, hidden_dim=True))
+        assert raises(lambda: AI.FlowMatching(2, t_dim=-1))
+        assert raises(lambda: self._mk().interpolate([1.0], [0.0, 0.0], 0.5))
+        assert raises(lambda: self._mk().interpolate([0.0, 0.0], [0.0, 0.0], -0.1))
+        assert raises(lambda: self._mk().interpolate([0.0, 0.0], [0.0, 0.0], 1.5))
+        assert raises(lambda: self._mk().velocity([0.0, 0.0], "0.5"))
+        assert raises(lambda: self._mk().fit([]))
+        assert raises(lambda: self._mk().fit([[1.0]]))
+        assert raises(lambda: self._mk().sample(0))
+        assert raises(lambda: self._mk().sample(1, steps=0))
+        assert raises(lambda: self._mk().sample(1, solver="rk4"))
+        assert raises(lambda: self._mk().adam_step(0.01, eps=0.0))
+        assert raises(lambda: self._mk().adam_step(0.01, b2=1.0))
+        assert raises(lambda: self._mk().train_step([0.0, 0.0], t=2.0))
