@@ -17673,3 +17673,247 @@ class TestEMASWACallbacks:
             for row in ws:
                 flat.extend(row)
         assert max(abs(p - q) for p, q in zip(flat, avg)) <= 1e-12
+
+
+# ============================================================================
+#  W9-D：学习率调度器族（LambdaLR / Multiplicative / MultiStep / 余弦重启 /
+#        CyclicLR / OneCycleLR / InverseSqrt / Noam / Polynomial / WSD /
+#        ChainedScheduler / SequentialLR）
+# ============================================================================
+class TestSchedulerFamily:
+    """每个调度器都用手写闭式解对照；StepLR 家族是 epoch 门控的，必须按序喂。"""
+
+    class _Opt:
+        def __init__(self, lr=0.1):
+            self.lr = lr
+
+    @staticmethod
+    def _at(sched, epoch):
+        sched.step(epoch)
+        return sched.optimizer.lr
+
+    def test_lambda_and_multiplicative(self):
+        o = self._Opt(0.2)
+        s = AI.LambdaLR(o, lambda e: 0.5 ** e)
+        assert abs(self._at(s, 2) - 0.05) < 1e-15
+        assert abs(self._at(s, 4) - 0.0125) < 1e-15
+        assert s.initial_lr == 0.2
+        with pytest.raises(ValueError):
+            AI.LambdaLR(self._Opt(), 3)
+        bad = AI.LambdaLR(self._Opt(), lambda e: -1.0)
+        with pytest.raises(ValueError):
+            bad.step(1)
+
+        o = self._Opt(0.2)
+        s = AI.MultiplicativeLR(o, lambda e: 0.5)
+        assert abs(self._at(s, 1) - 0.1) < 1e-15
+        assert abs(self._at(s, 2) - 0.05) < 1e-15
+        assert abs(self._at(s, 3) - 0.025) < 1e-15
+
+    def test_multistep(self):
+        o = self._Opt(0.2)
+        s = AI.MultiStepLR(o, [2, 5], gamma=0.1)
+        # 里程碑 ≤ epoch 的个数决定衰减次数
+        assert abs(self._at(s, 1) - 0.2) < 1e-15
+        assert abs(self._at(s, 2) - 0.02) < 1e-15
+        assert abs(self._at(s, 5) - 0.002) < 1e-15
+        for bad in ([], [0], [3, 2], [2, 2]):
+            with pytest.raises(ValueError):
+                AI.MultiStepLR(self._Opt(), bad)
+
+    def test_cosine_warm_restarts(self):
+        o = self._Opt(0.2)
+        s = AI.CosineAnnealingWarmRestarts(o, T_0=3, T_mult=2, eta_min=0.01)
+        assert s.cycle_of(1) == (0, 3, 1)
+        assert s.cycle_of(4) == (1, 6, 1)
+        assert s.cycle_of(10) == (2, 12, 1)
+        # 周期起点回到峰值、末轮触底
+        assert abs(self._at(s, 1) - 0.2) < 1e-15
+        assert abs(self._at(s, 3) - 0.01) < 1e-15
+        assert abs(self._at(s, 4) - 0.2) < 1e-15
+        assert abs(self._at(s, 9) - 0.01) < 1e-15
+        # 周期内闭式解
+        k, length, pos = s.cycle_of(6)
+        frac = (pos - 1) / (length - 1)
+        want = 0.01 + (0.2 - 0.01) * 0.5 * (1 + math.cos(math.pi * frac))
+        assert abs(self._at(s, 6) - want) < 1e-15
+        with pytest.raises(ValueError):
+            AI.CosineAnnealingWarmRestarts(self._Opt(), T_0=0)
+        with pytest.raises(ValueError):
+            AI.CosineAnnealingWarmRestarts(self._Opt(), T_0=3, T_mult=0)
+
+    def test_cyclic_lr_modes(self):
+        o = self._Opt()
+        s = AI.CyclicLR(o, 0.01, 0.11, step_size_up=2)
+        seq = [self._at(s, e) for e in range(1, 6)]
+        assert abs(seq[0] - 0.01) < 1e-15 and abs(seq[2] - 0.11) < 1e-15
+        assert abs(seq[3] - 0.06) < 1e-15            # 下降段中点
+        assert abs(seq[4] - 0.01) < 1e-15            # 一个完整周期后回到 base
+        assert seq[0] <= seq[1] <= seq[2] and seq[2] >= seq[3]
+
+        o = self._Opt()
+        s = AI.CyclicLR(o, 0.0, 1.0, step_size_up=2, mode="triangular2")
+        assert abs(self._at(s, 3) - 1.0) < 1e-15      # 第 1 周期峰值
+        assert abs(self._at(s, 6) - 0.25) < 1e-15     # 第 2 周期中点
+        assert abs(self._at(s, 7) - 0.5) < 1e-15      # 第 2 周期峰值
+
+        o = self._Opt()
+        s = AI.CyclicLR(o, 0.0, 1.0, step_size_up=2, mode="exp_range", gamma=0.5)
+        assert abs(self._at(s, 3) - 0.25) < 1e-15
+        with pytest.raises(ValueError):
+            AI.CyclicLR(self._Opt(), 0.2, 0.1)
+        with pytest.raises(ValueError):
+            AI.CyclicLR(self._Opt(), 0.1, 0.2, mode="cos")
+
+    def test_one_cycle(self):
+        o = self._Opt()
+        s = AI.OneCycleLR(o, max_lr=1.0, total_epochs=10, pct_start=0.3,
+                          div_factor=25.0, final_div_factor=1e4)
+        start = 1.0 / 25.0
+        end = start / 1e4
+        first = start + (1.0 - start) * 0.5 * (1 - math.cos(math.pi * (0.1 / 0.3)))
+        assert abs(self._at(s, 1) - first) < 1e-12
+        assert abs(self._at(s, 3) - 1.0) < 1e-12
+        assert abs(self._at(s, 10) - end) < 1e-9
+        assert abs(self._at(s, 40) - end) < 1e-9      # 超出 total 后夹住
+        with pytest.raises(ValueError):
+            AI.OneCycleLR(self._Opt(), 0.1, 0)
+        with pytest.raises(ValueError):
+            AI.OneCycleLR(self._Opt(), 0.1, 10, pct_start=1.5)
+
+    def test_inverse_sqrt_and_noam(self):
+        o = self._Opt(0.1)
+        s = AI.InverseSqrtLR(o, warmup_epochs=4, start_factor=0.0)
+        assert abs(self._at(s, 2) - 0.05) < 1e-15
+        assert abs(self._at(s, 4) - 0.1) < 1e-15
+        assert abs(self._at(s, 8) - 0.1 * math.sqrt(0.5)) < 1e-15
+
+        o = self._Opt(0.1)
+        s = AI.InverseSqrtLR(o, warmup_epochs=0)
+        assert abs(self._at(s, 1) - 0.1) < 1e-15
+        assert abs(self._at(s, 4) - 0.05) < 1e-15
+
+        o = self._Opt(0.1)
+        s = AI.NoamLR(o, d_model=16, warmup_epochs=4)
+        assert abs(self._at(s, 4) - 0.125) < 1e-12    # 峰值，覆盖 initial_lr
+        assert abs(self._at(s, 16) - (16 ** -0.5) * 16 ** -0.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.NoamLR(self._Opt(), d_model=0)
+        with pytest.raises(ValueError):
+            AI.InverseSqrtLR(self._Opt(), warmup_epochs=-1)
+
+    def test_polynomial_and_wsd(self):
+        o = self._Opt(0.2)
+        s = AI.PolynomialLR(o, total_epochs=10, power=2.0, min_lr=0.02)
+        assert abs(self._at(s, 5) - ((0.2 - 0.02) * 0.25 + 0.02)) < 1e-15
+        assert abs(self._at(s, 10) - 0.02) < 1e-15
+        assert abs(self._at(s, 50) - 0.02) < 1e-15
+
+        o = self._Opt(0.2)
+        s = AI.WSDLR(o, warmup_epochs=2, total_epochs=10, decay_epochs=3,
+                     decay_shape="linear")
+        assert abs(self._at(s, 1) - 0.1) < 1e-15
+        assert abs(self._at(s, 2) - 0.2) < 1e-15
+        assert abs(self._at(s, 5) - 0.2) < 1e-15      # stable
+        assert abs(self._at(s, 8) - (0.2 - 0.2 / 3.0)) < 1e-15
+        assert abs(self._at(s, 10) - 0.0) < 1e-15
+        with pytest.raises(ValueError):
+            AI.WSDLR(self._Opt(), warmup_epochs=5, total_epochs=10, decay_epochs=6)
+        with pytest.raises(ValueError):
+            AI.WSDLR(self._Opt(), decay_shape="sqrt")
+
+    def test_chained_and_sequential(self):
+        o = self._Opt(0.2)
+        a = AI.StepLR(o, step_size=3, gamma=0.5)
+        b = AI.MultiStepLR(o, [2], gamma=0.5)
+        ch = AI.ChainedScheduler(a, b)
+        ref = self._Opt(0.2)
+        ra = AI.StepLR(ref, step_size=3, gamma=0.5)
+        rb = AI.MultiStepLR(ref, [2], gamma=0.5)
+        for e in (1, 2, 3, 4, 5):
+            ra.step(e)
+            rb.step(e)
+            assert abs(self._at(ch, e) - ref.lr) < 1e-15
+        assert ch.optimizer is o
+        with pytest.raises(ValueError):
+            AI.ChainedScheduler()
+        with pytest.raises(ValueError):
+            AI.ChainedScheduler([1])
+
+        o = self._Opt(0.2)
+        s1 = AI.StepLR(o, step_size=2, gamma=0.1)
+        s2 = AI.ExponentialLR(o, gamma=0.5)
+        sq = AI.SequentialLR(o, [s1, s2], [4])
+        ref = self._Opt(0.2)
+        r1 = AI.StepLR(ref, step_size=2, gamma=0.1)
+        r2 = AI.ExponentialLR(ref, gamma=0.5)
+        for e in range(1, 8):
+            (r1 if e < 4 else r2).step(e)
+            assert abs(self._at(sq, e) - ref.lr) < 1e-15
+        for args in (([s1], [4, 8]), ([s1, s2], []), ([s1, s2], [8, 4]),
+                     ([s1, s2], [0])):
+            with pytest.raises(ValueError):
+                AI.SequentialLR(self._Opt(), *args)
+
+    def test_epoch_normalization(self):
+        o = self._Opt()
+        for s in (AI.CosineAnnealingWarmRestarts(o, T_0=3),
+                  AI.CyclicLR(o, 0.01, 0.1),
+                  AI.OneCycleLR(o, 0.1, 10),
+                  AI.InverseSqrtLR(o, warmup_epochs=2),
+                  AI.NoamLR(o, 16),
+                  AI.PolynomialLR(o, total_epochs=10),
+                  AI.WSDLR(o, warmup_epochs=1, total_epochs=10, decay_epochs=2)):
+            # epoch<=0 被夹到 1，不报错
+            s.step(0)
+            s.step(-3)
+            for bad in (True, 1.5, "3"):
+                with pytest.raises(ValueError):
+                    s.step(bad)
+
+    def test_existing_schedulers_unchanged(self):
+        """回归锁：W9-D 不应改动旧调度器的数值行为。"""
+        o = self._Opt(0.1)
+        s = AI.StepLR(o, step_size=2, gamma=0.5)
+        seq = [self._at(s, e) for e in range(1, 6)]
+        assert seq == [0.1, 0.05, 0.05, 0.025, 0.025], seq
+
+        o = self._Opt(0.1)
+        s = AI.ExponentialLR(o, gamma=0.5)
+        assert abs(self._at(s, 3) - 0.0125) < 1e-15
+
+        o = self._Opt(0.1)
+        s = AI.CosineAnnealingLR(o, T_max=10, eta_min=0.0)
+        vals = [self._at(s, e) for e in range(1, 11)]
+        assert abs(vals[-1]) < 1e-15
+        assert all(a >= b - 1e-18 for a, b in zip(vals, vals[1:])), vals
+
+    def test_fit_integration(self):
+        random.seed(3)
+        data = [([random.random(), random.random()],
+                 [1.0 if random.random() > 0.5 else 0.0]) for _ in range(16)]
+        factories = [
+            lambda opt: AI.CosineAnnealingWarmRestarts(opt, T_0=3),
+            lambda opt: AI.OneCycleLR(opt, max_lr=0.05, total_epochs=6),
+            lambda opt: AI.CyclicLR(opt, 0.001, 0.02, step_size_up=2),
+            lambda opt: AI.InverseSqrtLR(opt, warmup_epochs=2),
+            lambda opt: AI.PolynomialLR(opt, total_epochs=6),
+            lambda opt: AI.WSDLR(opt, warmup_epochs=1, total_epochs=6, decay_epochs=2),
+            lambda opt: AI.ChainedScheduler(AI.StepLR(opt, 3, 0.5),
+                                            AI.CosineAnnealingLR(opt, 6)),
+            lambda opt: AI.SequentialLR(opt, [AI.StepLR(opt, 2, 0.5),
+                                              AI.ExponentialLR(opt, 0.9)], [4]),
+            lambda opt: AI.NoamLR(opt, 8, warmup_epochs=2),
+            lambda opt: AI.LambdaLR(opt, lambda e: 0.9 ** e),
+            lambda opt: AI.MultiplicativeLR(opt, lambda e: 0.95),
+            lambda opt: AI.MultiStepLR(opt, [3], gamma=0.5),
+        ]
+        for factory in factories:
+            m = AI.Model(AI.MLP([2, 6, 1], activations=["relu", "sigmoid"]),
+                         loss_fn="mse", task="regression", lr=0.05)
+            hist = m.fit(data=data, epochs=6, batch_size=4, val_split=0.0,
+                         verbose=False, shuffle=False, seed=1,
+                         lr_scheduler=factory(m.optimizer))
+            losses = [v for _e, v in hist["train_loss"]]
+            assert len(losses) == 6
+            assert all(v == v and abs(v) < 1e6 for v in losses)

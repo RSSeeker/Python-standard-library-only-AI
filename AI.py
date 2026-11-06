@@ -21214,6 +21214,435 @@ def clip_grad_by_value(all_grads, clip_val: float):
             gb[j] = max(-clip_val, min(clip_val, gb[j]))
 
 
+# ==== 学习率调度器族（W9-D） ====
+# 约定：epoch 从 1 开始（`Model.fit` 就是这么调的）；`step(epoch)` 直接赋值
+# `optimizer.lr`，因此调度器之间可以互相嵌套（`ChainedScheduler` / `SequentialLR`）。
+
+
+def _sched_epoch(epoch, who):
+    """规范化 epoch：整数且 >= 1"""
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise ValueError(f"{who}: epoch 必须是整数，收到 {epoch!r}")
+    return max(epoch, 1)
+
+
+def _sched_check(who, name, value, minimum=None, maximum=None):
+    """校验调度器的超参：有限数字 + 可选上下界（bool 不算数字）"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{who}: {name} 必须是数字，收到 {value!r}")
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"{who}: {name} 必须是有限数字，收到 {value!r}")
+    if minimum is not None and v < minimum:
+        raise ValueError(f"{who}: {name} 必须 >= {minimum}，收到 {value!r}")
+    if maximum is not None and v > maximum:
+        raise ValueError(f"{who}: {name} 必须 <= {maximum}，收到 {value!r}")
+    return v
+
+
+class LambdaLR:
+    """``lr = initial_lr * lr_lambda(epoch)``（PyTorch `LambdaLR`）
+
+    `lr_lambda` 收到 1 起算的 epoch，返回值必须是非负有限数字。
+    """
+
+    def __init__(self, optimizer, lr_lambda):
+        if not callable(lr_lambda):
+            raise ValueError(f"LambdaLR: lr_lambda 必须可调用，收到 {lr_lambda!r}")
+        self.optimizer = optimizer
+        self.lr_lambda = lr_lambda
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "LambdaLR")
+        factor = self.lr_lambda(epoch)
+        factor = _sched_check("LambdaLR", "lr_lambda(epoch)", factor, minimum=0.0)
+        self.optimizer.lr = self.initial_lr * factor
+
+
+class MultiplicativeLR:
+    """``lr *= lr_lambda(epoch)``（累积式，PyTorch `MultiplicativeLR`）
+
+    与 `LambdaLR` 的区别：基准是**当前** lr 而不是初始 lr，所以多次调用会连乘。
+    """
+
+    def __init__(self, optimizer, lr_lambda):
+        if not callable(lr_lambda):
+            raise ValueError(
+                f"MultiplicativeLR: lr_lambda 必须可调用，收到 {lr_lambda!r}")
+        self.optimizer = optimizer
+        self.lr_lambda = lr_lambda
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "MultiplicativeLR")
+        factor = _sched_check("MultiplicativeLR", "lr_lambda(epoch)",
+                              self.lr_lambda(epoch), minimum=0.0)
+        self.optimizer.lr = self.optimizer.lr * factor
+
+
+class MultiStepLR:
+    """到 `milestones` 里的轮次就把 lr 乘一次 `gamma`（PyTorch `MultiStepLR`）
+
+    ``lr = initial_lr * gamma ** (#{m in milestones : m <= epoch})``
+    """
+
+    def __init__(self, optimizer, milestones, gamma: float = 0.1):
+        if isinstance(milestones, (int, float)) and not isinstance(milestones, bool):
+            milestones = [milestones]
+        if not isinstance(milestones, (list, tuple)) or not milestones:
+            raise ValueError(f"MultiStepLR: milestones 必须是非空列表，收到 {milestones!r}")
+        clean = []
+        for m in milestones:
+            if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+                raise ValueError(f"MultiStepLR: milestones 里的每项必须是 >=1 的整数，收到 {m!r}")
+            clean.append(int(m))
+        if sorted(clean) != clean or len(set(clean)) != len(clean):
+            raise ValueError(f"MultiStepLR: milestones 必须严格递增，收到 {milestones!r}")
+        g = _sched_check("MultiStepLR", "gamma", gamma, minimum=0.0)
+        self.optimizer = optimizer
+        self.milestones = list(clean)
+        self.gamma = g
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "MultiStepLR")
+        hits = sum(1 for m in self.milestones if m <= epoch)
+        self.optimizer.lr = self.initial_lr * (self.gamma ** hits)
+
+
+class CosineAnnealingWarmRestarts:
+    """余弦退火 + 周期重启（PyTorch `CosineAnnealingWarmRestarts`）
+
+    第 k 个周期长度 `T_0 * T_mult**k`；周期内按余弦从 `initial_lr` 退到 `eta_min`，
+    周期**最后一轮**正好落在 `eta_min`（分母用 `T_i-1`，与 `CosineAnnealingLR` 一致）。
+    """
+
+    def __init__(self, optimizer, T_0: int = 10, T_mult: int = 1,
+                 eta_min: float = 0.0):
+        if isinstance(T_0, bool) or not isinstance(T_0, int) or T_0 < 1:
+            raise ValueError(f"CosineAnnealingWarmRestarts: T_0 必须是 >=1 的整数，收到 {T_0!r}")
+        if isinstance(T_mult, bool) or not isinstance(T_mult, int) or T_mult < 1:
+            raise ValueError(
+                f"CosineAnnealingWarmRestarts: T_mult 必须是 >=1 的整数，收到 {T_mult!r}")
+        eta = _sched_check("CosineAnnealingWarmRestarts", "eta_min", eta_min, minimum=0.0)
+        self.optimizer = optimizer
+        self.T_0 = int(T_0)
+        self.T_mult = int(T_mult)
+        self.eta_min = eta
+        self.initial_lr = optimizer.lr
+
+    def cycle_of(self, epoch: int):
+        """返回 (周期序号 k, 周期长度 T_k, 周期内位置 pos[1..T_k])"""
+        epoch = _sched_epoch(epoch, "CosineAnnealingWarmRestarts")
+        k, start, length = 0, 1, self.T_0
+        while epoch >= start + length:
+            start += length
+            k += 1
+            length = self.T_0 * (self.T_mult ** k)
+        return k, length, epoch - start + 1
+
+    def step(self, epoch: int):
+        _k, length, pos = self.cycle_of(epoch)
+        progress = 1.0 if length == 1 else (pos - 1) / (length - 1)
+        self.optimizer.lr = self.eta_min + 0.5 * (self.initial_lr - self.eta_min) * (
+            1 + math.cos(math.pi * progress))
+
+
+class CyclicLR:
+    """三角循环学习率（PyTorch `CyclicLR` 的三个 mode）
+
+    `mode`：
+      - `triangular`：每个周期振幅相同
+      - `triangular2`：第 k 个周期振幅除以 `2**k`
+      - `exp_range`：振幅乘以 `gamma**pos`
+
+    一个周期 = `step_size_up` 轮上升 + `step_size_up` 轮下降。
+    """
+
+    MODES = ("triangular", "triangular2", "exp_range")
+
+    def __init__(self, optimizer, base_lr: float, max_lr: float,
+                 step_size_up: int = 2, mode: str = "triangular",
+                 gamma: float = 1.0):
+        if mode not in self.MODES:
+            raise ValueError(f"CyclicLR: mode 只能是 {self.MODES}，收到 {mode!r}")
+        base = _sched_check("CyclicLR", "base_lr", base_lr, minimum=0.0)
+        top = _sched_check("CyclicLR", "max_lr", max_lr, minimum=0.0)
+        if top < base:
+            raise ValueError(f"CyclicLR: max_lr({max_lr!r}) 不能小于 base_lr({base_lr!r})")
+        if isinstance(step_size_up, bool) or not isinstance(step_size_up, int) or step_size_up < 1:
+            raise ValueError(f"CyclicLR: step_size_up 必须是 >=1 的整数，收到 {step_size_up!r}")
+        g = _sched_check("CyclicLR", "gamma", gamma, minimum=0.0)
+        self.optimizer = optimizer
+        self.base_lr = base
+        self.max_lr = top
+        self.step_size_up = int(step_size_up)
+        self.mode = mode
+        self.gamma = g
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "CyclicLR")
+        up = self.step_size_up
+        period = 2 * up
+        pos = (epoch - 1) % period
+        cycle = (epoch - 1) // period
+        frac = pos / up if pos <= up else (period - pos) / up
+        if self.mode == "triangular":
+            scale = frac
+        elif self.mode == "triangular2":
+            scale = frac / (2.0 ** cycle)
+        else:
+            scale = frac * (self.gamma ** pos)
+        self.optimizer.lr = self.base_lr + (self.max_lr - self.base_lr) * scale
+
+
+class OneCycleLR:
+    """单周期学习率（PyTorch `OneCycleLR`，余弦版）
+
+    前 `pct_start` 段从 `max_lr/div_factor` 升到 `max_lr`，之后按余弦降到
+    `max_lr/div_factor/final_div_factor`。
+    """
+
+    def __init__(self, optimizer, max_lr: float, total_epochs: int,
+                 pct_start: float = 0.3, div_factor: float = 25.0,
+                 final_div_factor: float = 1e4):
+        top = _sched_check("OneCycleLR", "max_lr", max_lr, minimum=0.0)
+        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int)                 or total_epochs < 1:
+            raise ValueError(
+                f"OneCycleLR: total_epochs 必须是 >=1 的整数，收到 {total_epochs!r}")
+        pct = _sched_check("OneCycleLR", "pct_start", pct_start, minimum=0.0, maximum=1.0)
+        dv = _sched_check("OneCycleLR", "div_factor", div_factor, minimum=1.0)
+        fdv = _sched_check("OneCycleLR", "final_div_factor", final_div_factor, minimum=1.0)
+        self.optimizer = optimizer
+        self.max_lr = top
+        self.total_epochs = int(total_epochs)
+        self.pct_start = pct
+        self.div_factor = dv
+        self.final_div_factor = fdv
+        self.initial_lr = optimizer.lr
+        self._start_lr = top / dv
+        self._end_lr = top / dv / fdv
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "OneCycleLR")
+        pos = min(epoch, self.total_epochs) / self.total_epochs
+        if pos <= self.pct_start and self.pct_start > 0.0:
+            frac = pos / self.pct_start
+            lr = self._start_lr + (self.max_lr - self._start_lr) * 0.5 * (
+                1 - math.cos(math.pi * frac))
+        else:
+            span = max(1e-12, 1.0 - self.pct_start)
+            frac = min(1.0, (pos - self.pct_start) / span)
+            lr = self._end_lr + (self.max_lr - self._end_lr) * 0.5 * (
+                1 + math.cos(math.pi * frac))
+        self.optimizer.lr = lr
+
+
+class InverseSqrtLR:
+    """反平方根衰减（Transformer 论文的副产物，实践中很稳）
+
+    有 warmup 时：`epoch <= warmup` 线性升到 `initial_lr`；
+    之后 `lr = initial_lr * sqrt(warmup / epoch)`。
+    无 warmup（`warmup_epochs=0`）时：`lr = initial_lr / sqrt(epoch)`。
+    """
+
+    def __init__(self, optimizer, warmup_epochs: int = 0, start_factor: float = 0.1):
+        if isinstance(warmup_epochs, bool) or not isinstance(warmup_epochs, int)                 or warmup_epochs < 0:
+            raise ValueError(
+                f"InverseSqrtLR: warmup_epochs 必须是 >=0 的整数，收到 {warmup_epochs!r}")
+        sf = _sched_check("InverseSqrtLR", "start_factor", start_factor,
+                          minimum=0.0, maximum=1.0)
+        self.optimizer = optimizer
+        self.warmup_epochs = int(warmup_epochs)
+        self.start_factor = sf
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "InverseSqrtLR")
+        if self.warmup_epochs > 0 and epoch <= self.warmup_epochs:
+            frac = epoch / self.warmup_epochs
+            self.optimizer.lr = self.initial_lr * (
+                self.start_factor + (1.0 - self.start_factor) * frac)
+            return
+        base = max(1, epoch)
+        scale = 1.0 / math.sqrt(base)
+        if self.warmup_epochs > 0:
+            scale = math.sqrt(self.warmup_epochs / base)
+        self.optimizer.lr = self.initial_lr * scale
+
+
+class NoamLR:
+    """Transformer 原论文的学习率：``d_model^-0.5 · min(epoch^-0.5, epoch·warmup^-1.5)``
+
+    注意：这个公式**自带绝对量纲**，会直接覆盖 `optimizer.lr`（与 `initial_lr` 无关）。
+    """
+
+    def __init__(self, optimizer, d_model: int, warmup_epochs: int = 100):
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"NoamLR: d_model 必须是 >=1 的整数，收到 {d_model!r}")
+        if isinstance(warmup_epochs, bool) or not isinstance(warmup_epochs, int)                 or warmup_epochs < 1:
+            raise ValueError(
+                f"NoamLR: warmup_epochs 必须是 >=1 的整数，收到 {warmup_epochs!r}")
+        self.optimizer = optimizer
+        self.d_model = int(d_model)
+        self.warmup_epochs = int(warmup_epochs)
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "NoamLR")
+        scale = (self.d_model ** -0.5) * min(epoch ** -0.5,
+                                             epoch * (self.warmup_epochs ** -1.5))
+        self.optimizer.lr = scale
+
+
+class PolynomialLR:
+    """多项式衰减：``(initial_lr - min_lr)·(1 - epoch/total)^power + min_lr``"""
+
+    def __init__(self, optimizer, total_epochs: int, power: float = 1.0,
+                 min_lr: float = 0.0):
+        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int)                 or total_epochs < 1:
+            raise ValueError(
+                f"PolynomialLR: total_epochs 必须是 >=1 的整数，收到 {total_epochs!r}")
+        p = _sched_check("PolynomialLR", "power", power, minimum=0.0)
+        low = _sched_check("PolynomialLR", "min_lr", min_lr, minimum=0.0)
+        self.optimizer = optimizer
+        self.total_epochs = int(total_epochs)
+        self.power = p
+        self.min_lr = low
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "PolynomialLR")
+        frac = min(1.0, epoch / self.total_epochs)
+        self.optimizer.lr = (self.initial_lr - self.min_lr) * (
+            (1.0 - frac) ** self.power) + self.min_lr
+
+
+class WSDLR:
+    """Warmup-Stable-Decay：线性 warmup → 恒定 → 尾部衰减
+
+    `decay_epochs` 缺省时取 `max(1, total_epochs // 10)`；
+    `decay_shape` 支持 `'linear'` 与 `'cos'`（cos 更平滑，线性更省算）。
+    """
+
+    SHAPES = ("linear", "cos")
+
+    def __init__(self, optimizer, warmup_epochs: int = 1, total_epochs: int = 10,
+                 decay_epochs: int = None, min_lr: float = 0.0,
+                 decay_shape: str = "cos"):
+        if isinstance(warmup_epochs, bool) or not isinstance(warmup_epochs, int)                 or warmup_epochs < 0:
+            raise ValueError(
+                f"WSDLR: warmup_epochs 必须是 >=0 的整数，收到 {warmup_epochs!r}")
+        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int)                 or total_epochs < 2:
+            raise ValueError(
+                f"WSDLR: total_epochs 必须是 >=2 的整数，收到 {total_epochs!r}")
+        if decay_epochs is None:
+            decay_epochs = max(1, total_epochs // 10)
+        if isinstance(decay_epochs, bool) or not isinstance(decay_epochs, int)                 or decay_epochs < 1:
+            raise ValueError(
+                f"WSDLR: decay_epochs 必须是 >=1 的整数，收到 {decay_epochs!r}")
+        if warmup_epochs + decay_epochs > total_epochs:
+            raise ValueError(
+                f"WSDLR: warmup({warmup_epochs}) + decay({decay_epochs}) "
+                f"不能超过 total_epochs({total_epochs})")
+        if decay_shape not in self.SHAPES:
+            raise ValueError(f"WSDLR: decay_shape 只能是 {self.SHAPES}，收到 {decay_shape!r}")
+        low = _sched_check("WSDLR", "min_lr", min_lr, minimum=0.0)
+        self.optimizer = optimizer
+        self.warmup_epochs = int(warmup_epochs)
+        self.total_epochs = int(total_epochs)
+        self.decay_epochs = int(decay_epochs)
+        self.min_lr = low
+        self.decay_shape = decay_shape
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "WSDLR")
+        if self.warmup_epochs > 0 and epoch <= self.warmup_epochs:
+            frac = epoch / self.warmup_epochs
+            self.optimizer.lr = self.initial_lr * frac
+            return
+        decay_start = self.total_epochs - self.decay_epochs + 1
+        if epoch < decay_start:
+            self.optimizer.lr = self.initial_lr
+            return
+        frac = min(1.0, (epoch - decay_start + 1) / self.decay_epochs)
+        if self.decay_shape == "cos":
+            lr = self.min_lr + (self.initial_lr - self.min_lr) * 0.5 * (
+                1 + math.cos(math.pi * frac))
+        else:
+            lr = self.initial_lr - (self.initial_lr - self.min_lr) * frac
+        self.optimizer.lr = lr
+
+
+class ChainedScheduler:
+    """把多个调度器**依次**作用于同一个 optimizer（PyTorch `ChainedScheduler`）
+
+    注意与 `SequentialLR` 的区别：这里每个调度器**每轮都会被调用**，
+    所以适合「先按公式改 lr，再叠加一个上限」这类组合。
+    """
+
+    def __init__(self, *schedulers):
+        if len(schedulers) == 1 and isinstance(schedulers[0], (list, tuple)):
+            schedulers = tuple(schedulers[0])
+        if not schedulers:
+            raise ValueError("ChainedScheduler: 至少需要一个调度器")
+        for s in schedulers:
+            if not callable(getattr(s, "step", None)):
+                raise ValueError(f"ChainedScheduler: {s!r} 没有 step 方法")
+        self.schedulers = list(schedulers)
+        self.optimizer = self.schedulers[0].optimizer
+        self.initial_lr = self.optimizer.lr
+
+    def step(self, epoch: int):
+        for s in self.schedulers:
+            s.step(epoch)
+
+
+class SequentialLR:
+    """按里程碑切换调度器（PyTorch `SequentialLR`）
+
+    `milestones=[m1, m2]` 表示：epoch < m1 用第 0 个，m1 <= epoch < m2 用第 1 个，
+    之后用最后一个。因此 `schedulers` 必须是 `len(milestones) + 1` 个。
+    """
+
+    def __init__(self, optimizer, schedulers, milestones):
+        if not isinstance(schedulers, (list, tuple)) or not schedulers:
+            raise ValueError(f"SequentialLR: schedulers 必须是非空列表，收到 {schedulers!r}")
+        for s in schedulers:
+            if not callable(getattr(s, "step", None)):
+                raise ValueError(f"SequentialLR: {s!r} 没有 step 方法")
+        if isinstance(milestones, (int, float)) and not isinstance(milestones, bool):
+            milestones = [milestones]
+        if not isinstance(milestones, (list, tuple)) or not milestones:
+            raise ValueError(f"SequentialLR: milestones 必须是非空列表，收到 {milestones!r}")
+        clean = []
+        for m in milestones:
+            if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+                raise ValueError(f"SequentialLR: milestones 里的每项必须是 >=1 的整数，收到 {m!r}")
+            clean.append(int(m))
+        if sorted(clean) != clean or len(set(clean)) != len(clean):
+            raise ValueError(f"SequentialLR: milestones 必须严格递增，收到 {milestones!r}")
+        if len(schedulers) != len(clean) + 1:
+            raise ValueError(
+                f"SequentialLR: schedulers 需要有 {len(clean) + 1} 个"
+                f"（milestones {len(clean)} 个 + 1），收到 {len(schedulers)} 个")
+        self.optimizer = optimizer
+        self.schedulers = list(schedulers)
+        self.milestones = list(clean)
+        self.initial_lr = optimizer.lr
+
+    def step(self, epoch: int):
+        epoch = _sched_epoch(epoch, "SequentialLR")
+        idx = 0
+        for m in self.milestones:
+            if epoch >= m:
+                idx += 1
+        self.schedulers[idx].step(epoch)
+
+
 class StepLR:
     """每 step_size 个 epoch 将 lr 乘以 gamma"""
 

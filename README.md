@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1091 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1102 项）
 
 ## 特性
 
@@ -840,6 +840,18 @@ ga, gb = AI.pcgrad([1.0, 0.0], [-1.0, 1.0])
 | `ExponentialLR(optimizer, gamma)` | 指数衰减 |
 | `CosineAnnealingLR(optimizer, T_max)` | 余弦退火 |
 | `WarmupLR(optimizer, warmup_epochs, start_factor, base_scheduler)` | 线性 warmup；到期后交给 `base_scheduler`（可与上面任意一个组合） |
+| `LambdaLR(optimizer, lr_lambda)` | `lr = initial_lr × lr_lambda(epoch)`；`lr_lambda` 返回负数会报错 |
+| `MultiplicativeLR(optimizer, lr_lambda)` | 累积式：每轮 `lr *= lr_lambda(epoch)`（与 Lambda 的「绝对」语义不同） |
+| `MultiStepLR(optimizer, milestones, gamma)` | 里程碑衰减：`lr = initial_lr × gamma^(≤epoch 的里程碑个数)` |
+| `CosineAnnealingWarmRestarts(opt, T_0, T_mult, eta_min)` | 余弦重启：第 k 个周期长 `T_0·T_mult^k`，周期末落到 `eta_min`、下一轮回到峰值；`cycle_of(epoch)` 返回 `(k, T_k, pos)` |
+| `CyclicLR(opt, base_lr, max_lr, step_size_up, mode, gamma)` | 三角循环；`triangular2` 每周期峰值减半、`exp_range` 按 `gamma^pos` 缩放 |
+| `OneCycleLR(opt, max_lr, total_epochs, pct_start, ...)` | 单周期：`max_lr/div_factor` 起、`pct_start` 处升到 `max_lr`、末尾降到 `max_lr/div_factor/final_div_factor` |
+| `InverseSqrtLR(opt, warmup_epochs, start_factor)` | warmup 后 `initial/sqrt(epoch)`；无 warmup 时直接按 `1/sqrt(epoch)` |
+| `NoamLR(opt, d_model, warmup_epochs)` | Transformer 论文式 `d_model^-0.5 · min(e^-0.5, e·warmup^-1.5)`，**自带量纲、会覆盖 `initial_lr`** |
+| `PolynomialLR(opt, total_epochs, power, min_lr)` | `(initial-min)(1-frac)^power + min`，超出 `total_epochs` 夹在 `min_lr` |
+| `WSDLR(opt, warmup_epochs, total_epochs, decay_epochs, decay_shape)` | Warmup-Stable-Decay：线性升 → 恒定 → 尾部余弦/线性衰减到 `min_lr`（需 `warmup+decay ≤ total`） |
+| `ChainedScheduler(*schedulers)` | 每轮依次调用所有调度器（各自按 epoch 门控/赋值，效果与手动串联一致） |
+| `SequentialLR(opt, schedulers, milestones)` | 按里程碑切换：`len(schedulers) == len(milestones)+1`，里程碑严格递增 |
 
 ### 文本处理
 
@@ -1138,7 +1150,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1091 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1102 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1195,6 +1207,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLookahead` | 只在第 `k` 步同步、`alpha=0.5` 恰为中点、`Lookahead(Adam)` 的 `state_dict` 续训逐位一致 |
 | `TestEMAAndSWA` | EMA 三步闭式解、warmup 有效衰减、SWA 增量均值 == 算术均值、两者存档往返、非法输入 |
 | `TestEMASWACallbacks` | 回调每 epoch 更新一次（6 轮 → `step=6`/`n=6`）、SWA 平均恰为逐 epoch 快照的算术平均、`apply_to` 生效 |
+| `TestSchedulerFamily` | 12 个调度器的闭式解逐点对照、周期/里程碑边界、`step(0)` 夹到第 1 轮、`epoch` 非整数/布尔报错、旧调度器（Step/Exponential/Cosine）回归锁、与 `Model.fit(lr_scheduler=)` 的 12 种集成 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -1343,7 +1356,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1091 个单元测试
+├── test_ai.py       # 1102 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

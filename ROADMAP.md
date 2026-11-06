@@ -246,7 +246,8 @@
   - 三个都与手写参考**两步逐位一致**；`Ranger` 第一步每个参数满足 `p-p0 = -lr·g`（纯动量，worst 8.674e-17）；三者 `state_dict()` 续训逐位一致
   - 已知边界：只支持二维 `Layer` 权重（与 `Adam` 一致）；`LARS` 偏置恒用 `lr`；`LAMB` 的 `trust_clip` 默认 10.0 是经验值（更小时收敛更慢但更稳）
 - [ ] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
-- [ ] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
+- [x] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
+      - 12 个调度器（Lambda / Multiplicative / MultiStep / 余弦重启 / Cyclic / OneCycle / InverseSqrt / Noam / Polynomial / WSD / Chained / Sequential）；闭式解逐点对照、周期与里程碑边界、step(0) 夹到 1、与 it(lr_scheduler=) 12 种集成；**StepLR 家族是 epoch 门控的**（step(5) 且 5%2≠0 时 lr 不变），单独喂非整除轮次不会变。
       Polynomial / Lambda / MultiStep / Multiplicative / WSD / ChainedScheduler / SequentialLR
 - [ ] 标注不做：SparseAdam / SM3
 
