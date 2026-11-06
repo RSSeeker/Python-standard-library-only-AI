@@ -13343,3 +13343,199 @@ class TestSwinTransformer:
         assert raises(lambda: m2.backward([1.0, 0.0]), ValueError)
         assert raises(lambda: m2.sgd_step(-0.1), ValueError)
         assert raises(lambda: m2.adam_step(0.1, beta1=1.0), ValueError)
+
+
+class TestRoPEScaling:
+    """rope_inv_freqs：linear / NTK / YaRN 三种长度外推缩放"""
+
+    D_K = 8
+    BASE = 10000.0
+
+    def _plain(self, d_k=None):
+        d_k = self.D_K if d_k is None else d_k
+        return [1.0 / (self.BASE ** (2.0 * i / d_k)) for i in range(d_k // 2)]
+
+    def test_default_matches_formula(self):
+        freqs = AI.rope_inv_freqs(self.D_K, self.BASE)
+        assert len(freqs) == self.D_K // 2
+        for a, b in zip(freqs, self._plain()):
+            assert abs(a - b) < 1e-15
+        # scaling=None 时 factor 被忽略（默认参数就是 8.0，不能报错）
+        assert AI.rope_inv_freqs(self.D_K, self.BASE, None, 2.0) == freqs
+
+    def test_linear_and_ntk(self):
+        plain = self._plain()
+        lin = AI.rope_inv_freqs(self.D_K, self.BASE, 'linear', 4.0)
+        for a, b in zip(lin, plain):
+            assert abs(a - b / 4.0) < 1e-18
+
+        ntk = AI.rope_inv_freqs(self.D_K, self.BASE, 'ntk', 4.0)
+        base_eff = self.BASE * (4.0 ** (self.D_K / (self.D_K - 2.0)))
+        for i, got in enumerate(ntk):
+            want = 1.0 / (base_eff ** (2.0 * i / self.D_K))
+            assert abs(got - want) < 1e-18
+        assert abs(ntk[0] - 1.0) < 1e-15          # 第 0 维不受任何缩放影响
+        for i in range(1, len(plain)):
+            assert ntk[i] < plain[i]
+        for a, b in zip(lin, ntk):                # NTK 比 linear 更保守
+            assert b >= a - 1e-15
+
+    def test_yarn_endpoints_and_bounds(self):
+        plain = self._plain()
+        lin = AI.rope_inv_freqs(self.D_K, self.BASE, 'linear', 4.0)
+        yarn = AI.rope_inv_freqs(self.D_K, self.BASE, 'yarn', 4.0,
+                                 original_max=512)
+        for a, b in zip(plain, yarn):
+            assert min(a, a / 4.0) - 1e-15 <= b <= max(a, a / 4.0) + 1e-15
+        # 圈数极少 → 全部保持原样；圈数极多 → 全部 linear
+        small = AI.rope_inv_freqs(self.D_K, self.BASE, 'yarn', 4.0,
+                                  original_max=1)
+        for a, b in zip(small, plain):
+            assert abs(a - b) < 1e-18
+        big = AI.rope_inv_freqs(self.D_K, self.BASE, 'yarn', 4.0,
+                                original_max=10 ** 7)
+        for a, b in zip(big, lin):
+            assert abs(a - b) < 1e-18
+
+    def test_rope_scaling_reaches_mha(self):
+        def build(**kw):
+            random.seed(7)
+            return AI.MultiHeadAttention(8, 2, rope=True, **kw)
+
+        XS = [[math.sin(0.3 * t + 0.1 * j) for j in range(8)] for t in range(5)]
+        m0 = build()
+        assert m0.rope_freqs == AI.rope_inv_freqs(m0.d_k, 10000.0)
+        base_out = m0.forward([list(r) for r in XS])
+
+        ml = build(rope_scaling='linear', rope_factor=2.0)
+        assert ml.rope_freqs == AI.rope_inv_freqs(ml.d_k, 10000.0, 'linear', 2.0)
+        lin_out = ml.forward([list(r) for r in XS])
+        assert max(abs(a - b) for ra, rb in zip(base_out, lin_out)
+                   for a, b in zip(ra, rb)) > 1e-6
+
+        my = build(rope_scaling='yarn', rope_factor=4.0, rope_original_max=64)
+        assert len(my.rope_freqs) == len(m0.rope_freqs)
+
+    def test_gradients_with_scaling(self):
+        random.seed(7)
+        m = AI.MultiHeadAttention(8, 2, rope=True, rope_scaling='yarn',
+                                  rope_factor=4.0, rope_original_max=64)
+        XS = [[math.sin(0.3 * t + 0.1 * j) for j in range(8)] for t in range(5)]
+        W = [[math.cos(0.2 * t + 0.1 * j) for j in range(8)] for t in range(5)]
+        eps = 1e-6
+
+        def loss():
+            m.zero_grad()
+            out = m.forward([list(r) for r in XS])
+            return sum(W[t][j] * out[t][j] for t in range(5) for j in range(8))
+
+        for name, i, j in (('W_q', 1, 2), ('W_k', 0, 3), ('W_v', 2, 5),
+                           ('W_o', 3, 1)):
+            mat = getattr(m, name)
+            m.zero_grad()
+            m.forward([list(r) for r in XS])
+            m.backward([list(r) for r in W])
+            ana = m.grads[name][i][j]
+            old = mat[i][j]
+            mat[i][j] = old + eps
+            lp = loss()
+            mat[i][j] = old - eps
+            lm = loss()
+            mat[i][j] = old
+            num = (lp - lm) / (2 * eps)
+            assert abs(ana - num) / max(1.0, abs(num)) < 1e-6, (name, i, j)
+
+    def test_invalid_arguments(self):
+        def raises(fn):
+            try:
+                fn()
+            except ValueError:
+                return True
+            return False
+
+        assert raises(lambda: AI.rope_inv_freqs(1))
+        assert raises(lambda: AI.rope_inv_freqs(8, self.BASE, 'bad'))
+        assert raises(lambda: AI.rope_inv_freqs(8, self.BASE, 'linear', 0.5))
+        assert raises(lambda: AI.rope_inv_freqs(8, self.BASE, 'none', 2.0))
+        assert raises(lambda: AI.rope_inv_freqs(8, self.BASE, 'yarn', 4.0,
+                                                beta_fast=1.0, beta_slow=8.0))
+        assert raises(lambda: AI.rope_inv_freqs(8, -1.0))
+        assert raises(lambda: AI.rope_inv_freqs(8, self.BASE, 'yarn', 4.0,
+                                                original_max=0))
+
+
+class TestLearnedPositionalEncoding:
+    """可学习位置编码表"""
+
+    def test_forward_and_param_count(self):
+        random.seed(3)
+        pe = AI.LearnedPositionalEncoding(4, max_len=3, std=0.1)
+        X = [[0.1 * t + 0.05 * j for j in range(4)] for t in range(3)]
+        out = pe.forward([list(r) for r in X])
+        for t in range(3):
+            for j in range(4):
+                assert abs(out[t][j] - (X[t][j] + pe.table[t][j])) < 1e-15
+        assert pe.param_count() == 12
+
+    def test_backward_accumulates(self):
+        random.seed(3)
+        pe = AI.LearnedPositionalEncoding(4, max_len=3)
+        D = [[0.5, -0.2, 0.1, 0.3], [0.0, 0.0, 0.0, 0.0],
+             [-0.4, 0.2, 0.0, 0.7]]
+        pe.forward([[0.0] * 4 for _ in range(3)])
+        pe.zero_grad()
+        dx, dtab = pe.backward([list(r) for r in D])
+        assert dx == D                     # 位置编码只加常数，dx 就是 dout
+        for t in range(3):
+            for j in range(4):
+                assert abs(dtab[t][j] - D[t][j]) < 1e-15
+        pe.backward([list(r) for r in D])
+        for t in range(3):
+            for j in range(4):
+                assert abs(pe.grad_table[t][j] - 2 * D[t][j]) < 1e-15
+
+    def test_sgd_and_adam_update_table(self):
+        random.seed(4)
+        pe = AI.LearnedPositionalEncoding(3, max_len=2)
+        pe.forward([[1.0, 2.0, 3.0]])
+        pe.zero_grad()
+        pe.backward([[1.0, 1.0, 1.0]])
+        before = [row[:] for row in pe.table]
+        pe.sgd_step(0.1)
+        for j in range(3):
+            assert abs(pe.table[0][j] - (before[0][j] - 0.1)) < 1e-15
+            assert pe.table[1][j] == before[1][j]      # 没用到第 2 行
+
+        pe2 = AI.LearnedPositionalEncoding(3, max_len=2)
+        pe2.forward([[1.0, 2.0, 3.0]])
+        pe2.zero_grad()
+        pe2.backward([[1.0, 1.0, 1.0]])
+        b2 = [row[:] for row in pe2.table]
+        pe2.adam_step(0.01)
+        assert any(abs(pe2.table[0][j] - b2[0][j]) > 1e-9 for j in range(3))
+
+    def test_extends_table_on_longer_input(self):
+        pe = AI.LearnedPositionalEncoding(2, max_len=2)
+        out = pe.forward([[float(t), float(-t)] for t in range(5)])
+        assert len(out) == 5
+        assert len(pe.table) == 5
+        assert len(pe.m_table) == 5 and len(pe.v_table) == 5
+        assert len(pe.grad_table) == 5
+
+    def test_invalid_arguments(self):
+        def raises(fn):
+            try:
+                fn()
+            except ValueError:
+                return True
+            return False
+
+        assert raises(lambda: AI.LearnedPositionalEncoding(0))
+        assert raises(lambda: AI.LearnedPositionalEncoding(4, max_len=0))
+        assert raises(lambda: AI.LearnedPositionalEncoding(4, max_len=2, std=-1.0))
+        pe = AI.LearnedPositionalEncoding(4, max_len=2)
+        assert raises(lambda: pe.forward([[0.0] * 3]))
+        pe.forward([[0.0] * 4])
+        assert raises(lambda: pe.backward([[0.0] * 4] * 2))
+        assert raises(lambda: pe.sgd_step(-0.1))
+        assert raises(lambda: pe.adam_step(0.1, beta1=1.0))

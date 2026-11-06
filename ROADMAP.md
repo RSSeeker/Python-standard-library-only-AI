@@ -173,7 +173,9 @@
 
 ### W5 注意力与位置编码（P1/P2）
 - [ ] `MLA`（低秩 KV 压缩）；`MQA` 标注为 `num_kv_heads=1` 特例
-- [ ] 位置编码：可学习位置编码、T5 相对位置偏置、xPos、YaRN / NTK-aware RoPE（改 `rope_freqs`）
+- [x] `LearnedPositionalEncoding`（可学习位置编码表，`out=x+table`，`sgd_step`/`adam_step`，超长自动扩表）
+- [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（未实现 YaRN 的 mscale 温度，docstring 注明）
+- [ ] 位置编码剩余：T5 相对位置偏置、xPos、MLA 低秩 KV 压缩
 - [ ] 线性注意力族：`LinearAttention`、`Performer`（随机特征）、`Linformer`、`BigBird`（稀疏）、
       `Longformer`（滑窗+全局）、`Reformer`（LSH）
 - [ ] `FlashAttention` 分块算法（模拟，明确「不更快」）

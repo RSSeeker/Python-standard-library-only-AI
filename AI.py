@@ -9159,6 +9159,103 @@ class GRU:
 #  Transformer 组件
 # ============================================================================
 
+def rope_inv_freqs(d_k: int, base: float = 10000.0, scaling: str = None,
+                   factor: float = 8.0, original_max: int = 512,
+                   beta_fast: float = 32.0, beta_slow: float = 1.0):
+    """RoPE 的逐对逆频率（长度 d_k//2），支持三种长度外推缩放
+
+    第 i 对的原始频率是 `base ** (-2i/d_k)`，波长 `2*pi/freq`（单位：token）。
+    scaling:
+
+    - None / 'none'：原始频率，与旧版逐位一致（默认）。
+    - 'linear'：位置整体除以 factor（`pos -> pos/factor`），等价于所有频率
+      除以 factor。最简单，但会压缩所有频率、损失局部细节。
+    - 'ntk'：NTK-aware 插值，改底数 `base_eff = base * factor ** (d_k/(d_k-2))`。
+      低频（长波长）被拉得更长、高频几乎不动，比 linear 保留更多局部信息。
+    - 'yarn'：YaRN 的分段插值——按"在 original_max 长度内转了几圈"
+      `rotations = original_max * freq / (2*pi)` 做平滑过渡：转得多的
+      （高频）用 linear 缩放，转得少的（低频）保持原样，中间用 smoothstep 混合。
+      `beta_fast` / `beta_slow` 是两端的转折圈数。
+
+    YaRN 论文里的注意力温度 `mscale` 不在这里实现（需要同时改 softmax 温度），
+    docstring 注明即可。
+    """
+    if isinstance(d_k, bool) or not isinstance(d_k, int):
+        raise ValueError(f"rope_inv_freqs: d_k 必须是正整数，收到 {d_k!r}")
+    if d_k < 2:
+        raise ValueError(f"rope_inv_freqs: d_k 至少为 2，收到 {d_k}")
+    if isinstance(base, bool) or not isinstance(base, (int, float)):
+        raise ValueError(f"rope_inv_freqs: base 必须是正数，收到 {base!r}")
+    base = float(base)
+    if not (base > 0.0) or base != base or base == float('inf'):
+        raise ValueError(f"rope_inv_freqs: base 必须是有限正数，收到 {base!r}")
+    explicit_none = scaling == 'none'
+    if scaling is None:
+        scaling = 'none'
+    if scaling not in ('none', 'linear', 'ntk', 'yarn'):
+        raise ValueError(
+            "rope_inv_freqs: scaling 只能是 None/'none'/'linear'/'ntk'/'yarn'，"
+            f"收到 {scaling!r}"
+        )
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+        raise ValueError(f"rope_inv_freqs: factor 必须是 >=1 的数字，收到 {factor!r}")
+    factor = float(factor)
+    if not (factor >= 1.0) or factor != factor or factor == float('inf'):
+        raise ValueError(f"rope_inv_freqs: factor 必须是有限且 >=1，收到 {factor!r}")
+    if scaling == 'none':
+        # factor 在 none 下不起作用；默认参数就是 8.0，不能因此报错。
+        # 只有显式写 'none' 又给了非 1 的 factor 才提示，免得"以为开了缩放其实没开"。
+        if explicit_none and factor != 1.0:
+            raise ValueError("rope_inv_freqs: scaling='none' 时 factor 必须为 1.0")
+        return [1.0 / (base ** (2.0 * i / d_k)) for i in range(d_k // 2)]
+
+    if isinstance(original_max, bool) or not isinstance(original_max, int):
+        raise ValueError(
+            f"rope_inv_freqs: original_max 必须是正整数，收到 {original_max!r}"
+        )
+    if original_max < 1:
+        raise ValueError(f"rope_inv_freqs: original_max 必须 >= 1，收到 {original_max}")
+
+    if scaling == 'linear':
+        return [(1.0 / (base ** (2.0 * i / d_k))) / factor
+                for i in range(d_k // 2)]
+
+    if scaling == 'ntk':
+        base_eff = base * (factor ** (d_k / (d_k - 2.0)))
+        return [1.0 / (base_eff ** (2.0 * i / d_k)) for i in range(d_k // 2)]
+
+    # yarn
+    if isinstance(beta_fast, bool) or not isinstance(beta_fast, (int, float)):
+        raise ValueError(
+            f"rope_inv_freqs: beta_fast 必须是正数，收到 {beta_fast!r}"
+        )
+    if isinstance(beta_slow, bool) or not isinstance(beta_slow, (int, float)):
+        raise ValueError(
+            f"rope_inv_freqs: beta_slow 必须是正数，收到 {beta_slow!r}"
+        )
+    beta_fast = float(beta_fast)
+    beta_slow = float(beta_slow)
+    if not (beta_fast > beta_slow > 0.0):
+        raise ValueError(
+            "rope_inv_freqs: 需要 beta_fast > beta_slow > 0，收到 "
+            f"beta_fast={beta_fast}, beta_slow={beta_slow}"
+        )
+    two_pi = 2.0 * math.pi
+    out = []
+    for i in range(d_k // 2):
+        f0 = 1.0 / (base ** (2.0 * i / d_k))
+        rotations = original_max * f0 / two_pi
+        if rotations >= beta_fast:
+            ramp = 1.0
+        elif rotations <= beta_slow:
+            ramp = 0.0
+        else:
+            u = (rotations - beta_slow) / (beta_fast - beta_slow)
+            ramp = u * u * (3.0 - 2.0 * u)      # smoothstep
+        out.append((1.0 - ramp) * f0 + ramp * (f0 / factor))
+    return out
+
+
 class MultiHeadAttention:
     """多头自注意力 (Multi-Head Self-Attention)
 
@@ -9168,7 +9265,10 @@ class MultiHeadAttention:
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  causal: bool = False, rope: bool = False, rope_base: float = 10000.0,
-                 window: int = None, num_kv_heads: int = None, alibi: bool = False):
+                 window: int = None, num_kv_heads: int = None, alibi: bool = False,
+                 rope_scaling: str = None, rope_factor: float = 8.0,
+                 rope_original_max: int = 512, rope_beta_fast: float = 32.0,
+                 rope_beta_slow: float = 1.0):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -9194,6 +9294,14 @@ class MultiHeadAttention:
         Biases）：第 h 个头加 `slope_h * (t - j)`，slope_h = 2^(-8*(h+1)/num_heads)。
         距离越远惩罚越大，天然带「近处优先」，且无需位置编码就能外推更长的序列。
         偏置是常数、不参与求导，所以反向不需要额外分支。
+
+        rope_scaling: RoPE 的长度外推缩放，见 `rope_inv_freqs`。
+        'linear' / 'ntk' / 'yarn' 三选一，默认 None 表示原始频率——此时
+        `rope_freqs` 与旧版逐位一致，反向/前向都不变。
+        `rope_factor` 是外推倍数（想从 512 撑到 4096 就是 8.0），
+        `rope_original_max` 是预训练长度（YaRN 用它算每个维度的旋转圈数），
+        `rope_beta_fast` / `rope_beta_slow` 是 YaRN 的转折圈数。
+        注意：这里**不实现** YaRN 的注意力温度 mscale。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
@@ -9247,9 +9355,14 @@ class MultiHeadAttention:
         self.num_kv_heads = num_kv_heads
         self.kv_dim = num_kv_heads * self.d_k   # W_k/W_v 的输出维度（KV cache 宽度）
         self.kv_group = num_heads // num_kv_heads
-        # RoPE 的成对频率：第 i 对用 base^(-2i/d_k)，与 Llama 一致
-        self.rope_freqs = [1.0 / (self.rope_base ** (2.0 * i / self.d_k))
-                           for i in range(self.d_k // 2)]
+        # RoPE 的成对频率：第 i 对默认用 base^(-2i/d_k)（与 Llama 一致），
+        # 也可按 rope_scaling 做 linear / NTK / YaRN 外推缩放。
+        self.rope_scaling = rope_scaling
+        self.rope_factor = float(rope_factor)
+        self.rope_freqs = rope_inv_freqs(
+            self.d_k, self.rope_base, rope_scaling, rope_factor,
+            rope_original_max, rope_beta_fast, rope_beta_slow,
+        )
         # ALiBi 的逐头斜率：2^(-8*(h+1)/num_heads)，与论文/CausalLM 实现一致
         self.alibi_slopes = [2.0 ** (-8.0 * (h + 1) / num_heads)
                              for h in range(num_heads)]
@@ -10908,6 +11021,140 @@ class PositionalEncoding:
 # ============================================================================
 #  Embedding / Residual / Sequential
 # ============================================================================
+
+class LearnedPositionalEncoding:
+    """可学习的位置编码表（BERT / GPT-2 式）：`out[t] = x[t] + table[t]`
+
+    `table` 形状 (max_len, d_model)，随机初始化后与模型一起训练。
+    与 `PositionalEncoding`（固定 sin/cos、无参数）的区别就是**位置向量可学**。
+
+    forward 超长时按需扩展表格（新行用同分布的随机数填充并记录梯度位置），
+    不会静默截断；backward 返回 `(dx, d_table)`，其中 `d_table` 只覆盖本次
+    用到的前 seq_len 行。
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000, std: float = None):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise ValueError(
+                f"LearnedPositionalEncoding: d_model 必须是正整数，收到 {d_model!r}"
+            )
+        if d_model < 1:
+            raise ValueError(
+                f"LearnedPositionalEncoding: d_model 必须 >= 1，收到 {d_model}"
+            )
+        if isinstance(max_len, bool) or not isinstance(max_len, int):
+            raise ValueError(
+                f"LearnedPositionalEncoding: max_len 必须是正整数，收到 {max_len!r}"
+            )
+        if max_len < 1:
+            raise ValueError(
+                f"LearnedPositionalEncoding: max_len 必须 >= 1，收到 {max_len}"
+            )
+        if std is None:
+            std = 0.02
+        if isinstance(std, bool) or not isinstance(std, (int, float)):
+            raise ValueError(
+                f"LearnedPositionalEncoding: std 必须是正数，收到 {std!r}"
+            )
+        std = float(std)
+        if not (std > 0.0) or std != std:
+            raise ValueError(
+                f"LearnedPositionalEncoding: std 必须是有限正数，收到 {std!r}"
+            )
+        self.d_model = d_model
+        self.std = std
+        self.table = [[random.gauss(0.0, std) for _ in range(d_model)]
+                      for _ in range(max_len)]
+        self.m_table = [[0.0] * d_model for _ in range(max_len)]
+        self.v_table = [[0.0] * d_model for _ in range(max_len)]
+        self._adam_t = 0
+        self.grad_table = [[0.0] * d_model for _ in range(max_len)]
+        self.seq_len = 0
+
+    def _ensure_len(self, n: int):
+        """按需扩展编码表：新行随机初始化，同时扩展梯度/Adam 状态"""
+        while len(self.table) < n:
+            self.table.append([random.gauss(0.0, self.std)
+                               for _ in range(self.d_model)])
+            self.m_table.append([0.0] * self.d_model)
+            self.v_table.append([0.0] * self.d_model)
+            self.grad_table.append([0.0] * self.d_model)
+
+    def zero_grad(self):
+        """清零位置编码的梯度"""
+        self.grad_table = [[0.0] * self.d_model for _ in range(len(self.table))]
+
+    def forward(self, x_seq):
+        """x_seq: (seq_len, d_model) → x_seq + table[:seq_len]"""
+        for t, row in enumerate(x_seq):
+            if len(row) != self.d_model:
+                raise ValueError(
+                    "LearnedPositionalEncoding.forward: 第 %d 个 token 的维度 %d "
+                    "与 d_model=%d 不一致" % (t, len(row), self.d_model)
+                )
+        self._ensure_len(len(x_seq))
+        self.seq_len = len(x_seq)
+        return [[x_seq[t][j] + self.table[t][j] for j in range(self.d_model)]
+                for t in range(len(x_seq))]
+
+    def backward(self, dout_seq):
+        """返回 (dx, d_table)；位置编码对每个位置的偏导就是该位置的 dout"""
+        if len(dout_seq) != self.seq_len:
+            raise ValueError(
+                "LearnedPositionalEncoding.backward: dout 的序列长度 %d 与 forward "
+                "的 %d 不一致" % (len(dout_seq), self.seq_len)
+            )
+        dx = [list(row) for row in dout_seq]
+        for t in range(self.seq_len):
+            for j in range(self.d_model):
+                self.grad_table[t][j] += dout_seq[t][j]
+        return dx, [list(row) for row in self.grad_table[:self.seq_len]]
+
+    def param_count(self):
+        """参数量：表格总元素数"""
+        return len(self.table) * self.d_model
+
+    def sgd_step(self, lr: float):
+        """SGD 更新位置编码表"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+            raise ValueError(f"LearnedPositionalEncoding.sgd_step: lr 必须是数字，收到 {lr!r}")
+        lr = float(lr)
+        if not (lr >= 0.0) or lr != lr:
+            raise ValueError(
+                f"LearnedPositionalEncoding.sgd_step: lr 必须是非负有限数，收到 {lr!r}"
+            )
+        for t in range(len(self.table)):
+            row = self.table[t]
+            grad = self.grad_table[t]
+            for j in range(self.d_model):
+                row[j] -= lr * grad[j]
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """Adam 更新位置编码表"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+            raise ValueError(f"LearnedPositionalEncoding.adam_step: lr 必须是数字，收到 {lr!r}")
+        lr = float(lr)
+        if not (lr >= 0.0) or lr != lr:
+            raise ValueError(
+                f"LearnedPositionalEncoding.adam_step: lr 必须是非负有限数，收到 {lr!r}"
+            )
+        _check_adam_betas(beta1, beta2, "LearnedPositionalEncoding.adam_step")
+        self._adam_t += 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for r in range(len(self.table)):
+            row = self.table[r]
+            grad = self.grad_table[r]
+            mrow = self.m_table[r]
+            vrow = self.v_table[r]
+            for j in range(self.d_model):
+                g = grad[j]
+                mrow[j] = beta1 * mrow[j] + (1.0 - beta1) * g
+                vrow[j] = beta2 * vrow[j] + (1.0 - beta2) * g * g
+                row[j] -= lr * (mrow[j] / c1) / (math.sqrt(vrow[j] / c2) + eps)
+
 
 class Embedding:
     """词嵌入层：查表操作，将索引映射为稠密向量"""
