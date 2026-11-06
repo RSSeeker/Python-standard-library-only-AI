@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（966 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（976 项）
 
 ## 特性
 
@@ -279,6 +279,9 @@ model.train()     # 回到训练
 | `GraphSAGELayer(in_features, out_features, concat=True)` | 均值聚合 `σ(W [x_i ‖ mean_{j∈N(i)} x_j])`；`concat=False` 时只用邻居均值 |
 | `GINLayer(in_features, hidden, out_features, eps=0.0, train_eps=False)` | `MLP((1+eps)·x_i + Σ_{j∈N(i)} x_j)`；`train_eps=True` 时 `eps` 作标量参数参与优化 |
 | `GraphReadout(mode='mean')` | 节点特征 → 图向量的读出（`mean` / `sum` / `max`），反向按模式分发（`max` 只回给取到最大值的位置） |
+| `GATLayer(in_features, out_features, num_heads=1, concat=True)` | 图注意力：`s_ij = LeakyReLU(a_s·z_i + a_d·z_j)`、`alpha = softmax_{j∈N(i)} s_ij`、`ctx_i = Σ_j alpha_ij z_j`；`adj` 只用**存在性**（权重被忽略），`concat=True` 时多头拼接、否则取均值 |
+| `APPNPLayer(in_features, out_features, K=2, alpha=0.1)` | 个性化 PageRank 传播：`H0 = σ(XW+b)`、`H^{k+1} = (1-alpha)·Â H^k + alpha·H0`，输出 `H^K`；`alpha=0` 退化为 `Â^K H0`，`alpha=1` 直接输出 `H0` |
+| `JKNet(layers, mode='concat')` | 跳连汇总（JK-Net）：逐层前向再汇总，`concat` 拼所有层输出 / `last` 只用最后一层 / `max` 逐位置取最大；反向按堆叠语义把梯度链式回传每一层 |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
@@ -1093,7 +1096,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-966 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+976 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1203,6 +1206,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestT5RelativeBias` | 分桶公式（正负半区、单调、夹断）、查表一致、桶内梯度求和、优化器与非法输入 |
 | `TestXPosFactors` | 形状与位置 0 归 1、随位置衰减、`alpha=0` 关闭、`offset` 语义、非法输入 |
 | `TestGraphLayers` | GCN 退化语义与 `dW`/`dx` 中心差分、GraphSAGE 两种拼接、GIN 的 `eps` 梯度与「无边退化为 MLP」、三种读出与反向、训练下降、8 类非法输入 |
+| `TestGATLayer` | 注意力行和为 1 / 非邻居权重为 0 / `param_count`、`concat` 与 `mean` 两档的 `dx`/`dW`/`da_src`/`da_dst` 中心差分、累加与 `zero_grad`、两档优化器、非法输入 |
+| `TestAPPNPLayer` | `alpha=0` 退化为 `Â^K H0` / `alpha=1` 输出恒为 `H0`、K=1/2/3 的 `dW` 与 `dx` 中心差分、训练下降、非法输入 |
+| `TestJKNet` | `concat` 宽度、`last` 与手工双层堆叠的**黄金对照**（逐层 `gW`、`dx`）、`max` 汇总的回传、非法输入 |
 | `TestPatchEmbedding` | patch 切分与行优先顺序、偏置整体平移、`param_count`、`dx` 中心差分、6 类非法输入 |
 | `TestAttentionPooling` | `q=0` 退化为平均、softmax 权重闭式解、`dx`/`q` 中心差分、5 类非法输入 |
 | `TestGeMPooling` | `p=1` 等于平均、`p=2` 等于均方根、`p=2000` 仍接近最大值且不溢出、三档 `p` 的 `dx` 中心差分、6 类非法输入 |
@@ -1267,7 +1273,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 966 个单元测试
+├── test_ai.py       # 976 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

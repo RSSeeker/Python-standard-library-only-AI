@@ -14832,3 +14832,245 @@ class TestGraphLayers:
                 fn()
         with pytest.raises(RuntimeError):
             AI.GCNLayer(2, 3).backward(self.DG)
+
+
+# ============================================================================
+#  W6-B: GAT / APPNP / JKNet
+# ============================================================================
+
+class TestGATLayer:
+    """图注意力：注意力语义、dx/dW/da 中心差分、多头 concat/mean"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]]
+    ADJ = [[0.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]
+
+    def _loss_and_grads(self, gm, dout):
+        out = gm.forward(self.X, self.ADJ)
+        gm.zero_grad()
+        gm.backward(dout)
+        return sum(out[a][b] * dout[a][b]
+                   for a in range(len(out)) for b in range(len(out[0])))
+
+    def test_attention_semantics(self):
+        g = AI.GATLayer(2, 2, num_heads=1, activation='linear', seed=3)
+        out = g.forward(self.X, self.ADJ)
+        assert len(out) == 3 and len(out[0]) == 2
+        assert g.param_count() == (2 * 2 + 2) + 2 * 2
+        al = g._cache[3][0]
+        for i in range(3):
+            assert abs(sum(al[i]) - 1.0) < 1e-12
+        assert al[0][2] == 0.0            # 非邻居权重为 0
+
+    def test_gradient_finite_difference(self):
+        for concat in (True, False):
+            gm = AI.GATLayer(2, 2, num_heads=2, activation='elu',
+                             concat=concat, seed=5)
+            w = len(gm.forward(self.X, self.ADJ)[0])
+            dout = [[0.3, -0.2, 0.1, 0.05][:w], [0.1, 0.2, -0.3, 0.4][:w],
+                    [-0.2, 0.1, 0.25, -0.15][:w]]
+            eps = 1e-6
+            gm.zero_grad()
+            gm.forward(self.X, self.ADJ)
+            dx = gm.backward(dout)
+
+            def tgt():
+                o = gm.forward(self.X, self.ADJ)
+                return sum(o[a][b] * dout[a][b] for a in range(3) for b in range(w))
+
+            for i in range(3):
+                old = self.X[i][0]
+                self.X[i][0] = old + eps
+                up = tgt()
+                self.X[i][0] = old - eps
+                dn = tgt()
+                self.X[i][0] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][0] - num) < 2e-5 * max(1.0, abs(num))
+            # 注意力向量的梯度
+            ana = gm.ga_src[1][0]
+            gm.a_src[1][0] += eps
+            up = tgt()
+            gm.a_src[1][0] -= 2 * eps
+            dn = tgt()
+            gm.a_src[1][0] += eps
+            assert abs(ana - (up - dn) / (2 * eps)) < 2e-5
+            ana = gm.ga_dst[0][1]
+            gm.a_dst[0][1] += eps
+            up = tgt()
+            gm.a_dst[0][1] -= 2 * eps
+            dn = tgt()
+            gm.a_dst[0][1] += eps
+            assert abs(ana - (up - dn) / (2 * eps)) < 2e-5
+
+    def test_accumulate_zero_grad_and_optimizers(self):
+        g = AI.GATLayer(2, 2, num_heads=1, activation='elu', seed=7)
+        dout = [[0.3, -0.2], [0.1, 0.2], [-0.2, 0.1]]
+        g.zero_grad()
+        g.forward(self.X, self.ADJ)
+        g.backward(dout)
+        first = g.gW[0][0][0]
+        g.forward(self.X, self.ADJ)
+        g.backward(dout)
+        assert abs(g.gW[0][0][0] - 2.0 * first) < 1e-12
+        g.zero_grad()
+        assert all(v == 0.0 for head in g.gW for row in head for v in row)
+        before = [v for v in g.W[0][0]]
+        g.forward(self.X, self.ADJ)
+        g.backward(dout)
+        g.sgd_step(0.01)
+        assert g.W[0][0] != before
+        g.adam_step(0.01)
+        with pytest.raises(ValueError):
+            g.sgd_step(-1.0)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.GATLayer(0, 3)
+        with pytest.raises(ValueError):
+            AI.GATLayer(2, 3, num_heads=0)
+        with pytest.raises(ValueError):
+            AI.GATLayer(2, 3, negative_slope=0.0)
+        with pytest.raises(ValueError):
+            AI.GATLayer(2, 3, activation='softmax')
+        with pytest.raises(ValueError):
+            AI.GATLayer(2, 3).forward(self.X, [[0, 1], [1, 0]])
+        with pytest.raises(RuntimeError):
+            AI.GATLayer(2, 3).backward([[1.0, 2.0, 3.0]])
+
+
+class TestAPPNPLayer:
+    """APPNP：alpha=0/1 两端语义、K 档梯度、训练下降"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.5, -1.0]]
+    ADJ = [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0],
+           [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]
+    DOUT = [[0.3, -0.2, 0.1], [0.1, 0.2, -0.3], [-0.2, 0.1, 0.25], [0.4, -0.1, 0.2]]
+
+    def test_alpha_extremes(self):
+        a0 = AI.APPNPLayer(2, 2, K=2, alpha=0.0, activation='linear', seed=7)
+        o0 = a0.forward(self.X, self.ADJ)
+        an = AI._g_adj_norm(self.ADJ, True)
+        h0 = a0.dense.forward(self.X)
+        ref = AI._g_matmul(an, AI._g_matmul(an, h0))
+        for i in range(4):
+            for r in range(2):
+                assert abs(o0[i][r] - ref[i][r]) < 1e-12
+        a1 = AI.APPNPLayer(2, 2, K=2, alpha=1.0, activation='linear', seed=7)
+        o1 = a1.forward(self.X, self.ADJ)
+        h0b = a1.dense.forward(self.X)
+        for i in range(4):
+            for r in range(2):
+                assert abs(o1[i][r] - h0b[i][r]) < 1e-12
+
+    def test_gradient_finite_difference(self):
+        eps = 1e-6
+        for K in (1, 2, 3):
+            am = AI.APPNPLayer(2, 3, K=K, alpha=0.2, activation='relu', seed=9)
+            am.zero_grad()
+            out = am.forward(self.X, self.ADJ)
+            dx = am.backward(self.DOUT)
+
+            def tgt():
+                o = am.forward(self.X, self.ADJ)
+                return sum(o[a][b] * self.DOUT[a][b]
+                           for a in range(4) for b in range(3))
+
+            ana = am.dense.gW[0][1]
+            am.dense.W[0][1] += eps
+            up = tgt()
+            am.dense.W[0][1] -= 2 * eps
+            dn = tgt()
+            am.dense.W[0][1] += eps
+            assert abs(ana - (up - dn) / (2 * eps)) < 2e-5
+            for i in range(4):
+                old = self.X[i][1]
+                self.X[i][1] = old + eps
+                up = tgt()
+                self.X[i][1] = old - eps
+                dn = tgt()
+                self.X[i][1] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][1] - num) < 2e-5 * max(1.0, abs(num))
+
+    def test_train_and_invalid(self):
+        am = AI.APPNPLayer(2, 1, K=2, alpha=0.2, activation='relu', seed=13)
+        ys = [[1.0], [0.0], [1.0], [0.0]]
+        first = None
+        loss = None
+        for _ in range(120):
+            out = am.forward(self.X, self.ADJ)
+            loss = sum((out[i][0] - ys[i][0]) ** 2 for i in range(4)) / 4
+            if first is None:
+                first = loss
+            am.zero_grad()
+            am.backward([[2.0 * (out[i][0] - ys[i][0]) / 4] for i in range(4)])
+            am.adam_step(0.05)
+        assert loss < first * 0.7
+        assert am.param_count() == 2 * 1 + 1
+        with pytest.raises(ValueError):
+            AI.APPNPLayer(2, 3, K=0)
+        with pytest.raises(ValueError):
+            AI.APPNPLayer(2, 3, alpha=1.5)
+        with pytest.raises(RuntimeError):
+            AI.APPNPLayer(2, 3).backward([[1.0, 2.0, 3.0]])
+
+
+class TestJKNet:
+    """JK-Net：concat/last/max 三种汇总与反向"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.5, -1.0]]
+    ADJ = [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0],
+           [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]
+    DOUT = [[0.3, -0.2, 0.1], [0.1, 0.2, -0.3], [-0.2, 0.1, 0.25], [0.4, -0.1, 0.2]]
+
+    def _pair(self):
+        return (AI.GCNLayer(2, 3, activation='relu', seed=11),
+                AI.GCNLayer(3, 3, activation='relu', seed=12))
+
+    def test_concat(self):
+        l1, l2 = self._pair()
+        jk = AI.JKNet([l1, l2], mode='concat')
+        out = jk.forward(self.X, self.ADJ)
+        assert len(out[0]) == 6
+        jk.zero_grad()
+        dx = jk.backward([row + row for row in self.DOUT])
+        assert len(dx) == 4 and len(dx[0]) == 2
+        assert jk.param_count() == l1.param_count() + l2.param_count()
+
+    def test_last_equals_manual_stack(self):
+        l1, l2 = self._pair()
+        jk = AI.JKNet([l1, l2], mode='last')
+        jk.forward(self.X, self.ADJ)
+        jk.zero_grad()
+        dx_last = jk.backward(self.DOUT)
+        g1, g2 = self._pair()
+        g1.zero_grad()
+        g2.zero_grad()
+        h1 = g1.forward(self.X, self.ADJ)
+        h2 = g2.forward(h1, self.ADJ)
+        d2 = g2.backward(self.DOUT)
+        dx_man = g1.backward(d2)
+        for r in range(3):
+            for c in range(2):
+                assert abs(g1.dense.gW[r][c] - l1.dense.gW[r][c]) < 1e-12
+            for c in range(3):
+                assert abs(g2.dense.gW[r][c] - l2.dense.gW[r][c]) < 1e-12
+        for i in range(4):
+            for c in range(2):
+                assert abs(dx_man[i][c] - dx_last[i][c]) < 1e-12
+
+    def test_max_and_invalid(self):
+        l1, l2 = self._pair()
+        jm = AI.JKNet([l1, l2], mode='max')
+        jm.forward(self.X, self.ADJ)
+        jm.zero_grad()
+        jm.backward(self.DOUT)
+        got = (any(v != 0.0 for row in l1.dense.gW for v in row)
+               or any(v != 0.0 for row in l2.dense.gW for v in row))
+        assert got
+        with pytest.raises(ValueError):
+            AI.JKNet([], mode='concat')
+        with pytest.raises(ValueError):
+            AI.JKNet([AI.GCNLayer(2, 3)], mode='median')
+        with pytest.raises(TypeError):
+            AI.JKNet(['not-a-layer'], mode='last')

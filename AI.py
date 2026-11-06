@@ -7785,6 +7785,459 @@ class GraphReadout:
         return self
 
 
+def _g_zeros(shape):
+    """按 tuple 形状造嵌套零列表"""
+    if len(shape) == 1:
+        return [0.0] * shape[0]
+    return [_g_zeros(shape[1:]) for _ in range(shape[0])]
+
+
+class GATLayer:
+    """图注意力（单图、多头）：``alpha_ij = softmax_j(LeakyReLU(a_s·z_i + a_d·z_j))``
+
+    ``adj[i][j] > 0`` 视为存在边（**权重本身不参与** softmax，只当存在性用，
+    权重图请改用 ``GCNLayer``）；默认把自环加进邻居集合。多头输出默认拼接，
+    ``concat=False`` 时取平均。
+    """
+
+    def __init__(self, in_features: int, out_features: int, num_heads: int = 1,
+                 activation: str = 'elu', negative_slope: float = 0.2,
+                 concat: bool = True, self_loops: bool = True, seed: int = 0):
+        _ck_int(in_features, 'GATLayer(in_features)', 1)
+        _ck_int(out_features, 'GATLayer(out_features)', 1)
+        _ck_int(num_heads, 'GATLayer(num_heads)', 1)
+        if not _is_num(negative_slope) or negative_slope <= 0.0:
+            raise ValueError('GATLayer: negative_slope 必须是正有限数字')
+        rng = random.Random(seed + 21)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_heads = num_heads
+        self.concat = bool(concat)
+        self.self_loops = bool(self_loops)
+        self.negative_slope = float(negative_slope)
+        self.activation_name = activation
+        if activation == 'linear':
+            self.act_fn, self.act_deriv = None, None
+        else:
+            self.act_fn, self.act_deriv = _g_act(activation)
+        width = out_features * num_heads
+        self.width = width
+        std = 1.0 / math.sqrt(max(1, in_features))
+        self.W = [[[rng.gauss(0.0, std) for _ in range(in_features)]
+                   for _ in range(out_features)] for _ in range(num_heads)]
+        self.b = [[0.0] * out_features for _ in range(num_heads)]
+        self.a_src = [[rng.gauss(0.0, std) for _ in range(out_features)]
+                      for _ in range(num_heads)]
+        self.a_dst = [[rng.gauss(0.0, std) for _ in range(out_features)]
+                      for _ in range(num_heads)]
+        self.gW = [[[0.0] * in_features for _ in range(out_features)]
+                   for _ in range(num_heads)]
+        self.gb = [[0.0] * out_features for _ in range(num_heads)]
+        self.ga_src = [[0.0] * out_features for _ in range(num_heads)]
+        self.ga_dst = [[0.0] * out_features for _ in range(num_heads)]
+        self._m = {}
+        self._v = {}
+        self._t = 0
+        self._init_adam()
+        self._cache = None
+
+    def _init_adam(self):
+        for name, shape in (('W', (self.num_heads, self.out_features, self.in_features)),
+                            ('b', (self.num_heads, self.out_features)),
+                            ('a_src', (self.num_heads, self.out_features)),
+                            ('a_dst', (self.num_heads, self.out_features))):
+            self._m[name] = _g_zeros(shape)
+            self._v[name] = _g_zeros(shape)
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'GATLayer.forward')
+        _g_check_adj(adj, n, 'GATLayer.forward')
+        neigh = []
+        for i in range(n):
+            nb = [j for j in range(n) if adj[i][j] > 0.0]
+            if self.self_loops and i not in nb:
+                nb = sorted(nb + [i])
+            if not nb:
+                nb = [i]
+            neigh.append(nb)
+        zs = []
+        alphas = []
+        ctxs = []
+        for h in range(self.num_heads):
+            Wh, bh = self.W[h], self.b[h]
+            z = [[sum(Wh[r][k] * X[i][k] for k in range(self.in_features)) + bh[r]
+                  for r in range(self.out_features)] for i in range(n)]
+            al = [[0.0] * n for _ in range(n)]
+            for i in range(n):
+                nb = neigh[i]
+                sc = []
+                zi = z[i]
+                for j in nb:
+                    zj = z[j]
+                    asum = 0.0
+                    dsum = 0.0
+                    for r in range(self.out_features):
+                        asum += self.a_src[h][r] * zi[r]
+                        dsum += self.a_dst[h][r] * zj[r]
+                    v = asum + dsum
+                    sc.append(v if v >= 0.0 else self.negative_slope * v)
+                mx = max(sc)
+                ex = [math.exp(v - mx) for v in sc]
+                tot = sum(ex)
+                for pos, j in enumerate(nb):
+                    al[i][j] = ex[pos] / tot
+            ctx = [[0.0] * self.out_features for _ in range(n)]
+            for i in range(n):
+                for j in neigh[i]:
+                    w = al[i][j]
+                    if w == 0.0:
+                        continue
+                    zj = z[j]
+                    ci = ctx[i]
+                    for r in range(self.out_features):
+                        ci[r] += w * zj[r]
+            zs.append(z)
+            alphas.append(al)
+            ctxs.append(ctx)
+        if self.concat:
+            cat = [[0.0] * self.width for _ in range(n)]
+            for h in range(self.num_heads):
+                for i in range(n):
+                    for r in range(self.out_features):
+                        cat[i][h * self.out_features + r] = ctxs[h][i][r]
+            out = [self.act_fn(cat[i]) if self.act_fn else cat[i] for i in range(n)]
+            self._cache = (X, neigh, zs, alphas, cat, 'concat')
+        else:
+            avg = [[0.0] * self.out_features for _ in range(n)]
+            for h in range(self.num_heads):
+                for i in range(n):
+                    for r in range(self.out_features):
+                        avg[i][r] += ctxs[h][i][r] / self.num_heads
+            out = [self.act_fn(avg[i]) if self.act_fn else avg[i] for i in range(n)]
+            self._cache = (X, neigh, zs, alphas, avg, 'mean')
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GATLayer.backward: 需要先 forward')
+        X, neigh, zs, alphas, agg, mode = self._cache
+        n = len(dout)
+        if self.act_fn:
+            pre = agg
+            dagg = [_g_scale_rows(self.act_deriv(pre[i]), dout[i]) for i in range(n)]
+        else:
+            dagg = [list(r) for r in dout]
+        dz_all = [[[0.0] * self.out_features for _ in range(n)]
+                  for _ in range(self.num_heads)]
+        for h in range(self.num_heads):
+            z = zs[h]
+            al = alphas[h]
+            scale = 1.0 if mode == 'concat' else 1.0 / self.num_heads
+            dctx = []
+            for i in range(n):
+                if mode == 'concat':
+                    dctx.append([dagg[i][h * self.out_features + r]
+                                 for r in range(self.out_features)])
+                else:
+                    dctx.append([dagg[i][r] * scale for r in range(self.out_features)])
+            # dv 只依赖 alpha；ds 走 softmax 雅可比
+            for i in range(n):
+                nb = neigh[i]
+                dalpha = []
+                for j in nb:
+                    zj = z[j]
+                    acc = 0.0
+                    for r in range(self.out_features):
+                        acc += dctx[i][r] * zj[r]
+                    dalpha.append(acc)
+                for pos, j in enumerate(nb):
+                    w = al[i][j]
+                    if w == 0.0:
+                        continue
+                    zj = z[j]
+                    dzj = dz_all[h][j]
+                    for r in range(self.out_features):
+                        dzj[r] += w * dctx[i][r]
+                    total = 0.0
+                    for q in range(len(nb)):
+                        total += al[i][nb[q]] * dalpha[q]
+                    ds = w * (dalpha[pos] - total)
+                    zi = z[i]
+                    pre = 0.0
+                    for r2 in range(self.out_features):
+                        pre += self.a_src[h][r2] * zi[r2] + self.a_dst[h][r2] * zj[r2]
+                    slope = 1.0 if pre >= 0.0 else self.negative_slope
+                    dsl = ds * slope
+                    for r in range(self.out_features):
+                        self.ga_src[h][r] += dsl * zi[r]
+                        self.ga_dst[h][r] += dsl * zj[r]
+                    dzi = dz_all[h][i]
+                    for r in range(self.out_features):
+                        dzi[r] += dsl * self.a_src[h][r]
+                        dzj[r] += dsl * self.a_dst[h][r]
+        dx = [[0.0] * self.in_features for _ in range(n)]
+        for h in range(self.num_heads):
+            Wh = self.W[h]
+            for i in range(n):
+                dzi = dz_all[h][i]
+                for r in range(self.out_features):
+                    g = dzi[r]
+                    if g == 0.0:
+                        continue
+                    self.gW[h][r] = [self.gW[h][r][k] + g * X[i][k]
+                                     for k in range(self.in_features)]
+                    self.gb[h][r] += g
+                    for k in range(self.in_features):
+                        dx[i][k] += g * Wh[r][k]
+        return dx
+
+    def zero_grad(self):
+        self.gW = [[[0.0] * self.in_features for _ in range(self.out_features)]
+                   for _ in range(self.num_heads)]
+        self.gb = [[0.0] * self.out_features for _ in range(self.num_heads)]
+        self.ga_src = [[0.0] * self.out_features for _ in range(self.num_heads)]
+        self.ga_dst = [[0.0] * self.out_features for _ in range(self.num_heads)]
+
+    def param_count(self) -> int:
+        per = self.out_features * self.in_features + self.out_features
+        return self.num_heads * (per + 2 * self.out_features)
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'GATLayer.sgd_step')
+        for h in range(self.num_heads):
+            _la_apply_sgd(self.W[h], self.gW[h], lr)
+            _la_apply_sgd(self.b[h], self.gb[h], lr)
+            _la_apply_sgd(self.a_src[h], self.ga_src[h], lr)
+            _la_apply_sgd(self.a_dst[h], self.ga_dst[h], lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'GATLayer.adam_step')
+        _check_adam_betas(beta1, beta2, 'GATLayer.adam_step')
+        self._t += 1
+        c1 = 1.0 - beta1 ** self._t
+        c2 = 1.0 - beta2 ** self._t
+        for h in range(self.num_heads):
+            _la_apply_adam(self.W[h], self.gW[h], self._m['W'][h], self._v['W'][h],
+                           lr, c1, c2, beta1, beta2, eps)
+            _la_apply_adam(self.b[h], self.gb[h], self._m['b'][h], self._v['b'][h],
+                           lr, c1, c2, beta1, beta2, eps)
+            _la_apply_adam(self.a_src[h], self.ga_src[h], self._m['a_src'][h],
+                           self._v['a_src'][h], lr, c1, c2, beta1, beta2, eps)
+            _la_apply_adam(self.a_dst[h], self.ga_dst[h], self._m['a_dst'][h],
+                           self._v['a_dst'][h], lr, c1, c2, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class APPNPLayer:
+    """APPNP：``H0 = σ(XW+b)``，``H^{k+1} = (1-alpha) Â H^k + alpha H0``，输出 ``H^K``"""
+
+    def __init__(self, in_features: int, out_features: int, K: int = 2,
+                 alpha: float = 0.1, activation: str = 'relu',
+                 self_loops: bool = True, seed: int = 0):
+        _ck_int(in_features, 'APPNPLayer(in_features)', 1)
+        _ck_int(out_features, 'APPNPLayer(out_features)', 1)
+        _ck_int(K, 'APPNPLayer(K)', 1)
+        if not _is_num(alpha) or not (0.0 <= alpha <= 1.0):
+            raise ValueError('APPNPLayer: alpha 必须在 [0, 1] 内')
+        self.in_features = in_features
+        self.out_features = out_features
+        self.K = K
+        self.alpha = float(alpha)
+        self.self_loops = bool(self_loops)
+        self.activation_name = activation
+        if activation == 'linear':
+            self.act_fn, self.act_deriv = None, None
+        else:
+            self.act_fn, self.act_deriv = _g_act(activation)
+        self.dense = _GDense(in_features, out_features, random.Random(seed + 31))
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'APPNPLayer.forward')
+        _g_check_adj(adj, n, 'APPNPLayer.forward')
+        an = _g_adj_norm(adj, self.self_loops)
+        z0 = self.dense.forward(X)
+        h0 = [self.act_fn(z0[i]) if self.act_fn else list(z0[i]) for i in range(n)]
+        hs = [h0]
+        for _ in range(self.K):
+            prev = hs[-1]
+            ah = _g_matmul(an, prev)
+            hs.append([[(1.0 - self.alpha) * ah[i][r] + self.alpha * h0[i][r]
+                        for r in range(self.out_features)] for i in range(n)])
+        self._cache = (an, z0, hs)
+        return hs[-1]
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('APPNPLayer.backward: 需要先 forward')
+        an, z0, hs = self._cache
+        n = len(dout)
+        f = self.out_features
+        dh = [list(dout[i]) for i in range(n)]
+        dh0_extra = [[0.0] * f for _ in range(n)]
+        for k in range(self.K - 1, -1, -1):
+            # H^{k+1} = (1-a) Â H^k + a H0
+            trans = _g_matmul_t(an, dh)
+            for i in range(n):
+                for r in range(f):
+                    dh0_extra[i][r] += self.alpha * dh[i][r]
+                    trans[i][r] *= (1.0 - self.alpha)
+            dh = trans
+        for i in range(n):
+            for r in range(f):
+                dh[i][r] += dh0_extra[i][r]
+        if self.act_fn:
+            dz0 = [_g_scale_rows(self.act_deriv(z0[i]), dh[i]) for i in range(n)]
+        else:
+            dz0 = dh
+        return self.dense.backward(dz0)
+
+    def zero_grad(self):
+        self.dense.zero_grad()
+
+    def param_count(self) -> int:
+        return self.dense.param_count()
+
+    def sgd_step(self, lr: float):
+        self.dense.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.dense.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class JKNet:
+    """JK-Net：把多层输出按 ``mode`` 汇总（``concat`` / ``last`` / ``max``）
+
+    逐层用同一份 ``adj`` 传播（每层吃上一层的输出），然后把 ``layers`` 的输出
+    汇总。``backward`` 需要把汇总的梯度按模式拆回各层再依次回传。
+    """
+
+    def __init__(self, layers, mode: str = 'concat'):
+        if not isinstance(layers, (list, tuple)) or not layers:
+            raise ValueError('JKNet: layers 必须是非空列表')
+        for k, lyr in enumerate(layers):
+            if not hasattr(lyr, 'forward') or not hasattr(lyr, 'backward'):
+                raise TypeError('JKNet: 第 %d 个元素不是可用的图网络层' % k)
+        if mode not in ('concat', 'last', 'max'):
+            raise ValueError("JKNet: mode 只能是 'concat'/'last'/'max'")
+        self.layers = list(layers)
+        self.mode = mode
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'JKNet.forward')
+        _g_check_adj(adj, n, 'JKNet.forward')
+        h = X
+        outs = []
+        for lyr in self.layers:
+            h = lyr.forward(h, adj)
+            outs.append(h)
+        if self.mode == 'last':
+            out = outs[-1]
+        elif self.mode == 'concat':
+            out = []
+            for i in range(n):
+                row = []
+                for o in outs:
+                    row.extend(o[i])
+                out.append(row)
+        else:
+            out = []
+            for i in range(n):
+                row = list(outs[0][i])
+                for o in outs[1:]:
+                    for r in range(len(row)):
+                        if o[i][r] > row[r]:
+                            row[r] = o[i][r]
+                out.append(row)
+        self._cache = (outs, n)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('JKNet.backward: 需要先 forward')
+        outs, n = self._cache
+        grads = []
+        if self.mode == 'last':
+            grads = [None] * (len(outs) - 1) + [dout]
+        else:
+            widths = [len(o[0]) for o in outs]
+            if self.mode == 'concat':
+                for idx in range(len(outs)):
+                    off = sum(widths[:idx])
+                    grads.append([[dout[i][off + r] for r in range(widths[idx])]
+                                  for i in range(n)])
+            else:
+                for idx in range(len(outs)):
+                    g = []
+                    for i in range(n):
+                        row = []
+                        for r in range(widths[idx]):
+                            best = outs[0][i][r]
+                            who = 0
+                            for k2 in range(1, len(outs)):
+                                if outs[k2][i][r] > best:
+                                    best = outs[k2][i][r]
+                                    who = k2
+                            row.append(dout[i][r] if who == idx else 0.0)
+                        g.append(row)
+                    grads.append(g)
+        # 从后往前携带：第 k 层的输入梯度就是第 k-1 层输出的额外梯度
+        carry = None
+        for idx in range(len(self.layers) - 1, -1, -1):
+            g = grads[idx]
+            if g is None:
+                total = carry
+            elif carry is None:
+                total = g
+            else:
+                total = [[g[i][k2] + carry[i][k2] for k2 in range(len(g[i]))]
+                         for i in range(n)]
+            if total is None:
+                continue
+            carry = self.layers[idx].backward(total)
+        return carry
+
+    def zero_grad(self):
+        for lyr in self.layers:
+            lyr.zero_grad()
+
+    def param_count(self) -> int:
+        return sum(lyr.param_count() for lyr in self.layers)
+
+    def sgd_step(self, lr: float):
+        for lyr in self.layers:
+            lyr.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        for lyr in self.layers:
+            lyr.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        for lyr in self.layers:
+            lyr.train()
+        return self
+
+    def eval(self):
+        for lyr in self.layers:
+            lyr.eval()
+        return self
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
