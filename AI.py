@@ -8238,6 +8238,472 @@ class JKNet:
         return self
 
 
+class MPNNLayer:
+    """消息传递网络（MPNN）：``m_ij = MLP_msg([x_i || x_j || e_ij])``、
+    ``agg_i = Aggregate_{j in N(i)} m_ij``、``h_i = MLP_upd([x_i || agg_i])``
+
+    ``adj[i][j] > 0`` 只表示存在边（权重不参与计算）；``edge`` 是可选密集
+    边特征 ``edge[i][j]``（长度 ``edge_features`` 的向量），视为常量不反向。
+    ``aggregation`` 支持 ``sum`` / ``mean``。
+    """
+
+    def __init__(self, in_features: int, hidden: int, out_features: int,
+                 edge_features: int = 0, activation: str = 'relu',
+                 aggregation: str = 'sum', seed: int = 0):
+        _ck_int(in_features, 'MPNNLayer(in_features)', 1)
+        _ck_int(hidden, 'MPNNLayer(hidden)', 1)
+        _ck_int(out_features, 'MPNNLayer(out_features)', 1)
+        _ck_int(edge_features, 'MPNNLayer(edge_features)', 0)
+        if aggregation not in ('sum', 'mean'):
+            raise ValueError("MPNNLayer(aggregation) 只支持 'sum' 或 'mean'，"
+                             "收到 %r" % (aggregation,))
+        self.in_features = in_features
+        self.hidden = hidden
+        self.out_features = out_features
+        self.edge_features = edge_features
+        self.aggregation = aggregation
+        self.activation_name = activation
+        self.act_fn, self.act_deriv = _g_act(activation)
+        rng = random.Random(seed)
+        self.msg1 = _GDense(2 * in_features + edge_features, hidden, rng)
+        self.msg2 = _GDense(hidden, out_features, rng)
+        self.upd1 = _GDense(in_features + out_features, hidden, rng)
+        self.upd2 = _GDense(hidden, out_features, rng)
+        self._cache = None
+
+    def forward(self, X, adj, edge=None):
+        n = _g_check_x(X, 'MPNNLayer.forward')
+        _g_check_adj(adj, n, 'MPNNLayer.forward')
+        E = self.edge_features
+        if E:
+            if not isinstance(edge, list) or len(edge) != n:
+                raise ValueError('MPNNLayer.forward: 需要 N x N 的边特征矩阵')
+            for row in edge:
+                if not isinstance(row, list) or len(row) != n:
+                    raise ValueError('MPNNLayer.forward: 边特征矩阵不是 N x N')
+                for cell in row:
+                    if not isinstance(cell, list) or len(cell) != E:
+                        raise ValueError(
+                            'MPNNLayer.forward: 每个 edge[i][j] 要有 %d 个分量' % E)
+                    for v in cell:
+                        if not _is_num(v):
+                            raise ValueError('MPNNLayer.forward: 边特征必须是有限数字')
+        pairs = []
+        inputs = []
+        for i in range(n):
+            for j in range(n):
+                if adj[i][j] > 0.0:
+                    row = list(X[i]) + list(X[j])
+                    if E:
+                        row += [float(v) for v in edge[i][j]]
+                    inputs.append(row)
+                    pairs.append((i, j))
+        if pairs:
+            z1 = self.msg1.forward(inputs)
+            a1 = [self.act_fn(r) for r in z1]
+            z2 = self.msg2.forward(a1)
+            msgs = [self.act_fn(r) for r in z2]
+        else:
+            z1, a1, z2, msgs = [], [], [], []
+        agg = [[0.0] * self.out_features for _ in range(n)]
+        cnt = [0] * n
+        for p, (i, j) in enumerate(pairs):
+            cnt[i] += 1
+            m = msgs[p]
+            for r in range(self.out_features):
+                agg[i][r] += m[r]
+        if self.aggregation == 'mean':
+            for i in range(n):
+                c = cnt[i]
+                if c:
+                    for r in range(self.out_features):
+                        agg[i][r] /= c
+        uin = [[X[i][k] for k in range(self.in_features)]
+               + agg[i] for i in range(n)]
+        z_u1 = self.upd1.forward(uin)
+        a_u1 = [self.act_fn(r) for r in z_u1]
+        z_u2 = self.upd2.forward(a_u1)
+        out = [self.act_fn(r) for r in z_u2]
+        self._cache = (pairs, cnt, z1, z2, z_u1, z_u2)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('MPNNLayer.backward: 需要先 forward')
+        pairs, cnt, z1, z2, z_u1, z_u2 = self._cache
+        n = len(dout)
+        inf = self.in_features
+        dz_u2 = [_g_scale_rows(self.act_deriv(z_u2[i]), dout[i])
+                 for i in range(n)]
+        da_u1 = self.upd2.backward(dz_u2)
+        dz_u1 = [_g_scale_rows(self.act_deriv(z_u1[i]), da_u1[i])
+                 for i in range(n)]
+        duin = self.upd1.backward(dz_u1)
+        dX = [[duin[i][k] for k in range(inf)] for i in range(n)]
+        dagg = [[duin[i][inf + r] for r in range(self.out_features)]
+                for i in range(n)]
+        if self.aggregation == 'mean':
+            for i in range(n):
+                c = cnt[i]
+                if c:
+                    for r in range(self.out_features):
+                        dagg[i][r] /= c
+        P = len(pairs)
+        dmsg = [list(dagg[i]) for (i, _j) in pairs]
+        dz2 = [_g_scale_rows(self.act_deriv(z2[p]), dmsg[p]) for p in range(P)]
+        da1 = self.msg2.backward(dz2) if P else []
+        dz1 = [_g_scale_rows(self.act_deriv(z1[p]), da1[p]) for p in range(P)]
+        dinp = self.msg1.backward(dz1) if P else []
+        for p, (i, j) in enumerate(pairs):
+            row = dinp[p]
+            for k in range(inf):
+                dX[i][k] += row[k]
+                dX[j][k] += row[inf + k]
+        return dX
+
+    def zero_grad(self):
+        for layer in (self.msg1, self.msg2, self.upd1, self.upd2):
+            layer.zero_grad()
+
+    def param_count(self) -> int:
+        return sum(layer.param_count()
+                   for layer in (self.msg1, self.msg2, self.upd1, self.upd2))
+
+    def sgd_step(self, lr: float):
+        for layer in (self.msg1, self.msg2, self.upd1, self.upd2):
+            layer.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        for layer in (self.msg1, self.msg2, self.upd1, self.upd2):
+            layer.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class GCNIILayer:
+    """GCNII：``H^{l+1} = sigma(((1-alpha) A_hat H^l + alpha H^0)((1-beta_l) I + beta_l W))``
+
+    ``beta_l = log(lam / l + 1)``（``layer_index`` 即 l）。与原始论文一致，
+    要求输入输出同宽（各层共享宽度），``H^0`` 由调用方作为第三个参数传入
+    （缺省用本层输入）。
+    """
+
+    def __init__(self, in_features: int, alpha: float = 0.1, lam: float = 0.5,
+                 layer_index: int = 0, activation: str = 'relu',
+                 self_loops: bool = True, seed: int = 0):
+        _ck_int(in_features, 'GCNIILayer(in_features)', 1)
+        if not _is_num(alpha) or not (0.0 <= float(alpha) <= 1.0):
+            raise ValueError('GCNIILayer(alpha) 必须是 [0, 1] 内的有限数字')
+        if not _is_num(lam) or float(lam) < 0.0:
+            raise ValueError('GCNIILayer(lam) 必须是非负有限数字')
+        _ck_int(layer_index, 'GCNIILayer(layer_index)', 0)
+        d = in_features
+        self.in_features = d
+        self.out_features = d
+        self.alpha = float(alpha)
+        self.lam = float(lam)
+        self.layer_index = layer_index
+        self.self_loops = bool(self_loops)
+        self.activation_name = activation
+        self.act_fn, self.act_deriv = _g_act(activation)
+        rng = random.Random(seed)
+        scale = 1.0 / math.sqrt(d)
+        self.W = [[rng.gauss(0.0, scale) for _ in range(d)] for _ in range(d)]
+        self.gW = [[0.0] * d for _ in range(d)]
+        self.mW = [[0.0] * d for _ in range(d)]
+        self.vW = [[0.0] * d for _ in range(d)]
+        self._t = 0
+        self.grad_h0 = [[0.0] * d for _ in range(0)]
+        self._cache = None
+
+    def beta(self) -> float:
+        return math.log(self.lam / (self.layer_index + 1.0) + 1.0)
+
+    def _mix_matrix(self):
+        b = self.beta()
+        d = self.in_features
+        M = []
+        for a in range(d):
+            row = []
+            for c in range(d):
+                v = b * self.W[a][c]
+                if a == c:
+                    v += 1.0 - b
+                row.append(v)
+            M.append(row)
+        return M
+
+    def forward(self, X, adj, H0=None):
+        n = _g_check_x(X, 'GCNIILayer.forward')
+        _g_check_adj(adj, n, 'GCNIILayer.forward')
+        d = self.in_features
+        if H0 is None:
+            H0 = X
+        if not isinstance(H0, list) or len(H0) != n:
+            raise ValueError('GCNIILayer.forward: H0 要有 %d 行' % n)
+        for row in H0:
+            if not isinstance(row, list) or len(row) != d:
+                raise ValueError('GCNIILayer.forward: H0 每行要有 %d 个分量' % d)
+        an = _g_adj_norm(adj, self.self_loops)
+        ax = _g_matmul(an, X)
+        mix = [[(1.0 - self.alpha) * ax[i][r] + self.alpha * H0[i][r]
+                for r in range(d)] for i in range(n)]
+        M = self._mix_matrix()
+        z = _g_matmul_dense(mix, M)
+        out = [self.act_fn(z[i]) for i in range(n)]
+        self._cache = (an, mix, z, M)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GCNIILayer.backward: 需要先 forward')
+        an, mix, z, M = self._cache
+        n = len(dout)
+        d = self.in_features
+        dz = [_g_scale_rows(self.act_deriv(z[i]), dout[i]) for i in range(n)]
+        b = self.beta()
+        dM = [[0.0] * d for _ in range(d)]
+        for a in range(d):
+            for c in range(d):
+                acc = 0.0
+                for i in range(n):
+                    acc += mix[i][a] * dz[i][c]
+                dM[a][c] = acc
+                self.gW[a][c] += b * acc
+        dmix = [[0.0] * d for _ in range(n)]
+        for i in range(n):
+            for a in range(d):
+                acc = 0.0
+                for c in range(d):
+                    acc += dz[i][c] * M[a][c]
+                dmix[i][a] = acc
+        k = 1.0 - self.alpha
+        dax = [[k * dmix[i][r] for r in range(d)] for i in range(n)]
+        self.grad_h0 = [[self.alpha * dmix[i][r] for r in range(d)]
+                        for i in range(n)]
+        return _g_matmul_t(an, dax)
+
+    def zero_grad(self):
+        d = self.in_features
+        self.gW = [[0.0] * d for _ in range(d)]
+
+    def param_count(self) -> int:
+        return self.in_features * self.out_features
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'GCNIILayer.sgd_step')
+        _la_apply_sgd(self.W, self.gW, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'GCNIILayer.adam_step')
+        _check_adam_betas(beta1, beta2, 'GCNIILayer.adam_step')
+        self._t += 1
+        t = self._t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        _la_apply_adam(self.W, self.gW, self.mW, self.vW, lr, c1, c2,
+                       beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+def _g_matmul_dense(A, B):
+    """通用矩阵乘 ``(n x k) @ (k x m)``（``_g_matmul`` 只处理方阵邻接）"""
+    n = len(A)
+    k = len(A[0])
+    m = len(B[0])
+    if len(B) != k:
+        raise ValueError('_g_matmul_dense: 维度不匹配 (%d x %d) @ (%d x %d)'
+                         % (n, k, len(B), m))
+    out = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        ai = A[i]
+        oi = out[i]
+        for t in range(k):
+            w = ai[t]
+            if w == 0.0:
+                continue
+            bt = B[t]
+            for j in range(m):
+                oi[j] += w * bt[j]
+    return out
+
+
+def _g_matmul_dense_t(B, A):
+    """``A @ B^T``，用于把梯度回传给左乘矩阵的行"""
+    n = len(A)
+    k = len(A[0])
+    m = len(B)
+    out = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        ai = A[i]
+        oi = out[i]
+        for j in range(m):
+            bj = B[j]
+            acc = 0.0
+            for t in range(k):
+                acc += ai[t] * bj[t]
+            oi[j] = acc
+    return out
+
+
+def _g_submatrix(M, idx):
+    """按节点下标取出密集矩阵的子块"""
+    return [[M[i][j] for j in idx] for i in idx]
+
+
+def _g_topk_indices(scores, k):
+    """按分数取前 k 个节点下标（分数相同按原顺序）"""
+    order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+    return sorted(order[:k])
+
+
+class TopKPool:
+    """Top-K 图池化（Graph U-Net 风格）：``score_i = W x_i + b``、``g_i = sigmoid(score_i)``
+
+    保留分数最大的 ``k = max(1, round(ratio * N))`` 个节点，特征按 gate 缩放
+    ``x'_i = g_i * x_i``，邻接取对应子块。``backward`` 只回传给被选中的节点。
+    """
+
+    def __init__(self, in_features: int, ratio: float = 0.5, seed: int = 0):
+        _ck_int(in_features, 'TopKPool(in_features)', 1)
+        if not _is_num(ratio) or not (0.0 < float(ratio) <= 1.0):
+            raise ValueError('TopKPool(ratio) 必须在 (0, 1] 内')
+        self.in_features = in_features
+        self.ratio = float(ratio)
+        self.score = _GDense(in_features, 1, random.Random(seed))
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'TopKPool.forward')
+        _g_check_adj(adj, n, 'TopKPool.forward')
+        raw = self.score.forward(X)
+        s = [r[0] for r in raw]
+        g = [1.0 / (1.0 + math.exp(-v)) if v >= 0.0
+             else math.exp(v) / (1.0 + math.exp(v)) for v in s]
+        k = max(1, int(round(self.ratio * n)))
+        idx = _g_topk_indices(s, k)
+        out = [[g[i] * X[i][j] for j in range(self.in_features)] for i in idx]
+        self._cache = (idx, g, X)
+        return out, _g_submatrix(adj, idx)
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('TopKPool.backward: 需要先 forward')
+        idx, g, X = self._cache
+        n = len(X)
+        d = self.in_features
+        dX = [[0.0] * d for _ in range(n)]
+        dscore = [[0.0] for _ in range(n)]
+        for p, i in enumerate(idx):
+            gi = g[i]
+            acc = 0.0
+            for j in range(d):
+                dX[i][j] = dout[p][j] * gi
+                acc += dout[p][j] * X[i][j]
+            dscore[i][0] = acc * gi * (1.0 - gi)
+        dg = self.score.backward(dscore)
+        for i in range(n):
+            for j in range(d):
+                dX[i][j] += dg[i][j]
+        return dX
+
+    def zero_grad(self):
+        self.score.zero_grad()
+
+    def param_count(self) -> int:
+        return self.score.param_count()
+
+    def sgd_step(self, lr: float):
+        self.score.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.score.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class SAGPool:
+    """自注意力图池化（SAGPool）：用一层 GCN 打分 ``s = tanh(GCN(X, A))``，
+    保留前 ``k`` 个节点并按 ``s`` 缩放特征，邻接取子块。
+    """
+
+    def __init__(self, in_features: int, ratio: float = 0.5, seed: int = 0):
+        _ck_int(in_features, 'SAGPool(in_features)', 1)
+        if not _is_num(ratio) or not (0.0 < float(ratio) <= 1.0):
+            raise ValueError('SAGPool(ratio) 必须在 (0, 1] 内')
+        self.in_features = in_features
+        self.ratio = float(ratio)
+        self.gcn = GCNLayer(in_features, 1, activation='linear', seed=seed)
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'SAGPool.forward')
+        _g_check_adj(adj, n, 'SAGPool.forward')
+        z = self.gcn.forward(X, adj)
+        s = [math.tanh(r[0]) for r in z]
+        k = max(1, int(round(self.ratio * n)))
+        idx = _g_topk_indices(s, k)
+        out = [[s[i] * X[i][j] for j in range(self.in_features)] for i in idx]
+        self._cache = (idx, s, X)
+        return out, _g_submatrix(adj, idx)
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('SAGPool.backward: 需要先 forward')
+        idx, s, X = self._cache
+        n = len(X)
+        d = self.in_features
+        dX = [[0.0] * d for _ in range(n)]
+        dz = [[0.0] for _ in range(n)]
+        for p, i in enumerate(idx):
+            si = s[i]
+            acc = 0.0
+            for j in range(d):
+                dX[i][j] = dout[p][j] * si
+                acc += dout[p][j] * X[i][j]
+            dz[i][0] = acc * (1.0 - si * si)
+        dg = self.gcn.backward(dz)
+        for i in range(n):
+            for j in range(d):
+                dX[i][j] += dg[i][j]
+        return dX
+
+    def zero_grad(self):
+        self.gcn.zero_grad()
+
+    def param_count(self) -> int:
+        return self.gcn.param_count()
+
+    def sgd_step(self, lr: float):
+        self.gcn.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.gcn.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 

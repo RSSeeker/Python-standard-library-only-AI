@@ -191,7 +191,8 @@
 ### W6 图神经网络（§1 全新范式）
 - [x] `GCNLayer` / `GINLayer` / `GraphSAGELayer` + `GraphReadout`（W6-A，提交在 W6-A 这一批）：`adj` 用 `N×N` 密集矩阵（教学规模足够，公式最直观），GCN 是 `D^{-1/2}(A+I)D^{-1/2}` 归一化、GraphSAGE 是均值聚合 + 可选拼接、GIN 是 `MLP((1+eps)x + Σ邻居)` 且 `eps` 可学；踩过的坑：①激活导数是**行向量**，不能与上游梯度直接 `*`（`list*list` 直接 TypeError），必须逐元素相乘；②GIN 的邻居散射要用 forward 缓存的邻接矩阵，否则 `NameError`；③无边 + 无自环时 `Â=0`，输出只剩偏置（不是「退化为逐节点全连接」）
 - [x] `GATLayer` / `APPNPLayer` / `JKNet`（W6-B）—— 注意力 `dx`/`dW`/`da_src`/`da_dst` 中心差分 ≤1e-5、`alpha=0` 退化为 `Â^K H0` 且 `alpha=1` 输出恒为 `H0`、JKNet 三种汇总与手工双层堆叠黄金对照 1e-12；踩到：GAT 前向错用 `z` 而非 `ctx`（注意力形同无效）、`slope` 未乘进注意力梯度、JKNet 逐层 `dx` 宽度不同要先累加再回传
-- [ ] `MPNNLayer` / `GCNIILayer` + 图池化 `TopKPool` / `DiffPool` / `SAGPool`（W6-C）
+- [x] `MPNNLayer` / `GCNIILayer` + 图池化 `TopKPool` / `SAGPool`（W6-C）—— MPNN 的 `dx`/`dW` 中心差分 1.46e-11、GCNII 的 `dx`/`gW`/`grad_h0` 均 ≤3.1e-11、两种池化的全节点梯度 ≤1.3e-10；踩到：`_g_matmul` 只支持方阵邻接（GCNII 要通用矩阵乘）、池化的 score 路径梯度一开始漏加（5.6e-01）；`DiffPool` 需要软分配矩阵，留作后续
+- [ ] `DiffPool`（软分配池化）
 - [ ] 图池化：`TopKPool`、`DiffPool`（简化）、`SAGPool`
 
 ### W7 LLM 微调与推理（P0/P1）

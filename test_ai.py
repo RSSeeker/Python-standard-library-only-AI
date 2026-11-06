@@ -15074,3 +15074,265 @@ class TestJKNet:
             AI.JKNet([AI.GCNLayer(2, 3)], mode='median')
         with pytest.raises(TypeError):
             AI.JKNet(['not-a-layer'], mode='last')
+
+
+# ============================================================================
+#  W6-C: MPNN / GCNII / 图池化
+# ============================================================================
+
+class TestMPNNLayer:
+    """消息传递：sum/mean 聚合、边特征、梯度中心差分、累加与训练"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.5, -1.0]]
+    ADJ = [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0],
+           [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]
+    DOUT = [[0.3, -0.2, 0.1], [0.1, 0.2, -0.3], [-0.2, 0.1, 0.25], [0.4, -0.1, 0.2]]
+
+    def test_shape_and_params(self):
+        m = AI.MPNNLayer(2, 5, 3, activation='relu', seed=3)
+        out = m.forward(self.X, self.ADJ)
+        assert len(out) == 4 and len(out[0]) == 3
+        want = (4 * 5 + 5) + (5 * 3 + 3) + (2 + 3) * 5 + 5 + (5 * 3 + 3)
+        assert m.param_count() == want
+
+    def test_gradient_finite_difference(self):
+        eps = 1e-6
+        m = AI.MPNNLayer(2, 5, 3, activation='relu', seed=3)
+
+        def loss():
+            o = m.forward(self.X, self.ADJ)
+            return sum(o[a][b] * self.DOUT[a][b]
+                       for a in range(4) for b in range(3))
+
+        m.zero_grad()
+        m.forward(self.X, self.ADJ)
+        dx = m.backward(self.DOUT)
+        for i in range(4):
+            for j in range(2):
+                old = self.X[i][j]
+                self.X[i][j] = old + eps
+                up = loss()
+                self.X[i][j] = old - eps
+                dn = loss()
+                self.X[i][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][j] - num) < 2e-5 * max(1.0, abs(num))
+        m.zero_grad()
+        m.forward(self.X, self.ADJ)
+        m.backward(self.DOUT)
+        ana = m.msg1.gW[0][0]
+        old = m.msg1.W[0][0]
+        m.msg1.W[0][0] = old + eps
+        up = loss()
+        m.msg1.W[0][0] = old - eps
+        dn = loss()
+        m.msg1.W[0][0] = old
+        assert abs(ana - (up - dn) / (2 * eps)) < 2e-5
+
+    def test_aggregation_edge_and_train(self):
+        mean = AI.MPNNLayer(2, 4, 2, activation='linear', aggregation='mean', seed=5)
+        summ = AI.MPNNLayer(2, 4, 2, activation='linear', aggregation='sum', seed=5)
+        om = mean.forward(self.X, self.ADJ)
+        os_ = summ.forward(self.X, self.ADJ)
+        assert any(abs(om[i][j] - os_[i][j]) > 1e-12
+                   for i in range(4) for j in range(2))
+        iso = [[1.0, 0.0], [0.0, 1.0]]
+        assert len(mean.forward(iso, [[0.0, 0.0], [0.0, 0.0]])) == 2
+        me = AI.MPNNLayer(2, 4, 2, edge_features=1, activation='linear', seed=7)
+        edge = [[[0.5 if self.ADJ[i][j] > 0 else 0.0] for j in range(4)]
+                for i in range(4)]
+        assert len(me.forward(self.X, self.ADJ, edge)[0]) == 2
+        tr = AI.MPNNLayer(2, 6, 1, activation='relu', seed=23)
+        ys = [[1.0], [0.0], [1.0], [0.0]]
+        first = None
+        last = None
+        for _ in range(120):
+            o = tr.forward(self.X, self.ADJ)
+            last = sum((o[i][0] - ys[i][0]) ** 2 for i in range(4)) / 4
+            if first is None:
+                first = last
+            tr.zero_grad()
+            tr.backward([[2.0 * (o[i][0] - ys[i][0]) / 4] for i in range(4)])
+            tr.adam_step(0.05)
+        assert last < first * 0.5
+        with pytest.raises(ValueError):
+            AI.MPNNLayer(0, 3, 2)
+        with pytest.raises(ValueError):
+            AI.MPNNLayer(2, 3, 2, edge_features=-1)
+        with pytest.raises(ValueError):
+            AI.MPNNLayer(2, 3, 2, aggregation='max')
+        with pytest.raises(ValueError):
+            AI.MPNNLayer(2, 3, 2, activation='softmax')
+        with pytest.raises(ValueError):
+            AI.MPNNLayer(2, 3, 2).forward(self.X, [[1.0, 0.0]])
+        with pytest.raises(RuntimeError):
+            AI.MPNNLayer(2, 3, 2).backward(self.DOUT)
+
+
+class TestGCNIILayer:
+    """GCNII：beta 公式、混合矩阵、H0 通路、三组梯度"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.5, -1.0]]
+    ADJ = [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0],
+           [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]
+    H0 = [[1.0, 2.0], [0.5, -1.0], [2.0, 0.0], [-1.0, 1.0]]
+    DOUT = [[0.3, -0.2], [0.1, 0.2], [-0.2, 0.1], [0.4, -0.1]]
+
+    def test_beta_and_mix_matrix(self):
+        g = AI.GCNIILayer(2, alpha=0.1, lam=0.5, layer_index=1, seed=9)
+        assert abs(g.beta() - math.log(0.5 / 2.0 + 1.0)) < 1e-12
+        beta = g.beta()
+        M = g._mix_matrix()
+        for a in range(2):
+            for c in range(2):
+                want = beta * g.W[a][c] + ((1.0 - beta) if a == c else 0.0)
+                assert abs(M[a][c] - want) < 1e-12
+        assert g.param_count() == 4
+
+    def test_alpha_zero_ignores_h0(self):
+        g = AI.GCNIILayer(2, alpha=0.0, layer_index=1, activation='linear', seed=9)
+        o1 = g.forward(self.X, self.ADJ, [[9.0, 9.0]] * 4)
+        o2 = g.forward(self.X, self.ADJ, [[-9.0, -9.0]] * 4)
+        for i in range(4):
+            for j in range(2):
+                assert abs(o1[i][j] - o2[i][j]) < 1e-12
+
+    def test_gradients_and_optimizer(self):
+        eps = 1e-6
+        g = AI.GCNIILayer(2, alpha=0.1, layer_index=1, activation='linear', seed=9)
+        H0 = [row[:] for row in self.H0]
+
+        def loss():
+            o = g.forward(self.X, self.ADJ, H0)
+            return sum(o[a][b] * self.DOUT[a][b]
+                       for a in range(4) for b in range(2))
+
+        g.zero_grad()
+        g.forward(self.X, self.ADJ, H0)
+        dx = g.backward(self.DOUT)
+        gW = [row[:] for row in g.gW]
+        dh0 = [row[:] for row in g.grad_h0]
+        for i in range(4):
+            for j in range(2):
+                old = self.X[i][j]
+                self.X[i][j] = old + eps
+                up = loss()
+                self.X[i][j] = old - eps
+                dn = loss()
+                self.X[i][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][j] - num) < 2e-5 * max(1.0, abs(num))
+        for a in range(2):
+            for c in range(2):
+                old = g.W[a][c]
+                g.W[a][c] = old + eps
+                up = loss()
+                g.W[a][c] = old - eps
+                dn = loss()
+                g.W[a][c] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(gW[a][c] - num) < 2e-5 * max(1.0, abs(num))
+        for i in range(4):
+            for j in range(2):
+                old = H0[i][j]
+                H0[i][j] = old + eps
+                up = loss()
+                H0[i][j] = old - eps
+                dn = loss()
+                H0[i][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dh0[i][j] - num) < 2e-5 * max(1.0, abs(num))
+        before = [row[:] for row in g.W]
+        g.zero_grad()
+        g.forward(self.X, self.ADJ, H0)
+        g.backward(self.DOUT)
+        g.sgd_step(0.01)
+        assert g.W != before
+        g.adam_step(0.01)
+        with pytest.raises(ValueError):
+            AI.GCNIILayer(0)
+        with pytest.raises(ValueError):
+            AI.GCNIILayer(2, alpha=1.5)
+        with pytest.raises(ValueError):
+            AI.GCNIILayer(2, lam=-0.1)
+        with pytest.raises(RuntimeError):
+            AI.GCNIILayer(2).backward(self.DOUT)
+
+
+class TestGraphPooling:
+    """TopKPool / SAGPool：保留数、子图、gate 缩放、全节点梯度"""
+
+    X = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.5, -1.0]]
+    ADJ = [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0],
+           [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]
+
+    def test_topk_forward(self):
+        p = AI.TopKPool(2, ratio=0.5, seed=11)
+        xp, ap = p.forward(self.X, self.ADJ)
+        assert len(xp) == 2 and len(ap) == 2 and len(ap[0]) == 2
+        assert p.param_count() == 3
+        idx = p._cache[0]
+        for i in range(2):
+            for j in range(2):
+                assert abs(xp[i][j]) <= abs(self.X[idx[i]][j]) + 1e-12
+
+    def test_topk_gradient(self):
+        eps = 1e-6
+        p = AI.TopKPool(2, ratio=0.5, seed=11)
+        dout = [[1.0, -2.0], [0.5, 0.25]]
+
+        def loss():
+            o, _a = p.forward(self.X, self.ADJ)
+            return sum(o[a][b] * dout[a][b] for a in range(2) for b in range(2))
+
+        p.zero_grad()
+        p.forward(self.X, self.ADJ)
+        dx = p.backward(dout)
+        for i in range(4):
+            for j in range(2):
+                old = self.X[i][j]
+                self.X[i][j] = old + eps
+                up = loss()
+                self.X[i][j] = old - eps
+                dn = loss()
+                self.X[i][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][j] - num) < 2e-5 * max(1.0, abs(num))
+
+    def test_sagpool(self):
+        eps = 1e-6
+        sp = AI.SAGPool(2, ratio=0.5, seed=13)
+        xs, as_ = sp.forward(self.X, self.ADJ)
+        assert len(xs) == 2 and len(as_) == 2
+        assert sp.param_count() == 3
+        dout = [[1.0, 0.5], [-0.5, 1.0]]
+
+        def loss():
+            o, _a = sp.forward(self.X, self.ADJ)
+            return sum(o[a][b] * dout[a][b] for a in range(2) for b in range(2))
+
+        sp.zero_grad()
+        sp.forward(self.X, self.ADJ)
+        dx = sp.backward(dout)
+        for i in range(4):
+            for j in range(2):
+                old = self.X[i][j]
+                self.X[i][j] = old + eps
+                up = loss()
+                self.X[i][j] = old - eps
+                dn = loss()
+                self.X[i][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][j] - num) < 2e-5 * max(1.0, abs(num))
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.TopKPool(2, ratio=0.0)
+        with pytest.raises(ValueError):
+            AI.TopKPool(2, ratio=1.5)
+        with pytest.raises(ValueError):
+            AI.SAGPool(0)
+        with pytest.raises(RuntimeError):
+            AI.TopKPool(2).backward([[1.0, 0.0], [0.0, 1.0]])
+        with pytest.raises(RuntimeError):
+            AI.SAGPool(2).backward([[1.0, 0.0], [0.0, 1.0]])
