@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1018 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1025 项）
 
 ## 特性
 
@@ -292,6 +292,7 @@ model.train()     # 回到训练
 | `packed_causal_mask(segment_ids, causal=True)` | 打包序列的注意力掩码：只允许同段（`causal` 时再加 `j<=i`） |
 | `PrefixCache(num_layers, d_model)` | 逐层 KV 前缀缓存：`set`/`get`/`length`/`truncate`/`merge` + `to_dict`/`from_dict`/`save`/`load`（JSON 持久化） |
 | `ContinuousBatcher(max_batch=2, max_total_tokens=None)` | 连续批处理调度：`add(prompt, max_new, request_id)` 入队、`batch()` 取当前批、`step({id: token})` 喂 token 并补位、`result(id)`/`stats()`；只做调度与记账，不依赖模型实现 |
+| `PagedKVCache(num_layers, num_heads, head_dim, block_size=4, max_blocks=16)` | PagedAttention 的块表（数据结构演示）：`new_request`/`append`/`get`/`length`/`free`/`stats`；逻辑位置到物理块不必连续、释放后可复用 |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
@@ -367,6 +368,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `top_a_filter(logits, top_a=0.1)` | top-a：阈值 `top_a × p_max²`（`top_a=0` 不过滤） |
 | `eta_filter(logits, eta=0.3)` | eta 采样：丢掉概率 ≤ eta 的 token（至少保留 argmax） |
 | `mirostat_filter(logits, mu=5.0)` | Mirostat：保留 `-log p ≤ mu` 的 token，返回 `(masked, 保留集熵)`；配合 `mirostat_update(mu, 观测惊讶度)` 迭代 |
+| `tail_free_filter(logits, tft=0.5)` | Tail-free 采样：按 `log p` 曲线的归一化二阶差分截断长尾（跳过头部线性区），`tft` 越小保留越多；返回带 `-inf` 的新 logits |
 | `token_id_mask(logits, allowed)` | 约束解码：只保留 `allowed` 里的 token id（其余置 `-inf`），可与任意采样器叠加 |
 | `token_prefix_mask(logits, generated, sequences, eos_id=None)` | 前缀约束：只允许仍是某个合法序列前缀的下一个 token；序列已完整时只允许 `eos_id` |
 | `speculative_accept(draft_ids, draft_probs, target_probs)` | 投机解码的接受判定：按 `min(1, p_target/p_draft)` 拒绝采样，被拒时从 `max(0, p_target − p_draft)` 重采样，返回 `(接受个数, 重采样 token)` |
@@ -1115,7 +1117,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1018 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1025 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1240,6 +1242,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPTuning` | MLP 生成的提示与前向一致、`anchor`/`W1`/`W2` 三组中心差分、优化器、非法输入 |
 | `TestPackingAndPrefixCache` | 打包的 `segment_ids`/`position_ids`/段边界、掩码跨段为 0 与同段因果、缓存的 `set`/`get`/深拷贝/`truncate`/`merge`/字典往返、7 类非法输入 |
 | `TestContinuousBatcher` | 容量与补位（短请求退休后立即补位）、`max_total_tokens` 预算只算提示词占用、`used_tokens` 记账不出现负值、`result` 与 `stats`、4 组非法输入 |
+| `TestTailFreeFilter` | 保留集是概率降序前缀、`tft` 单调、入参不被修改、n≤2 原样、非法 `tft` 与 logits |
+| `TestPagedKVCache` | 块分配（2 token/块）、`fragmentation`、逻辑顺序、释放与复用、块耗尽报错、多请求交错、6 组校验 |
 | `TestPatchEmbedding` | patch 切分与行优先顺序、偏置整体平移、`param_count`、`dx` 中心差分、6 类非法输入 |
 | `TestAttentionPooling` | `q=0` 退化为平均、softmax 权重闭式解、`dx`/`q` 中心差分、5 类非法输入 |
 | `TestGeMPooling` | `p=1` 等于平均、`p=2` 等于均方根、`p=2000` 仍接近最大值且不溢出、三档 `p` 的 `dx` 中心差分、6 类非法输入 |
@@ -1304,7 +1308,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1018 个单元测试
+├── test_ai.py       # 1025 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

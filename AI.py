@@ -9486,6 +9486,185 @@ def mirostat_update(mu: float, observed_surprisal: float,
                * (float(observed_surprisal) - float(target_entropy)))
 
 
+def tail_free_filter(logits, tft: float = 0.5):
+    """Tail-free 采样（Zhu et al.）：按 log 概率曲线的二阶差分截断长尾
+
+    步骤：softmax → 按概率降序 → 对 ``log p`` 取一阶/二阶差分 → 用二阶差分的
+    最大绝对值归一化 → 找到第一个「归一化二阶差分 < ``tft``」的位置，保留它及其之前
+    的 token（至少保留 argmax）。返回**新的** logits，未保留的位置为 ``-inf``。
+
+    ``tft`` 越小保留越多，越大保留越少（最少 1 个）。这是纯函数，不修改入参。
+    """
+    if isinstance(tft, bool) or not isinstance(tft, (int, float)):
+        raise ValueError('tail_free_filter: tft 必须是数字，收到 %r' % (tft,))
+    tft = float(tft)
+    if tft != tft or tft in (float('inf'), float('-inf')):
+        raise ValueError('tail_free_filter: tft 必须是有限值')
+    if tft <= 0.0:
+        raise ValueError('tail_free_filter: tft 必须 > 0，收到 %r' % (tft,))
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError('tail_free_filter: logits 必须是非空列表')
+    for v in logits:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError('tail_free_filter: logits 元素必须是数字，收到 %r'
+                             % (v,))
+        if v != v or v in (float('inf'), float('-inf')):
+            raise ValueError('tail_free_filter: logits 必须都是有限值')
+    vals = [float(v) for v in logits]
+    n = len(vals)
+    if n <= 2:
+        return list(vals)
+    probs = _softmax_row(vals)
+    order = sorted(range(n), key=lambda i: (-probs[i], i))
+    lp = [math.log(probs[i]) if probs[i] > 0.0 else -745.0 for i in order]
+    d1 = [lp[i + 1] - lp[i] for i in range(n - 1)]
+    d2 = [d1[i + 1] - d1[i] for i in range(n - 2)]
+    scale = max(abs(v) for v in d2)
+    if scale <= 0.0:
+        keep = 1
+    else:
+        # 头部几项的二阶差分恰好为 0（log 概率曲线在头部是线性的），若从 0 开始找
+        # 会立刻截断，所以从第 1 项起找第一个「归一化二阶差分 < tft」的位置
+        keep = n
+        for i in range(1, len(d2)):
+            if d2[i] / scale < tft:
+                keep = i + 2
+                break
+    keep = max(1, min(keep, n))
+    allowed = order[:keep]
+    return _apply_keep_mask(vals, allowed)
+
+
+class PagedKVCache:
+    """PagedAttention 的块表（数据结构演示，不做真实显存管理）
+
+    把每条请求的 KV 缓存切成固定大小的块（``block_size`` 个 token 一块），
+    逻辑位置到物理块的映射记在块表里，因此请求的物理块**不必连续**，
+    释放后可以立刻被别的请求复用。
+
+    - ``new_request()`` / ``append(rid, layer, key, value)`` / ``get(rid, layer)``
+    - ``length(rid)``：已写入的 token 数
+    - ``free(rid)``：归还全部物理块
+    - ``stats()``：``{'tokens', 'blocks_used', 'blocks_free', 'slots_used',
+      'slots_capacity', 'fragmentation'}``
+
+    ``key``/``value`` 的形状是 ``(num_heads, head_dim)``，对应**一个** token。
+    ``fragmentation`` = 已分配但尚未写入的槽位比例（越小说明块用得越满）。
+    """
+
+    def __init__(self, num_layers: int, num_heads: int, head_dim: int,
+                 block_size: int = 4, max_blocks: int = 16):
+        for name, val in (('num_layers', num_layers), ('num_heads', num_heads),
+                          ('head_dim', head_dim), ('block_size', block_size),
+                          ('max_blocks', max_blocks)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError('PagedKVCache: %s 必须是正整数，收到 %r'
+                                 % (name, val))
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.block_size = block_size
+        self.max_blocks = max_blocks
+        self._blocks = {}          # 物理块号 -> {layer: [(k, v), ...]}
+        self._free = list(range(max_blocks))
+        self._tables = {}          # rid -> [物理块号, ...]（逻辑顺序）
+        self._lens = {}            # rid -> token 数
+        self._seq = 0
+
+    # ---------- 内部 ----------
+    @staticmethod
+    def _check_rid(rid, tables, who):
+        if rid not in tables:
+            raise ValueError('%s: 未知请求 %r' % (who, rid))
+
+    def _check_layer(self, layer, who):
+        if isinstance(layer, bool) or not isinstance(layer, int):
+            raise ValueError('%s: layer 必须是整数，收到 %r' % (who, layer))
+        if not 0 <= layer < self.num_layers:
+            raise ValueError('%s: layer 越界 %r（共 %d 层）'
+                             % (who, layer, self.num_layers))
+
+    def _check_row(self, row, name, who):
+        if not isinstance(row, (list, tuple)) or len(row) != self.num_heads:
+            raise ValueError('%s: %s 必须是长度 %d 的列表，收到 %r'
+                             % (who, name, self.num_heads, row))
+        out = []
+        for h in row:
+            if not isinstance(h, (list, tuple)) or len(h) != self.head_dim:
+                raise ValueError('%s: %s 的每行必须是长度 %d 的列表'
+                                 % (who, name, self.head_dim))
+            out.append([float(v) for v in h])
+        return out
+
+    # ---------- 对外 ----------
+    def new_request(self):
+        rid = self._seq
+        self._seq += 1
+        self._tables[rid] = []
+        self._lens[rid] = 0
+        return rid
+
+    def length(self, rid):
+        self._check_rid(rid, self._tables, 'PagedKVCache.length')
+        return self._lens[rid]
+
+    def append(self, rid, layer, key, value):
+        """写入一个 token 的 K/V；块不够时抛 ValueError（模拟显存耗尽）"""
+        who = 'PagedKVCache.append'
+        self._check_rid(rid, self._tables, who)
+        self._check_layer(layer, who)
+        k = self._check_row(key, 'key', who)
+        v = self._check_row(value, 'value', who)
+        table = self._tables[rid]
+        pos = self._lens[rid]
+        need = pos // self.block_size + 1
+        while len(table) < need:
+            if not self._free:
+                raise ValueError('%s: 物理块已用尽（max_blocks=%d）'
+                                 % (who, self.max_blocks))
+            table.append(self._free.pop(0))
+        blk = self._blocks.setdefault(table[need - 1], {})
+        rows = blk.setdefault(layer, [])
+        rows.append((k, v))
+        self._lens[rid] = pos + 1
+
+    def get(self, rid, layer):
+        """按逻辑顺序返回 ``{'key': [...], 'value': [...]}``（各 T 行）"""
+        who = 'PagedKVCache.get'
+        self._check_rid(rid, self._tables, who)
+        self._check_layer(layer, who)
+        keys, vals = [], []
+        remain = self._lens[rid]
+        for bid in self._tables[rid]:
+            rows = self._blocks.get(bid, {}).get(layer, [])
+            for k, v in rows:
+                if remain <= 0:
+                    break
+                keys.append([list(r) for r in k])
+                vals.append([list(r) for r in v])
+                remain -= 1
+        return {'key': keys, 'value': vals}
+
+    def free(self, rid):
+        who = 'PagedKVCache.free'
+        self._check_rid(rid, self._tables, who)
+        for bid in self._tables[rid]:
+            self._blocks.pop(bid, None)
+            self._free.append(bid)
+        self._free.sort()
+        del self._tables[rid]
+        del self._lens[rid]
+
+    def stats(self):
+        used = len(self._blocks)
+        slots = used * self.block_size
+        tokens = sum(self._lens.values())
+        frag = 0.0 if slots == 0 else 1.0 - tokens / slots
+        return {'tokens': tokens, 'blocks_used': used,
+                'blocks_free': len(self._free), 'slots_used': tokens,
+                'slots_capacity': slots, 'fragmentation': frag}
+
+
 def token_id_mask(logits, allowed):
     """约束解码：只保留 ``allowed`` 里的 token id，其余置 ``-inf``
 

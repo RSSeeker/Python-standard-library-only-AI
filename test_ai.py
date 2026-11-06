@@ -16007,3 +16007,117 @@ class TestContinuousBatcher:
         done.step({0: 2})
         with pytest.raises(ValueError):
             done.step({0: 3})
+
+
+# ====  ======================================================================
+#   Tail-free 采样 + PagedAttention 块表（W7-E）
+# ============================================================================
+
+class TestTailFreeFilter:
+    def test_prefix_and_monotone(self):
+        logits = [3.0, 2.0, 1.0, 0.5, 0.1, -1.0]
+        out = AI.tail_free_filter(logits, 0.5)
+        keep = [i for i, v in enumerate(out) if v != float("-inf")]
+        assert keep == [0, 1, 2, 3]
+        # 入参不被修改，保留位置取值不变
+        assert logits == [3.0, 2.0, 1.0, 0.5, 0.1, -1.0]
+        assert all(out[i] == logits[i] for i in keep)
+
+        counts = [len([v for v in AI.tail_free_filter(logits, t)
+                       if v != float("-inf")])
+                  for t in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        assert all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1))
+
+    def test_edge_cases(self):
+        assert AI.tail_free_filter([1.5], 0.5) == [1.5]
+        assert AI.tail_free_filter([1.5, 0.2], 0.5) == [1.5, 0.2]
+        # 掩码后仍是合法分布
+        masked = AI.tail_free_filter([2.0, 2.0, 0.1], 0.5)
+        assert abs(sum(AI._softmax_row(masked)) - 1.0) < 1e-12
+
+    def test_validation(self):
+        for bad in (0, -0.5, True, "x"):
+            with pytest.raises((ValueError, TypeError)):
+                AI.tail_free_filter([1.0, 0.5], bad)
+        with pytest.raises(ValueError):
+            AI.tail_free_filter([], 0.5)
+        with pytest.raises(ValueError):
+            AI.tail_free_filter([1.0, float("nan")], 0.5)
+        with pytest.raises(ValueError):
+            AI.tail_free_filter([1.0, True], 0.5)
+
+
+class TestPagedKVCache:
+    @staticmethod
+    def _row(i):
+        return [[float(i), float(i) + 0.5], [float(-i), 1.0]]
+
+    def test_blocks_and_order(self):
+        c = AI.PagedKVCache(2, 2, 2, block_size=2, max_blocks=4)
+        r = c.new_request()
+        assert c.length(r) == 0
+        c.append(r, 0, self._row(0), self._row(10))
+        c.append(r, 0, self._row(1), self._row(11))
+        assert c.stats()["blocks_used"] == 1
+        c.append(r, 0, self._row(2), self._row(12))
+        assert c.stats()["blocks_used"] == 2
+        assert abs(c.stats()["fragmentation"] - 0.25) < 1e-12
+
+        got = c.get(r, 0)
+        assert len(got["key"]) == 3
+        assert got["key"][2] == self._row(2)
+        assert got["value"][0] == self._row(10)
+
+    def test_free_and_reuse(self):
+        c = AI.PagedKVCache(1, 2, 2, block_size=2, max_blocks=4)
+        r = c.new_request()
+        c.append(r, 0, self._row(1), self._row(2))
+        c.free(r)
+        assert c.stats()["blocks_used"] == 0
+        assert c.stats()["blocks_free"] == 4
+        r2 = c.new_request()
+        c.append(r2, 0, self._row(7), self._row(8))
+        assert c.stats()["blocks_used"] == 1
+        assert c.get(r2, 0)["key"][0] == self._row(7)
+
+    def test_exhaustion_and_interleaving(self):
+        small = AI.PagedKVCache(1, 1, 1, block_size=1, max_blocks=2)
+        q = small.new_request()
+        small.append(q, 0, [[1.0]], [[2.0]])
+        small.append(q, 0, [[3.0]], [[4.0]])
+        with pytest.raises(ValueError):
+            small.append(q, 0, [[5.0]], [[6.0]])
+        assert small.length(q) == 2
+
+        m = AI.PagedKVCache(1, 1, 2, block_size=2, max_blocks=8)
+        a = m.new_request()
+        b = m.new_request()
+        m.append(a, 0, [[1.0, 2.0]], [[3.0, 4.0]])
+        m.append(b, 0, [[5.0, 6.0]], [[7.0, 8.0]])
+        m.append(a, 0, [[9.0, 10.0]], [[11.0, 12.0]])
+        assert m.get(a, 0)["key"] == [[[1.0, 2.0]], [[9.0, 10.0]]]
+        assert m.get(b, 0)["key"] == [[[5.0, 6.0]]]
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.PagedKVCache(0, 1, 1)
+        with pytest.raises(ValueError):
+            AI.PagedKVCache(1, 1, 1, block_size=0)
+        with pytest.raises(ValueError):
+            AI.PagedKVCache(1, 1, 1, max_blocks=True)
+
+        m = AI.PagedKVCache(1, 2, 2, block_size=2, max_blocks=4)
+        a = m.new_request()
+        m.append(a, 0, self._row(1), self._row(2))
+        with pytest.raises(ValueError):
+            m.length(99)
+        with pytest.raises(ValueError):
+            m.get(99, 0)
+        with pytest.raises(ValueError):
+            m.free(99)
+        with pytest.raises(ValueError):
+            m.append(a, 5, self._row(1), self._row(2))
+        with pytest.raises(ValueError):
+            m.append(a, 0, [[1.0]], self._row(2))
+        with pytest.raises(ValueError):
+            m.append(a, 0, self._row(1), [[1.0]])

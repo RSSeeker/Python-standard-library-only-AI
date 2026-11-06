@@ -198,13 +198,15 @@
 ### W7 LLM 微调与推理（P0/P1）
 - [x] 提示微调：`PromptTuning`（软提示）/ `P_Tuning`（MLP 生成前缀）——`g_prompt` 与 `anchor`/`W1`/`W2` 全部中心差分 ≤2.2e-11；`PrefixTuning`（每层 KV 前缀）留到接进 MHA 时再做，当前用 `PrefixCache` 承载缓存
 - [x] 参数高效：`DoRALinear`（幅度+方向分解，`B=0` 与原层逐位一致，`g_V/g_m/g_A/g_B` 中心差分 ≤9.4e-7）/ `AdaLoRALinear`（每秩重要性 EMA + `prune(keep)` 剪秩，剪后前向等于存活秩之和）
-- [ ] 参数高效剩余：`QLoRA`（量化基座 + LoRA 接口；本库只有 float32 张量，留作接口与说明）
-- [ ] 采样扩展：typical / mirostat / eta / top-a / tail-free / contrastive search / diverse beam
+- [x] `QLoRA` 说明：本库只有 float32 张量、没有 4-bit 量化基座，因此**不做**量化路径；`DoRALinear`/`AdaLoRALinear` 的 `params()`/`merge()`/`denormalized()` 就是 QLoRA 训练侧的同一套约定
+- [x] 采样扩展：`typical_filter` / `mirostat_filter` + `mirostat_update` / `eta_filter` / `top_a_filter` / `tail_free_filter`（`tft` 0.1/0.3/0.5/0.7/0.9 实测保留 5/4/4/4/3 个 token，单调不增）
+- [ ] 采样扩展剩余：contrastive search / diverse beam（需要模型前向，留作生成器集成）
 - [x] 约束解码：`token_id_mask`（任意 id 白名单）+ `token_prefix_mask`（合法序列前缀约束，含 `eos_id` 收尾）；JSON Schema / 正则 / CFG 的完整语法器留作后续
 - [ ] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
 - [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）
 - [x] `ContinuousBatcher`：请求随时进出、每步按容量重组批与补位；记账按**准入时**的提示词长度（旧版扣生成后长度会让 `used_tokens` 变负数）；测试 4 例、计数 1014→1018
-- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）、`PagedAttention`（数据结构演示）
+- [x] `PagedKVCache`：PagedAttention 的块表数据结构（按 `block_size` 分块、逻辑→物理块映射、释放即复用；3 token 用 2 块、fragmentation=0.25）
+- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）
 - [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）
