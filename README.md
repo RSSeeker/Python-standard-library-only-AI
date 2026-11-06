@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（893 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（898 项）
 
 ## 特性
 
@@ -159,6 +159,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `FPN(in_channels_list, out_channels=8, smooth=True)` | 特征金字塔：每级先过 1x1 横向卷积压到统一通道，再从最粗一级往上 `P_i = lateral_i + upsample2x(P_{i+1})`，每级过 3x3 平滑卷积（`smooth=False` 可关）。要求相邻特征尺寸严格 2 倍关系；`backward` 返回与输入等长的梯度列表 |
 | `SegNet(in_channels=1, num_classes=2, base_channels=4)` | 2 级编码-解码分割网络：编码 `Conv+ReLU+MaxPool`，解码用**池化索引**（`MaxPool2d.mask` 的 argmax 位置）把值放回原位置再卷积，不做跳跃拼接；要求输入 `H`、`W` 能被 4 整除 |
 | `MLPMixer(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, token_hidden=32, channel_hidden=32, num_classes=10)` | MLP-Mixer：每个 block 先做 **token 混合**（转置后逐通道跑同一个 MLP），再做**通道混合**（逐 token 跑 MLP），两段都是 pre-LN 残差；输出对 token 取均值池化。逐行批量前向/反向（cache 按行保存，不会互相覆盖），`backward` 梯度累加、`sgd_step`/`adam_step` 都有 |
+| `SwinTransformer(in_channels=3, image_size=8, patch_size=4, d_model=16, num_heads=4, d_ff=32, num_layers=2, window_size=2, num_classes=10)` | **简化版 Swin**：PatchEmbedding → 交替（普通 / 移位 `window_size//2`）窗口块 → 全局均值池化 → 线性头。窗口内注意力手写（共享 `q/k/v/o` 投影，按窗口切分后做缩放点积 + softmax），逐行批量 helper 保证 cache 不互相覆盖。**简化点**：单 stage、无 patch merging、移位用循环 roll **且不加 attention mask**（真实 Swin 会挡住跨窗口部分） |
 | `GeMPooling(p=3.0)` | 广义平均池化：`(mean(x^p))^(1/p)`，`p=1` 是平均、`p→∞` 趋近最大；前后向都在 log 空间算，`p` 取到几千也不溢出 |
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
 | `GlobalMaxPool2d` | 全局最大池化：`(C,H,W) → (C,)`，反向只回传给最大值位置 |
@@ -1076,7 +1077,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-893 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+898 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1172,6 +1173,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFPN` | 三级输出尺寸与参数量、`smooth=False` 分支、逐级 `dx` 与横向/平滑卷积 `grad_w` 中心差分、`sgd_step`/`adam_step`、6 类非法输入 |
 | `TestSegNet` | 输出形状与参数量、`dx` 与 `conv1` 梯度中心差分、`pool0.mask` 逐窗口等于 argmax 且 `_unpool2` 只在选中位置取值、40 步 Adam loss 降到 1/3 以下、8 类非法输入 |
 | `TestMLPMixer` | 形状与参数量 891、`dx` 与 block 内 `t1/t2/c1/c2` 四组权重梯度中心差分、head 与 block 内 LayerNorm 梯度中心差分、两次 `backward` 线性累加且 `zero_grad` 清空、120 步 Adam 收敛且 4 张图全对、9 类非法输入 |
+| `TestSwinTransformer` | 窗口划分与移位 `perm` 语义、形状与参数量 1243、`dx` 与 block 内 `q/k/v/o/f1/f2` 六组权重梯度中心差分、head 与 block 内 LayerNorm 梯度、累加语义与 `zero_grad`、150 步 Adam 收敛且 4 张图全对、10 类非法输入 |
 | `TestPatchEmbedding` | patch 切分与行优先顺序、偏置整体平移、`param_count`、`dx` 中心差分、6 类非法输入 |
 | `TestAttentionPooling` | `q=0` 退化为平均、softmax 权重闭式解、`dx`/`q` 中心差分、5 类非法输入 |
 | `TestGeMPooling` | `p=1` 等于平均、`p=2` 等于均方根、`p=2000` 仍接近最大值且不溢出、三档 `p` 的 `dx` 中心差分、6 类非法输入 |
@@ -1236,7 +1238,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 893 个单元测试
+├── test_ai.py       # 898 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

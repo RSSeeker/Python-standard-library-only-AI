@@ -6839,6 +6839,384 @@ class MLPMixer:
         _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
 
 
+def _win_partition(gh, gw, ws, shift):
+    """按窗口切 (gh,gw) 网格；shift>0 时先循环 roll（右下）。
+
+    返回 perm：rolled 网格第 i 个位置对应的**原始**下标（长度 gh*gw）。
+    """
+    perm = [0] * (gh * gw)
+    for r in range(gh):
+        sr = (r - shift) % gh
+        for c in range(gw):
+            sc = (c - shift) % gw
+            perm[r * gw + c] = sr * gw + sc
+    windows = []
+    for wr in range(gh // ws):
+        for wc in range(gw // ws):
+            idx = []
+            for i in range(ws):
+                base = (wr * ws + i) * gw + wc * ws
+                idx.extend(range(base, base + ws))
+            windows.append(idx)
+    return perm, windows
+
+
+def _win_attn_forward(q, k, v, windows, num_heads, d_model):
+    """窗口内的缩放点积注意力；q/k/v 已按 rolled 顺序给好。
+
+    返回 (ctx, cache)；cache 存每个窗口的 softmax 概率，反向直接用。
+    """
+    dk = d_model // num_heads
+    scale = 1.0 / math.sqrt(dk)
+    ctx = [[0.0] * d_model for _ in range(len(q))]
+    cache = []
+    for idx in windows:
+        n = len(idx)
+        probs_win = []
+        for hh in range(num_heads):
+            lo = hh * dk
+            for i in range(n):
+                ii = idx[i]
+                qi = q[ii][lo:lo + dk]
+                logits = []
+                for j in range(n):
+                    kj = k[idx[j]][lo:lo + dk]
+                    logits.append(sum(map(_mul, qi, kj)) * scale)
+                mx = max(logits)
+                ex = [math.exp(t - mx) for t in logits]
+                s = sum(ex)
+                pr = [e / s for e in ex]
+                probs_win.append(pr)
+                ci = ctx[ii]
+                for j in range(n):
+                    w = pr[j]
+                    if w == 0.0:
+                        continue
+                    vj = v[idx[j]]
+                    for t in range(dk):
+                        ci[lo + t] += w * vj[lo + t]
+        cache.append(probs_win)
+    return ctx, cache
+
+
+def _win_attn_backward(dctx, q, k, v, windows, cache, num_heads, d_model):
+    """窗口内注意力反向，返回 (dq, dk, dv)，形状与 q/k/v 相同"""
+    dk = d_model // num_heads
+    scale = 1.0 / math.sqrt(dk)
+    dq = [[0.0] * d_model for _ in range(len(q))]
+    dk_ = [[0.0] * d_model for _ in range(len(k))]
+    dv = [[0.0] * d_model for _ in range(len(v))]
+    for wi, idx in enumerate(windows):
+        n = len(idx)
+        probs_win = cache[wi]
+        for hh in range(num_heads):
+            lo = hh * dk
+            for i in range(n):
+                ii = idx[i]
+                pr = probs_win[hh * n + i]
+                dci = dctx[ii][lo:lo + dk]
+                qi = q[ii][lo:lo + dk]
+                dot = []
+                for j in range(n):
+                    vj = v[idx[j]][lo:lo + dk]
+                    dot.append(sum(map(_mul, dci, vj)))
+                avg = sum(pr[s] * dot[s] for s in range(n))
+                for j in range(n):
+                    g = pr[j] * (dot[j] - avg) * scale
+                    jj = idx[j]
+                    kj = k[jj][lo:lo + dk]
+                    vj = v[jj][lo:lo + dk]
+                    dqi = dq[ii]
+                    dkj = dk_[jj]
+                    dvj = dv[jj]
+                    for t in range(dk):
+                        dqi[lo + t] += g * kj[t]
+                        dkj[lo + t] += g * qi[t]
+                        dvj[lo + t] += pr[j] * dci[t]
+    return dq, dk_, dv
+
+
+class SwinBlock:
+    """Swin 的单 stage block：窗口注意力 + 两层 MLP（都是 pre-LN 残差）
+
+    `shift=0` 是普通窗口；`shift=window_size//2` 是移位窗口。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff, window_size, shift=0, eps=1e-5):
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads < 1:
+            raise ValueError(f"SwinBlock: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"SwinBlock: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size < 1:
+            raise ValueError(
+                f"SwinBlock: window_size 必须是正整数，收到 {window_size!r}")
+        if isinstance(shift, bool) or not isinstance(shift, int) or shift < 0:
+            raise ValueError(f"SwinBlock: shift 必须是非负整数，收到 {shift!r}")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift = shift
+        self.ln1 = LayerNorm(d_model, eps)
+        self.ln2 = LayerNorm(d_model, eps)
+        self.q = Layer(d_model, d_model, "linear")
+        self.k = Layer(d_model, d_model, "linear")
+        self.v = Layer(d_model, d_model, "linear")
+        self.o = Layer(d_model, d_model, "linear")
+        self.f1 = Layer(d_model, d_ff, "gelu")
+        self.f2 = Layer(d_ff, d_model, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        d = self.d_model
+        self.grads = {
+            "q": _layer_zero_grads(self.q),
+            "k": _layer_zero_grads(self.k),
+            "v": _layer_zero_grads(self.v),
+            "o": _layer_zero_grads(self.o),
+            "f1": _layer_zero_grads(self.f1),
+            "f2": _layer_zero_grads(self.f2),
+        }
+        self.norm_grads = {"ln1": ([0.0] * d, [0.0] * d),
+                           "ln2": ([0.0] * d, [0.0] * d)}
+
+    def forward(self, tokens, gh, gw):
+        ws = self.window_size
+        if gh % ws or gw % ws:
+            raise ValueError(
+                f"SwinBlock.forward: 网格 {(gh, gw)} 必须能被 window_size={ws} 整除")
+        perm, windows = _win_partition(gh, gw, ws, self.shift)
+        rolled = [tokens[i] for i in perm]
+        a, ln1_cache = _norm_rows_forward(self.ln1, rolled)
+        q, qc = _dense_rows_forward(self.q, a)
+        k, kc = _dense_rows_forward(self.k, a)
+        v, vc = _dense_rows_forward(self.v, a)
+        ctx, attn_cache = _win_attn_forward(q, k, v, windows, self.num_heads,
+                                            self.d_model)
+        o, oc = _dense_rows_forward(self.o, ctx)
+        merged = [[rolled[t][c] + o[t][c] for c in range(self.d_model)]
+                  for t in range(len(rolled))]
+        b, ln2_cache = _norm_rows_forward(self.ln2, merged)
+        h, f1c = _dense_rows_forward(self.f1, b)
+        ff, f2c = _dense_rows_forward(self.f2, h)
+        out_rolled = [[merged[t][c] + ff[t][c] for c in range(self.d_model)]
+                      for t in range(len(merged))]
+        out = [None] * len(tokens)
+        for i, si in enumerate(perm):
+            out[si] = out_rolled[i]
+        self._cache = (perm, windows, gh, gw, rolled, ln1_cache, q, k, v,
+                       qc, kc, vc, attn_cache, oc, merged, ln2_cache, h, f1c,
+                       f2c)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("SwinBlock.backward: 必须先调用 forward()")
+        (perm, windows, gh, gw, rolled, ln1_cache, q, k, v, qc, kc, vc,
+         attn_cache, oc, merged, ln2_cache, h, f1c, f2c) = self._cache
+        d = self.d_model
+        n = len(rolled)
+        d_rolled = [dout[i] for i in perm]
+        # ---- MLP 分支 ----
+        g2, b2, dh = _dense_rows_backward(self.f2, f2c, d_rolled)
+        _layer_add_grads(self.grads["f2"], (g2, b2))
+        g1, b1, db = _dense_rows_backward(self.f1, f1c, dh)
+        _layer_add_grads(self.grads["f1"], (g1, b1))
+        ggl, gbl, dmerged_ln = _norm_rows_backward(self.ln2, ln2_cache, db)
+        ng2 = self.norm_grads["ln2"]
+        for c in range(d):
+            ng2[0][c] += ggl[c]
+            ng2[1][c] += gbl[c]
+        dmerged = [[d_rolled[t][c] + dmerged_ln[t][c] for c in range(d)]
+                   for t in range(n)]
+        # ---- 注意力分支 ----
+        go, gbo2, dctx = _dense_rows_backward(self.o, oc, dmerged)
+        _layer_add_grads(self.grads["o"], (go, gbo2))
+        dq, dk_, dv = _win_attn_backward(dctx, q, k, v, windows, attn_cache,
+                                         self.num_heads, d)
+        gq, bq, da_q = _dense_rows_backward(self.q, qc, dq)
+        _layer_add_grads(self.grads["q"], (gq, bq))
+        gk, bk, da_k = _dense_rows_backward(self.k, kc, dk_)
+        _layer_add_grads(self.grads["k"], (gk, bk))
+        gv, bv, da_v = _dense_rows_backward(self.v, vc, dv)
+        _layer_add_grads(self.grads["v"], (gv, bv))
+        da = [[da_q[t][c] + da_k[t][c] + da_v[t][c] for c in range(d)]
+              for t in range(n)]
+        ggl1, gbl1, dpre = _norm_rows_backward(self.ln1, ln1_cache, da)
+        ng1 = self.norm_grads["ln1"]
+        for c in range(d):
+            ng1[0][c] += ggl1[c]
+            ng1[1][c] += gbl1[c]
+        out = [None] * n
+        for i, si in enumerate(perm):
+            out[si] = [dmerged[i][c] + dpre[i][c] for c in range(d)]
+        return out
+
+    def param_count(self):
+        total = sum(_dense_param_count(getattr(self, name))
+                    for name in ("q", "k", "v", "o", "f1", "f2"))
+        return total + _norm_param_count(self.ln1) + _norm_param_count(self.ln2)
+
+    def train(self):
+        pass
+
+    def eval(self):
+        pass
+
+    def sgd_step(self, lr):
+        for name in ("q", "k", "v", "o", "f1", "f2"):
+            _dense_apply_sgd(getattr(self, name), self.grads[name], lr)
+        _norm_apply_sgd(self.ln1, self.norm_grads["ln1"], lr)
+        _norm_apply_sgd(self.ln2, self.norm_grads["ln2"], lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        for name in ("q", "k", "v", "o", "f1", "f2"):
+            _dense_apply_adam(getattr(self, name), self.grads[name], lr,
+                              beta1, beta2, eps)
+        _norm_apply_adam(self.ln1, self.norm_grads["ln1"], lr, beta1, beta2, eps)
+        _norm_apply_adam(self.ln2, self.norm_grads["ln2"], lr, beta1, beta2, eps)
+
+
+class SwinTransformer:
+    """简化版 Swin：PatchEmbedding → 交替（普通 / 移位）窗口块 → 全局均值池化 → 线性头
+
+    **简化点**（与论文的差异，见 README）：单 stage、无 patch merging；
+    移位窗口用循环 roll 实现且**不加 attention mask**，所以跨窗口边界的信息会混进来。
+    """
+
+    def __init__(self, in_channels=3, image_size=8, patch_size=4, d_model=16,
+                 num_heads=4, d_ff=32, num_layers=2, window_size=2,
+                 num_classes=10, eps=1e-5):
+        for name, v in (("in_channels", in_channels), ("patch_size", patch_size),
+                        ("d_model", d_model), ("num_heads", num_heads),
+                        ("d_ff", d_ff), ("num_layers", num_layers),
+                        ("window_size", window_size),
+                        ("num_classes", num_classes)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(
+                    f"SwinTransformer: {name} 必须是正整数，收到 {v!r}")
+        if isinstance(image_size, int):
+            size = (image_size, image_size)
+        else:
+            if len(image_size) != 2:
+                raise ValueError("SwinTransformer: image_size 必须是 int 或 (H, W)")
+            size = (image_size[0], image_size[1])
+        if size[0] % patch_size or size[1] % patch_size:
+            raise ValueError(
+                f"SwinTransformer: image_size={size} 必须能被 patch_size="
+                f"{patch_size} 整除")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"SwinTransformer: d_model={d_model} 必须能被 num_heads="
+                f"{num_heads} 整除")
+        gh, gw = size[0] // patch_size, size[1] // patch_size
+        if gh % window_size or gw % window_size:
+            raise ValueError(
+                f"SwinTransformer: patch 网格 {(gh, gw)} 必须能被 window_size="
+                f"{window_size} 整除")
+        self.in_channels = in_channels
+        self.image_size = size
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.window_size = window_size
+        self.num_classes = num_classes
+        self.grid = (gh, gw)
+        self.patch_embed = PatchEmbedding(in_channels, patch_size, d_model)
+        self.blocks = []
+        for i in range(num_layers):
+            shift = 0 if i % 2 == 0 else window_size // 2
+            self.blocks.append(
+                SwinBlock(d_model, num_heads, d_ff, window_size, shift, eps))
+        self.norm = LayerNorm(d_model, eps)
+        self.head = Layer(d_model, num_classes, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.norm_grads = ([0.0] * self.d_model, [0.0] * self.d_model)
+        self.head_grads = _layer_zero_grads(self.head)
+        for blk in self.blocks:
+            blk.zero_grad()
+        self.patch_embed.zero_grad()
+
+    def forward(self, x):
+        if len(x) != self.in_channels:
+            raise ValueError(
+                f"SwinTransformer.forward: 输入通道数 {len(x)} 与 in_channels="
+                f"{self.in_channels} 不符")
+        if (len(x[0]), len(x[0][0])) != self.image_size:
+            raise ValueError(
+                f"SwinTransformer.forward: 输入尺寸 {(len(x[0]), len(x[0][0]))} "
+                f"与 image_size={self.image_size} 不符")
+        tokens = self.patch_embed.forward(x)
+        gh, gw = self.grid
+        for blk in self.blocks:
+            tokens = blk.forward(tokens, gh, gw)
+        normed, norm_cache = _norm_rows_forward(self.norm, tokens)
+        n = len(normed)
+        pooled = [sum(normed[t][c] for t in range(n)) / n
+                  for c in range(self.d_model)]
+        logits = self.head.forward(pooled)
+        self._cache = (tokens, n, norm_cache)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("SwinTransformer.backward: 必须先调用 forward()")
+        if len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"SwinTransformer.backward: dlogits 长度 {len(dlogits)} 与 "
+                f"num_classes={self.num_classes} 不符")
+        tokens, n, norm_cache = self._cache
+        gw, gb, dpooled = self.head.backward(dlogits)
+        _layer_add_grads(self.head_grads, (gw, gb))
+        dnormed = [[dpooled[c] / n for c in range(self.d_model)]
+                   for _ in range(n)]
+        ggn, gbn, dtokens = _norm_rows_backward(self.norm, norm_cache, dnormed)
+        for c in range(self.d_model):
+            self.norm_grads[0][c] += ggn[c]
+            self.norm_grads[1][c] += gbn[c]
+        gh, gw = self.grid
+        for blk in reversed(self.blocks):
+            dtokens = blk.backward(dtokens)
+        return self.patch_embed.backward(dtokens)
+
+    def param_count(self):
+        total = (self.patch_embed.param_count()
+                 + _dense_param_count(self.head)
+                 + _norm_param_count(self.norm))
+        for blk in self.blocks:
+            total += blk.param_count()
+        return total
+
+    def train(self):
+        pass
+
+    def eval(self):
+        pass
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SwinTransformer.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.patch_embed.sgd_step(lr)
+        for blk in self.blocks:
+            blk.sgd_step(lr)
+        _dense_apply_sgd(self.head, self.head_grads, lr)
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SwinTransformer.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.patch_embed.adam_step(lr, beta1, beta2, eps)
+        for blk in self.blocks:
+            blk.adam_step(lr, beta1, beta2, eps)
+        _dense_apply_adam(self.head, self.head_grads, lr, beta1, beta2, eps)
+        _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 

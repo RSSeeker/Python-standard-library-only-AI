@@ -167,7 +167,7 @@
 - [x] `UNet`（2 级下采样 + 瓶颈 + 2 级上采样 + 通道拼接跳跃；可选 BN；`dx` 与编码/转置卷积/BN 三组参数梯度中心差分 ≤1e-9；Adam 40 步 MSE 0.67 → <0.22）
 - [x] `FPN`（1x1 横向 + 最近邻上采样相加 + 3x3 平滑；逐级 `dx` 与横向/平滑卷积 `grad_w` 中心差分 ≤1e-9，要求相邻尺寸严格 2 倍）
 - [x] `SegNet`（简化 2 级；解码用 `MaxPool2d.mask` 的**窗口内相对位置**+ stride 换算出绝对坐标做 unpool —— 直接当绝对位置用会让 `dx` 差 4 倍，`_unpool2`/`_unpool2_back` 已按此修；`dx` 与 `conv1` 梯度中心差分 ≤1e-7，40 步 Adam loss 1.01 → 0.02）
-- [ ] `SwinTransformer`（窗口注意力，简化）
+- [x] `SwinTransformer`（简化）：单 stage、交替普通/移位窗口；移位用循环 roll 且**不做 mask**；窗口内注意力手写（不复用 `MultiHeadAttention`，避免其单份 cache 被逐窗口调用覆盖）；`dx` 1.51e-09、block 内 q/k/v/o/f1/f2 逐项 ≤1e-5、150 步 Adam 收敛，898 passed
 - [x] `MLPMixer`：token 混合 + 通道混合，两段 pre-LN 残差；**踩过的坑**：同一 `Layer`/`LayerNorm` 实例在循环里逐通道/逐 token 调用会互相覆盖 cache（`Layer.backward` 只读最后一次的 `input`/`z`），实测 `t1` 解析梯度 ≈ -1.19e-18 而数值是 -0.242284；改用按行批量的 `_dense_rows_forward/backward`、`_norm_rows_forward/backward` 后，block 内四组权重、两级 LayerNorm、head、`dx` 的中心差分全部 ≤1e-5 相对误差，893 passed
 - [x] `AttentionPooling`（`q` 可学，`q=0` 退化为平均；`dx`/`grad_q` 中心差分 ≤1e-9）、`GeMPooling`（`p=1` 平均 / `p=2` 均方根 / `p=2000` 仍不溢出，log 空间实现）
 
