@@ -257,11 +257,11 @@
   - E1（已完成）：`Adan` / `Prodigy` / `CAME` —— Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr，`d` 按「上一步是否真的下降」乘性自适应（与原论文的累积投影估计不同，docstring 与 README 都写明）；CAME 用 `r`/`c` 行/列**向量**因子化二阶矩。
   - 三个都与手写参考 5 步**逐位一致**（maxdiff 0.000e+00）；`state_dict()` 往返续训逐位一致（Prodigy 额外存 `d`/`p_prev`/`g_prev`）；400 步 XOR 收敛到 9.4e-4 / 5e-6 / 8.3e-4。
   - 踩坑：CAME 最初把 `r`/`c` 都做成逐元素矩阵，`v = r·c` 只有 `|g|⁴` 量级 ⇒ 步长被放大 `1/|g|` 倍，`clip_threshold=1e6`（等于关掉校正）时参数飞到 9.68e+02；改成 Adafactor 式行/列均值 `v_ij = r_i·c_j/mean(r)` 才把量纲对齐。另：偏置是扁平 `list[float]`，`param[j]` 的嵌套写法会直接 `TypeError`。
-  - E2（待做）：`Shampoo` / `Sophia` / `L-BFGS`
+  - E2（已完成）：`Shampoo` / `Sophia` / `L-BFGS` —— Shampoo 走 `L^{-1/4} G R^{-1/4}`；Sophia 的曲率按 `hessian_diags` > `hessian_fn` > `g²` 取值；L-BFGS 逐层分块、无 line search。三者 `state_dict()` 往后续训逐位一致，11 例测试全绿。
 - [x] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
       - 12 个调度器（Lambda / Multiplicative / MultiStep / 余弦重启 / Cyclic / OneCycle / InverseSqrt / Noam / Polynomial / WSD / Chained / Sequential）；闭式解逐点对照、周期与里程碑边界、step(0) 夹到 1、与 `fit(lr_scheduler=)` 12 种集成；**StepLR 家族是 epoch 门控的**（step(5) 且 5%2≠0 时 lr 不变），单独喂非整除轮次不会变。
       Polynomial / Lambda / MultiStep / Multiplicative / WSD / ChainedScheduler / SequentialLR
-- [ ] 标注不做：SparseAdam / SM3
+- 明确不做：SparseAdam / SM3 —— 稀疏梯度在纯 Python 的稠密 `list` 表示下没有收益，保留为说明项，不计入完成度。
 
 ### W10 正则与训练技巧（§5）
 - [ ] Dropout 变体：SpatialDropout / AlphaDropout / GaussianDropout / R-Drop
