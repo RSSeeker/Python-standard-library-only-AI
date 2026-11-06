@@ -12260,3 +12260,187 @@ class TestHighway:
             AI.Highway(3).forward([1.0])
         with pytest.raises(RuntimeError):
             AI.Highway(3).backward([1.0, 2.0, 3.0])
+
+# ---------------------------------------------------------------------------
+#  视觉前端（PatchEmbedding / AttentionPooling / GeMPooling）
+# ---------------------------------------------------------------------------
+class TestPatchEmbedding:
+    """把图像切成 patch 再映射成 token"""
+
+    def _img(self):
+        return [[[float(4 * i + j + 1) for j in range(4)] for i in range(4)]]
+
+    def test_split_and_order(self):
+        pe = AI.PatchEmbedding(1, 2, 3)
+        # 只保留 patch 左上角像素，偏置区分三个输出通道
+        pe.conv.weights = [[[[1.0, 0.0], [0.0, 0.0]]] for _ in range(3)]
+        pe.conv.biases = [0.0, 10.0, 100.0]
+        toks = pe.forward(self._img())
+        assert len(toks) == 4 and all(len(t) == 3 for t in toks)
+        img = self._img()[0]
+        assert [t[0] for t in toks] == [img[0][0], img[0][2], img[2][0], img[2][2]]
+        for t in toks:
+            assert abs(t[1] - t[0] - 10.0) < 1e-12
+            assert abs(t[2] - t[0] - 100.0) < 1e-12
+        assert pe.param_count() == 3 * 4 + 3
+
+    def test_backward_finite_difference(self):
+        pe = AI.PatchEmbedding(1, 2, 2)
+        pe.conv.weights = [[[[0.5, -0.3], [0.2, 0.7]]], [[[0.1, 0.4], [-0.2, 0.6]]]]
+        pe.conv.biases = [0.05, -0.1]
+        coef = (0.3, -0.8, 0.5, 1.2)
+        dtok = [[coef[p] + 0.01 * c for c in range(2)] for p in range(4)]
+
+        img = self._img()
+        pe.forward(img)
+        dx = pe.backward(dtok)
+
+        def loss():
+            t = pe.forward(img)
+            return sum(t[p][c] * (coef[p] + 0.01 * c)
+                       for p in range(4) for c in range(2))
+
+        for i in range(4):
+            for j in range(4):
+                old = img[0][i][j]
+                img[0][i][j] = old + 1e-6
+                lp = loss()
+                img[0][i][j] = old - 1e-6
+                lm = loss()
+                img[0][i][j] = old
+                assert abs((lp - lm) / 2e-6 - dx[0][i][j]) < 1e-6
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.PatchEmbedding(0, 2, 3)
+        with pytest.raises(ValueError):
+            AI.PatchEmbedding(1, 0, 3)
+        with pytest.raises(TypeError):
+            AI.PatchEmbedding(1, 2.0, 3)
+        with pytest.raises(ValueError):
+            AI.PatchEmbedding(1, 2, 3).forward([[[1.0, 2.0, 3.0]]])
+        with pytest.raises(ValueError):
+            AI.PatchEmbedding(2, 2, 3).forward(self._img())
+        with pytest.raises(RuntimeError):
+            AI.PatchEmbedding(1, 2, 3).backward([[0.0] * 3])
+
+
+class TestAttentionPooling:
+    """可学习查询向量的注意力池化"""
+
+    def _toks(self):
+        return [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+
+    def test_uniform_when_query_zero(self):
+        ap = AI.AttentionPooling(3)
+        ap.q = [0.0, 0.0, 0.0]
+        toks = self._toks()
+        out = ap.forward(toks)
+        for j in range(3):
+            assert abs(out[j] - sum(t[j] for t in toks) / 3.0) < 1e-12
+        assert abs(sum(ap.weights) - 1.0) < 1e-12
+        assert ap.param_count() == 3
+
+    def test_softmax_weights_and_backward(self):
+        ap = AI.AttentionPooling(3)
+        ap.q = [0.5, -0.2, 0.9]
+        toks = self._toks()
+        out = ap.forward(toks)
+        sc = 1.0 / math.sqrt(3)
+        scores = [sum(ap.q[i] * t[i] for i in range(3)) * sc for t in toks]
+        m = max(scores)
+        ex = [math.exp(v - m) for v in scores]
+        z = sum(ex)
+        for i in range(3):
+            assert abs(ap.weights[i] - ex[i] / z) < 1e-12
+        for j in range(3):
+            assert abs(out[j] - sum(ap.weights[i] * toks[i][j]
+                                    for i in range(3))) < 1e-12
+
+        dout = [0.7, -0.4, 1.1]
+        ap.forward(toks)
+        dt = ap.backward(dout)
+
+        def loss():
+            o = ap.forward(toks)
+            return sum(o[j] * dout[j] for j in range(3))
+
+        for i in range(3):
+            for j in range(3):
+                old = toks[i][j]
+                toks[i][j] = old + 1e-6
+                lp = loss()
+                toks[i][j] = old - 1e-6
+                lm = loss()
+                toks[i][j] = old
+                assert abs((lp - lm) / 2e-6 - dt[i][j]) < 1e-6
+
+        for i in range(3):
+            old = ap.q[i]
+            ap.q[i] = old + 1e-6
+            lp = loss()
+            ap.q[i] = old - 1e-6
+            lm = loss()
+            ap.q[i] = old
+            assert abs((lp - lm) / 2e-6 - ap.grad_q[i]) < 1e-6
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.AttentionPooling(0)
+        with pytest.raises(ValueError):
+            AI.AttentionPooling(3).forward([])
+        with pytest.raises(ValueError):
+            AI.AttentionPooling(3).forward([[1.0, 2.0]])
+        with pytest.raises(RuntimeError):
+            AI.AttentionPooling(3).backward([1.0, 2.0, 3.0])
+
+
+class TestGeMPooling:
+    """广义平均池化"""
+
+    def test_known_values(self):
+        x = [[[1.0, 2.0], [3.0, 4.0]]]
+        assert abs(AI.GeMPooling(1.0).forward(x)[0] - 2.5) < 1e-12
+        assert abs(AI.GeMPooling(2.0).forward(x)[0] - math.sqrt(7.5)) < 1e-12
+        # p 越大越接近最大值，且不溢出
+        v20 = AI.GeMPooling(20.0).forward(x)[0]
+        v2000 = AI.GeMPooling(2000.0).forward(x)[0]
+        assert 2.5 < v20 < 4.0
+        assert v2000 > v20 and abs(v2000 - 4.0) < 1e-2
+        assert AI.GeMPooling(2.0).param_count() == 0
+
+    def test_backward_finite_difference(self):
+        x = [[[0.5, 1.5], [2.0, 3.0]], [[1.0, 2.0], [4.0, 8.0]]]
+        for pval in (1.0, 1.5, 3.0):
+            gp = AI.GeMPooling(pval)
+            gp.forward(x)
+            dx = gp.backward([1.0, -1.0])
+
+            def loss():
+                o = gp.forward(x)
+                return o[0] - o[1]
+
+            for c in range(2):
+                for i in range(2):
+                    for j in range(2):
+                        old = x[c][i][j]
+                        x[c][i][j] = old + 1e-6
+                        lp = loss()
+                        x[c][i][j] = old - 1e-6
+                        lm = loss()
+                        x[c][i][j] = old
+                        assert abs((lp - lm) / 2e-6 - dx[c][i][j]) < 1e-6
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            AI.GeMPooling(0.0)
+        with pytest.raises(ValueError):
+            AI.GeMPooling(-1.0)
+        with pytest.raises(ValueError):
+            AI.GeMPooling(float("nan"))
+        with pytest.raises(TypeError):
+            AI.GeMPooling(True)
+        with pytest.raises(ValueError):
+            AI.GeMPooling(2.0).forward([[[-1.0, 2.0]]])
+        with pytest.raises(RuntimeError):
+            AI.GeMPooling(2.0).backward([1.0])

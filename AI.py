@@ -22,6 +22,8 @@
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
+  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling；残差变体：
+    ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
 """
@@ -5404,6 +5406,315 @@ class Highway:
                 vh = v[i] / (1 - beta2 ** t)
                 holder[i] -= lr * mh / (math.sqrt(vh) + eps)
         self.zero_grad()
+
+
+class PatchEmbedding:
+    """把 `(C,H,W)` 图像切成不重叠的 patch，每个 patch 映射成一个 `d_model` 维 token
+
+    本质就是 `Conv2d(in_channels, d_model, kernel_size=patch_size,
+    stride=patch_size)`，只是把输出张量 `(d_model, gh, gw)` 按**行优先**摊平成
+   长度 `gh*gw` 的 token 列表 —— 这是 ViT 的第一步。
+    """
+
+    def __init__(self, in_channels: int, patch_size: int, d_model: int):
+        if isinstance(in_channels, bool) or not isinstance(in_channels, int):
+            raise TypeError(
+                f"PatchEmbedding: in_channels 必须是 int，收到 {type(in_channels).__name__}")
+        if in_channels < 1:
+            raise ValueError(f"PatchEmbedding: in_channels 必须 >= 1，收到 {in_channels!r}")
+        if isinstance(patch_size, bool) or not isinstance(patch_size, int):
+            raise TypeError(
+                f"PatchEmbedding: patch_size 必须是 int，收到 {type(patch_size).__name__}")
+        if patch_size < 1:
+            raise ValueError(f"PatchEmbedding: patch_size 必须 >= 1，收到 {patch_size!r}")
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise TypeError(
+                f"PatchEmbedding: d_model 必须是 int，收到 {type(d_model).__name__}")
+        if d_model < 1:
+            raise ValueError(f"PatchEmbedding: d_model 必须 >= 1，收到 {d_model!r}")
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.conv = Conv2d(in_channels, d_model, patch_size, stride=patch_size)
+        self.grid = None
+        self.training = True
+
+    def forward(self, x):
+        """`(C,H,W)` → `list[list[float]]`（每个 token 长度 d_model）"""
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("PatchEmbedding.forward: 输入不能为空")
+        c, h, w = len(x), len(x[0]), len(x[0][0])
+        if c != self.in_channels:
+            raise ValueError(
+                f"PatchEmbedding.forward: 输入通道数 {c} 与 in_channels="
+                f"{self.in_channels} 不符")
+        p = self.patch_size
+        if h % p != 0 or w % p != 0:
+            raise ValueError(
+                f"PatchEmbedding.forward: 图像尺寸 {(h, w)} 必须能被 patch_size="
+                f"{p} 整除")
+        out = self.conv.forward(x)          # (d_model, gh, gw)
+        gh, gw = len(out[0]), len(out[0][0])
+        self.grid = (self.d_model, gh, gw)
+        return [[out[c][i][j] for c in range(self.d_model)]
+                for i in range(gh) for j in range(gw)]
+
+    def backward(self, dtokens):
+        """`list[token 梯度]` → `(C,H,W)` 的输入梯度；卷积的 `grad_w`/`grad_b` 就地填充"""
+        if self.grid is None:
+            raise RuntimeError("PatchEmbedding.backward: 必须先调用 forward()")
+        dm, gh, gw = self.grid
+        if len(dtokens) != gh * gw:
+            raise ValueError(
+                f"PatchEmbedding.backward: token 数 {len(dtokens)} 与 forward 的 "
+                f"{gh * gw} 不一致")
+        grid = [[[0.0] * gw for _ in range(gh)] for _ in range(dm)]
+        for i in range(gh):
+            for j in range(gw):
+                tok = dtokens[i * gw + j]
+                if len(tok) != dm:
+                    raise ValueError(
+                        f"PatchEmbedding.backward: token 梯度长度 {len(tok)} 与 "
+                        f"d_model={dm} 不一致")
+                for c in range(dm):
+                    grid[c][i][j] = tok[c]
+        return self.conv.backward(grid)
+
+    def zero_grad(self):
+        self.conv.zero_grad()
+
+    def param_count(self):
+        return _conv_param_count(self.conv)
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"PatchEmbedding.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _conv_sgd(self.conv, float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"PatchEmbedding.adam_step: lr 必须是非负数，收到 {lr!r}")
+        _conv_adam(self.conv, float(lr), beta1, beta2, eps)
+
+
+class AttentionPooling:
+    """注意力池化：可学习查询向量给每个 token 打分，softmax 后加权求和
+
+    `score_t = q·x_t / sqrt(d)`、`w = softmax(score)`、`out = Σ_t w_t x_t`。
+    和 `GlobalAvgPool2d` 的区别是权重由内容决定，所以模型能学会"只看重要的补丁"。
+    """
+
+    def __init__(self, d_model: int):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise TypeError(
+                f"AttentionPooling: d_model 必须是 int，收到 {type(d_model).__name__}")
+        if d_model < 1:
+            raise ValueError(f"AttentionPooling: d_model 必须 >= 1，收到 {d_model!r}")
+        self.d = d_model
+        rng = random.Random(20240001)
+        std = math.sqrt(1.0 / d_model)
+        self.q = [rng.gauss(0.0, std) for _ in range(d_model)]
+        self.grad_q = [0.0] * d_model
+        self.m_q = [0.0] * d_model
+        self.v_q = [0.0] * d_model
+        self._adam_t = 0
+        self.tokens = None
+        self.weights = None
+        self.training = True
+
+    def _scale(self):
+        return 1.0 / math.sqrt(self.d)
+
+    def forward(self, tokens):
+        """`list[token]` → 长度 d_model 的向量"""
+        if not tokens:
+            raise ValueError("AttentionPooling.forward: token 列表不能为空")
+        n = len(tokens)
+        if len(tokens[0]) != self.d:
+            raise ValueError(
+                f"AttentionPooling.forward: token 长度 {len(tokens[0])} 与 "
+                f"d_model={self.d} 不一致")
+        sc = self._scale()
+        scores = []
+        for t in tokens:
+            if len(t) != self.d:
+                raise ValueError(
+                    f"AttentionPooling.forward: token 长度 {len(t)} 与 "
+                    f"d_model={self.d} 不一致")
+            scores.append(sum(self.q[i] * t[i] for i in range(self.d)) * sc)
+        m = max(scores)
+        ex = [math.exp(v - m) for v in scores]
+        z = sum(ex)
+        w = [v / z for v in ex]
+        out = [0.0] * self.d
+        for t_i in range(n):
+            wt = w[t_i]
+            tok = tokens[t_i]
+            for j in range(self.d):
+                out[j] += wt * tok[j]
+        self.tokens = tokens
+        self.weights = w
+        return out
+
+    def backward(self, dout):
+        if self.tokens is None:
+            raise RuntimeError("AttentionPooling.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"AttentionPooling.backward: dout 长度 {len(dout)} 与 "
+                f"d_model={self.d} 不一致")
+        n = len(self.tokens)
+        sc = self._scale()
+        w = self.weights
+        dw = [sum(dout[j] * self.tokens[t][j] for j in range(self.d))
+              for t in range(n)]
+        mean_dw = sum(w[t] * dw[t] for t in range(n))
+        dscore = [w[t] * (dw[t] - mean_dw) for t in range(n)]
+        self.grad_q = [sc * sum(dscore[t] * self.tokens[t][i] for t in range(n))
+                       for i in range(self.d)]
+        dx = []
+        for t in range(n):
+            g = sc * dscore[t]
+            dx.append([dout[j] * w[t] + g * self.q[j] for j in range(self.d)])
+        return dx
+
+    def zero_grad(self):
+        self.grad_q = [0.0] * self.d
+
+    def param_count(self):
+        return self.d
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"AttentionPooling.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _sgd_apply(self.q, self.grad_q, float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"AttentionPooling.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.q, self.grad_q, self.m_q, self.v_q, self._adam_t,
+                    float(lr), beta1, beta2, eps)
+
+
+class GeMPooling:
+    """广义平均池化（GeM）：`y_c = (mean_{h,w}(x^p))^(1/p)`
+
+    `p=1` 是平均池化、`p→∞` 趋近最大池化，所以一个可调超参就能在两者之间
+    连续插值 —— 检索里常用的池化头。要求输入非负（前面接 ReLU 即可）。
+    前向与反向都在 log 空间里算，`p` 取到几千也不会溢出。
+    """
+
+    def __init__(self, p: float = 3.0):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError(f"GeMPooling: p 必须是数字，收到 {type(p).__name__}")
+        if not math.isfinite(float(p)) or p <= 0:
+            raise ValueError(f"GeMPooling: p 必须是正有限数，收到 {p!r}")
+        self.p = float(p)
+        self.x = None
+        self.y = None
+        self.training = True
+
+    def forward(self, x):
+        """`(C,H,W)` → `(C,)`"""
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("GeMPooling.forward: 输入不能为空")
+        c, h, w = len(x), len(x[0]), len(x[0][0])
+        n = h * w
+        out = []
+        for ch in range(c):
+            row = x[ch]
+            # log 空间：先减最大值再 exp，p 很大（如 2000）也不会溢出
+            top = 0.0
+            for i in range(h):
+                for j in range(w):
+                    v = row[i][j]
+                    if v < 0:
+                        raise ValueError(
+                            "GeMPooling.forward: 输入必须非负（x^p 无意义），"
+                            f"通道 {ch} 位置 {(i, j)} 是 {v!r}")
+                    if v > top:
+                        top = v
+            if top == 0.0:
+                out.append(0.0)
+                continue
+            log_top = math.log(top)
+            acc = 0.0
+            for i in range(h):
+                for j in range(w):
+                    v = row[i][j]
+                    if v > 0.0:
+                        acc += math.exp(self.p * (math.log(v) - log_top))
+            out.append(math.exp(log_top + math.log(acc / n) / self.p))
+        self.x = x
+        self.y = out
+        return out
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("GeMPooling.backward: 必须先调用 forward()")
+        c, h, w = len(self.x), len(self.x[0]), len(self.x[0][0])
+        if len(dout) != c:
+            raise ValueError(
+                f"GeMPooling.backward: dout 长度 {len(dout)} 与通道数 {c} 不一致")
+        n = h * w
+        p = self.p
+        dx = [[[0.0] * w for _ in range(h)] for _ in range(c)]
+        for ch in range(c):
+            y = self.y[ch]
+            g = dout[ch]
+            if y == 0.0:
+                continue
+            log_y = math.log(y)
+            row = self.x[ch]
+            for i in range(h):
+                for j in range(w):
+                    v = row[i][j]
+                    if v <= 0.0:
+                        dx[ch][i][j] = 0.0
+                        continue
+                    # (y^(1-p)·v^(p-1))/n = exp((p-1)(log v - log y))/n；v<=y 故该指数 <=0
+                    dx[ch][i][j] = (g / n) * math.exp(
+                        (p - 1.0) * (math.log(v) - log_y))
+        return dx
+
+    def zero_grad(self):
+        pass
+
+    def param_count(self):
+        return 0
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"GeMPooling.sgd_step: lr 必须是非负数，收到 {lr!r}")
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"GeMPooling.adam_step: lr 必须是非负数，收到 {lr!r}")
 
 
 class Flatten:

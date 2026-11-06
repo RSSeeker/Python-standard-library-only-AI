@@ -163,10 +163,10 @@
 - [x] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway（ReZero/SkipInit/PreNormResidual/PostNormResidual/Highway；dx/参数梯度中心差分 ≤1e-6，ReZero 的 lpha=0 逐位恒等；顺带补了 _dense_param_count/_dense_apply_sgd/_dense_apply_adam/_norm_* 六个助手，因为 Layer/LayerNorm 本身没有 param_count()/sgd_step()）
 
 ### W4 视觉骨干（P0/P1）
-- [ ] `PatchEmbedding`（= `Conv2d(in=3, out=d_model, kernel=p, stride=p)`）+ `ViT`（含 CLS token、位置编码、分类头）
+- [ ] `PatchEmbedding` [x]（`Conv2d(kernel=stride=p)` + 行优先摊平，`backward` 还原特征图；`dx`/`conv.grad_w` 中心差分 ≤1e-7）+ `ViT`（含 CLS token、位置编码、分类头）**待做**
 - [ ] `UNet`（编码-解码 + 跳跃连接）、`FPN`、`SegNet`（简化）
 - [ ] `SwinTransformer`（窗口注意力，简化）、`MLPMixer`
-- [ ] `AttentionPooling` / `GeMPooling`
+- [x] `AttentionPooling`（`q` 可学，`q=0` 退化为平均；`dx`/`grad_q` 中心差分 ≤1e-9）、`GeMPooling`（`p=1` 平均 / `p=2` 均方根 / `p=2000` 仍不溢出，log 空间实现）
 
 ### W5 注意力与位置编码（P1/P2）
 - [ ] `MLA`（低秩 KV 压缩）；`MQA` 标注为 `num_kv_heads=1` 特例
