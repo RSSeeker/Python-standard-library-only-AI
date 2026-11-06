@@ -177,7 +177,7 @@
 - [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（未实现 YaRN 的 mscale 温度，docstring 注明）
 - [x] `MLAttention`（MLA 简化版：低秩 KV 潜在向量 `d_c`，KV cache 从 `T·2·H·d_k` 降到 `T·d_c`；
       T=4/H=2/d_k=4 时压缩 8 倍；五组权重与偏置梯度中心差分 ≤1e-5）**W5-B4**
-- [ ] 位置编码剩余：T5 相对位置偏置、xPos
+- [x] 位置编码剩余：T5 相对位置偏置、xPos —— `T5RelativeBias(num_heads, num_buckets=32, max_distance=128, bidirectional=True)`（`(num_buckets, num_heads)` 可学习表，`t5_relative_buckets` 按 T5 原公式：正负各占一半桶、每半区再分近端线性/远端对数）+ `xpos_factors(seq_len, d_k, base=10000.0, alpha=1.0, offset=0.0)`（位置衰减 `(t+1+offset)^(-alpha*theta_i)`，位置 0 归 1、`alpha=0` 等于关闭）。踩过的坑：①分桶若把远端也算进本半区低桶，会出现「距离 3 → 桶 3、距离 4 → 桶 0」的非单调，改成每半区再二分后单调；②`_la_apply_adam` 的签名是 `(param, grad, m, v, lr, c1, c2, beta1, beta2, eps)`，没有 `t` 参数
 - [x] `LinearAttention`（`phi=elu+1`，O(T·d²)；`causal=True` 用前缀和、非 causal 用全长和；
       `W_q/W_k/W_v/W_o` 与输入梯度中心差分 ≤1e-5，120 步 Adam 收敛）
 - [x] `LinformerAttention`（K/V 低秩投影 `E`/`F`，O(T·k·d)；不支持 causal；

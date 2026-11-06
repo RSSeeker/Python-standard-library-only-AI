@@ -14571,3 +14571,106 @@ class TestFlashAttention:
                 fn()
         with pytest.raises(RuntimeError):
             AI.FlashAttention(4, 2).backward(DOUT4C)
+
+
+class TestT5RelativeBias:
+    def test_buckets(self):
+        b = AI.t5_relative_buckets(6, 6, 8, 16, True)
+        half = 4
+        # 正负相对位置落不同半区，对角线为 0，且不越界
+        for i in range(6):
+            assert b[i][i] == 0
+            left = [b[i][j] for j in range(i - 1, -1, -1)]
+            right = [b[i][j] for j in range(i + 1, 6)]
+            assert left == sorted(left)
+            assert right == sorted(right)
+            assert all(v < half for v in left)
+            assert all(v >= half for v in right)
+        # 非双向：只按距离，且夹到桶表范围
+        nb = AI.t5_relative_buckets(1, 60, 8, 128, False)[0]
+        assert nb[:5] == [0, 1, 2, 3, 4]
+        assert max(nb) == 7
+
+    def test_forward_lookup(self):
+        op = AI.T5RelativeBias(2, num_buckets=8, max_distance=16)
+        bias = op.forward(4)
+        buckets = AI.t5_relative_buckets(4, 4, 8, 16, True)
+        for h in range(2):
+            for i in range(4):
+                for j in range(4):
+                    assert bias[h][i][j] == op.table[buckets[i][j]][h]
+        assert op.param_count() == 16
+        # 同一桶的位置取值相同（只与相对位置有关）
+        assert bias[0][0][0] == bias[0][1][1]
+
+    def test_backward_sums_within_bucket(self):
+        op = AI.T5RelativeBias(2, num_buckets=8, max_distance=16)
+        op.forward(4)
+        db = [[[0.5 + 0.1 * h + 0.01 * (i + j) for j in range(4)]
+               for i in range(4)] for h in range(2)]
+        step = op.backward(db)
+        buckets = AI.t5_relative_buckets(4, 4, 8, 16, True)
+        manual = [[0.0] * 2 for _ in range(8)]
+        for h in range(2):
+            for i in range(4):
+                for j in range(4):
+                    manual[buckets[i][j]][h] += db[h][i][j]
+        for x in range(8):
+            for h in range(2):
+                assert abs(step[x][h] - manual[x][h]) < 1e-12
+                assert abs(op.grad_table[x][h] - manual[x][h]) < 1e-12
+        op.zero_grad()
+        assert all(v == 0.0 for r in op.grad_table for v in r)
+
+    def test_optimizers_and_errors(self):
+        op = AI.T5RelativeBias(2, num_buckets=8, max_distance=16)
+        op.forward(3)
+        op.backward([[[1.0] * 3 for _ in range(3)] for _ in range(2)])
+        before = [list(r) for r in op.table]
+        op.sgd_step(0.1)
+        assert op.table != before
+        op.zero_grad()
+        op.forward(3)
+        op.backward([[[1.0] * 3 for _ in range(3)] for _ in range(2)])
+        mid = [list(r) for r in op.table]
+        op.adam_step(0.01)
+        assert op.table != mid
+        with pytest.raises((ValueError, TypeError)):
+            AI.T5RelativeBias(0)
+        with pytest.raises((ValueError, TypeError)):
+            AI.T5RelativeBias(2, num_buckets=2)
+        with pytest.raises((ValueError, TypeError)):
+            AI.T5RelativeBias(2, std=-1.0)
+        with pytest.raises(RuntimeError):
+            AI.T5RelativeBias(2).backward([[[1.0]]])
+        op2 = AI.T5RelativeBias(2)
+        op2.forward(3)
+        with pytest.raises(ValueError):
+            op2.backward([[[1.0] * 3 for _ in range(3)]])
+        with pytest.raises(ValueError):
+            op2.backward([[[1.0] * 3] for _ in range(2)])
+
+
+class TestXPosFactors:
+    def test_shape_and_decay(self):
+        f = AI.xpos_factors(5, 8)
+        assert len(f) == 5 and all(len(r) == 8 for r in f)
+        # 位置 0 处乘子为 1（与标准 RoPE 一致）
+        assert all(v == 1.0 for v in f[0])
+        # 越靠后衰减越多；同一位置内低频索引（theta 更大）衰减更多
+        assert all(f[t][0] > f[t + 1][0] for t in range(4))
+        assert f[4][0] < f[4][6]
+
+    def test_extremes_and_errors(self):
+        # alpha=0 等于关闭 xPos
+        assert all(v == 1.0 for r in AI.xpos_factors(3, 8, alpha=0.0) for v in r)
+        # offset 相当于从更靠后的位置开始，因子只会更小
+        m = AI.xpos_factors(3, 8, alpha=1.0, offset=2.0)
+        assert m[0][0] < AI.xpos_factors(3, 8)[0][0]
+        for fn in (lambda: AI.xpos_factors(0, 4),
+                   lambda: AI.xpos_factors(3, 5),
+                   lambda: AI.xpos_factors(3, 4, base=0.0),
+                   lambda: AI.xpos_factors(3, 4, alpha=-1.0),
+                   lambda: AI.xpos_factors(3, 4, offset=-1.0)):
+            with pytest.raises((ValueError, TypeError)):
+                fn()

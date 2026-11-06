@@ -11901,6 +11901,202 @@ class FlashAttention(_SparseAttention):
         return dx
 
 
+def _is_num(v) -> bool:
+    """有限实数（bool 不算）"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _ck_int(v, name: str, minimum: int):
+    """正整数校验（bool 不算整数），返回 int"""
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise TypeError('%s 必须是整数，收到 %r' % (name, v))
+    if v < minimum:
+        raise ValueError('%s 必须 >= %d，收到 %d' % (name, minimum, v))
+    return int(v)
+
+
+def t5_relative_buckets(qlen: int, klen: int, num_buckets: int = 32,
+                        max_distance: int = 128,
+                        bidirectional: bool = True) -> List[List[int]]:
+    """T5 的相对位置分桶（与论文/原实现同公式，纯整数运算）。
+
+    返回 ``(qlen, klen)`` 的桶编号矩阵。相对位置 ``i - j`` 先按正负切成
+    「远/近」两半，近端线性分桶、远端按 ``log`` 增速分桶，再截断到
+    ``max_distance``。``bidirectional=False`` 时只保留 ``j <= i`` 的一半
+    （因果语言模型用），负相对位置被折回同一套桶。
+    """
+    _ck_int(qlen, 't5_relative_buckets(qlen)', 1)
+    _ck_int(klen, 't5_relative_buckets(klen)', 1)
+    _ck_int(num_buckets, 't5_relative_buckets(num_buckets)', 4)
+    _ck_int(max_distance, 't5_relative_buckets(max_distance)', 1)
+    if not isinstance(bidirectional, bool):
+        raise TypeError('t5_relative_buckets: bidirectional 必须是 bool')
+    half = num_buckets // 2
+    max_exact = half // 2
+    ret = []
+    for i in range(qlen):
+        row = []
+        for j in range(klen):
+            rel = j - i
+            if bidirectional:
+                # T5 原公式：先按正负分成两个半区，每个半区内部再分
+                # 「近端线性（距离 < max_exact）」与「远端对数」两段。
+                n = abs(rel)
+                if n < max_exact:
+                    inner = n
+                else:
+                    inner = max_exact + int(
+                        math.log(max(n, 1) / max_exact)
+                        / math.log(max_distance / max_exact)
+                        * (half - max_exact))
+                    inner = min(inner, half - 1)
+                row.append(inner + (half if rel > 0 else 0))
+            else:
+                # 因果版：只看左侧距离，并夹到桶表范围内
+                row.append(min(abs(rel), max_distance, num_buckets - 1))
+        ret.append(row)
+    return ret
+
+
+class T5RelativeBias:
+    """T5 式相对位置偏置：可学习的 ``(num_buckets, num_heads)`` 表，加到分数上。
+
+    ``forward(qlen, klen=None)`` 返回 ``bias[head][i][j]``；``backward(dbias)``
+    把梯度累加到 ``self.grad_table``。用法::
+
+        bias_op = T5RelativeBias(num_heads=4)
+        bias = bias_op.forward(T)          # 加在 softmax 之前的 scores 上
+        biases = bias_op.backward(dscores) # dscores 同形状
+    """
+
+    def __init__(self, num_heads: int, num_buckets: int = 32,
+                 max_distance: int = 128, bidirectional: bool = True,
+                 std: float = 0.02):
+        _ck_int(num_heads, 'T5RelativeBias(num_heads)', 1)
+        _ck_int(num_buckets, 'T5RelativeBias(num_buckets)', 4)
+        _ck_int(max_distance, 'T5RelativeBias(max_distance)', 1)
+        if not isinstance(bidirectional, bool):
+            raise TypeError('T5RelativeBias: bidirectional 必须是 bool')
+        if not _is_num(std) or std < 0.0:
+            raise ValueError('T5RelativeBias: std 必须是非负有限数字')
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.bidirectional = bidirectional
+        rng = random.Random(20240502 + num_heads * 1009 + num_buckets)
+        self.table = [[rng.gauss(0.0, float(std)) for _ in range(num_heads)]
+                      for _ in range(num_buckets)]
+        self.grad_table = [[0.0] * num_heads for _ in range(num_buckets)]
+        self.m_table = [[0.0] * num_heads for _ in range(num_buckets)]
+        self.v_table = [[0.0] * num_heads for _ in range(num_buckets)]
+        self._adam_t = 0
+        self._cache = None
+
+    def forward(self, qlen: int, klen: Optional[int] = None) -> List[List[List[float]]]:
+        """返回 ``bias[head][i][j]``（bias 形状 ``(num_heads, qlen, klen)``）"""
+        if klen is None:
+            klen = qlen
+        buckets = t5_relative_buckets(qlen, klen, self.num_buckets,
+                                      self.max_distance, self.bidirectional)
+        h, t = self.num_heads, qlen
+        out = [[[0.0] * klen for _ in range(t)] for _ in range(h)]
+        for head in range(h):
+            tab = self.table
+            for i in range(t):
+                row = buckets[i]
+                dst = out[head][i]
+                for j in range(klen):
+                    dst[j] = tab[row[j]][head]
+        self._cache = buckets
+        return out
+
+    def backward(self, dbias: List[List[List[float]]]) -> List[List[float]]:
+        """累加 ``table`` 的梯度并返回本次的梯度（形状同 table）"""
+        if self._cache is None:
+            raise RuntimeError('T5RelativeBias.backward: 需要先 forward')
+        if not isinstance(dbias, list) or len(dbias) != self.num_heads:
+            raise ValueError('T5RelativeBias.backward: dbias 头数不匹配')
+        buckets = self._cache
+        t = len(buckets)
+        klen = len(buckets[0])
+        step = [[0.0] * self.num_heads for _ in range(self.num_buckets)]
+        for head in range(self.num_heads):
+            dh = dbias[head]
+            if not isinstance(dh, list) or len(dh) != t:
+                raise ValueError('T5RelativeBias.backward: dbias 行数与 forward 不一致')
+            for i in range(t):
+                row = dh[i]
+                if not isinstance(row, list) or len(row) != klen:
+                    raise ValueError('T5RelativeBias.backward: dbias 列数与 forward 不一致')
+                brow = buckets[i]
+                for j in range(klen):
+                    step[brow[j]][head] += row[j]
+        for b in range(self.num_buckets):
+            for head in range(self.num_heads):
+                self.grad_table[b][head] += step[b][head]
+        return step
+
+    def zero_grad(self):
+        self.grad_table = [[0.0] * self.num_heads for _ in range(self.num_buckets)]
+
+    def param_count(self) -> int:
+        return self.num_buckets * self.num_heads
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'T5RelativeBias.sgd_step')
+        _la_apply_sgd(self.table, self.grad_table, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'T5RelativeBias.adam_step')
+        _check_adam_betas(beta1, beta2, 'T5RelativeBias.adam_step')
+        self._adam_t += 1
+        c1 = 1.0 - beta1 ** self._adam_t
+        c2 = 1.0 - beta2 ** self._adam_t
+        _la_apply_adam(self.table, self.grad_table, self.m_table, self.v_table,
+                       lr, c1, c2, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+def xpos_factors(seq_len: int, d_k: int, base: float = 10000.0,
+                 alpha: float = 1.0, offset: float = 0.0) -> List[List[float]]:
+    """xPos 的位置衰减因子（简化版）：对第 ``i`` 个频率维乘以
+    ``(t + 1 + offset) ** (-alpha * theta_i)``，``theta_i = base ** (-2i/d_k)``。
+
+    位置 0 处因子为 1（与标准 RoPE 一致），越靠后衰减越多；``alpha=0``
+    时退化为全 1（即「关闭 xPos」）。返回 ``seq_len x d_k`` 的乘子矩阵，
+    直接逐元素乘到旋转后的 q/k 上即可。真实 xPos 还会配合长度外推的
+    offset 使用，这里只实现衰减部分。
+    """
+    _ck_int(seq_len, 'xpos_factors(seq_len)', 1)
+    _ck_int(d_k, 'xpos_factors(d_k)', 1)
+    if d_k % 2 != 0:
+        raise ValueError('xpos_factors: d_k 必须是偶数')
+    if not _is_num(base) or base <= 0.0:
+        raise ValueError('xpos_factors: base 必须是正有限数字')
+    if not _is_num(alpha) or alpha < 0.0:
+        raise ValueError('xpos_factors: alpha 必须是非负有限数字')
+    if not _is_num(offset) or offset < 0.0:
+        raise ValueError('xpos_factors: offset 必须是非负有限数字')
+    pairs = d_k // 2
+    theta = [float(base) ** (-2.0 * i / d_k) for i in range(pairs)]
+    out = []
+    for t in range(seq_len):
+        pos = t + 1 + float(offset)
+        row = []
+        for i in range(pairs):
+            f = 1.0 if alpha == 0.0 else pos ** (-alpha * theta[i])
+            row.append(f)
+            row.append(f)
+        out.append(row)
+    return out
+
+
 class LinearAttention:
     """线性注意力（Katharopoulos et al. 2020）：`phi(x) = elu(x) + 1`
 
