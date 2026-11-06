@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（848 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（862 项）
 
 ## 特性
 
@@ -177,6 +177,11 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `Conv3d` | 三维卷积：`(C,D,H,W) → (Cout,Od,Oh,Ow)`，三轴独立 kernel/stride/padding；直接滑动窗口累加（不做 im2col，小体数据更省内存） |
 | `ConvTranspose3d` | 三维转置卷积：每轴 `(D-1)*s-2p+k+op`，前向按 stride 散射累加，`output_padding` 只改输出尺寸 |
 | `DropPath` | 随机深度：整条残差分支按概率丢弃（inverted，`eval()` 关闭） |
+| `ReZero(layer, init_alpha=0.0)` | ReZero 残差：`y = x + alpha·f(x)`，`alpha` 从 0 起可学 ⇒ 整块初始就是恒等映射，深层网络一开始不爆也不消 |
+| `SkipInit(layer, num_blocks=1)` | SkipInit 残差：`y = x + beta·f(x)`，`beta = 1/√num_blocks` **固定不可学**（参数量与内层相同） |
+| `PreNormResidual(layer, eps=1e-5)` | Pre-LN 残差：`y = x + f(LN(x))`，归一化在分支入口、主路是干净单位通路（主流 Transformer 摆法） |
+| `PostNormResidual(layer, eps=1e-5)` | Post-LN 残差：`y = LN(x + f(x))`（Transformer 原始论文摆法，主路梯度要穿 LN） |
+| `Highway(num_features)` | Highway 门控：`y = g ⊙ x + (1-g) ⊙ tanh(w ⊙ x + b)`，`g = sigmoid(W_g·x + b_g)` 逐特征门控且依赖整条输入 |
 | `BatchNorm1d` | 批归一化：`forward` 同时接受单样本与 batch；训练+2D 走 batch 统计量，推理用 running 统计量 |
 | `BatchNorm2d` | 二维批归一化：按通道在 H×W 上归一化，训练更新 running 统计量、`eval()` 用 running；`backward` 返回 `(dx, grad_gamma, grad_beta)`，**反向也分模式**（eval 时统计量来自 running，dx 为逐元素 `gamma/sqrt(var+eps)`） |
 | `GroupNorm` / `InstanceNorm` | 分组归一化（`(C,H,W)`，小 batch 稳定）；`InstanceNorm` 是组数等于通道数的特例 |
@@ -1063,7 +1068,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-848 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+862 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1151,6 +1156,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInitFamily` | LeCun 正态/均匀的 `std` 与界内、正交矩阵行模长 `==gain` 且两两正交（fat 矩阵改验列正交）、稀疏零比例、截断正态界内、`zero_bias`、残差零初始化后退化为 `relu(x)`（Bottleneck 零 `bn3` 而非 `short_bn`）、非法输入、默认 He 初始化未被改动 |
 | `TestWeightNorm` | 初始化即等于原层、`dv`（含 `v`/`g` 解耦项）/`dg`/`db` 中心差分、`dx = wᵀdout`、forward 不永久改写内层权重 |
 | `TestSpectralNorm` | 前向 `(v/σ)x+b`、冻结 σ 时 `dv` 中心差分、未冻结时 σ 随权重变化、`power_iter`/维度/未 forward 校验 |
+| `TestReZeroSkipInit` | `alpha=0` 时输出逐位等于输入、`x + 0.5·f(x)` 闭式解、`grad_alpha` 与 `dx` 中心差分、SkipInit 的 `beta=1/√n` 与不可学参数量、6 类非法输入 |
+| `TestPrePostNorm` | Pre-LN 闭式解、Pre-LN 与 Post-LN 输出不同、`dx`（穿 LN）与 `norm.gamma` 中心差分、层数不符报错 |
+| `TestHighway` | 闭式解、`param_count = d²+3d`、`dx`/`wg`/`w` 中心差分、`sgd_step`/`adam_step` 真改参数、4 类非法输入 |
 | `TestSwitchNorm` | 三统计量加权闭式解、`dx`/`gamma`/`beta`/`logits` 四组中心差分、批量形状、整体平移 logits 不变性、优化器步与非法输入 |
 | `TestFRN` | 闭式解与 TLU 截断、`dx`/`beta`/`tau` 中心差分、eps→0 时的尺度不变性、优化器步与 6 类非法输入 |
 | `TestFractionalPooling` | 输出尺寸随比例、每个输出等于被选位置原值、同 seed 逐位相同、反向只回传被选位置且总量守恒 |
@@ -1212,7 +1220,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 848 个单元测试
+├── test_ai.py       # 862 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

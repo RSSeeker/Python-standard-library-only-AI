@@ -160,7 +160,7 @@
       拿 ReLU 输出算 std 时偏置平移会把一半压成 0，收敛到 0.79 就到头了）、
       `fixup_init`（残差分支最后一层 `1/√n` 缩放 + 偏置置零；Conv2d 权重是 4 层嵌套要逐叶缩放）、
       `mimic_init`（NET2NET 宽度/深度迁移，激活不一致报错）
-- [ ] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway
+- [x] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway（ReZero/SkipInit/PreNormResidual/PostNormResidual/Highway；dx/参数梯度中心差分 ≤1e-6，ReZero 的 lpha=0 逐位恒等；顺带补了 _dense_param_count/_dense_apply_sgd/_dense_apply_adam/_norm_* 六个助手，因为 Layer/LayerNorm 本身没有 param_count()/sgd_step()）
 
 ### W4 视觉骨干（P0/P1）
 - [ ] `PatchEmbedding`（= `Conv2d(in=3, out=d_model, kernel=p, stride=p)`）+ `ViT`（含 CLS token、位置编码、分类头）

@@ -12033,3 +12033,230 @@ class TestMimicInit:
         out = AI.mimic_init(AI.MLP([3, 4], activations=["relu"]),
                             AI.MLP([3, 4, 2], activations=["relu", "relu"]))
         assert out["depth_copied"] == 1
+
+# ---------------------------------------------------------------------------
+#  残差变体（ReZero / SkipInit / Pre-LN / Post-LN / Highway）
+# ---------------------------------------------------------------------------
+class TestReZeroSkipInit:
+    """ReZero 与 SkipInit：缩放残差分支"""
+
+    def test_rezero_identity_at_zero(self):
+        layer = AI.Layer(3, 3, "relu")
+        rz = AI.ReZero(layer, init_alpha=0.0)
+        x = [0.3, -1.2, 2.0]
+        assert rz.forward(x) == x          # alpha=0 ⇒ 逐位恒等
+
+    def test_rezero_forward_and_grad(self):
+        layer = AI.Layer(3, 3, "relu")
+        rz = AI.ReZero(layer, init_alpha=0.5)
+        x = [0.3, -1.2, 2.0]
+        branch = [v for v in layer.forward(x)]
+        got = rz.forward(x)
+        for i in range(3):
+            assert abs(got[i] - (x[i] + 0.5 * branch[i])) < 1e-15
+
+        dx = rz.backward([1.0, -1.0, 0.5])
+        assert abs(rz.grad_alpha[0]
+                   - (1.0 * branch[0] - 1.0 * branch[1] + 0.5 * branch[2])) < 1e-12
+
+        # dx：数值差分
+        def loss():
+            return sum(rz.forward(x)[i] * c for i, c in enumerate((1.0, -1.0, 0.5)))
+
+        for i in range(3):
+            old = x[i]
+            x[i] = old + 1e-6
+            lp = loss()
+            x[i] = old - 1e-6
+            lm = loss()
+            x[i] = old
+            assert abs((lp - lm) / 2e-6 - dx[i]) < 1e-6
+
+    def test_skipinit_beta_and_param_count(self):
+        layer = AI.Layer(3, 3, "relu")
+        sk = AI.SkipInit(layer, num_blocks=4)
+        assert abs(sk.beta - 0.5) < 1e-15
+        assert sk.param_count() == 3 * 3 + 3    # 不可学，参数与内层相同
+
+        x = [0.3, -1.2, 2.0]
+        branch = [v for v in layer.forward(x)]
+        got = sk.forward(x)
+        for i in range(3):
+            assert abs(got[i] - (x[i] + 0.5 * branch[i])) < 1e-15
+
+    def test_rezero_invalid(self):
+        with pytest.raises(TypeError):
+            AI.ReZero("not a layer")
+        with pytest.raises(ValueError):
+            AI.ReZero(AI.Layer(3, 3), init_alpha=float("nan"))
+        with pytest.raises(ValueError):
+            AI.SkipInit(AI.Layer(3, 3), num_blocks=0)
+        with pytest.raises(TypeError):
+            AI.SkipInit(AI.Layer(3, 3), num_blocks=True)
+        with pytest.raises(ValueError):
+            AI.ReZero(AI.Layer(3, 3)).forward([1.0])
+        with pytest.raises(RuntimeError):
+            AI.ReZero(AI.Layer(3, 3)).backward([1.0, 2.0, 3.0])
+
+
+class TestPrePostNorm:
+    """Pre-LN 与 Post-LN 残差"""
+
+    def _setup(self, cls):
+        block = cls(AI.Layer(3, 3, "relu"))
+        block.norm.gamma = [1.2, 0.8, 1.0]
+        block.norm.beta = [0.1, -0.2, 0.3]
+        return block
+
+    def test_prenorm_forward(self):
+        block = self._setup(AI.PreNormResidual)
+        x = [0.3, -1.2, 2.0]
+        n = block.norm.forward(x)
+        branch = [v for v in block.layer.forward(n)]
+        got = block.forward(x)
+        for i in range(3):
+            assert abs(got[i] - (x[i] + branch[i])) < 1e-14
+
+    def test_postnorm_forward_differs(self):
+        pre = self._setup(AI.PreNormResidual)
+        post = self._setup(AI.PostNormResidual)
+        x = [0.3, -1.2, 2.0]
+        assert pre.forward(x) != post.forward(x)
+
+    def test_prenorm_gradients(self):
+        block = self._setup(AI.PreNormResidual)
+        x = [0.3, -1.2, 2.0]
+        coef = (0.7, -0.4, 1.1)
+        block.forward(x)
+        dx = block.backward(list(coef))
+
+        def loss():
+            return sum(block.forward(x)[i] * coef[i] for i in range(3))
+
+        for i in range(3):
+            old = x[i]
+            x[i] = old + 1e-6
+            lp = loss()
+            x[i] = old - 1e-6
+            lm = loss()
+            x[i] = old
+            assert abs((lp - lm) / 2e-6 - dx[i]) < 1e-6
+
+        for i in range(3):
+            g = block.norm.gamma
+            old = g[i]
+            g[i] = old + 1e-6
+            lp = loss()
+            g[i] = old - 1e-6
+            lm = loss()
+            g[i] = old
+            assert abs((lp - lm) / 2e-6 - block.norm_grads[0][i]) < 1e-6
+
+    def test_postnorm_gradient(self):
+        block = self._setup(AI.PostNormResidual)
+        x = [0.3, -1.2, 2.0]
+        coef = (0.7, -0.4, 1.1)
+        block.forward(x)
+        dx = block.backward(list(coef))
+
+        def loss():
+            return sum(block.forward(x)[i] * coef[i] for i in range(3))
+
+        for i in range(3):
+            old = x[i]
+            x[i] = old + 1e-6
+            lp = loss()
+            x[i] = old - 1e-6
+            lm = loss()
+            x[i] = old
+            assert abs((lp - lm) / 2e-6 - dx[i]) < 1e-6
+
+    def test_norm_blocks_param_count(self):
+        pre = self._setup(AI.PreNormResidual)
+        # 内层 3*3+3 = 12，LN 的 gamma/beta 各 3 ⇒ 总 18
+        assert pre.param_count() == 12 + 6
+
+
+class TestHighway:
+    """Highway 门控残差"""
+
+    def _gate(self, hw, x, i):
+        acc = hw.bg[i] + sum(hw.wg[i][j] * x[j] for j in range(3))
+        return 1.0 / (1.0 + math.exp(-acc))
+
+    def test_forward_closed_form(self):
+        hw = AI.Highway(3)
+        x = [0.3, -1.2, 2.0]
+        hs = []
+        gs = []
+        for i in range(3):
+            gs.append(self._gate(hw, x, i))
+            hs.append(math.tanh(hw.w[i] * x[i] + hw.b[i]))
+        got = hw.forward(x)
+        for i in range(3):
+            assert abs(got[i] - (gs[i] * x[i] + (1 - gs[i]) * hs[i])) < 1e-14
+
+    def test_param_count(self):
+        assert AI.Highway(3).param_count() == 9 + 9      # d*d + 3d
+
+    def test_gradients_all_five(self):
+        hw = AI.Highway(3)
+        x = [0.3, -1.2, 2.0]
+        coef = (0.7, -0.4, 1.1)
+        hw.forward(x)
+        dx = hw.backward(list(coef))
+
+        def loss():
+            return sum(hw.forward(x)[i] * coef[i] for i in range(3))
+
+        for i in range(3):
+            old = x[i]
+            x[i] = old + 1e-6
+            lp = loss()
+            x[i] = old - 1e-6
+            lm = loss()
+            x[i] = old
+            assert abs((lp - lm) / 2e-6 - dx[i]) < 1e-6
+
+        old = hw.wg[0][1]
+        hw.wg[0][1] = old + 1e-6
+        lp = loss()
+        hw.wg[0][1] = old - 1e-6
+        lm = loss()
+        hw.wg[0][1] = old
+        assert abs((lp - lm) / 2e-6 - hw.grad_wg[0][1]) < 1e-6
+
+        old = hw.w[1]
+        hw.w[1] = old + 1e-6
+        lp = loss()
+        hw.w[1] = old - 1e-6
+        lm = loss()
+        hw.w[1] = old
+        assert abs((lp - lm) / 2e-6 - hw.grad_w[1]) < 1e-6
+
+    def test_optimizer_steps(self):
+        hw = AI.Highway(3)
+        x = [0.3, -1.2, 2.0]
+        hw.forward(x)
+        hw.backward([1.0, 1.0, 1.0])
+        before = [row[:] for row in hw.wg]
+        hw.sgd_step(0.1)
+        assert any(abs(before[i][j] - hw.wg[i][j]) > 1e-12
+                   for i in range(3) for j in range(3))
+
+        hw.forward(x)
+        hw.backward([1.0, 1.0, 1.0])
+        before = [row[:] for row in hw.wg]
+        hw.adam_step(0.01)
+        assert any(abs(before[i][j] - hw.wg[i][j]) > 1e-12
+                   for i in range(3) for j in range(3))
+
+    def test_invalid(self):
+        with pytest.raises(TypeError):
+            AI.Highway(3.0)
+        with pytest.raises(ValueError):
+            AI.Highway(0)
+        with pytest.raises(ValueError):
+            AI.Highway(3).forward([1.0])
+        with pytest.raises(RuntimeError):
+            AI.Highway(3).backward([1.0, 2.0, 3.0])

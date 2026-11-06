@@ -4878,6 +4878,534 @@ class FReLU:
         self.zero_grad()
 
 
+def _dense_param_count(layer):
+    """`Layer` 的参数量（权重 + 偏置）；`Layer` 本身没有 `param_count()`"""
+    return len(layer.weights) * len(layer.weights[0]) + len(layer.biases)
+
+
+def _dense_apply_sgd(layer, grads, lr):
+    """把 `backward` 返回的 `(grad_w, grad_b)` 原地 SGD 到 `Layer` 上"""
+    if grads is None:
+        raise RuntimeError("_dense_apply_sgd: 必须先调用 backward()")
+    gw, gb = grads
+    for i in range(len(layer.weights)):
+        wi = layer.weights[i]
+        for j in range(len(wi)):
+            wi[j] -= lr * gw[i][j]
+    for i in range(len(layer.biases)):
+        layer.biases[i] -= lr * gb[i]
+
+
+def _dense_apply_adam(layer, grads, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    """把 `backward` 的梯度原地 Adam 到 `Layer`（矩复用 layer 自带的 `m_*`/`v_*`）"""
+    if grads is None:
+        raise RuntimeError("_dense_apply_adam: 必须先调用 backward()")
+    gw, gb = grads
+    layer._dense_adam_t = getattr(layer, '_dense_adam_t', 0) + 1
+    t = layer._dense_adam_t
+    c1 = 1.0 - beta1 ** t
+    c2 = 1.0 - beta2 ** t
+    for i in range(len(layer.weights)):
+        wi, gw_i = layer.weights[i], gw[i]
+        mw_i, vw_i = layer.m_w[i], layer.v_w[i]
+        for j in range(len(wi)):
+            g = gw_i[j]
+            mw_i[j] = beta1 * mw_i[j] + (1 - beta1) * g
+            vw_i[j] = beta2 * vw_i[j] + (1 - beta2) * g * g
+            wi[j] -= lr * (mw_i[j] / c1) / (math.sqrt(vw_i[j] / c2) + eps)
+    for i in range(len(layer.biases)):
+        g = gb[i]
+        layer.m_b[i] = beta1 * layer.m_b[i] + (1 - beta1) * g
+        layer.v_b[i] = beta2 * layer.v_b[i] + (1 - beta2) * g * g
+        layer.biases[i] -= lr * (layer.m_b[i] / c1) / (
+            math.sqrt(layer.v_b[i] / c2) + eps)
+
+
+def _norm_param_count(norm):
+    """`LayerNorm` 的参数量（gamma + beta）"""
+    return 2 * len(norm.gamma)
+
+
+def _norm_apply_sgd(norm, grads, lr):
+    """把 `LayerNorm.backward` 的 `(grad_gamma, grad_beta)` 原地 SGD"""
+    if grads is None:
+        raise RuntimeError("_norm_apply_sgd: 必须先调用 backward()")
+    gg, gbeta = grads
+    for i in range(len(norm.gamma)):
+        norm.gamma[i] -= lr * gg[i]
+        norm.beta[i] -= lr * gbeta[i]
+
+
+def _norm_apply_adam(norm, grads, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    if grads is None:
+        raise RuntimeError("_norm_apply_adam: 必须先调用 backward()")
+    gg, gbeta = grads
+    norm._dense_adam_t = getattr(norm, '_dense_adam_t', 0) + 1
+    t = norm._dense_adam_t
+    c1 = 1.0 - beta1 ** t
+    c2 = 1.0 - beta2 ** t
+    for i in range(len(norm.gamma)):
+        g = gg[i]
+        norm.m_gamma[i] = beta1 * norm.m_gamma[i] + (1 - beta1) * g
+        norm.v_gamma[i] = beta2 * norm.v_gamma[i] + (1 - beta2) * g * g
+        norm.gamma[i] -= lr * (norm.m_gamma[i] / c1) / (
+            math.sqrt(norm.v_gamma[i] / c2) + eps)
+        g = gbeta[i]
+        norm.m_beta[i] = beta1 * norm.m_beta[i] + (1 - beta1) * g
+        norm.v_beta[i] = beta2 * norm.v_beta[i] + (1 - beta2) * g * g
+        norm.beta[i] -= lr * (norm.m_beta[i] / c1) / (
+            math.sqrt(norm.v_beta[i] / c2) + eps)
+
+
+class ReZero:
+    """ReZero：`y = x + alpha * f(x)`，`alpha` 从 0 开始可学
+
+    分支初始乘 0 ⇒ 整块初始就是恒等映射，深层网络一开始不会爆也不会消。
+    `f` 必须是有 `(grad_w, grad_b, delta)` 三元组反向的 `Layer`。
+    """
+
+    def __init__(self, layer: "Layer", init_alpha: float = 0.0):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"ReZero: layer 必须是 Layer，收到 {type(layer).__name__}")
+        if isinstance(init_alpha, bool) or not isinstance(init_alpha, (int, float)):
+            raise TypeError(
+                f"ReZero: init_alpha 必须是数字，收到 {type(init_alpha).__name__}")
+        if not math.isfinite(float(init_alpha)):
+            raise ValueError(f"ReZero: init_alpha 必须是有限数，收到 {init_alpha!r}")
+        self.layer = layer
+        self.d = layer.fan_in
+        self.alpha = [float(init_alpha)]
+        self.x = None
+        self.branch = None
+        self.grad_alpha = [0.0]
+        self.m_alpha = [0.0]
+        self.v_alpha = [0.0]
+        self._adam_t = 0
+        self.inner_grads = None
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"ReZero.forward: 输入长度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        b = self.layer.forward(x)
+        self.branch = b
+        a = self.alpha[0]
+        return [x[i] + a * b[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("ReZero.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"ReZero.backward: dout 长度 {len(dout)} 与本层 {self.d} 不一致")
+        a = self.alpha[0]
+        gw, gb, delta = self.layer.backward([a * v for v in dout])
+        self.inner_grads = (gw, gb)
+        self.grad_alpha = [sum(dout[i] * self.branch[i] for i in range(self.d))]
+        return [dout[i] + delta[i] for i in range(self.d)]
+
+    def zero_grad(self):
+        self.grad_alpha = [0.0]
+        self.inner_grads = None
+
+    def param_count(self):
+        return _dense_param_count(self.layer) + 1
+
+    def train(self):
+        self.training = True
+        self.layer.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        self.layer.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ReZero.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.alpha[0] -= lr * self.grad_alpha[0]
+        _dense_apply_sgd(self.layer, self.inner_grads, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ReZero.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        g = self.grad_alpha[0]
+        self.m_alpha[0] = beta1 * self.m_alpha[0] + (1 - beta1) * g
+        self.v_alpha[0] = beta2 * self.v_alpha[0] + (1 - beta2) * g * g
+        mh = self.m_alpha[0] / (1 - beta1 ** self._adam_t)
+        vh = self.v_alpha[0] / (1 - beta2 ** self._adam_t)
+        self.alpha[0] -= lr * mh / (math.sqrt(vh) + eps)
+        _dense_apply_adam(self.layer, self.inner_grads, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class SkipInit:
+    """SkipInit：`y = x + beta * f(x)`，`beta = 1/sqrt(num_blocks)` **固定**
+
+    和 ReZero 的区别是缩放系数不可学、按块数预先定死（原论文的做法），
+    目的是让残差分支的累积方差与块数无关。
+    """
+
+    def __init__(self, layer: "Layer", num_blocks: int = 1):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"SkipInit: layer 必须是 Layer，收到 {type(layer).__name__}")
+        if isinstance(num_blocks, bool) or not isinstance(num_blocks, int):
+            raise TypeError(
+                f"SkipInit: num_blocks 必须是 int，收到 {type(num_blocks).__name__}")
+        if num_blocks < 1:
+            raise ValueError(
+                f"SkipInit: num_blocks 必须 >= 1，收到 {num_blocks!r}")
+        self.layer = layer
+        self.d = layer.fan_in
+        self.num_blocks = num_blocks
+        self.beta = 1.0 / math.sqrt(num_blocks)
+        self.x = None
+        self.inner_grads = None
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"SkipInit.forward: 输入长度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        b = self.layer.forward(x)
+        return [x[i] + self.beta * b[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("SkipInit.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"SkipInit.backward: dout 长度 {len(dout)} 与本层 {self.d} 不一致")
+        gw, gb, delta = self.layer.backward([self.beta * v for v in dout])
+        self.inner_grads = (gw, gb)
+        return [dout[i] + delta[i] for i in range(self.d)]
+
+    def zero_grad(self):
+        self.inner_grads = None
+
+    def param_count(self):
+        return _dense_param_count(self.layer)
+
+    def train(self):
+        self.training = True
+        self.layer.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        self.layer.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SkipInit.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_sgd(self.layer, self.inner_grads, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SkipInit.adam_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_adam(self.layer, self.inner_grads, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class PreNormResidual:
+    """Pre-LN 残差：`y = x + f(LN(x))`
+
+    归一化放在分支入口，主路是干净的单位通路 —— 深层梯度不会在 LN 处衰减，
+    这是现在主流 Transformer 的摆法（Post-LN 是原始实现）。
+    """
+
+    def __init__(self, layer: "Layer", eps: float = 1e-5):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"PreNormResidual: layer 必须是 Layer，收到 {type(layer).__name__}")
+        self.layer = layer
+        self.d = layer.fan_in
+        self.norm = LayerNorm(self.d, eps)
+        self.x = None
+        self.inner_grads = None
+        self.norm_grads = None
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"PreNormResidual.forward: 输入长度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        n = self.norm.forward(x)
+        b = self.layer.forward(n)
+        return [x[i] + b[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("PreNormResidual.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"PreNormResidual.backward: dout 长度 {len(dout)} 与本层 {self.d} 不一致")
+        gw, gb, delta = self.layer.backward(dout)
+        self.inner_grads = (gw, gb)
+        gg, gbeta, dnorm = self.norm.backward(delta)
+        self.norm_grads = (gg, gbeta)
+        return [dout[i] + dnorm[i] for i in range(self.d)]
+
+    def zero_grad(self):
+        self.inner_grads = None
+        self.norm_grads = None
+
+    def param_count(self):
+        return _dense_param_count(self.layer) + _norm_param_count(self.norm)
+
+    def train(self):
+        self.training = True
+        self.layer.train()
+        self.norm.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        self.layer.eval()
+        self.norm.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"PreNormResidual.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_sgd(self.layer, self.inner_grads, lr)
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"PreNormResidual.adam_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_adam(self.layer, self.inner_grads, lr, beta1, beta2, eps)
+        _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class PostNormResidual:
+    """Post-LN 残差：`y = LN(x + f(x))`（Transformer 原始论文的摆法）"""
+
+    def __init__(self, layer: "Layer", eps: float = 1e-5):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"PostNormResidual: layer 必须是 Layer，收到 {type(layer).__name__}")
+        self.layer = layer
+        self.d = layer.fan_in
+        self.norm = LayerNorm(self.d, eps)
+        self.x = None
+        self.summed = None
+        self.inner_grads = None
+        self.norm_grads = None
+        self.training = True
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"PostNormResidual.forward: 输入长度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        b = self.layer.forward(x)
+        s = [x[i] + b[i] for i in range(self.d)]
+        self.summed = s
+        return self.norm.forward(s)
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("PostNormResidual.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"PostNormResidual.backward: dout 长度 {len(dout)} 与本层 {self.d} 不一致")
+        gg, gbeta, ds = self.norm.backward(dout)
+        self.norm_grads = (gg, gbeta)
+        gw, gb, delta = self.layer.backward(ds)
+        self.inner_grads = (gw, gb)
+        return [ds[i] + delta[i] for i in range(self.d)]
+
+    def zero_grad(self):
+        self.inner_grads = None
+        self.norm_grads = None
+
+    def param_count(self):
+        return _dense_param_count(self.layer) + _norm_param_count(self.norm)
+
+    def train(self):
+        self.training = True
+        self.layer.train()
+        self.norm.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        self.layer.eval()
+        self.norm.eval()
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"PostNormResidual.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_sgd(self.layer, self.inner_grads, lr)
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"PostNormResidual.adam_step: lr 必须是非负数，收到 {lr!r}")
+        _dense_apply_adam(self.layer, self.inner_grads, lr, beta1, beta2, eps)
+        _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class Highway:
+    """Highway：`y = g ⊙ x + (1 - g) ⊙ tanh(w ⊙ x + b)`，`g = sigmoid(W_g x + b_g)`
+
+    门控是**逐特征**的，并且依赖整条输入（`W_g` 是矩阵），所以 `dx` 里有一项
+    要把 dout 通过门控传回所有输入维度。变换支路用逐特征权重 `w`（对角），
+    这样保留"每个通道自己的变换"语义。
+    """
+
+    def __init__(self, num_features: int):
+        if isinstance(num_features, bool) or not isinstance(num_features, int):
+            raise TypeError(
+                f"Highway: num_features 必须是 int，收到 {type(num_features).__name__}")
+        if num_features < 1:
+            raise ValueError(
+                f"Highway: num_features 必须 >= 1，收到 {num_features!r}")
+        self.d = num_features
+        rng = random.Random(1234)
+        std = math.sqrt(1.0 / self.d)
+        self.wg = [[rng.gauss(0.0, std) for _ in range(self.d)] for _ in range(self.d)]
+        self.bg = [0.0] * self.d
+        self.w = [rng.gauss(0.0, std) for _ in range(self.d)]
+        self.b = [0.0] * self.d
+        self.grad_wg = [[0.0] * self.d for _ in range(self.d)]
+        self.grad_bg = [0.0] * self.d
+        self.grad_w = [0.0] * self.d
+        self.grad_b = [0.0] * self.d
+        self._init_adam()
+        self.x = None
+        self.g = None
+        self.h = None
+        self.training = True
+
+    def _init_adam(self):
+        self.m_wg = [[0.0] * self.d for _ in range(self.d)]
+        self.v_wg = [[0.0] * self.d for _ in range(self.d)]
+        self.m_bg = [0.0] * self.d
+        self.v_bg = [0.0] * self.d
+        self.m_w = [0.0] * self.d
+        self.v_w = [0.0] * self.d
+        self.m_b = [0.0] * self.d
+        self.v_b = [0.0] * self.d
+        self._adam_t = 0
+
+    def forward(self, x):
+        if len(x) != self.d:
+            raise ValueError(
+                f"Highway.forward: 输入长度 {len(x)} 与本层 {self.d} 不一致")
+        self.x = x
+        g = []
+        for i in range(self.d):
+            acc = self.bg[i]
+            for j in range(self.d):
+                acc += self.wg[i][j] * x[j]
+            g.append(1.0 / (1.0 + math.exp(-acc)) if acc >= 0 else
+                     math.exp(acc) / (1.0 + math.exp(acc)))
+        h = [math.tanh(self.w[i] * x[i] + self.b[i]) for i in range(self.d)]
+        self.g = g
+        self.h = h
+        return [g[i] * x[i] + (1.0 - g[i]) * h[i] for i in range(self.d)]
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("Highway.backward: 必须先调用 forward()")
+        if len(dout) != self.d:
+            raise ValueError(
+                f"Highway.backward: dout 长度 {len(dout)} 与本层 {self.d} 不一致")
+        self.zero_grad()
+        # 门控的局部梯度：dg_i = dout_i * (x_i - h_i)
+        dg_pre = [dout[i] * (self.x[i] - self.h[i]) * self.g[i] * (1.0 - self.g[i])
+                  for i in range(self.d)]
+        for i in range(self.d):
+            self.grad_bg[i] += dg_pre[i]
+            for j in range(self.d):
+                self.grad_wg[i][j] += dg_pre[i] * self.x[j]
+        dpre_h = [dout[i] * (1.0 - self.g[i]) * (1.0 - self.h[i] ** 2)
+                  for i in range(self.d)]
+        for i in range(self.d):
+            self.grad_w[i] += dpre_h[i] * self.x[i]
+            self.grad_b[i] += dpre_h[i]
+        dx = [0.0] * self.d
+        for j in range(self.d):
+            acc = dout[j] * self.g[j]
+            for i in range(self.d):
+                acc += dg_pre[i] * self.wg[i][j]
+            acc += dpre_h[j] * self.w[j]
+            dx[j] = acc
+        return dx
+
+    def zero_grad(self):
+        self.grad_wg = [[0.0] * self.d for _ in range(self.d)]
+        self.grad_bg = [0.0] * self.d
+        self.grad_w = [0.0] * self.d
+        self.grad_b = [0.0] * self.d
+
+    def param_count(self):
+        return self.d * self.d + self.d + 2 * self.d
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"Highway.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.d):
+            for j in range(self.d):
+                self.wg[i][j] -= lr * self.grad_wg[i][j]
+            self.bg[i] -= lr * self.grad_bg[i]
+            self.w[i] -= lr * self.grad_w[i]
+            self.b[i] -= lr * self.grad_b[i]
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"Highway.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        t = self._adam_t
+        for i in range(self.d):
+            for j in range(self.d):
+                gv = self.grad_wg[i][j]
+                self.m_wg[i][j] = beta1 * self.m_wg[i][j] + (1 - beta1) * gv
+                self.v_wg[i][j] = beta2 * self.v_wg[i][j] + (1 - beta2) * gv * gv
+                mh = self.m_wg[i][j] / (1 - beta1 ** t)
+                vh = self.v_wg[i][j] / (1 - beta2 ** t)
+                self.wg[i][j] -= lr * mh / (math.sqrt(vh) + eps)
+            for holder, grad, m, v in ((self.bg, self.grad_bg[i], self.m_bg, self.v_bg),
+                                       (self.w, self.grad_w[i], self.m_w, self.v_w),
+                                       (self.b, self.grad_b[i], self.m_b, self.v_b)):
+                m[i] = beta1 * m[i] + (1 - beta1) * grad
+                v[i] = beta2 * v[i] + (1 - beta2) * grad * grad
+                mh = m[i] / (1 - beta1 ** t)
+                vh = v[i] / (1 - beta2 ** t)
+                holder[i] -= lr * mh / (math.sqrt(vh) + eps)
+        self.zero_grad()
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
