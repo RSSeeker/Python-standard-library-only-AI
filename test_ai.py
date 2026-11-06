@@ -9907,3 +9907,176 @@ class TestConvTranspose3d:
             t.backward([[[[1.0]]]])
         with pytest.raises(ValueError):
             AI.ConvTranspose3d(2, 1, 3).forward([[[[1.0]]]])
+
+
+# ==== W2-F：CBAM 注意力 ====
+
+class TestCBAMBlock:
+    """CBAMBlock 的通道支路 / 空间支路 / 校验"""
+
+    @staticmethod
+    def _clone(x):
+        return [[[v for v in row] for row in ch] for ch in x]
+
+    def _fd_dx(self, block, x, dout, eps=1e-6):
+        def loss(xx):
+            out = block.forward(self._clone(xx))
+            return sum(out[c][h][w] * dout[c][h][w]
+                       for c in range(len(out)) for h in range(len(out[0]))
+                       for w in range(len(out[0][0])))
+
+        block.zero_grad()
+        block.forward(self._clone(x))
+        dx = block.backward(dout)
+        worst = 0.0
+        for c in range(len(x)):
+            for h in range(len(x[0])):
+                for w in range(len(x[0][0])):
+                    old = x[c][h][w]
+                    x[c][h][w] = old + eps
+                    vp = loss(x)
+                    x[c][h][w] = old - eps
+                    vm = loss(x)
+                    x[c][h][w] = old
+                    worst = max(worst, abs((vp - vm) / (2 * eps) - dx[c][h][w]))
+        return dx, worst
+
+    def test_channel_branch_matches_se(self):
+        """空间支路退化成恒等（sp_w=0、sp_b 很大）时，通道支路与 SEBlock 逐位相同"""
+        random.seed(901)
+        cb = AI.CBAMBlock(3, reduction=2, kernel_size=3)
+        for a in range(3):
+            for b in range(3):
+                cb.sp_w[a][b] = 0.0
+        cb.sp_b[0] = 50.0                      # sigmoid(50) ≈ 1
+        se = AI.SEBlock(3, reduction=2)
+        se.W1 = [[v for v in row] for row in cb.W1]
+        se.b1 = list(cb.b1)
+        se.W2 = [[v for v in row] for row in cb.W2]
+        se.b2 = list(cb.b2)
+        x = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(3)]
+        dout = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                for _ in range(3)]
+        cb.zero_grad()
+        cb.forward(self._clone(x))
+        dx = cb.backward(dout)
+        se.zero_grad()
+        se.forward(self._clone(x))
+        dx_se = se.backward(dout)
+        assert max(abs(a - b) for ca, cbb in zip(dx_se, dx)
+                   for ra, rb in zip(ca, cbb) for a, b in zip(ra, rb)) < 1e-12
+        assert cb.grads["b1"] == se.grads["b1"]
+
+    def test_spatial_attention_varies_per_position(self):
+        """空间支路真的逐位置不同（不是整图系数）"""
+        random.seed(902)
+        cb = AI.CBAMBlock(3, reduction=2, kernel_size=3)
+        x = [[[random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+             for _ in range(3)]
+        cb.forward(self._clone(x))
+        s_sp = cb._cache[9]
+        flat = [v for row in s_sp for v in row]
+        assert len(flat) == 16
+        assert max(flat) - min(flat) > 1e-3
+        assert all(0.0 < v < 1.0 for v in flat)
+
+    def test_spatial_branch_gradients(self):
+        """dx 与 sp_w / sp_b 都过中心差分（核不对称，能抓下标翻转）"""
+        random.seed(903)
+        cb = AI.CBAMBlock(3, reduction=2, kernel_size=3)
+        x = [[[random.uniform(-0.8, 0.8) for _ in range(4)] for _ in range(4)]
+             for _ in range(3)]
+        dout = [[[random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+                for _ in range(3)]
+        dx, worst = self._fd_dx(cb, x, dout)
+        assert worst < 1e-7, f"dx 中心差分误差 {worst:.3e}"
+
+        cb.zero_grad()
+        cb.forward(self._clone(x))
+        cb.backward(dout)
+        eps = 1e-6
+
+        def loss():
+            out = cb.forward(self._clone(x))
+            return sum(out[c][h][w] * dout[c][h][w]
+                       for c in range(3) for h in range(4) for w in range(4))
+
+        worst = 0.0
+        for a in range(3):
+            for b in range(3):
+                old = cb.sp_w[a][b]
+                cb.sp_w[a][b] = old + eps
+                vp = loss()
+                cb.sp_w[a][b] = old - eps
+                vm = loss()
+                cb.sp_w[a][b] = old
+                worst = max(worst, abs((vp - vm) / (2 * eps) - cb.grads["sp_w"][a][b]))
+        assert worst < 1e-7, f"sp_w 中心差分误差 {worst:.3e}"
+        old = cb.sp_b[0]
+        cb.sp_b[0] = old + eps
+        vp = loss()
+        cb.sp_b[0] = old - eps
+        vm = loss()
+        cb.sp_b[0] = old
+        assert abs((vp - vm) / (2 * eps) - cb.grads["sp_b"][0]) < 1e-7
+
+    def test_meta(self):
+        """参数量、train/eval、尺寸校验"""
+        cb = AI.CBAMBlock(3, reduction=2, kernel_size=3)
+        assert cb.param_count() == 3 * 1 + 1 + 3 * 1 + 3 + 3 * 3 + 1 == 20
+        assert cb.hidden == 1 and cb.half == 1
+        cb.eval()
+        assert cb.training is False
+        cb.train()
+        assert cb.training is True
+        for bad in [(0,), (-1,), (3.0,), (True,)]:
+            try:
+                AI.CBAMBlock(*bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"CBAMBlock{bad} 应该报错")
+        for bad_k in (2, 4, 0, -3):
+            try:
+                AI.CBAMBlock(3, reduction=2, kernel_size=bad_k)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"kernel_size={bad_k} 应该报错")
+        try:
+            cb.forward([[1.0, 2.0], [3.0, 4.0]])
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("二维输入应该报错")
+
+    def test_optimizer_steps(self):
+        """SEBlock / CBAMBlock 的 sgd_step 与 adam_step 真的改参数"""
+        import random as _random
+        for name in ("SEBlock", "CBAMBlock"):
+            _random.seed(77)
+            blk = getattr(AI, name)(3, reduction=2)
+            blk.b1 = [0.9] * blk.hidden      # 保证 ReLU 单元活着，W1/W2 才有梯度
+            x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                 for _ in range(3)]
+            dout = [[[0.3, 0.3, 0.3] for _ in range(3)] for _ in range(3)]
+            blk.forward(self._clone(x))
+            blk.backward(dout)
+            assert any(abs(v) > 0.0 for v in blk.grads["W1"][0])
+            before = list(blk.W1[0])
+            blk.sgd_step(0.1)
+            assert any(abs(a - b) > 1e-12 for a, b in zip(before, blk.W1[0]))
+            blk.forward(self._clone(x))
+            blk.backward(dout)
+            before = list(blk.W1[0])
+            blk.adam_step(0.05)
+            assert blk._adam_t == 1
+            assert any(abs(a - b) > 1e-12 for a, b in zip(before, blk.W1[0]))
+            for bad in (-0.1, True, "0.1"):
+                try:
+                    blk.sgd_step(bad)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    raise AssertionError(f"{name}.sgd_step({bad!r}) 应该报错")

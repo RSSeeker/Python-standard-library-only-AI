@@ -1557,6 +1557,23 @@ class SEBlock:
     def zero_grad(self):
         self.grads = {k: _zeros_like(v) for k, v in self._params()}
 
+    def sgd_step(self, lr):
+        """原地 SGD：`param -= lr * grad`（参数在 `_params()` 里）"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SEBlock: lr 必须是非负数字，收到 {lr!r}")
+        for key, param in self._params():
+            _sgd_apply(param, self.grads[key], float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        """原地 Adam；步数记在 `_adam_t`，矩在 `_adam_m` / `_adam_v`"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SEBlock: lr 必须是非负数字，收到 {lr!r}")
+        self._adam_t += 1
+        for key, param in self._params():
+            _adam_apply(param, self.grads[key], self._adam_m[key],
+                        self._adam_v[key], self._adam_t, float(lr),
+                        beta1, beta2, eps)
+
     def param_count(self):
         return _w2_count(self._params())
 
@@ -3022,6 +3039,241 @@ class ConvTranspose3d:
                                             acc += g * woc[kd][kh][kw]
                                             wg[kd][kh][kw] += g * v
                         dx[ic][i_d][i_h][i_w] = acc
+        return dx
+
+
+class CBAMBlock:
+    """CBAM 注意力：先通道注意力（SE 式瓶颈 MLP），再空间注意力（通道池化 + k×k 卷积）
+
+    `forward((C,H,W)) -> (C,H,W)`：`u = x ⊙ s_c`（逐通道），`y = u ⊙ s_sp`（逐位置）。
+    空间注意力对 `u` 做通道维的 mean/max 池化得到两张 `(H,W)` 图，拼接后过一层
+    `k×k`（零填充）单输出卷积再 sigmoid。梯度全部留在 `self.grads`：
+    `W1/b1/W2/b2`（通道支路）与 `sp_w/sp_b`（空间支路）。
+    """
+
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        for n, v in (("channels", channels), ("reduction", reduction),
+                     ("kernel_size", kernel_size)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"CBAMBlock: {n} 必须是正整数，收到 {v!r}")
+        if kernel_size % 2 == 0:
+            raise ValueError(f"CBAMBlock: kernel_size 必须是奇数，收到 {kernel_size}")
+        self.channels = channels
+        self.reduction = reduction
+        self.kernel_size = kernel_size
+        self.half = kernel_size // 2
+        self.hidden = max(1, channels // reduction)
+        std1 = (2.0 / channels) ** 0.5
+        std2 = (2.0 / self.hidden) ** 0.5
+        self.W1 = [[random.gauss(0.0, std1) for _ in range(channels)]
+                   for _ in range(self.hidden)]
+        self.b1 = [0.0] * self.hidden
+        self.W2 = [[random.gauss(0.0, std2) for _ in range(self.hidden)]
+                   for _ in range(channels)]
+        self.b2 = [0.0] * channels
+        k = kernel_size
+        std3 = (2.0 / (2 * k * k)) ** 0.5
+        self.sp_w = [[random.gauss(0.0, std3) for _ in range(k)] for _ in range(k)]
+        self.sp_b = [0.0]  # 单元素列表：Adam/计数辅助只吃序列
+        self.training = True
+        self._cache = None
+        self._adam_m = {k2: _zeros_like(v) for k2, v in self._params()}
+        self._adam_v = {k2: _zeros_like(v) for k2, v in self._params()}
+        self._adam_t = 0
+        self.zero_grad()
+
+    def _params(self):
+        return (("W1", self.W1), ("b1", self.b1), ("W2", self.W2), ("b2", self.b2),
+                ("sp_w", self.sp_w), ("sp_b", self.sp_b))
+
+    def zero_grad(self):
+        self.grads = {k: _zeros_like(v) for k, v in self._params()}
+
+    def sgd_step(self, lr):
+        """原地 SGD：`param -= lr * grad`（参数在 `_params()` 里）"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"CBAMBlock: lr 必须是非负数字，收到 {lr!r}")
+        for key, param in self._params():
+            _sgd_apply(param, self.grads[key], float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        """原地 Adam；步数记在 `_adam_t`，矩在 `_adam_m` / `_adam_v`"""
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"CBAMBlock: lr 必须是非负数字，收到 {lr!r}")
+        self._adam_t += 1
+        for key, param in self._params():
+            _adam_apply(param, self.grads[key], self._adam_m[key],
+                        self._adam_v[key], self._adam_t, float(lr),
+                        beta1, beta2, eps)
+
+    def param_count(self):
+        return _w2_count(self._params())
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+    def _spatial_conv(self, pooled):
+        """pooled: (2,H,W) -> (H,W) 的 k×k 零填充卷积 + 偏置（未过 sigmoid）"""
+        H, W = len(pooled[0]), len(pooled[0][0])
+        k, half = self.kernel_size, self.half
+        out = [[self.sp_b[0] for _ in range(W)] for _ in range(H)]
+        for h in range(H):
+            for w in range(W):
+                acc = 0.0
+                for a in range(k):
+                    ih = h + a - half
+                    if ih < 0 or ih >= H:
+                        continue
+                    prow = pooled
+                    wrow = self.sp_w[a]
+                    for b in range(k):
+                        iw = w + b - half
+                        if iw < 0 or iw >= W:
+                            continue
+                        acc += wrow[b] * (prow[0][ih][iw] + prow[1][ih][iw])
+                out[h][w] += acc
+        return out
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("CBAMBlock: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.channels:
+            raise ValueError(
+                f"CBAMBlock: 输入通道数 {C} 与 channels={self.channels} 不符")
+        # 通道注意力
+        z = _w2_channel_means(x)
+        a1 = [sum(map(_mul, self.W1[k], z)) + self.b1[k] for k in range(self.hidden)]
+        r1 = [v if v > 0.0 else 0.0 for v in a1]
+        a2 = [sum(map(_mul, self.W2[c], r1)) + self.b2[c] for c in range(C)]
+        s_c = [_sigmoid_scalar(v) for v in a2]
+        u = [[[x[c][h][w] * s_c[c] for w in range(W)] for h in range(H)]
+             for c in range(C)]
+        # 空间注意力：通道维 mean / max 池化
+        mean_map = [[0.0] * W for _ in range(H)]
+        max_map = [[0.0] * W for _ in range(H)]
+        arg_map = [[0] * W for _ in range(H)]
+        for h in range(H):
+            for w in range(W):
+                best = u[0][h][w]
+                arg = 0
+                total = u[0][h][w]
+                for c in range(1, C):
+                    v = u[c][h][w]
+                    total += v
+                    if v > best:
+                        best = v
+                        arg = c
+                mean_map[h][w] = total / C
+                max_map[h][w] = best
+                arg_map[h][w] = arg
+        pooled = [mean_map, max_map]
+        z_sp = self._spatial_conv(pooled)
+        s_sp = [[_sigmoid_scalar(z_sp[h][w]) for w in range(W)] for h in range(H)]
+        out = [[[u[c][h][w] * s_sp[h][w] for w in range(W)] for h in range(H)]
+               for c in range(C)]
+        self._cache = (x, u, s_c, r1, a1, z, mean_map, max_map, arg_map, s_sp)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("CBAMBlock.backward: 必须先调用 forward")
+        x, u, s_c, r1, a1, z, mean_map, max_map, arg_map, s_sp = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if (len(dout) != C or len(dout[0]) != H or len(dout[0][0]) != W):
+            raise ValueError(
+                f"CBAMBlock.backward: dout 形状 "
+                f"{(len(dout), len(dout[0]), len(dout[0][0]))} "
+                f"与输入 {(C, H, W)} 不符")
+
+        # 1) 经空间注意力的链
+        du = [[[dout[c][h][w] * s_sp[h][w] for w in range(W)] for h in range(H)]
+              for c in range(C)]
+        ds_sp = [[0.0] * W for _ in range(H)]
+        for h in range(H):
+            for w in range(W):
+                acc = 0.0
+                for c in range(C):
+                    acc += dout[c][h][w] * u[c][h][w]
+                ds_sp[h][w] = acc
+        dz_sp = [[ds_sp[h][w] * s_sp[h][w] * (1.0 - s_sp[h][w]) for w in range(W)]
+                 for h in range(H)]
+        k, half = self.kernel_size, self.half
+        d_mean = [[0.0] * W for _ in range(H)]
+        d_max = [[0.0] * W for _ in range(H)]
+        db_sp = 0.0
+        for h in range(H):
+            for w in range(W):
+                g = dz_sp[h][w]
+                if g == 0.0:
+                    continue
+                db_sp += g
+                for a in range(k):
+                    ih = h + a - half
+                    if ih < 0 or ih >= H:
+                        continue
+                    for b in range(k):
+                        iw = w + b - half
+                        if iw < 0 or iw >= W:
+                            continue
+                        self.grads["sp_w"][a][b] += g * (mean_map[ih][iw]
+                                                        + max_map[ih][iw])
+        self.grads["sp_b"][0] += db_sp
+        # dL/dpooled[i][j] = Σ_{a,b} sp_w[a][b] · dz_sp[i - a + half][j - b + half]
+        # （对 z = conv(pooled) 求反卷积；下标方向写反会在核不对称时差一个翻转）
+        for h in range(H):
+            for w in range(W):
+                acc = 0.0
+                for a in range(k):
+                    ih = h - a + half
+                    if ih < 0 or ih >= H:
+                        continue
+                    for b in range(k):
+                        iw = w - b + half
+                        if iw < 0 or iw >= W:
+                            continue
+                        acc += dz_sp[ih][iw] * self.sp_w[a][b]
+                d_mean[h][w] = acc
+                d_max[h][w] = acc
+        for h in range(H):
+            for w in range(W):
+                du[arg_map[h][w]][h][w] += d_max[h][w]
+                share = d_mean[h][w] / C
+                for c in range(C):
+                    du[c][h][w] += share
+
+        # 2) 经通道注意力的链
+        area = float(H * W)
+        ds_c = [0.0] * C
+        for c in range(C):
+            acc = 0.0
+            for h in range(H):
+                for w in range(W):
+                    acc += du[c][h][w] * x[c][h][w]
+            ds_c[c] = acc
+        da2 = [ds_c[c] * s_c[c] * (1.0 - s_c[c]) for c in range(C)]
+        for c in range(C):
+            for kk in range(self.hidden):
+                self.grads["W2"][c][kk] += da2[c] * r1[kk]
+            self.grads["b2"][c] += da2[c]
+        dz_ch = [0.0] * C
+        for kk in range(self.hidden):
+            dr1 = sum(da2[c] * self.W2[c][kk] for c in range(C))
+            da1 = dr1 if a1[kk] > 0.0 else 0.0
+            for c in range(C):
+                self.grads["W1"][kk][c] += da1 * z[c]
+            self.grads["b1"][kk] += da1
+            for c in range(C):
+                dz_ch[c] += da1 * self.W1[kk][c]
+        dx = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for c in range(C):
+            g = dz_ch[c] / area
+            for h in range(H):
+                for w in range(W):
+                    dx[c][h][w] = du[c][h][w] * s_c[c] + g
         return dx
 
 

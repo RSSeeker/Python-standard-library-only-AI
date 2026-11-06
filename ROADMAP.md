@@ -126,7 +126,7 @@
 - [ ] `DenseBlock` / 稠密连接
 - [x] `SEBlock`（W2-A 提交：GAP → 瓶颈 MLP → sigmoid 乘回输入，dx 与四组参数梯度中心差分 ≤1e-9）
 - [x] `ECABlock`（W2-B：GAP 后一条奇数宽 1D 卷积跨通道混权重，只多 `kernel_size` 个参数；dx/`grad_w` 中心差分 ≤1e-8）
-- [ ] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支）
+- [x] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支；空间反卷积下标写反过，`dx` 中心差分 1.187e-01 → 修后 7.2e-11；顺带给 `SEBlock`/`CBAMBlock` 补了 `sgd_step`/`adam_step`）
 - [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
 - [x] `ConvTranspose1d`（W2-D）：`(Cin,L) -> (Cout,(L-1)*s-2p+k+op)`，前向把每个输入点按 stride 摆到输出网格累加，`dx` 与 `grad_w` 中心差分 ≤1e-8
 - [x] `Conv3d` / `ConvTranspose3d`（W2-E）：三轴独立 `kernel/stride/padding`，`(D-1)*s-2p+k+op` 的输出尺寸，`dx` 与 `grad_w` 中心差分 ≤1e-8，中心 tap 退化为恒等映射、单点散射位置逐个校验
