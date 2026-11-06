@@ -10346,6 +10346,194 @@ class DropPath:
         return _scale_nested(dout, self.factor)
 
 
+class DropBlock2d:
+    """按**连续方块**丢弃的二维 dropout（`(C, H, W)` 特征图）
+
+    逐元素 dropout 在卷积网络里几乎无效——噪声会被后续卷积的空间平滑抹掉。
+    DropBlock 改丢连续的 ``block_size × block_size`` 方块：每个特征图先在
+    「合法种子位置」（左上角能放下整个方块的位置）上以 ``γ`` 掷硬币，命中就把
+    整块置零，最后按**实际保留比例**整体放大，保持期望不变::
+
+        γ = p / (bs²) · (H·W) / ((H-bs+1)·(W-bs+1))
+
+    ``p`` 是**期望丢弃的元素比例**（不是种子概率）：期望覆盖面积
+    ``种子数·bs²·γ/(H·W)`` 恰好等于 ``p``。``block_size`` 超过特征图
+    边长时自动夹到边长（此时退化成整图丢弃）。``eval()`` 后恒等。
+    """
+
+    def __init__(self, p: float = 0.1, block_size: int = 3):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"DropBlock2d: p 必须在 [0, 1) 内，收到 {p!r}")
+        if isinstance(block_size, bool) or not isinstance(block_size, int):
+            raise TypeError(f"DropBlock2d: block_size 必须是整数，收到 "
+                            f"{type(block_size).__name__}")
+        if block_size < 1:
+            raise ValueError(f"DropBlock2d: block_size 必须 >= 1，收到 {block_size!r}")
+        self.p = float(p)
+        self.block_size = block_size
+        self.mask = None
+        self.scale = 1.0
+        self.training = True
+
+    def train(self):
+        """训练模式：按方块丢弃"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：恒等映射"""
+        self.training = False
+        return self
+
+    @staticmethod
+    def _check_shape(x, who):
+        if not x or not isinstance(x[0], list):
+            raise ValueError(f"DropBlock2d.{who}: 输入形状必须是 (C, H, W)")
+        h = len(x[0])
+        if h == 0 or not isinstance(x[0][0], list):
+            raise ValueError(f"DropBlock2d.{who}: 输入形状必须是 (C, H, W)")
+        w = len(x[0][0])
+        if w == 0:
+            raise ValueError(f"DropBlock2d.{who}: 特征图宽度不能为 0")
+        for ci, ch in enumerate(x):
+            if len(ch) != h:
+                raise ValueError(f"DropBlock2d.{who}: 通道 {ci} 的高与通道 0 不一致")
+            for r, row in enumerate(ch):
+                if not isinstance(row, list) or len(row) != w:
+                    raise ValueError(f"DropBlock2d.{who}: 通道 {ci} 第 {r} 行宽度不是 {w}")
+        return len(x), h, w
+
+    def forward(self, x):
+        c, h, w = self._check_shape(x, "forward")
+        if not self.training or self.p == 0.0:
+            self.mask = [[[1.0] * w for _ in range(h)] for _ in range(c)]
+            self.scale = 1.0
+            return x
+        bs = min(self.block_size, h, w)
+        # 合法种子数（左上角位置数）：(H-bs+1)*(W-bs+1)
+        seeds_h = h - bs + 1
+        seeds_w = w - bs + 1
+        # 期望覆盖面积 = 种子数·bs²·γ/(H·W)，令它等于 p ⇒ γ = p/(bs²)·(H·W)/种子数
+        gamma = self.p / (bs * bs) * (h * w) / (seeds_h * seeds_w)
+        mask = [[[1.0] * w for _ in range(h)] for _ in range(c)]
+        for ch in range(c):
+            for i in range(seeds_h):
+                for j in range(seeds_w):
+                    if random.random() < gamma:
+                        for a in range(bs):
+                            row = mask[ch][i + a]
+                            for b in range(bs):
+                                row[j + b] = 0.0
+        kept = 0.0
+        for ch in range(c):
+            for i in range(h):
+                kept += sum(mask[ch][i])
+        total = float(c * h * w)
+        self.scale = total / kept if kept > 0.0 else 0.0
+        self.mask = mask
+        out = []
+        for ch in range(c):
+            rows = []
+            for i in range(h):
+                rows.append([v * m * self.scale for v, m in zip(x[ch][i], mask[ch][i])])
+            out.append(rows)
+        return out
+
+    def backward(self, dout):
+        if self.mask is None:
+            raise ValueError("DropBlock2d.backward: 先调用 forward")
+        c = len(dout)
+        out = []
+        for ch in range(c):
+            rows = []
+            for i in range(len(dout[ch])):
+                rows.append([d * m * self.scale
+                             for d, m in zip(dout[ch][i], self.mask[ch][i])])
+            out.append(rows)
+        return out
+
+
+class DropConnect(Layer):
+    """**权重级** dropout：把权重矩阵元素按概率置零，而不是置零激活
+
+    与 ``Dropout`` 的区别：Dropout 丢的是这一层输出（同一行的所有权重一起失效），
+    DropConnect 丢的是单个连接 ``W[j][i]`` —— 每一行仍保留大部分输入，表达更细，
+    但正则更强（原论文在 MNIST/ImageNet 上报告优于 Dropout）。
+
+    它本身就是一个 ``Layer`` 子类，可以直接放进 ``MLP``：前向用掩码后的权重算
+    ``z = (W⊙M)x + b``，反向对 ``grad_w`` 乘同一个掩码、``next_delta`` 用掩码后的
+    权重（与前向保持一致）。保留的连接乘 ``1/(1-p)``，``eval()`` 后与普通 ``Layer``
+    逐位相同。
+    """
+
+    def __init__(self, fan_in: int, fan_out: int, activation: str = "leaky_relu",
+                 is_output: bool = False, p: float = 0.5):
+        if not isinstance(p, (int, float)) or isinstance(p, bool) or not (0.0 <= p < 1.0):
+            raise ValueError(f"DropConnect: p 必须在 [0, 1) 内，收到 {p!r}")
+        super().__init__(fan_in, fan_out, activation, is_output)
+        self.p = float(p)
+        self.mask = None
+        self.masked_weights = None
+        self.training = True
+
+    def train(self):
+        """训练模式：按连接丢弃"""
+        self.training = True
+        return self
+
+    def eval(self):
+        """推理模式：与普通全连接层逐位相同"""
+        self.training = False
+        return self
+
+    def _masked(self):
+        """返回本次前向用的权重（训练时是 ``W⊙M·scale``，推理时就是 ``W``）"""
+        W = self.weights
+        if not self.training or self.p == 0.0:
+            self.mask = None
+            return W
+        scale = 1.0 / (1.0 - self.p)
+        mask = []
+        for j in range(self.fan_out):
+            row = W[j]
+            mask.append([scale if random.random() > self.p else 0.0
+                         for _ in range(self.fan_in)])
+        self.mask = mask
+        return [[wj * mj for wj, mj in zip(W[j], mask[j])] for j in range(self.fan_out)]
+
+    def forward(self, x):
+        if len(x) != self.fan_in:
+            raise ValueError(
+                f"DropConnect.forward: 输入长度 {len(x)} 与本层 fan_in={self.fan_in} 不一致"
+            )
+        self.input = x
+        self.masked_weights = self._masked()
+        Wm, b = self.masked_weights, self.biases
+        self.z = [sum(map(_mul, Wm[j], x)) + b[j] for j in range(self.fan_out)]
+        self.a = self.act_fn(self.z)
+        return self.a
+
+    def backward(self, delta):
+        if self.z is None:
+            raise RuntimeError("DropConnect.backward: 必须先调用 forward()（没有缓存的 z）")
+        if len(delta) != self.fan_out:
+            raise ValueError(
+                f"DropConnect.backward: delta 长度 {len(delta)} 与本层输出维度 "
+                f"{self.fan_out} 不一致"
+            )
+        d_act = self.act_deriv(self.z)
+        w = [delta[j] * d_act[j] for j in range(self.fan_out)]
+        if self.mask is None:
+            grad_w = [[s * xi for xi in self.input] for s in w]
+        else:
+            grad_w = [[s * xi * mj for xi, mj in zip(self.input, self.mask[j])]
+                      for j, s in enumerate(w)]
+        grad_b = list(w)
+        Wm = self.masked_weights if self.masked_weights is not None else self.weights
+        next_delta = [sum(map(_mul, col, w)) for col in zip(*Wm)]
+        return grad_w, grad_b, next_delta
+
+
 class BatchNorm1d:
     """一维批归一化
 

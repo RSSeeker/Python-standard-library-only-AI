@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1131 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1141 项）
 
 ## 特性
 
@@ -166,6 +166,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `SpatialDropout2d(p)` | 按通道丢弃（特征图 `(C, H, W)`）：整张特征图一起丢，避免逐像素独立掷硬币被后续卷积平滑掉 |
 | `AlphaDropout(p)` | SELU 自归一化网络的 dropout：丢弃值填 `α' = -λα ≈ -1.7581`，再整体仿射 `y = a·v + b`（`a = (1-p+p·α'²)^(-1/2)`、`b = -a·α'·p`）把一/二阶矩拉回 |
 | `GaussianDropout(p)` | 乘性噪声 `y = x·N(1, σ)`、`σ = sqrt(p/(1-p))`：期望/方差与 Dropout 相同，但梯度永不为 0 |
+| `DropBlock2d(p, block_size=3)` | 按**连续方块**丢弃 `(C, H, W)`：种子位置以 `γ = p/(bs²)·(H·W)/((H-bs+1)(W-bs+1))` 掷硬币，命中则整块置零，最后按实际保留比例放大保期望；`eval()` 恒等 |
+| `DropConnect(in, out, act, p=0.5)` | 权重级丢弃（直接继承 `Layer`）：`W⊙M/(1-p)`，正向与反向都用掩码权重；`eval()` 与同权重 `Layer` 逐位相同 |
 | `GlobalMaxPool2d` | 全局最大池化：`(C,H,W) → (C,)`，反向只回传给最大值位置 |
 | `AdaptiveMaxPool2d` | 自适应最大池化：`(C,H,W) → (C,out_h,out_w)`，分箱与 `AdaptiveAvgPool2d` 一致（`(1,1)` 与 `GlobalMaxPool2d` 逐位相同） |
 | `LPPool2d` | Lp 池化：`(Σ\|x\|^p / area)^(1/p)`；`p=1` 在非负输入上等于 `AvgPool2d`，`p` 越大越接近 `MaxPool2d` |
@@ -1157,7 +1159,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1131 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1141 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1313,6 +1315,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGroupNorm` | 组内均值/方差、组间独立、`dx`/`dgamma`/`dbeta` vs 数值梯度、`InstanceNorm == GroupNorm(G=C)`、非法参数 |
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
 | `TestDropoutVariants` | `p=0`/`eval()` 恒等、SpatialDropout1d 整条时间轴共用掩码、SpatialDropout2d 整通道丢弃、AlphaDropout 的 `a·x+b` 闭式与「均值 0 方差 1」、GaussianDropout 的 `E=1`/`Var=p/(1-p)` 与同种子复现、R-Drop 同分布为 0/对称/alpha 线性、11 类非法输入、未 forward 就 backward 报错 |
+| `TestStructuredRegularization` | DropBlock2d 的丢弃比例与连块性、缩放保期望、反向用掩码；DropConnect 的 `eval()` 逐位退化、`grad_w` 掩码与 `next_delta` 有限差分、能进 `MLP` 训练 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1366,7 +1369,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1131 个单元测试
+├── test_ai.py       # 1141 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

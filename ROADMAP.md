@@ -270,7 +270,11 @@
   - `GaussianDropout`：`y = x·N(1, sqrt(p/(1-p)))`，实测 `E=1.0015`、`Var=0.2512`（理论 1 与 0.25）；
   - `r_drop_loss(logits_a, logits_b, alpha=0.5)`：对称 KL 正则项，同分布为 0、对称、`alpha` 线性；
   - 探针 `probe_w10a.py` 全绿，`TestDropoutVariants` 10 例；越界 `p`/非负 `α`/非方阵特征图都在入口报错，未 forward 就 backward 也报错。
-- [ ] 结构化：DropBlock / DropConnect
+- [x] 结构化：DropBlock / DropConnect
+      - `DropBlock2d(p, block_size=3)`：合法种子位置上以 `γ = p/(bs²)·(H·W)/((H-bs+1)(W-bs+1))` 掷硬币，命中则整块置零，最后按实际保留比例放大；实测丢弃比例 0.2925（目标 0.3）、100% 的丢零元都有 ≥2 个丢零邻居；
+      - `DropConnect(in, out, act, p=0.5)` 直接继承 `Layer`（复用权重与 Adam 状态）：`W⊙M/(1-p)`，正向与反向都用掩码权重；`eval()` 下与同权重 `Layer` 逐位相同，`next_delta` 用掩码权重（有限差分 -1.641944 vs -1.641944）；
+      - 找到的真 bug：`DropBlock2d` 的 `γ` 一开始写成 `(1-p)/(bs²)·…`（把 `p` 当保留率），实测丢弃比例 0.534 而目标 0.3 ⇒ 改成 `p/(bs²)·…`（期望覆盖面积 `种子数·bs²·γ/(H·W) = p`）；
+      - 探针 `probe_w10b.py` 24 项全绿，`TestStructuredRegularization` 10 例；越界 `p`/`block_size`、非 `(C,H,W)`、未 forward 就 backward 都在入口报错。
 - [ ] 对抗训练：FGSM / PGD / TRADES / MART / FreeLB / SMART
 - [ ] 噪声注入（权重/梯度/输入）、课程学习 `CurriculumSampler`、Manifold Mixup、Snapshot Ensembles
 - [ ] 半监督：VAT、伪标签、FixMatch、MixMatch、MeanTeacher、一致性正则

@@ -18411,3 +18411,148 @@ class TestDropoutVariants:
             except ValueError:
                 continue
             raise AssertionError(type(mod).__name__ + " 没有报错")
+
+
+# ============================================================================
+#  W10-B：结构化正则（DropBlock2d / DropConnect）
+# ============================================================================
+
+class TestStructuredRegularization:
+    """方块级与权重级丢弃。"""
+
+    @staticmethod
+    def _img(n=2, h=8, w=8, seed=1):
+        random.seed(seed)
+        return [[[random.gauss(0.0, 1.0) for _ in range(w)] for _ in range(h)]
+                for _ in range(n)]
+
+    def test_dropblock_identity(self):
+        """p=0 与 eval() 都必须恒等。"""
+        x = self._img()
+        assert AI.DropBlock2d(0.0).forward(x) == x
+        assert AI.DropBlock2d(0.4).eval().forward(x) == x
+
+    def test_dropblock_drop_ratio(self):
+        """期望丢弃比例应接近 p（gamma 用 p 而不是 1-p）。"""
+        random.seed(5)
+        db = AI.DropBlock2d(p=0.3, block_size=3)
+        x = self._img(n=8, h=16, w=16)
+        db.forward(x)
+        total = sum(1 for ch in range(8) for i in range(16) for j in range(16))
+        zeros = sum(1 for ch in range(8) for i in range(16) for j in range(16)
+                    if db.mask[ch][i][j] == 0.0)
+        ratio = zeros / total
+        assert abs(ratio - 0.3) < 0.08, ratio
+
+    def test_dropblock_is_blockwise(self):
+        """被丢的元素应当连成方块，而不是散点。"""
+        random.seed(5)
+        db = AI.DropBlock2d(p=0.3, block_size=3)
+        db.forward(self._img(n=8, h=16, w=16))
+        checked = nearby = 0
+        for ch in range(8):
+            for i in range(1, 15):
+                for j in range(1, 15):
+                    if db.mask[ch][i][j] != 0.0:
+                        continue
+                    checked += 1
+                    cnt = 0
+                    for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        if db.mask[ch][i + di][j + dj] == 0.0:
+                            cnt += 1
+                    if cnt >= 2:
+                        nearby += 1
+        assert checked > 0
+        assert nearby / checked > 0.98
+
+    def test_dropblock_preserves_expectation(self):
+        """缩放因子应使输出均值与原均值一致。"""
+        random.seed(7)
+        db = AI.DropBlock2d(p=0.3, block_size=3)
+        sx = sy = n = 0.0
+        for _ in range(40):
+            x = self._img(n=2, h=8, w=8, seed=None)
+            out = db.forward(x)
+            for ch in range(2):
+                for i in range(8):
+                    for j in range(8):
+                        sx += x[ch][i][j]
+                        sy += out[ch][i][j]
+                        n += 1
+        assert abs(sx / n - sy / n) < 0.2
+
+    def test_dropblock_backward_uses_mask(self):
+        random.seed(9)
+        db = AI.DropBlock2d(0.3, 3)
+        db.forward(self._img(n=2, h=6, w=6))
+        grad = db.backward([[[1.0] * 6 for _ in range(6)] for _ in range(2)])
+        for ch in range(2):
+            for i in range(6):
+                for j in range(6):
+                    assert abs(grad[ch][i][j] - db.mask[ch][i][j] * db.scale) < 1e-15
+
+    def test_dropblock_validation(self):
+        with pytest.raises(ValueError):
+            AI.DropBlock2d(1.0)
+        with pytest.raises(ValueError):
+            AI.DropBlock2d(0.1, 0)
+        with pytest.raises(TypeError):
+            AI.DropBlock2d(0.1, True)
+        with pytest.raises(ValueError):
+            AI.DropBlock2d(0.1).forward([[1.0, 2.0], [3.0]])
+        with pytest.raises(ValueError):
+            AI.DropBlock2d(0.1).backward(self._img(n=1, h=2, w=2))
+
+    def test_dropconnect_eval_matches_layer(self):
+        """eval() 下 DropConnect 必须退化为同权重的 Layer（逐位）。"""
+        random.seed(3)
+        layer = AI.Layer(4, 3, "relu")
+        random.seed(3)
+        dc = AI.DropConnect(4, 3, "relu", p=0.5)
+        assert layer.weights == dc.weights
+        xin = [0.3, -0.7, 1.1, 0.2]
+        dc.eval()
+        assert dc.forward(xin) == layer.forward(xin)
+        assert dc.backward([0.5, -0.4, 0.9]) == layer.backward([0.5, -0.4, 0.9])
+
+    def test_dropconnect_grad_and_delta(self):
+        """grad_w 必须被掩码遮住；next_delta 必须用掩码权重。"""
+        random.seed(11)
+        dc = AI.DropConnect(5, 4, "linear", p=0.6)
+        xin = [0.2, 0.4, -0.6, 0.8, 0.1]
+        dc.forward(xin)
+        mask = dc.mask
+        gw, gb, dx = dc.backward([1.0, 1.0, 1.0, 1.0])
+        for j in range(4):
+            for i in range(5):
+                if mask[j][i] == 0.0:
+                    assert gw[j][i] == 0.0
+                elif xin[i] != 0.0:
+                    assert gw[j][i] != 0.0
+        # 固定种子复现同一掩码，再做有限差分
+        eps = 1e-6
+        random.seed(77)
+        o1 = sum(dc.forward(xin))
+        m1 = dc.mask
+        random.seed(77)
+        o2 = sum(dc.forward([xi + eps for xi in xin]))
+        assert m1 == dc.mask
+        _, _, dx2 = dc.backward([1.0, 1.0, 1.0, 1.0])
+        assert abs((o2 - o1) / eps - sum(dx2)) < 1e-4
+
+    def test_dropconnect_trains(self):
+        """把最后一层换成 DropConnect 后仍能正常训练。"""
+        random.seed(13)
+        net = AI.MLP([3, 6, 2], activations=["relu", "linear"])
+        net.layers[-1] = AI.DropConnect(6, 2, "linear", is_output=True, p=0.3)
+        model = AI.Model(net, loss_fn="mse", task="regression",
+                         optimizer="adam", lr=0.02)
+        data = [([0.1 * i, -0.2 * i, 0.3 * i], [0.0, 1.0]) for i in range(6)]
+        hist = model.fit(data=data, epochs=40, verbose=False)
+        assert hist["train_loss"][-1][1] < hist["train_loss"][0][1]
+
+    def test_dropconnect_validation(self):
+        with pytest.raises(ValueError):
+            AI.DropConnect(2, 2, "relu", p=1.0)
+        with pytest.raises(ValueError):
+            AI.DropConnect(2, 2, "relu", p=-1.0)
