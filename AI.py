@@ -13,6 +13,7 @@
   - MSE / L1 / Log-Cosh / Quantile / Smooth-L1 / CrossEntropy / Focal / BCE / Huber / KL 损失函数
   + 类别不平衡损失（Class-Balanced / LDAM / OHEM）
   + 知识蒸馏（distill_loss 软目标 KL + T² 缩放 / hint_loss 隐藏层对齐）
+  + 偏好对齐（preference_loss：DPO / IPO / SimPO / CPO / ORPO；kto_loss）
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
@@ -6735,6 +6736,146 @@ def hint_loss(student_feat, teacher_feat, weight: float = 1.0):
     loss = weight * total / n
     grad = [weight * 2.0 * (a - b) / n for a, b in zip(stud, tgt)]
     return loss, grad
+
+
+def _pref_number(v, name, who):
+    """偏好对齐损失的标量参数校验（拒绝 bool / 非有限 / NaN）。"""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise TypeError(f"{who}: {name} 必须是数字，收到 {v!r}")
+    fv = float(v)
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):
+        raise ValueError(f"{who}: {name} 必须是有限数字，收到 {v!r}")
+    return fv
+
+
+def _log_sigmoid(x):
+    """数值稳定的 `log σ(x)`。"""
+    if x >= 0.0:
+        return -math.log1p(math.exp(-x))
+    return x - math.log1p(math.exp(x))
+
+
+def _sigmoid(x):
+    """数值稳定的 sigmoid（避免 `exp` 溢出）。"""
+    if x >= 0.0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def _logit_odds(logp):
+    """把 log 概率换成「logit」：`log(p/(1-p))`，用于 ORPO。"""
+    if not (logp < 0.0):
+        raise ValueError(f"preference_loss: ORPO 需要 log 概率 < 0，收到 {logp!r}")
+    p = math.exp(logp)
+    return logp - math.log1p(-p)
+
+
+def preference_loss(chosen_logp, rejected_logp, ref_chosen_logp=None,
+                    ref_rejected_logp=None, method: str = "dpo",
+                    beta: float = 0.1, margin: float = 0.0,
+                    sft_weight: float = 0.1):
+    """偏好对齐损失：给定「好回答/坏回答」的对数概率，返回 `(loss, d_chosen, d_rejected)`
+
+    支持五种方法（`method`）：
+
+    - `'dpo'`：`-log σ(β(Δ − Δ_ref))`，`Δ = log π(c) − log π(r)`（需要参考模型的 logp）
+    - `'ipo'`：`(Δ − Δ_ref − 1/(2β))²`，把偏好差直接回归到目标间隔
+    - `'simpo'`：`-log σ(β·Δ − margin)`，不需要参考模型（SimPO 的卖点）
+    - `'cpo'`：DPO 项 + `sft_weight · (−log π(c))`，一个损失里同时做对齐与 SFT
+    - `'orpo'`：`-log σ(β·(logit π(c) − logit π(r)))`，在 logit 空间比较优势
+
+    梯度是标量，分别相对 `chosen_logp` 与 `rejected_logp`（可以直接乘到序列的
+    log-prob 梯度上）。`β>0`、`margin>=0`；只有 `'simpo'` / `'orpo'` 不需要 `ref_*`。
+    """
+    who = "preference_loss"
+    if not isinstance(method, str):
+        raise TypeError(f"{who}: method 必须是字符串，收到 {method!r}")
+    m = method.strip().lower()
+    if m not in ("dpo", "ipo", "simpo", "cpo", "orpo"):
+        raise ValueError(f"{who}: method 必须是 dpo/ipo/simpo/cpo/orpo 之一，收到 {method!r}")
+    beta = _pref_number(beta, "beta", who)
+    margin = _pref_number(margin, "margin", who)
+    sft_weight = _pref_number(sft_weight, "sft_weight", who)
+    if not (beta > 0.0):
+        raise ValueError(f"{who}: beta 必须 > 0，收到 {beta!r}")
+    if margin < 0.0:
+        raise ValueError(f"{who}: margin 必须 >= 0，收到 {margin!r}")
+    if sft_weight < 0.0:
+        raise ValueError(f"{who}: sft_weight 必须 >= 0，收到 {sft_weight!r}")
+    c = _pref_number(chosen_logp, "chosen_logp", who)
+    r = _pref_number(rejected_logp, "rejected_logp", who)
+
+    needs_ref = m in ("dpo", "ipo", "cpo")
+    if needs_ref:
+        if ref_chosen_logp is None or ref_rejected_logp is None:
+            raise ValueError(f"{who}: method={m!r} 需要 ref_chosen_logp 与 ref_rejected_logp")
+        rc = _pref_number(ref_chosen_logp, "ref_chosen_logp", who)
+        rr = _pref_number(ref_rejected_logp, "ref_rejected_logp", who)
+    else:
+        rc = rr = 0.0
+
+    delta = c - r
+    if m == "dpo":
+        x = beta * (delta - (rc - rr))
+        loss = -_log_sigmoid(x)
+        d_delta = beta * (_sigmoid(x) - 1.0)
+        dc, dr = d_delta, -d_delta
+    elif m == "ipo":
+        target = 1.0 / (2.0 * beta)
+        gap = delta - (rc - rr) - target
+        loss = gap * gap
+        d_delta = 2.0 * gap
+        dc, dr = d_delta, -d_delta
+    elif m == "simpo":
+        x = beta * delta - margin
+        loss = -_log_sigmoid(x)
+        d_delta = beta * (_sigmoid(x) - 1.0)
+        dc, dr = d_delta, -d_delta
+    elif m == "orpo":
+        gap = _logit_odds(c) - _logit_odds(r)
+        x = beta * gap
+        loss = -_log_sigmoid(x)
+        d_x = _sigmoid(x) - 1.0
+        # d logit_odds / d logp = 1 + p/(1-p)
+        dc = beta * d_x * (1.0 + math.exp(c) / (1.0 - math.exp(c)))
+        dr = -beta * d_x * (1.0 + math.exp(r) / (1.0 - math.exp(r)))
+    else:  # cpo
+        x = beta * (delta - (rc - rr))
+        loss = -_log_sigmoid(x) + sft_weight * (-c)
+        d_delta = beta * (_sigmoid(x) - 1.0)
+        dc, dr = d_delta - sft_weight, -d_delta
+    return loss, dc, dr
+
+
+def kto_loss(logp, ref_logp, desirable: bool = True, beta: float = 0.1,
+             baseline: float = 0.0):
+    """KTO（Kahneman-Tversky 优化）：单条回答的二分类式对齐
+
+    `desirable=True` 时 `loss = 1 − σ(β(z − baseline))`，`False` 时
+    `loss = 1 − σ(β(baseline − z))`，其中 `z = log π − log π_ref`。
+    返回 `(loss, d_logp)`；`baseline` 通常取「参考模型下的平均 KL」的估计值，
+    教学实现里默认为 0。
+    """
+    who = "kto_loss"
+    beta = _pref_number(beta, "beta", who)
+    baseline = _pref_number(baseline, "baseline", who)
+    if not (beta > 0.0):
+        raise ValueError(f"{who}: beta 必须 > 0，收到 {beta!r}")
+    if not isinstance(desirable, bool):
+        raise TypeError(f"{who}: desirable 必须是 bool，收到 {desirable!r}")
+    z = _pref_number(logp, "logp", who) - _pref_number(ref_logp, "ref_logp", who)
+
+    if desirable:
+        u = beta * (z - baseline)
+    else:
+        u = beta * (baseline - z)
+    sig = _sigmoid(u)
+    loss = 1.0 - sig
+    # d(1 - σ(u))/du = -σ(u)(1-σ(u))
+    du = -sig * (1.0 - sig)
+    d_logp = du * beta if desirable else -du * beta
+    return loss, d_logp
 
 
 def mse_loss(pred: List[float], target):

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（719 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（728 项）
 
 ## 特性
 
@@ -535,6 +535,8 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `ohem_loss(preds, targets, keep_ratio=0.7)` | OHEM（**批级**）：一批概率向量里只保留最难的那部分样本，被丢掉的样本梯度全 0 |
 | `distill_loss(student_logits, teacher_logits, T=2.0)` | 知识蒸馏：`T²·KL(teacher_T ‖ student_T)`，对学生 logits 的梯度是 `T·(p_s − p_t)` |
 | `hint_loss(student_feat, teacher_feat, weight=1.0)` | 隐藏层对齐（FitNet 式）：学生/教师特征的均方误差，`weight` 调与主损失的配比 |
+| `preference_loss(chosen_logp, rejected_logp, ref_*, method='dpo', beta=0.1)` | 偏好对齐，五种：`dpo` / `ipo` / `simpo` / `cpo` / `orpo`；吃**一对**序列的 log 概率，返回对两者的梯度 |
+| `kto_loss(logp, ref_logp, desirable=True, beta=0.1, baseline=0.0)` | KTO：单条样本「好/坏」二元反馈即可，不需要成对偏好数据 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
 |------|------|------|
@@ -548,6 +550,10 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `'class_balanced'` | `softmax` | 类别索引 / one-hot / 软标签（`loss_kwargs` 必须给 `class_counts`） |
 | `'ldam'` | `linear` | 类别索引 / one-hot（`loss_kwargs` 必须给 `class_counts`） |
 | `'distill'` | `linear` | 教师 logits（与输出层同维度的数值向量，`loss_kwargs` 可给 `T`） |
+
+`preference_loss` / `kto_loss` **也不在**上面的映射表里：它们吃的是「一段序列的 log 概率」
+（偏好损失还要一对），不是逐样本的 `(pred, target)`，所以只能在自定义训练循环里调用，
+不能传给 `Model(loss=...)`。
 
 `kl_divergence` **不在**上面的映射里：它要求 `pred` 是概率分布，而 `softmax` 层的
 反向是 softmax+CE 的联合梯度，任何非 CE 损失叠在 softmax 上都拿到不自洽的梯度
@@ -988,7 +994,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-719 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+728 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1068,6 +1074,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTransformerDecoder` | 自注意力因果但交叉注意力看全 memory、`dx`/`dmemory`/交叉 `W_k` vs 数值梯度、单层与直接调层逐位一致、多层 `dmemory` 形状、非法 `num_layers` |
 | `TestImbalanceLosses` | Class-Balanced 权重公式与归一化、CB 索引/软标签梯度、LDAM 闭式对齐与梯度、OHEM 选样、Model 接线与两个激活守卫、8 类非法输入 |
 | `TestDistillAndHint` | 蒸馏损失：T² 缩放与 KL 对齐、梯度差分、T 校验、hint 均方误差与 weight、Model 接线与激活守卫 |
+| `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
 | `TestFlops` | `estimate_flops` 的 MACs / 参数量 / 逐层明细与手算一致、不认识的模块报 TypeError |
@@ -1100,7 +1107,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 719 个单元测试
+├── test_ai.py       # 728 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

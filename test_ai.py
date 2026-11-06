@@ -8937,3 +8937,98 @@ class TestDistillAndHint:
         bad = AI.MLP([4, 8, 3], activations=["relu", "softmax"])
         with pytest.raises(ValueError):
             AI.Model(bad, loss_fn="distill", task="classification")
+
+
+# ============================================================================
+#  偏好对齐损失（W1-D：DPO / IPO / SimPO / CPO / ORPO + KTO）
+# ============================================================================
+
+class TestPreferenceLoss:
+    def test_dpo_closed_form_and_signs(self):
+        loss, dc, dr = AI.preference_loss(-1.2, -2.5, -1.5, -2.2, method="dpo", beta=0.1)
+        x = 0.1 * ((-1.2 - (-2.5)) - (-1.5 - (-2.2)))
+        assert abs(loss - (-math.log(1.0 / (1.0 + math.exp(-x))))) < 1e-12
+        assert dc < 0.0 and abs(dr + dc) < 1e-15
+
+    def test_dpo_gradient_matches_finite_difference(self):
+        eps = 1e-6
+        _, dc, dr = AI.preference_loss(-1.2, -2.5, -1.5, -2.2, method="dpo", beta=0.1)
+        lp = AI.preference_loss(-1.2 + eps, -2.5, -1.5, -2.2, method="dpo", beta=0.1)[0]
+        lm = AI.preference_loss(-1.2 - eps, -2.5, -1.5, -2.2, method="dpo", beta=0.1)[0]
+        assert abs((lp - lm) / (2 * eps) - dc) < 1e-8
+        lp = AI.preference_loss(-1.2, -2.5 + eps, -1.5, -2.2, method="dpo", beta=0.1)[0]
+        lm = AI.preference_loss(-1.2, -2.5 - eps, -1.5, -2.2, method="dpo", beta=0.1)[0]
+        assert abs((lp - lm) / (2 * eps) - dr) < 1e-8
+
+    def test_ipo_closed_form(self):
+        loss, dc, _ = AI.preference_loss(-1.2, -2.5, -1.5, -2.2, method="ipo", beta=0.1)
+        gap = (-1.2 - (-2.5)) - (-1.5 - (-2.2)) - 1.0 / (2 * 0.1)
+        assert abs(loss - gap * gap) < 1e-12
+        assert abs(dc - 2 * gap) < 1e-12
+
+    def test_simpo_needs_no_reference(self):
+        loss, _, _ = AI.preference_loss(-1.2, -2.5, method="simpo", beta=0.2, margin=0.5)
+        x = 0.2 * (-1.2 - (-2.5)) - 0.5
+        assert abs(loss - (-math.log(1.0 / (1.0 + math.exp(-x))))) < 1e-12
+        with_margin = AI.preference_loss(-1.2, -2.5, method="simpo", beta=0.2, margin=0.5)[0]
+        no_margin = AI.preference_loss(-1.2, -2.5, method="simpo", beta=0.2, margin=0.0)[0]
+        assert with_margin > no_margin
+
+    def test_cpo_adds_sft_term(self):
+        cpo_loss, cpo_dc, _ = AI.preference_loss(-1.2, -2.5, -1.5, -2.2,
+                                                 method="cpo", beta=0.1, sft_weight=0.3)
+        dpo_loss, dpo_dc, _ = AI.preference_loss(-1.2, -2.5, -1.5, -2.2, method="dpo", beta=0.1)
+        assert abs(cpo_loss - (dpo_loss + 0.3 * 1.2)) < 1e-12
+        assert abs(cpo_dc - (dpo_dc - 0.3)) < 1e-12
+
+    def test_orpo_logit_space(self):
+        loss, dc, _ = AI.preference_loss(-0.7, -1.4, method="orpo", beta=0.1)
+        oc = math.log(math.exp(-0.7) / (1.0 - math.exp(-0.7)))
+        orr = math.log(math.exp(-1.4) / (1.0 - math.exp(-1.4)))
+        x = 0.1 * (oc - orr)
+        assert abs(loss - (-math.log(1.0 / (1.0 + math.exp(-x))))) < 1e-10
+        eps = 1e-6
+        lp = AI.preference_loss(-0.7 + eps, -1.4, method="orpo", beta=0.1)[0]
+        lm = AI.preference_loss(-0.7 - eps, -1.4, method="orpo", beta=0.1)[0]
+        assert abs((lp - lm) / (2 * eps) - dc) < 1e-6
+        with pytest.raises(ValueError):  # p >= 1 时 logit 无定义
+            AI.preference_loss(0.0, -1.0, method="orpo")
+
+    def test_kto_two_sides(self):
+        z = -1.0 - (-1.6)
+        ld, gd = AI.kto_loss(-1.0, -1.6, desirable=True, beta=0.5)
+        lu, gu = AI.kto_loss(-1.0, -1.6, desirable=False, beta=0.5)
+        assert abs(ld - (1.0 - 1.0 / (1.0 + math.exp(-0.5 * z)))) < 1e-12
+        assert abs(lu - 1.0 / (1.0 + math.exp(-0.5 * z))) < 1e-12
+        assert abs(gd + gu) < 1e-15
+        eps = 1e-6
+        lp = AI.kto_loss(-1.0 + eps, -1.6, desirable=True, beta=0.5)[0]
+        lm = AI.kto_loss(-1.0 - eps, -1.6, desirable=True, beta=0.5)[0]
+        assert abs((lp - lm) / (2 * eps) - gd) < 1e-6
+
+    def test_numeric_stability(self):
+        tie = AI.preference_loss(-1.0, -30.0, -1.0, -30.0, method="dpo", beta=50.0)
+        assert abs(tie[0] - math.log(2.0)) < 1e-12
+        extreme = AI.preference_loss(-0.1, -30.0, -1.0, -30.0, method="dpo", beta=50.0)
+        assert math.isfinite(extreme[0]) and extreme[0] < 1e-12
+        assert math.isfinite(extreme[1]) and math.isfinite(extreme[2])
+
+    def test_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.preference_loss(-1, -2, method="ppo")
+        with pytest.raises(TypeError):
+            AI.preference_loss(-1, -2, method=3)
+        with pytest.raises(ValueError):
+            AI.preference_loss(-1, -2, method="dpo")  # 缺参考
+        with pytest.raises(ValueError):
+            AI.preference_loss(-1, -2, -1, -2, method="dpo", beta=0.0)
+        with pytest.raises(ValueError):
+            AI.preference_loss(-1, -2, method="simpo", margin=-0.5)
+        with pytest.raises(TypeError):
+            AI.preference_loss(True, -2)
+        with pytest.raises(ValueError):
+            AI.preference_loss(float("nan"), -2)
+        with pytest.raises(TypeError):
+            AI.kto_loss(-1.0, -1.6, desirable=1)
+        with pytest.raises(ValueError):
+            AI.kto_loss(-1.0, -1.6, beta=-1.0)

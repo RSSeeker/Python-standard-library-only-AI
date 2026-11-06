@@ -110,8 +110,10 @@
 
 ### W1 损失：回归与偏好对齐（P0）
 - [x] 回归族：`l1_loss`、`log_cosh_loss`、`quantile_loss`（= pinball）、`smooth_l1`（= `huber_loss` 别名，逐位等价）（`c37cdf5`；梯度差分 ≤2.6e-10，`quantile(0.5)` 逐位等于 `l1/2`）
-- [ ] 偏好对齐族：`preference_loss(chosen_logp, rejected_logp, ref_..., method=)` 支持
-      DPO / IPO / KTO / ORPO / SimPO / CPO，配「参考模型冻结」的等效性验证
+- [x] 偏好对齐族：`preference_loss(chosen_logp, rejected_logp, ref_..., method=)` 支持
+      DPO / IPO / KTO / ORPO / SimPO / CPO + 单边 `kto_loss(logp, ref_logp, desirable=)`
+      （W1-D 提交；五种 method 闭式解与双向中心差分吻合 ≤1e-8，`β=50` 极端情形 loss < 1e-12 不溢出；
+      ORPO 在 logit 空间做、`p>=1` 报错；**不进 `_LOSS_MAP`**——吃一对 logp 而非逐样本 `(pred, target)`）
 - [x] 蒸馏：`distill_loss(student_logits, teacher_logits, T=2.0)`（`T²·KL`，对学生 logits 的梯度 `T·(p_s−p_t)`）+ `hint_loss(student_feat, teacher_feat, weight)`（隐藏层均方误差）；`_LOSS_MAP` 增 `'distill'`、输出层要求 `linear`（梯度差分 ≤9.4e-10，`T=1` 时与手算 KL 逐位一致）
 - [x] 类别不平衡族：`ohem_loss`（批级，不进 `Model`）、`class_balanced_loss`、`ldam_loss`；`soft_ce` **不再单独实现**——`cross_entropy_loss` 已支持任意软标签与 `label_smoothing`，再写一个只是重复（W1-B 提交；CB/LDAM 梯度差分 ≤3.5e-9）
 - [ ] 多任务权重：`uncertainty_weighting`、`gradnorm`、`pcgrad`
