@@ -26576,6 +26576,184 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
     return grads
 
 
+# ============================================================================
+#  W10-C：对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+# ============================================================================
+
+def _adv_check(eps, alpha, steps, clip_low, clip_high):
+    """校验对抗攻击的超参"""
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps != eps or eps < 0:
+        raise ValueError(f"对抗攻击: eps 必须是非负实数，收到 {eps!r}")
+    if alpha is not None:
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
+                or alpha != alpha or alpha <= 0:
+            raise ValueError(f"对抗攻击: alpha 必须是正实数或 None，收到 {alpha!r}")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError(f"对抗攻击: steps 必须是 >=1 的整数，收到 {steps!r}")
+    if clip_low is not None and clip_high is not None and clip_low > clip_high:
+        raise ValueError(
+            f"对抗攻击: clip_low={clip_low} 大于 clip_high={clip_high}"
+        )
+
+
+def _adv_project(x_adv, x, eps, clip_low, clip_high):
+    """把扰动投影回 L∞ 球（以及可选的取值区间）"""
+    out = []
+    for a, b in zip(x_adv, x):
+        d = a - b
+        if d > eps:
+            d = eps
+        elif d < -eps:
+            d = -eps
+        v = b + d
+        if clip_low is not None and v < clip_low:
+            v = clip_low
+        if clip_high is not None and v > clip_high:
+            v = clip_high
+        out.append(v)
+    return out
+
+
+def _adv_input_grad(model, loss_grad):
+    """内部工具：损失对**输入**的梯度（沿各层 backward 链式传到底）
+
+    既接受 `MLP` 也接受 `Model`（后者取 `.model`）。
+    """
+    delta = loss_grad
+    for layer in reversed(getattr(model, "model", model).layers):
+        _, _, delta = layer.backward(delta)
+    return delta
+
+
+def _adv_example(model, x, y, eps, alpha, steps, rng,
+                 random_start, clip_low, clip_high):
+    """内部工具：单样本 FGSM/PGD 攻击，返回扰动后的输入"""
+    if random_start and rng is not None:
+        x_adv = [xi + rng.uniform(-eps, eps) for xi in x]
+    else:
+        x_adv = list(x)
+    x_adv = _adv_project(x_adv, x, eps, clip_low, clip_high)
+    for _ in range(steps):
+        pred = model.forward(x_adv)
+        _, grad = model._loss(pred, y)
+        g = _adv_input_grad(model, grad)
+        x_adv = [xi + (alpha if gi > 0.0 else (-alpha if gi < 0.0 else 0.0))
+                 for xi, gi in zip(x_adv, g)]
+        x_adv = _adv_project(x_adv, x, eps, clip_low, clip_high)
+    return x_adv
+
+
+def pgd_examples(model, xs, ys, eps=0.03, alpha=None, steps=5, random_start=True,
+                 seed=None, clip_low=None, clip_high=None):
+    """用 PGD 生成对抗样本（批量，返回与 ``xs`` 等长的输入列表）
+
+    `alpha` 默认 ``2.5*eps/steps``（PGD 常用的步长），`random_start=True` 时先在
+    半径 ``eps`` 的 L∞ 球内均匀取起点（更接近 "radii" 版 PGD）。扰动每一步都
+    投影回 ``||x_adv - x||_∞ <= eps``，最后按需夹到 ``[clip_low, clip_high]``。
+
+    这是**批级**接口：签名里要模型本身，因此不能直接传给 ``Model(loss_fn=)``；
+    训练时用 ``Model.fit(adv_eps=...)`` 或自己在外层循环调用。
+    """
+    _adv_check(eps, alpha, steps, clip_low, clip_high)
+    if len(xs) != len(ys):
+        raise ValueError(f"pgd_examples: xs 有 {len(xs)} 个，ys 有 {len(ys)} 个")
+    if alpha is None:
+        alpha = 2.5 * eps / steps
+    rng = random.Random(seed) if seed is not None else random
+    if eps == 0.0:
+        return [list(x) for x in xs]
+    return [_adv_example(model, list(x), y, eps, alpha, steps, rng,
+                         random_start, clip_low, clip_high)
+            for x, y in zip(xs, ys)]
+
+
+def fgsm_examples(model, xs, ys, eps=0.03, seed=None,
+                  clip_low=None, clip_high=None):
+    """FGSM：单步、步长等于 ``eps`` 的符号梯度攻击（`pgd_examples` 的特例）"""
+    return pgd_examples(model, xs, ys, eps=eps, alpha=eps if eps > 0 else None,
+                        steps=1, random_start=False, seed=seed,
+                        clip_low=clip_low, clip_high=clip_high)
+
+
+def freelb_examples(model, xs, ys, eps=0.03, alpha=None, steps=3, seed=None,
+                    clip_low=None, clip_high=None):
+    """FreeLB 的**扰动**部分：不带随机起点、把各步扰动累积下来
+
+    真正的 FreeLB 还会把每一步的梯度累积起来只更新一次参数（省 forward/backward
+    轮数）。纯 Python 版没有单独的参数更新时机，所以这里只做扰动累积；梯度累积
+    用 ``Model.fit(grad_accum=steps)`` 近似即可（docstring 里写明这一点）。
+    """
+    if alpha is None:
+        alpha = eps if eps > 0 else None
+    return pgd_examples(model, xs, ys, eps=eps, alpha=alpha, steps=steps,
+                        random_start=False, seed=seed,
+                        clip_low=clip_low, clip_high=clip_high)
+
+
+def _adv_kl(p_logits, q_logits):
+    """内部工具：逐行 KL(softmax(p) || softmax(q)) 的均值"""
+    if len(p_logits) != len(q_logits):
+        raise ValueError(
+            f"对抗正则: 两组 logits 的行数不一致（{len(p_logits)} vs {len(q_logits)}）"
+        )
+    if not p_logits:
+        raise ValueError("对抗正则: logits 不能为空")
+    total = 0.0
+    for lp, lq in zip(p_logits, q_logits):
+        if len(lp) != len(lq):
+            raise ValueError(
+                f"对抗正则: 同一行 logits 长度不一致（{len(lp)} vs {len(lq)}）"
+            )
+        a = _log_softmax_row(lp)
+        b = _log_softmax_row(lq)
+        for pa, pb in zip(a, b):
+            total += math.exp(pa) * (pa - pb)
+    return total / len(p_logits)
+
+
+def trades_regularizer(logits_clean, logits_adv, beta=1.0):
+    """TRADES 的鲁棒项：``beta * KL(p_clean || p_adv)``
+
+    与 ``loss_natural + beta * 本项`` 一起用，其中 ``loss_natural`` 用干净样本算。
+    TRADES 的对抗样本应当由**最大化同一个 KL** 生成（`pgd_examples` 用的是任务
+    损失，属于 PGD-AT 的写法；要严格复现 TRADES 的攻击目标请自己在外层循环里
+    用本函数做上升，本文档不假装两者等价）。
+    """
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta < 0:
+        raise ValueError(f"trades_regularizer: beta 必须是非负实数，收到 {beta!r}")
+    return beta * _adv_kl(logits_clean, logits_adv)
+
+
+def mart_regularizer(logits_clean, logits_adv, beta=6.0):
+    """MART 的鲁棒项：``beta * mean((1 - p_max_clean) * KL(p_clean || p_adv))``
+
+    ``1 - p_max`` 让「模型已经很自信的样本」权重更低（MART 的误分类感知加权），
+    与原文的 ``(1 - y_max)`` 同义（这里用干净预测的最大概率近似）。
+    """
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta < 0:
+        raise ValueError(f"mart_regularizer: beta 必须是非负实数，收到 {beta!r}")
+    if len(logits_clean) != len(logits_adv):
+        raise ValueError("mart_regularizer: 两组 logits 的行数不一致")
+    total = 0.0
+    for lp, lq in zip(logits_clean, logits_adv):
+        a = _log_softmax_row(lp)
+        b = _log_softmax_row(lq)
+        kl = 0.0
+        for pa, pb in zip(a, b):
+            kl += math.exp(pa) * (pa - pb)
+        total += (1.0 - math.exp(max(a))) * kl
+    return beta * total / len(logits_clean)
+
+
+def smart_regularizer(logits_clean, logits_adv, beta=1.0):
+    """SMART 的**输出**光滑项：``beta * KL(p_clean || p_adv)``（对称化可选）
+
+    SMART 原文还包含输入空间的 Bregman 散度项；纯 Python 版只实现输出项，
+    因此这里叫「输出光滑项」，不声称等价于完整 SMART。
+    """
+    return trades_regularizer(logits_clean, logits_adv, beta)
+
+
 class Model:
     """
     高层封装：将模型、损失函数、优化器打包为 sklearn 风格 API。
@@ -27031,7 +27209,8 @@ class Model:
             early_stop_metric='val', restore_best_weights=False,
             checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1,
             seed=None, callbacks=None, resume_from=None, mixup_alpha: float = 0.0,
-            record_layer_norms: bool = False):
+            record_layer_norms: bool = False, adv_eps: float = 0.0,
+            adv_steps: int = 5, adv_alpha: float = None):
         """
         训练模型。
 
@@ -27067,6 +27246,11 @@ class Model:
             mixup_alpha:  >0 时对每个 batch 做 mixup（仅分类任务、仅索引型损失），
                 lam ~ Beta(alpha, alpha)；0（默认）表示关闭，关闭时数值完全不变
             record_layer_norms: True 时把每层梯度范数记进 history['layer_grad_norm']
+            adv_eps:      >0 时对每个 batch 做 PGD 对抗训练（先用 `pgd_examples` 攻击
+                当前权重，再在被扰动的样本上算损失与梯度）；0（默认）关闭，关闭时
+                数值与旧版完全一致。与 mixup_alpha 互斥
+            adv_steps:    对抗攻击的步数（越大越强、越慢）
+            adv_alpha:    对抗攻击每步步长（None = 2.5*adv_eps/adv_steps）
         """
         # === 规范化数据 ===
         if data is not None:
@@ -27143,6 +27327,21 @@ class Model:
 
         callbacks = _normalize_callbacks(callbacks)
 
+        if isinstance(adv_eps, bool) or not isinstance(adv_eps, (int, float)) \
+                or adv_eps != adv_eps or adv_eps < 0:
+            raise ValueError(f"fit: adv_eps 必须是非负实数，收到 {adv_eps!r}")
+        if isinstance(adv_steps, bool) or not isinstance(adv_steps, int) or adv_steps < 1:
+            raise ValueError(f"fit: adv_steps 必须是 >=1 的整数，收到 {adv_steps!r}")
+        if adv_alpha is not None:
+            if isinstance(adv_alpha, bool) or not isinstance(adv_alpha, (int, float)) \
+                    or adv_alpha != adv_alpha or adv_alpha <= 0:
+                raise ValueError(f"fit: adv_alpha 必须是正实数或 None，收到 {adv_alpha!r}")
+        if adv_eps > 0 and mixup_alpha > 0:
+            raise ValueError(
+                "fit: adv_eps 与 mixup_alpha 不能同时启用（mixup 的软标签没有对应的"
+                "对抗目标；要两者都做请自己在回调里实现）"
+            )
+
         if not isinstance(mixup_alpha, (int, float)) or isinstance(mixup_alpha, bool) \
                 or mixup_alpha != mixup_alpha or mixup_alpha < 0:
             raise ValueError(f"fit: mixup_alpha 必须是 >=0 的数字，收到 {mixup_alpha!r}")
@@ -27195,6 +27394,15 @@ class Model:
                 batch = dataset[b:b + batch_size]
                 if mixup_alpha > 0.0:
                     batch = self._mixup_batch(batch, mixup_alpha, rng)
+                if adv_eps > 0.0:
+                    # 用当前权重攻击这一批样本，再在被扰动的样本上训练
+                    _adv_seed = rng.randrange(1 << 30) if seed is not None else None
+                    _x_adv = pgd_examples(
+                        self, [xi for xi, _ in batch], [yi for _, yi in batch],
+                        eps=adv_eps, alpha=adv_alpha, steps=adv_steps,
+                        random_start=True, seed=_adv_seed,
+                    )
+                    batch = [(_x_adv[i], batch[i][1]) for i in range(len(batch))]
 
                 # 直接在反向传播时把各样本梯度累加到 buffer：
                 #   1) 不再保存 batch 内每个样本的完整梯度（省下 B×参数量 的中间结构）

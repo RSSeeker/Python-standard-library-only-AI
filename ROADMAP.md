@@ -275,7 +275,11 @@
       - `DropConnect(in, out, act, p=0.5)` 直接继承 `Layer`（复用权重与 Adam 状态）：`W⊙M/(1-p)`，正向与反向都用掩码权重；`eval()` 下与同权重 `Layer` 逐位相同，`next_delta` 用掩码权重（有限差分 -1.641944 vs -1.641944）；
       - 找到的真 bug：`DropBlock2d` 的 `γ` 一开始写成 `(1-p)/(bs²)·…`（把 `p` 当保留率），实测丢弃比例 0.534 而目标 0.3 ⇒ 改成 `p/(bs²)·…`（期望覆盖面积 `种子数·bs²·γ/(H·W) = p`）；
       - 探针 `probe_w10b.py` 24 项全绿，`TestStructuredRegularization` 10 例；越界 `p`/`block_size`、非 `(C,H,W)`、未 forward 就 backward 都在入口报错。
-- [ ] 对抗训练：FGSM / PGD / TRADES / MART / FreeLB / SMART
+- [x] 对抗训练：FGSM / PGD / TRADES / MART / FreeLB / SMART
+      - `pgd_examples` / `fgsm_examples` / `freelb_examples`：输入空间攻击，每步投影回 `‖x_adv−x‖∞ ≤ eps`，`alpha` 默认 `2.5·eps/steps`；单步 PGD 与 FGSM 逐位相同，FGSM 用 linear+mse 的闭式解核对过；
+      - `trades_regularizer` / `mart_regularizer` / `smart_regularizer`：都是「干净 logits + 对抗 logits」的批级函数，手算 KL 与 `(1−p_max)` 加权逐项核对；SMART 只实现输出项（诚实标注）；
+      - `Model.fit(adv_eps=, adv_steps=, adv_alpha=)`：每 batch 先用当前权重攻击再训练；`adv_eps=0`（默认）时权重与 loss 曲线**逐位不变**；与 `mixup_alpha` 互斥并报错；
+      - 探针 `probe_w10c.py` 全绿，`TestAdversarialTraining` 12 例，全库 1153 passed。
 - [ ] 噪声注入（权重/梯度/输入）、课程学习 `CurriculumSampler`、Manifold Mixup、Snapshot Ensembles
 - [ ] 半监督：VAT、伪标签、FixMatch、MixMatch、MeanTeacher、一致性正则
 - [ ] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）

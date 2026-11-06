@@ -18556,3 +18556,165 @@ class TestStructuredRegularization:
             AI.DropConnect(2, 2, "relu", p=1.0)
         with pytest.raises(ValueError):
             AI.DropConnect(2, 2, "relu", p=-1.0)
+
+
+# ============================================================================
+#  W10-C：对抗训练（FGSM / PGD / TRADES / MART / SMART / fit(adv_eps)）
+# ============================================================================
+
+class TestAdversarialTraining:
+    """输入空间攻击与鲁棒正则。"""
+
+    @staticmethod
+    def _model(sizes=(2, 3, 2), seed=1):
+        random.seed(seed)
+        net = AI.MLP(list(sizes), activations=["relu"] * (len(sizes) - 2) + ["linear"])
+        return AI.Model(net, loss_fn="mse", task="regression", optimizer="adam", lr=0.01)
+
+    def test_eps_zero_is_identity(self):
+        model = self._model()
+        x, y = [0.3, -0.2], [1.0, 0.0]
+        assert AI.pgd_examples(model, [x], [y], eps=0.0, steps=3)[0] == x
+        assert AI.fgsm_examples(model, [x], [y], eps=0.0)[0] == x
+
+    def test_fgsm_closed_form(self):
+        """linear + mse：x_adv = x + eps*sign(Wᵀ·dL/dpred)。"""
+        random.seed(7)
+        net = AI.MLP([2, 2], activations=["linear"])
+        model = AI.Model(net, loss_fn="mse", task="regression", optimizer="sgd", lr=0.01)
+        x, y = [0.3, -0.2], [1.0, 0.0]
+        eps = 0.05
+        _, grad = model._loss(model.forward(x), y)
+        w = net.layers[0].weights
+        g = [sum(w[j][i] * grad[j] for j in range(2)) for i in range(2)]
+        want = [x[i] + eps * (1.0 if g[i] > 0 else (-1.0 if g[i] < 0 else 0.0))
+                for i in range(2)]
+        got = AI.fgsm_examples(model, [x], [y], eps=eps)[0]
+        for a, b in zip(want, got):
+            assert abs(a - b) < 1e-12
+
+    def test_eps_ball_and_clip(self):
+        model = self._model()
+        xs = [[0.1 * i, -0.2 * i] for i in range(5)]
+        ys = [[1.0, 0.0] for _ in range(5)]
+        adv = AI.pgd_examples(model, xs, ys, eps=0.1, steps=4, seed=11)
+        for xa, xb in zip(adv, xs):
+            for a, b in zip(xa, xb):
+                assert abs(a - b) <= 0.1 + 1e-12
+        adv_c = AI.pgd_examples(model, xs, ys, eps=0.5, steps=2, seed=11,
+                                clip_low=0.0, clip_high=1.0)
+        for row in adv_c:
+            for v in row:
+                assert 0.0 <= v <= 1.0
+
+    def test_single_step_pgd_equals_fgsm(self):
+        model = self._model()
+        xs = [[0.1, -0.2], [0.2, 0.3]]
+        ys = [[1.0, 0.0]] * 2
+        a = AI.pgd_examples(model, xs, ys, eps=0.1, alpha=0.1, steps=1,
+                            random_start=False)
+        b = AI.fgsm_examples(model, xs, ys, eps=0.1)
+        for xa, xb in zip(a, b):
+            for p, q in zip(xa, xb):
+                assert abs(p - q) < 1e-15
+
+    def test_attack_raises_loss(self):
+        model = self._model()
+        xs = [[0.1 * i, -0.2 * i] for i in range(5)]
+        ys = [[1.0, 0.0] for _ in range(5)]
+        clean = sum(model._loss(model.forward(xi), yi)[0]
+                    for xi, yi in zip(xs, ys)) / len(xs)
+        f_adv = sum(model._loss(model.forward(xi), yi)[0]
+                    for xi, yi in zip(AI.fgsm_examples(model, xs, ys, eps=0.2), ys)) / len(xs)
+        p_adv = sum(model._loss(model.forward(xi), yi)[0]
+                    for xi, yi in zip(
+                        AI.pgd_examples(model, xs, ys, eps=0.2, steps=5, seed=5), ys)) / len(xs)
+        assert f_adv >= clean - 1e-12
+        assert p_adv >= f_adv - 1e-9
+
+    def test_trades_regularizer(self):
+        lc = [[2.0, 0.0], [0.0, 1.0]]
+        assert AI.trades_regularizer(lc, lc) == 0.0
+        la = [[0.0, 2.0], [0.0, 1.0]]
+        val = AI.trades_regularizer(lc, la)
+        assert val > 0.0
+        assert abs(AI.trades_regularizer(lc, la, beta=2.0) - 2.0 * val) < 1e-12
+        # 手算：只有第一行不同，函数按行取均值
+        p = [math.exp(2.0) / (math.exp(2.0) + 1.0), 1.0 / (math.exp(2.0) + 1.0)]
+        q = [1.0 / (math.exp(2.0) + 1.0), math.exp(2.0) / (math.exp(2.0) + 1.0)]
+        kl = sum(pi * math.log(pi / qi) for pi, qi in zip(p, q)) / 2.0
+        assert abs(val - kl) < 1e-12
+
+    def test_mart_regularizer(self):
+        lc = [[2.0, 0.0], [0.0, 1.0]]
+        assert AI.mart_regularizer(lc, lc) == 0.0
+        la = [[0.0, 2.0], [0.0, 1.0]]
+        got = AI.mart_regularizer(lc, la, beta=1.0)
+        kl = AI.trades_regularizer(lc, la) * 2.0   # 每行 KL（不除行数）
+        pmax = math.exp(2.0) / (math.exp(2.0) + 1.0)
+        want = (1.0 - pmax) * kl / 2.0
+        assert abs(got - want) < 1e-12
+
+    def test_smart_matches_trades_output_term(self):
+        lc = [[2.0, 0.0], [0.0, 1.0]]
+        la = [[0.0, 2.0], [0.0, 1.0]]
+        assert abs(AI.smart_regularizer(lc, la)
+                   - AI.trades_regularizer(lc, la)) < 1e-15
+
+    def test_attack_validation(self):
+        model = self._model()
+        xs = [[0.1, -0.2]]
+        ys = [[1.0, 0.0]]
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys, eps=-1.0)
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys, eps=0.1, alpha=0.0)
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys, eps=0.1, steps=0)
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys, eps=0.1, steps=1.5)
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys, eps=0.1, clip_low=1.0, clip_high=0.0)
+        with pytest.raises(ValueError):
+            AI.pgd_examples(model, xs, ys + ys, eps=0.1)
+        with pytest.raises(ValueError):
+            AI.trades_regularizer([[1.0]], [[1.0]], beta=-1.0)
+        with pytest.raises(ValueError):
+            AI.trades_regularizer([], [])
+
+    def test_fit_adv_eps_zero_is_bitwise_identical(self):
+        """adv_eps=0 必须与不传该参数逐位一致。"""
+        data = [([0.1 * i, -0.2 * i], [1.0, 0.0]) for i in range(6)]
+        random.seed(21)
+        a = self._model()
+        random.seed(21)
+        b = self._model()
+        ha = a.fit(data=data, epochs=5, batch_size=3, verbose=False, seed=4)
+        hb = b.fit(data=data, epochs=5, batch_size=3, verbose=False, seed=4, adv_eps=0.0)
+        assert ha["train_loss"] == hb["train_loss"]
+        assert a.model.layers[0].weights == b.model.layers[0].weights
+
+    def test_fit_adv_training_runs(self):
+        data = [([0.1 * i, -0.2 * i], [1.0, 0.0]) for i in range(6)]
+        random.seed(23)
+        model = self._model()
+        hist = model.fit(data=data, epochs=30, batch_size=3, verbose=False,
+                         seed=4, adv_eps=0.05, adv_steps=3)
+        first, last = hist["train_loss"][0][1], hist["train_loss"][-1][1]
+        assert math.isfinite(last)
+        assert last < first
+
+    def test_fit_adv_validation(self):
+        data = [([0.1, -0.2], [1.0, 0.0])] * 4
+        with pytest.raises(ValueError):
+            self._model().fit(data=data, epochs=1, batch_size=2, verbose=False,
+                              adv_eps=-0.1)
+        with pytest.raises(ValueError):
+            self._model().fit(data=data, epochs=1, batch_size=2, verbose=False,
+                              adv_eps=0.1, adv_steps=0)
+        with pytest.raises(ValueError):
+            self._model().fit(data=data, epochs=1, batch_size=2, verbose=False,
+                              adv_eps=0.1, adv_alpha=0.0)
+        with pytest.raises(ValueError):
+            self._model().fit(data=data, epochs=1, batch_size=2, verbose=False,
+                              adv_eps=0.1, mixup_alpha=0.2)

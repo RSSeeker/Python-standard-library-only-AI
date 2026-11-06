@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1141 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1153 项）
 
 ## 特性
 
@@ -224,6 +224,27 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 > 要连 Adam 的动量/二阶矩一起存，需显式传 `optimizer=`（`Model.save` 默认已传），
 > 加载时再传 `restore_optimizer=True`。不恢复动量的话「加载后继续训练」不等于「不中断地训练」——
 > 前几步的更新幅度会偏大（实测 2.4e-02 量级差异）；恢复后可达**逐位续训**（见下方「断点续训」）。
+
+### 对抗训练（W10-C）
+
+攻击与鲁棒正则都是**批级**接口（签名里要模型本身），因此不能塞进 `Model(loss_fn=)`：
+
+| 函数 | 说明 |
+|---|---|
+| `pgd_examples(model, xs, ys, eps, alpha=None, steps=5, random_start=True, seed=None, clip_low=None, clip_high=None)` | PGD 攻击：`alpha` 默认 `2.5·eps/steps`，每步投影回 `‖x_adv−x‖∞ ≤ eps`，可选夹到 `[clip_low, clip_high]` |
+| `fgsm_examples(model, xs, ys, eps, ...)` | FGSM = 单步、步长 `eps`、无随机起点的 `pgd_examples`（探针核对过两者逐位相同） |
+| `freelb_examples(model, xs, ys, eps, steps=3, ...)` | FreeLB 的**扰动**部分：不带随机起点、扰动逐步累积；梯度累积用 `fit(grad_accum=steps)` 近似 |
+| `trades_regularizer(logits_clean, logits_adv, beta=1.0)` | `beta·KL(p_clean‖p_adv)`（按行取均值） |
+| `mart_regularizer(logits_clean, logits_adv, beta=6.0)` | `beta·mean((1−p_max)·KL)`，给自信样本降权 |
+| `smart_regularizer(logits_clean, logits_adv, beta=1.0)` | SMART 的**输出**光滑项（等于 `trades_regularizer`；输入空间 Bregman 项未实现） |
+
+训练时直接开 `fit(adv_eps=...)`：每个 batch 先用**当前权重**攻击这批样本，再在被扰动
+样本上算损失与梯度（PGD-AT）。`adv_eps` 默认 `0.0`，关闭时数值与旧版**逐位相同**
+（探针核对过权重与 loss 曲线）；`adv_eps` 与 `mixup_alpha` 互斥（mixup 的软标签没有
+对应的对抗目标）。
+
+诚实边界：TRADES 的攻击目标应当是最大化 KL，而 `pgd_examples` 用的是任务损失
+（PGD-AT 的写法），两者不等价；SMART 只实现输出项；FreeLB 只做扰动累积。
 
 ### 训练 / 推理模式
 
@@ -1159,7 +1180,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1141 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1153 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1316,6 +1337,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDropPath` | `p=0`/`eval()` 恒等、丢弃率≈p、保留时放大 `1/(1-p)`、backward 与 gate 一致、非法 p |
 | `TestDropoutVariants` | `p=0`/`eval()` 恒等、SpatialDropout1d 整条时间轴共用掩码、SpatialDropout2d 整通道丢弃、AlphaDropout 的 `a·x+b` 闭式与「均值 0 方差 1」、GaussianDropout 的 `E=1`/`Var=p/(1-p)` 与同种子复现、R-Drop 同分布为 0/对称/alpha 线性、11 类非法输入、未 forward 就 backward 报错 |
 | `TestStructuredRegularization` | DropBlock2d 的丢弃比例与连块性、缩放保期望、反向用掩码；DropConnect 的 `eval()` 逐位退化、`grad_w` 掩码与 `next_delta` 有限差分、能进 `MLP` 训练 |
+| `TestAdversarialTraining` | FGSM 闭式解、L∞ 球与取值裁剪、单步 PGD = FGSM、对抗样本抬高损失、TRADES/MART 的手算 KL、`adv_eps=0` 逐位不变、对抗训练能降 loss、4 类非法超参 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1369,7 +1391,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1141 个单元测试
+├── test_ai.py       # 1153 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
