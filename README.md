@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1079 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1091 项）
 
 ## 特性
 
@@ -367,6 +367,8 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `LARS(model, lr=0.1, momentum=0.9, trust_coef=0.001, nesterov=False)` | 层粒度信任比：`local_lr = lr·tc·‖W‖/(‖g‖+wd·‖W‖+eps)`，再用动量更新；`‖W‖=0`（或分母为 0）时回落成 `lr`。偏置恒用 `lr`，与原文一致 |
 | `LAMB(model, lr=1e-3, beta1=0.9, beta2=0.999, weight_decay=0.0, trust_clip=10.0)` | Adam 的层粒度版：先算整层更新 `u = m̂/(√v̂+eps) + wd·W`，再乘 `trust = ‖W‖/‖u‖`（截到 `trust_clip`）；大 batch 训练常用 |
 | `Ranger(model, lr=1e-3, alpha=0.5, k=6)` | RAdam + Lookahead：RAdam 的动量相→修正相，再每 `k` 步把快权重按 `alpha` 混入慢权重并同步回去 |
+| `SGDW(model, lr=0.01, momentum=0.0, weight_decay=0.01, nesterov=False)` | **解耦**权重衰减的 SGD：`p *= 1-lr·wd` 先衰减，再用动量/一阶梯度更新；`nesterov=True` 用 `g + mu·v` 前瞻 |
+| `NesterovSGD(model, lr=0.01, momentum=0.9)` | `SGDW(wd=0, momentum=0.9, nesterov=True)` 的便捷写法 |
 | `RAdam(model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)` | 用 `rho_t = rho_inf - 2t·b2^t/(1-b2^t)` 判断二阶矩够不够可信：`rho_t<=4` 时只走纯动量，之后才按 `r_t` 缩放自适应步长（免手工 warmup） |
 | `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
 | `ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=0.0, mode='min')` | 指标停滞 `patience+1` 次就把 lr 乘 `factor`（可反复降档，与 PyTorch 一致）；`step()` 要传指标 |
@@ -607,6 +609,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
 | `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套（W9-A）；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
 | `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套（W9-B）：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
+| `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族（W9-C）：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
@@ -743,6 +746,9 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上；会保存 `groups`（分组/深度卷积可原样加载，没有该字段的旧存档按 1 处理） |
 | `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；W9-A 的四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
+| `Lookahead(optimizer, k=6, alpha=0.5)` | 包在任意优化器外面：每 `k` 步把快权重与慢权重按 `alpha` 混合再同步；`state_dict()` 含内层状态与慢权重 |
+| `EMA(model, decay=0.999, warmup=0)` | 权重指数移动平均：`update()` 累积、`shadow()` 取快照、`apply_to(model)` 写回；`warmup>0` 时用 `(1+t)/(10+t)` 做有效衰减 |
+| `SWA(model)` | 简单权重平均（Stochastic Weight Averaging）：`update()` 增量求均值、`average()` / `apply_to()`，`state_dict()` 可存档 |
 | `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False, loss_kwargs=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训；损失函数名与 `loss_kwargs` 随存档往返，显式传参可覆盖 |
 
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
@@ -765,6 +771,8 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `Callback` | 训练回调基类，子类覆写需要的钩子即可 |
 | `EarlyStopping(monitor, patience, min_delta, mode)` | 监控指标连续 `patience` 轮不改善就请求停止（`should_stop` / `stopped_epoch`），不改权重 |
 | `ModelCheckpoint(path, every, monitor, save_best_only)` | 每 `every` 轮存一份（含优化器状态）；`save_best_only` 只存最优；产物可直接 `resume_from` |
+| `EMACallback(model, decay, warmup)` | 每轮训练结束 `EMA.update()`，训练后 `cb.ema.apply_to()` 用平均权重推理（典型 +0.2~1% 泛化） |
+| `SWACallback(model)` | 每轮训练结束 `SWA.update()`，训练后 `cb.swa.apply_to()` 用平均权重；常配较大的常量 lr 做后半程平均 |
 | `LoggingCallback(logger)` | 每轮指标写进标准库 `logging`（默认 logger `ai.train`） |
 | `HistoryCallback()` | 把每轮 logs 收进 `records`（画曲线 / 导出 CSV 用） |
 | `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
@@ -1130,7 +1138,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1079 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1091 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1183,6 +1191,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
 | `TestCTCLoss` | loss 与穷举所有对齐路径一致 / 梯度 vs 数值 / 不可达与非法标签 |
 | `TestLayerwiseOptimizers` | LARS/LAMB 与手写参考逐步逐位一致、LARS 零权重回落 `lr`、LAMB 的 `trust_clip` 单调、Ranger 第一步是纯动量且 Lookahead 后 `fast == slow`、三者 `state_dict` 往返续训逐位一致（需连权重一起搬）、非法超参 || `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
+| `TestSGDWFamily` | `wd=0/mu=0` 时 `SGDW` 与 `SGD` 逐位相同、纯衰减时 `p *= 1-lr·wd`、`NesterovSGD` 三步与手写参考一致 |
+| `TestLookahead` | 只在第 `k` 步同步、`alpha=0.5` 恰为中点、`Lookahead(Adam)` 的 `state_dict` 续训逐位一致 |
+| `TestEMAAndSWA` | EMA 三步闭式解、warmup 有效衰减、SWA 增量均值 == 算术均值、两者存档往返、非法输入 |
+| `TestEMASWACallbacks` | 回调每 epoch 更新一次（6 轮 → `step=6`/`n=6`）、SWA 平均恰为逐 epoch 快照的算术平均、`apply_to` 生效 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -1331,7 +1343,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1079 个单元测试
+├── test_ai.py       # 1091 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -17444,3 +17444,232 @@ class TestLayerwiseOptimizers:
             first = m.history["train_loss"][0][1]
             last = m.history["train_loss"][-1][1]
             assert last < first, (name, first, last)
+
+
+# ==== W9-C：SGDW / Nesterov / Lookahead / EMA / SWA ====
+class TestSGDWFamily:
+    X = [1.0, -0.5, 0.25]
+    Y = [0.3, -0.7]
+
+    @staticmethod
+    def _mk(seed=4):
+        random.seed(seed)
+        return AI.MLP([3, 4, 2], activations=["relu", "linear"])
+
+    @staticmethod
+    def _grads(model):
+        _l, gp = AI.mse_loss(model.forward(TestSGDWFamily.X), TestSGDWFamily.Y)
+        return AI._mlp_backward(model, gp)
+
+    @staticmethod
+    def _flat(model):
+        out = []
+        for layer in model.layers:
+            out.extend(layer.biases)
+            for row in layer.weights:
+                out.extend(row)
+        return out
+
+    @staticmethod
+    def _close(a, b, tol=1e-12):
+        return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+    def test_sgdw_without_decay_matches_sgd(self):
+        a, b = self._mk(), self._mk()
+        for la, lb in zip(a.layers, b.layers):
+            lb.biases = la.biases[:]
+            lb.weights = [row[:] for row in la.weights]
+        g = self._grads(a)
+        AI.SGD(a, lr=0.05).step(g)
+        AI.SGDW(b, lr=0.05, momentum=0.0, weight_decay=0.0).step(g)
+        assert max(abs(p - q) for p, q in zip(self._flat(a), self._flat(b))) == 0.0
+
+    def test_sgdw_decoupled_weight_decay(self):
+        m = self._mk(5)
+        opt = AI.SGDW(m, lr=0.1, momentum=0.0, weight_decay=0.5)
+        before = self._flat(m)
+        zero = [([[0.0] * l.fan_in for _ in range(l.fan_out)], [0.0] * l.fan_out)
+                for l in m.layers]
+        opt.step(zero)
+        expect = [p * (1.0 - 0.1 * 0.5) for p in before]
+        assert all(self._close(p, q) for p, q in zip(self._flat(m), expect))
+
+    def test_nesterov_matches_hand_computation(self):
+        m1, m2 = self._mk(11), self._mk(11)
+        for la, lb in zip(m1.layers, m2.layers):
+            lb.biases = la.biases[:]
+            lb.weights = [row[:] for row in la.weights]
+        opt = AI.NesterovSGD(m1, lr=0.03, momentum=0.9)
+        vw = [[[0.0] * l.fan_in for _ in range(l.fan_out)] for l in m2.layers]
+        vb = [[0.0] * l.fan_out for l in m2.layers]
+        for _ in range(3):
+            g = self._grads(m1)
+            opt.step(g)
+            for li, layer in enumerate(m2.layers):
+                gw, gb = g[li]
+                for j in range(layer.fan_out):
+                    v = 0.9 * vb[li][j] + gb[j]
+                    vb[li][j] = v
+                    layer.biases[j] -= 0.03 * (gb[j] + 0.9 * v)
+                    for i in range(layer.fan_in):
+                        v = 0.9 * vw[li][j][i] + gw[j][i]
+                        vw[li][j][i] = v
+                        layer.weights[j][i] -= 0.03 * (gw[j][i] + 0.9 * v)
+        assert max(abs(p - q) for p, q in zip(self._flat(m1), self._flat(m2))) <= 1e-13
+
+
+class TestLookahead:
+    X = TestSGDWFamily.X
+    Y = TestSGDWFamily.Y
+    _mk = staticmethod(TestSGDWFamily._mk)
+    _grads = staticmethod(TestSGDWFamily._grads)
+    _flat = staticmethod(TestSGDWFamily._flat)
+    _close = staticmethod(TestSGDWFamily._close)
+
+    def test_sync_happens_on_kth_step(self):
+        m = self._mk(13)
+        la = AI.Lookahead(AI.SGDMomentum(m, lr=0.05, momentum=0.9), k=2, alpha=0.5)
+        g = self._grads(m)
+        la.step(g)
+        assert la.step_count == 1
+        la.step(g)
+        fast = self._flat(m)
+        slow = []
+        for bs, ws in la._slow:
+            slow.extend(bs)
+            for row in ws:
+                slow.extend(row)
+        assert all(self._close(p, q) for p, q in zip(fast, slow))
+
+    def test_alpha_is_midpoint(self):
+        m = self._mk(13)
+        la = AI.Lookahead(AI.SGDMomentum(m, lr=0.05, momentum=0.9), k=2, alpha=0.5)
+        g = self._grads(m)
+        slow0 = self._flat(m)
+        la.step(g)
+        la.step(g)
+        slow = []
+        for bs, ws in la._slow:
+            slow.extend(bs)
+            for row in ws:
+                slow.extend(row)
+        # 手写：两次 inner step 用同一份 stale 梯度，slow = slow0 + 0.5*(fast-slow0)
+        m2 = self._mk(13)
+        inner = AI.SGDMomentum(m2, lr=0.05, momentum=0.9)
+        inner.step(g)
+        inner.step(g)
+        expect = [s + 0.5 * (f - s) for s, f in zip(slow0, self._flat(m2))]
+        assert max(abs(p - q) for p, q in zip(slow, expect)) <= 1e-12
+
+    def test_state_dict_roundtrip_with_inner_adam(self):
+        m = self._mk(17)
+        la = AI.Lookahead(AI.Adam(m, lr=0.02), k=2, alpha=0.4)
+        for _ in range(3):
+            la.step(self._grads(m))
+        blob = la.state_dict()
+        m2 = self._mk(17)
+        la2 = AI.Lookahead(AI.Adam(m2, lr=0.02), k=2, alpha=0.4)
+        la2.optimizer.step_count = la.optimizer.step_count
+        for a, b in zip(m.layers, m2.layers):
+            b.biases = a.biases[:]
+            b.weights = [row[:] for row in a.weights]
+            b.m_w = [row[:] for row in a.m_w]
+            b.v_w = [row[:] for row in a.v_w]
+            b.m_b = a.m_b[:]
+            b.v_b = a.v_b[:]
+        la2.load_state_dict(blob)
+        for _ in range(2):
+            la.step(self._grads(m))
+            la2.step(self._grads(m2))
+        assert la2.step_count == 5
+        assert max(abs(p - q) for p, q in zip(self._flat(m), self._flat(m2))) == 0.0
+
+
+class TestEMAAndSWA:
+    _flat = staticmethod(TestSGDWFamily._flat)
+    _close = staticmethod(TestSGDWFamily._close)
+
+    def test_ema_closed_form(self):
+        m = AI.MLP([2, 3, 1])
+        ema = AI.EMA(m, decay=0.9)
+        w0 = m.layers[0].weights[0][0]
+        ema.update()
+        seq = [w0]
+        for k in range(1, 4):
+            m.layers[0].weights[0][0] = w0 + k
+            seq.append(w0 + k)
+            ema.update()
+        ref = seq[0]
+        for k in range(1, 4):
+            ref = 0.9 * ref + 0.1 * seq[k]
+        assert self._close(ema.shadow()[0][1][0][0], ref)
+
+    def test_ema_warmup_effective_decay(self):
+        m = AI.MLP([2, 3, 1])
+        ema = AI.EMA(m, decay=0.999, warmup=2)
+        d0 = ema.effective_decay()
+        ema.update()
+        d1 = ema.effective_decay()
+        assert self._close(d0, 1 / 10) and self._close(d1, 2 / 11)
+
+    def test_swa_incremental_mean_and_roundtrip(self):
+        m = AI.MLP([2, 3, 1])
+        swa = AI.SWA(m)
+        snaps = []
+        for k in range(4):
+            m.layers[0].weights[0][0] = float(k)
+            snaps.append(float(k))
+            swa.update()
+        mean = sum(snaps) / len(snaps)
+        assert self._close(swa.average()[0][1][0][0], mean)
+        blob = swa.state_dict()
+        swa2 = AI.SWA(AI.MLP([2, 3, 1]))
+        swa2.load_state_dict(blob)
+        assert swa2.n == 4 and self._close(swa2.average()[0][1][0][0], mean)
+
+    def test_ema_swa_validation(self):
+        m = AI.MLP([2, 2])
+        for fn in (lambda: AI.EMA(m, decay=1.0),
+                   lambda: AI.EMA(m, warmup=-1),
+                   lambda: AI.EMA(m).load_state_dict({"nope": 1}),
+                   lambda: AI.SWA(m).load_state_dict({"nope": 1}),
+                   lambda: AI.EMA(AI.MLP([3, 3])).apply_to(m)):
+            with pytest.raises(ValueError):
+                fn()
+
+
+class TestEMASWACallbacks:
+    def _data(self):
+        return [([1.0, 2.0, 3.0], [0.5, 0.1]), ([0.1, 0.2, 0.3], [0.0, 1.0]),
+                ([0.5, 0.5, 0.5], [0.3, 0.3])]
+
+    def test_callbacks_track_each_epoch(self):
+        mm = AI.MLP([3, 4, 2], activations=["relu", "linear"])
+        model = AI.Model(mm, task="regression", loss_fn="mse", optimizer="adam", lr=0.05)
+        ecb = AI.EMACallback(mm, decay=0.5)
+        scb = AI.SWACallback(mm)
+        model.fit(data=self._data(), epochs=6, verbose=False, seed=3,
+                  callbacks=[ecb, scb])
+        assert ecb.ema.step == 6 and scb.swa.n == 6
+
+    def test_swa_average_equals_snapshot_mean(self):
+        snaps = []
+
+        class Rec(AI.Callback):
+            def on_epoch_end(self, epoch, logs):
+                snaps.append(TestSGDWFamily._flat(mm))
+
+        mm = AI.MLP([3, 4, 2], activations=["relu", "linear"])
+        model = AI.Model(mm, task="regression", loss_fn="mse", optimizer="adam", lr=0.05)
+        scb = AI.SWACallback(mm)
+        model.fit(data=self._data(), epochs=4, verbose=False, seed=3,
+                  callbacks=[scb, Rec()])
+        avg = []
+        for k, snap in enumerate(snaps, start=1):
+            avg = list(snap) if k == 1 else [a + (b - a) / k for a, b in zip(avg, snap)]
+        flat = []
+        for bs, ws in scb.swa.average():
+            flat.extend(bs)
+            for row in ws:
+                flat.extend(row)
+        assert max(abs(p - q) for p, q in zip(flat, avg)) <= 1e-12

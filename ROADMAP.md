@@ -227,7 +227,13 @@
 - [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、多尺度 Glow 组合（把上面两件与 RealNVP 耦合串成完整 Glow）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
 
 ### W9 优化器与调度（§3/§4）
-- [ ] `SGDSGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`
+- [x] `SGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`
+      - `SGDW`：`p *= 1-lr·wd` 解耦衰减 + 动量/Nesterov 前瞻；`wd=0, momentum=0` 时与 `SGD` **逐位相同**（探针 diff 0.0e+00）
+      - `NesterovSGD`：`SGDW(wd=0, momentum=0.9, nesterov=True)` 便捷写法；三步与手写参考 worst 0.0e+00
+      - `Lookahead`：包任意优化器，每 `k` 步 `slow += alpha·(fast-slow)`；`alpha=0.5` 恰为中点（0.0e+00），`state_dict` 续训逐位一致
+      - `EMA` / `SWA`：`shadow`/`avg` + `apply_to()`；EMA 三步闭式解 `0.966274244912`、warmup 有效衰减 `d0=0.1, d1=2/11`；SWA 增量均值 == 算术均值（0.0e+00）
+      - 回调 `EMACallback` / `SWACallback`：每 epoch 一次，6 轮 → `step=6` / `n=6`；**`fit` 传给回调的是 `Model` 包装器**，内部要 `getattr(model, 'model', model)` 取 MLP（否则 `AttributeError: 'Model' object has no attribute 'layers'`）
+      - 已知边界：`Lookahead` 只包「有 `step`/`.model` 的优化器」；`EMA`/`SWA` 的状态不从 `save_model(optimizer=)` 走，要自己 `state_dict()`；Adam 族的矩存在 `layer` 上，断点续训必须连 `m_w/v_w/m_b/v_b` 与 `step_count` 一起搬
 - [x] 自适应族前半：`AdaGrad` / `AdaDelta` / `Nadam` / `RAdam`（W9-A）
   - 与手写参考实现逐步**逐位相同**；AdaGrad 步长单调不增、AdaDelta 对梯度整体缩放不变、
     Nadam 在 `b1=0` 退化成 RMSprop 式、RAdam 前几步纯动量后自动打开修正。

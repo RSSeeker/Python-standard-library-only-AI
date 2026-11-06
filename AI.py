@@ -20056,6 +20056,306 @@ class RMSprop:
 
 
 
+# ============================================================================
+#  SGDW / Nesterov / Lookahead / SWA / EMA（W9-C）
+#
+#  前两个是「改更新式」，后三个是「在优化器之外维护一份权重」：
+#  Lookahead 包住任意优化器（需要 .step/.model），SWA / EMA 各自维护影子权重，
+#  训练完用 apply_to() 换进模型。三者都能被 fit(callbacks=...) 自动驱动
+#  （见本节的 EMACallback / SWACallback）。
+# ============================================================================
+
+class SGDW:
+    """解耦权重衰减的 SGD（SGDW，Loshchilov & Hutter 2019）
+
+    ``p *= (1 - lr*wd)`` 与梯度步分开做，所以和 L2 正则（``g += wd*p``）
+    不再是同一件事：小 lr 时惩罚力度与梯度尺度无关。
+
+    参数
+    ----
+    lr, momentum, weight_decay : float
+        ``momentum=0`` 时退化成纯 SGDW；``weight_decay=0`` 且 ``momentum=0``
+        时与 ``SGD(lr)`` **逐位相同**。
+    nesterov : bool
+        Nesterov 动量：``v = mu*v + g``，更新用 ``g + mu*v``（需要 ``momentum>0``）。
+    """
+
+    def __init__(self, model: MLP, lr: float = 0.01, momentum: float = 0.0,
+                 weight_decay: float = 0.01, nesterov: bool = False):
+        if not _is_num(lr) or lr < 0:
+            raise ValueError("SGDW: lr 必须是非负有限数字")
+        if not _is_num(momentum) or not 0.0 <= momentum < 1.0:
+            raise ValueError("SGDW: momentum 必须在 [0, 1) 内")
+        if not _is_num(weight_decay) or weight_decay < 0:
+            raise ValueError("SGDW: weight_decay 必须是非负有限数字")
+        if not isinstance(nesterov, bool):
+            raise ValueError("SGDW: nesterov 必须是 bool")
+        if nesterov and momentum <= 0.0:
+            raise ValueError("SGDW: nesterov=True 需要 momentum > 0")
+        self.model = model
+        self.lr = float(lr)
+        self.momentum = float(momentum)
+        self.weight_decay = float(weight_decay)
+        self.nesterov = nesterov
+        self.step_count = 0
+        self.v_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                    for layer in model.layers]
+        self.v_b = [[0.0] * layer.fan_out for layer in model.layers]
+
+    def step(self, all_grads):
+        lr, mu, wd = self.lr, self.momentum, self.weight_decay
+        decay = 1.0 - lr * wd
+        nesterov = self.nesterov
+        for idx, (layer, (grad_w, grad_b)) in enumerate(zip(self.model.layers, all_grads)):
+            vw, vb = self.v_w[idx], self.v_b[idx]
+            W, B = layer.weights, layer.biases
+            for j in range(layer.fan_out):
+                g = grad_b[j]
+                v = mu * vb[j] + g
+                vb[j] = v
+                step_b = (g + mu * v) if nesterov else v
+                B[j] = B[j] * decay - lr * step_b
+                gwj, vwj, Wj = grad_w[j], vw[j], W[j]
+                for i in range(layer.fan_in):
+                    g = gwj[i]
+                    v = mu * vwj[i] + g
+                    vwj[i] = v
+                    step_w = (g + mu * v) if nesterov else v
+                    Wj[i] = Wj[i] * decay - lr * step_w
+        self.step_count += 1
+
+    def zero_grad(self):
+        pass
+
+
+class NesterovSGD(SGDW):
+    """带 Nesterov 动量的 SGD（默认 ``momentum=0.9``、无权重衰减）"""
+
+    def __init__(self, model: MLP, lr: float = 0.01, momentum: float = 0.9,
+                 weight_decay: float = 0.0):
+        super().__init__(model, lr=lr, momentum=momentum,
+                         weight_decay=weight_decay, nesterov=True)
+
+
+class Lookahead:
+    """Lookahead：外挂任意优化器（Zhang et al. 2019）
+
+    ``optimizer.step()`` 照常更新快权重；每 ``k`` 步把慢权重按
+    ``slow += alpha*(fast - slow)`` 混入，再令 ``fast = slow``。
+    要求被包的优化器有 ``.model`` 与 ``.step(all_grads)``。
+    """
+
+    def __init__(self, optimizer, k: int = 6, alpha: float = 0.5):
+        if not isinstance(optimizer, object) or not hasattr(optimizer, "step"):
+            raise ValueError("Lookahead: optimizer 必须有 step(all_grads)")
+        if not hasattr(optimizer, "model"):
+            raise ValueError("Lookahead: optimizer 必须有 .model 属性")
+        if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+            raise ValueError("Lookahead: k 必须是正整数")
+        if not _is_num(alpha) or not 0.0 < alpha <= 1.0:
+            raise ValueError("Lookahead: alpha 必须在 (0, 1] 内")
+        self.optimizer = optimizer
+        self.model = optimizer.model
+        self.k = int(k)
+        self.alpha = float(alpha)
+        self.step_count = 0
+        self._slow = self._snapshot()
+
+    def _snapshot(self):
+        return [(layer.biases[:], [row[:] for row in layer.weights])
+                for layer in self.model.layers]
+
+    def step(self, all_grads):
+        self.optimizer.step(all_grads)
+        self.step_count += 1
+        if self.step_count % self.k == 0:
+            a = self.alpha
+            for idx, layer in enumerate(self.model.layers):
+                slow_b, slow_w = self._slow[idx]
+                B, W = layer.biases, layer.weights
+                for j in range(layer.fan_out):
+                    slow_b[j] = slow_b[j] + a * (B[j] - slow_b[j])
+                    B[j] = slow_b[j]
+                    for i in range(layer.fan_in):
+                        slow_w[j][i] = slow_w[j][i] + a * (W[j][i] - slow_w[j][i])
+                        W[j][i] = slow_w[j][i]
+
+    def zero_grad(self):
+        if hasattr(self.optimizer, "zero_grad"):
+            self.optimizer.zero_grad()
+
+    def state_dict(self):
+        return {
+            "optimizer": "lookahead",
+            "k": self.k,
+            "alpha": self.alpha,
+            "step_count": self.step_count,
+            "inner": self.optimizer.state_dict() if hasattr(self.optimizer, "state_dict") else None,
+            "slow": [
+                {"biases": b[:], "weights": [row[:] for row in w]}
+                for (b, w) in self._slow
+            ],
+        }
+
+    def load_state_dict(self, st):
+        if not isinstance(st, dict) or st.get("optimizer") != "lookahead":
+            raise ValueError("Lookahead.load_state_dict: 需要 lookahead 的 state_dict")
+        if st.get("k") != self.k or not _is_num(st.get("alpha")):
+            raise ValueError("Lookahead.load_state_dict: k / alpha 与当前实例不符")
+        self.step_count = int(st["step_count"])
+        slow = st["slow"]
+        if len(slow) != len(self.model.layers):
+            raise ValueError("Lookahead.load_state_dict: 层数不符")
+        for idx, layer in enumerate(self.model.layers):
+            b = slow[idx]["biases"]
+            w = slow[idx]["weights"]
+            if len(b) != layer.fan_out or len(w) != layer.fan_out:
+                raise ValueError("Lookahead.load_state_dict: 形状与模型不符")
+            self._slow[idx] = (list(b), [list(row) for row in w])
+        inner = st.get("inner")
+        if inner is not None and hasattr(self.optimizer, "load_state_dict"):
+            self.optimizer.load_state_dict(inner)
+
+
+class EMA:
+    """指数滑动平均权重（``shadow = decay*shadow + (1-decay)*p``）
+
+    ``warmup>0`` 时前若干次更新用 TF 式有效衰减
+    ``min(decay, (1+t)/(10+t))``，避免开头几次把影子权重拉得太偏。
+    """
+
+    def __init__(self, model: MLP, decay: float = 0.999, warmup: int = 0):
+        if not _is_num(decay) or not 0.0 <= decay < 1.0:
+            raise ValueError("EMA: decay 必须在 [0, 1) 内")
+        if not isinstance(warmup, int) or isinstance(warmup, bool) or warmup < 0:
+            raise ValueError("EMA: warmup 必须是非负整数")
+        self.model = model
+        self.decay = float(decay)
+        self.warmup = int(warmup)
+        self.step = 0
+        self._shadow = [(layer.biases[:], [row[:] for row in layer.weights])
+                        for layer in model.layers]
+
+    def effective_decay(self):
+        if self.warmup and self.step < self.warmup:
+            return min(self.decay, (1.0 + self.step) / (10.0 + self.step))
+        return self.decay
+
+    def update(self):
+        d = self.effective_decay()
+        od = 1.0 - d
+        self.step += 1
+        for idx, layer in enumerate(self.model.layers):
+            sh_b, sh_w = self._shadow[idx]
+            B, W = layer.biases, layer.weights
+            for j in range(layer.fan_out):
+                sh_b[j] = d * sh_b[j] + od * B[j]
+                for i in range(layer.fan_in):
+                    sh_w[j][i] = d * sh_w[j][i] + od * W[j][i]
+
+    def shadow(self):
+        return [(b[:], [row[:] for row in w]) for (b, w) in self._shadow]
+
+    def apply_to(self, model=None):
+        target = self.model if model is None else model
+        if len(target.layers) != len(self._shadow):
+            raise ValueError("EMA.apply_to: 层数不符")
+        for idx, layer in enumerate(target.layers):
+            b, w = self._shadow[idx]
+            if len(b) != layer.fan_out:
+                raise ValueError("EMA.apply_to: 形状与模型不符")
+            layer.biases = list(b)
+            layer.weights = [list(row) for row in w]
+
+    def state_dict(self):
+        return {
+            "ema": {
+                "decay": self.decay,
+                "warmup": self.warmup,
+                "step": self.step,
+                "shadow": [
+                    {"biases": b[:], "weights": [row[:] for row in w]}
+                    for (b, w) in self._shadow
+                ],
+            }
+        }
+
+    def load_state_dict(self, st):
+        if not isinstance(st, dict) or "ema" not in st:
+            raise ValueError("EMA.load_state_dict: 需要 {'ema': {...}}")
+        d = st["ema"]
+        self.decay = float(d["decay"])
+        self.warmup = int(d.get("warmup", 0))
+        self.step = int(d.get("step", 0))
+        shadow = d["shadow"]
+        if len(shadow) != len(self.model.layers):
+            raise ValueError("EMA.load_state_dict: 层数不符")
+        for idx, layer in enumerate(self.model.layers):
+            b, w = shadow[idx]["biases"], shadow[idx]["weights"]
+            if len(b) != layer.fan_out or len(w) != layer.fan_out:
+                raise ValueError("EMA.load_state_dict: 形状与模型不符")
+            self._shadow[idx] = (list(b), [list(row) for row in w])
+
+
+class SWA:
+    """随机权重平均（``avg += (snap - avg)/n``，等价于全部快照的算术平均）"""
+
+    def __init__(self, model: MLP):
+        self.model = model
+        self.n = 0
+        self._avg = [(layer.biases[:], [row[:] for row in layer.weights])
+                     for layer in model.layers]
+
+    def update(self):
+        self.n += 1
+        for idx, layer in enumerate(self.model.layers):
+            av_b, av_w = self._avg[idx]
+            B, W = layer.biases, layer.weights
+            for j in range(layer.fan_out):
+                av_b[j] = av_b[j] + (B[j] - av_b[j]) / self.n
+                for i in range(layer.fan_in):
+                    av_w[j][i] = av_w[j][i] + (W[j][i] - av_w[j][i]) / self.n
+
+    def average(self):
+        return [(b[:], [row[:] for row in w]) for (b, w) in self._avg]
+
+    def apply_to(self, model=None):
+        target = self.model if model is None else model
+        if len(target.layers) != len(self._avg):
+            raise ValueError("SWA.apply_to: 层数不符")
+        for idx, layer in enumerate(target.layers):
+            b, w = self._avg[idx]
+            if len(b) != layer.fan_out:
+                raise ValueError("SWA.apply_to: 形状与模型不符")
+            layer.biases = list(b)
+            layer.weights = [list(row) for row in w]
+
+    def state_dict(self):
+        return {
+            "swa": {
+                "n": self.n,
+                "avg": [
+                    {"biases": b[:], "weights": [row[:] for row in w]}
+                    for (b, w) in self._avg
+                ],
+            }
+        }
+
+    def load_state_dict(self, st):
+        if not isinstance(st, dict) or "swa" not in st:
+            raise ValueError("SWA.load_state_dict: 需要 {'swa': {...}}")
+        d = st["swa"]
+        self.n = int(d["n"])
+        avg = d["avg"]
+        if len(avg) != len(self.model.layers):
+            raise ValueError("SWA.load_state_dict: 层数不符")
+        for idx, layer in enumerate(self.model.layers):
+            b, w = avg[idx]["biases"], avg[idx]["weights"]
+            if len(b) != layer.fan_out or len(w) != layer.fan_out:
+                raise ValueError("SWA.load_state_dict: 形状与模型不符")
+            self._avg[idx] = (list(b), [list(row) for row in w])
+
+
 class Lion:
     """Lion 优化器（EvoLved Sign Momentum，Google 2023）
 
@@ -24072,6 +24372,41 @@ class HistoryCallback(Callback):
 _CALLBACK_HOOKS = ('on_train_begin', 'on_epoch_begin', 'on_epoch_end', 'on_train_end')
 
 
+class EMACallback(Callback):
+    """每个 epoch 结束更新一次 EMA 影子权重"""
+
+    def __init__(self, model=None, decay: float = 0.999, warmup: int = 0):
+        if model is None:
+            raise ValueError("EMACallback: 需要传入 model")
+        mlp = getattr(model, "model", model)  # 允许传 Model 包装器
+        self.ema = EMA(mlp, decay=decay, warmup=warmup)
+
+    def on_train_begin(self, model, info):
+        mlp = getattr(model, "model", model)
+        if mlp is not self.ema.model:
+            self.ema = EMA(mlp, decay=self.ema.decay, warmup=self.ema.warmup)
+
+    def on_epoch_end(self, epoch, logs):
+        self.ema.update()
+
+
+class SWACallback(Callback):
+    """每个 epoch 结束收集一次快照（等价于对 epoch 权重取平均）"""
+
+    def __init__(self, model=None):
+        if model is None:
+            raise ValueError("SWACallback: 需要传入 model")
+        self.swa = SWA(getattr(model, "model", model))
+
+    def on_train_begin(self, model, info):
+        mlp = getattr(model, "model", model)
+        if mlp is not self.swa.model:
+            self.swa = SWA(mlp)
+
+    def on_epoch_end(self, epoch, logs):
+        self.swa.update()
+
+
 def _normalize_callbacks(callbacks):
     """None / 单个回调 / 回调列表 → 列表，并校验四个钩子齐备"""
     if callbacks is None:
@@ -24559,6 +24894,8 @@ class Model:
         'lars': LARS,
         'lamb': LAMB,
         'ranger': Ranger,
+        'sgdw': SGDW,
+        'nesterov': NesterovSGD,
     }
 
     _LOSS_MAP = {
