@@ -123,11 +123,11 @@
 - [x] `DepthwiseSeparableConv2d`（W2-B：`Conv2d(groups=C)` + 1×1 点卷积，参数量 `C·k·k + C + C·out + out`；dx 中心差分 ≤1e-8，`sgd_step`/`adam_step` 真改权重）
 - [x] `BasicBlock2d`（W2-B：`conv3x3 → BN → ReLU → conv3x3 → BN → (+x) → ReLU`，stride=1 恒等捷径；全零卷积时退化为 `relu(x)`，eval 模式 dx 中心差分 ≤1e-7）
 - [x] `Bottleneck2d`（W2-C：`1x1 降维(mid=out//4) → 3x3 → 1x1 升维` + 残差；stride≠1 或通道变化时用 `1x1 Conv + BN` 投影捷径，BN 梯度收在 `bn_grads`，eval 模式 dx 中心差分 ≤1e-7）
-- [ ] `DenseBlock` / 稠密连接
+- [x] `DenseBlock` / 稠密连接（`BN → ReLU → 3x3 Conv` 逐层拼接，`(Cin,H,W) → (Cin+growth*num_layers,H,W)`；`dx`/conv `grad_w`/BN `gamma,beta` 中心差分 ≤1e-7，eval 走 running 统计量）
 - [x] `SEBlock`（W2-A 提交：GAP → 瓶颈 MLP → sigmoid 乘回输入，dx 与四组参数梯度中心差分 ≤1e-9）
 - [x] `ECABlock`（W2-B：GAP 后一条奇数宽 1D 卷积跨通道混权重，只多 `kernel_size` 个参数；dx/`grad_w` 中心差分 ≤1e-8）
 - [x] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支；空间反卷积下标写反过，`dx` 中心差分 1.187e-01 → 修后 7.2e-11；顺带给 `SEBlock`/`CBAMBlock` 补了 `sgd_step`/`adam_step`）
-- [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
+- [x] `ConvNeXtBlock`（7×7 depthwise + 逐位置跨通道 LayerNorm + 1×1 升/降维 + GELU + 残差；`xhat` 方差 `var/(var+eps)`、`pw2` 全零时输出等于输入、`dx`/LN 参数/depthwise 权重中心差分 ≤1e-7）
 - [x] `ConvTranspose1d`（W2-D）：`(Cin,L) -> (Cout,(L-1)*s-2p+k+op)`，前向把每个输入点按 stride 摆到输出网格累加，`dx` 与 `grad_w` 中心差分 ≤1e-8
 - [x] `Conv3d` / `ConvTranspose3d`（W2-E）：三轴独立 `kernel/stride/padding`，`(D-1)*s-2p+k+op` 的输出尺寸，`dx` 与 `grad_w` 中心差分 ≤1e-8，中心 tap 退化为恒等映射、单点散射位置逐个校验
 - [x] 池化家族（部分，W2-A 提交）：`GlobalMaxPool2d`（只回传最大值位置）、`AdaptiveMaxPool2d`（分箱与

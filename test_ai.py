@@ -10080,3 +10080,261 @@ class TestCBAMBlock:
                     pass
                 else:
                     raise AssertionError(f"{name}.sgd_step({bad!r}) 应该报错")
+
+
+# ==== W2-G：DenseBlock / ConvNeXtBlock ====
+
+class TestDenseBlock:
+    """稠密连接：拼接形状、梯度、eval 模式"""
+
+    @staticmethod
+    def _clone(x):
+        return [[[v for v in row] for row in ch] for ch in x]
+
+    def test_forward_concat(self):
+        """输出通道数、前 in 个通道原样保留、下游真的用到了前面所有层"""
+        import random as _random
+        _random.seed(1201)
+        db = AI.DenseBlock(3, growth_rate=2, num_layers=2, kernel_size=3)
+        x = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+             for _ in range(3)]
+        out = db.forward(self._clone(x))
+        assert len(out) == 7 and db.out_channels == 7
+        for c in range(3):
+            for h in range(4):
+                for w in range(4):
+                    assert abs(out[c][h][w] - x[c][h][w]) < 1e-12
+        assert db.param_count() == (3 * 2 * 9 + 2) + (5 * 2 * 9 + 2) + 2 * (3 + 5)
+
+    def test_gradients(self):
+        """dx / conv grad_w / BN gamma,beta 都过中心差分"""
+        import random as _random
+        _random.seed(1202)
+        db = AI.DenseBlock(3, growth_rate=2, num_layers=2, kernel_size=3)
+        x = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+             for _ in range(3)]
+        dout = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+                for _ in range(7)]
+
+        def loss():
+            o = db.forward(self._clone(x))
+            return sum(o[c][h][w] * dout[c][h][w]
+                       for c in range(7) for h in range(4) for w in range(4))
+
+        db.zero_grad()
+        db.forward(self._clone(x))
+        dx = db.backward(dout)
+        eps = 1e-6
+        worst = 0.0
+        for c in range(3):
+            for h in range(4):
+                for w in range(4):
+                    old = x[c][h][w]
+                    x[c][h][w] = old + eps
+                    vp = loss()
+                    x[c][h][w] = old - eps
+                    vm = loss()
+                    x[c][h][w] = old
+                    worst = max(worst, abs((vp - vm) / (2 * eps) - dx[c][h][w]))
+        assert worst < 1e-7, f"dx 差分 {worst:.3e}"
+
+        db.zero_grad()
+        db.forward(self._clone(x))
+        db.backward(dout)
+        worst = 0.0
+        for li in range(2):
+            conv = db.convs[li]
+            for o in range(conv.out_channels):
+                for i in range(conv.in_channels):
+                    for a in range(3):
+                        for b in range(3):
+                            old = conv.weights[o][i][a][b]
+                            conv.weights[o][i][a][b] = old + eps
+                            vp = loss()
+                            conv.weights[o][i][a][b] = old - eps
+                            vm = loss()
+                            conv.weights[o][i][a][b] = old
+                            worst = max(worst, abs((vp - vm) / (2 * eps)
+                                                   - conv.grad_w[o][i][a][b]))
+        assert worst < 1e-7, f"grad_w 差分 {worst:.3e}"
+
+        worst = 0.0
+        for li in range(2):
+            bn = db.bns[li]
+            for c in range(bn.c):
+                for arr, gkey in ((bn.gamma, "L%d_gamma" % li),
+                                  (bn.beta, "L%d_beta" % li)):
+                    old = arr[c]
+                    arr[c] = old + eps
+                    vp = loss()
+                    arr[c] = old - eps
+                    vm = loss()
+                    arr[c] = old
+                    worst = max(worst, abs((vp - vm) / (2 * eps)
+                                           - db.bn_grads[gkey][c]))
+        assert worst < 1e-7, f"BN 参数差分 {worst:.3e}"
+
+    def test_eval_mode_and_errors(self):
+        """eval 用 running 统计量；参数/通道/未 forward 报错"""
+        import random as _random
+        _random.seed(1203)
+        db = AI.DenseBlock(3, growth_rate=2, num_layers=2)
+        x = [[[_random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+             for _ in range(3)]
+        out = db.forward(self._clone(x))
+        db.eval()
+        o_eval = db.forward(self._clone(x))
+        assert any(abs(o_eval[c][h][w] - out[c][h][w]) > 1e-9
+                   for c in range(7) for h in range(4) for w in range(4))
+        db.train()
+        o_train = db.forward(self._clone(x))
+        assert all(abs(o_train[c][h][w] - out[c][h][w]) < 1e-12
+                   for c in range(7) for h in range(4) for w in range(4))
+        for bad in (0, -1, 1.5, True):
+            try:
+                AI.DenseBlock(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"DenseBlock({bad!r}) 应该报错")
+        try:
+            db.forward([[1.0, 2.0], [3.0, 4.0]])
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("二维输入应该报错")
+        try:
+            AI.DenseBlock(3).backward(out)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")
+
+
+class TestConvNeXtBlock:
+    """ConvNeXt：跨通道 LayerNorm、残差、梯度、参数计数"""
+
+    @staticmethod
+    def _clone(x):
+        return [[[v for v in row] for row in ch] for ch in x]
+
+    def test_layernorm_and_residual(self):
+        """xhat 逐位置均值 0、方差 var/(var+eps)；pw2 全零时输出等于输入"""
+        import random as _random
+        _random.seed(1301)
+        cb = AI.ConvNeXtBlock(4, kernel_size=7, expansion=2)
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(4)]
+        cb.forward(self._clone(x))
+        u, xhat = cb._cache[1], cb._cache[2]
+        for h in range(3):
+            for w in range(3):
+                mu = sum(xhat[c][h][w] for c in range(4)) / 4.0
+                assert abs(mu) < 1e-10
+                var_x = sum((xhat[c][h][w] - mu) ** 2 for c in range(4)) / 4.0
+                mu_u = sum(u[c][h][w] for c in range(4)) / 4.0
+                var_u = sum((u[c][h][w] - mu_u) ** 2 for c in range(4)) / 4.0
+                assert abs(var_x - var_u / (var_u + cb.eps)) < 1e-9
+
+        zero = AI.ConvNeXtBlock(4, kernel_size=3, expansion=1)
+        for o in range(4):
+            for i in range(4):
+                zero.pw2.weights[o][i][0][0] = 0.0
+            zero.pw2.biases[o] = 0.0
+        out0 = zero.forward(self._clone(x))
+        for c in range(4):
+            for h in range(3):
+                for w in range(3):
+                    assert abs(out0[c][h][w] - x[c][h][w]) < 1e-12
+
+    def test_gradients(self):
+        """dx、LN gamma/beta、depthwise conv 权重都过中心差分"""
+        import random as _random
+        _random.seed(1302)
+        cb = AI.ConvNeXtBlock(4, kernel_size=7, expansion=2)
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(4)]
+        dout = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                for _ in range(4)]
+
+        def loss():
+            o = cb.forward(self._clone(x))
+            return sum(o[c][h][w] * dout[c][h][w]
+                       for c in range(4) for h in range(3) for w in range(3))
+
+        cb.zero_grad()
+        cb.forward(self._clone(x))
+        dx = cb.backward(dout)
+        eps = 1e-6
+        worst = 0.0
+        for c in range(4):
+            for h in range(3):
+                for w in range(3):
+                    old = x[c][h][w]
+                    x[c][h][w] = old + eps
+                    vp = loss()
+                    x[c][h][w] = old - eps
+                    vm = loss()
+                    x[c][h][w] = old
+                    worst = max(worst, abs((vp - vm) / (2 * eps) - dx[c][h][w]))
+        assert worst < 1e-7, f"dx 差分 {worst:.3e}"
+
+        cb.zero_grad()
+        cb.forward(self._clone(x))
+        cb.backward(dout)
+        worst = 0.0
+        for c in range(4):
+            for arr, gkey in ((cb.gamma, "gamma"), (cb.beta, "beta")):
+                old = arr[c]
+                arr[c] = old + eps
+                vp = loss()
+                arr[c] = old - eps
+                vm = loss()
+                arr[c] = old
+                worst = max(worst, abs((vp - vm) / (2 * eps) - cb.norm_grads[gkey][c]))
+        assert worst < 1e-7, f"LN 参数差分 {worst:.3e}"
+
+        worst = 0.0
+        for o in range(4):
+            for i in range(cb.dw.cg):
+                for a in range(7):
+                    for b in range(7):
+                        old = cb.dw.weights[o][i][a][b]
+                        cb.dw.weights[o][i][a][b] = old + eps
+                        vp = loss()
+                        cb.dw.weights[o][i][a][b] = old - eps
+                        vm = loss()
+                        cb.dw.weights[o][i][a][b] = old
+                        worst = max(worst, abs((vp - vm) / (2 * eps)
+                                               - cb.dw.grad_w[o][i][a][b]))
+        assert worst < 1e-7, f"depthwise 权重差分 {worst:.3e}"
+
+    def test_param_count_and_errors(self):
+        """参数量公式、非法参数、通道不符、未 forward"""
+        cb = AI.ConvNeXtBlock(4, kernel_size=7, expansion=2)
+        assert cb.param_count() == ((4 * 1 * 49 + 4) + (8 * 4 + 8) + (4 * 8 + 4) + 8)
+        for bad in (0, -2, 2.0, True):
+            try:
+                AI.ConvNeXtBlock(bad)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"ConvNeXtBlock({bad!r}) 应该报错")
+        try:
+            AI.ConvNeXtBlock(4, eps=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("eps=0 应该报错")
+        try:
+            cb.forward([[[1.0]], [[2.0]], [[3.0]]])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("通道数不符应该报错")
+        try:
+            AI.ConvNeXtBlock(4).backward([[[1.0]]])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 应该报错")

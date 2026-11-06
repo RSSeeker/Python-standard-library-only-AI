@@ -3277,6 +3277,272 @@ class CBAMBlock:
         return dx
 
 
+def _gelu_scalar(z):
+    """GELU（tanh 近似），与 Layer._gelu 同一公式，逐位一致"""
+    u = _GELU_C * (z + 0.044715 * z * z * z)
+    return 0.5 * z * (1.0 + math.tanh(u))
+
+
+def _dgelu_scalar(z):
+    """GELU 的导数，与 Layer._gelu_deriv 同一公式"""
+    u = _GELU_C * (z + 0.044715 * z * z * z)
+    t = math.tanh(u)
+    du = _GELU_C * (1.0 + 3.0 * 0.044715 * z * z)
+    return 0.5 * (1.0 + t) + 0.5 * z * (1.0 - t * t) * du
+
+
+def _w2_concat(a, b):
+    """(Ca,H,W) + (Cb,H,W) -> (Ca+Cb,H,W)"""
+    return [list(ch) for ch in a] + [list(ch) for ch in b]
+
+
+class DenseBlock:
+    """DenseNet 稠密块：每层 `BN -> ReLU -> 3x3 Conv`，输出与输入在通道维拼接
+
+    `forward((Cin,H,W)) -> (Cin + growth_rate*num_layers, H, W)`；
+    第 i 层的输入是前面所有层输出的拼接（通道维），因此 `bns[i]` 的通道数逐层增长。
+    BN 的 gamma/beta 梯度收在 `self.bn_grads`，键 `L{i}_gamma` / `L{i}_beta`。
+    """
+
+    def __init__(self, in_channels, growth_rate=4, num_layers=3, kernel_size=3):
+        for n, v in (("in_channels", in_channels), ("growth_rate", growth_rate),
+                     ("num_layers", num_layers), ("kernel_size", kernel_size)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"DenseBlock: {n} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.growth_rate = growth_rate
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        pad = kernel_size // 2
+        self.convs = []
+        self.bns = []
+        cur = in_channels
+        for _ in range(num_layers):
+            self.bns.append(BatchNorm2d(cur))
+            self.convs.append(Conv2d(cur, growth_rate, kernel_size, stride=1, padding=pad))
+            cur += growth_rate
+        self.out_channels = cur
+        self.training = True
+        self.bn_grads = {}
+        for i in range(num_layers):
+            self.bn_grads["L%d_gamma" % i] = [0.0] * self.bns[i].c
+            self.bn_grads["L%d_beta" % i] = [0.0] * self.bns[i].c
+        self._cache = None
+
+    def zero_grad(self):
+        for conv in self.convs:
+            conv.zero_grad()
+        for i, bn in enumerate(self.bns):
+            self.bn_grads["L%d_gamma" % i] = [0.0] * bn.c
+            self.bn_grads["L%d_beta" % i] = [0.0] * bn.c
+
+    def param_count(self):
+        total = sum(_conv_param_count(c) for c in self.convs)
+        total += 2 * sum(bn.c for bn in self.bns)
+        return total
+
+    def train(self):
+        self.training = True
+        for bn in self.bns:
+            bn.train()
+
+    def eval(self):
+        self.training = False
+        for bn in self.bns:
+            bn.eval()
+
+    def sgd_step(self, lr):
+        for conv in self.convs:
+            _conv_sgd(conv, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        for conv in self.convs:
+            _conv_adam(conv, lr, beta1, beta2, eps)
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("DenseBlock: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.in_channels:
+            raise ValueError(
+                f"DenseBlock: 输入通道数 {C} 与 in_channels={self.in_channels} 不符")
+        cur = x
+        cache = []
+        for i in range(self.num_layers):
+            a = self.bns[i].forward(cur)
+            r = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a]
+            h = self.convs[i].forward(r)
+            cache.append((cur, a, r))
+            cur = _w2_concat(cur, h)
+        self._cache = (cache, C, H, W)
+        return cur
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("DenseBlock.backward: 必须先调用 forward")
+        cache, C, H, W = self._cache
+        if (len(dout) != self.out_channels or len(dout[0]) != H
+                or len(dout[0][0]) != W):
+            raise ValueError(
+                f"DenseBlock.backward: dout 形状 "
+                f"{(len(dout), len(dout[0]), len(dout[0][0]))} 与输出 "
+                f"{(self.out_channels, H, W)} 不符")
+        dcum = dout
+        for i in range(self.num_layers - 1, -1, -1):
+            cur, a, r = cache[i]
+            cin = len(cur)
+            d_prev = dcum[:cin]
+            d_new = dcum[cin:]
+            if len(d_new) != self.growth_rate:
+                raise ValueError("DenseBlock.backward: 梯度通道数与 growth_rate 不符")
+            dh = self.convs[i].backward(d_new)
+            dr = [[[dh[c][h][w] if a[c][h][w] > 0.0 else 0.0 for w in range(W)]
+                   for h in range(H)] for c in range(cin)]
+            da, g, b = self.bns[i].backward(dr)
+            for c in range(cin):
+                self.bn_grads["L%d_gamma" % i][c] += g[c]
+                self.bn_grads["L%d_beta" % i][c] += b[c]
+            dcum = [[[d_prev[c][h][w] + da[c][h][w] for w in range(W)]
+                     for h in range(H)] for c in range(cin)]
+        if len(dcum) != C:
+            raise ValueError("DenseBlock.backward: 回传到输入的通道数不符")
+        return dcum
+
+
+class ConvNeXtBlock:
+    """ConvNeXt 块：`7x7 depthwise Conv -> LayerNorm(跨通道) -> 1x1 升维 -> GELU -> 1x1 降维` + 残差
+
+    数据布局是 channels-first 的 `(C,H,W)`，所以"LayerNorm"是在**每个空间位置上
+    跨通道**做归一化（等价于 channels-last 的 LayerNorm）。gamma/beta 长度 C，
+    梯度收在 `self.norm_grads["gamma"]` / `["beta"]`。
+    """
+
+    def __init__(self, channels, kernel_size=7, expansion=4, eps=1e-6):
+        for n, v in (("channels", channels), ("kernel_size", kernel_size),
+                     ("expansion", expansion)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"ConvNeXtBlock: {n} 必须是正整数，收到 {v!r}")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError(f"ConvNeXtBlock: eps 必须是正数，收到 {eps!r}")
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.expansion = expansion
+        self.hidden = channels * expansion
+        self.eps = float(eps)
+        self.dw = Conv2d(channels, channels, kernel_size, stride=1,
+                         padding=kernel_size // 2, groups=channels)
+        self.pw1 = Conv2d(channels, self.hidden, 1)
+        self.pw2 = Conv2d(self.hidden, channels, 1)
+        self.gamma = [1.0] * channels
+        self.beta = [0.0] * channels
+        self.norm_grads = {"gamma": [0.0] * channels, "beta": [0.0] * channels}
+        self.training = True
+        self._cache = None
+
+    def zero_grad(self):
+        self.dw.zero_grad()
+        self.pw1.zero_grad()
+        self.pw2.zero_grad()
+        self.norm_grads["gamma"] = [0.0] * self.channels
+        self.norm_grads["beta"] = [0.0] * self.channels
+
+    def param_count(self):
+        return (_conv_param_count(self.dw) + _conv_param_count(self.pw1)
+                + _conv_param_count(self.pw2) + 2 * self.channels)
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+    def sgd_step(self, lr):
+        _conv_sgd(self.dw, lr)
+        _conv_sgd(self.pw1, lr)
+        _conv_sgd(self.pw2, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        _conv_adam(self.dw, lr, beta1, beta2, eps)
+        _conv_adam(self.pw1, lr, beta1, beta2, eps)
+        _conv_adam(self.pw2, lr, beta1, beta2, eps)
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("ConvNeXtBlock: 输入不能为空")
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if C != self.channels:
+            raise ValueError(
+                f"ConvNeXtBlock: 输入通道数 {C} 与 channels={self.channels} 不符")
+        u = self.dw.forward(x)
+        n = float(C)
+        var = [0.0] * 0
+        xhat = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        inv = [[0.0] * W for _ in range(H)]
+        for h in range(H):
+            for w in range(W):
+                total = 0.0
+                for c in range(C):
+                    total += u[c][h][w]
+                mu = total / n
+                acc = 0.0
+                for c in range(C):
+                    d = u[c][h][w] - mu
+                    acc += d * d
+                v = acc / n
+                iv = 1.0 / math.sqrt(v + self.eps)
+                inv[h][w] = iv
+                for c in range(C):
+                    xhat[c][h][w] = (u[c][h][w] - mu) * iv
+        z = [[[self.gamma[c] * xhat[c][h][w] + self.beta[c] for w in range(W)]
+              for h in range(H)] for c in range(C)]
+        g1 = self.pw1.forward(z)
+        act = [[[ _gelu_scalar(v) for v in row] for row in ch] for ch in g1]
+        g2 = self.pw2.forward(act)
+        out = [[[g2[c][h][w] + x[c][h][w] for w in range(W)] for h in range(H)]
+               for c in range(C)]
+        self._cache = (x, u, xhat, inv, z, g1, act)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("ConvNeXtBlock.backward: 必须先调用 forward")
+        x, u, xhat, inv, z, g1, act = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        if len(dout) != C or len(dout[0]) != H or len(dout[0][0]) != W:
+            raise ValueError(
+                f"ConvNeXtBlock.backward: dout 形状 "
+                f"{(len(dout), len(dout[0]), len(dout[0][0]))} 与输入 {(C, H, W)} 不符")
+        dact = self.pw2.backward(dout)
+        # 注意：这里是升维后的 hidden 个通道，不是输入的 C 个
+        dg1 = [[[dact[c][h][w] * _dgelu_scalar(g1[c][h][w]) for w in range(W)]
+                for h in range(H)] for c in range(self.hidden)]
+        dz = self.pw1.backward(dg1)
+        n = float(C)
+        du = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for h in range(H):
+            for w in range(W):
+                dg = [dz[c][h][w] for c in range(C)]
+                for c in range(C):
+                    self.norm_grads["gamma"][c] += dg[c] * xhat[c][h][w]
+                    self.norm_grads["beta"][c] += dg[c]
+                iv = inv[h][w]
+                mean_dxhat = 0.0
+                mean_dxhat_xhat = 0.0
+                for c in range(C):
+                    dxhat = dg[c] * self.gamma[c]
+                    mean_dxhat += dxhat
+                    mean_dxhat_xhat += dxhat * xhat[c][h][w]
+                mean_dxhat /= n
+                mean_dxhat_xhat /= n
+                for c in range(C):
+                    dxhat = dg[c] * self.gamma[c]
+                    du[c][h][w] = (dxhat - mean_dxhat
+                                   - xhat[c][h][w] * mean_dxhat_xhat) * iv
+        ddw = self.dw.backward(du)
+        return [[[ddw[c][h][w] + dout[c][h][w] for w in range(W)] for h in range(H)]
+                for c in range(C)]
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
