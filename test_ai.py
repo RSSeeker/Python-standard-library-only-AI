@@ -11341,3 +11341,246 @@ class TestInitFamily:
         _, sd = self._stats(vals)
         expect = _math.sqrt(2.0 / 100)
         assert abs(sd - expect) / expect < 0.1
+
+
+# ==== W3-D：SwitchNorm 与 FRN ====
+
+class TestSwitchNorm:
+    """三种统计量软加权：前向闭式解、四组梯度、跨通道耦合、优化器步"""
+
+    def test_forward_closed_form(self):
+        import math as _math
+        import random as _random
+        _random.seed(21)
+        sn = AI.SwitchNorm(2, eps=1e-5)
+        sn.gamma = [1.3, 0.7]
+        sn.beta = [0.1, -0.2]
+        sn.logits = [0.5, 0.2, 0.9]
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        out = sn.forward(x)
+        w = [_math.exp(v) for v in sn.logits]
+        tot = sum(w)
+        w = [v / tot for v in w]
+        w_ib = w[0] + w[1]
+        im, iv = [], []
+        for c in range(2):
+            vals = [x[c][i][j] for i in range(3) for j in range(3)]
+            m = sum(vals) / 9
+            im.append(m)
+            iv.append(sum((q - m) ** 2 for q in vals) / 9)
+        every = [x[c][i][j] for c in range(2) for i in range(3) for j in range(3)]
+        lm = sum(every) / 18
+        lv = sum((q - lm) ** 2 for q in every) / 18
+        m0 = w_ib * im[0] + w[2] * lm
+        v0 = w_ib * iv[0] + w[2] * lv
+        ref = (x[0][0][0] - m0) / _math.sqrt(v0 + 1e-5) * 1.3 + 0.1
+        assert abs(out[0][0][0] - ref) < 1e-12
+        assert len(out) == 2 and len(out[0]) == 3 and len(out[0][0]) == 3
+        assert sn.param_count() == 2 * 2 + 3
+
+    def test_gradients_vs_finite_difference(self):
+        import random as _random
+        _random.seed(22)
+        sn = AI.SwitchNorm(2, eps=1e-5)
+        sn.gamma = [1.1, 0.9]
+        sn.logits = [0.3, -0.4, 0.7]
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        coef = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                for _ in range(2)]
+
+        def loss():
+            o = sn.forward(x)
+            return sum(o[c][i][j] * coef[c][i][j]
+                       for c in range(2) for i in range(3) for j in range(3))
+
+        sn.forward(x)
+        dx, g_gamma, g_beta, g_logits = sn.backward(coef)
+        worst = 0.0
+        for c in range(2):
+            for i in range(3):
+                for j in range(3):
+                    old = x[c][i][j]
+                    h = 1e-6
+                    x[c][i][j] = old + h
+                    lp = loss()
+                    x[c][i][j] = old - h
+                    lmm = loss()
+                    x[c][i][j] = old
+                    num = (lp - lmm) / (2 * h)
+                    worst = max(worst, abs(num - dx[c][i][j])
+                                / max(1e-8, abs(num), abs(dx[c][i][j])))
+        assert worst <= 1e-7, f"dx 差分误差 {worst:.3e}"
+
+        # 软权重的梯度：layer 统计量跨通道共享，l 的链式传回去会牵动所有通道
+        per_channel_sums = []
+        for k in range(3):
+            old = sn.logits[k]
+            h = 1e-6
+            sn.logits[k] = old + h
+            lp = loss()
+            sn.logits[k] = old - h
+            lmm = loss()
+            sn.logits[k] = old
+            num = (lp - lmm) / (2 * h)
+            per_channel_sums.append(num)
+            assert abs(num - g_logits[k]) <= 1e-7 * max(1.0, abs(num)), \
+                f"grad_logits[{k}] 差分误差 {abs(num - g_logits[k]):.3e}"
+        # softmax 的雅可比行和为 0 ⇒ 三个软权重的梯度在 logit 空间里满足
+        # Σ_k raw_k 的加权组合为零；这里直接验"整体平移 logits 不改变输出"更稳
+        base = loss()
+        shift = [v + 0.7 for v in sn.logits]
+        keep = list(sn.logits)
+        sn.logits = shift
+        assert abs(loss() - base) < 1e-12
+        sn.logits = keep
+
+    def test_batch_and_steps(self):
+        import random as _random
+        _random.seed(23)
+        sn = AI.SwitchNorm(2)
+        xb = [[[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+               for _ in range(2)] for _ in range(2)]
+        ob = sn.forward(xb)
+        assert len(ob) == 2 and len(ob[0]) == 2
+        douts = [[[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                  for _ in range(2)] for _ in range(2)]
+        dxb, _, _, _ = sn.backward(douts)
+        assert len(dxb) == 2 and len(dxb[1]) == 2
+        g0 = list(sn.gamma)
+        sn.grad_gamma = [0.5] * 2
+        sn.sgd_step(0.1)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(g0, sn.gamma))
+        assert all(v == 0.0 for v in sn.grad_gamma)
+        lg = list(sn.logits)
+        sn.grad_logits = [0.3, -0.2, 0.1]
+        sn.adam_step(0.01)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(lg, sn.logits))
+
+    def test_errors(self):
+        for fn in (lambda: AI.SwitchNorm(0), lambda: AI.SwitchNorm(True),
+                   lambda: AI.SwitchNorm(2, eps=-1.0),
+                   lambda: AI.SwitchNorm(2).forward([[[1.0, 2.0]]]),
+                   lambda: AI.SwitchNorm(2).forward([]),
+                   lambda: AI.SwitchNorm(2).backward([[[0.0]]])):
+            try:
+                fn()
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")
+
+
+class TestFRN:
+    """FRN + 阈值化 ReLU：统计量跨通道、batch=1 可用"""
+
+    def test_forward_closed_form(self):
+        import math as _math
+        import random as _random
+        _random.seed(31)
+        frn = AI.FRN(2, eps=1e-6, tau=0.0)
+        frn.beta = [0.1, 0.2]
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        out = frn.forward(x)
+        s = sum(x[c][i][j] ** 2 for c in range(2) for i in range(3) for j in range(3))
+        inv = 1.0 / _math.sqrt(s / 18 + 1e-6)
+        raw = x[0][0][0] * inv - 0.1
+        assert abs(out[0][0][0] - max(raw, 0.0)) < 1e-12
+        # 被截断的位置输出恰为 tau
+        cut = [(c, i, j) for c in range(2) for i in range(3) for j in range(3)
+               if x[c][i][j] * inv - frn.beta[c] <= 0.0]
+        assert cut
+        assert all(abs(out[c][i][j] - 0.0) < 1e-12 for c, i, j in cut)
+        assert frn.param_count() == 4
+
+    def test_gradients_vs_finite_difference(self):
+        import random as _random
+        _random.seed(32)
+        frn = AI.FRN(2, eps=1e-6, tau=0.0)
+        frn.beta = [0.05, -0.05]
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        coef = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                for _ in range(2)]
+
+        def loss():
+            o = frn.forward(x)
+            return sum(o[c][i][j] * coef[c][i][j]
+                       for c in range(2) for i in range(3) for j in range(3))
+
+        frn.forward(x)
+        dx, g_beta, g_tau = frn.backward(coef)
+        worst = 0.0
+        for c in range(2):
+            for i in range(3):
+                for j in range(3):
+                    old = x[c][i][j]
+                    h = 1e-6
+                    x[c][i][j] = old + h
+                    lp = loss()
+                    x[c][i][j] = old - h
+                    lmm = loss()
+                    x[c][i][j] = old
+                    num = (lp - lmm) / (2 * h)
+                    worst = max(worst, abs(num - dx[c][i][j])
+                                / max(1e-8, abs(num), abs(dx[c][i][j])))
+        assert worst <= 1e-7, f"FRN dx 差分误差 {worst:.3e}"
+
+        for arr, ana, name in ((frn.beta, g_beta, "beta"), (frn.tau, g_tau, "tau")):
+            for c in range(2):
+                old = arr[c]
+                h = 1e-6
+                arr[c] = old + h
+                lp = loss()
+                arr[c] = old - h
+                lmm = loss()
+                arr[c] = old
+                num = (lp - lmm) / (2 * h)
+                assert abs(num - ana[c]) <= 1e-6 * max(1.0, abs(num)), \
+                    f"FRN grad_{name}[{c}] 差分误差 {abs(num - ana[c]):.3e}"
+
+    def test_scale_invariance_and_steps(self):
+        import random as _random
+        _random.seed(33)
+        x = [[[_random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+             for _ in range(2)]
+        tiny = AI.FRN(2, eps=1e-14, tau=-1e9)
+        tiny.beta = [0.1, 0.2]
+        a = tiny.forward(x)
+        big = [[[v * 37.0 for v in row] for row in ch] for ch in x]
+        b = tiny.forward(big)
+        for c in range(2):
+            for i in range(3):
+                for j in range(3):
+                    assert abs(a[c][i][j] - b[c][i][j]) < 1e-9
+        # 有 eps 时严格尺度不变被打破（是 FRN 的定义，不是缺陷）
+        frn = AI.FRN(2, eps=1e-6, tau=-1e9)
+        a2 = frn.forward(x)
+        b2 = frn.forward(big)
+        assert any(abs(a2[c][i][j] - b2[c][i][j]) > 1e-9
+                   for c in range(2) for i in range(3) for j in range(3))
+
+        frn.grad_beta = [0.4, -0.3]
+        frn.grad_tau = [0.2, -0.1]
+        b_before = list(frn.beta)
+        t_before = list(frn.tau)
+        frn.adam_step(0.01)
+        assert any(abs(a - b) > 1e-12 for a, b in zip(b_before, frn.beta))
+        assert any(abs(a - b) > 1e-12 for a, b in zip(t_before, frn.tau))
+        frn.grad_beta = [0.4, -0.3]
+        frn.sgd_step(0.1)
+        assert all(v == 0.0 for v in frn.grad_beta)
+
+        for fn in (lambda: AI.FRN(0), lambda: AI.FRN(True),
+                   lambda: AI.FRN(2, eps=0.0), lambda: AI.FRN(2, tau="x"),
+                   lambda: AI.FRN(2).forward([[1.0]]),
+                   lambda: AI.FRN(2).forward([[[1.0, 2.0]], [[1.0]]]),
+                   lambda: AI.FRN(2).backward([[[0.0]]])):
+            try:
+                fn()
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("非法输入应该报错")

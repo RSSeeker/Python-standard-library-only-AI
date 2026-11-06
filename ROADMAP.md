@@ -141,7 +141,11 @@
 
 ### W3 归一化·激活·初始化（P1 + §6）
 - [x] 归一化族（W3-A）：`ScaleNorm`（只有标量 g）、`WeightNorm`（`w = g⊙v/‖v‖`，反向含解耦项，`dv`/`dg`/`db` 中心差分 ≤1e-7）、`SpectralNorm`（幂迭代估计 σ，默认 σ 视为常量，`freeze_sigma()` 后 `dv` 与中心差分一致）
-- [ ] 归一化族（剩余）：`SwitchNorm`（批/实例/层三种统计量软加权）、`FilterResponseNorm`（FRN + 阈值 τ）
+- [x] 归一化族（W3-D）：`SwitchNorm`（instance/batch/layer 三种统计量按 `softmax(logits)` 软加权，
+      本实现 instance 与 batch 同源；`dx` 与 `gamma`/`beta`/`logits` 四组中心差分 ≤1e-7）、
+      `FRN`（跨通道 ν²，batch=1 可用；TLU 截断位置的 `dout` 只流向 `tau`）
+      —— 两处推导坑：`dx` 的 layer 项必须对**全部通道**求和（只算本通道时误差 1.503），
+      而 `grad_logits` 的 `S`/`Sx` 只需**本通道**（用全局量时 `dL/dw2` 差 2.03×）。
 - [x] 激活族（W3-B）：`PReLU`（逐特征可学习斜率，负分支才累计 `da`）、`Snake`（`y = x + sin²(ax)/a`，`a→0` 走极限分支；`dx`/`da` 中心差分 ≤1e-7）
 - [ ] 激活族（剩余）：`Maxout`、`DynamicReLU`、`FReLU`
 - [x] GLU 族（W3-B）：`SwiGLU(gate="swish|silu|gelu|relu|bilinear")` → SwiGLU / GeGLU / ReGLU / Bilinear GLU；默认 `swish` 与原实现逐位一致，各 gate 的 `grad_Wg` 中心差分 ≤1e-6

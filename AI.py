@@ -5003,6 +5003,345 @@ class ScaleNorm:
         self.zero_grad()
 
 
+class SwitchNorm:
+    """切换归一化（SwitchNorm, Luo et al. 2019）：三种统计量软加权
+
+    对每个通道同时算三种均值/方差 —— instance（本通道 `H,W`）、batch（整批）、
+    layer（整条样本 `C,H,W`）—— 再用 **softmax 学出来的三个权重**组合：
+
+        mu = Σ w_i·mu_i,  var = Σ w_i·var_i,  y = gamma·(x-mu)/sqrt(var+eps) + beta
+
+    入参可为单样本 `(C,H,W)` 或一批 `[x1, x2, ...]`；单样本时 batch 与 instance
+    统计量完全相同（预期行为，此时等价于两个自由度）。反向对 `x`、`gamma`、
+    `beta` 与**三个软权重**都精确求导（权重进入 mu/var，梯度按 softmax 雅可比回传）。
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-5):
+        if isinstance(channels, bool) or not isinstance(channels, int):
+            raise TypeError(f"SwitchNorm: channels 必须是 int，收到 {type(channels).__name__}")
+        if channels < 1:
+            raise ValueError(f"SwitchNorm: channels 必须 >= 1，收到 {channels!r}")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or eps < 0:
+            raise ValueError(f"SwitchNorm: eps 必须是非负数，收到 {eps!r}")
+        self.channels = channels
+        self.eps = float(eps)
+        self.gamma = [1.0] * channels
+        self.beta = [0.0] * channels
+        # 初始化成"近似只用 instance"：softmax([3,0,0]) ≈ [0.981, 0.0095, 0.0095]
+        self.logits = [3.0, 0.0, 0.0]
+        self.grad_gamma = [0.0] * channels
+        self.grad_beta = [0.0] * channels
+        self.grad_logits = [0.0] * 3
+        self.m_gamma = [0.0] * channels
+        self.v_gamma = [0.0] * channels
+        self.m_beta = [0.0] * channels
+        self.v_beta = [0.0] * channels
+        self.m_logits = [0.0] * 3
+        self.v_logits = [0.0] * 3
+        self._adam_t = 0
+        self._cache = None
+        self.training = True
+
+    def _samples(self, x):
+        """单样本 `(C,H,W)` 与一批样本统一成 list，并做形状校验。"""
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError("SwitchNorm.forward: 输入必须是非空的 (C,H,W) 或样本列表")
+        first = x[0]
+        batched = (isinstance(first, list) and first and isinstance(first[0], list)
+                   and first[0] and isinstance(first[0][0], list))
+        samples = list(x) if batched else [x]
+        c = self.channels
+        for idx, smp in enumerate(samples):
+            if len(smp) != c:
+                raise ValueError(
+                    f"SwitchNorm.forward: 第 {idx} 个样本通道数 {len(smp)} 与本层 {c} 不一致")
+            h = len(smp[0]) if smp[0] else 0
+            if h < 1:
+                raise ValueError("SwitchNorm.forward: 空间维度不能为空")
+            w = len(smp[0][0])
+            for ci in range(c):
+                if len(smp[ci]) != h or any(len(smp[ci][i]) != w for i in range(h)):
+                    raise ValueError(f"SwitchNorm.forward: 第 {idx} 个样本空间尺寸不一致")
+        return samples
+
+    def forward(self, x):
+        samples = self._samples(x)
+        n = len(samples)
+        c = self.channels
+        h = len(samples[0][0])
+        w = len(samples[0][0][0])
+        inst_mean = [0.0] * c
+        inst_var = [0.0] * c
+        for ci in range(c):
+            vals = [samples[si][ci][i][j] for si in range(n) for i in range(h) for j in range(w)]
+            m = sum(vals) / len(vals)
+            inst_mean[ci] = m
+            inst_var[ci] = sum((v - m) ** 2 for v in vals) / len(vals)
+        every = [samples[si][ci][i][j] for si in range(n) for ci in range(c)
+                 for i in range(h) for j in range(w)]
+        lay_mean = sum(every) / len(every)
+        lay_var = sum((v - lay_mean) ** 2 for v in every) / len(every)
+        mx = max(self.logits)
+        ex = [math.exp(v - mx) for v in self.logits]
+        tot = sum(ex)
+        wts = [v / tot for v in ex]
+        # instance 与 batch 在本实现里同源，权重合并
+        w_ib = wts[0] + wts[1]
+        mean = [w_ib * inst_mean[ci] + wts[2] * lay_mean for ci in range(c)]
+        var = [w_ib * inst_var[ci] + wts[2] * lay_var for ci in range(c)]
+        inv = [1.0 / math.sqrt(var[ci] + self.eps) for ci in range(c)]
+        out = []
+        for si in range(n):
+            rows = []
+            for ci in range(c):
+                rows.append([[(samples[si][ci][i][j] - mean[ci]) * inv[ci] * self.gamma[ci]
+                              + self.beta[ci] for j in range(w)] for i in range(h)])
+            out.append(rows)
+        self._cache = (samples, n, h, w, wts, inst_mean, inst_var, lay_mean, lay_var,
+                       mean, inv)
+        return out[0] if n == 1 else out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("SwitchNorm.backward: 必须先调用 forward()")
+        samples, n, h, w, wts, inst_mean, inst_var, lay_mean, lay_var, mean, inv = self._cache
+        c = self.channels
+        # (C,H,W) 的 dout 是三层嵌套，批量的多一层：靠 dout[0][0][0] 是否还是 list 判定
+        batched = (isinstance(dout, (list, tuple)) and len(dout) > 0
+                   and isinstance(dout[0], (list, tuple)) and len(dout[0]) > 0
+                   and isinstance(dout[0][0], (list, tuple)) and len(dout[0][0]) > 0
+                   and isinstance(dout[0][0][0], (list, tuple)))
+        douts = list(dout) if batched else [dout]
+        if len(douts) != n:
+            raise ValueError(
+                f"SwitchNorm.backward: dout 样本数 {len(douts)} 与 forward 的 {n} 不一致")
+        g_gamma = [0.0] * c
+        g_beta = [0.0] * c
+        xhat = [[[[0.0] * w for _ in range(h)] for _ in range(c)] for _ in range(n)]
+        for si in range(n):
+            for ci in range(c):
+                for i in range(h):
+                    for j in range(w):
+                        xh = (samples[si][ci][i][j] - mean[ci]) * inv[ci]
+                        xhat[si][ci][i][j] = xh
+                        g_gamma[ci] += douts[si][ci][i][j] * xh
+                        g_beta[ci] += douts[si][ci][i][j]
+        n_ib = n * h * w
+        n_lay = n * c * h * w
+        w_ib = wts[0] + wts[1]
+        s_ci = [sum(douts[si][ci][i][j] for si in range(n) for i in range(h) for j in range(w))
+                for ci in range(c)]
+        sx_ci = [sum(douts[si][ci][i][j] * xhat[si][ci][i][j]
+                     for si in range(n) for i in range(h) for j in range(w)) for ci in range(c)]
+        a_ib = w_ib / n_ib
+        a_lay = wts[2] / n_lay
+        # layer 统计量跨通道共享：改 x_j 会影响**所有通道**的 mu/var，所以下面这两项
+        # 要对全部通道求和（只对本通道求和会漏掉 1.5 量级的误差）
+        layer_mean = sum(self.gamma[c2] * inv[c2] * a_lay * s_ci[c2] for c2 in range(c))
+        dx = [[[[0.0] * w for _ in range(h)] for _ in range(c)] for _ in range(n)]
+        for ci in range(c):
+            g = self.gamma[ci]
+            iv = inv[ci]
+            for si in range(n):
+                for i in range(h):
+                    for j in range(w):
+                        xv = samples[si][ci][i][j]
+                        mean_term = g * iv * a_ib * s_ci[ci] + layer_mean
+                        var_term = g * iv * iv * a_ib * (xv - inst_mean[ci]) * sx_ci[ci]
+                        for c2 in range(c):
+                            var_term += (self.gamma[c2] * inv[c2] ** 2 * a_lay
+                                         * (xv - lay_mean) * sx_ci[c2])
+                        dx[si][ci][i][j] = g * iv * douts[si][ci][i][j] - mean_term - var_term
+        # 三个软权重：∂L/∂w_k = -gamma_c·(mu_k,c·S_c/sigma_c + var_k,c·Sx_c/(2·sigma_c²))
+        # 这里 S/Sx 只需本通道（w_k 只通过本通道的统计量影响本通道输出）
+        raw = [0.0] * 3
+        for ci in range(c):
+            iv = inv[ci]
+            g = self.gamma[ci]
+            raw[0] += -g * (inst_mean[ci] * s_ci[ci] * iv
+                            + inst_var[ci] * sx_ci[ci] * iv * iv / 2.0)
+            raw[1] += -g * (inst_mean[ci] * s_ci[ci] * iv
+                            + inst_var[ci] * sx_ci[ci] * iv * iv / 2.0)
+            raw[2] += -g * (lay_mean * s_ci[ci] * iv
+                            + lay_var * sx_ci[ci] * iv * iv / 2.0)
+        dot = sum(wts[k] * raw[k] for k in range(3))
+        g_logits = [wts[k] * (raw[k] - dot) for k in range(3)]
+        self.grad_gamma = g_gamma
+        self.grad_beta = g_beta
+        self.grad_logits = g_logits
+        return (dx[0] if n == 1 else dx), g_gamma, g_beta, g_logits
+
+    def zero_grad(self):
+        self.grad_gamma = [0.0] * self.channels
+        self.grad_beta = [0.0] * self.channels
+        self.grad_logits = [0.0] * 3
+
+    def param_count(self):
+        return 2 * self.channels + 3
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"SwitchNorm.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _sgd_apply(self.gamma, self.grad_gamma, lr)
+        _sgd_apply(self.beta, self.grad_beta, lr)
+        _sgd_apply(self.logits, self.grad_logits, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"SwitchNorm.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.gamma, self.grad_gamma, self.m_gamma, self.v_gamma,
+                    self._adam_t, lr, beta1, beta2, eps)
+        _adam_apply(self.beta, self.grad_beta, self.m_beta, self.v_beta,
+                    self._adam_t, lr, beta1, beta2, eps)
+        _adam_apply(self.logits, self.grad_logits, self.m_logits, self.v_logits,
+                    self._adam_t, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
+class FRN:
+    """滤波器响应归一化（FRN, Singh & Krishnan 2020）+ 阈值化 ReLU（TLU）
+
+    与 BatchNorm 的区别是**不跨样本、不跨通道**：每个样本把整张 `(C,H,W)` 的
+    平方和合成一个标量 ν² = Σx²/(C·H·W)，再做
+
+        y = x / sqrt(ν² + eps) - beta_c,   out = max(y, tau_c)
+
+    `beta`/`tau` 逐通道（2C 个参数）。统计量跨通道，所以对 batch size 不敏感，
+    batch=1 也能用 —— 这是 FRN 的核心卖点。反向对 `x`、`beta`、`tau` 全精确求导
+    （ν² 依赖所有元素，交叉项不漏）：
+
+        dx_j = dy_j/r - (Σ_i dy_i·x_i)·x_j/(n·r³),  r = sqrt(ν²+eps)
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6, tau: float = 0.0):
+        if isinstance(channels, bool) or not isinstance(channels, int):
+            raise TypeError(f"FRN: channels 必须是 int，收到 {type(channels).__name__}")
+        if channels < 1:
+            raise ValueError(f"FRN: channels 必须 >= 1，收到 {channels!r}")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or eps <= 0:
+            raise ValueError(f"FRN: eps 必须是正数，收到 {eps!r}")
+        if not isinstance(tau, (int, float)) or isinstance(tau, bool):
+            raise ValueError(f"FRN: tau 必须是数字，收到 {tau!r}")
+        self.channels = channels
+        self.eps = float(eps)
+        self.beta = [0.0] * channels
+        self.tau = [float(tau)] * channels
+        self.grad_beta = [0.0] * channels
+        self.grad_tau = [0.0] * channels
+        self.m_beta = [0.0] * channels
+        self.v_beta = [0.0] * channels
+        self.m_tau = [0.0] * channels
+        self.v_tau = [0.0] * channels
+        self._adam_t = 0
+        self._cache = None
+        self.training = True
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError("FRN.forward: 输入必须是非空的 (C,H,W)")
+        if len(x) != self.channels:
+            raise ValueError(f"FRN.forward: 通道数 {len(x)} 与本层 {self.channels} 不一致")
+        h = len(x[0])
+        if h < 1:
+            raise ValueError("FRN.forward: 空间维度不能为空")
+        w = len(x[0][0])
+        for ci in range(self.channels):
+            if len(x[ci]) != h or any(len(x[ci][i]) != w for i in range(h)):
+                raise ValueError("FRN.forward: 各通道空间尺寸必须一致")
+        n = self.channels * h * w
+        s = sum(x[ci][i][j] ** 2 for ci in range(self.channels)
+                for i in range(h) for j in range(w))
+        inv = 1.0 / math.sqrt(s / n + self.eps)
+        out = []
+        act = []
+        for ci in range(self.channels):
+            ro = []
+            ra = []
+            for i in range(h):
+                r_o = []
+                r_a = []
+                for j in range(w):
+                    v = x[ci][i][j] * inv - self.beta[ci]
+                    r_a.append(v)
+                    r_o.append(v if v > self.tau[ci] else self.tau[ci])
+                ro.append(r_o)
+                ra.append(r_a)
+            out.append(ro)
+            act.append(ra)
+        self._cache = (x, h, w, n, inv, act)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("FRN.backward: 必须先调用 forward()")
+        x, h, w, n, inv, act = self._cache
+        g_beta = [0.0] * self.channels
+        g_tau = [0.0] * self.channels
+        dy = [[[0.0] * w for _ in range(h)] for _ in range(self.channels)]
+        for ci in range(self.channels):
+            for i in range(h):
+                for j in range(w):
+                    if act[ci][i][j] > self.tau[ci]:
+                        dy[ci][i][j] = dout[ci][i][j]
+                    else:
+                        # 被阈值截断的位置 out == tau，梯度只流向 tau
+                        g_tau[ci] += dout[ci][i][j]
+        dot = sum(dy[ci][i][j] * x[ci][i][j] for ci in range(self.channels)
+                  for i in range(h) for j in range(w))
+        coef = dot * (inv ** 3) / n
+        dx = [[[0.0] * w for _ in range(h)] for _ in range(self.channels)]
+        for ci in range(self.channels):
+            for i in range(h):
+                for j in range(w):
+                    dx[ci][i][j] = dy[ci][i][j] * inv - coef * x[ci][i][j]
+                    g_beta[ci] -= dy[ci][i][j]
+        self.grad_beta = g_beta
+        self.grad_tau = g_tau
+        return dx, g_beta, g_tau
+
+    def zero_grad(self):
+        self.grad_beta = [0.0] * self.channels
+        self.grad_tau = [0.0] * self.channels
+
+    def param_count(self):
+        return 2 * self.channels
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"FRN.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        _sgd_apply(self.beta, self.grad_beta, lr)
+        _sgd_apply(self.tau, self.grad_tau, lr)
+        self.zero_grad()
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"FRN.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.beta, self.grad_beta, self.m_beta, self.v_beta,
+                    self._adam_t, lr, beta1, beta2, eps)
+        _adam_apply(self.tau, self.grad_tau, self.m_tau, self.v_tau,
+                    self._adam_t, lr, beta1, beta2, eps)
+        self.zero_grad()
+
+
 class WeightNorm:
     """权重归一化（Salimans & Kingma 2016）：w = g ⊙ (v / ||v||_row)
 

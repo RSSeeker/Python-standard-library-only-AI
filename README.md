@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（823 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（830 项）
 
 ## 特性
 
@@ -185,6 +185,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `ScaleNorm(num_features, eps=1e-6)` | 尺度归一化：只有标量 `g`，`y = g·x/(‖x‖/√d+eps)`（整向量缩放，不是逐特征归一化） |
 | `WeightNorm(layer)` | 权重归一化：`w = g ⊙ v/‖v‖_row`，把权重的尺度与方向解耦；反向精确传到 `v`/`g`/`b`（含 `dv` 里的解耦项） |
 | `SpectralNorm(layer, power_iter=1)` | 谱归一化：`w = v/σ(v)`，σ 用幂迭代估计；默认把 σ 视为常量（`freeze_sigma()` 可冻结以获得严格端到端梯度） |
+| `SwitchNorm(channels, eps=1e-5)` | Switchable Norm：instance / batch / layer 三种统计量按 `softmax(logits)` 软加权（本实现 instance 与 batch 同源，权重合并）；`logits` 也可学 |
+| `FRN(channels, eps=1e-6, tau=0.0)` | Filter Response Normalization：跨通道求 ν²、无 batch 依赖（batch=1 可用），后接可学习阈值的 TLU |
 | `PReLU(num_features, init=0.25)` | 参数化 ReLU：逐特征可学习斜率，负分支才累计 `da` |
 | `Snake(num_features, init=1.0)` | Snake 激活：`y = x + sin²(ax)/a`，逐特征可学习 `a`，`a→0` 退化为恒等（按极限 `y ≈ x + a·x²` 处理） |
 | `Embedding` | 嵌入层 |
@@ -1055,7 +1057,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-823 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+830 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1137,6 +1139,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInitFamily` | LeCun 正态/均匀的 `std` 与界内、正交矩阵行模长 `==gain` 且两两正交（fat 矩阵改验列正交）、稀疏零比例、截断正态界内、`zero_bias`、残差零初始化后退化为 `relu(x)`（Bottleneck 零 `bn3` 而非 `short_bn`）、非法输入、默认 He 初始化未被改动 |
 | `TestWeightNorm` | 初始化即等于原层、`dv`（含 `v`/`g` 解耦项）/`dg`/`db` 中心差分、`dx = wᵀdout`、forward 不永久改写内层权重 |
 | `TestSpectralNorm` | 前向 `(v/σ)x+b`、冻结 σ 时 `dv` 中心差分、未冻结时 σ 随权重变化、`power_iter`/维度/未 forward 校验 |
+| `TestSwitchNorm` | 三统计量加权闭式解、`dx`/`gamma`/`beta`/`logits` 四组中心差分、批量形状、整体平移 logits 不变性、优化器步与非法输入 |
+| `TestFRN` | 闭式解与 TLU 截断、`dx`/`beta`/`tau` 中心差分、eps→0 时的尺度不变性、优化器步与 6 类非法输入 |
 | `TestFractionalPooling` | 输出尺寸随比例、每个输出等于被选位置原值、同 seed 逐位相同、反向只回传被选位置且总量守恒 |
 | `TestStochasticPooling` | 概率和为 1、训练输出等于采样值且反向乘 `p`、`eval()` 取期望、非正窗口退化为均匀、同 seed 可复现 |
 | `TestConditionalNorm` | `gamma/beta` 闭式解、`dx`/`b_g,b_b`/`W_g,W_b`/`grad_cond` 四组中心差分、优化器步与 8 类非法输入 |
@@ -1196,7 +1200,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 823 个单元测试
+├── test_ai.py       # 830 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
