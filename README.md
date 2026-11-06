@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（960 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（966 项）
 
 ## 特性
 
@@ -275,6 +275,10 @@ model.train()     # 回到训练
 | `FlashAttention(d_model, num_heads, causal=False, block_size=2)` | 分块 + 在线 softmax 的注意力：`O(T)` 显存、**不物化 T×T 矩阵**；反向按 `(m, l)` 重算概率。注意：纯 Python 里**不会更快**，价值是把显存从 O(T²) 降到 O(T) —— 反向的 `tot = Σ_j p_ij·dp_ij` 必须在**所有键块**上求和，单块实现会漏 |
 | `T5RelativeBias(num_heads, num_buckets=32, max_distance=128, bidirectional=True)` | T5 式相对位置偏置：`(num_buckets, num_heads)` 可学习表，`forward(qlen, klen)` 返回 `bias[head][i][j]` 加到 softmax 前；分桶用 `t5_relative_buckets(...)`，正负相对位置各占一半桶、近端线性远端对数 |
 | `xpos_factors(seq_len, d_k, base=10000.0, alpha=1.0, offset=0.0)` | xPos 的位置衰减因子（简化版）：对第 `i` 个频率维乘 `(t+1+offset) ** (-alpha * theta_i)`，位置 0 处为 1；`alpha=0` 等于关闭 |
+| `GCNLayer(in_features, out_features, activation='relu', self_loops=True)` | 图卷积 `H = σ(Â X W + b)`，`Â = D^{-1/2}(A+I)D^{-1/2}`；`adj` 是 `N×N` 密集矩阵，邻接视为常量不参与反向 |
+| `GraphSAGELayer(in_features, out_features, concat=True)` | 均值聚合 `σ(W [x_i ‖ mean_{j∈N(i)} x_j])`；`concat=False` 时只用邻居均值 |
+| `GINLayer(in_features, hidden, out_features, eps=0.0, train_eps=False)` | `MLP((1+eps)·x_i + Σ_{j∈N(i)} x_j)`；`train_eps=True` 时 `eps` 作标量参数参与优化 |
+| `GraphReadout(mode='mean')` | 节点特征 → 图向量的读出（`mean` / `sum` / `max`），反向按模式分发（`max` 只回给取到最大值的位置） |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
@@ -1089,7 +1093,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-960 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+966 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1198,6 +1202,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFlashAttention` | 块大小与稠密一致、块不变性、`O(T)` 缓存无 T×T、causal 前缀逐位不变、四组梯度中心差分、累加与非法输入 |
 | `TestT5RelativeBias` | 分桶公式（正负半区、单调、夹断）、查表一致、桶内梯度求和、优化器与非法输入 |
 | `TestXPosFactors` | 形状与位置 0 归 1、随位置衰减、`alpha=0` 关闭、`offset` 语义、非法输入 |
+| `TestGraphLayers` | GCN 退化语义与 `dW`/`dx` 中心差分、GraphSAGE 两种拼接、GIN 的 `eps` 梯度与「无边退化为 MLP」、三种读出与反向、训练下降、8 类非法输入 |
 | `TestPatchEmbedding` | patch 切分与行优先顺序、偏置整体平移、`param_count`、`dx` 中心差分、6 类非法输入 |
 | `TestAttentionPooling` | `q=0` 退化为平均、softmax 权重闭式解、`dx`/`q` 中心差分、5 类非法输入 |
 | `TestGeMPooling` | `p=1` 等于平均、`p=2` 等于均方根、`p=2000` 仍接近最大值且不溢出、三档 `p` 的 `dx` 中心差分、6 类非法输入 |
@@ -1262,7 +1267,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 960 个单元测试
+├── test_ai.py       # 966 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

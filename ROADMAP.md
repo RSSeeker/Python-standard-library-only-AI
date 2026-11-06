@@ -189,7 +189,8 @@
 - [x] `FlashAttention` 分块算法（模拟，明确「不更快」）—— 在线 softmax + cache 只存 `q/k/v/m/l`（不物化 T×T）；反向按 `(m,l)` 重算概率；`block_size` 1/2/3/4/8 与稠密一致 <1e-12、块大小不影响结果 <1e-15。踩过的坑：`tot = Σ_j p_ij dp_ij` 原来只在单个键块内累加，单块恰好对、多块漏项（梯度差 6.55e-02），改成每个查询块两遍扫描后归零
 
 ### W6 图神经网络（§1 全新范式）
-- [ ] `GCNLayer` / `GATLayer` / `GINLayer` / `GraphSAGELayer` / `MPNNLayer` / `GCNIILayer` / `APPNPLayer` / `JKNet`
+- [x] `GCNLayer` / `GINLayer` / `GraphSAGELayer` + `GraphReadout`（W6-A，提交在 W6-A 这一批）：`adj` 用 `N×N` 密集矩阵（教学规模足够，公式最直观），GCN 是 `D^{-1/2}(A+I)D^{-1/2}` 归一化、GraphSAGE 是均值聚合 + 可选拼接、GIN 是 `MLP((1+eps)x + Σ邻居)` 且 `eps` 可学；踩过的坑：①激活导数是**行向量**，不能与上游梯度直接 `*`（`list*list` 直接 TypeError），必须逐元素相乘；②GIN 的邻居散射要用 forward 缓存的邻接矩阵，否则 `NameError`；③无边 + 无自环时 `Â=0`，输出只剩偏置（不是「退化为逐节点全连接」）
+- [ ] `GATLayer` / `MPNNLayer` / `GCNIILayer` / `APPNPLayer` / `JKNet`（W6-B）
 - [ ] 图池化：`TopKPool`、`DiffPool`（简化）、`SAGPool`
 
 ### W7 LLM 微调与推理（P0/P1）

@@ -14674,3 +14674,161 @@ class TestXPosFactors:
                    lambda: AI.xpos_factors(3, 4, offset=-1.0)):
             with pytest.raises((ValueError, TypeError)):
                 fn()
+
+
+class TestGraphLayers:
+    XG = [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]]
+    AG = [[0.0, 1.0, 0.3], [1.0, 0.0, 1.0], [0.3, 1.0, 0.0]]
+    DG = [[0.5, -0.2, 0.1], [0.1, 0.3, -0.4], [-0.2, 0.6, 0.25]]
+
+    def _target(self, model, out, dout):
+        return sum(out[a][b] * dout[a][b]
+                   for a in range(len(out)) for b in range(len(out[0])))
+
+    def test_gcn_forward_and_grad(self):
+        m = AI.GCNLayer(2, 3, activation='linear', seed=3)
+        out = m.forward(self.XG, self.AG)
+        assert len(out) == 3 and len(out[0]) == 3
+        assert m.param_count() == 9
+        # 无边 + 无自环 => A_hat = 0，输出只剩偏置
+        iso = [[0.0] * 3 for _ in range(3)]
+        m0 = AI.GCNLayer(2, 2, activation='linear', self_loops=False)
+        for row in m0.forward(self.XG, iso):
+            assert row == m0.dense.b
+        # 自环让孤立节点的 Â 恰为单位阵
+        m1 = AI.GCNLayer(2, 2, activation='linear', self_loops=False + True)
+        o1 = m1.forward(self.XG, iso)
+        for i, row in enumerate(self.XG):
+            for h in range(2):
+                want = m1.dense.b[h] + sum(m1.dense.W[h][k] * row[k] for k in range(2))
+                assert abs(o1[i][h] - want) < 1e-12
+        m.zero_grad()
+        m.forward(self.XG, self.AG)
+        m.backward(self.DG)
+        ana = m.dense.gW[0][0]
+        eps = 1e-6
+        m.dense.W[0][0] += eps
+        up = self._target(m, m.forward(self.XG, self.AG), self.DG)
+        m.dense.W[0][0] -= 2 * eps
+        dn = self._target(m, m.forward(self.XG, self.AG), self.DG)
+        m.dense.W[0][0] += eps
+        assert abs(ana - (up - dn) / (2 * eps)) < 1e-5
+
+    def test_gcn_dx_and_activation(self):
+        for act in ('relu', 'tanh'):
+            m = AI.GCNLayer(2, 3, activation=act, seed=4)
+            m.zero_grad()
+            m.forward(self.XG, self.AG)
+            dx = m.backward(self.DG)
+            eps = 1e-6
+            for i in range(3):
+                base = self.XG[i][0]
+                self.XG[i][0] = base + eps
+                up = self._target(m, m.forward(self.XG, self.AG), self.DG)
+                self.XG[i][0] = base - eps
+                dn = self._target(m, m.forward(self.XG, self.AG), self.DG)
+                self.XG[i][0] = base
+                num = (up - dn) / (2 * eps)
+                assert abs(dx[i][0] - num) < 1e-5, (act, i, dx[i][0], num)
+
+    def test_graphsage(self):
+        for concat in (True, False):
+            m = AI.GraphSAGELayer(2, 3, activation='tanh', concat=concat, seed=5)
+            out = m.forward(self.XG, self.AG)
+            assert len(out) == 3 and len(out[0]) == 3
+            want = (4 * 3 + 3) if concat else (2 * 3 + 3)
+            assert m.param_count() == want
+            m.zero_grad()
+            m.forward(self.XG, self.AG)
+            m.backward(self.DG)
+            ana = m.dense.gW[1][1]
+            eps = 1e-6
+            m.dense.W[1][1] += eps
+            up = self._target(m, m.forward(self.XG, self.AG), self.DG)
+            m.dense.W[1][1] -= 2 * eps
+            dn = self._target(m, m.forward(self.XG, self.AG), self.DG)
+            m.dense.W[1][1] += eps
+            assert abs(ana - (up - dn) / (2 * eps)) < 1e-5
+
+    def test_gin_and_eps(self):
+        for train_eps in (True, False):
+            m = AI.GINLayer(2, 4, 3, activation='relu', eps=0.1,
+                            train_eps=train_eps, seed=7)
+            m.forward(self.XG, self.AG)
+            m.zero_grad()
+            m.forward(self.XG, self.AG)
+            m.backward(self.DG)
+            want = (2 * 4 + 4) + (4 * 3 + 3) + (1 if train_eps else 0)
+            assert m.param_count() == want
+            ana = m.g_eps[0]
+            eps = 1e-6
+            m._eps[0] += eps
+            up = self._target(m, m.forward(self.XG, self.AG), self.DG)
+            m._eps[0] -= 2 * eps
+            dn = self._target(m, m.forward(self.XG, self.AG), self.DG)
+            m._eps[0] += eps
+            num = (up - dn) / (2 * eps)
+            if train_eps:
+                assert abs(ana - num) < 1e-5, (ana, num)
+            else:
+                assert ana == 0.0
+        # 无边 + eps=0 退化为两层 MLP
+        m2 = AI.GINLayer(2, 3, 2, activation='linear', eps=0.0, seed=9)
+        iso = [[0.0] * 3 for _ in range(3)]
+        out = m2.forward(self.XG, iso)
+        for i, row in enumerate(self.XG):
+            z1 = [sum(m2.l1.W[h][k] * row[k] for k in range(2)) + m2.l1.b[h]
+                  for h in range(3)]
+            for h in range(2):
+                want = m2.l2.b[h] + sum(m2.l2.W[h][k] * z1[k] for k in range(3))
+                assert abs(out[i][h] - want) < 1e-12
+
+    def test_readout(self):
+        rm = AI.GraphReadout('mean')
+        r = rm.forward(self.XG)
+        assert abs(r[0] - 2.0 / 3) < 1e-15 and abs(r[1] - 1.0) < 1e-15
+        dr = rm.backward([1.0, 1.0])
+        assert all(abs(v - 1.0 / 3) < 1e-15 for row in dr for v in row)
+        rs = AI.GraphReadout('sum')
+        assert rs.forward(self.XG) == [2.0, 3.0]
+        rs.backward([1.0, 1.0])
+        assert all(v == 1.0 for row in rs.backward([1.0, 1.0]) for v in row)
+        rx = AI.GraphReadout('max')
+        assert rx.forward(self.XG) == [1.0, 2.0]
+        dx = rx.backward([1.0, 1.0])
+        # 第 0 列 node0 与 node2 都是 1.0，严格大于保留先出现的 node0
+        assert dx[0][0] == 1.0 and dx[1][1] == 1.0
+        assert dx[2][0] == 0.0 and dx[0][1] == 0.0
+        assert rm.param_count() == 0
+
+    def test_train_and_errors(self):
+        m = AI.GCNLayer(2, 2, activation='tanh', seed=11)
+        XD = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]]
+        AD = [[0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0],
+              [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+        YD = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]]
+        first = None
+        loss = None
+        for _ in range(120):
+            out = m.forward(XD, AD)
+            loss = sum((out[a][b] - YD[a][b]) ** 2 for a in range(4)
+                       for b in range(2)) / 4
+            if first is None:
+                first = loss
+            m.zero_grad()
+            m.backward([[2.0 * (out[a][b] - YD[a][b]) / 4 for b in range(2)]
+                        for a in range(4)])
+            m.adam_step(0.05)
+        assert loss < first * 0.5, (first, loss)
+        for fn in (lambda: AI.GCNLayer(0, 3),
+                   lambda: AI.GCNLayer(2, 3, activation='softmax'),
+                   lambda: AI.GCNLayer(2, 3).forward([], self.AG),
+                   lambda: AI.GCNLayer(2, 3).forward([[1.0, 2.0], [1.0]], self.AG),
+                   lambda: AI.GCNLayer(2, 3).forward(self.XG, [[0, 1], [1, 0]]),
+                   lambda: AI.GINLayer(2, 0, 3),
+                   lambda: AI.GINLayer(2, 3, 4, eps=float('inf')),
+                   lambda: AI.GraphReadout('median')):
+            with pytest.raises((ValueError, TypeError)):
+                fn()
+        with pytest.raises(RuntimeError):
+            AI.GCNLayer(2, 3).backward(self.DG)

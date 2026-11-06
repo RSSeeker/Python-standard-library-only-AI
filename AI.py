@@ -7217,6 +7217,574 @@ class SwinTransformer:
         _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
 
 
+def _g_act(name: str):
+    """按名字返回 (逐行激活函数, 逐行导数)，供图网络层使用。
+
+    只支持不依赖行内其它位置的激活（relu / leaky_relu / elu / selu /
+    gelu / silu / mish / tanh / sigmoid / linear）；softmax 这类依赖整行的
+    激活不开放，避免在图读出时产生歧义。
+    """
+    if not isinstance(name, str):
+        raise TypeError('图网络层的 activation 必须是字符串，收到 %r' % (name,))
+    key = name.lower()
+    if key == 'relu':
+        return (lambda z: [v if v > 0.0 else 0.0 for v in z],
+                lambda z: [1.0 if v > 0.0 else 0.0 for v in z])
+    if key == 'leaky_relu':
+        return (lambda z: [v if v >= 0.0 else 0.01 * v for v in z],
+                lambda z: [1.0 if v >= 0.0 else 0.01 for v in z])
+    if key == 'linear':
+        return (lambda z: list(z), lambda z: [1.0] * len(z))
+    if key == 'tanh':
+        return (lambda z: [math.tanh(v) for v in z],
+                lambda z: [1.0 - math.tanh(v) ** 2 for v in z])
+    if key == 'sigmoid':
+        def _sig_row(z):
+            out = []
+            for v in z:
+                if v >= 0.0:
+                    out.append(1.0 / (1.0 + math.exp(-v)))
+                else:
+                    e = math.exp(v)
+                    out.append(e / (1.0 + e))
+            return out
+
+        def _dsig_row(z, _s=_sig_row):
+            return [s * (1.0 - s) for s in _s(z)]
+
+        return (_sig_row, _dsig_row)
+    if key in ('gelu', 'silu', 'mish', 'elu', 'selu'):
+        row_fn = _G_ACT_ROW[key]
+        row_der = _G_ACT_ROW_DERIV[key]
+        return (row_fn, row_der)
+    raise ValueError("不支持的激活 %r（可选 relu / leaky_relu / linear / tanh / "
+                     "sigmoid / gelu / silu / mish / elu / selu）" % (name,))
+
+
+
+_G_ACT_ROW = {
+    'gelu': lambda z: [_gelu_scalar(v) for v in z],
+    'silu': lambda z: [v * _silu_scalar(v) for v in z],
+    'mish': lambda z: [v * math.tanh(math.log1p(math.exp(v))) if v < 20.0
+                       else v for v in z],
+    'elu': lambda z: [v if v > 0.0 else math.exp(v) - 1.0 for v in z],
+    'selu': lambda z: [1.0507009873554805 * (v if v > 0.0
+                                             else 1.6732632423543772 * (math.exp(v) - 1.0))
+                       for v in z],
+}
+
+_G_ACT_ROW_DERIV = {
+    'gelu': lambda z: [_dgelu_scalar(v) for v in z],
+    'silu': lambda z: [_silu_scalar(v) + v * _silu_scalar(v) * (1.0 - _silu_scalar(v))
+                       for v in z],
+    'mish': lambda z: [(math.tanh(math.log1p(math.exp(v)))
+                        + v * (1.0 - math.tanh(math.log1p(math.exp(v))) ** 2)
+                        * _silu_scalar(v)) if v < 20.0 else 1.0 for v in z],
+    'elu': lambda z: [1.0 if v > 0.0 else math.exp(v) for v in z],
+    'selu': lambda z: [1.0507009873554805 if v > 0.0
+                       else 1.0507009873554805 * 1.6732632423543772 * math.exp(v)
+                       for v in z],
+}
+
+def _g_check_x(X, who: str) -> int:
+    """校验节点特征矩阵并返回节点数"""
+    if not isinstance(X, list) or not X:
+        raise ValueError('%s: X 必须是非空的节点列表' % who)
+    if not isinstance(X[0], list) or not X[0]:
+        raise ValueError('%s: X 的每个节点必须是特征列表' % who)
+    dim = len(X[0])
+    for i, row in enumerate(X):
+        if not isinstance(row, list) or len(row) != dim:
+            raise ValueError('%s: X 第 %d 行的特征维度不是 %d' % (who, i, dim))
+        for v in row:
+            if not _is_num(v):
+                raise ValueError('%s: X[%d] 含非有限数值 %r' % (who, i, v))
+    return len(X)
+
+
+def _g_check_adj(adj, n: int, who: str):
+    """校验邻接矩阵：n x n、对称性不强制、权重必须有限"""
+    if not isinstance(adj, list) or len(adj) != n:
+        raise ValueError('%s: adj 必须是 %d x %d 矩阵' % (who, n, n))
+    for i, row in enumerate(adj):
+        if not isinstance(row, list) or len(row) != n:
+            raise ValueError('%s: adj 第 %d 行长度不是 %d' % (who, i, n))
+        for v in row:
+            if not _is_num(v):
+                raise ValueError('%s: adj[%d] 含非有限数值 %r' % (who, i, v))
+
+
+def _g_adj_norm(adj, self_loops: bool = True):
+    """返回 ``D^{-1/2} (A + I) D^{-1/2}``（不再保证对称归一化以外的性质）"""
+    n = len(adj)
+    a = [[float(adj[i][j]) for j in range(n)] for i in range(n)]
+    if self_loops:
+        for i in range(n):
+            a[i][i] += 1.0
+    deg = [sum(a[i]) for i in range(n)]
+    inv = [(1.0 / math.sqrt(d)) if d > 0.0 else 0.0 for d in deg]
+    return [[a[i][j] * inv[i] * inv[j] for j in range(n)] for i in range(n)]
+
+
+def _g_row_mean(adj):
+    """行归一化邻接矩阵 ``D^{-1} A``（只在有边时归一化）"""
+    n = len(adj)
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        deg = sum(adj[i])
+        if deg <= 0.0:
+            continue
+        inv = 1.0 / deg
+        for j in range(n):
+            out[i][j] = adj[i][j] * inv
+    return out
+
+
+def _g_scale_rows(a, b):
+    """逐元素相乘（a、b 同长度的行向量）"""
+    return [x * y for x, y in zip(a, b)]
+
+
+def _g_matmul(M, X):
+    """(N x N) @ (N x F)"""
+    n = len(M)
+    f = len(X[0])
+    out = [[0.0] * f for _ in range(n)]
+    for i in range(n):
+        mi = M[i]
+        oi = out[i]
+        for j in range(n):
+            w = mi[j]
+            if w == 0.0:
+                continue
+            xj = X[j]
+            for k in range(f):
+                oi[k] += w * xj[k]
+    return out
+
+
+def _g_matmul_t(M, D):
+    """(N x N)^T @ (N x F)"""
+    n = len(M)
+    f = len(D[0])
+    out = [[0.0] * f for _ in range(n)]
+    for i in range(n):
+        oi = out[i]
+        for j in range(n):
+            w = M[j][i]
+            if w == 0.0:
+                continue
+            dj = D[j]
+            for k in range(f):
+                oi[k] += w * dj[k]
+    return out
+
+
+class _GDense:
+    """图网络内部的小型全连接层（自带梯度与优化器状态）"""
+
+    def __init__(self, fan_in: int, fan_out: int, rng, std: Optional[float] = None):
+        self.fan_in = fan_in
+        self.fan_out = fan_out
+        scale = (1.0 / math.sqrt(max(1, fan_in))) if std is None else float(std)
+        self.W = [[rng.gauss(0.0, scale) for _ in range(fan_in)]
+                  for _ in range(fan_out)]
+        self.b = [0.0] * fan_out
+        self.gW = [[0.0] * fan_in for _ in range(fan_out)]
+        self.gb = [0.0] * fan_out
+        self.mW = [[0.0] * fan_in for _ in range(fan_out)]
+        self.vW = [[0.0] * fan_in for _ in range(fan_out)]
+        self.mb = [0.0] * fan_out
+        self.vb = [0.0] * fan_out
+        self._t = 0
+        self._x = None
+
+    def forward(self, X):
+        self._x = [list(r) for r in X]
+        out = []
+        for row in X:
+            o = list(self.b)
+            for k in range(self.fan_in):
+                v = row[k]
+                if v == 0.0:
+                    continue
+                for h in range(self.fan_out):
+                    o[h] += self.W[h][k] * v
+            out.append(o)
+        return out
+
+    def backward(self, dout):
+        x = self._x
+        n = len(x)
+        for h in range(self.fan_out):
+            gh = self.gW[h]
+            for k in range(self.fan_in):
+                acc = 0.0
+                for i in range(n):
+                    acc += dout[i][h] * x[i][k]
+                gh[k] += acc
+        for h in range(self.fan_out):
+            acc = 0.0
+            for i in range(n):
+                acc += dout[i][h]
+            self.gb[h] += acc
+        dx = [[0.0] * self.fan_in for _ in range(n)]
+        for i in range(n):
+            di = dout[i]
+            dxi = dx[i]
+            for h in range(self.fan_out):
+                w = di[h]
+                if w == 0.0:
+                    continue
+                wh = self.W[h]
+                for k in range(self.fan_in):
+                    dxi[k] += w * wh[k]
+        return dx
+
+    def zero_grad(self):
+        self.gW = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        self.gb = [0.0] * self.fan_out
+
+    def param_count(self) -> int:
+        return self.fan_in * self.fan_out + self.fan_out
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, '_GDense.sgd_step')
+        _la_apply_sgd(self.W, self.gW, lr)
+        _la_apply_sgd(self.b, self.gb, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, '_GDense.adam_step')
+        _check_adam_betas(beta1, beta2, '_GDense.adam_step')
+        self._t += 1
+        c1 = 1.0 - beta1 ** self._t
+        c2 = 1.0 - beta2 ** self._t
+        _la_apply_adam(self.W, self.gW, self.mW, self.vW, lr, c1, c2,
+                       beta1, beta2, eps)
+        _la_apply_adam(self.b, self.gb, self.mb, self.vb, lr, c1, c2,
+                       beta1, beta2, eps)
+
+
+class GCNLayer:
+    """图卷积：``H = sigma(A_hat X W + b)``，``A_hat = D^{-1/2}(A+I)D^{-1/2}``
+
+    ``adj`` 是 ``N x N`` 的加权密集矩阵。邻接矩阵不参与反向（视为常量）。
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 activation: str = 'relu', self_loops: bool = True,
+                 bias: bool = True, seed: int = 0):
+        _ck_int(in_features, 'GCNLayer(in_features)', 1)
+        _ck_int(out_features, 'GCNLayer(out_features)', 1)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.activation_name = activation
+        self.self_loops = bool(self_loops)
+        self.act_fn, self.act_deriv = _g_act(activation)
+        self.dense = _GDense(in_features, out_features, random.Random(seed))
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'GCNLayer.forward')
+        _g_check_adj(adj, n, 'GCNLayer.forward')
+        an = _g_adj_norm(adj, self.self_loops)
+        ax = _g_matmul(an, X)
+        z = self.dense.forward(ax)
+        out = [self.act_fn(z[i]) for i in range(n)] if self.act_fn else z
+        self._cache = (an, ax, z)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GCNLayer.backward: 需要先 forward')
+        an, ax, z = self._cache
+        n = len(dout)
+        dz = ([_g_scale_rows(self.act_deriv(z[i]), dout[i]) for i in range(n)]
+              if self.act_fn else dout)
+        dax = self.dense.backward(dz)
+        return _g_matmul_t(an, dax)
+
+    def zero_grad(self):
+        self.dense.zero_grad()
+
+    def param_count(self) -> int:
+        return self.dense.param_count()
+
+    def sgd_step(self, lr: float):
+        self.dense.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.dense.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class GraphSAGELayer:
+    """GraphSAGE 的均值聚合：``h_i' = sigma(W [x_i || mean_{j in N(i)} x_j])``
+
+    ``concat=True`` 时把自特征与邻居均值拼起来（2F），否则只用邻居均值（F）。
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 activation: str = 'relu', concat: bool = True,
+                 self_loops: bool = False, seed: int = 0):
+        _ck_int(in_features, 'GraphSAGELayer(in_features)', 1)
+        _ck_int(out_features, 'GraphSAGELayer(out_features)', 1)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.activation_name = activation
+        self.concat = bool(concat)
+        self.self_loops = bool(self_loops)
+        self.act_fn, self.act_deriv = _g_act(activation)
+        width = in_features * 2 if self.concat else in_features
+        self.dense = _GDense(width, out_features, random.Random(seed + 1))
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'GraphSAGELayer.forward')
+        _g_check_adj(adj, n, 'GraphSAGELayer.forward')
+        a = [list(r) for r in adj]
+        if self.self_loops:
+            for i in range(n):
+                a[i][i] += 1.0
+        rn = _g_row_mean(a)
+        mean = _g_matmul(rn, X)
+        cat = [[mean[i][k] for k in range(self.in_features)]
+               + ([X[i][k] for k in range(self.in_features)] if self.concat else [])
+               for i in range(n)]
+        z = self.dense.forward(cat)
+        out = [self.act_fn(z[i]) for i in range(n)] if self.act_fn else z
+        self._cache = (rn, mean, z)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GraphSAGELayer.backward: 需要先 forward')
+        rn, mean, z = self._cache
+        n = len(dout)
+        dz = ([_g_scale_rows(self.act_deriv(z[i]), dout[i]) for i in range(n)]
+              if self.act_fn else dout)
+        dcat = self.dense.backward(dz)
+        f = self.in_features
+        dmean = [[dcat[i][k] for k in range(f)] for i in range(n)]
+        dself = ([[dcat[i][f + k] for k in range(f)] for i in range(n)]
+                 if self.concat else [[0.0] * f for _ in range(n)])
+        dm = _g_matmul_t(rn, dmean)
+        return [[dm[i][k] + dself[i][k] for k in range(f)] for i in range(n)]
+
+    def zero_grad(self):
+        self.dense.zero_grad()
+
+    def param_count(self) -> int:
+        return self.dense.param_count()
+
+    def sgd_step(self, lr: float):
+        self.dense.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.dense.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class GINLayer:
+    """GIN：``h_i' = MLP((1 + eps) x_i + sum_{j in N(i)} x_j)``
+
+    ``eps`` 默认不可学（``train_eps=False``），打开后作为标量参数参与优化。
+    """
+
+    def __init__(self, in_features: int, hidden: int, out_features: int,
+                 activation: str = 'relu', eps: float = 0.0,
+                 train_eps: bool = False, seed: int = 0):
+        _ck_int(in_features, 'GINLayer(in_features)', 1)
+        _ck_int(hidden, 'GINLayer(hidden)', 1)
+        _ck_int(out_features, 'GINLayer(out_features)', 1)
+        if not _is_num(eps):
+            raise ValueError('GINLayer: eps 必须是有限数字')
+        rng = random.Random(seed + 2)
+        self.activation_name = activation
+        self.act_fn, self.act_deriv = _g_act(activation)
+        self.l1 = _GDense(in_features, hidden, rng)
+        self.l2 = _GDense(hidden, out_features, rng)
+        self.train_eps = bool(train_eps)
+        self._eps = [float(eps)]
+        self.g_eps = [0.0]
+        self.m_eps = [0.0]
+        self.v_eps = [0.0]
+        self._cache = None
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'GINLayer.forward')
+        _g_check_adj(adj, n, 'GINLayer.forward')
+        f = len(X[0])
+        agg = [[0.0] * f for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                w = adj[i][j]
+                if w == 0.0:
+                    continue
+                xj = X[j]
+                ai = agg[i]
+                for k in range(f):
+                    ai[k] += w * xj[k]
+        eps = self._eps[0]
+        h = [[(1.0 + eps) * X[i][k] + agg[i][k] for k in range(f)]
+             for i in range(n)]
+        z1 = self.l1.forward(h)
+        a1 = [self.act_fn(z1[i]) for i in range(n)] if self.act_fn else z1
+        out = self.l2.forward(a1)
+        self._cache = (X, agg, h, z1, a1, [list(r) for r in adj])
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GINLayer.backward: 需要先 forward')
+        X, agg, h, z1, a1, adj = self._cache
+        n = len(dout)
+        da1 = self.l2.backward(dout)
+        dz1 = ([_g_scale_rows(self.act_deriv(z1[i]), da1[i]) for i in range(n)]
+               if self.act_fn else da1)
+        dh = self.l1.backward(dz1)
+        f = len(X[0])
+        eps = self._eps[0]
+        g_eps = 0.0
+        for i in range(n):
+            for k in range(f):
+                g_eps += dh[i][k] * X[i][k]
+        self.g_eps[0] += g_eps
+        # 对邻居的贡献：agg[i] 由 x_j 汇总而来 -> 按 adj 反向散射
+        dx = [[(1.0 + eps) * dh[i][k] for k in range(f)] for i in range(n)]
+        for i in range(n):
+            dhi = dh[i]
+            for j in range(n):
+                w = adj[i][j]
+                if w == 0.0:
+                    continue
+                dxj = dx[j]
+                for k in range(f):
+                    dxj[k] += w * dhi[k]
+        if not self.train_eps:
+            self.g_eps[0] = 0.0
+        return dx
+
+    def zero_grad(self):
+        self.l1.zero_grad()
+        self.l2.zero_grad()
+        self.g_eps[0] = 0.0
+
+    def param_count(self) -> int:
+        return self.l1.param_count() + self.l2.param_count() + (
+            1 if self.train_eps else 0)
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'GINLayer.sgd_step')
+        self.l1.sgd_step(lr)
+        self.l2.sgd_step(lr)
+        if self.train_eps:
+            _la_apply_sgd(self._eps, self.g_eps, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'GINLayer.adam_step')
+        self.l1.adam_step(lr, beta1, beta2, eps)
+        self.l2.adam_step(lr, beta1, beta2, eps)
+        if self.train_eps:
+            _check_adam_betas(beta1, beta2, 'GINLayer.adam_step')
+            self._eps_t = getattr(self, '_eps_t', 0) + 1
+            c1 = 1.0 - beta1 ** self._eps_t
+            c2 = 1.0 - beta2 ** self._eps_t
+            _la_apply_adam(self._eps, self.g_eps, self.m_eps, self.v_eps,
+                           lr, c1, c2, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class GraphReadout:
+    """图级读出：把 ``N x F`` 的节点特征聚成一个 ``F`` 维向量。
+
+    ``mode='mean'`` / ``'sum'`` / ``'max'``。反向按模式分发梯度
+    （max 只回传给取到最大值的位置）。
+    """
+
+    def __init__(self, mode: str = 'mean'):
+        if mode not in ('mean', 'sum', 'max'):
+            raise ValueError("GraphReadout: mode 只能是 'mean'/'sum'/'max'")
+        self.mode = mode
+        self._cache = None
+
+    def forward(self, X):
+        n = _g_check_x(X, 'GraphReadout.forward')
+        f = len(X[0])
+        if self.mode == 'sum':
+            out = [sum(X[i][k] for i in range(n)) for k in range(f)]
+            self._cache = (n, None)
+        elif self.mode == 'mean':
+            out = [sum(X[i][k] for i in range(n)) / n for k in range(f)]
+            self._cache = (n, None)
+        else:
+            out = []
+            arg = []
+            for k in range(f):
+                best = X[0][k]
+                pos = 0
+                for i in range(1, n):
+                    if X[i][k] > best:
+                        best = X[i][k]
+                        pos = i
+                out.append(best)
+                arg.append(pos)
+            self._cache = (n, arg)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('GraphReadout.backward: 需要先 forward')
+        n, arg = self._cache
+        f = len(dout)
+        if self.mode == 'sum':
+            return [[dout[k] for k in range(f)] for _ in range(n)]
+        if self.mode == 'mean':
+            return [[dout[k] / n for k in range(f)] for _ in range(n)]
+        dx = [[0.0] * f for _ in range(n)]
+        for k in range(f):
+            dx[arg[k]][k] += dout[k]
+        return dx
+
+    def zero_grad(self):
+        pass
+
+    def param_count(self) -> int:
+        return 0
+
+    def sgd_step(self, lr: float):
+        pass
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        pass
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
