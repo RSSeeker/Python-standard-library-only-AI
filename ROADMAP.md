@@ -280,7 +280,12 @@
       - `trades_regularizer` / `mart_regularizer` / `smart_regularizer`：都是「干净 logits + 对抗 logits」的批级函数，手算 KL 与 `(1−p_max)` 加权逐项核对；SMART 只实现输出项（诚实标注）；
       - `Model.fit(adv_eps=, adv_steps=, adv_alpha=)`：每 batch 先用当前权重攻击再训练；`adv_eps=0`（默认）时权重与 loss 曲线**逐位不变**；与 `mixup_alpha` 互斥并报错；
       - 探针 `probe_w10c.py` 全绿，`TestAdversarialTraining` 12 例，全库 1153 passed。
-- [ ] 噪声注入（权重/梯度/输入）、课程学习 `CurriculumSampler`、Manifold Mixup、Snapshot Ensembles
+- [x] 噪声注入（权重/梯度/输入）、课程学习 `CurriculumSampler`、Manifold Mixup、Snapshot Ensembles
+      - `inject_weight_noise` / `add_gradient_noise` / `input_noise`：`sigma=0` 数值不变；200 次加噪实测均值 0.0002、方差 0.0101（`sigma=0.1`）；同种子可复现；
+      - `curriculum_fraction`（linear / exp / step）+ `CurriculumSampler`：按 `difficulty` 排序，第 1 轮只给最简单 `min_fraction`（默认 0.1）比例，末轮全量；`set_epoch` + 同种子可复现；
+      - `manifold_mixup(fa, fb, lam)`：嵌套结构校验 + 端点/中点闭式核对；
+      - `SnapshotEnsemble` + `SnapshotCallback(every=)`：单快照预测与普通前向逐位相同，`predict` 结束后权重恢复（无副作用）；
+      - 探针 `probe_w10d.py` 全绿，`TestNoiseCurriculumEnsemble` 10 例，全库 1163 passed。
 - [ ] 半监督：VAT、伪标签、FixMatch、MixMatch、MeanTeacher、一致性正则
 - [ ] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）
 

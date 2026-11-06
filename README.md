@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1153 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1163 项）
 
 ## 特性
 
@@ -245,6 +245,29 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 诚实边界：TRADES 的攻击目标应当是最大化 KL，而 `pgd_examples` 用的是任务损失
 （PGD-AT 的写法），两者不等价；SMART 只实现输出项；FreeLB 只做扰动累积。
+
+### 训练正则与集成（W10-D）
+
+| 函数 / 类 | 说明 |
+|---|---|
+| `inject_weight_noise(model, sigma=0.01, seed=None)` | 给权重与偏置**原地**加 `N(0, sigma²)`；`sigma=0` 时不动任何数值 |
+| `add_gradient_noise(grads, sigma=0.01, seed=None)` | 返回加噪后的梯度（不改入参），用于探索平坦极小值 |
+| `input_noise(x, sigma=0.01, seed=None)` | 返回加噪后的输入 |
+| `curriculum_fraction(epoch, total_epochs=10, schedule='linear')` | 课程学习进度：`linear` / `exp`（后期放开）/ `step`（四档） |
+| `CurriculumSampler(difficulty, total_epochs=10, schedule='linear', shuffle=True, seed=None, min_fraction=0.1)` | 按 `difficulty`（越小越简单）从易到难放量，`set_epoch(e)` 后迭代只给最简单的 `fraction` 比例 |
+| `manifold_mixup(fa, fb, lam)` | 隐空间 mixup：两组特征按 `lam` 线性插值（支持嵌套 list，结构不一致报错） |
+| `SnapshotEnsemble(model)` | `capture()` 存一份权重的深拷贝；`predict(x)` 对每份快照各前向一次取平均（结束后恢复原权重） |
+| `SnapshotCallback(every=10)` | 每 `every` 轮自动 `capture()` 进一个 `SnapshotEnsemble` |
+
+课程学习与 `Dataset` 无关，直接产出下标，和现有 `fit(data=...)` 配合方式如下：
+
+```python
+sampler = CurriculumSampler(difficulty, total_epochs=20)
+for epoch in range(1, 21):
+    sampler.set_epoch(epoch)
+    subset = [data[i] for i in sampler]
+    model.fit(data=subset, epochs=1, verbose=False)
+```
 
 ### 训练 / 推理模式
 
@@ -1180,7 +1203,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1153 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1163 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1338,6 +1361,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDropoutVariants` | `p=0`/`eval()` 恒等、SpatialDropout1d 整条时间轴共用掩码、SpatialDropout2d 整通道丢弃、AlphaDropout 的 `a·x+b` 闭式与「均值 0 方差 1」、GaussianDropout 的 `E=1`/`Var=p/(1-p)` 与同种子复现、R-Drop 同分布为 0/对称/alpha 线性、11 类非法输入、未 forward 就 backward 报错 |
 | `TestStructuredRegularization` | DropBlock2d 的丢弃比例与连块性、缩放保期望、反向用掩码；DropConnect 的 `eval()` 逐位退化、`grad_w` 掩码与 `next_delta` 有限差分、能进 `MLP` 训练 |
 | `TestAdversarialTraining` | FGSM 闭式解、L∞ 球与取值裁剪、单步 PGD = FGSM、对抗样本抬高损失、TRADES/MART 的手算 KL、`adv_eps=0` 逐位不变、对抗训练能降 loss、4 类非法超参 |
+| `TestNoiseCurriculumEnsemble` | 权重/梯度/输入噪声的零均值零方差与可复现、`curriculum_fraction` 三种 schedule、采样器「只取最简比例」且同种子可复现、manifold mixup 端点与中点、快照集成的单快照=普通前向与无副作用、13 类非法参数 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1391,7 +1415,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1153 个单元测试
+├── test_ai.py       # 1163 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

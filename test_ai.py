@@ -18718,3 +18718,147 @@ class TestAdversarialTraining:
         with pytest.raises(ValueError):
             self._model().fit(data=data, epochs=1, batch_size=2, verbose=False,
                               adv_eps=0.1, mixup_alpha=0.2)
+
+
+# ============================================================================
+#  W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+# ============================================================================
+
+class TestNoiseCurriculumEnsemble:
+    """训练期正则与集成工具。"""
+
+    @staticmethod
+    def _model(sizes=(2, 3, 2), seed=1):
+        random.seed(seed)
+        net = AI.MLP(list(sizes), activations=["relu"] * (len(sizes) - 2) + ["linear"])
+        return AI.Model(net, loss_fn="mse", task="regression", optimizer="adam", lr=0.01)
+
+    def test_inject_weight_noise(self):
+        random.seed(1)
+        model = self._model()
+        before = [row[:] for row in model.model.layers[0].weights]
+        AI.inject_weight_noise(model, 0.0)
+        assert model.model.layers[0].weights == before
+        AI.inject_weight_noise(model, 0.05, seed=7)
+        assert model.model.layers[0].weights != before
+
+    def test_inject_weight_noise_reproducible(self):
+        random.seed(3)
+        a = self._model()
+        random.seed(3)
+        b = self._model()
+        AI.inject_weight_noise(a, 0.1, seed=42)
+        AI.inject_weight_noise(b, 0.1, seed=42)
+        assert a.model.layers[0].weights == b.model.layers[0].weights
+
+    def test_noise_statistics(self):
+        """200 次加噪后，权重扰动应近似零均值、方差 ≈ sigma²。"""
+        random.seed(2)
+        model = self._model()
+        vals = []
+        for _ in range(200):
+            for row in model.model.layers[0].weights:
+                for j in range(len(row)):
+                    row[j] = 0.0
+            AI.inject_weight_noise(model, 0.1)
+            vals.extend(model.model.layers[0].weights[0])
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        assert abs(mean) < 0.05
+        assert abs(var - 0.01) < 0.005
+
+    def test_gradient_and_input_noise(self):
+        grads = [([[1.0, 2.0], [3.0, 4.0]], [0.5, -0.5])]
+        assert AI.add_gradient_noise(grads, 0.0) == grads
+        assert grads[0][0][0][0] == 1.0          # 入参未被改动
+        assert AI.add_gradient_noise(grads, 0.1, seed=5) != grads
+        x = [1.0, -1.0]
+        y = AI.input_noise(x, 0.0)
+        assert y == x and y is not x
+        assert AI.input_noise(x, 0.1, seed=1) != x
+        assert x == [1.0, -1.0]
+
+    def test_curriculum_fraction(self):
+        assert abs(AI.curriculum_fraction(5, 10, "linear") - 0.5) < 1e-15
+        assert AI.curriculum_fraction(20, 10, "linear") == 1.0
+        assert abs(AI.curriculum_fraction(10, 10, "exp") - 1.0) < 1e-15
+        assert AI.curriculum_fraction(1, 10, "exp") < 0.01
+        assert abs(AI.curriculum_fraction(1, 8, "step") - 0.25) < 1e-15
+        assert AI.curriculum_fraction(8, 8, "step") == 1.0
+
+    def test_curriculum_sampler(self):
+        diff = [float(i) for i in range(10)]
+        s = AI.CurriculumSampler(diff, total_epochs=10, shuffle=False)
+        s.set_epoch(1)
+        assert list(s) == [0]
+        s.set_epoch(10)
+        assert set(s) == set(range(10))
+        s2 = AI.CurriculumSampler(diff, total_epochs=10, shuffle=True, seed=3)
+        s2.set_epoch(5)
+        first = list(s2)
+        s2.set_epoch(5)
+        assert first == list(s2)
+        assert set(first) == set(range(5))   # 只取最简单的 5 个
+
+    def test_manifold_mixup(self):
+        fa = [[1.0, 2.0], [3.0, 4.0]]
+        fb = [[5.0, 6.0], [7.0, 8.0]]
+        assert AI.manifold_mixup(fa, fb, 1.0) == fa
+        assert AI.manifold_mixup(fa, fb, 0.0) == fb
+        assert AI.manifold_mixup(fa, fb, 0.5) == [[3.0, 4.0], [5.0, 6.0]]
+        assert AI.manifold_mixup([1.0, 2.0], [3.0, 4.0], 0.25) == [2.5, 3.5]
+        assert fa == [[1.0, 2.0], [3.0, 4.0]]
+
+    def test_snapshot_ensemble(self):
+        random.seed(9)
+        model = self._model()
+        ens = AI.SnapshotEnsemble(model)
+        with pytest.raises(ValueError):
+            ens.predict([0.1, 0.2])
+        ens.capture()
+        base = model.forward([0.1, 0.2])
+        got = ens.predict([0.1, 0.2])
+        for a, b in zip(got, base):
+            assert abs(a - b) < 1e-15
+        # 改权重 → 两张快照的平均；predict 结束后权重要恢复
+        for row in model.model.layers[0].weights:
+            for j in range(len(row)):
+                row[j] *= 0.5
+        ens.capture()
+        changed = model.forward([0.1, 0.2])
+        ens.predict([0.1, 0.2])
+        assert model.forward([0.1, 0.2]) == changed
+
+    def test_snapshot_callback(self):
+        random.seed(11)
+        model = self._model()
+        cb = AI.SnapshotCallback(every=2)
+        data = [([0.1 * i, -0.2 * i], [1.0, 0.0]) for i in range(6)]
+        model.fit(data=data, epochs=6, batch_size=3, verbose=False, callbacks=[cb])
+        assert len(cb.ensemble) == 3
+        assert len(cb.ensemble.predict([0.1, -0.2])) == 2
+
+    def test_validation(self):
+        model = self._model()
+        with pytest.raises(ValueError):
+            AI.inject_weight_noise(model, -1.0)
+        with pytest.raises(ValueError):
+            AI.add_gradient_noise([([[1.0]], [1.0])], -1.0)
+        with pytest.raises(ValueError):
+            AI.add_gradient_noise([])
+        with pytest.raises(ValueError):
+            AI.input_noise([])
+        with pytest.raises(ValueError):
+            AI.curriculum_fraction(0)
+        with pytest.raises(ValueError):
+            AI.curriculum_fraction(1, 10, "nope")
+        with pytest.raises(ValueError):
+            AI.CurriculumSampler([])
+        with pytest.raises(ValueError):
+            AI.CurriculumSampler([1.0], min_fraction=0.0)
+        with pytest.raises(ValueError):
+            AI.manifold_mixup([1.0], [2.0], 1.5)
+        with pytest.raises(ValueError):
+            AI.manifold_mixup([[1.0]], [2.0], 0.5)
+        with pytest.raises(TypeError):
+            AI.SnapshotCallback("3")

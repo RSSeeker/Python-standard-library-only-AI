@@ -26577,6 +26577,260 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
 
 
 # ============================================================================
+#  W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+# ============================================================================
+
+def _noise_check(sigma, who):
+    """校验噪声强度"""
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)) \
+            or sigma != sigma or sigma < 0 or sigma == float("inf"):
+        raise ValueError(f"{who}: sigma 必须是非负有限实数，收到 {sigma!r}")
+
+
+def _noise_layers(model):
+    """内部工具：取出有 weights 的层（Flatten 之类没有）"""
+    return [l for l in getattr(model, "model", model).layers if hasattr(l, "weights")]
+
+
+def inject_weight_noise(model, sigma=0.01, seed=None):
+    """给权重与偏置**原地**加高斯噪声 ``N(0, sigma²)``（返回 ``model`` 便于链式）
+
+    每次调用都会重新抽噪声；``sigma=0`` 时不动任何数值（与不加等价）。
+    这是正则化手段（等价于权重空间的随机扰动），训练中途调用即可。
+    """
+    _noise_check(sigma, "inject_weight_noise")
+    if sigma == 0.0:
+        return model
+    rng = random.Random(seed) if seed is not None else random
+    for layer in _noise_layers(model):
+        for j in range(layer.fan_out):
+            wj = layer.weights[j]
+            for k in range(len(wj)):
+                wj[k] += rng.gauss(0.0, sigma)
+            layer.biases[j] += rng.gauss(0.0, sigma)
+    return model
+
+
+def add_gradient_noise(grads, sigma=0.01, seed=None):
+    """**返回**加噪后的梯度列表（不改动入参）；``grads`` 是 ``[(grad_w, grad_b), ...]``
+
+    与权重噪声不同，梯度噪声不改变参数分布，常用于探索平坦极小值。
+    """
+    _noise_check(sigma, "add_gradient_noise")
+    if not isinstance(grads, (list, tuple)) or not grads:
+        raise ValueError("add_gradient_noise: grads 必须是非空列表")
+    rng = random.Random(seed) if seed is not None else random
+    out = []
+    for gw, gb in grads:
+        new_w = [[v + rng.gauss(0.0, sigma) for v in row] for row in gw]
+        new_b = [v + rng.gauss(0.0, sigma) for v in gb]
+        out.append((new_w, new_b))
+    return out
+
+
+def input_noise(x, sigma=0.01, seed=None):
+    """**返回**加噪后的输入（不改动入参）"""
+    _noise_check(sigma, "input_noise")
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("input_noise: x 必须是非空列表")
+    rng = random.Random(seed) if seed is not None else random
+    return [v + rng.gauss(0.0, sigma) for v in x]
+
+
+def curriculum_fraction(epoch: int, total_epochs: int = 10, schedule: str = "linear"):
+    """课程学习的「进度比例」：第 ``epoch`` 轮（从 1 起）用多大比例的**最简单**样本
+
+    - ``linear``: ``min(1, epoch/total_epochs)``
+    - ``exp``:    ``min(1, 2 ** (epoch - total_epochs))``（后期才放开）
+    - ``step``:   每 ``max(1, total_epochs // 4)`` 轮跳一档（0.25/0.5/0.75/1.0）
+    """
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise ValueError(f"curriculum_fraction: epoch 必须是 >=1 的整数，收到 {epoch!r}")
+    if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) or total_epochs < 1:
+        raise ValueError(
+            f"curriculum_fraction: total_epochs 必须是 >=1 的整数，收到 {total_epochs!r}"
+        )
+    if schedule not in ("linear", "exp", "step"):
+        raise ValueError(
+            f"curriculum_fraction: schedule 只能是 'linear'/'exp'/'step'，收到 {schedule!r}"
+        )
+    if schedule == "linear":
+        frac = epoch / total_epochs
+    elif schedule == "exp":
+        frac = 2.0 ** (epoch - total_epochs)
+    else:
+        step = max(1, total_epochs // 4)
+        frac = (epoch + step - 1) // step / 4.0
+    if frac > 1.0:
+        return 1.0
+    if frac < 0.0:
+        return 0.0
+    return frac
+
+
+class CurriculumSampler:
+    """按难度从易到难放量的索引采样器
+
+    ``difficulty`` 是与数据集等长的分数列表（越小越简单；可用 loss、序列长度等）。
+    每个 epoch 调 ``set_epoch(e)``，迭代时只取**最简单的**
+    ``curriculum_fraction(e, total_epochs, schedule)`` 比例，返回它们的下标
+    （默认再打乱，保证同难度的样本顺序不固定）。
+
+    用法::
+
+        sampler = CurriculumSampler(difficulty, total_epochs=20)
+        for epoch in range(1, 21):
+            sampler.set_epoch(epoch)
+            for i in sampler:
+                ...
+    """
+
+    def __init__(self, difficulty, total_epochs=10, schedule="linear",
+                 shuffle=True, seed=None, min_fraction=0.1):
+        if not isinstance(difficulty, (list, tuple)) or not difficulty:
+            raise ValueError("CurriculumSampler: difficulty 必须是非空列表")
+        vals = []
+        for v in difficulty:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+                raise ValueError(
+                    f"CurriculumSampler: difficulty 里必须都是数字，收到 {v!r}"
+                )
+            vals.append(float(v))
+        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) \
+                or total_epochs < 1:
+            raise ValueError("CurriculumSampler: total_epochs 必须是 >=1 的整数")
+        if isinstance(min_fraction, bool) or not isinstance(min_fraction, (int, float)) \
+                or not (0.0 < min_fraction <= 1.0):
+            raise ValueError("CurriculumSampler: min_fraction 必须在 (0, 1] 内")
+        if schedule not in ("linear", "exp", "step"):
+            raise ValueError(
+                f"CurriculumSampler: schedule 只能是 'linear'/'exp'/'step'，收到 {schedule!r}"
+            )
+        self.difficulty = vals
+        self.total_epochs = total_epochs
+        self.schedule = schedule
+        self.shuffle = shuffle
+        self.min_fraction = float(min_fraction)
+        self.seed = seed
+        self.epoch = 1
+        # 稳定排序：同分数保持原始下标顺序，便于复现
+        self._order = sorted(range(len(vals)), key=lambda i: (vals[i], i))
+
+    def set_epoch(self, epoch: int):
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise ValueError(f"CurriculumSampler.set_epoch: epoch 必须是 >=1 的整数，收到 {epoch!r}")
+        self.epoch = epoch
+        return self
+
+    def fraction(self):
+        frac = curriculum_fraction(self.epoch, self.total_epochs, self.schedule)
+        return max(self.min_fraction, frac)
+
+    def __len__(self):
+        n = int(round(len(self._order) * self.fraction()))
+        return max(1, min(len(self._order), n))
+
+    def __iter__(self):
+        k = len(self)
+        idx = list(self._order[:k])
+        if self.shuffle:
+            rng = random.Random(None if self.seed is None else self.seed * 100003 + self.epoch)
+            rng.shuffle(idx)
+        return iter(idx)
+
+
+def manifold_mixup(fa, fb, lam):
+    """隐空间 mixup：把两组特征按 ``lam`` 线性插值（支持任意嵌套 list）
+
+    ``fa``/``fb`` 形状必须一致（会逐层校验），返回新列表，不改动入参。
+    ``lam`` 通常是 ``Beta(alpha, alpha)`` 的样本，与输入空间 mixup 相同。
+    """
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)) or lam != lam \
+            or not (0.0 <= lam <= 1.0):
+        raise ValueError(f"manifold_mixup: lam 必须在 [0, 1] 内，收到 {lam!r}")
+
+    def _mix(a, b):
+        if isinstance(a, list) or isinstance(b, list):
+            if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
+                raise ValueError("manifold_mixup: 两组特征结构不一致")
+            return [_mix(p, q) for p, q in zip(a, b)]
+        return lam * a + (1.0 - lam) * b
+
+    if not isinstance(fa, (list, tuple)) or not isinstance(fb, (list, tuple)):
+        raise ValueError("manifold_mixup: 输入必须是 list（特征向量或嵌套特征图）")
+    return _mix(list(fa), list(fb))
+
+
+class SnapshotEnsemble:
+    """快照集成：把训练过程中若干时刻的权重存下来，预测时对输出取平均
+
+    与 ``SnapshotCallback`` 配合使用（周期性快照），也可以手动 ``capture()``。
+    预测时会把每份权重复写进模板模型、前向一次、最后恢复原权重。
+    """
+
+    def __init__(self, model):
+        self.model = getattr(model, "model", model)
+        self.snapshots = []
+
+    def capture(self):
+        """把当前权重/偏置深拷贝进快照列表"""
+        snap = []
+        for layer in _noise_layers(self.model):
+            snap.append((_w9_copy(layer.weights), _w9_copy(layer.biases)))
+        self.snapshots.append(snap)
+        return self
+
+    def __len__(self):
+        return len(self.snapshots)
+
+    def predict(self, x):
+        """对每份快照各前向一次，返回逐元素平均输出"""
+        if not self.snapshots:
+            raise ValueError("SnapshotEnsemble.predict: 还没有任何快照（先 capture()）")
+        layers = _noise_layers(self.model)
+        backup = [(_w9_copy(l.weights), list(l.biases)) for l in layers]
+
+        def _load(layer, w, b):
+            for j in range(len(layer.weights)):
+                layer.weights[j][:] = w[j]
+            layer.biases[:] = b
+
+        try:
+            total = None
+            for snap in self.snapshots:
+                for layer, (w, b) in zip(layers, snap):
+                    _load(layer, w, b)
+                out = self.model.forward(list(x))
+                if total is None:
+                    total = [float(v) for v in out]
+                else:
+                    for i, v in enumerate(out):
+                        total[i] += v
+            n = float(len(self.snapshots))
+            return [v / n for v in total]
+        finally:
+            for layer, (w, b) in zip(layers, backup):
+                _load(layer, w, b)
+
+
+class SnapshotCallback(Callback):
+    """每 ``every`` 轮把权重快照进一个 `SnapshotEnsemble`（``every<=0`` 关闭）"""
+
+    def __init__(self, every=10):
+        if isinstance(every, bool) or not isinstance(every, int):
+            raise TypeError(f"SnapshotCallback: every 必须是整数，收到 {type(every).__name__}")
+        self.every = every
+        self.ensemble = None
+
+    def on_train_begin(self, model, info):
+        self.ensemble = SnapshotEnsemble(getattr(model, "model", model))
+
+    def on_epoch_end(self, epoch, logs):
+        if self.every > 0 and epoch % self.every == 0:
+            self.ensemble.capture()
+
+
+# ============================================================================
 #  W10-C：对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
 # ============================================================================
 
