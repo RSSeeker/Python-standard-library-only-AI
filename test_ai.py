@@ -9618,3 +9618,126 @@ class TestFiLM:
         f = AI.FiLM(4)
         with pytest.raises(ValueError):
             f.forward([1.0])
+
+
+class TestConvTranspose1d:
+    def test_shape_and_forward(self):
+        ct = AI.ConvTranspose1d(2, 3, 3, stride=2, padding=1)
+        assert len(ct.forward([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]])) == 3
+        assert len(ct.forward([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]])[0]) == 5
+        gt = AI.ConvTranspose1d(2, 2, 2, stride=2)
+        gt.weights[0][0][0] = 1.0
+        gt.weights[0][0][1] = 0.0
+        gt.weights[0][1][0] = 0.0
+        gt.weights[0][1][1] = 0.0
+        gt.biases[0] = 0.0
+        out = gt.forward([[3.0], [9.0]])
+        assert out[0] == [3.0, 0.0]
+
+    def test_backward_matches_finite_difference(self):
+        random.seed(71)
+        ct = AI.ConvTranspose1d(2, 2, 3, stride=2, padding=1)
+        x = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(2)]
+        dout = [[random.uniform(-1, 1) for _ in range(5)] for _ in range(2)]
+        base = [row[:] for row in x]
+
+        def loss(xx):
+            o = ct.forward(xx)
+            return sum(o[c][i] * dout[c][i] for c in range(2) for i in range(5))
+
+        ct.zero_grad()
+        ct.forward([row[:] for row in base])
+        dx = ct.backward(dout)
+        eps = 1e-6
+        for c in range(2):
+            for i in range(3):
+                old = base[c][i]
+                base[c][i] = old + eps
+                vp = loss([row[:] for row in base])
+                base[c][i] = old - eps
+                vm = loss([row[:] for row in base])
+                base[c][i] = old
+                assert abs((vp - vm) / (2 * eps) - dx[c][i]) < 1e-8
+        ct.zero_grad()
+        ct.forward([row[:] for row in base])
+        ct.backward(dout)
+        for oc in range(2):
+            for ic in range(2):
+                for k in range(3):
+                    old = ct.weights[oc][ic][k]
+                    ct.weights[oc][ic][k] = old + eps
+                    vp = loss([row[:] for row in base])
+                    ct.weights[oc][ic][k] = old - eps
+                    vm = loss([row[:] for row in base])
+                    ct.weights[oc][ic][k] = old
+                    assert abs((vp - vm) / (2 * eps) - ct.grad_w[oc][ic][k]) < 1e-8
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.ConvTranspose1d(2, 2, 3, stride=2, output_padding=2)
+        with pytest.raises(ValueError):
+            AI.ConvTranspose1d(0, 2, 3)
+        ct = AI.ConvTranspose1d(2, 2, 3)
+        with pytest.raises(RuntimeError):
+            ct.backward([[1.0]])
+
+
+class TestPool1d:
+    def test_max_and_avg_values(self):
+        mp = AI.MaxPool1d(2)
+        assert mp.forward([[1.0, 3.0, 2.0, 5.0]]) == [[3.0, 5.0]]
+        # floor 语义：长度 3 只出一个窗口，尾部被丢弃
+        assert mp.forward([[1.0, 3.0, 2.0]]) == [[3.0]]
+        ap = AI.AvgPool1d(2)
+        assert ap.forward([[1.0, 3.0, 2.0, 5.0]]) == [[2.0, 3.5]]
+
+    def test_backward_routing(self):
+        mp = AI.MaxPool1d(2)
+        mp.forward([[1.0, 3.0, 2.0, 5.0]])
+        assert mp.backward([[1.0, 2.0]]) == [[0.0, 1.0, 0.0, 2.0]]
+        ap = AI.AvgPool1d(2)
+        ap.forward([[1.0, 3.0, 2.0, 5.0]])
+        assert ap.backward([[2.0, 4.0]]) == [[1.0, 1.0, 2.0, 2.0]]
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.MaxPool1d(0)
+        with pytest.raises(ValueError):
+            AI.AvgPool1d(2, stride=0)
+        with pytest.raises(RuntimeError):
+            AI.MaxPool1d(2).backward([[1.0]])
+
+
+class TestPool3d:
+    def test_shapes_and_values(self):
+        x = [[[[float(d + h + w) for w in range(4)] for h in range(4)] for d in range(4)]]
+        mp = AI.MaxPool3d(2)
+        out = mp.forward(x)
+        assert (len(out), len(out[0]), len(out[0][0]), len(out[0][0][0])) == (1, 2, 2, 2)
+        window = [x[0][d][h][w] for d in range(2) for h in range(2) for w in range(2)]
+        assert out[0][0][0][0] == max(window)
+        ap = AI.AvgPool3d(2)
+        out2 = ap.forward(x)
+        assert abs(out2[0][0][0][0] - sum(window) / 8.0) < 1e-12
+
+    def test_backward_totals(self):
+        x = [[[[float(d + h + w) for w in range(4)] for h in range(4)] for d in range(4)]]
+        dout = [[[[1.0] * 2 for _ in range(2)] for _ in range(2)]]
+        mp = AI.MaxPool3d(2)
+        mp.forward(x)
+        dx = mp.backward(dout)
+        total = sum(v for ch in dx for d in ch for h in d for v in h)
+        assert abs(total - 8.0) < 1e-12
+        ap = AI.AvgPool3d(2)
+        ap.forward(x)
+        dx2 = ap.backward(dout)
+        total2 = sum(v for ch in dx2 for d in ch for h in d for v in h)
+        assert abs(total2 - 8.0) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.MaxPool3d(0)
+        with pytest.raises(ValueError):
+            AI.AvgPool3d(2).forward([])
+        with pytest.raises(RuntimeError):
+            AI.MaxPool3d(2).backward([[[[1.0]]]])

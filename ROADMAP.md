@@ -128,11 +128,13 @@
 - [x] `ECABlock`（W2-B：GAP 后一条奇数宽 1D 卷积跨通道混权重，只多 `kernel_size` 个参数；dx/`grad_w` 中心差分 ≤1e-8）
 - [ ] `CBAMBlock`（通道注意力 + 7×7 空间注意力，比 ECA 多个空间分支）
 - [ ] `ConvNeXtBlock`（7×7 depthwise + LayerNorm + 1×1 升/降维）
-- [ ] 卷积家族：`Conv3d`、`ConvTranspose1d`、`ConvTranspose3d`
+- [x] `ConvTranspose1d`（W2-D）：`(Cin,L) -> (Cout,(L-1)*s-2p+k+op)`，前向把每个输入点按 stride 摆到输出网格累加，`dx` 与 `grad_w` 中心差分 ≤1e-8
+- [ ] `Conv3d` / `ConvTranspose3d`（三维卷积与转置，形状推导同上但多一维）
 - [x] 池化家族（部分，W2-A 提交）：`GlobalMaxPool2d`（只回传最大值位置）、`AdaptiveMaxPool2d`（分箱与
       `AdaptiveAvgPool2d` 一致，`(1,1)` 与全局最大逐位相同）、`LPPool2d`（`p=1` 在非负输入上等于
       `AvgPool2d`，随 p 增大单调逼近 `MaxPool2d`，梯度差分 ≤1e-9）
-- [ ] 池化家族（剩余）：`MaxPool1d/3d`、`AvgPool1d/3d`、`FractionalMaxPool2d`、`StochasticPool2d`
+- [x] 池化家族（1D / 3D，W2-D）：`MaxPool1d` / `AvgPool1d` / `MaxPool3d` / `AvgPool3d`（floor 语义丢弃尾窗、最大池化只回传最大值位置、平均池化均分、padding 不接收梯度）
+- [ ] 池化家族（2D 特殊）：`FractionalMaxPool2d`、`StochasticPool2d`
 - [x] `AdaIN`（W2-C：按通道实例归一化后乘风格向量，`set_style()`；`d_gamma`/`d_beta`/`dx` 中心差分 ≤1e-6，单向量输入 mean=x ⇒ `dx=0`）
 - [x] `FiLM`（W2-C：`y = gamma ⊙ x + beta`，`groups>1` 时特征分段共享调制参数）
 - [ ] `ConditionalNorm`（条件归一化：把条件向量投影成 gamma/beta 的完整模块，AdaIN/FiLM 已提供其数学核）

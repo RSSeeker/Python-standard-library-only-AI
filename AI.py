@@ -2222,6 +2222,388 @@ class FiLM:
             d_gamma[g_i] += dout[i] * self._x[i]
             d_beta[g_i] += dout[i]
         return dx, d_gamma, d_beta
+class ConvTranspose1d:
+    """1D 转置卷积：输入 (Cin, L) -> (Cout, Lo)，`Lo = (L-1)*s - 2p + k + output_padding`
+
+    前向就是「把每个输入点乘上整条核、按 stride 摆到输出网格上累加」；反向对应
+    `dx` 与 `grad_w` 两次同样的累加。权重 `[out][in][k]`（转置卷积不做 groups）。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, output_padding=0):
+        for n, v, lo in (("in_channels", in_channels, 1), ("out_channels", out_channels, 1),
+                         ("kernel_size", kernel_size, 1), ("stride", stride, 1),
+                         ("padding", padding, 0), ("output_padding", output_padding, 0)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"ConvTranspose1d: {n} 必须是 >= {lo} 的整数，收到 {v!r}")
+        if output_padding >= stride:
+            raise ValueError(
+                f"ConvTranspose1d: output_padding={output_padding} 必须 < stride={stride}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.k = kernel_size
+        self.s = stride
+        self.p = padding
+        self.op = output_padding
+        fan_in = in_channels * self.k
+        std = math.sqrt(2.0 / fan_in)
+        self.weights = [[[random.gauss(0, std) for _ in range(self.k)]
+                         for _ in range(in_channels)] for _ in range(out_channels)]
+        self.biases = [0.0] * out_channels
+        self.m_w = [[[0.0] * self.k for _ in range(in_channels)] for _ in range(out_channels)]
+        self.v_w = [[[0.0] * self.k for _ in range(in_channels)] for _ in range(out_channels)]
+        self.m_b = [0.0] * out_channels
+        self.v_b = [0.0] * out_channels
+        self.x = None
+        self.lo = 0
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_w = [[[0.0] * self.k for _ in range(self.in_channels)]
+                       for _ in range(self.out_channels)]
+        self.grad_b = [0.0] * self.out_channels
+
+    def _out_len(self, L):
+        lo = (L - 1) * self.s - 2 * self.p + self.k + self.op
+        if lo <= 0:
+            raise ValueError(
+                f"ConvTranspose1d: 输入长度 {L} 配 kernel {self.k}、stride {self.s}、"
+                f"padding {self.p}、output_padding {self.op} 得到输出长度 {lo}，必须 > 0")
+        return lo
+
+    def forward(self, x):
+        if not x or len(x) != self.in_channels:
+            raise ValueError(
+                f"ConvTranspose1d.forward: 输入通道 {len(x) if x else 0} "
+                f"!= in_channels={self.in_channels}")
+        L = len(x[0])
+        for c in range(len(x)):
+            if len(x[c]) != L:
+                raise ValueError("ConvTranspose1d.forward: 各通道长度必须一致")
+        lo = self._out_len(L)
+        self.x = x
+        self.lo = lo
+        out = [[self.biases[oc]] * lo for oc in range(self.out_channels)]
+        out = [list(row) for row in out]
+        for oc in range(self.out_channels):
+            w_oc = self.weights[oc]
+            for ic in range(self.in_channels):
+                w = w_oc[ic]
+                xc = x[ic]
+                for o in range(L):
+                    v = xc[o]
+                    if v == 0.0:
+                        continue
+                    base = o * self.s - self.p
+                    for k in range(self.k):
+                        idx = base + k
+                        if 0 <= idx < lo:
+                            out[oc][idx] += v * w[k]
+        return out
+
+    def backward(self, dout):
+        if self.x is None:
+            raise RuntimeError("ConvTranspose1d.backward: 请先调用 forward")
+        L = len(self.x[0])
+        lo = self.lo
+        dx = [[0.0] * L for _ in range(self.in_channels)]
+        for oc in range(self.out_channels):
+            d = dout[oc]
+            self.grad_b[oc] += sum(d)
+            w_oc = self.weights[oc]
+            gw_oc = self.grad_w[oc]
+            for ic in range(self.in_channels):
+                w = w_oc[ic]
+                gw = gw_oc[ic]
+                xc = self.x[ic]
+                dxi = dx[ic]
+                for o in range(L):
+                    base = o * self.s - self.p
+                    acc = 0.0
+                    for k in range(self.k):
+                        idx = base + k
+                        if 0 <= idx < lo:
+                            dv = d[idx]
+                            acc += dv * w[k]
+                            gw[k] += xc[o] * dv
+                    dxi[o] += acc
+        return dx
+
+
+class MaxPool1d:
+    """一维最大池化：`(C, L) -> (C, Lo)`，反向只回传每个窗口的最大值位置"""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        for n, v, lo in (("kernel_size", kernel_size, 1), ("padding", padding, 0)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"MaxPool1d: {n} 必须是 >= {lo} 的整数，收到 {v!r}")
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError(f"MaxPool1d: stride 必须是正整数，收到 {stride!r}")
+        if padding >= kernel_size:
+            raise ValueError(
+                f"MaxPool1d: padding={padding} 必须 < kernel_size={kernel_size}")
+        self.k = kernel_size
+        self.s = stride
+        self.p = padding
+        self._cache = None
+
+    def _out_len(self, L):
+        lo = (L + 2 * self.p - self.k) // self.s + 1
+        if lo <= 0:
+            raise ValueError(f"MaxPool1d: 输入长度 {L} 太小，输出长度 {lo}")
+        return lo
+
+    def forward(self, x):
+        if not x:
+            raise ValueError("MaxPool1d.forward: 输入不能为空")
+        L = len(x[0])
+        for c in range(len(x)):
+            if len(x[c]) != L:
+                raise ValueError("MaxPool1d.forward: 各通道长度必须一致")
+        lo = self._out_len(L)
+        out = []
+        idxs = []
+        for c in range(len(x)):
+            row = []
+            ridx = []
+            for o in range(lo):
+                base = o * self.s - self.p
+                best = None
+                best_i = -1
+                for k in range(self.k):
+                    i = base + k
+                    if 0 <= i < L:
+                        v = x[c][i]
+                        if best is None or v > best:
+                            best, best_i = v, i
+                row.append(best if best is not None else 0.0)
+                ridx.append(best_i)
+            out.append(row)
+            idxs.append(ridx)
+        self._cache = (len(x), L, idxs)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("MaxPool1d.backward: 必须先调用 forward")
+        C, L, idxs = self._cache
+        lo = len(dout[0])
+        dx = [[0.0] * L for _ in range(C)]
+        for c in range(C):
+            for o in range(lo):
+                i = idxs[c][o]
+                if 0 <= i < L:
+                    dx[c][i] += dout[c][o]
+        return dx
+
+
+class AvgPool1d:
+    """一维平均池化：`(C, L) -> (C, Lo)`，反向把梯度均分回窗口（含 padding 的零位不接收梯度）"""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        for n, v, lo in (("kernel_size", kernel_size, 1), ("padding", padding, 0)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"AvgPool1d: {n} 必须是 >= {lo} 的整数，收到 {v!r}")
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError(f"AvgPool1d: stride 必须是正整数，收到 {stride!r}")
+        if padding >= kernel_size:
+            raise ValueError(
+                f"AvgPool1d: padding={padding} 必须 < kernel_size={kernel_size}")
+        self.k = kernel_size
+        self.s = stride
+        self.p = padding
+        self._cache = None
+
+    def _out_len(self, L):
+        lo = (L + 2 * self.p - self.k) // self.s + 1
+        if lo <= 0:
+            raise ValueError(f"AvgPool1d: 输入长度 {L} 太小，输出长度 {lo}")
+        return lo
+
+    def forward(self, x):
+        if not x:
+            raise ValueError("AvgPool1d.forward: 输入不能为空")
+        L = len(x[0])
+        lo = self._out_len(L)
+        out = []
+        for c in range(len(x)):
+            row = []
+            for o in range(lo):
+                base = o * self.s - self.p
+                acc = 0.0
+                for k in range(self.k):
+                    i = base + k
+                    if 0 <= i < L:
+                        acc += x[c][i]
+                row.append(acc / self.k)
+            out.append(row)
+        self._cache = (len(x), L, lo)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("AvgPool1d.backward: 必须先调用 forward")
+        C, L, lo = self._cache
+        dx = [[0.0] * L for _ in range(C)]
+        inv = 1.0 / self.k
+        for c in range(C):
+            for o in range(lo):
+                base = o * self.s - self.p
+                for k in range(self.k):
+                    i = base + k
+                    if 0 <= i < L:
+                        dx[c][i] += dout[c][o] * inv
+        return dx
+
+
+class MaxPool3d:
+    """三维最大池化：`(C, D, H, W) -> (C, Do, Ho, Wo)`，反向只回传最大值位置"""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        for n, v, lo in (("kernel_size", kernel_size, 1), ("padding", padding, 0)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"MaxPool3d: {n} 必须是 >= {lo} 的整数，收到 {v!r}")
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError(f"MaxPool3d: stride 必须是正整数，收到 {stride!r}")
+        self.k = kernel_size
+        self.s = stride
+        self.p = padding
+        self._cache = None
+
+    def _out_len(self, n):
+        o = (n + 2 * self.p - self.k) // self.s + 1
+        if o <= 0:
+            raise ValueError(f"MaxPool3d: 输入尺寸 {n} 太小，输出 {o}")
+        return o
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("MaxPool3d.forward: 输入必须是 (C, D, H, W)")
+        C, D, H, W = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        Do, Ho, Wo = self._out_len(D), self._out_len(H), self._out_len(W)
+        out = [[[[0.0] * Wo for _ in range(Ho)] for _ in range(Do)] for _ in range(C)]
+        idxs = [[[[(-1, -1, -1)] * Wo for _ in range(Ho)] for _ in range(Do)] for _ in range(C)]
+        for c in range(C):
+            for od in range(Do):
+                for oh in range(Ho):
+                    for ow in range(Wo):
+                        best = None
+                        pos = (-1, -1, -1)
+                        for kd in range(self.k):
+                            d = od * self.s - self.p + kd
+                            if not (0 <= d < D):
+                                continue
+                            for kh in range(self.k):
+                                h = oh * self.s - self.p + kh
+                                if not (0 <= h < H):
+                                    continue
+                                for kw in range(self.k):
+                                    w = ow * self.s - self.p + kw
+                                    if not (0 <= w < W):
+                                        continue
+                                    v = x[c][d][h][w]
+                                    if best is None or v > best:
+                                        best, pos = v, (d, h, w)
+                        out[c][od][oh][ow] = best if best is not None else 0.0
+                        idxs[c][od][oh][ow] = pos
+        self._cache = (C, D, H, W, idxs)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("MaxPool3d.backward: 必须先调用 forward")
+        C, D, H, W, idxs = self._cache
+        dx = [[[[0.0] * W for _ in range(H)] for _ in range(D)] for _ in range(C)]
+        Do, Ho, Wo = len(dout[0]), len(dout[0][0]), len(dout[0][0][0])
+        for c in range(C):
+            for od in range(Do):
+                for oh in range(Ho):
+                    for ow in range(Wo):
+                        d, h, w = idxs[c][od][oh][ow]
+                        if d >= 0:
+                            dx[c][d][h][w] += dout[c][od][oh][ow]
+        return dx
+
+
+class AvgPool3d:
+    """三维平均池化：`(C, D, H, W) -> (C, Do, Ho, Wo)`，反向把梯度均分回窗口"""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        for n, v, lo in (("kernel_size", kernel_size, 1), ("padding", padding, 0)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"AvgPool3d: {n} 必须是 >= {lo} 的整数，收到 {v!r}")
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError(f"AvgPool3d: stride 必须是正整数，收到 {stride!r}")
+        self.k = kernel_size
+        self.s = stride
+        self.p = padding
+        self._cache = None
+
+    def _out_len(self, n):
+        o = (n + 2 * self.p - self.k) // self.s + 1
+        if o <= 0:
+            raise ValueError(f"AvgPool3d: 输入尺寸 {n} 太小，输出 {o}")
+        return o
+
+    def forward(self, x):
+        if not x or not x[0] or not x[0][0]:
+            raise ValueError("AvgPool3d.forward: 输入必须是 (C, D, H, W)")
+        C, D, H, W = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        Do, Ho, Wo = self._out_len(D), self._out_len(H), self._out_len(W)
+        out = [[[[0.0] * Wo for _ in range(Ho)] for _ in range(Do)] for _ in range(C)]
+        for c in range(C):
+            for od in range(Do):
+                for oh in range(Ho):
+                    for ow in range(Wo):
+                        acc = 0.0
+                        for kd in range(self.k):
+                            d = od * self.s - self.p + kd
+                            if not (0 <= d < D):
+                                continue
+                            for kh in range(self.k):
+                                h = oh * self.s - self.p + kh
+                                if not (0 <= h < H):
+                                    continue
+                                for kw in range(self.k):
+                                    w = ow * self.s - self.p + kw
+                                    if 0 <= w < W:
+                                        acc += x[c][d][h][w]
+                        out[c][od][oh][ow] = acc / (self.k ** 3)
+        self._cache = (C, D, H, W, Do, Ho, Wo)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("AvgPool3d.backward: 必须先调用 forward")
+        C, D, H, W, Do, Ho, Wo = self._cache
+        dx = [[[[0.0] * W for _ in range(H)] for _ in range(D)] for _ in range(C)]
+        inv = 1.0 / (self.k ** 3)
+        for c in range(C):
+            for od in range(Do):
+                for oh in range(Ho):
+                    for ow in range(Wo):
+                        g = dout[c][od][oh][ow] * inv
+                        for kd in range(self.k):
+                            d = od * self.s - self.p + kd
+                            if not (0 <= d < D):
+                                continue
+                            for kh in range(self.k):
+                                h = oh * self.s - self.p + kh
+                                if not (0 <= h < H):
+                                    continue
+                                for kw in range(self.k):
+                                    w = ow * self.s - self.p + kw
+                                    if 0 <= w < W:
+                                        dx[c][d][h][w] += g
+        return dx
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
