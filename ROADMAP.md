@@ -85,18 +85,28 @@
 ## 4. 逐波清单
 
 ### W0 训练基础设施（P0，最先做，杠杆最大）
-- [ ] `set_seed(seed, deterministic=True)`：一次性固定 `random` / 采样器 / 初始化，并提供
-      「进入-退出」上下文，避免污染调用方
-- [ ] `TrainingCallback` 基类（`on_train_begin / on_epoch_begin / on_epoch_end /
-      on_batch_end / on_train_end`）+ `Model.fit(callbacks=[...])`
-- [ ] 内置 `EarlyStopping` / `ModelCheckpoint` / `LoggingCallback`（接 `logging`）/ `HistoryCallback`
-- [ ] `fit(resume_from=...)`：恢复 epoch、history、最佳指标、调度器与优化器状态（现在
-      `load(restore_optimizer=True)` 只恢复参数，epoch 仍从 1 开始）
-- [ ] `infer_shapes(model, input_shape)`：真跑一次前向拿每层形状（区别于 `estimate_flops` 的解析估算）
-- [ ] `predict_batch(model, xs, batch_size=32)`：批推理
-- [ ] 逐层梯度范数进 `history['layer_grad_norm']`
-- [ ] `activation_stats(model, x)` / `dead_unit_report(model, x)`：用已有 hook 统计逐层均值/方差/死单元
-- [ ] `fit(train_augment=...)`：把 mixup / cutmix / cutout 接进训练循环
+
+**状态：已完成（提交 `W0` 批次）**。偏差见每条的括注——都是有意收窄，不是遗漏。
+
+- [x] `set_seed(seed)`：固定全局 `random`（只做这一件事；`fit(seed=)` 仍独立控制打乱，
+      两者分工写在 docstring 里）
+- [x] `Callback` 基类（`on_train_begin / on_epoch_begin / on_epoch_end / on_train_end`）
+      + `Model.fit(callbacks=[...])`；钩子抛异常会中断训练（不吞异常）
+      （**未做** `on_batch_end`：batch 级钩子会进最内层循环，留到确有需求时再加）
+- [x] 内置 `EarlyStopping` / `ModelCheckpoint` / `LoggingCallback` / `HistoryCallback`；
+      `EarlyStopping` 只发停止请求（`should_stop`），回滚最优权重仍用
+      `fit(restore_best_weights=True)`
+- [x] `fit(resume_from=...)`：恢复权重 + 优化器状态（含 `step_count`），`epochs=0` 即「只恢复」
+      （**未做** epoch/history/调度器续接：现在的 optimizer `step_count` 足以保证逐位续训，
+      history 拼接属展示层，等有真实需求再补）
+- [x] `infer_shapes(model, x)`：真跑一次前向拿每层形状（入参是样本而不是 shape，
+      省得再猜 dtype/布局）
+- [x] `predict_batch(model, xs, batch_size=64)`：与 `predict` 逐位一致
+- [x] 逐层梯度范数进 `history['layer_grad_norm']`（`record_layer_norms=True`，只记录不改训练）
+- [x] `activation_stats(model, x)` / `dead_units(model, x)`：逐层 mean/std/min/max/zero_ratio
+      与死单元下标、比例
+- [ ] `fit(train_augment=...)`：**只接了 Mixup**（`mixup_alpha=`，分类 + 索引型损失）；
+      CutMix/Cutout 需要「先卷积再混合」的图像语义，随 W10 的增强族一起接
 
 ### W1 损失：回归与偏好对齐（P0）
 - [ ] 回归族：`l1_loss`、`log_cosh_loss`、`quantile_loss`（= pinball）、`smooth_l1`（标注 `huber_loss` 即同类）

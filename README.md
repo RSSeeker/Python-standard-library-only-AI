@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（677 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（699 项）
 
 ## 特性
 
@@ -20,6 +20,9 @@
   这些损失都能通过 `Model(loss_fn='focal', loss_kwargs={...})` 直接用，配错输出层激活会在构造时报错
 - **LLM 全家桶**: `Seq2SeqLM`（encoder-decoder + teacher forcing）/ `MaskedLM`（BERT 式）、GQA/MQA、滑动窗口、ALiBi、SwiGLU、LoRA、Lion / Adafactor、以及 min-p / 重复·存在·频率惩罚 / 禁重复 n-gram 五种采样控制
 - **训练工程化**: 梯度累积、断点续训（含优化器与损失配置）、分层切分、K 折、`StandardScaler` / `MinMaxScaler`、配置驱动训练、超参搜索、逐层性能剖析、学习率扫描
+- **训练基础设施**: `set_seed` / `Callback` 回调（4 个钩子）/ `infer_shapes` /
+  `predict_batch` / `activation_stats` / `dead_units` / `resume_from` 续训 /
+  `record_layer_norms` 逐层梯度范数 / `fit(mixup_alpha=)`
 - **评估与诊断**: 14 个纯标准库指标（含混淆矩阵 / PRF / MCC / AUC / BLEU / ROUGE-L）、`grad_check` 梯度自检、`estimate_flops`、`ascii_plot`、注意力可视化
 - **更多模型**: 序列标注头与多标签头、`MoE` 专家混合、VAE / GAN / DDPM 三个生成模型
 - **分词器**: 字节级 BPE（任意 UTF-8 无损）与 WordPiece（`##` 子词 + 最长前缀匹配）
@@ -109,8 +112,12 @@ model2 = Model.load("model.json")
 | `checkpoint_path` / `checkpoint_every` | 每 `checkpoint_every` 轮把模型（含优化器状态）存到该路径，用于断点续训 |
 | `grad_accum` | 梯度累积步数（1 = 每个 batch 更新一次）；>1 时累加若干 batch 的平均梯度再更新，等效放大 batch 而不占额外内存 |
 | `seed` | 打乱数据的随机种子（None = 用全局 `random`，与旧版行为一致；传整数则改用局部 `Random`：同样的 `fit` 再跑一次结果完全相同，也不会推进调用方的全局随机状态） |
+| `callbacks` | 单个 `Callback` 或列表；四个钩子 `on_train_begin/on_epoch_begin/on_epoch_end/on_train_end`，钩子抛异常会直接中断训练 |
+| `resume_from` | 从 checkpoint JSON 恢复权重与优化器状态（`epochs=0` 即“只恢复不训练”）；层数或形状不符直接报错 |
+| `mixup_alpha` | >0 时对每个 batch 做 Mixup（Beta(α, α) 混合样本与软标签）；只支持分类任务 + 索引型损失，默认 0 关闭 |
+| `record_layer_norms` | 记录每层梯度范数到 `history['layer_grad_norm']`；只记录、不影响训练数值 |
 
-训练结束后 `model.history` 里有三个键：`train_loss`、`val_loss`、`grad_norm`
+训练结束后 `model.history` 里有三个键：`train_loss`、`val_loss`、`grad_norm`（`record_layer_norms=True` 时多一个 `layer_grad_norm`，每轮一个逐层列表）
 （每轮平均梯度范数，裁剪前；用来判断训练是否发散）。
 
 `val_data` 支持三种写法（会校验维度，维度不符直接报错）：
@@ -622,6 +629,16 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `evaluate_all(model, x, y)` | 按任务一次算完：回归 `mae/rmse/mape/r2`；分类 `accuracy/precision/recall/f1/confusion_matrix/mcc`，二分类加 `roc_auc`、多分类加 `top_k_accuracy`；`Model.evaluate_all(x, y)` 同名方法 |
 | `StandardScaler` / `MinMaxScaler` | 逐特征标准化 / 归一化（`fit`/`transform`/`inverse_transform`） |
 | `ascii_plot(history)` | 把训练曲线画成终端 ASCII 图 |
+| `set_seed(seed)` | 设定全局 `random` 种子；注意训练可复现还需要给 `fit(seed=)`（两者作用不同） |
+| `infer_shapes(model, x)` | 一次前向推断输入/输出形状、每层形状与激活名、参数量，并返回输出 |
+| `predict_batch(model, x, batch_size=64)` | 分块推理，结果与 `predict` 逐位一致（大输入避免一次性占内存） |
+| `activation_stats(model, x)` | 每层激活的 `mean/std/min/max/zero_ratio`，用于找塌陷的层 |
+| `dead_units(model, x, atol=1e-12)` | 每层恒为 0 的单元下标与比例（ReLU 死单元诊断） |
+| `Callback` | 训练回调基类，子类覆写需要的钩子即可 |
+| `EarlyStopping(monitor, patience, min_delta, mode)` | 监控指标连续 `patience` 轮不改善就请求停止（`should_stop` / `stopped_epoch`），不改权重 |
+| `ModelCheckpoint(path, every, monitor, save_best_only)` | 每 `every` 轮存一份（含优化器状态）；`save_best_only` 只存最优；产物可直接 `resume_from` |
+| `LoggingCallback(logger)` | 每轮指标写进标准库 `logging`（默认 logger `ai.train`） |
+| `HistoryCallback()` | 把每轮 logs 收进 `records`（画曲线 / 导出 CSV 用） |
 | `grad_check(module, x, y=None)` | 中心差分校验解析梯度（MLP / Model / CausalLM，以及 `Seq2SeqLM`（传 `(src, tgt)` 二元组））；解析与数值都 ≈0 的参数记进 `zeros` 不参与相对误差 |
 | `build_model(config, data=None)` | 按 dict（或 JSON 路径）建 `Model`：`hidden`/`activations`/`task`/`loss`/`loss_kwargs`/`optimizer`/`lr`；维度可写死也可从 `data` 推断，未知配置项直接报错 |
 | `train_from_config(config, data=..., x=..., y=...)` | 按配置建模型并训练，返回已训练好的 `Model`；`seed` 同时固定初始化与打乱，`lr_scheduler` 支持 step/exponential/cosine/warmup/plateau |
@@ -697,6 +714,49 @@ print(pair[0] == wp.cls_id, pair[-1] == wp.sep_id)
 
 与 BPE 的分工：BPE 字节级、**永不产生 `[UNK]`**，适合从零训练语言模型；
 WordPiece 有可读词表与特殊标记，适合接 BERT 式双向编码器与 `MaskedLM`。
+
+## 训练基础设施（W0）
+
+```python
+AI.set_seed(42)
+
+class Log(AI.Callback):
+    def on_epoch_end(self, epoch, logs):
+        print(epoch, round(logs["train_loss"], 4), round(logs["lr"], 6))
+
+model = make_classifier(2, 2, hidden_layers=(8,))
+model.fit(x, y, epochs=20, callbacks=[Log()], seed=42,
+          record_layer_norms=True, checkpoint_path="ck.json")
+
+# 只恢复、不继续训练
+resumed = make_classifier(2, 2, hidden_layers=(8,))
+resumed.fit(x, y, epochs=0, resume_from="ck.json")
+
+AI.infer_shapes(model, x[0])          # {'input_shape': [2], 'output_shape': [2], 'params': 42, ...}
+AI.predict_batch(model, x, batch_size=8)
+AI.activation_stats(model, x)          # 每层 mean/std/min/max/zero_ratio
+AI.dead_units(model, x)                # 恒为 0 的单元下标与比例
+```
+
+内置回调（也可自己继承 `Callback`）：
+
+```python
+cbs = [AI.EarlyStopping(patience=3),
+       AI.ModelCheckpoint("ck.json", every=2),
+       AI.LoggingCallback(),
+       AI.HistoryCallback()]
+model.fit(x, y, epochs=50, callbacks=cbs, seed=42)
+model.history["early_stop"]       # 不存在；停止信息在回调对象上
+cbs[0].should_stop, cbs[0].stopped_epoch
+cbs[3].records[-1]                 # 最后一轮的完整指标
+```
+
+四条约定：
+
+- `seed` 与 `set_seed` 分工不同：前者管 `fit` 内部的打乱与（配合初始化的）可复现，后者只设全局 `random`。
+- `record_layer_norms` 只记录，**不改变训练数值**（与不开启时 `train_loss` 完全相同）。
+- `resume_from` 恢复权重 + 优化器状态；`epochs=0` 就是“只恢复”，用于做推理或对比。
+- `mixup_alpha` 只支持分类任务与索引型损失（one-hot / 概率向量标签也行）；回归任务直接报错。
 
 ## 配置驱动训练
 
@@ -906,7 +966,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-677 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+699 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -996,6 +1056,13 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConv1d` | 形状与 stride、手算卷积、`groups` 等价、`grad_w`/`dx` vs 数值、非法参数 |
 | `TestQuickTrainSeed` | `quick_train(seed=)` 同 seed 权重与曲线完全相同、不同 seed 不同、不推进全局 RNG |
 | `TestFitSeed` | `fit(seed=)` 两次训练曲线/权重逐位相同、不同 seed 顺序不同、传 seed 不推进全局 RNG、`shuffle=False` 同样可复现、顶层 `train(seed=)` 可复现 |
+| `TestTrainingInfraSeed` | `set_seed` 同种子同序列、非整数报错、`fit(seed=)` 不推进全局 RNG |
+| `TestInferShapesAndBatch` | `infer_shapes` 的形状/参数/激活名与手算一致、`predict_batch` 与 `predict` 逐位一致、非法输入报错 |
+| `TestDiagnostics` | `activation_stats` 的 `zero_ratio` 与 `dead_units` 检出的死单元下标一致、linear 层带提示 |
+| `TestBuiltinCallbacks` | `EarlyStopping` 提前停并记录最优/停止轮、`ModelCheckpoint` 按轮存且可 `resume`、`save_best_only` 只存一次、`LoggingCallback` 与 `HistoryCallback` 输出 |
+| `TestCallbacks` | 四个钩子的触发顺序与 payload 键、坏回调 TypeError、钩子异常会中断训练 |
+| `TestResumeAndLayerNorms` | `resume_from`（`epochs=0`）恢复权重与 `step_count`、坏存档报错、`layer_grad_norm` 只记录不改训练 |
+| `TestMixupInFit` | `_mixup_batch` 的软标签和为 1、`mixup_alpha` 改变训练轨迹且数值有限、回归/非法 alpha 报错 |
 | `TestHooks` | 前向/反向 hook 都能看到该层张量、注销与 `clear_hooks` 生效、非法 index/不可调用报错、挂 hook 不改变训练数值（两个同权重模型逐位相同） |
 | `TestConvTranspose2d` | 输出尺寸公式与 `output_padding`、单点散布核、伴随恒等 `<Cx,y>==<x,C^T y>`、梯度 vs 数值、非法参数 |
 
@@ -1008,7 +1075,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 677 个单元测试
+├── test_ai.py       # 699 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

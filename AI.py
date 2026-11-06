@@ -14,6 +14,7 @@
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
+  - 训练基础设施：set_seed / Callback 回调 / infer_shapes / predict_batch / 激活与死单元诊断
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
@@ -41,14 +42,16 @@
 #  17. 模型保存 / 加载 (JSON)
 #  18. 序列标注 / 多标签分类头
 #  19. PyTorch 数值对齐对比
-#  20. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  21. 生成模型：VAE / GAN / DDPM
-#  22. Main: 回归 + 分类 + CNN 完整示例
+#  20. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#  21. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  22. 生成模型：VAE / GAN / DDPM
+#  23. Main: 回归 + 分类 + CNN 完整示例
 
 
 import io
 import itertools
 import json
+import logging
 import os
 import sys
 
@@ -10372,6 +10375,378 @@ def compare_with_pytorch():
 
 
 # ============================================================================
+#  训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+# ============================================================================
+
+
+def set_seed(seed: int):
+    """固定全局随机种子（对应 PyTorch 的 torch.manual_seed）。
+
+    只影响 `random` 模块。想让「训练完全可复现」还要给 fit / quick_train /
+    train_from_config 传 seed —— 它们用局部 Random，不受这里影响。
+    """
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise TypeError(f"set_seed: seed 必须是整数，收到 {type(seed).__name__}")
+    random.seed(seed)
+
+
+class Callback:
+    """训练回调基类：继承后按需覆盖钩子，传给 fit(callbacks=[...])。
+
+    钩子：
+        on_train_begin(model, info)   info: epochs/batch_size/lr/task/n_train/n_val/resumed_step
+        on_epoch_begin(epoch, info)   info: epoch/epochs/lr
+        on_epoch_end(epoch, logs)     logs: epoch/train_loss/val_loss/grad_norm/layer_grad_norm/lr
+        on_train_end(history)
+    回调里抛异常会中断训练（不吞异常）。
+    """
+
+    def on_train_begin(self, model, info):
+        pass
+
+    def on_epoch_begin(self, epoch, info):
+        pass
+
+    def on_epoch_end(self, epoch, logs):
+        pass
+
+    def on_train_end(self, history):
+        pass
+
+
+class EarlyStopping(Callback):
+    """监控指标，连续 `patience` 轮没有改善就请求 `fit` 停止。
+
+    `mode="min"` 用于 loss（越小越好），`"max"` 用于 accuracy（越大越好）。
+    只发出停止请求，不负责回滚权重——要回滚最优权重请用 `fit(restore_best_weights=True)`。
+    """
+
+    def __init__(self, monitor='val_loss', patience=5, min_delta=0.0, mode='min'):
+        if monitor not in ('train_loss', 'val_loss', 'grad_norm'):
+            raise ValueError(
+                f"EarlyStopping: monitor 只能是 train_loss/val_loss/grad_norm，收到 {monitor!r}")
+        if not isinstance(patience, int) or isinstance(patience, bool) or patience < 1:
+            raise ValueError(f"EarlyStopping: patience 必须是 >=1 的整数，收到 {patience!r}")
+        if float(min_delta) < 0.0:
+            raise ValueError("EarlyStopping: min_delta 不能为负")
+        if mode not in ('min', 'max'):
+            raise ValueError(f"EarlyStopping: mode 只能是 'min' 或 'max'，收到 {mode!r}")
+        self.monitor = monitor
+        self.patience = patience
+        self.min_delta = float(min_delta)
+        self.mode = mode
+        self.best = None
+        self.bad_epochs = 0
+        self.should_stop = False
+        self.stopped_epoch = None
+
+    def on_train_begin(self, model, info):
+        self.best = None
+        self.bad_epochs = 0
+        self.should_stop = False
+        self.stopped_epoch = None
+
+    def on_epoch_end(self, epoch, logs):
+        cur = logs.get(self.monitor)
+        if cur is None:
+            return
+        if self.best is None:
+            self.best = cur
+            return
+        improved = (cur < self.best - self.min_delta) if self.mode == 'min' \
+            else (cur > self.best + self.min_delta)
+        if improved:
+            self.best = cur
+            self.bad_epochs = 0
+            return
+        self.bad_epochs += 1
+        if self.bad_epochs >= self.patience:
+            self.should_stop = True
+            self.stopped_epoch = epoch
+
+
+class ModelCheckpoint(Callback):
+    """每隔 `every` 轮把模型（含优化器状态）存一份；`save_best_only=True` 时只存最优。
+
+    存出来的文件可以直接 `Model.load(path, restore_optimizer=True)`，
+    也可以作为 `fit(resume_from=...)` 的输入。
+    """
+
+    def __init__(self, path, every=1, monitor='val_loss', save_best_only=False, mode='min'):
+        if not isinstance(path, str) or not path:
+            raise ValueError("ModelCheckpoint: path 必须是非空字符串")
+        if not isinstance(every, int) or isinstance(every, bool) or every < 1:
+            raise ValueError(f"ModelCheckpoint: every 必须是 >=1 的整数，收到 {every!r}")
+        if mode not in ('min', 'max'):
+            raise ValueError(f"ModelCheckpoint: mode 只能是 'min' 或 'max'，收到 {mode!r}")
+        self.path = path
+        self.every = every
+        self.monitor = monitor
+        self.save_best_only = bool(save_best_only)
+        self.mode = mode
+        self.best = None
+        self.saved_epochs = []
+
+    def on_train_begin(self, model, info):
+        self.best = None
+        self.saved_epochs = []
+        self._model = model
+
+    def _save(self, model):
+        save_model(model.model, self.path, task=model.task,
+                   optimizer=model.optimizer, quiet=True)
+
+    def on_epoch_end(self, epoch, logs):
+        if not hasattr(self, '_model'):
+            return
+        model = self._model
+        if self.save_best_only:
+            cur = logs.get(self.monitor)
+            if cur is None:
+                return
+            better = self.best is None or (
+                cur < self.best if self.mode == 'min' else cur > self.best)
+            if better:
+                self.best = cur
+                self._save(model)
+                self.saved_epochs.append(epoch)
+            return
+        if epoch % self.every == 0:
+            self._save(model)
+            self.saved_epochs.append(epoch)
+
+
+class LoggingCallback(Callback):
+    """把每轮指标写进标准库 `logging`（默认 logger 名 `ai.train`）。"""
+
+    def __init__(self, logger=None, level=logging.INFO):
+        self.logger = logger or logging.getLogger('ai.train')
+        self.level = level
+
+    def on_train_begin(self, model, info):
+        self.logger.log(self.level, "训练开始: epochs=%s batch=%s lr=%s n_train=%s",
+                        info.get('epochs'), info.get('batch_size'),
+                        info.get('lr'), info.get('n_train'))
+
+    def on_epoch_end(self, epoch, logs):
+        self.logger.log(self.level, "epoch %s: train=%.6f val=%s lr=%.6g",
+                        epoch, logs['train_loss'],
+                        'None' if logs['val_loss'] is None else "%.6f" % logs['val_loss'],
+                        logs['lr'])
+
+    def on_train_end(self, history):
+        self.logger.log(self.level, "训练结束: %s 轮", len(history.get('train_loss', [])))
+
+
+class HistoryCallback(Callback):
+    """把每轮的 logs 原样收进 `self.records`（画曲线、导出 CSV 都够用）。"""
+
+    def __init__(self):
+        self.records = []
+
+    def on_train_begin(self, model, info):
+        self.records = []
+
+    def on_epoch_end(self, epoch, logs):
+        self.records.append(dict(logs))
+
+
+_CALLBACK_HOOKS = ('on_train_begin', 'on_epoch_begin', 'on_epoch_end', 'on_train_end')
+
+
+def _normalize_callbacks(callbacks):
+    """None / 单个回调 / 回调列表 → 列表，并校验四个钩子齐备"""
+    if callbacks is None:
+        return []
+    items = list(callbacks) if isinstance(callbacks, (list, tuple)) else [callbacks]
+    for cb in items:
+        for hook in _CALLBACK_HOOKS:
+            if not callable(getattr(cb, hook, None)):
+                raise TypeError(
+                    f"fit: 回调 {type(cb).__name__} 缺少可调用的 {hook}()"
+                    "（继承 AI.Callback 即可获得默认空实现）"
+                )
+    return items
+
+
+def _as_mlp(model, who):
+    """Model 或 MLP → MLP"""
+    mlp = model.model if isinstance(model, Model) else model
+    if not isinstance(mlp, MLP):
+        raise TypeError(f"{who}: 需要 MLP 或 Model，收到 {type(model).__name__}")
+    if not mlp.layers:
+        raise ValueError(f"{who}: 模型没有层")
+    return mlp
+
+
+def _check_samples(x, mlp, who):
+    """校验样本列表并转成 list[list[float]]"""
+    if isinstance(x, (str, bytes)) or not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: x 必须是非空样本列表（单个样本请写成 [x]）")
+    n_in = mlp.layers[0].fan_in
+    samples = []
+    for i, xi in enumerate(x):
+        if isinstance(xi, (int, float, bool)) or not isinstance(xi, (list, tuple)):
+            raise ValueError(f"{who}: 第 {i} 个样本不是序列（应为 list[float]）")
+        if len(xi) != n_in:
+            raise ValueError(
+                f"{who}: 第 {i} 个样本维度 {len(xi)} 与模型输入维度 {n_in} 不一致"
+            )
+        samples.append(list(xi))
+    return samples
+
+
+def infer_shapes(model, x):
+    """跑一次前向，报告每层的输入/输出维度、激活名、参数量与真实输出。
+
+    不训练、不改权重、不建图。x 是样本列表（单个样本写成 [x]）。
+    """
+    mlp = _as_mlp(model, "infer_shapes")
+    samples = _check_samples(x, mlp, "infer_shapes")
+    out = mlp.forward(samples[0])
+    layers = []
+    total = 0
+    for i, layer in enumerate(mlp.layers):
+        n = layer.fan_in * layer.fan_out + layer.fan_out
+        total += n
+        layers.append({
+            "layer": i,
+            "in": layer.fan_in,
+            "out": layer.fan_out,
+            "activation": getattr(layer, "activation_name", "unknown"),
+            "params": n,
+            "output": list(layer.a),
+        })
+    return {
+        "input_shape": [mlp.layers[0].fan_in],
+        "output_shape": [mlp.layers[-1].fan_out],
+        "params": total,
+        "layers": layers,
+        "output": list(out),
+    }
+
+
+def predict_batch(model, x, batch_size: int = 64):
+    """分块推理：结果与 predict 相同（单样本→list，多样本→list[list]）。
+
+    只是把样本切块逐个前向，数值与逐个 predict 完全一致（同一条计算路径）。
+    """
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError(f"predict_batch: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+    is_model = isinstance(model, Model)
+    if not is_model and not isinstance(model, MLP):
+        raise TypeError(f"predict_batch: 需要 MLP 或 Model，收到 {type(model).__name__}")
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("predict_batch: x 必须非空（单个样本请写成 [x]）")
+    if not isinstance(x[0], (list, tuple)):        # 单个样本
+        return model.predict(list(x)) if is_model else model.forward(list(x))
+    out = []
+    for i in range(0, len(x), batch_size):
+        chunk = [list(xi) for xi in x[i:i + batch_size]]
+        if is_model:
+            out.extend(model.predict(chunk))
+        else:
+            out.extend(model.forward(xi) for xi in chunk)
+    return out
+
+
+def _collect_activations(model, x, who):
+    """跑前向并收集每层的激活输出 → (samples, per_layer[list[float]])"""
+    mlp = _as_mlp(model, who)
+    samples = _check_samples(x, mlp, who)
+    per_layer = [[] for _ in mlp.layers]
+    for xi in samples:
+        mlp.forward(xi)
+        for i, layer in enumerate(mlp.layers):
+            per_layer[i].extend(layer.a)
+    return samples, mlp, per_layer
+
+
+def activation_stats(model, x):
+    """统计各层激活输出的分布：均值 / 标准差 / 最小 / 最大 / 零值比例。
+
+    用来判断「某层是不是整体死掉了/饱和了」：std 接近 0 或 zero_ratio 接近 1
+    通常说明这一层没在学东西。
+    """
+    samples, mlp, per_layer = _collect_activations(model, x, "activation_stats")
+    layers = []
+    for i, layer in enumerate(mlp.layers):
+        vals = per_layer[i]
+        n = len(vals)
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / n
+        zeros = sum(1 for v in vals if v == 0.0)
+        layers.append({
+            "layer": i,
+            "activation": getattr(layer, "activation_name", "unknown"),
+            "mean": mean,
+            "std": math.sqrt(var),
+            "min": min(vals),
+            "max": max(vals),
+            "zero_ratio": zeros / n,
+        })
+    return {"samples": len(samples), "layers": layers}
+
+
+def dead_units(model, x, atol: float = 1e-12):
+    """找出「对这批输入从不激活」的单元（按层返回索引与比例）。
+
+    判据：该单元在所有样本上的 |激活| 都 <= atol。对 ReLU 家族这意味着
+    「永远不点火」（典型是学习率过大或初始化不当）；linear / softmax 层照算，
+    但零激活不代表死亡，结果里用 note 标注。
+    """
+    if not isinstance(atol, (int, float)) or isinstance(atol, bool) or atol < 0:
+        raise ValueError(f"dead_units: atol 必须是 >=0 的数字，收到 {atol!r}")
+    samples, mlp, per_layer = _collect_activations(model, x, "dead_units")
+    atol = float(atol)
+    layers = []
+    for i, layer in enumerate(mlp.layers):
+        vals = per_layer[i]
+        n_samples = len(samples)
+        dead = []
+        for j in range(layer.fan_out):
+            worst = 0.0
+            for k in range(n_samples):
+                a = abs(vals[k * layer.fan_out + j])
+                if a > worst:
+                    worst = a
+            if worst <= atol:
+                dead.append(j)
+        act = getattr(layer, "activation_name", "unknown")
+        note = None
+        if act in ("linear", "softmax"):
+            note = f"{act} 层的零激活不代表死亡，仅作参考"
+        layers.append({
+            "layer": i,
+            "activation": act,
+            "dead": dead,
+            "dead_ratio": len(dead) / layer.fan_out,
+            "note": note,
+        })
+    return {"samples": len(samples), "atol": atol, "layers": layers}
+
+
+def _layer_norms(grads):
+    """每层的梯度范数（层内先平方和再开根号，求和顺序与 _grads_norm 一致）"""
+    out = []
+    for gw_l, gb_l in grads:
+        sq = 0.0
+        for row in gw_l:
+            for v in row:
+                sq += v * v
+        for v in gb_l:
+            sq += v * v
+        out.append(math.sqrt(sq))
+    return out
+
+
+def _accum_layer_norms(dst, grads):
+    """把一层的梯度范数累加进 dst"""
+    for i, v in enumerate(_layer_norms(grads)):
+        dst[i] += v
+
+
+# ============================================================================
 #  High-Level API: Model 封装（sklearn 风格） + 工厂函数
 # ============================================================================
 
@@ -10894,6 +11269,96 @@ class Model:
 
 # ── 训练
 
+    def _load_checkpoint(self, path):
+        """从 checkpoint 恢复权重与优化器动量，返回恢复的 step_count。"""
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"fit: resume_from 必须是文件路径字符串，收到 {path!r}")
+        try:
+            with io.open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"fit: resume_from 文件不存在: {path}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"fit: resume_from 解析失败（{exc}）: {path}")
+        if not isinstance(data, dict) or data.get("type") != "MLP":
+            raise ValueError(f"fit: resume_from 的文件不是 MLP 存档: {path}")
+        saved = data.get("layers")
+        if not isinstance(saved, list) or len(saved) != len(self.model.layers):
+            raise ValueError(
+                f"fit: resume_from 的层数与当前模型不一致"
+                f"（存档 {len(saved) if isinstance(saved, list) else '?'} 层，"
+                f"当前 {len(self.model.layers)} 层）"
+            )
+        for i, (layer, ld) in enumerate(zip(self.model.layers, saved)):
+            if not isinstance(ld, dict):
+                raise ValueError(f"fit: resume_from 第 {i} 层不是对象")
+            w, b = ld.get("weights"), ld.get("biases")
+            if (not isinstance(w, list) or len(w) != layer.fan_out
+                    or any(not isinstance(row, list) or len(row) != layer.fan_in for row in w)):
+                raise ValueError(
+                    f"fit: resume_from 第 {i} 层权重形状与当前模型不符"
+                    f"（应为 {layer.fan_out}×{layer.fan_in}）"
+                )
+            if not isinstance(b, list) or len(b) != layer.fan_out:
+                raise ValueError(
+                    f"fit: resume_from 第 {i} 层偏置形状与当前模型不符"
+                    f"（应为 {layer.fan_out} 个）"
+                )
+            for j in range(layer.fan_out):
+                layer.weights[j] = [float(v) for v in w[j]]
+            layer.biases[:] = [float(v) for v in b]
+        state = data.get("optimizer")
+        if isinstance(state, dict):
+            load_optimizer_state(self.optimizer, state)
+            return int(state.get("step_count", 0))
+        return 0
+
+    def _mixup_batch(self, batch, alpha, rng):
+        """把一个 batch 变成 mixup 后的 (x_mix, y_soft) 列表（长度不变）。"""
+        num_classes = self.model.layers[-1].fan_out
+
+        def _label_vec(y, k):
+            if isinstance(y, (list, tuple)):
+                if len(y) != num_classes:
+                    raise ValueError(
+                        f"fit(mixup_alpha): 第 {k} 个样本的软标签长度 {len(y)}"
+                        f" 与输出维度 {num_classes} 不一致"
+                    )
+                vec = [float(v) for v in y]
+                total = sum(vec)
+                if abs(total - 1.0) > 1e-6:
+                    raise ValueError(
+                        f"fit(mixup_alpha): 第 {k} 个样本的软标签和为 {total:.6f}，应为 1"
+                    )
+                return vec
+            if isinstance(y, bool) or not isinstance(y, int):
+                raise ValueError(
+                    f"fit(mixup_alpha): 目标必须是类别索引或 one-hot 向量，"
+                    f"第 {k} 个样本收到 {type(y).__name__}"
+                )
+            if not (0 <= y < num_classes):
+                raise ValueError(
+                    f"fit(mixup_alpha): 第 {k} 个样本的类别索引 {y} 越界"
+                    f"（应为 0..{num_classes - 1}）"
+                )
+            vec = [0.0] * num_classes
+            vec[y] = 1.0
+            return vec
+
+        xs = [list(x) for x, _ in batch]
+        ys = [_label_vec(y, k) for k, (_, y) in enumerate(batch)]
+        n = len(xs)
+        mixed = []
+        for k in range(n):
+            j = rng.randrange(n)
+            lam = _beta_lam(alpha, rng, "fit(mixup_alpha)")
+            x1, x2 = xs[k], xs[j]
+            y1, y2 = ys[k], ys[j]
+            xm = [lam * a + (1.0 - lam) * b for a, b in zip(x1, x2)]
+            ym = [lam * a + (1.0 - lam) * b for a, b in zip(y1, y2)]
+            mixed.append((xm, ym))
+        return mixed
+
     def _normalize_val_data(self, val_data):
         """把 val_data 规范化为 [(x, y), ...]，并做维度校验。
 
@@ -10963,7 +11428,8 @@ class Model:
             shuffle=True, lr_scheduler=None, grad_clip=None,
             early_stop_metric='val', restore_best_weights=False,
             checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1,
-            seed=None):
+            seed=None, callbacks=None, resume_from=None, mixup_alpha: float = 0.0,
+            record_layer_norms: bool = False):
         """
         训练模型。
 
@@ -10993,6 +11459,12 @@ class Model:
                 grad_accum 个 batch 的**平均梯度**，再更新一次；代价是更新次数变少，
                 收益是等效 batch 更大而显存不变。每个 epoch 末尾会把剩余不足
                 grad_accum 的 batch 也更新一次（不会白算）。
+            callbacks:    训练回调列表（继承 AI.Callback，钩子见该类 docstring）
+            resume_from:  checkpoint 路径：训练前先恢复权重与优化器动量（含 step_count），
+                再用给定的 epochs 继续训练（epoch 编号从 1 重新开始）
+            mixup_alpha:  >0 时对每个 batch 做 mixup（仅分类任务、仅索引型损失），
+                lam ~ Beta(alpha, alpha)；0（默认）表示关闭，关闭时数值完全不变
+            record_layer_norms: True 时把每层梯度范数记进 history['layer_grad_norm']
         """
         # === 规范化数据 ===
         if data is not None:
@@ -11067,12 +11539,48 @@ class Model:
         if not isinstance(grad_accum, int) or isinstance(grad_accum, bool) or grad_accum < 1:
             raise ValueError(f"fit: grad_accum 必须是 >=1 的整数，收到 {grad_accum!r}")
 
+        callbacks = _normalize_callbacks(callbacks)
+
+        if not isinstance(mixup_alpha, (int, float)) or isinstance(mixup_alpha, bool) \
+                or mixup_alpha != mixup_alpha or mixup_alpha < 0:
+            raise ValueError(f"fit: mixup_alpha 必须是 >=0 的数字，收到 {mixup_alpha!r}")
+        if mixup_alpha > 0.0:
+            if self.task != 'classification':
+                raise ValueError(
+                    f"fit: mixup_alpha 只支持分类任务（需要 one-hot 软标签），当前 task={self.task!r}"
+                )
+            if self._loss_name not in self._INDEX_LOSSES:
+                raise ValueError(
+                    f"fit: mixup_alpha 需要索引型损失（{list(self._INDEX_LOSSES)}），"
+                    f"当前 {self._loss_name!r} 不支持软标签"
+                )
+
         self.history = {'train_loss': [], 'val_loss': [], 'grad_norm': []}
+        if record_layer_norms:
+            self.history['layer_grad_norm'] = []
         best_val_loss = float('inf')
         no_improve = 0
         best_snapshot = None      # restore_best_weights 用的最优权重快照
 
+        _resumed_step = 0
+        if resume_from is not None:
+            _resumed_step = self._load_checkpoint(resume_from)
+            if verbose:
+                print(f"已恢复权重与优化器状态：{resume_from}（优化器步数 {_resumed_step}）")
+
+        for _cb in callbacks:
+            _cb.on_train_begin(self, {
+                'epochs': epochs, 'batch_size': batch_size, 'lr': self.lr,
+                'task': self.task, 'n_train': len(dataset),
+                'n_val': len(val_set) if val_set else 0,
+                'resumed_step': _resumed_step,
+            })
+
         for epoch in range(1, epochs + 1):
+            for _cb in callbacks:
+                _cb.on_epoch_begin(epoch, {'epoch': epoch, 'epochs': epochs, 'lr': self.lr})
+            ln_sum = [0.0] * len(self.model.layers) if record_layer_norms else None
+            ln_n = 0
             if shuffle:
                 rng.shuffle(dataset)
 
@@ -11083,6 +11591,8 @@ class Model:
             pending_n = 0
             for b in range(0, len(dataset), batch_size):
                 batch = dataset[b:b + batch_size]
+                if mixup_alpha > 0.0:
+                    batch = self._mixup_batch(batch, mixup_alpha, rng)
 
                 # 直接在反向传播时把各样本梯度累加到 buffer：
                 #   1) 不再保存 batch 内每个样本的完整梯度（省下 B×参数量 的中间结构）
@@ -11121,6 +11631,9 @@ class Model:
                     # 记录梯度范数（裁剪前，用来判断训练是否发散/爆炸）
                     gn_sum += _grads_norm(avg_grads)
                     gn_n += 1
+                    if ln_sum is not None:
+                        _accum_layer_norms(ln_sum, avg_grads)
+                        ln_n += 1
 
                     # 梯度裁剪
                     if grad_clip is not None:
@@ -11149,6 +11662,9 @@ class Model:
                         ]
                         gn_sum += _grads_norm(merged)
                         gn_n += 1
+                        if ln_sum is not None:
+                            _accum_layer_norms(ln_sum, merged)
+                            ln_n += 1
                         if grad_clip is not None:
                             clip_grad_by_norm(merged, max_norm=grad_clip)
                         self.optimizer.step(merged)
@@ -11164,6 +11680,9 @@ class Model:
                 ]
                 gn_sum += _grads_norm(merged)
                 gn_n += 1
+                if ln_sum is not None:
+                    _accum_layer_norms(ln_sum, merged)
+                    ln_n += 1
                 if grad_clip is not None:
                     clip_grad_by_norm(merged, max_norm=grad_clip)
                 self.optimizer.step(merged)
@@ -11173,6 +11692,10 @@ class Model:
             train_loss /= len(dataset)
             self.history['train_loss'].append((epoch, train_loss))
             self.history['grad_norm'].append((epoch, gn_sum / max(gn_n, 1)))
+            if record_layer_norms:
+                self.history['layer_grad_norm'].append(
+                    (epoch, [v / max(ln_n, 1) for v in ln_sum])
+                )
 
             # 验证
             val_loss = None
@@ -11183,6 +11706,21 @@ class Model:
             if val_set:
                 val_loss = self.evaluate(data=val_set)
                 self.history['val_loss'].append((epoch, val_loss))
+
+            for _cb in callbacks:
+                _cb.on_epoch_end(epoch, {
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'grad_norm': gn_sum / max(gn_n, 1),
+                    'layer_grad_norm': None if ln_sum is None
+                    else [v / max(ln_n, 1) for v in ln_sum],
+                    'lr': self.lr,
+                })
+            if any(getattr(_cb, 'should_stop', False) for _cb in callbacks):
+                if verbose:
+                    print("回调请求停止训练（EarlyStopping）")
+                break
 
             # 早停判据：默认盯验证损失（需要验证集）；
             # early_stop_metric='train' 时改盯训练损失，此时不依赖验证集
@@ -11235,6 +11773,9 @@ class Model:
                 layer.biases[:] = b
             if verbose:
                 print(f"已回滚到最优权重（monitored={best_val_loss:.6f}）")
+
+        for _cb in callbacks:
+            _cb.on_train_end(self.history)
 
         # epochs=0 时什么都没训练，不能标记为已训练
         self._is_trained = epochs > 0

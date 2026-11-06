@@ -14,6 +14,8 @@
 """
 
 import pytest
+import io
+import logging
 import math
 import random
 import os
@@ -8395,3 +8397,267 @@ class TestDDPM:
             AI.DDPM(0)
         with pytest.raises(ValueError):
             AI.DDPM(2).train_step([0.1])
+
+
+# ============================================================================
+#  W0：训练基础设施（seed / 推理辅助 / 诊断 / 回调 / 续训 / layer_grad_norm / mixup）
+# ============================================================================
+
+_DATA2 = [([0.0, 0.0], 0), ([0.0, 1.0], 0), ([1.0, 0.0], 0), ([1.0, 1.0], 1)]
+
+
+def _clf(seed=11):
+    random.seed(seed)
+    return AI.Model(AI.MLP([2, 4, 2], activations=['leaky_relu', 'softmax']),
+                    task='classification')
+
+
+class TestTrainingInfraSeed:
+    def test_set_seed_reproducible(self):
+        AI.set_seed(7)
+        a = [random.random() for _ in range(5)]
+        AI.set_seed(7)
+        assert [random.random() for _ in range(5)] == a
+
+    def test_set_seed_rejects_non_int(self):
+        for bad in (1.5, "7", None, True):
+            with pytest.raises(TypeError):
+                AI.set_seed(bad)
+
+    def test_fit_seed_still_independent(self):
+        """fit 的 seed 用局部 Random，不推进全局流"""
+        m = _clf(11)          # 建模型会重置全局种子，必须先建后测
+        random.seed(1)
+        before = random.random()
+        random.seed(1)
+        m.fit(data=_DATA2, epochs=2, batch_size=2, verbose=False, seed=3)
+        assert random.random() == before
+
+
+class TestInferShapesAndBatch:
+    def test_infer_shapes(self):
+        m = AI.Model(AI.MLP([3, 5, 2], activations=['relu', 'softmax']),
+                     task='classification')
+        info = AI.infer_shapes(m, [[0.1, 0.2, 0.3]])
+        assert info['input_shape'] == [3]
+        assert info['output_shape'] == [2]
+        assert info['params'] == 3 * 5 + 5 + 5 * 2 + 2
+        assert [l['activation'] for l in info['layers']] == ['relu', 'softmax']
+        assert info['output'] == m.model.forward([0.1, 0.2, 0.3])
+
+    def test_infer_shapes_rejects_bad_input(self):
+        m = AI.Model(AI.MLP([3, 2], activations=['softmax']), task='classification')
+        with pytest.raises(ValueError):
+            AI.infer_shapes(m, [[0.1, 0.2]])
+        with pytest.raises(ValueError):
+            AI.infer_shapes(m, [])
+        with pytest.raises(TypeError):
+            AI.infer_shapes(object(), [[0.1, 0.2, 0.3]])
+
+    def test_predict_batch_matches_predict(self):
+        m = AI.Model(AI.MLP([3, 5, 2], activations=['relu', 'softmax']),
+                     task='classification')
+        xs = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(11)]
+        ref = m.predict(xs)
+        for bs in (1, 3, 64):
+            assert AI.predict_batch(m, xs, batch_size=bs) == ref
+        assert AI.predict_batch(m, xs[0]) == m.predict(xs[0])
+        with pytest.raises(ValueError):
+            AI.predict_batch(m, xs, batch_size=0)
+
+
+class TestDiagnostics:
+    def _dead_model(self):
+        m = AI.Model(AI.MLP([3, 6, 2], activations=['relu', 'linear']), task='regression')
+        for j in (1, 4):
+            m.model.layers[0].biases[j] = -50.0
+        return m
+
+    def test_activation_stats(self):
+        m = self._dead_model()
+        X = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(20)]
+        st = AI.activation_stats(m, X)
+        assert st['samples'] == 20
+        assert len(st['layers']) == 2
+        assert st['layers'][0]['zero_ratio'] > 0.0
+        assert all(l['std'] >= 0.0 for l in st['layers'])
+        assert all(l['min'] <= l['max'] for l in st['layers'])
+
+    def test_dead_units(self):
+        m = self._dead_model()
+        X = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(20)]
+        du = AI.dead_units(m, X)
+        assert du['layers'][0]['dead'] == [1, 4]
+        assert abs(du['layers'][0]['dead_ratio'] - 2 / 6) < 1e-12
+        assert du['layers'][0]['note'] is None        # relu 层不作说明
+        assert du['layers'][1]['note'] is not None    # linear 层会提示
+        with pytest.raises(ValueError):
+            AI.dead_units(m, X, atol=-1.0)
+
+
+class TestCallbacks:
+    class _Rec(AI.Callback):
+        def __init__(self):
+            self.events = []
+
+        def on_train_begin(self, model, info):
+            self.events.append(('begin', dict(info)))
+
+        def on_epoch_begin(self, epoch, info):
+            self.events.append(('epoch_begin', epoch))
+
+        def on_epoch_end(self, epoch, logs):
+            self.events.append(('epoch_end', dict(logs)))
+
+        def on_train_end(self, history):
+            self.events.append(('end', len(history['train_loss'])))
+
+    def test_hook_order_and_payload(self):
+        rec = self._Rec()
+        m = _clf()
+        m.fit(data=_DATA2, epochs=3, batch_size=2, verbose=False, callbacks=[rec], seed=5)
+        kinds = [e[0] for e in rec.events]
+        assert kinds == ['begin'] + ['epoch_begin', 'epoch_end'] * 3 + ['end']
+        begin = rec.events[0][1]
+        assert begin['epochs'] == 3 and begin['batch_size'] == 2
+        assert begin['task'] == 'classification'
+        assert begin['n_train'] == 3 and begin['n_val'] == 1
+        assert begin['resumed_step'] == 0
+        logs = [e[1] for e in rec.events if e[0] == 'epoch_end']
+        assert [l['epoch'] for l in logs] == [1, 2, 3]
+        assert set(logs[0]) == {'epoch', 'train_loss', 'val_loss', 'grad_norm',
+                                'layer_grad_norm', 'lr'}
+
+    def test_single_callback_and_bad_callback(self):
+        rec = self._Rec()
+        assert AI._normalize_callbacks(rec) == [rec]
+        with pytest.raises(TypeError):
+            _clf().fit(data=_DATA2, epochs=1, verbose=False, callbacks=[object()])
+
+    def test_callback_exception_propagates(self):
+        class Boom(AI.Callback):
+            def on_epoch_end(self, epoch, logs):
+                raise RuntimeError('stop now')
+
+        with pytest.raises(RuntimeError):
+            _clf().fit(data=_DATA2, epochs=2, batch_size=2, verbose=False,
+                       callbacks=[Boom()], seed=1)
+
+
+class TestResumeAndLayerNorms:
+    def test_resume_restores_weights_and_step(self, tmp_path):
+        ck = str(tmp_path / "ck.json")
+        base = _clf(9)
+        base.fit(data=_DATA2, epochs=3, batch_size=2, verbose=False,
+                 checkpoint_path=ck, seed=8)
+        cont = _clf(21)
+        cont.fit(data=_DATA2, epochs=0, batch_size=2, verbose=False, resume_from=ck)
+        assert cont.optimizer.step_count == 6
+        for la, lb in zip(cont.model.layers, base.model.layers):
+            assert la.weights == lb.weights
+            assert la.biases == lb.biases
+
+    def test_resume_errors(self, tmp_path):
+        ck = str(tmp_path / "bad.json")
+        with open(ck, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "MLP", "layers": []}))
+        with pytest.raises(ValueError):
+            _clf().fit(data=_DATA2, epochs=1, verbose=False, resume_from=ck)
+        with pytest.raises(FileNotFoundError):
+            _clf().fit(data=_DATA2, epochs=1, verbose=False,
+                       resume_from=str(tmp_path / "nope.json"))
+
+    def test_layer_grad_norm(self):
+        m1, m2 = _clf(5), _clf(5)
+        kw = dict(data=_DATA2, epochs=3, batch_size=4, verbose=False, seed=4)
+        h1 = m1.fit(record_layer_norms=True, **kw)
+        h2 = m2.fit(**kw)
+        assert h1['train_loss'] == h2['train_loss']        # 只记录，不影响训练
+        assert len(h1['layer_grad_norm']) == 3
+        assert all(len(v) == 2 and all(x >= 0 for x in v) for _, v in h1['layer_grad_norm'])
+        assert 'layer_grad_norm' not in h2
+
+
+class TestMixupInFit:
+    def test_mixup_batch_semantics(self):
+        m = _clf(31)
+        mixed = m._mixup_batch([([0.0, 0.0], 0), ([1.0, 1.0], 1)], 0.4, random.Random(7))
+        assert len(mixed) == 2
+        assert all(len(y) == 2 and abs(sum(y) - 1.0) < 1e-12 for _, y in mixed)
+        with pytest.raises(ValueError):
+            m._mixup_batch([([0.0, 0.0], [0.5, 0.6])], 0.4, random.Random(7))
+
+    def test_mixup_changes_training_but_stays_finite(self):
+        m = _clf(31)
+        h_mix = m.fit(data=_DATA2, epochs=4, batch_size=2, verbose=False,
+                      mixup_alpha=0.4, seed=3)
+        assert all(math.isfinite(v) for _, v in h_mix['train_loss'])
+        m2 = _clf(31)
+        h_plain = m2.fit(data=_DATA2, epochs=4, batch_size=2, verbose=False, seed=3)
+        assert h_mix['train_loss'] != h_plain['train_loss']
+
+    def test_mixup_rejects_regression_and_bad_alpha(self):
+        reg = AI.Model(AI.MLP([2, 3, 1], activations=['relu', 'linear']), task='regression')
+        with pytest.raises(ValueError):
+            reg.fit(data=[([0.0, 0.0], 1.0)], epochs=1, verbose=False, mixup_alpha=0.2)
+        for bad in (-0.1, float('nan'), 'x'):
+            with pytest.raises((ValueError, TypeError)):
+                _clf().fit(data=_DATA2, epochs=1, verbose=False, mixup_alpha=bad)
+
+
+class TestBuiltinCallbacks:
+    def test_early_stopping_requests_stop(self):
+        es = AI.EarlyStopping(monitor='val_loss', patience=1)
+        m = _clf()
+        m.fit(data=_DATA2, epochs=40, batch_size=4, verbose=False,
+              callbacks=[es], seed=3)
+        assert len(m.history['train_loss']) < 40
+        assert es.should_stop and es.stopped_epoch is not None
+        assert es.best == min(v for _, v in m.history['val_loss'])
+
+    def test_early_stopping_validation(self):
+        for kw in ({'patience': 0}, {'mode': 'up'}, {'monitor': 'acc'},
+                   {'min_delta': -1.0}):
+            with pytest.raises(ValueError):
+                AI.EarlyStopping(**kw)
+
+    def test_model_checkpoint_and_resume(self, tmp_path):
+        path = str(tmp_path / "ck.json")
+        cb = AI.ModelCheckpoint(path, every=2)
+        m = _clf()
+        m.fit(data=_DATA2, epochs=4, batch_size=4, verbose=False,
+              callbacks=[cb], seed=5)
+        assert cb.saved_epochs == [2, 4]
+        saved = json.load(io.open(path, encoding="utf-8"))
+        assert "optimizer" in saved
+        cont = _clf(99)
+        cont.fit(data=_DATA2, epochs=0, verbose=False, resume_from=path)
+        assert cont.optimizer.step_count == saved["optimizer"]["step_count"]
+
+    def test_model_checkpoint_best_only(self, tmp_path):
+        path = str(tmp_path / "best.json")
+        cb = AI.ModelCheckpoint(path, save_best_only=True)
+        m = _clf()
+        m.fit(data=_DATA2, epochs=5, batch_size=4, verbose=False,
+              callbacks=[cb], seed=7)
+        assert len(cb.saved_epochs) == 1
+        assert cb.best <= max(v for _, v in m.history['val_loss'])
+        with pytest.raises(ValueError):
+            AI.ModelCheckpoint("")
+        with pytest.raises(ValueError):
+            AI.ModelCheckpoint(path, every=0)
+
+    def test_logging_and_history_callbacks(self):
+        stream = io.StringIO()
+        logger = logging.getLogger("test.ai.train")
+        logger.handlers = [logging.StreamHandler(stream)]
+        logger.setLevel(logging.INFO)
+        hc = AI.HistoryCallback()
+        m = _clf()
+        m.fit(data=_DATA2, epochs=2, batch_size=4, verbose=False,
+              callbacks=[AI.LoggingCallback(logger), hc], seed=1)
+        out = stream.getvalue()
+        assert "训练开始" in out and "epoch 2" in out and "训练结束" in out
+        assert len(hc.records) == 2
+        assert set(hc.records[-1]) == {'epoch', 'train_loss', 'val_loss',
+                                       'grad_norm', 'layer_grad_norm', 'lr'}
