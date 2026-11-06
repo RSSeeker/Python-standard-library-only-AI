@@ -11022,6 +11022,582 @@ class PositionalEncoding:
 #  Embedding / Residual / Sequential
 # ============================================================================
 
+class _SparseAttention:
+    """稀疏注意力基类：只算「被允许的 (t, j) 对」，其余位置权重恒 0
+
+    标准注意力要算 T×T 个分数，长序列下这是平方项。BigBird / Longformer /
+    Reformer 的共同思路都是**事先决定哪些位置可以互相看见**，然后只在
+    这个稀疏图上做 softmax：
+
+        out_t = sum_{j in A(t)} softmax_j(q_t·k_j/sqrt(d)) v_j
+
+    `A(t)` 就是子类的 `_allow(x_seq, T)` 返回的「第 t 个位置能看见的下标列表」。
+    被排除的位置连分数都不算，softmax 归一化只在 A(t) 内进行——这和「先算完整
+    再屏蔽」不同，后者要到 O(T^2) 的分数全部算完才知道该屏蔽谁。
+
+    反向也是标准的：设 `p` 是稀疏权重矩阵（不允许的位置为 0），
+
+        dv_j = sum_t p_tj dout_t
+        dp_tj = dout_t·v_j
+        ds_tj = p_tj (dp_tj - sum_s p_ts dp_ts)
+        dq_t = scale * sum_j ds_tj k_j         dk_j = scale * sum_t ds_tj q_t
+
+    被屏蔽位置 `p = 0` ⇒ `ds = 0`，自动不产生梯度，不需要额外分支。
+
+    子类只需要实现 `_allow`：(T, d_model) 的输入 → 长度 T 的列表，第 t 项是
+    t 能看见的下标列表（**必须包含 t 自己**，否则 softmax 分母为 0）。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, causal: bool = False):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise ValueError("%s: d_model 必须是正整数，收到 %r"
+                             % (type(self).__name__, d_model))
+        if d_model < 1:
+            raise ValueError("%s: d_model 必须 >= 1，收到 %r"
+                             % (type(self).__name__, d_model))
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int):
+            raise ValueError("%s: num_heads 必须是正整数，收到 %r"
+                             % (type(self).__name__, num_heads))
+        if num_heads < 1:
+            raise ValueError("%s: num_heads 必须 >= 1，收到 %r"
+                             % (type(self).__name__, num_heads))
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "%s: d_model=%d 必须能被 num_heads=%d 整除"
+                % (type(self).__name__, d_model, num_heads))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.causal = bool(causal)
+        std = math.sqrt(2.0 / d_model)
+        self.W_q = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_k = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_v = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.W_o = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.b_q = [0.0] * d_model
+        self.b_k = [0.0] * d_model
+        self.b_v = [0.0] * d_model
+        self.b_o = [0.0] * d_model
+        self._init_adam()
+        self.zero_grad()
+        self.seq_len = 0
+        self.x = None
+        self.concat = None
+        self._cache = None
+
+    def zero_grad(self):
+        """清零所有参数梯度"""
+        d = self.d_model
+
+        def zeros_2d(r, c):
+            return [[0.0] * c for _ in range(r)]
+
+        self.grads = {
+            "W_q": zeros_2d(d, d), "b_q": [0.0] * d,
+            "W_k": zeros_2d(d, d), "b_k": [0.0] * d,
+            "W_v": zeros_2d(d, d), "b_v": [0.0] * d,
+            "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
+        }
+
+    def _init_adam(self):
+        d = self.d_model
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            setattr(self, "m_" + name, [[0.0] * d for _ in range(d)])
+            setattr(self, "v_" + name, [[0.0] * d for _ in range(d)])
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            setattr(self, "m_" + name, [0.0] * d)
+            setattr(self, "v_" + name, [0.0] * d)
+        self._adam_t = 0
+
+    def train(self):
+        """稀疏注意力没有 dropout，空操作（保持接口统一）"""
+        return self
+
+    def eval(self):
+        """稀疏注意力没有 dropout，空操作（保持接口统一）"""
+        return self
+
+    def _allow(self, x_seq, T):
+        """子类返回：长度 T 的列表，第 t 项是 t 能看见的下标（必须含 t）"""
+        raise NotImplementedError("%s: 必须实现 _allow" % (type(self).__name__,))
+
+    def _proj(self, W, b, x_t):
+        return [sum(map(_mul, W[r], x_t)) + b[r] for r in range(self.d_model)]
+
+    def _check_allow(self, allow, T):
+        """校验子类产出的稀疏模式（含 t 自己、下标合法、去重有序）"""
+        who = type(self).__name__
+        if not isinstance(allow, list) or len(allow) != T:
+            raise ValueError("%s._allow: 必须返回长度 %d 的列表，收到 %r"
+                             % (who, T, allow))
+        for t in range(T):
+            idx = allow[t]
+            if not idx:
+                raise ValueError("%s._allow: 第 %d 个位置没有任何可见位置" % (who, t))
+            if t not in idx:
+                raise ValueError("%s._allow: 第 %d 个位置的可见集合必须包含自己"
+                                 % (who, t))
+            for j in idx:
+                if isinstance(j, bool) or not isinstance(j, int):
+                    raise ValueError("%s._allow: 下标必须是整数，收到 %r" % (who, j))
+                if j < 0 or j >= T:
+                    raise ValueError("%s._allow: 下标 %d 越界（T=%d）" % (who, j, T))
+        return allow
+
+    def forward(self, x_seq):
+        """x_seq: (T, d_model) → (T, d_model)"""
+        who = type(self).__name__
+        if not x_seq:
+            raise ValueError("%s.forward: 输入序列不能为空" % who)
+        d = self.d_model
+        for t, row in enumerate(x_seq):
+            if len(row) != d:
+                raise ValueError(
+                    "%s.forward: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (who, t, len(row), d))
+        T = len(x_seq)
+        q_all = [self._proj(self.W_q, self.b_q, xt) for xt in x_seq]
+        k_all = [self._proj(self.W_k, self.b_k, xt) for xt in x_seq]
+        v_all = [self._proj(self.W_v, self.b_v, xt) for xt in x_seq]
+        allow = self._check_allow(self._allow(x_seq, T), T)
+        d_k = self.d_k
+        scale = 1.0 / math.sqrt(d_k)
+        concat = [[0.0] * d for _ in range(T)]
+        cache = []
+        for head in range(self.num_heads):
+            off = head * d_k
+            qh = [q_all[t][off:off + d_k] for t in range(T)]
+            kh = [k_all[t][off:off + d_k] for t in range(T)]
+            vh = [v_all[t][off:off + d_k] for t in range(T)]
+            p = [[0.0] * T for _ in range(T)]
+            outs = []
+            for t in range(T):
+                idx = allow[t]
+                qt = qh[t]
+                scores = []
+                for j in idx:
+                    kj = kh[j]
+                    acc = 0.0
+                    for r in range(d_k):
+                        acc += qt[r] * kj[r]
+                    scores.append(acc * scale)
+                mx = max(scores)
+                ex = [math.exp(sc - mx) for sc in scores]
+                tot = 0.0
+                for e in ex:
+                    tot += e
+                prow = p[t]
+                for pos, j in enumerate(idx):
+                    prow[j] = ex[pos] / tot
+                out = []
+                for r in range(d_k):
+                    acc = 0.0
+                    for pos, j in enumerate(idx):
+                        acc += prow[j] * vh[j][r]
+                    out.append(acc)
+                outs.append(out)
+            for t in range(T):
+                for r in range(d_k):
+                    concat[t][off + r] = outs[t][r]
+            cache.append({"q": qh, "k": kh, "v": vh, "p": p, "allow": allow})
+        y = [[sum(map(_mul, self.W_o[r], concat[t])) + self.b_o[r] for r in range(d)]
+             for t in range(T)]
+        self.seq_len = T
+        self.x = [list(row) for row in x_seq]
+        self.concat = concat
+        self._cache = cache
+        return y
+
+    def backward(self, dout_seq):
+        """dout_seq: (T, d_model) → (T, d_model) 输入梯度"""
+        who = type(self).__name__
+        if self._cache is None:
+            raise RuntimeError("%s.backward: 必须先 forward" % who)
+        if len(dout_seq) != self.seq_len:
+            raise ValueError(
+                "%s.backward: dout 长度 %d 与 forward 的 %d 不一致"
+                % (who, len(dout_seq), self.seq_len))
+        d = self.d_model
+        T = self.seq_len
+        d_k = self.d_k
+        scale = 1.0 / math.sqrt(d_k)
+        dconcat = [[sum(dout_seq[t][j] * self.W_o[j][r] for j in range(d))
+                    for r in range(d)] for t in range(T)]
+        for r in range(d):
+            wrow = self.grads["W_o"][r]
+            sb = 0.0
+            for t in range(T):
+                dt = dout_seq[t][r]
+                sb += dt
+                if dt == 0.0:
+                    continue
+                crow = self.concat[t]
+                for c in range(d):
+                    wrow[c] += dt * crow[c]
+            self.grads["b_o"][r] += sb
+        dq_all = [[0.0] * d for _ in range(T)]
+        dk_all = [[0.0] * d for _ in range(T)]
+        dv_all = [[0.0] * d for _ in range(T)]
+        for head in range(self.num_heads):
+            off = head * d_k
+            c = self._cache[head]
+            qh, kh, vh, p, allow = c["q"], c["k"], c["v"], c["p"], c["allow"]
+            dqh = [[0.0] * d_k for _ in range(T)]
+            dkh = [[0.0] * d_k for _ in range(T)]
+            dvh = [[0.0] * d_k for _ in range(T)]
+            ds = [[0.0] * T for _ in range(T)]
+            for t in range(T):
+                dout = dconcat[t][off:off + d_k]
+                prow = p[t]
+                idx = allow[t]
+                dp = {}
+                tot = 0.0
+                for j in idx:
+                    pj = prow[j]
+                    if pj == 0.0:
+                        continue
+                    vj = vh[j]
+                    acc = 0.0
+                    for r in range(d_k):
+                        acc += dout[r] * vj[r]
+                    dp[j] = acc
+                    tot += pj * acc
+                dsrow = ds[t]
+                for j in idx:
+                    pj = prow[j]
+                    if pj == 0.0:
+                        continue
+                    dsrow[j] = pj * (dp[j] - tot)
+            # dv 只依赖「权重 p」，与 ds 是否为 0 无关：
+            # causal 下 t=0 只有一个可见位置，ds 恒为 0，但 dv 仍然非零。
+            for t in range(T):
+                prow = p[t]
+                dout = dconcat[t][off:off + d_k]
+                for j in allow[t]:
+                    pj = prow[j]
+                    if pj == 0.0:
+                        continue
+                    dvj = dvh[j]
+                    for r in range(d_k):
+                        dvj[r] += pj * dout[r]
+            for t in range(T):
+                dsrow = ds[t]
+                kj_all = kh
+                dqt = dqh[t]
+                for j in allow[t]:
+                    g = dsrow[j]
+                    if g == 0.0:
+                        continue
+                    kj = kj_all[j]
+                    for r in range(d_k):
+                        dqt[r] += scale * g * kj[r]
+            for t in range(T):
+                qt = qh[t]
+                for j in allow[t]:
+                    g = ds[t][j]
+                    if g == 0.0:
+                        continue
+                    dkt = dkh[j]
+                    for r in range(d_k):
+                        dkt[r] += scale * g * qt[r]
+            for t in range(T):
+                for r in range(d_k):
+                    dq_all[t][off + r] = dqh[t][r]
+                    dk_all[t][off + r] = dkh[t][r]
+                    dv_all[t][off + r] = dvh[t][r]
+        for r in range(d):
+            wq = self.grads["W_q"][r]
+            wk = self.grads["W_k"][r]
+            wv = self.grads["W_v"][r]
+            sbq = sbk = sbv = 0.0
+            for t in range(T):
+                xt = self.x[t]
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                sbq += dqr
+                sbk += dkr
+                sbv += dvr
+                if dqr != 0.0:
+                    for cc in range(d):
+                        wq[cc] += dqr * xt[cc]
+                if dkr != 0.0:
+                    for cc in range(d):
+                        wk[cc] += dkr * xt[cc]
+                if dvr != 0.0:
+                    for cc in range(d):
+                        wv[cc] += dvr * xt[cc]
+            self.grads["b_q"][r] += sbq
+            self.grads["b_k"][r] += sbk
+            self.grads["b_v"][r] += sbv
+        dx = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            xrow = dx[t]
+            for r in range(d):
+                dqr = dq_all[t][r]
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                if dqr == 0.0 and dkr == 0.0 and dvr == 0.0:
+                    continue
+                wq = self.W_q[r]
+                wk = self.W_k[r]
+                wv = self.W_v[r]
+                for cc in range(d):
+                    xrow[cc] += dqr * wq[cc] + dkr * wk[cc] + dvr * wv[cc]
+        return dx
+
+    def param_count(self):
+        """参数量：四个 d×d 投影 + 四个 d 维偏置（稀疏模式本身不带参数）"""
+        d = self.d_model
+        return 4 * d * d + 4 * d
+
+    def sgd_step(self, lr: float):
+        """SGD 更新"""
+        lr = _la_check_lr(lr, "%s.sgd_step" % type(self).__name__)
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _la_apply_sgd(getattr(self, name), self.grads[name], lr)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            for i in range(len(param)):
+                param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """Adam 更新"""
+        who = "%s.adam_step" % type(self).__name__
+        lr = _la_check_lr(lr, who)
+        _check_adam_betas(beta1, beta2, who)
+        self._adam_t += 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            _la_apply_adam(getattr(self, name), self.grads[name],
+                           getattr(self, "m_" + name), getattr(self, "v_" + name),
+                           lr, c1, c2, beta1, beta2, eps)
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            m = getattr(self, "m_" + name)
+            v = getattr(self, "v_" + name)
+            for i in range(len(param)):
+                g = grad[i]
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
+                param[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
+class BigBirdAttention(_SparseAttention):
+    """BigBird 稀疏注意力（Beltagy et al. 2020）：三种连接拼起来
+
+    每个位置 t 只能看见三类位置：
+
+    * **窗口**：`[t-w, t+w]` 内的邻居，负责局部语法
+    * **全局**：固定的前 `num_global` 个 token（默认 `[0]`，常放 `[CLS]`），
+      所有位置都能看见它们，它们也能看见所有位置——这是「用 O(T) 条边
+      换到全局可达性」的关键
+    * **随机**：每个位置再随机连 `num_random` 个位置，让信息有机会跳过
+      中间层（论文里这一步把理论上的表达能力补回来）
+
+    稀疏模式由 `seed` 决定，`forward` 里用 `random.Random(seed + T)` 现算并缓存，
+    反向复用同一份（随机连边是不可导的离散结构，梯度只走注意力权重）。
+    `causal=True` 时再把 `j > t` 全部去掉（自回归场景）。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, window_size: int = 2,
+                 num_global: int = 1, num_random: int = 1,
+                 causal: bool = False, seed: int = 0):
+        super(BigBirdAttention, self).__init__(d_model, num_heads, causal)
+        for name, val in (("window_size", window_size), ("num_global", num_global),
+                          ("num_random", num_random)):
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError("BigBirdAttention: %s 必须是非负整数，收到 %r"
+                                 % (name, val))
+            if val < 0:
+                raise ValueError("BigBirdAttention: %s 必须 >= 0，收到 %r"
+                                 % (name, val))
+        if num_global < 0:
+            raise ValueError("BigBirdAttention: num_global 不能为负")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("BigBirdAttention: seed 必须是整数，收到 %r" % (seed,))
+        self.window_size = window_size
+        self.num_global = num_global
+        self.num_random = num_random
+        self.seed = seed
+
+    def _allow(self, x_seq, T):
+        """窗口 + 全局 + 随机三类连接"""
+        rng = random.Random(self.seed * 1000003 + T)
+        glob = list(range(min(self.num_global, T)))
+        allow = []
+        for t in range(T):
+            seen = set()
+            lo = t - self.window_size
+            hi = t + self.window_size
+            if lo < 0:
+                lo = 0
+            if hi > T - 1:
+                hi = T - 1
+            for j in range(lo, hi + 1):
+                seen.add(j)
+            for g in glob:
+                seen.add(g)
+            for _ in range(self.num_random):
+                seen.add(rng.randrange(T))
+            if self.causal:
+                seen = set(j for j in seen if j <= t)
+            seen.add(t)
+            allow.append(sorted(seen))
+        return allow
+
+
+class LongformerAttention(_SparseAttention):
+    """Longformer 稀疏注意力（Beltagy et al. 2020）：滑窗 + 全局 token
+
+    和 BigBird 的区别是「随机连边」换成「由调用方指定的全局 token」：
+
+    * 普通位置只看窗口 `[t-w, t+w]` 与全部全局 token
+    * 全局 token（默认 `[0]`）看所有位置
+
+    这样一段长文本里可以把问题句、标题等少数位置标成全局，信息就能跨
+    整个序列传播，而注意力代价仍是 O(T·w)。`causal=True` 时普通位置只看
+    `j <= t`，但**全局 token 仍能看见整条序列**（它们本来就是摘要位）。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, window_size: int = 2,
+                 global_tokens=None, causal: bool = False):
+        super(LongformerAttention, self).__init__(d_model, num_heads, causal)
+        if isinstance(window_size, bool) or not isinstance(window_size, int):
+            raise ValueError("LongformerAttention: window_size 必须是整数，收到 %r"
+                             % (window_size,))
+        if window_size < 0:
+            raise ValueError("LongformerAttention: window_size 必须 >= 0，收到 %r"
+                             % (window_size,))
+        if global_tokens is None:
+            global_tokens = [0]
+        if isinstance(global_tokens, int) and not isinstance(global_tokens, bool):
+            global_tokens = list(range(global_tokens))
+        if not isinstance(global_tokens, (list, tuple)):
+            raise ValueError("LongformerAttention: global_tokens 必须是下标列表，收到 %r"
+                             % (global_tokens,))
+        idx = []
+        for g in global_tokens:
+            if isinstance(g, bool) or not isinstance(g, int):
+                raise ValueError("LongformerAttention: 全局 token 下标必须是整数，收到 %r"
+                                 % (g,))
+            if g < 0:
+                raise ValueError("LongformerAttention: 全局 token 下标不能为负，收到 %r"
+                                 % (g,))
+            idx.append(g)
+        self.window_size = window_size
+        self.global_tokens = sorted(set(idx))
+
+    def _allow(self, x_seq, T):
+        """滑窗 + 全局 token"""
+        glob = [g for g in self.global_tokens if g < T]
+        if not glob:
+            glob = [0]
+        gset = set(glob)
+        allow = []
+        for t in range(T):
+            seen = set(glob)
+            lo = t - self.window_size
+            hi = t + self.window_size
+            if lo < 0:
+                lo = 0
+            if hi > T - 1:
+                hi = T - 1
+            for j in range(lo, hi + 1):
+                seen.add(j)
+            if self.causal and t not in gset:
+                seen = set(j for j in seen if j <= t or j in gset)
+            if t in gset:
+                # 全局 token 的特殊之处：它能看见整条序列（包括未来的位置），
+                # 这样信息才能一步跨过整个窗口半径。
+                seen = set(range(T))
+            seen.add(t)
+            allow.append(sorted(seen))
+        return allow
+
+
+class ReformerAttention(_SparseAttention):
+    """Reformer 的 LSH 注意力（Kitaev et al. 2020）：只和同桶位置算注意力
+
+    做法是**用随机投影给每个位置分桶**，然后只在桶内做注意力：
+
+        h_t = argmax_r (R x_t)_r          # R 是固定的随机投影
+        A(t) = {j : h_j = h_t, j <= t (causal)}
+
+    理想情况下「q·k 大」的位置会落进同一个桶，于是桶内 softmax 能近似
+    全局 softmax，但每个位置只跟桶内 ~T/num_buckets 个位置交互，代价从
+    O(T^2) 降到 O(T^2/num_buckets)。
+
+    两个简化（都写进文档，不藏）：
+
+    1. 真实的 LSH 用「多轮哈希 + 取众数」找最近邻桶，这里用单次随机投影
+       的 argmax，桶内成员的语义相关性弱一些；
+    2. 分桶是离散操作，**梯度只走注意力权重**，不经过 `R`（这与原论文一致）。
+
+    空桶不会出现（每个位置至少和自己同桶）。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, num_buckets: int = 2,
+                 causal: bool = False, seed: int = 0):
+        super(ReformerAttention, self).__init__(d_model, num_heads, causal)
+        if isinstance(num_buckets, bool) or not isinstance(num_buckets, int):
+            raise ValueError("ReformerAttention: num_buckets 必须是正整数，收到 %r"
+                             % (num_buckets,))
+        if num_buckets < 1:
+            raise ValueError("ReformerAttention: num_buckets 必须 >= 1，收到 %r"
+                             % (num_buckets,))
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("ReformerAttention: seed 必须是整数，收到 %r" % (seed,))
+        self.num_buckets = num_buckets
+        self.seed = seed
+        rng = random.Random(seed * 1000003 + d_model * 31 + num_buckets)
+        self.hash_proj = [[rng.gauss(0.0, 1.0 / math.sqrt(d_model))
+                           for _ in range(d_model)] for _ in range(num_buckets)]
+        self._buckets = None
+        self._buckets_len = 0
+
+    def _bucketize(self, x_seq):
+        """用固定的随机投影把每个位置分到 num_buckets 个桶之一"""
+        buckets = []
+        for t, row in enumerate(x_seq):
+            best = 0
+            best_val = None
+            for r, wrow in enumerate(self.hash_proj):
+                acc = 0.0
+                for c in range(len(row)):
+                    acc += wrow[c] * row[c]
+                if best_val is None or acc > best_val:
+                    best_val = acc
+                    best = r
+            buckets.append(best)
+        self._buckets = buckets
+        self._buckets_len = len(buckets)
+        return buckets
+
+    def _allow(self, x_seq, T):
+        """同桶 + （causal 时）j <= t"""
+        buckets = self._bucketize(x_seq)
+        allow = []
+        for t in range(T):
+            b = buckets[t]
+            seen = [j for j in range(T) if buckets[j] == b]
+            if self.causal:
+                seen = [j for j in seen if j <= t]
+            if t not in seen:
+                seen.append(t)
+            allow.append(sorted(set(seen)))
+        return allow
+
+
 class LinearAttention:
     """线性注意力（Katharopoulos et al. 2020）：`phi(x) = elu(x) + 1`
 

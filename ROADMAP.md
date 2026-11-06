@@ -184,7 +184,8 @@
       `k=T` 且 `E=F=I` 时与标准注意力逐位等价 <1e-12）
 - [x] `PerformerAttention`（FAVOR+ 随机特征 `phi(x)=exp(Wx-|x|²/2)/sqrt(m)`，O(T·d·m)；
       iid 高斯特征，实测 m=4 误差 92% / m=64 误差 35%，是省算力而非逼近 softmax）**W5-B3**
-- [ ] 线性注意力族剩余：`BigBird`（稀疏）、`Longformer`（滑窗+全局）、`Reformer`（LSH）
+- [x] 稀疏注意力族（W5-C）：`BigBirdAttention`（窗口+全局+随机连边）、`LongformerAttention`（滑窗+全局 token，全局位看全序列）、`ReformerAttention`（随机投影 argmax 分桶，桶内注意力）——全连通时与手写稠密注意力逐位等价，参数/输入梯度中心差分 ≤1e-5；
+      修掉一个只有 causal 才暴露的真 bug：`ds == 0` 的短路把 `dv` 累加也跳过了（causal 下 t=0 只有一个可见位置，ds 恒为 0 而 dv 非零）
 - [ ] `FlashAttention` 分块算法（模拟，明确「不更快」）
 
 ### W6 图神经网络（§1 全新范式）

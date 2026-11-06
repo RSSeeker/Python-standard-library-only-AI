@@ -14185,3 +14185,277 @@ class TestMLAttention:
             pass
         else:
             raise AssertionError("未 forward 就 backward 没有报错")
+
+
+# ==== W5-C：稀疏注意力（BigBird / Longformer / Reformer）====
+
+X4C = [[1.0, 0.0, 0.5, -0.5],
+       [0.2, 0.3, -0.1, 0.4],
+       [-0.3, 0.6, 0.2, 0.1],
+       [0.5, 0.5, 0.5, 0.5]]
+
+DOUT4C = [[0.3, -0.2, 0.1, 0.05],
+          [0.1, 0.2, -0.3, 0.4],
+          [-0.2, 0.1, 0.25, -0.15],
+          [0.4, -0.1, 0.2, 0.3]]
+
+
+def _w5c_loss(model, X):
+    out = model.forward(X)
+    return sum(out[t][r] * DOUT4C[t][r] for t in range(len(DOUT4C))
+               for r in range(len(DOUT4C[0])))
+
+
+def _w5c_grad_ok(model, eps=1e-5, tol=1e-5):
+    """返回 (参数梯度 worst, 输入梯度 worst)"""
+    model.zero_grad()
+    model.forward(X4C)
+    dx_ana = model.backward(DOUT4C)
+    ana = {}
+    for name in ('W_q', 'W_k', 'W_v', 'W_o'):
+        ana[name] = [list(r) for r in model.grads[name]]
+    for name in ('b_q', 'b_k', 'b_v', 'b_o'):
+        ana[name] = list(model.grads[name])
+    worst = 0.0
+    for name in ('W_q', 'W_k', 'W_v', 'W_o'):
+        W = getattr(model, name)
+        for r in range(len(W)):
+            for c in range(len(W[r])):
+                old = W[r][c]
+                W[r][c] = old + eps
+                up = _w5c_loss(model, X4C)
+                W[r][c] = old - eps
+                dn = _w5c_loss(model, X4C)
+                W[r][c] = old
+                num = (up - dn) / (2 * eps)
+                a = ana[name][r][c]
+                if abs(a) < 1e-9 and abs(num) < 1e-9:
+                    continue
+                worst = max(worst, abs(a - num) / max(abs(a), abs(num), 1.0))
+    for name in ('b_q', 'b_k', 'b_v', 'b_o'):
+        b = getattr(model, name)
+        for r in range(len(b)):
+            old = b[r]
+            b[r] = old + eps
+            up = _w5c_loss(model, X4C)
+            b[r] = old - eps
+            dn = _w5c_loss(model, X4C)
+            b[r] = old
+            num = (up - dn) / (2 * eps)
+            a = ana[name][r]
+            if abs(a) < 1e-9 and abs(num) < 1e-9:
+                continue
+            worst = max(worst, abs(a - num) / max(abs(a), abs(num), 1.0))
+    dworst = 0.0
+    for t in range(4):
+        for r in range(4):
+            X = [list(row) for row in X4C]
+            old = X[t][r]
+            X[t][r] = old + eps
+            up = _w5c_loss(model, X)
+            X[t][r] = old - eps
+            dn = _w5c_loss(model, X)
+            X[t][r] = old
+            num = (up - dn) / (2 * eps)
+            a = dx_ana[t][r]
+            if abs(a) < 1e-9 and abs(num) < 1e-9:
+                continue
+            dworst = max(dworst, abs(a - num) / max(abs(a), abs(num), 1.0))
+    return worst, dworst
+
+
+class TestBigBirdAttention:
+    def test_shape_and_params(self):
+        m = AI.BigBirdAttention(4, 2, window_size=1, num_global=1, num_random=1,
+                                seed=1)
+        out = m.forward(X4C)
+        assert len(out) == 4 and len(out[0]) == 4
+        assert m.param_count() == 4 * 4 * 4 + 4 * 4  # 80
+        assert len(m._cache) == 2  # 两个头
+
+    def test_sparse_pattern(self):
+        m = AI.BigBirdAttention(4, 2, window_size=1, num_global=1, num_random=0,
+                                seed=3)
+        m.forward(X4C)
+        allow = m._cache[0]['allow']
+        p = m._cache[0]['p']
+        # 只允许窗口 + 全局 0
+        assert allow[0] == [0, 1]
+        assert all(0 in allow[t] for t in range(4))
+        # 未允许的位置权重恰为 0，每行和为 1
+        for t in range(4):
+            for j in range(4):
+                if j not in allow[t]:
+                    assert p[t][j] == 0.0
+            assert abs(sum(p[t]) - 1.0) < 1e-12
+
+    def test_causal_mask(self):
+        m = AI.BigBirdAttention(4, 2, window_size=2, num_global=1, num_random=1,
+                                causal=True, seed=5)
+        m.forward(X4C)
+        p = m._cache[0]['p']
+        for t in range(4):
+            for j in range(t + 1, 4):
+                assert p[t][j] == 0.0
+            assert abs(sum(p[t]) - 1.0) < 1e-12
+
+    def test_gradients(self):
+        m = AI.BigBirdAttention(4, 2, window_size=1, num_global=1, num_random=1,
+                                seed=2)
+        wp, wd = _w5c_grad_ok(m)
+        assert wp < 1e-5, wp
+        assert wd < 1e-5, wd
+        # causal 下 t=0 只有一个可见位置：ds 恒为 0，但 dv 必须仍然正确
+        mc = AI.BigBirdAttention(4, 2, window_size=2, num_global=1, num_random=1,
+                                 causal=True, seed=2)
+        wpc, wdc = _w5c_grad_ok(mc)
+        assert wpc < 1e-5, wpc
+        assert wdc < 1e-5, wdc
+
+    def test_full_pattern_equals_dense(self):
+        m = AI.BigBirdAttention(4, 2, window_size=10, num_global=4, num_random=0)
+        out = m.forward(X4C)
+        p = m._cache[0]['p']
+        # 全连通时权重就是普通 softmax：每行和为 1 且全非零
+        assert abs(sum(p[0]) - 1.0) < 1e-12
+        assert all(p[0][j] > 0.0 for j in range(4))
+        assert len(out) == 4
+
+    def test_accumulate_and_optimizers(self):
+        m = AI.BigBirdAttention(4, 2, window_size=1, num_global=1, num_random=1,
+                                seed=1)
+        m.zero_grad()
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        g1 = m.grads['W_q'][0][0]
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        assert abs(m.grads['W_q'][0][0] - 2 * g1) < 1e-12
+        m.zero_grad()
+        assert m.grads['W_q'][0][0] == 0.0
+        before = [list(r) for r in m.W_q]
+        m.forward(X4C)
+        m.backward(DOUT4C)
+        m.sgd_step(0.01)
+        assert m.W_q != before
+        m.adam_step(0.001)
+        assert m.W_q != before
+
+    def test_errors(self):
+        for fn in (lambda: AI.BigBirdAttention(0, 2),
+                   lambda: AI.BigBirdAttention(4, 0),
+                   lambda: AI.BigBirdAttention(5, 2),
+                   lambda: AI.BigBirdAttention(4, 2, window_size=-1),
+                   lambda: AI.BigBirdAttention(4, 2, window_size=1.5),
+                   lambda: AI.BigBirdAttention(4, 2, num_global=-1),
+                   lambda: AI.BigBirdAttention(4, 2, num_random=True),
+                   lambda: AI.BigBirdAttention(4, 2, seed=1.2)):
+            with pytest.raises((ValueError, TypeError)):
+                fn()
+        m = AI.BigBirdAttention(4, 2)
+        with pytest.raises(RuntimeError):
+            m.backward(DOUT4C)
+        with pytest.raises(ValueError):
+            m.forward([])
+        with pytest.raises(ValueError):
+            m.forward([[1.0, 2.0]])
+        m.forward(X4C)
+        with pytest.raises(ValueError):
+            m.backward(DOUT4C[:2])
+
+
+class TestLongformerAttention:
+    def test_global_tokens_see_all(self):
+        m = AI.LongformerAttention(4, 2, window_size=1, global_tokens=[0, 2])
+        m.forward(X4C)
+        allow = m._cache[0]['allow']
+        assert allow[0] == [0, 1, 2, 3]
+        assert allow[2] == [0, 1, 2, 3]
+        assert allow[3] == [0, 2, 3]
+        p = m._cache[0]['p']
+        assert all(p[0][j] > 0.0 for j in range(4))
+
+    def test_window_and_shape(self):
+        m = AI.LongformerAttention(4, 2, window_size=1, global_tokens=[0])
+        out = m.forward(X4C)
+        assert len(out) == 4 and len(out[0]) == 4
+        assert m.param_count() == 80
+
+    def test_gradients(self):
+        m = AI.LongformerAttention(4, 2, window_size=1, global_tokens=[0, 2])
+        wp, wd = _w5c_grad_ok(m)
+        assert wp < 1e-5, wp
+        assert wd < 1e-5, wd
+
+    def test_causal(self):
+        m = AI.LongformerAttention(4, 2, window_size=1, global_tokens=[0],
+                                   causal=True)
+        m.forward(X4C)
+        p = m._cache[0]['p']
+        for j in range(4):
+            assert p[0][j] > 0.0  # 全局 token 看见全部
+        for t in range(1, 4):
+            for j in range(t + 1, 4):
+                assert p[t][j] == 0.0
+        wp, wd = _w5c_grad_ok(m)
+        assert wp < 1e-5, wp
+        assert wd < 1e-5, wd
+
+    def test_errors(self):
+        for fn in (lambda: AI.LongformerAttention(4, 2, window_size=-2),
+                   lambda: AI.LongformerAttention(4, 2, global_tokens=[-1]),
+                   lambda: AI.LongformerAttention(4, 2, global_tokens=[0.5]),
+                   lambda: AI.LongformerAttention(4, 2, window_size=1.5)):
+            with pytest.raises((ValueError, TypeError)):
+                fn()
+
+
+class TestReformerAttention:
+    def test_bucket_semantics(self):
+        m = AI.ReformerAttention(4, 2, num_buckets=2, seed=1)
+        m.forward(X4C)
+        p = m._cache[0]['p']
+        bk = m._buckets
+        for t in range(4):
+            for j in range(4):
+                if bk[j] != bk[t]:
+                    assert p[t][j] == 0.0
+            assert abs(sum(p[t]) - 1.0) < 1e-12
+
+    def test_single_bucket_equals_dense(self):
+        one = AI.ReformerAttention(4, 2, num_buckets=1)
+        one.forward(X4C)
+        p = one._cache[0]['p']
+        # num_buckets=1 ⇒ 全都同桶 ⇒ 权重退化成普通 softmax（每行全非零）
+        assert all(p[t][j] > 0.0 for t in range(4) for j in range(4))
+        assert one.param_count() == 80
+        # 换成 4 个桶时，同桶外的位置必须被挡住
+        many = AI.ReformerAttention(4, 2, num_buckets=4, seed=2)
+        many.forward(X4C)
+        pm = many._cache[0]['p']
+        bk = many._buckets
+        zeros = sum(1 for t in range(4) for j in range(4)
+                    if bk[j] != bk[t] and pm[t][j] == 0.0)
+        assert zeros >= 4
+
+    def test_gradients(self):
+        for causal in (False, True):
+            m = AI.ReformerAttention(4, 2, num_buckets=2, causal=causal, seed=1)
+            wp, wd = _w5c_grad_ok(m)
+            assert wp < 1e-5, (causal, wp)
+            assert wd < 1e-5, (causal, wd)
+
+    def test_hash_deterministic(self):
+        a = AI.ReformerAttention(4, 2, num_buckets=2, seed=1)
+        a.forward(X4C)
+        b = AI.ReformerAttention(4, 2, num_buckets=2, seed=1)
+        assert a.hash_proj == b.hash_proj
+        b.forward(X4C)
+        assert a._buckets == b._buckets
+
+    def test_errors(self):
+        for fn in (lambda: AI.ReformerAttention(4, 2, num_buckets=0),
+                   lambda: AI.ReformerAttention(4, 2, num_buckets=True),
+                   lambda: AI.ReformerAttention(4, 2, seed=1.5)):
+            with pytest.raises((ValueError, TypeError)):
+                fn()
