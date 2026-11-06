@@ -25133,18 +25133,25 @@ class DDPM:
     """最小 DDPM（去噪扩散概率模型）
 
     前向：x_t = sqrt(abar_t)*x0 + sqrt(1-abar_t)*noise
-    训练：给网络 (x_t, t) 让它预测 noise，损失是逐维 MSE
-    采样：从 x_T ~ N(0,1) 逐步反向去噪
+    训练：给网络 (x_t, t) 让它预测 ``prediction`` 指定的量（噪声 / v / x0），损失是逐维 MSE
+    采样：``sample()`` 是 DDPM（随机，用全部 steps）；``ddim_sample()`` 是 DDIM
+    （``eta=0`` 时确定性、可只走 ``steps`` 中的一部分子序列）
+    min-SNR：``train_step(..., min_snr_gamma=g)`` 按 ``min(SNR, g)/SNR`` 加权
     """
 
     def __init__(self, data_dim: int, hidden_dim: int = 32, steps: int = 50,
-                 beta_start: float = 1e-4, beta_end: float = 0.02, t_dim: int = 8):
+                 beta_start: float = 1e-4, beta_end: float = 0.02, t_dim: int = 8,
+                 prediction: str = "eps"):
         for name, value in (("data_dim", data_dim), ("hidden_dim", hidden_dim),
                             ("steps", steps), ("t_dim", t_dim)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"DDPM: {name} 必须是 >= 1 的整数")
         if not 0.0 < beta_start < beta_end < 1.0:
             raise ValueError("DDPM: 需要 0 < beta_start < beta_end < 1")
+        if prediction not in ("eps", "v", "x0"):
+            raise ValueError("DDPM: prediction 只能是 'eps' / 'v' / 'x0'，"
+                             f"收到 {prediction!r}")
+        self.prediction = prediction
         self.data_dim = data_dim
         self.hidden_dim = hidden_dim
         self.steps = steps
@@ -25206,10 +25213,56 @@ class DDPM:
         h2 = self.l2.forward(h1)
         return self.l3.forward(h2)
 
-    def train_step(self, x0, rng=None, t=None, noise=None):
-        """一步训练：随机取 t 与噪声，预测噪声并累积梯度。
+    def target(self, x0, noise, t):
+        """训练目标：``eps`` 预测噪声、``v`` 预测 ``sqrt(abar)*eps - sqrt(1-abar)*x0``、
+        ``x0`` 直接预测原样本"""
+        if t < 0 or t >= self.steps:
+            raise ValueError(f"DDPM.target: 步数 t 必须在 [0, {self.steps})")
+        a = math.sqrt(self.abar[t])
+        b = math.sqrt(1.0 - self.abar[t])
+        if self.prediction == "eps":
+            return list(noise)
+        if self.prediction == "v":
+            return [a * noise[i] - b * x0[i] for i in range(self.data_dim)]
+        return list(x0)
+
+    def min_snr_weight(self, t, gamma: float = 5.0):
+        """min-SNR 损失权重 ``min(SNR, gamma) / SNR``（eps 预测）；``x0`` 预测用互补形式"""
+        if t < 0 or t >= self.steps:
+            raise ValueError(f"DDPM.min_snr_weight: 步数 t 必须在 [0, {self.steps})")
+        if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+            raise ValueError("DDPM.min_snr_weight: gamma 必须是数字")
+        gamma = float(gamma)
+        if not gamma > 0.0:
+            raise ValueError("DDPM.min_snr_weight: gamma 必须 > 0")
+        ab = self.abar[t]
+        snr = ab / max(1e-12, 1.0 - ab)
+        if self.prediction == "x0":
+            # x0 预测的信噪比倒数：低噪声步权重更大
+            snr = 1.0 / max(1e-12, snr)
+        return min(snr, gamma) / max(1e-12, snr)
+
+    def pred_to_x0_eps(self, pred, x_t, t):
+        """把网络输出（按 ``prediction`` 解释）换成 ``(x0, eps)`` 两个量"""
+        a = math.sqrt(self.abar[t])
+        b = math.sqrt(1.0 - self.abar[t])
+        if self.prediction == "eps":
+            eps = list(pred)
+            x0 = [(x_t[i] - b * eps[i]) / max(1e-12, a) for i in range(self.data_dim)]
+            return x0, eps
+        if self.prediction == "v":
+            x0 = [a * x_t[i] - b * pred[i] for i in range(self.data_dim)]
+            eps = [a * pred[i] + b * x_t[i] for i in range(self.data_dim)]
+            return x0, eps
+        x0 = list(pred)
+        eps = [(x_t[i] - a * x0[i]) / max(1e-12, b) for i in range(self.data_dim)]
+        return x0, eps
+
+    def train_step(self, x0, rng=None, t=None, noise=None, min_snr_gamma=None):
+        """一步训练：随机取 t 与噪声，按 ``prediction`` 求目标并累积梯度。
 
         `t` / `noise` 显式给出时用于测试（固定随机性做中心差分）。
+        ``min_snr_gamma`` 给定时按 min-SNR 加权（eps 预测）。
         """
         if not isinstance(x0, (list, tuple)) or len(x0) != self.data_dim:
             raise ValueError(f"DDPM.train_step: x0 维度应为 {self.data_dim}")
@@ -25220,9 +25273,12 @@ class DDPM:
             noise = _gauss_vec(self.data_dim, r)
         x_t = self.q_sample(x0, t, noise)
         pred = self.predict_noise(x_t, t)
+        tgt = self.target(x0, noise, t)
         n = self.data_dim
-        loss = sum((pred[i] - noise[i]) ** 2 for i in range(n)) / n
-        d_pred = [2.0 * (pred[i] - noise[i]) / n for i in range(n)]
+        w = 1.0 if min_snr_gamma is None else self.min_snr_weight(
+            t, min_snr_gamma)
+        loss = w * sum((pred[i] - tgt[i]) ** 2 for i in range(n)) / n
+        d_pred = [2.0 * w * (pred[i] - tgt[i]) / n for i in range(n)]
         gw3, gb3, d2 = self.l3.backward(d_pred)
         gw2, gb2, d1 = self.l2.backward(d2)
         gw1, gb1, _ = self.l1.backward(d1)
@@ -25280,17 +25336,69 @@ class DDPM:
         for _ in range(n):
             x = _gauss_vec(self.data_dim, r)
             for t in range(self.steps - 1, -1, -1):
-                eps_pred = self.predict_noise(x, t)
+                _x0_pred, eps_pred = self.pred_to_x0_eps(
+                    self.predict_noise(x, t), x, t)
                 a = self.alphas[t]
-                ab = self.abar[t]
-                mean = [(x[i] - (1.0 - a) / math.sqrt(max(1e-12, 1.0 - ab)) * eps_pred[i])
-                        / math.sqrt(a) for i in range(self.data_dim)]
+                mean = [(x[i] - (1.0 - a) / math.sqrt(max(1e-12, 1.0 - self.abar[t]))
+                         * eps_pred[i]) / math.sqrt(a) for i in range(self.data_dim)]
                 if t > 0:
                     sigma = math.sqrt(self.betas[t])
                     z = _gauss_vec(self.data_dim, r)
                     x = [mean[i] + sigma * z[i] for i in range(self.data_dim)]
                 else:
                     x = mean
+            out.append(x)
+        return out
+
+    def ddim_sample(self, n=1, rng=None, steps=None, eta=0.0):
+        """DDIM 采样：``eta=0`` 完全确定性，且可以只走 ``steps`` 个时间点的子序列
+
+        更新式：``x_prev = sqrt(abar_prev)*x0_pred
+        + sqrt(1-abar_prev-sigma^2)*eps_pred + sigma*z``，
+        ``sigma = eta*sqrt((1-abar_prev)/(1-abar_t))*sqrt(1-abar_t/abar_prev)``。
+        """
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("DDPM.ddim_sample: n 必须是 >= 1 的整数")
+        if isinstance(eta, bool) or not isinstance(eta, (int, float)):
+            raise ValueError("DDPM.ddim_sample: eta 必须是数字")
+        eta = float(eta)
+        if not 0.0 <= eta <= 1.0:
+            raise ValueError("DDPM.ddim_sample: eta 必须在 [0, 1]")
+        if steps is None:
+            seq = list(range(self.steps - 1, -1, -1))
+        else:
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+                raise ValueError("DDPM.ddim_sample: steps 必须是 >= 1 的整数")
+            if steps > self.steps:
+                raise ValueError("DDPM.ddim_sample: steps 不能超过训练步数")
+            # 等距子序列，必须包含 t=0
+            seq = sorted({int(round(i * (self.steps - 1) / max(1, steps - 1)))
+                          for i in range(steps)}, reverse=True)
+        r = rng or random
+        out = []
+        for _ in range(n):
+            x = _gauss_vec(self.data_dim, r)
+            for idx, t in enumerate(seq):
+                x0_pred, eps_pred = self.pred_to_x0_eps(
+                    self.predict_noise(x, t), x, t)
+                if idx + 1 < len(seq):
+                    t_prev = seq[idx + 1]
+                    ab_prev = self.abar[t_prev]
+                else:
+                    t_prev = -1
+                    ab_prev = 1.0
+                ab_t = self.abar[t]
+                sigma = 0.0
+                if eta > 0.0 and t > 0:
+                    sigma = eta * math.sqrt(
+                        max(0.0, (1.0 - ab_prev) / max(1e-12, 1.0 - ab_t))
+                        * max(0.0, 1.0 - ab_t / max(1e-12, ab_prev)))
+                dir_coef = math.sqrt(max(0.0, 1.0 - ab_prev - sigma ** 2))
+                x = [math.sqrt(ab_prev) * x0_pred[i] + dir_coef * eps_pred[i]
+                     for i in range(self.data_dim)]
+                if sigma > 0.0:
+                    z = _gauss_vec(self.data_dim, r)
+                    x = [x[i] + sigma * z[i] for i in range(self.data_dim)]
             out.append(x)
         return out
 

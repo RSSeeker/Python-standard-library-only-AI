@@ -210,7 +210,7 @@
 - [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）
-- [ ] 扩散：`DDIM`、`v-prediction` / `x0-prediction` / `Min-SNR` 加权（DDPM 已有）
+- [x] 扩散：`DDPM(prediction="eps"|"v"|"x0")` + `target`/`pred_to_x0_eps` 互逆、`ddim_sample(steps=, eta=)` 确定性子序列采样、`train_step(min_snr_gamma=)` 的 `min(SNR,γ)/SNR` 加权（加权后 loss 恰为 `w×` 原 loss，实测 1.2174 → 0.8197）
 - [ ] `VQVAE`（码本 + straight-through）
 - [ ] `FlowMatching` / `RectifiedFlow`
 - [ ] GAN 变体：DCGAN / WGAN / WGAN-GP / LSGAN / Hinge / R1-R2 / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive

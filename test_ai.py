@@ -16121,3 +16121,93 @@ class TestPagedKVCache:
             m.append(a, 0, [[1.0]], self._row(2))
         with pytest.raises(ValueError):
             m.append(a, 0, self._row(1), [[1.0]])
+
+
+# ====  ======================================================================
+#   扩散采样与预测参数化（W8-A）
+# ============================================================================
+
+class TestDDIMSampling:
+    def test_deterministic_eta0(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        a = m.ddim_sample(1, rng=random.Random(5), eta=0.0)
+        b = m.ddim_sample(1, rng=random.Random(5), eta=0.0)
+        assert a == b
+        c = m.ddim_sample(1, rng=random.Random(5), eta=1.0)
+        assert c == m.ddim_sample(1, rng=random.Random(5), eta=1.0)
+        assert c != a
+
+    def test_subset_steps(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=12, t_dim=4)
+        full = m.ddim_sample(1, rng=random.Random(3), steps=12, eta=0.0)
+        sub = m.ddim_sample(1, rng=random.Random(3), steps=4, eta=0.0)
+        one = m.ddim_sample(1, rng=random.Random(3), steps=1, eta=0.0)
+        assert full != sub
+        assert all(abs(v) < 1e6 for v in sub[0] + one[0])
+
+    def test_validation(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=6, t_dim=4)
+        with pytest.raises(ValueError):
+            m.ddim_sample(0)
+        with pytest.raises(ValueError):
+            m.ddim_sample(True)
+        with pytest.raises(ValueError):
+            m.ddim_sample(1, eta=-0.1)
+        with pytest.raises(ValueError):
+            m.ddim_sample(1, eta=1.5)
+        with pytest.raises(ValueError):
+            m.ddim_sample(1, steps=0)
+        with pytest.raises(ValueError):
+            m.ddim_sample(1, steps=m.steps + 1)
+
+
+class TestPredictionTypes:
+    def test_target_and_inverse(self):
+        x0, noise, t = [0.5, -0.3], [1.0, -1.0], 3
+        for pred in ("eps", "v", "x0"):
+            m = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4, prediction=pred)
+            xt = m.q_sample(x0, t, noise)
+            tgt = m.target(x0, noise, t)
+            back_x0, back_eps = m.pred_to_x0_eps(tgt, xt, t)
+            assert max(abs(a - b) for a, b in zip(back_x0, x0)) < 1e-10
+            assert max(abs(a - b) for a, b in zip(back_eps, noise)) < 1e-10
+
+    def test_eps_target_is_noise(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        assert m.target([0.5, -0.3], [1.0, -1.0], 2) == [1.0, -1.0]
+
+    def test_bad_prediction(self):
+        with pytest.raises(ValueError):
+            AI.DDPM(2, prediction="ve")
+        with pytest.raises(ValueError):
+            AI.DDPM(2, prediction=None)
+
+
+class TestMinSNR:
+    def test_weight_shape(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        ws = [m.min_snr_weight(t, 5.0) for t in range(m.steps)]
+        assert all(0.0 < w <= 1.0 for w in ws)
+        # 噪声越大（t 越大）权重越大
+        assert all(ws[i] <= ws[i + 1] + 1e-12 for i in range(len(ws) - 1))
+        # gamma 越小、权重越不放大
+        small = [m.min_snr_weight(t, 0.5) for t in range(m.steps)]
+        assert all(small[i] <= ws[i] + 1e-12 for i in range(len(ws)))
+
+    def test_loss_scaled_by_weight(self):
+        m1 = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        m2 = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        for a, b in zip(m1.layers, m2.layers):
+            b.weights = [row[:] for row in a.weights]
+            b.biases = list(a.biases)
+        base = m1.train_step([0.5, -0.3], t=4, noise=[1.0, -1.0])
+        w = m2.min_snr_weight(4, 5.0)
+        wtd = m2.train_step([0.5, -0.3], t=4, noise=[1.0, -1.0],
+                            min_snr_gamma=5.0)
+        assert abs(wtd - w * base) < 1e-12
+
+    def test_validation(self):
+        m = AI.DDPM(2, hidden_dim=8, steps=8, t_dim=4)
+        for bad in (0.0, -1.0, True, "x"):
+            with pytest.raises((ValueError, TypeError)):
+                m.min_snr_weight(0, bad)

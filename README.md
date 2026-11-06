@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1025 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1034 项）
 
 ## 特性
 
@@ -258,7 +258,7 @@ model.train()     # 回到训练
 | `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
 | `VAE(input_dim, hidden_dim=32, latent_dim=2, beta=1.0)` | 变分自编码器：重参数化采样 `z = mu + eps·std`，损失 = 重构 MSE + `beta·KL`；`fit` / `sample` |
 | `GAN(input_dim, hidden_dim=32, latent_dim=2)` | 生成对抗网络：D 用 sigmoid + BCE，G 的梯度经 D 反传（`d_out = -1/p`）；`step` 一次更新 D 与 G |
-| `DDPM(data_dim, hidden_dim=32, steps=50)` | 扩散模型：线性 beta 表 + 累积 `abar`；`q_sample` 加噪、`predict_noise` 预测噪声、`sample` 反向去噪 |
+| `DDPM(data_dim, hidden_dim=32, steps=50, prediction="eps")` | 扩散模型：线性 beta 表 + 累积 `abar`；`prediction` 可选 `eps`/`v`/`x0`（`target()` 与 `pred_to_x0_eps()` 互为反函数）；`q_sample` 加噪、`sample` DDPM 反向去噪、`ddim_sample(steps=, eta=)` 确定性 DDIM（可只走子序列）；`train_step(..., min_snr_gamma=)` 按 `min(SNR, γ)/SNR` 加权 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` / `window=N` / `alibi=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` / `window` 会传给每一层） |
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
@@ -975,7 +975,7 @@ samples = ddpm.sample(8)
 ```
 
 三者的梯度都用中心差分验证过（`dec2`/`enc2`、D 与 G、扩散网络的输出层），
-训练曲线在探针里分别降 6.9×、把生成均值从 3.16 拉到 1.75、降 4.4×。DDPM 的
+训练曲线在探针里分别降 6.9×、把生成均值从 3.16 拉到 1.75、降 4.4×。采样端另有 `ddim_sample(steps=20, eta=0)`：`eta=0` 时完全确定性、且只需训练步数的一个子序列。DDPM 的
 `train_step` 允许显式传入 `t` 与 `noise`，就是为了让测试能固定随机性做差分。
 
 ## 序列标注与多标签分类
@@ -1117,7 +1117,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1025 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1034 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1142,6 +1142,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
 | `TestDDPM` | `q_sample` 与公式逐位一致、`t`/`x0`/`noise` 三类校验、噪声预测层梯度中心差分、150 轮训练降 2.5 倍、反向采样有限且均值在数据尺度内 |
+| `TestDDIMSampling` | `eta=0` 同 seed 逐位相同、`eta=1` 引入随机、子序列 `steps` 与全步不同但有限、`n`/`eta`/`steps` 非法值 |
+| `TestPredictionTypes` | `eps`/`v`/`x0` 三种参数的 `target()` 都能被 `pred_to_x0_eps()` 反解回 `(x0, eps)`、`eps` 目标就是噪声、非法 `prediction` |
+| `TestMinSNR` | 权重 ∈ (0,1] 且随 t 单调、`γ` 越小越不放大、加权后 loss 恰为 `w×` 原 loss、非法 `γ` |
 | `TestProfileModel` | 层数/总耗时/参数量、逐层耗时之和等于总耗时、反向统计、`Model` 自动解包、非法 repeat 与非网络报错 |
 | `TestLRFinder` | history 长度与等比增长、`suggested_lr` 落在区间内、`optimizer.lr` 恢复、同 seed 可复现、全程下降时的提示、六类非法参数 |
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
@@ -1308,7 +1311,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1025 个单元测试
+├── test_ai.py       # 1034 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
