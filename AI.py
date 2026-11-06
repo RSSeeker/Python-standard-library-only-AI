@@ -20186,6 +20186,341 @@ class Adafactor:
 
 
 # ============================================================================
+#  More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam（W9-A）
+# ============================================================================
+
+def _w9_check(who, lr, betas=(), eps=None):
+    """W9 优化器的公共参数校验（不接 bool，不接 nan/inf）"""
+    if not _is_num(lr) or lr < 0:
+        raise ValueError(f"{who}: lr 必须是非负有限数字，收到 {lr!r}")
+    for name, b in betas:
+        if not _is_num(b) or not 0.0 <= b < 1.0:
+            raise ValueError(f"{who}: {name} 必须在 [0,1)，收到 {b!r}")
+    if eps is not None and (not _is_num(eps) or eps <= 0.0):
+        raise ValueError(f"{who}: eps 必须 > 0，收到 {eps!r}")
+
+
+def _w9_get(a, j, i):
+    return a[j] if i is None else a[j][i]
+
+
+def _w9_set(a, j, i, v):
+    if i is None:
+        a[j] = v
+    else:
+        a[j][i] = v
+
+
+def _w9_zeros(layer, kind):
+    if kind == 'w':
+        return [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+    return [0.0] * layer.fan_out
+
+
+def _w9_copy(obj):
+    """深拷贝嵌套 list（state_dict 必须交出快照，不能交活引用）
+
+    否则常见用法会把两个优化器**别名**到同一份状态上：
+    `blob = opt_a.state_dict(); opt_b.load_state_dict(blob)` 之后
+    两边共享同一批 list，进一步训练 opt_a 会顺手改掉 opt_b 的状态。
+    """
+    if isinstance(obj, list):
+        return [_w9_copy(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _w9_copy(v) for k, v in obj.items()}
+    return obj
+
+
+def _w9_check_state(st, layer, kind, who):
+    """校验载入的状态形状与层匹配（形状不符会让 step 里静默算错）"""
+    if kind == 'b':
+        if not isinstance(st, list) or len(st) != layer.fan_out:
+            raise ValueError(
+                f"{who}: 偏置状态长度必须是 fan_out={layer.fan_out}")
+        for v in st:
+            if not _is_num(v):
+                raise ValueError(f"{who}: 偏置状态里有非数字 {v!r}")
+        return
+    if not isinstance(st, list) or len(st) != layer.fan_out:
+        raise ValueError(f"{who}: 权重状态行数必须是 fan_out={layer.fan_out}")
+    for row in st:
+        if not isinstance(row, list) or len(row) != layer.fan_in:
+            raise ValueError(f"{who}: 权重状态列数必须是 fan_in={layer.fan_in}")
+        for v in row:
+            if not _is_num(v):
+                raise ValueError(f"{who}: 权重状态里有非数字 {v!r}")
+
+
+class _StatefulOptimizer:
+    """带「每参数独立状态」的优化器基类（W9-A 引入）
+
+    Adam 一族把两个矩直接存在 layer 上（`m_w`/`v_w`/`m_b`/`v_b`），够用且能随
+    `_optimizer_state` 一起存档。AdaGrad / AdaDelta 这类每个参数要 1–2 个**额外**
+    累积量，塞进 layer 会污染层结构，因此状态放在优化器实例的 `state` 字典里，
+    键是 `(层号, 'w'|'b')`，用到时才创建（惰性）。
+
+    `state_dict()` / `load_state_dict()` 用于断点续训：Adam 那套状态挂在 layer 上
+    所以能进模型存档，这套必须单独存。
+    """
+
+    name = "stateful"
+
+    def __init__(self, model, lr):
+        self.model = model
+        self.lr = float(lr)
+        self.step_count = 0
+        self.state = {}
+
+    def _ensure(self, idx, kind, layer):
+        key = (idx, kind)
+        st = self.state.get(key)
+        if st is None:
+            st = self._new_state(layer, kind)
+            self.state[key] = st
+        return st
+
+    def _new_state(self, layer, kind):
+        raise NotImplementedError
+
+    def _prepare(self):
+        """每步开头算一次只依赖 step_count 的系数（子类覆盖）"""
+
+    def _increment(self, st, g, j, i):
+        """返回该参数本步的「减量」（正数表示沿负梯度方向前进）"""
+        raise NotImplementedError
+
+    def step(self, all_grads):
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError(
+                f"{self.name}.step: 梯度层数 {len(all_grads)} 与模型层数 "
+                f"{len(self.model.layers)} 不一致")
+        self.step_count += 1
+        self._prepare()
+        for idx, (layer, (grad_w, grad_b)) in enumerate(
+                zip(self.model.layers, all_grads)):
+            st_b = self._ensure(idx, 'b', layer)
+            st_w = self._ensure(idx, 'w', layer)
+            for j in range(layer.fan_out):
+                layer.biases[j] -= self._increment(st_b, grad_b[j], j, None)
+                row_g, row_W = grad_w[j], layer.weights[j]
+                for i in range(layer.fan_in):
+                    row_W[i] -= self._increment(st_w, row_g[i], j, i)
+
+    def state_dict(self):
+        items = sorted(self.state.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+        return {
+            "optimizer": self.name,
+            "lr": self.lr,
+            "step_count": self.step_count,
+            "state": {f"{idx}:{kind}": _w9_copy(st)
+                      for (idx, kind), st in items},
+        }
+
+    def load_state_dict(self, blob):
+        if not isinstance(blob, dict):
+            raise ValueError(
+                f"{self.name}: state_dict 必须是 dict，收到 {type(blob).__name__}")
+        owner = blob.get("optimizer")
+        if owner not in (None, self.name):
+            raise ValueError(f"{self.name}: state_dict 属于 {owner!r} 的优化器")
+        state = blob.get("state", {})
+        if not isinstance(state, dict):
+            raise ValueError(f"{self.name}: state 字段必须是 dict")
+        parsed = {}
+        for key, st in state.items():
+            idx_s, _, kind = str(key).partition(":")
+            try:
+                idx = int(idx_s)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 不是 '层号:w|b' 形式")
+            if kind not in ("w", "b"):
+                raise ValueError(f"{self.name}: 状态键 {key!r} 的参数类型必须是 w/b")
+            if not 0 <= idx < len(self.model.layers):
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 指向不存在的层（共 "
+                    f"{len(self.model.layers)} 层）")
+            copied = _w9_copy(st)
+            # 每个字段（s/u/m/v）都要与层形状一致
+            if not isinstance(copied, dict) or not copied:
+                raise ValueError(
+                    f"{self.name}: 状态键 {key!r} 的值必须是非空 dict")
+            layer = self.model.layers[idx]
+            for field, arr in copied.items():
+                _w9_check_state(arr, layer, kind,
+                                f"{self.name}.load_state_dict[{key}.{field}]")
+            parsed[(idx, kind)] = copied
+        t = blob.get("step_count", 0)
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+            raise ValueError(f"{self.name}: step_count 必须是非负整数，收到 {t!r}")
+        self.state = parsed
+        self.step_count = t
+        if "lr" in blob:
+            self.lr = float(blob["lr"])
+        return self
+
+
+class AdaGrad(_StatefulOptimizer):
+    """AdaGrad（2011）：按历史梯度平方和逐参数衰减步长
+
+    ``s += g * g``；``p -= lr * g / (sqrt(s) + eps)``。
+
+    它是**单调不增步长**的：某个方向历史上梯度越大，之后迈的步子越小。
+    好处是不用调 lr 也能在稀疏梯度上快速推进；坏处是训练中期容易过早停滞
+    （s 只增不减，步长一路单调衰减），这也是后来 RMSprop/Adam 出现的原因。
+    """
+
+    name = "adagrad"
+
+    def __init__(self, model: MLP, lr: float = 0.01, eps: float = 1e-8):
+        _w9_check("AdaGrad", lr, eps=eps)
+        super().__init__(model, lr)
+        self.eps = float(eps)
+
+    def _new_state(self, layer, kind):
+        return {"s": _w9_zeros(layer, kind)}
+
+    def _increment(self, st, g, j, i):
+        s = _w9_get(st["s"], j, i) + g * g
+        _w9_set(st["s"], j, i, s)
+        return self.lr * g / (math.sqrt(s) + self.eps)
+
+
+class AdaDelta(_StatefulOptimizer):
+    """AdaDelta（2012）：用「更新量平方的滑动平均」替掉全局学习率
+
+    ``s = rho * s + (1-rho) * g^2``、
+    ``dx = sqrt(u + eps) / sqrt(s + eps) * g``、
+    ``u = rho * u + (1-rho) * dx^2``，然后 ``p -= lr * dx``。
+
+    分子 u 与分母 s 都是「梯度的平方」量纲，商是无量纲的，所以算法对梯度的
+    整体缩放不变（把梯度乘 10，dx 乘 10 后 u 乘 100，比值不变）。因此默认
+    ``lr=1.0`` 就有意义，不需要按任务调。
+    """
+
+    name = "adadelta"
+
+    def __init__(self, model: MLP, lr: float = 1.0, rho: float = 0.95,
+                 eps: float = 1e-6):
+        if not _is_num(rho) or not 0.0 <= rho < 1.0:
+            raise ValueError(f"AdaDelta: rho 必须在 [0,1)，收到 {rho!r}")
+        _w9_check("AdaDelta", lr, eps=eps)
+        super().__init__(model, lr)
+        self.rho = float(rho)
+        self.eps = float(eps)
+
+    def _new_state(self, layer, kind):
+        return {"s": _w9_zeros(layer, kind), "u": _w9_zeros(layer, kind)}
+
+    def _increment(self, st, g, j, i):
+        rho, eps = self.rho, self.eps
+        s = rho * _w9_get(st["s"], j, i) + (1.0 - rho) * g * g
+        _w9_set(st["s"], j, i, s)
+        dx = math.sqrt(_w9_get(st["u"], j, i) + eps) / math.sqrt(s + eps) * g
+        u = rho * _w9_get(st["u"], j, i) + (1.0 - rho) * dx * dx
+        _w9_set(st["u"], j, i, u)
+        return self.lr * dx
+
+
+class Nadam(_StatefulOptimizer):
+    """Nadam（Dozat 2016）：Adam + Nesterov 动量
+
+    ``m = b1*m + (1-b1)*g``、``v = b2*v + (1-b2)*g^2``、
+    ``m_hat = m/(1-b1^t)``、``v_hat = v/(1-b2^t)``，
+    更新方向是 ``b1*m_hat + (1-b1)*g/(1-b1^t)``。
+
+    与 Adam 的差别只在分子：除了平滑动量还额外加了一份**当前梯度**，
+    等价于「先沿动量方向走半步、再按当前梯度修正」（Nesterov 的味道）。
+    ``b1=0`` 时退化成 RMSprop 式（``g/(sqrt(v_hat)+eps)``）。
+    """
+
+    name = "nadam"
+
+    def __init__(self, model: MLP, lr: float = 1e-3, beta1: float = 0.9,
+                 beta2: float = 0.999, eps: float = 1e-8):
+        _w9_check("Nadam", lr, (("beta1", beta1), ("beta2", beta2)), eps=eps)
+        super().__init__(model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
+
+    def _prepare(self):
+        b1, b2, t = self.beta1, self.beta2, self.step_count
+        self._c1 = 1.0 - b1 ** t
+        self._c2 = 1.0 - b2 ** t
+
+    def _increment(self, st, g, j, i):
+        b1, b2 = self.beta1, self.beta2
+        m = b1 * _w9_get(st["m"], j, i) + (1.0 - b1) * g
+        v = b2 * _w9_get(st["v"], j, i) + (1.0 - b2) * g * g
+        _w9_set(st["m"], j, i, m)
+        _w9_set(st["v"], j, i, v)
+        c1, c2 = self._c1, self._c2
+        num = b1 * (m / c1) + (1.0 - b1) * g / c1
+        return self.lr * num / (math.sqrt(v / c2) + self.eps)
+
+
+class RAdam(_StatefulOptimizer):
+    """RAdam（2019）：按「二阶矩的可信度」自动决定用不用自适应步长
+
+    定义 ``rho_inf = 2/(1-b2) - 1``、
+    ``rho_t = rho_inf - 2*t*b2^t/(1-b2^t)``。
+    ``rho_t > 4`` 时二阶矩已统计到足够多方向，用带修正因子的 Adam 步：
+    ``r_t = sqrt(((rho_t-4)(rho_t-2)rho_inf) / ((rho_inf-4)(rho_inf-2)rho_t))``；
+    否则（训练最初几步）退化成纯动量 ``p -= lr * m_hat``。
+
+    这样就不需要「warmup 若干步」这种手工技巧：算法自己在前几步关掉自适应缩放，
+    等 v 的可信度够了再逐渐打开。
+    """
+
+    name = "radam"
+
+    def __init__(self, model: MLP, lr: float = 1e-3, beta1: float = 0.9,
+                 beta2: float = 0.999, eps: float = 1e-8):
+        _w9_check("RAdam", lr, (("beta1", beta1), ("beta2", beta2)), eps=eps)
+        super().__init__(model, lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.rho_inf = 2.0 / (1.0 - self.beta2) - 1.0
+        if self.rho_inf <= 4.0:
+            raise ValueError(
+                f"RAdam: beta2={beta2!r} 太小时 rho_inf={self.rho_inf:.6g} 不足 4，"
+                "修正因子无定义（请用 >= 0.9 的 beta2）")
+
+    def _new_state(self, layer, kind):
+        return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
+
+    def _prepare(self):
+        b1, b2, t = self.beta1, self.beta2, self.step_count
+        self._c1 = 1.0 - b1 ** t
+        c2 = 1.0 - b2 ** t
+        self._c2 = c2
+        rho_t = self.rho_inf - 2.0 * t * (b2 ** t) / c2
+        self._rho_t = rho_t
+        ri = self.rho_inf
+        if rho_t > 4.0 and ri > 4.0:
+            self._rt = math.sqrt(((rho_t - 4.0) * (rho_t - 2.0) * ri)
+                                 / ((ri - 4.0) * (ri - 2.0) * rho_t))
+        else:
+            self._rt = None
+
+    def _increment(self, st, g, j, i):
+        b1, b2 = self.beta1, self.beta2
+        m = b1 * _w9_get(st["m"], j, i) + (1.0 - b1) * g
+        v = b2 * _w9_get(st["v"], j, i) + (1.0 - b2) * g * g
+        _w9_set(st["m"], j, i, m)
+        _w9_set(st["v"], j, i, v)
+        m_hat = m / self._c1
+        if self._rt is None:
+            return self.lr * m_hat
+        return self.lr * self._rt * m_hat / (math.sqrt(v / self._c2) + self.eps)
+
+
+# ============================================================================
 #  Gradient Clipping / LR Scheduler
 # ============================================================================
 
@@ -23861,6 +24196,10 @@ class Model:
         'sgd': SGD,
         'sgd_momentum': SGDMomentum,
         'rmsprop': RMSprop,
+        'adagrad': AdaGrad,
+        'adadelta': AdaDelta,
+        'nadam': Nadam,
+        'radam': RAdam,
     }
 
     _LOSS_MAP = {

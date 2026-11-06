@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1063 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1070 项）
 
 ## 特性
 
@@ -361,6 +361,10 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
 | `Lion(model, lr=1e-4, beta1=0.9, beta2=0.99)` | 符号动量优化器：更新量恒为 `±lr`（+ 解耦 wd），只存一份动量；**lr 通常比 Adam 小一个量级** |
 | `Adafactor(model, lr=1e-3, eps2=1e-3, weight_decay=0.0)` | 行列因子化二阶矩，显存 O(m+n)；乘相对步长 `max(eps2, rms(g))`，所以 lr 语义比 Adam 小一个量级 |
+| `AdaGrad(model, lr=0.01, eps=1e-8)` | 累积梯度平方 `s += g²`，步长 `lr·g/(√s+eps)` **单调不增**；稀疏梯度友好，但训练中期容易过早停滞 |
+| `AdaDelta(model, lr=1.0, rho=0.95, eps=1e-6)` | 用「更新量平方的滑动平均」替掉学习率：`dx = √(u+eps)/√(s+eps)·g`，对梯度整体缩放不变，所以默认 `lr=1.0` 就有意义 |
+| `Nadam(model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)` | Adam + Nesterov 动量：分子是 `b1·m̂ + (1-b1)·g/(1-b1^t)`；`b1=0` 时退化成 RMSprop 式 |
+| `RAdam(model, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)` | 用 `rho_t = rho_inf - 2t·b2^t/(1-b2^t)` 判断二阶矩够不够可信：`rho_t<=4` 时只走纯动量，之后才按 `r_t` 缩放自适应步长（免手工 warmup） |
 | `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
 | `ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=0.0, mode='min')` | 指标停滞 `patience+1` 次就把 lr 乘 `factor`（可反复降档，与 PyTorch 一致）；`step()` 要传指标 |
 | `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
@@ -598,6 +602,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 |------|------|
 | `Adam` | Adam（默认） |
 | `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
+| `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套（W9-A）；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
@@ -733,7 +738,7 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `save_model(model, path, task=None, optimizer=None, quiet=False, loss=None, loss_kwargs=None)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态，传 `loss=` / `loss_kwargs=` 时记下损失配置；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上；会保存 `groups`（分组/深度卷积可原样加载，没有该字段的旧存档按 1 处理） |
-| `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`） |
+| `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；W9-A 的四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
 | `Model.save(path)` / `Model.load(path, task='auto', restore_optimizer=False, loss_kwargs=None)` | 高层封装；`task='auto'` 时优先采用文件中记录的 task；`restore_optimizer=True` 做逐位续训；损失函数名与 `loss_kwargs` 随存档往返，显式传参可覆盖 |
 
 | `clip_grad_by_norm(grads, max_norm)` | 梯度范数裁剪 |
@@ -1121,7 +1126,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1063 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1070 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1173,6 +1178,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInfoNCELoss` | loss 与闭式公式一致 / 四个梯度 vs 数值 / 难负样本 loss 更大 / 非法参数 |
 | `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
 | `TestCTCLoss` | loss 与穷举所有对齐路径一致 / 梯度 vs 数值 / 不可达与非法标签 |
+| `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
 | `TestLion` | Lion 一步手算 / 零梯度 / 符号步长 / 线性回归收敛 |
 | `TestAdafactor` | 一步与独立公式一致 / 解耦衰减用更新前权重 / 收敛 |
 | `TestReduceLROnPlateau` | 停滞降档 / 改善不降 / min_lr 下界 / mode=max / NaN 忽略 / 非法参数 |
@@ -1321,7 +1327,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1063 个单元测试
+├── test_ai.py       # 1070 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

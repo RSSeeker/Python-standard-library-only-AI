@@ -228,7 +228,14 @@
 
 ### W9 优化器与调度（§3/§4）
 - [ ] `SGDSGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`
-- [ ] 自适应族：AdaGrad / AdaDelta / Nadam / RAdam / Ranger / LAMB / LARS
+- [x] 自适应族前半：`AdaGrad` / `AdaDelta` / `Nadam` / `RAdam`（W9-A）
+  - 与手写参考实现逐步**逐位相同**；AdaGrad 步长单调不增、AdaDelta 对梯度整体缩放不变、
+    Nadam 在 `b1=0` 退化成 RMSprop 式、RAdam 前几步纯动量后自动打开修正。
+  - 踩坑：`state_dict()` 最初只深拷贝了 list，**没拷贝 dict** ⇒ 状态字典被原样返回，
+    两个优化器共享同一批 list，一方 `step` 会改掉另一方要用的状态（续训不再逐位一致）。
+  - 已知：状态挂在优化器实例上，`save_model(optimizer=...)` 只序列化 Adam 一族的 layer 状态，
+    这四个要走 `state_dict()` / `load_state_dict()` 单独存。
+- [ ] 自适应族后半：Ranger / LAMB / LARS
 - [ ] 进阶：Prodigy（无 lr）/ Sophia / Shampoo / CAME / Adan / L-BFGS（小模型）
 - [ ] 调度器族：CosineAnnealingWarmRestarts / OneCycle / InverseSqrt / Noam / CyclicLR（triangular·triangular2·exp_range）/
       Polynomial / Lambda / MultiStep / Multiplicative / WSD / ChainedScheduler / SequentialLR

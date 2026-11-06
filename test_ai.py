@@ -16969,3 +16969,239 @@ class TestInvertibleLinear:
         w0 = [row[:] for row in L2.W]
         L2.adam_step(0.01)
         assert L2.W != w0
+
+def _w9_close(a, b, tol=1e-12):
+    """相对容差比较（测试内用，避免依赖 pytest.approx 的语义差异）"""
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+class TestClassicOptimizers:
+    """W9-A：AdaGrad / AdaDelta / Nadam / RAdam"""
+
+    @staticmethod
+    def _model(seed=0, sizes=(2, 3, 2)):
+        random.seed(seed)
+        acts = ["relu"] * (len(sizes) - 2) + ["linear"]
+        return AI.MLP(list(sizes), activations=acts)
+
+    @staticmethod
+    def _grads(model, rng):
+        out = []
+        for layer in model.layers:
+            gw = [[rng.uniform(-0.5, 0.5) for _ in range(layer.fan_in)]
+                  for _ in range(layer.fan_out)]
+            gb = [rng.uniform(-0.5, 0.5) for _ in range(layer.fan_out)]
+            out.append((gw, gb))
+        return out
+
+    def test_adagrad_matches_hand_computation(self):
+        """AdaGrad 两步与手算逐位一致；步长单调不增"""
+        model = AI.MLP([2, 2], activations=["linear"])
+        for j in range(2):
+            model.layers[0].weights[j] = [1.0, -1.0]
+            model.layers[0].biases[j] = 0.5
+        opt = AI.AdaGrad(model, lr=0.1, eps=1e-8)
+        gw = [[0.5, -0.25], [0.5, -0.25]]
+        gb = [0.5, 0.5]
+        s00 = 0.25
+        w00 = 1.0
+        w00 -= 0.1 * 0.5 / (math.sqrt(s00) + 1e-8)
+        assert abs(model.layers[0].weights[0][0] - w00) > 0  # 尚未 step
+        opt.step([(gw, gb)])
+        assert _w9_close(model.layers[0].weights[0][0], w00, 1e-15), (
+            model.layers[0].weights[0][0], w00)
+
+        # 常数梯度下每步位移单调不增
+        deltas = []
+        for _ in range(6):
+            before = model.layers[0].biases[0]
+            opt.step([(gw, gb)])
+            deltas.append(abs(model.layers[0].biases[0] - before))
+        assert all(deltas[i] >= deltas[i + 1] - 1e-15
+                   for i in range(len(deltas) - 1)), deltas
+
+    def test_adadelta_reference_and_scale_invariance(self):
+        """AdaDelta 与参考实现逐位一致；梯度整体 ×10 参数几乎不动"""
+        model = self._model()
+        opt = AI.AdaDelta(model, lr=1.0, rho=0.95, eps=1e-6)
+        rng = random.Random(11)
+        grads = [self._grads(model, rng) for _ in range(4)]
+        for g in grads:
+            opt.step(g)
+        # 参考实现（与实现同顺序）
+        ref = self._model()
+        sw = [[[0.0] * 2 for _ in range(3)], [[0.0] * 3 for _ in range(2)]]
+        sb = [[0.0] * 3, [0.0] * 2]
+        uw = [[[0.0] * 2 for _ in range(3)], [[0.0] * 3 for _ in range(2)]]
+        ub = [[0.0] * 3, [0.0] * 2]
+        # 注意：0.95 与 1-0.95 在浮点下不是同一个数（1-0.95 = 0.050000000000000044），
+        # 参考实现必须用 (1.0 - rho) 才能与实现逐位对齐
+        rho = 0.95
+        om = 1.0 - rho
+        for g in grads:
+            for li, layer in enumerate(ref.layers):
+                gw, gb = g[li]
+                for j in range(layer.fan_out):
+                    gr = gb[j]
+                    sb[li][j] = rho * sb[li][j] + om * gr * gr
+                    dx = math.sqrt(ub[li][j] + 1e-6) / math.sqrt(sb[li][j] + 1e-6) * gr
+                    ub[li][j] = rho * ub[li][j] + om * dx * dx
+                    layer.biases[j] -= dx
+                    for i in range(layer.fan_in):
+                        gr = gw[j][i]
+                        sw[li][j][i] = rho * sw[li][j][i] + om * gr * gr
+                        dx = (math.sqrt(uw[li][j][i] + 1e-6)
+                              / math.sqrt(sw[li][j][i] + 1e-6) * gr)
+                        uw[li][j][i] = rho * uw[li][j][i] + om * dx * dx
+                        layer.weights[j][i] -= dx
+        for a, b in zip(model.layers, ref.layers):
+            assert a.weights == b.weights
+            assert a.biases == b.biases
+
+        # 尺度不变性
+        ma, mb = self._model(), self._model()
+        oa, ob = AI.AdaDelta(ma), AI.AdaDelta(mb)
+        rng2 = random.Random(3)
+        for _ in range(6):
+            g = self._grads(ma, rng2)
+            big = [([[v * 10.0 for v in row] for row in gw], [v * 10.0 for v in gb])
+                   for gw, gb in g]
+            oa.step(g)
+            ob.step(big)
+        for la, lb in zip(ma.layers, mb.layers):
+            for ra, rb in zip(la.weights, lb.weights):
+                for va, vb in zip(ra, rb):
+                    assert abs(va - vb) <= 1e-3 * max(1.0, abs(va)), (va, vb)
+
+    def test_nadam_reference_and_b1_zero_rmsprop(self):
+        """Nadam 与手写参考一致；b1=0 时单步等于 RMSprop 式"""
+        model = AI.MLP([2, 2], activations=["linear"])
+        for j in range(2):
+            model.layers[0].weights[j] = [1.0, -1.0]
+            model.layers[0].biases[j] = 0.0
+        opt = AI.Nadam(model, lr=0.1, beta1=0.0, beta2=0.999, eps=1e-8)
+        g = [([[0.5, -0.5], [0.5, -0.5]], [0.0, 0.0])]
+        before = model.layers[0].weights[0][0]
+        opt.step(g)
+        got = before - model.layers[0].weights[0][0]
+        v = 0.001 * 0.25
+        expect = 0.1 * 0.5 / (math.sqrt(v / (1 - 0.999)) + 1e-8)
+        assert _w9_close(got, expect, 1e-12), (got, expect)
+
+        # 与四步手算参考比对（b1=0.9）
+        model2 = AI.MLP([2, 2], activations=["linear"])
+        for j in range(2):
+            model2.layers[0].weights[j] = [1.0, -1.0]
+            model2.layers[0].biases[j] = 0.0
+        opt2 = AI.Nadam(model2, lr=0.05)
+        m = [[0.0, 0.0], [0.0, 0.0]]
+        v = [[0.0, 0.0], [0.0, 0.0]]
+        w = [[1.0, -1.0], [1.0, -1.0]]
+        for t in range(1, 5):
+            for j in range(2):
+                for i in range(2):
+                    gr = 0.3 - 0.1 * j + 0.05 * i
+                    m[j][i] = 0.9 * m[j][i] + 0.1 * gr
+                    v[j][i] = 0.999 * v[j][i] + 0.001 * gr * gr
+                    c1 = 1 - 0.9 ** t
+                    c2 = 1 - 0.999 ** t
+                    num = 0.9 * (m[j][i] / c1) + 0.1 * gr / c1
+                    w[j][i] -= 0.05 * num / (math.sqrt(v[j][i] / c2) + 1e-8)
+            opt2.step([([[0.3, 0.35], [0.2, 0.25]], [0.0, 0.0])])
+        for j in range(2):
+            for i in range(2):
+                assert _w9_close(model2.layers[0].weights[j][i], w[j][i], 1e-15)
+
+    def test_radam_momentum_phase_then_rectified(self):
+        """RAdam 最初几步是纯动量，之后 rho_t>4 才打开修正因子"""
+        model = self._model()
+        opt = AI.RAdam(model, lr=0.02)
+        rng = random.Random(13)
+        early = []
+        for _ in range(3):
+            opt.step(self._grads(model, rng))
+            early.append(opt._rt is None)
+        assert all(early), early
+        for _ in range(12):
+            opt.step(self._grads(model, rng))
+        assert opt._rt is not None and opt._rt > 0.0
+        assert opt._rho_t > 4.0
+        # 第一步（纯动量）与 m_hat 一致
+        model2 = self._model()
+        opt2 = AI.RAdam(model2, lr=0.02)
+        g = self._grads(model2, random.Random(13))
+        before = model2.layers[0].weights[0][0]
+        opt2.step(g)
+        got = before - model2.layers[0].weights[0][0]
+        assert _w9_close(got, 0.02 * g[0][0][0][0], 1e-12), got
+
+    def test_state_dict_roundtrip_is_bit_exact(self):
+        """state_dict 必须是快照：载入后各自续训，权重逐位一致
+
+        回归测试：早期版本 `_w9_copy` 把状态字典原样返回（只拷贝了 list），
+        于是两个优化器共享同一批 list，一方 step 会改掉另一方要用的状态。
+        """
+        m1 = self._model()
+        opt1 = AI.Nadam(m1, lr=0.03)
+        rng = random.Random(21)
+        grads = [self._grads(m1, rng) for _ in range(8)]
+        for g in grads[:5]:
+            opt1.step(g)
+        blob = opt1.state_dict()
+
+        m2 = self._model()
+        for a, b in zip(m1.layers, m2.layers):
+            for j in range(len(a.weights)):
+                b.weights[j] = list(a.weights[j])
+            b.biases = list(a.biases)
+        opt2 = AI.Nadam(m2, lr=0.03)
+        opt2.load_state_dict(blob)
+
+        for g in grads[5:]:
+            opt1.step(g)
+            opt2.step(g)
+        assert opt1.step_count == opt2.step_count == 8
+        for a, b in zip(m1.layers, m2.layers):
+            assert a.weights == b.weights
+            assert a.biases == b.biases
+
+    def test_validation(self):
+        """非法超参 / 层数不符 / 坏 state_dict 都报 ValueError"""
+        model = self._model()
+        with pytest.raises(ValueError):
+            AI.AdaGrad(model, lr=-0.1)
+        with pytest.raises(ValueError):
+            AI.AdaGrad(model, eps=0.0)
+        with pytest.raises(ValueError):
+            AI.AdaDelta(model, rho=1.0)
+        with pytest.raises(ValueError):
+            AI.Nadam(model, beta2=1.0)
+        with pytest.raises(ValueError):
+            AI.RAdam(model, beta2=0.5)
+        with pytest.raises(ValueError):
+            AI.AdaGrad(model).step([([[0.1]], [0.1])])
+        with pytest.raises(ValueError):
+            AI.Nadam(model).load_state_dict([1, 2])
+        with pytest.raises(ValueError):
+            AI.Nadam(model).load_state_dict({"optimizer": "nadam", "state": {"x:y": {}}})
+        with pytest.raises(ValueError):
+            AI.Nadam(model).load_state_dict({"optimizer": "nadam", "state": {"9:w": {}}})
+        with pytest.raises(ValueError):
+            AI.Nadam(model).load_state_dict({"optimizer": "adagrad", "state": {}})
+        # 形状不符：把 3 行的状态载入 4 行的层（状态惰性创建，先 step 一次）
+        src = AI.Nadam(self._model())
+        src.step(self._grads(self._model(), random.Random(1)))
+        with pytest.raises(ValueError):
+            AI.Nadam(self._model(sizes=(2, 4, 2))).load_state_dict(src.state_dict())
+
+    def test_model_wiring(self):
+        """Model(optimizer=...) 认得四个新名字，且能降 loss"""
+        for name in ("adagrad", "adadelta", "nadam", "radam"):
+            model = AI.Model(AI.MLP([2, 4, 2], activations=["relu", "linear"]),
+                             loss_fn="mse", task="regression",
+                             optimizer=name, lr=0.05)
+            data = [([0.1 * i, -0.2 * i], [0.0, 1.0]) for i in range(4)]
+            random.seed(0)
+            h = model.fit(data=data, epochs=5, verbose=False)
+            assert math.isfinite(h["train_loss"][-1][1])
+            assert h["train_loss"][-1][1] <= h["train_loss"][0][1] + 1e-9
