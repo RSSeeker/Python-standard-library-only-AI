@@ -175,7 +175,9 @@
 - [ ] `MLA`（低秩 KV 压缩）；`MQA` 标注为 `num_kv_heads=1` 特例
 - [x] `LearnedPositionalEncoding`（可学习位置编码表，`out=x+table`，`sgd_step`/`adam_step`，超长自动扩表）
 - [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（未实现 YaRN 的 mscale 温度，docstring 注明）
-- [ ] 位置编码剩余：T5 相对位置偏置、xPos、MLA 低秩 KV 压缩
+- [x] `MLAttention`（MLA 简化版：低秩 KV 潜在向量 `d_c`，KV cache 从 `T·2·H·d_k` 降到 `T·d_c`；
+      T=4/H=2/d_k=4 时压缩 8 倍；五组权重与偏置梯度中心差分 ≤1e-5）**W5-B4**
+- [ ] 位置编码剩余：T5 相对位置偏置、xPos
 - [x] `LinearAttention`（`phi=elu+1`，O(T·d²)；`causal=True` 用前缀和、非 causal 用全长和；
       `W_q/W_k/W_v/W_o` 与输入梯度中心差分 ≤1e-5，120 步 Adam 收敛）
 - [x] `LinformerAttention`（K/V 低秩投影 `E`/`F`，O(T·k·d)；不支持 causal；

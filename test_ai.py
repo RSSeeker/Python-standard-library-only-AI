@@ -14006,3 +14006,182 @@ class TestPerformerAttention:
             pass
         else:
             raise AssertionError("未 forward 就 backward 没有报错")
+
+
+# ==== W5-B4：MLAttention（低秩 KV 压缩） ====
+
+class TestMLAttention:
+    def _setup(self, D=8, H=2, DC=2, T=4, causal=False):
+        random.seed(9)
+        m = AI.MLAttention(D, H, latent_dim=DC, causal=causal)
+        x = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        dout = [[random.gauss(0, 1) for _ in range(D)] for _ in range(T)]
+        return m, x, dout
+
+    def _scalar(self, m, x, dout):
+        m.zero_grad()
+        y = m.forward(x)
+        return sum(dout[t][j] * y[t][j] for t in range(len(y))
+                   for j in range(len(y[0])))
+
+    def test_shape_params_and_cache(self):
+        m, x, dout = self._setup()
+        y = m.forward(x)
+        assert len(y) == 4 and len(y[0]) == 8
+        # latent 是 (T, d_c)
+        assert len(m.latent) == 4 and len(m.latent[0]) == 2
+        hk = 2 * 4
+        assert m.param_count() == (2 * 64 + 16) + 2 * 8 + 2 + 2 * hk * 2 + 2 * hk
+        # KV cache：MLA 存 T*d_c，标准 MHA 存 T*2*H*d_k
+        assert m.kv_cache_size(8) == 16
+        assert m.full_kv_cache_size(8) == 8 * 2 * 2 * 4
+        assert m.full_kv_cache_size(8) / m.kv_cache_size(8) == 8.0
+
+    def test_gradients_vs_finite_difference(self):
+        eps = 1e-5
+        for causal in (False, True):
+            m, x, dout = self._setup(causal=causal)
+
+            def rel_param(name, i, j):
+                obj = getattr(m, name)
+                old = obj[i][j]
+                m.zero_grad()
+                m.forward(x)
+                m.backward(dout)
+                ana = m.grads[name][i][j]
+                obj[i][j] = old + eps
+                up = self._scalar(m, x, dout)
+                obj[i][j] = old - eps
+                dn = self._scalar(m, x, dout)
+                obj[i][j] = old
+                num = (up - dn) / (2 * eps)
+                if abs(ana) < 1e-6 and abs(num) < 1e-6:
+                    return 0.0
+                return abs(ana - num) / max(abs(ana), abs(num), 1e-8)
+
+            for name in ("W_q", "W_dkv", "W_uk", "W_uv", "W_o"):
+                obj = getattr(m, name)
+                for (i, j) in ((0, 0), (len(obj) - 1, len(obj[0]) - 1)):
+                    assert rel_param(name, i, j) < 1e-5, (causal, name, i, j)
+
+            def rel_bias(name, i):
+                obj = getattr(m, name)
+                old = obj[i]
+                m.zero_grad()
+                m.forward(x)
+                m.backward(dout)
+                ana = m.grads[name][i]
+                obj[i] = old + eps
+                up = self._scalar(m, x, dout)
+                obj[i] = old - eps
+                dn = self._scalar(m, x, dout)
+                obj[i] = old
+                num = (up - dn) / (2 * eps)
+                if abs(ana) < 1e-6 and abs(num) < 1e-6:
+                    return 0.0
+                return abs(ana - num) / max(abs(ana), abs(num), 1e-8)
+
+            for name in ("b_q", "b_dkv", "b_uk", "b_uv", "b_o"):
+                obj = getattr(m, name)
+                for i in (0, len(obj) - 1):
+                    assert rel_bias(name, i) < 1e-5, (causal, name, i)
+
+            m.zero_grad()
+            m.forward(x)
+            dx = m.backward(dout)
+            for (t, j) in ((0, 0), (3, 7)):
+                xp = [list(r) for r in x]
+                xm = [list(r) for r in x]
+                xp[t][j] += eps
+                xm[t][j] -= eps
+                num = (self._scalar(m, xp, dout) - self._scalar(m, xm, dout)) / (2 * eps)
+                assert abs(dx[t][j] - num) / max(abs(dx[t][j]), abs(num), 1e-8) < 1e-5
+
+    def test_causal_mask(self):
+        m, x, _ = self._setup(causal=True)
+        m.forward(x)
+        for h in range(m.num_heads):
+            rows = m.attn_weights[h]
+            for t in range(len(rows)):
+                for s in range(len(rows[t])):
+                    if s > t:
+                        assert rows[t][s] == 0.0
+                assert abs(sum(rows[t]) - 1.0) < 1e-6
+        mn, xn, _ = self._setup(causal=False)
+        mn.forward(xn)
+        for h in range(mn.num_heads):
+            for t in range(len(mn.attn_weights[h])):
+                assert abs(sum(mn.attn_weights[h][t]) - 1.0) < 1e-6
+
+    def test_accumulate_optimizers(self):
+        m, x, dout = self._setup()
+        m.zero_grad()
+        m.forward(x)
+        m.backward(dout)
+        g1 = m.grads["W_dkv"][0][0]
+        m.forward(x)
+        m.backward(dout)
+        g2 = m.grads["W_dkv"][0][0]
+        assert abs(g2 - 2 * g1) < 1e-12 * max(1.0, abs(g2))
+        m.zero_grad()
+        left = [v for name in ("W_q", "W_dkv", "W_uk", "W_uv", "W_o")
+                for row in m.grads[name] for v in row]
+        assert max(abs(v) for v in left) == 0.0
+        before = [list(r) for r in m.W_uk]
+        m.forward(x)
+        m.backward(dout)
+        m.sgd_step(0.1)
+        assert m.W_uk != before
+        before = [list(r) for r in m.W_uk]
+        m.zero_grad()
+        m.forward(x)
+        m.backward(dout)
+        m.adam_step(0.01)
+        assert m.W_uk != before
+
+    def test_training_and_validation(self):
+        random.seed(0)
+        m = AI.MLAttention(8, 2, latent_dim=4)
+        xs = [[random.gauss(0, 1) for _ in range(8)] for _ in range(4)]
+        first = None
+        for _ in range(120):
+            m.zero_grad()
+            y = m.forward(xs)
+            if first is None:
+                first = 0.5 * sum(v * v for row in y for v in row)
+            m.backward([[y[t][j] for j in range(8)] for t in range(4)])
+            m.adam_step(0.02)
+        assert 0.5 * sum(v * v for row in y for v in row) < first * 0.05
+
+        for bad in (lambda: AI.MLAttention(8, 3),
+                    lambda: AI.MLAttention(8, 2, 0),
+                    lambda: AI.MLAttention(8, 2, 2.5),
+                    lambda: AI.MLAttention(8, 2, 2, 1),
+                    lambda: AI.MLAttention(8, 2, 2, False, 0.0),
+                    lambda: AI.MLAttention(0, 2),
+                    lambda: AI.MLAttention(8, 0)):
+            try:
+                bad()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("非法构造没有报错")
+        q = AI.MLAttention(8, 2)
+        try:
+            q.forward([])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("空序列没有报错")
+        try:
+            q.forward([[0.0] * 3] * 4)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("token 维度不符没有报错")
+        try:
+            q.backward([[0.0] * 8] * 4)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("未 forward 就 backward 没有报错")

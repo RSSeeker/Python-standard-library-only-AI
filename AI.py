@@ -12209,6 +12209,380 @@ class PerformerAttention:
                 param[i] -= lr * (mv[i] / c1) / (math.sqrt(vv[i] / c2) + eps)
 
 
+class MLAttention:
+    """MLA 简化版：把 K/V 压到低秩潜在向量，再上投影回每头
+
+    标准多头注意力每层要为每个 token 缓存 `2·H·d_k` 个 K/V 数。
+    MLA（DeepSeek-V2）的想法是：K/V 其实来自同一个低秩空间，于是
+
+        c_t   = W_dkv x_t + b_dkv              # (d_c)，d_c << H·d_k
+        k_th  = W_uk[h] c_t + b_uk[h]          # 每头 (d_k)
+        v_th  = W_uv[h] c_t + b_uv[h]
+
+    这样 **KV cache 只需存 c_t**——`T·d_c` 个数，而不是 `T·2·H·d_k`。
+    本实现保留 Q 的全秩投影（`W_q`）与标准缩放点积注意力，也保留 causal，
+    所以它是「低秩 KV」而不是完整的 DeepSeek-V2 MLA（后者还会压缩 Q、
+    并把 RoPE 部分解耦出去）。
+
+    反向最需要注意的是 `c_t` 是 K 和 V 两条链的汇合点：
+    `dc_t = W_uk^T dk_t + W_uv^T dv_t`，两条链都要带上。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, latent_dim: int = None,
+                 causal: bool = False, eps: float = 1e-8):
+        if isinstance(d_model, bool) or not isinstance(d_model, int):
+            raise ValueError("MLAttention: d_model 必须是正整数，收到 %r" % (d_model,))
+        if d_model < 1:
+            raise ValueError("MLAttention: d_model 必须 >= 1，收到 %r" % (d_model,))
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int):
+            raise ValueError("MLAttention: num_heads 必须是正整数，收到 %r"
+                             % (num_heads,))
+        if num_heads < 1:
+            raise ValueError("MLAttention: num_heads 必须 >= 1，收到 %r"
+                             % (num_heads,))
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "MLAttention: d_model=%d 必须能被 num_heads=%d 整除"
+                % (d_model, num_heads))
+        d_k = d_model // num_heads
+        if latent_dim is None:
+            latent_dim = d_k
+        if isinstance(latent_dim, bool) or not isinstance(latent_dim, int):
+            raise ValueError("MLAttention: latent_dim 必须是正整数，收到 %r"
+                             % (latent_dim,))
+        if latent_dim < 1:
+            raise ValueError("MLAttention: latent_dim 必须 >= 1，收到 %r"
+                             % (latent_dim,))
+        if not isinstance(causal, bool):
+            raise ValueError("MLAttention: causal 必须是 bool，收到 %r" % (causal,))
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise ValueError("MLAttention: eps 必须是正数，收到 %r" % (eps,))
+        eps = float(eps)
+        if not (eps > 0.0) or eps != eps:
+            raise ValueError("MLAttention: eps 必须是有限正数，收到 %r" % (eps,))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_k
+        self.latent_dim = latent_dim
+        self.causal = causal
+        self.eps = eps
+        std = math.sqrt(2.0 / d_model)
+        self.W_q = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.b_q = [0.0] * d_model
+        # 下投影：d_model -> latent_dim
+        self.W_dkv = [[random.gauss(0, std) for _ in range(d_model)]
+                      for _ in range(latent_dim)]
+        self.b_dkv = [0.0] * latent_dim
+        # 上投影：latent_dim -> H*d_k（K 与 V 各一套）
+        self.W_uk = [[random.gauss(0, std) for _ in range(latent_dim)]
+                     for _ in range(num_heads * d_k)]
+        self.b_uk = [0.0] * (num_heads * d_k)
+        self.W_uv = [[random.gauss(0, std) for _ in range(latent_dim)]
+                     for _ in range(num_heads * d_k)]
+        self.b_uv = [0.0] * (num_heads * d_k)
+        self.W_o = [[random.gauss(0, std) for _ in range(d_model)]
+                    for _ in range(d_model)]
+        self.b_o = [0.0] * d_model
+        self._init_adam()
+        self.zero_grad()
+        self.x = None
+        self.latent = None
+        self.concat = None
+        self._cache = None
+        self.attn_weights = None
+
+    def zero_grad(self):
+        """清零所有参数梯度"""
+        d = self.d_model
+        dc = self.latent_dim
+        hk = self.num_heads * self.d_k
+
+        def z2(r, c):
+            return [[0.0] * c for _ in range(r)]
+
+        self.grads = {
+            "W_q": z2(d, d), "b_q": [0.0] * d,
+            "W_dkv": z2(dc, d), "b_dkv": [0.0] * dc,
+            "W_uk": z2(hk, dc), "b_uk": [0.0] * hk,
+            "W_uv": z2(hk, dc), "b_uv": [0.0] * hk,
+            "W_o": z2(d, d), "b_o": [0.0] * d,
+        }
+
+    def _init_adam(self):
+        d = self.d_model
+        dc = self.latent_dim
+        hk = self.num_heads * self.d_k
+        shapes = {"W_q": (d, d), "b_q": (d,), "W_dkv": (dc, d), "b_dkv": (dc,),
+                  "W_uk": (hk, dc), "b_uk": (hk,), "W_uv": (hk, dc), "b_uv": (hk,),
+                  "W_o": (d, d), "b_o": (d,)}
+        for name, shp in shapes.items():
+            if len(shp) == 1:
+                setattr(self, "m_" + name, [0.0] * shp[0])
+                setattr(self, "v_" + name, [0.0] * shp[0])
+            else:
+                setattr(self, "m_" + name, [[0.0] * shp[1] for _ in range(shp[0])])
+                setattr(self, "v_" + name, [[0.0] * shp[1] for _ in range(shp[0])])
+        self._adam_t = 0
+
+    def train(self):
+        """无 dropout，空操作（保持接口统一）"""
+        return self
+
+    def eval(self):
+        """无 dropout，空操作（保持接口统一）"""
+        return self
+
+    def kv_cache_size(self, seq_len: int) -> int:
+        """长度为 seq_len 的序列在 KV cache 里要存多少个标量（MLA 是 T·d_c）"""
+        return int(seq_len) * self.latent_dim
+
+    def full_kv_cache_size(self, seq_len: int) -> int:
+        """同样长度下标准多头注意力要存多少（T·2·H·d_k），用于对比"""
+        return int(seq_len) * 2 * self.num_heads * self.d_k
+
+    def forward(self, x_seq):
+        """x_seq: (T, d_model) → (T, d_model)"""
+        if not x_seq:
+            raise ValueError("MLAttention.forward: 输入序列不能为空")
+        d = self.d_model
+        dc = self.latent_dim
+        d_k = self.d_k
+        H = self.num_heads
+        T = len(x_seq)
+        for t, row in enumerate(x_seq):
+            if len(row) != d:
+                raise ValueError(
+                    "MLAttention.forward: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (t, len(row), d))
+        q_all = [[sum(map(_mul, self.W_q[r], xt)) + self.b_q[r] for r in range(d)]
+                 for xt in x_seq]
+        latent = [[sum(map(_mul, self.W_dkv[r], xt)) + self.b_dkv[r]
+                   for r in range(dc)] for xt in x_seq]
+        k_all = [[sum(map(_mul, self.W_uk[r], ct)) + self.b_uk[r] for r in range(H * d_k)]
+                 for ct in latent]
+        v_all = [[sum(map(_mul, self.W_uv[r], ct)) + self.b_uv[r] for r in range(H * d_k)]
+                 for ct in latent]
+        scale = 1.0 / math.sqrt(d_k)
+        concat = [[0.0] * d for _ in range(T)]
+        cache = []
+        weights_all = []
+        for head in range(H):
+            off = head * d_k
+            qh = [q_all[t][off:off + d_k] for t in range(T)]
+            kh = [k_all[t][off:off + d_k] for t in range(T)]
+            vh = [v_all[t][off:off + d_k] for t in range(T)]
+            rows = []
+            outs = []
+            for t in range(T):
+                scores = []
+                for s in range(T):
+                    if self.causal and s > t:
+                        scores.append(None)
+                        continue
+                    scores.append(sum(qh[t][j] * kh[s][j] for j in range(d_k)) * scale)
+                m = max(v for v in scores if v is not None)
+                ex = [None if v is None else math.exp(v - m) for v in scores]
+                tot = sum(v for v in ex if v is not None) + self.eps
+                probs = [0.0 if v is None else v / tot for v in ex]
+                rows.append(probs)
+                outs.append([sum(probs[s] * vh[s][j] for s in range(T))
+                             for j in range(d_k)])
+            for t in range(T):
+                for j in range(d_k):
+                    concat[t][off + j] = outs[t][j]
+            cache.append({"q": qh, "k": kh, "v": vh, "probs": rows, "out": outs})
+            weights_all.append(rows)
+        y = [[sum(map(_mul, self.W_o[r], concat[t])) + self.b_o[r] for r in range(d)]
+             for t in range(T)]
+        self.x = [list(r) for r in x_seq]
+        self.latent = latent
+        self.concat = concat
+        self._cache = cache
+        self.attn_weights = weights_all
+        return y
+
+    def backward(self, dout_seq):
+        """dout_seq: (T, d_model) → (T, d_model) 输入梯度"""
+        if self._cache is None:
+            raise RuntimeError("MLAttention.backward: 必须先 forward")
+        d = self.d_model
+        dc = self.latent_dim
+        d_k = self.d_k
+        H = self.num_heads
+        T = len(self.x)
+        if len(dout_seq) != T:
+            raise ValueError(
+                "MLAttention.backward: dout 长度 %d 与 forward 的 %d 不一致"
+                % (len(dout_seq), T))
+        scale = 1.0 / math.sqrt(d_k)
+        dconcat = [[sum(dout_seq[t][j] * self.W_o[j][r] for j in range(d))
+                    for r in range(d)] for t in range(T)]
+        for r in range(d):
+            wrow = self.grads["W_o"][r]
+            sb = 0.0
+            for t in range(T):
+                dt = dout_seq[t][r]
+                sb += dt
+                if dt != 0.0:
+                    crow = self.concat[t]
+                    for c in range(d):
+                        wrow[c] += dt * crow[c]
+            self.grads["b_o"][r] += sb
+        dq_all = [[0.0] * d for _ in range(T)]
+        dk_all = [[0.0] * (H * d_k) for _ in range(T)]
+        dv_all = [[0.0] * (H * d_k) for _ in range(T)]
+        for head in range(H):
+            off = head * d_k
+            c = self._cache[head]
+            qh, kh, vh = c["q"], c["k"], c["v"]
+            probs, outs = c["probs"], c["out"]
+            dout = [dconcat[t][off:off + d_k] for t in range(T)]
+            dprobs = [[0.0] * T for _ in range(T)]
+            dvh = [[0.0] * d_k for _ in range(T)]
+            for t in range(T):
+                for s in range(T):
+                    if self.causal and s > t:
+                        continue
+                    dvh[s] = [dvh[s][j] + probs[t][s] * dout[t][j] for j in range(d_k)]
+                    dprobs[t][s] = sum(dout[t][j] * vh[s][j] for j in range(d_k))
+            dscores = [[0.0] * T for _ in range(T)]
+            for t in range(T):
+                dot = 0.0
+                for s in range(T):
+                    if self.causal and s > t:
+                        continue
+                    dot += probs[t][s] * dprobs[t][s]
+                for s in range(T):
+                    if self.causal and s > t:
+                        continue
+                    dscores[t][s] = probs[t][s] * (dprobs[t][s] - dot)
+            dqh = [[0.0] * d_k for _ in range(T)]
+            dkh = [[0.0] * d_k for _ in range(T)]
+            for t in range(T):
+                for s in range(T):
+                    if self.causal and s > t:
+                        continue
+                    g = dscores[t][s] * scale
+                    if g == 0.0:
+                        continue
+                    for j in range(d_k):
+                        dqh[t][j] += g * kh[s][j]
+                        dkh[s][j] += g * qh[t][j]
+            for t in range(T):
+                for j in range(d_k):
+                    dq_all[t][off + j] = dqh[t][j]
+                    dk_all[t][off + j] = dkh[t][j]
+                    dv_all[t][off + j] = dvh[t][j]
+        # 上投影：dk_all/dv_all -> W_uk/W_uv 的梯度与 dc
+        dlatent = [[0.0] * dc for _ in range(T)]
+        for r in range(H * d_k):
+            wuk = self.grads["W_uk"][r]
+            wuv = self.grads["W_uv"][r]
+            sbk = sbv = 0.0
+            for t in range(T):
+                dkr = dk_all[t][r]
+                dvr = dv_all[t][r]
+                sbk += dkr
+                sbv += dvr
+                if dkr == 0.0 and dvr == 0.0:
+                    continue
+                ct = self.latent[t]
+                drow = dlatent[t]
+                if dkr != 0.0:
+                    for c2 in range(dc):
+                        wuk[c2] += dkr * ct[c2]
+                        drow[c2] += dkr * self.W_uk[r][c2]
+                if dvr != 0.0:
+                    for c2 in range(dc):
+                        wuv[c2] += dvr * ct[c2]
+                        drow[c2] += dvr * self.W_uv[r][c2]
+            self.grads["b_uk"][r] += sbk
+            self.grads["b_uv"][r] += sbv
+        # 下投影：dc -> W_dkv 的梯度与 dx
+        for r in range(dc):
+            wrow = self.grads["W_dkv"][r]
+            sb = 0.0
+            for t in range(T):
+                dr = dlatent[t][r]
+                sb += dr
+                if dr != 0.0:
+                    xt = self.x[t]
+                    for c2 in range(d):
+                        wrow[c2] += dr * xt[c2]
+            self.grads["b_dkv"][r] += sb
+        # W_q 与 dx
+        for r in range(d):
+            wrow = self.grads["W_q"][r]
+            sb = 0.0
+            for t in range(T):
+                dr = dq_all[t][r]
+                sb += dr
+                if dr != 0.0:
+                    xt = self.x[t]
+                    for c2 in range(d):
+                        wrow[c2] += dr * xt[c2]
+            self.grads["b_q"][r] += sb
+        dx = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            xrow = dx[t]
+            for r in range(d):
+                dqr = dq_all[t][r]
+                if dqr != 0.0:
+                    wq = self.W_q[r]
+                    for c2 in range(d):
+                        xrow[c2] += dqr * wq[c2]
+            for r in range(dc):
+                dr = dlatent[t][r]
+                if dr != 0.0:
+                    wd = self.W_dkv[r]
+                    for c2 in range(d):
+                        xrow[c2] += dr * wd[c2]
+        return dx
+
+    def param_count(self):
+        """参数量：Q/O 各 d²+d，下投影 d_c·d，上投影 2·H·d_k·d_c + 2·H·d_k"""
+        d = self.d_model
+        dc = self.latent_dim
+        hk = self.num_heads * self.d_k
+        return (2 * d * d + 2 * d) + dc * d + dc + 2 * hk * dc + 2 * hk
+
+    def sgd_step(self, lr: float):
+        """SGD 更新"""
+        lr = _la_check_lr(lr, "MLAttention.sgd_step")
+        for name in ("W_q", "W_dkv", "W_uk", "W_uv", "W_o"):
+            _la_apply_sgd(getattr(self, name), self.grads[name], lr)
+        for name in ("b_q", "b_dkv", "b_uk", "b_uv", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            for i in range(len(param)):
+                param[i] -= lr * grad[i]
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """Adam 更新"""
+        lr = _la_check_lr(lr, "MLAttention.adam_step")
+        _check_adam_betas(beta1, beta2, "MLAttention.adam_step")
+        self._adam_t += 1
+        t = self._adam_t
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
+        for name in ("W_q", "W_dkv", "W_uk", "W_uv", "W_o"):
+            _la_apply_adam(getattr(self, name), self.grads[name],
+                           getattr(self, "m_" + name), getattr(self, "v_" + name),
+                           lr, c1, c2, beta1, beta2, eps)
+        for name in ("b_q", "b_dkv", "b_uk", "b_uv", "b_o"):
+            param = getattr(self, name)
+            grad = self.grads[name]
+            mv = getattr(self, "m_" + name)
+            vv = getattr(self, "v_" + name)
+            for i in range(len(param)):
+                g = grad[i]
+                mv[i] = beta1 * mv[i] + (1.0 - beta1) * g
+                vv[i] = beta2 * vv[i] + (1.0 - beta2) * g * g
+                param[i] -= lr * (mv[i] / c1) / (math.sqrt(vv[i] / c2) + eps)
+
+
 class LearnedPositionalEncoding:
     """可学习的位置编码表（BERT / GPT-2 式）：`out[t] = x[t] + table[t]`
 
