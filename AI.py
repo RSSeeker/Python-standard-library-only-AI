@@ -22,7 +22,7 @@
   - 评估指标：precision / recall / F1、confusion_matrix、ROC-AUC、top-k、MCC、
     MAE / RMSE / MAPE / R²、sequence_accuracy、BLEU / ROUGE-L、evaluate_all
   - 文本处理：TextProcessor（字符级）/ BytePairTokenizer（字节级 BPE，任意 UTF-8 无损往返）
-  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / UNet；残差变体：
+  - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / UNet / FPN / SegNet；残差变体：
     ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
 ================================================================================
@@ -6173,6 +6173,336 @@ class UNet:
         for i, bn in enumerate(self.bns):
             if i in self.bn_grads:
                 _norm_apply_adam(bn, self.bn_grads[i], float(lr), beta1, beta2, eps)
+
+
+def _up2(x):
+    """最近邻 2× 上采样：`(C,h,w) -> (C,2h,2w)`"""
+    out = []
+    for ch in x:
+        rows = []
+        for row in ch:
+            new = []
+            for v in row:
+                new.append(v)
+                new.append(v)
+            rows.append(new)
+            rows.append(list(new))
+        out.append(rows)
+    return out
+
+
+def _up2_back(d, h, w):
+    """`_up2` 的反向：把 `(C,2h,2w)` 的梯度按 2x2 块求和回 `(C,h,w)`"""
+    out = []
+    for ch in d:
+        rows = []
+        for i in range(h):
+            row = []
+            for j in range(w):
+                row.append(ch[2 * i][2 * j] + ch[2 * i][2 * j + 1]
+                           + ch[2 * i + 1][2 * j] + ch[2 * i + 1][2 * j + 1])
+            rows.append(row)
+        out.append(rows)
+    return out
+
+
+def _unpool2(x, pool, H, W):
+    """按 `MaxPool2d` 记录的索引把 `(C,ho,wo)` 填回 `(C,H,W)`
+
+    `MaxPool2d.mask[c][oh][ow]` 存的是**窗口内相对位置** `(kh, kw)`，
+    绝对位置要按 `oh * stride + kh` 换算；非选中位置保持 0。
+    """
+    C = len(x)
+    ho, wo = len(x[0]), len(x[0][0])
+    out = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+    for c in range(C):
+        for i in range(ho):
+            for j in range(wo):
+                kh, kw = pool.mask[c][i][j]
+                ih = i * pool.sh + kh
+                iw = j * pool.sw + kw
+                out[c][ih][iw] = x[c][i][j]
+    return out
+
+
+def _unpool2_back(d, pool):
+    """`_unpool2` 的反向：只把梯度收回各窗口被选中的位置"""
+    C = len(d)
+    ho, wo = len(pool.mask[0]), len(pool.mask[0][0])
+    out = [[[0.0] * wo for _ in range(ho)] for _ in range(C)]
+    for c in range(C):
+        for i in range(ho):
+            for j in range(wo):
+                kh, kw = pool.mask[c][i][j]
+                ih = i * pool.sh + kh
+                iw = j * pool.sw + kw
+                out[c][i][j] = d[c][ih][iw]
+    return out
+
+
+class FPN:
+    """特征金字塔（top-down 路径 + 横向连接）
+
+    输入是从细到粗的特征图列表 `[F0, F1, ..., F{L-1}]`（空间尺寸逐级减半，通道数任意）。
+    每个 `Fi` 先过 1x1 横向卷积压到 `out_channels`，再从最粗一级往上做：
+    `P_i = lateral_i(F_i) + upsample2x(P_{i+1})`，最后每级过 3x3 平滑卷积
+    （`smooth=False` 可关掉）。输出与输入等长的特征图列表，尺寸与输入一致。
+
+    要求相邻特征的尺寸严格是 2 倍关系，否则上采样后无法相加。
+    """
+
+    def __init__(self, in_channels_list, out_channels: int = 8, smooth: bool = True):
+        if not isinstance(in_channels_list, (list, tuple)) or len(in_channels_list) < 2:
+            raise TypeError(
+                f"FPN: in_channels_list 必须是长度 >=2 的列表，收到 {in_channels_list!r}")
+        chans = []
+        for c in in_channels_list:
+            if isinstance(c, bool) or not isinstance(c, int) or c < 1:
+                raise ValueError(f"FPN: 输入通道数必须是 >=1 的整数，收到 {c!r}")
+            chans.append(c)
+        if isinstance(out_channels, bool) or not isinstance(out_channels, int) or out_channels < 1:
+            raise ValueError(
+                f"FPN: out_channels 必须是 >=1 的整数，收到 {out_channels!r}")
+        self.in_channels_list = chans
+        self.out_channels = out_channels
+        self.num_levels = len(chans)
+        self.smooth_enabled = bool(smooth)
+        self.lateral = [Conv2d(c, out_channels, 1) for c in chans]
+        self.smooth = ([Conv2d(out_channels, out_channels, 3, padding=1)
+                        for _ in range(self.num_levels)]
+                       if self.smooth_enabled else [])
+        self._cache = None
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward(self, feats):
+        n = self.num_levels
+        if not isinstance(feats, (list, tuple)) or len(feats) != n:
+            raise ValueError(
+                f"FPN.forward: 需要 {n} 级特征，收到 "
+                f"{len(feats) if isinstance(feats, (list, tuple)) else type(feats).__name__}")
+        shapes = []
+        for i, f in enumerate(feats):
+            if len(f) != self.in_channels_list[i]:
+                raise ValueError(
+                    f"FPN.forward: 第 {i} 级通道数 {len(f)} 与 "
+                    f"in_channels_list[{i}]={self.in_channels_list[i]} 不符")
+            shapes.append((len(f[0]), len(f[0][0])))
+        for i in range(n - 1):
+            hi, wi = shapes[i]
+            hj, wj = shapes[i + 1]
+            if hi != 2 * hj or wi != 2 * wj:
+                raise ValueError(
+                    f"FPN.forward: 第 {i} 级尺寸 {(hi, wi)} 必须是第 {i + 1} 级 "
+                    f"{(hj, wj)} 的 2 倍")
+
+        laterals = [self.lateral[i].forward(feats[i]) for i in range(n)]
+        merged = [None] * n
+        merged[n - 1] = laterals[n - 1]
+        for i in range(n - 2, -1, -1):
+            up = _up2(merged[i + 1])
+            hi, wi = shapes[i]
+            if (len(up[0]), len(up[0][0])) != (hi, wi):
+                raise ValueError(
+                    f"FPN.forward: 第 {i + 1} 级上采样到 {(len(up[0]), len(up[0][0]))} "
+                    f"与第 {i} 级 {(hi, wi)} 不一致")
+            base = laterals[i]
+            merged[i] = [[[base[c][a][b] + up[c][a][b] for b in range(wi)]
+                          for a in range(hi)] for c in range(self.out_channels)]
+
+        outs = ([self.smooth[i].forward(merged[i]) for i in range(n)]
+                if self.smooth_enabled else merged)
+        self._cache = (shapes, laterals, merged)
+        return outs
+
+    def backward(self, douts):
+        if self._cache is None:
+            raise RuntimeError("FPN.backward: 必须先调用 forward()")
+        shapes, laterals, merged = self._cache
+        n = self.num_levels
+        if not isinstance(douts, (list, tuple)) or len(douts) != n:
+            raise ValueError(f"FPN.backward: 需要 {n} 级梯度，收到 {len(douts)}")
+
+        if self.smooth_enabled:
+            dmerged = [self.smooth[i].backward(douts[i]) for i in range(n)]
+        else:
+            dmerged = [douts[i] for i in range(n)]
+
+        acc = [None] * n
+        dxs = [None] * n
+        for i in range(n):
+            g = dmerged[i]
+            if acc[i] is not None:
+                rows = len(g[0])
+                cols = len(g[0][0])
+                g = [[[g[c][a][b] + acc[i][c][a][b] for b in range(cols)]
+                      for a in range(rows)] for c in range(len(g))]
+            dxs[i] = self.lateral[i].backward(g)
+            if i + 1 < n:
+                hi, wi = shapes[i + 1]
+                dup = _up2_back(g, hi, wi)
+                if acc[i + 1] is None:
+                    acc[i + 1] = dup
+                else:
+                    acc[i + 1] = [[[acc[i + 1][c][a][b] + dup[c][a][b]
+                                    for b in range(wi)] for a in range(hi)]
+                                  for c in range(len(dup))]
+        return dxs
+
+    def zero_grad(self):
+        for layer in self.lateral + self.smooth:
+            layer.zero_grad()
+
+    def param_count(self):
+        return sum(_conv_param_count(layer) for layer in self.lateral + self.smooth)
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"FPN.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self.lateral + self.smooth:
+            _conv_sgd(layer, float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"FPN.adam_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self.lateral + self.smooth:
+            _conv_adam(layer, float(lr), beta1, beta2, eps)
+
+
+class SegNet:
+    """SegNet（简化，2 级）：编码用 `MaxPool2d`，解码用**池化索引**还原位置
+
+    结构（输入 `(Cin,H,W)`，要求 `H`、`W` 能被 4 整除）：
+
+        conv1 (Cin→c0)  → relu → h0 (c0,H,W)    → pool0 → p0 (c0,H/2,W/2)
+        conv2 (c0→2c0)  → relu → h1 (2c0,H/2,W/2) → pool1 → p1 (2c0,H/4,W/4)
+        conv3 (2c0→2c0) → relu → b  (2c0,H/4,W/4)
+        unpool1(b) → conv4 (2c0→c0) → relu → (c0,H/2,W/2)
+        unpool0    → conv5 (c0→c0)  → relu → (c0,H,W)
+        out: conv 1x1 (c0→num_classes)
+
+    与 U-Net 的区别：解码不做跳跃拼接，且上采样是「把值放回最大池化选中的位置」。
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 2,
+                 base_channels: int = 4):
+        for name, val in (("in_channels", in_channels),
+                          ("num_classes", num_classes),
+                          ("base_channels", base_channels)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"SegNet: {name} 必须是 >=1 的整数，收到 {val!r}")
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.base_channels = base_channels
+        c0 = base_channels
+        c1 = base_channels * 2
+        self.conv1 = Conv2d(in_channels, c0, 3, padding=1)
+        self.conv2 = Conv2d(c0, c1, 3, padding=1)
+        self.conv3 = Conv2d(c1, c1, 3, padding=1)
+        self.conv4 = Conv2d(c1, c0, 3, padding=1)
+        self.conv5 = Conv2d(c0, c0, 3, padding=1)
+        self.out = Conv2d(c0, num_classes, 1)
+        self.pool0 = MaxPool2d(2)
+        self.pool1 = MaxPool2d(2)
+        self._convs = [self.conv1, self.conv2, self.conv3, self.conv4,
+                       self.conv5, self.out]
+        self._cache = None
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    @staticmethod
+    def _relu(z):
+        return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in z]
+
+    @staticmethod
+    def _relu_back(d, z, rows, cols):
+        return [[[d[c][a][b] if z[c][a][b] > 0.0 else 0.0 for b in range(cols)]
+                 for a in range(rows)] for c in range(len(z))]
+
+    def forward(self, x):
+        c = len(x)
+        if c != self.in_channels:
+            raise ValueError(
+                f"SegNet.forward: 输入通道数 {c} 与 in_channels={self.in_channels} 不符")
+        H, W = len(x[0]), len(x[0][0])
+        if H % 4 != 0 or W % 4 != 0:
+            raise ValueError(f"SegNet.forward: 输入尺寸 {(H, W)} 必须能被 4 整除")
+        H2, W2 = H // 2, W // 2
+        z1 = self.conv1.forward(x)
+        h0 = self._relu(z1)
+        p0 = self.pool0.forward(h0)
+        z2 = self.conv2.forward(p0)
+        h1 = self._relu(z2)
+        p1 = self.pool1.forward(h1)
+        z3 = self.conv3.forward(p1)
+        hb = self._relu(z3)
+        u1 = _unpool2(hb, self.pool1, H2, W2)
+        z4 = self.conv4.forward(u1)
+        h4 = self._relu(z4)
+        u0 = _unpool2(h4, self.pool0, H, W)
+        z5 = self.conv5.forward(u0)
+        h5 = self._relu(z5)
+        logits = self.out.forward(h5)
+        self._cache = (z1, z2, z3, z4, z5)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("SegNet.backward: 必须先调用 forward()")
+        if len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"SegNet.backward: dlogits 通道数 {len(dlogits)} 与 num_classes="
+                f"{self.num_classes} 不符")
+        z1, z2, z3, z4, z5 = self._cache
+        c0 = self.base_channels
+        c1 = c0 * 2
+        H = len(z1[0])
+        W = len(z1[0][0])
+        H2, W2 = H // 2, W // 2
+        H4, W4 = H // 4, W // 4
+
+        dh5 = self.out.backward(dlogits)
+        dz5 = self._relu_back(dh5, z5, H, W)
+        du0 = self.conv5.backward(dz5)
+        dh4 = _unpool2_back(du0, self.pool0)
+        dz4 = self._relu_back(dh4, z4, H2, W2)
+        du1 = self.conv4.backward(dz4)
+        dhb = _unpool2_back(du1, self.pool1)
+        dz3 = self._relu_back(dhb, z3, H4, W4)
+        dp1 = self.conv3.backward(dz3)
+        dh1 = self.pool1.backward(dp1)
+        dz2 = self._relu_back(dh1, z2, H2, W2)
+        dp0 = self.conv2.backward(dz2)
+        dh0 = self.pool0.backward(dp0)
+        dz1 = self._relu_back(dh0, z1, H, W)
+        return self.conv1.backward(dz1)
+
+    def zero_grad(self):
+        for layer in self._convs:
+            layer.zero_grad()
+
+    def param_count(self):
+        return sum(_conv_param_count(layer) for layer in self._convs)
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SegNet.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self._convs:
+            _conv_sgd(layer, float(lr))
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"SegNet.adam_step: lr 必须是非负数，收到 {lr!r}")
+        for layer in self._convs:
+            _conv_adam(layer, float(lr), beta1, beta2, eps)
 
 
 class Flatten:

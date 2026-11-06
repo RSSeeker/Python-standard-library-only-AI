@@ -12746,3 +12746,251 @@ class TestUNet:
         with pytest.raises(ValueError):
             AI.UNet().adam_step('x')
 
+
+# ============================== W4-D: FPN / SegNet ==============================
+class TestFPN:
+    """特征金字塔：三级横向连接 + top-down"""
+
+    @staticmethod
+    def _feats():
+        return [
+            [[[0.1 * (c + 1) + 0.013 * a - 0.007 * b for b in range(8)]
+              for a in range(8)] for c in range(2)],
+            [[[0.2 * (c + 1) - 0.011 * a + 0.009 * b for b in range(4)]
+              for a in range(4)] for c in range(4)],
+            [[[0.3 * (c + 1) + 0.017 * a + 0.005 * b for b in range(2)]
+              for a in range(2)] for c in range(8)],
+        ]
+
+    def test_shapes_and_params(self):
+        random.seed(3)
+        net = AI.FPN([2, 4, 8], out_channels=3)
+        outs = net.forward(self._feats())
+        assert [(len(o), len(o[0]), len(o[0][0])) for o in outs] == \
+            [(3, 8, 8), (3, 4, 4), (3, 2, 2)]
+        # 每个 1x1 横向卷积 2/4/8 进 3 出：参数量 = 3*(2+4+8) + 3*3 个偏置
+        # 每个 3x3 平滑卷积：3*3*3*3 + 3
+        assert net.param_count() == 3 * (2 + 4 + 8) + 3 * 3 + 3 * (3 * 3 * 3 * 3 + 3)
+        # smooth=False 时只有横向卷积
+        net2 = AI.FPN([2, 4, 8], out_channels=3, smooth=False)
+        assert net2.forward(self._feats())[0][0][0][0] is not None
+        assert net2.param_count() == 3 * (2 + 4 + 8) + 3 * 3
+        # 通道/尺寸/级数不符都要报错
+        with pytest.raises(ValueError):
+            net.forward(self._feats()[:2])
+        with pytest.raises(ValueError):
+            AI.FPN([2, 4, 8], out_channels=3).forward(
+                [self._feats()[0], self._feats()[1][:2], self._feats()[2]])
+        with pytest.raises(ValueError):
+            AI.FPN([2, 4, 8], out_channels=3).forward(
+                self._feats()[:2] + [[[[0.0] * 3 for _ in range(3)] for _ in range(8)]])
+        with pytest.raises(TypeError):
+            AI.FPN([2])
+        with pytest.raises(ValueError):
+            AI.FPN([2, 0])
+        with pytest.raises(ValueError):
+            AI.FPN([2, 4], out_channels=0)
+
+    def test_dx_matches_finite_difference(self):
+        random.seed(3)
+        net = AI.FPN([2, 4, 8], out_channels=3)
+        feats = self._feats()
+        outs = net.forward(feats)
+        Wg = [[[[random.uniform(-1, 1) for _ in range(len(o[0][0]))]
+                for _ in range(len(o[0]))] for _ in range(3)] for o in outs]
+
+        def loss(fs):
+            o = net.forward(fs)
+            return sum(Wg[i][c][a][b] * o[i][c][a][b]
+                       for i in range(3) for c in range(3)
+                       for a in range(len(o[i][0])) for b in range(len(o[i][0][0])))
+
+        eps = 1e-6
+        for lvl, (c, a, b) in [(0, (0, 0, 0)), (1, (3, 3, 3)), (2, (7, 1, 1))]:
+            fs = [[[list(row) for row in ch] for ch in f] for f in feats]
+            fs[lvl][c][a][b] += eps
+            lp = loss(fs)
+            fs = [[[list(row) for row in ch] for ch in f] for f in feats]
+            fs[lvl][c][a][b] -= eps
+            lm = loss(fs)
+            num = (lp - lm) / (2 * eps)
+            net.zero_grad()
+            net.forward(feats)
+            dxs = net.backward(Wg)
+            assert abs(dxs[lvl][c][a][b] - num) <= 1e-6
+
+    def test_conv_grads_and_steps(self):
+        random.seed(3)
+        net = AI.FPN([2, 4, 8], out_channels=3)
+        feats = self._feats()
+        outs = net.forward(feats)
+        Wg = [[[[random.uniform(-1, 1) for _ in range(len(o[0][0]))]
+                for _ in range(len(o[0]))] for _ in range(3)] for o in outs]
+
+        def loss():
+            o = net.forward(feats)
+            return sum(Wg[i][c][a][b] * o[i][c][a][b]
+                       for i in range(3) for c in range(3)
+                       for a in range(len(o[i][0])) for b in range(len(o[i][0][0])))
+
+        eps = 1e-6
+        for layer, idx in [(net.lateral[0], (0, 0, 0, 0)), (net.smooth[1], (0, 0, 1, 1))]:
+            old = layer.weights[idx[0]][idx[1]][idx[2]][idx[3]]
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = old + eps
+            lp = loss()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = old - eps
+            lm = loss()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = old
+            num = (lp - lm) / (2 * eps)
+            net.zero_grad()
+            net.forward(feats)
+            net.backward(Wg)
+            ana = layer.grad_w[idx[0]][idx[1]][idx[2]][idx[3]]
+            assert abs(ana - num) <= 1e-6
+
+        before = net.lateral[0].weights[0][0][0][0]
+        net.sgd_step(0.01)
+        assert net.lateral[0].weights[0][0][0][0] != before
+        before = net.lateral[0].weights[0][0][0][0]
+        net.adam_step(0.01)
+        assert net.lateral[0].weights[0][0][0][0] != before
+        with pytest.raises(ValueError):
+            net.sgd_step(-1)
+        with pytest.raises(RuntimeError):
+            AI.FPN([2, 4, 8], out_channels=3).backward(Wg)
+
+
+class TestSegNet:
+    """SegNet：池化索引解码"""
+
+    @staticmethod
+    def _img():
+        return [[[0.1 * a - 0.05 * b + 0.01 * (a * b % 3) for b in range(8)]
+                 for a in range(8)]]
+
+    @staticmethod
+    def _dw():
+        return [[[1.0 if (a + b) % 2 == 0 else -0.5 for b in range(8)]
+                 for a in range(8)] for _ in range(2)]
+
+    def test_shapes_params_and_errors(self):
+        random.seed(5)
+        seg = AI.SegNet(in_channels=1, num_classes=2, base_channels=2)
+        logits = seg.forward(self._img())
+        assert (len(logits), len(logits[0]), len(logits[0][0])) == (2, 8, 8)
+        # 6 个 3x3/1x1 卷积：cin*c0*9+c0, c0*c1*9+c1, c1*c1*9+c1, c1*c0*9+c0,
+        # c0*c0*9+c0, c0*2*1+2 —— c0=2, c1=4
+        expect = (1 * 2 * 9 + 2) + (2 * 4 * 9 + 4) + (4 * 4 * 9 + 4) + \
+                 (4 * 2 * 9 + 2) + (2 * 2 * 9 + 2) + (2 * 2 * 1 + 2)
+        assert seg.param_count() == expect
+        dx = seg.backward(self._dw())
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
+        with pytest.raises(ValueError):
+            AI.SegNet(1, 2, 2).forward([self._img()[0], self._img()[0]])
+        with pytest.raises(ValueError):
+            AI.SegNet(1, 2, 2).forward([[[0.0] * 6 for _ in range(6)]])
+        with pytest.raises(RuntimeError):
+            AI.SegNet(1, 2, 2).backward(self._dw())
+        with pytest.raises(ValueError):
+            AI.SegNet(1, 0, 2)
+        with pytest.raises(ValueError):
+            AI.SegNet(1, 2, 2.5)
+        s2 = AI.SegNet(1, 2, 2)
+        s2.forward(self._img())
+        with pytest.raises(ValueError):
+            s2.backward(self._dw()[:1])
+        with pytest.raises(ValueError):
+            s2.sgd_step(-0.1)
+
+    def test_dx_matches_finite_difference(self):
+        random.seed(5)
+        seg = AI.SegNet(in_channels=1, num_classes=2, base_channels=2)
+        img = self._img()
+        DW = self._dw()
+
+        def loss(im):
+            o = seg.forward(im)
+            return sum(DW[c][a][b] * o[c][a][b]
+                       for c in range(2) for a in range(8) for b in range(8))
+
+        eps = 1e-6
+        for (a, b) in [(0, 0), (3, 5), (7, 7)]:
+            im2 = [[list(row) for row in img[0]]]
+            im2[0][a][b] += eps
+            lp = loss(im2)
+            im3 = [[list(row) for row in img[0]]]
+            im3[0][a][b] -= eps
+            lm = loss(im3)
+            num = (lp - lm) / (2 * eps)
+            seg.zero_grad()
+            seg.forward(img)
+            dx = seg.backward(DW)
+            assert abs(dx[0][a][b] - num) <= 1e-7
+        # 卷积参数梯度也核对一项
+        c1 = seg.conv1
+        old = c1.weights[0][0][1][1]
+        c1.weights[0][0][1][1] = old + eps
+        lp = loss(img)
+        c1.weights[0][0][1][1] = old - eps
+        lm = loss(img)
+        c1.weights[0][0][1][1] = old
+        num = (lp - lm) / (2 * eps)
+        seg.zero_grad()
+        seg.forward(img)
+        seg.backward(DW)
+        assert abs(c1.grad_w[0][0][1][1] - num) <= 1e-6
+
+    def test_unpool_uses_argmax_indices(self):
+        random.seed(5)
+        seg = AI.SegNet(in_channels=1, num_classes=2, base_channels=2)
+        img = self._img()
+        seg.forward(img)
+        h0 = seg._relu(seg.conv1.forward(img))
+        p0 = seg.pool0.forward(h0)
+        # mask 存的是窗口内相对位置，逐窗口和 argmax 对齐
+        for c in range(len(h0)):
+            for i in range(4):
+                for j in range(4):
+                    best = -1e18
+                    arg = (0, 0)
+                    for kh in range(2):
+                        for kw in range(2):
+                            v = h0[c][2 * i + kh][2 * j + kw]
+                            if v > best:
+                                best = v
+                                arg = (kh, kw)
+                    assert seg.pool0.mask[c][i][j] == arg
+        u = AI._unpool2(p0, seg.pool0, 8, 8)
+        for c in range(len(p0)):
+            for i in range(4):
+                for j in range(4):
+                    kh, kw = seg.pool0.mask[c][i][j]
+                    assert u[c][i * 2 + kh][j * 2 + kw] == p0[c][i][j]
+        # 未选中的位置为 0
+        picked = {(i * 2 + seg.pool0.mask[0][i][j][0], j * 2 + seg.pool0.mask[0][i][j][1])
+                  for i in range(4) for j in range(4)}
+        assert len(picked) == 16
+        # 非选中位置必须为 0（选中位置可能是 0.0，所以不能数非零个数）
+        assert all(u[0][a][b] == 0.0 for a in range(8) for b in range(8)
+                   if (a, b) not in picked)
+        # 训练：40 步 Adam 让 loss 显著下降
+        random.seed(11)
+        seg2 = AI.SegNet(in_channels=1, num_classes=1, base_channels=3)
+        imgs = [[[[0.05 * (a + 2 * b) for b in range(8)] for a in range(8)]],
+                [[[0.9 - 0.05 * (a + b) for b in range(8)] for a in range(8)]]]
+        tgts = [[[[1.0] * 8 for _ in range(8)]], [[[0.0] * 8 for _ in range(8)]]]
+        first = None
+        for _ in range(40):
+            tot = 0.0
+            for im, tg in zip(imgs, tgts):
+                seg2.zero_grad()
+                o = seg2.forward(im)
+                d = [[[o[c][a][b] - tg[c][a][b] for b in range(8)]
+                      for a in range(8)] for c in range(1)]
+                tot += sum((o[c][a][b] - tg[c][a][b]) ** 2 for c in range(1)
+                           for a in range(8) for b in range(8)) / 64.0
+                seg2.backward(d)
+                seg2.adam_step(0.02)
+            if first is None:
+                first = tot
+        assert tot < first / 3.0

@@ -165,7 +165,8 @@
 ### W4 视觉骨干（P0/P1）
 - [x] `PatchEmbedding`（`Conv2d(kernel=stride=p)` + 行优先摊平，`backward` 还原特征图；`dx`/`conv.grad_w` 中心差分 ≤1e-7）+ `ViT`（CLS token + 位置编码 + 2 层编码器 + 分类头；`dx` 与 CLS/`pos`/head/`LayerNorm` 四组梯度中心差分 ≤1e-7；梯度累加语义与 `zero_grad`；2 类小任务 15 轮收敛并全对；只有 `sgd_step`，与 Transformer 系列一致）
 - [x] `UNet`（2 级下采样 + 瓶颈 + 2 级上采样 + 通道拼接跳跃；可选 BN；`dx` 与编码/转置卷积/BN 三组参数梯度中心差分 ≤1e-9；Adam 40 步 MSE 0.67 → <0.22）
-- [ ] `FPN`、`SegNet`（简化）
+- [x] `FPN`（1x1 横向 + 最近邻上采样相加 + 3x3 平滑；逐级 `dx` 与横向/平滑卷积 `grad_w` 中心差分 ≤1e-9，要求相邻尺寸严格 2 倍）
+- [x] `SegNet`（简化 2 级；解码用 `MaxPool2d.mask` 的**窗口内相对位置**+ stride 换算出绝对坐标做 unpool —— 直接当绝对位置用会让 `dx` 差 4 倍，`_unpool2`/`_unpool2_back` 已按此修；`dx` 与 `conv1` 梯度中心差分 ≤1e-7，40 步 Adam loss 1.01 → 0.02）
 - [ ] `SwinTransformer`（窗口注意力，简化）、`MLPMixer`
 - [x] `AttentionPooling`（`q` 可学，`q=0` 退化为平均；`dx`/`grad_q` 中心差分 ≤1e-9）、`GeMPooling`（`p=1` 平均 / `p=2` 均方根 / `p=2000` 仍不溢出，log 空间实现）
 
