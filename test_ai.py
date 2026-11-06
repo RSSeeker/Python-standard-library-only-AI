@@ -11166,3 +11166,178 @@ class TestSwiGLUGates:
         else:
             raise AssertionError("非字符串 gate 应该报错")
         assert AI.SwiGLU.GATES == ("swish", "silu", "gelu", "relu", "bilinear")
+
+
+# ==== W3-C：初始化族 ====
+
+class TestInitFamily:
+    """LeCun / 正交 / 稀疏 / 截断正态 / 零偏置 / 残差零初始化"""
+
+    @staticmethod
+    def _flat(layer):
+        return [v for row in layer.weights for v in row]
+
+    @staticmethod
+    def _stats(vals):
+        import math as _math
+        n = len(vals)
+        mu = sum(vals) / n
+        var = sum((v - mu) ** 2 for v in vals) / n
+        return mu, _math.sqrt(var)
+
+    def test_lecun(self):
+        import math as _math
+        import random as _random
+        _random.seed(101)
+        layer = AI.Layer(64, 32, activation="linear")
+        AI.init_lecun_normal(layer)
+        mu, sd = self._stats(self._flat(layer))
+        expect = _math.sqrt(1.0 / 64)
+        assert abs(mu) < 0.01
+        assert abs(sd - expect) / expect < 0.06
+
+        AI.init_lecun_uniform(layer)
+        mu, sd = self._stats(self._flat(layer))
+        bound = _math.sqrt(3.0 / 64)
+        assert abs(sd - bound / _math.sqrt(3)) / (bound / _math.sqrt(3)) < 0.06
+        assert all(abs(v) <= bound + 1e-12 for v in self._flat(layer))
+
+        _random.seed(101)
+        l2 = AI.Layer(64, 32, activation="linear")
+        AI.init_lecun_normal(l2, fan_in=16)
+        _, sd = self._stats(self._flat(l2))
+        assert abs(sd - _math.sqrt(1.0 / 16)) / _math.sqrt(1.0 / 16) < 0.06
+
+    def test_orthogonal(self):
+        import math as _math
+        import random as _random
+        _random.seed(102)
+        sq = AI.Layer(8, 8, activation="linear")
+        AI.init_orthogonal(sq, gain=2.0)
+        rows = [list(r) for r in sq.weights]
+        for r in rows:
+            assert abs(_math.sqrt(sum(v * v for v in r)) - 2.0) < 1e-9
+        for i in range(8):
+            for j in range(i + 1, 8):
+                dot = sum(rows[i][k] * rows[j][k] for k in range(8))
+                assert abs(dot) <= 1e-10, f"第 {i},{j} 行不垂直：{dot:.3e}"
+
+        # 行多于列：行无法正交，改为列正交（wᵀw = I）
+        tall = AI.Layer(3, 6, activation="linear")
+        AI.init_orthogonal(tall, gain=1.0)
+        cols = [[tall.weights[i][j] for i in range(6)] for j in range(3)]
+        for c in cols:
+            assert abs(_math.sqrt(sum(v * v for v in c)) - 1.0) < 1e-9
+        for i in range(3):
+            for j in range(i + 1, 3):
+                assert abs(sum(cols[i][k] * cols[j][k] for k in range(6))) <= 1e-10
+
+    def test_sparse_and_trunc_normal(self):
+        import math as _math
+        import random as _random
+        _random.seed(103)
+        sp = AI.Layer(20, 10, activation="linear")
+        AI.init_sparse(sp, sparsity=0.8)
+        vals = self._flat(sp)
+        zeros = sum(1 for v in vals if v == 0.0) / len(vals)
+        assert abs(zeros - 0.8) < 0.06
+        nonzero = [v for v in vals if v != 0.0]
+        _, sd = self._stats(nonzero)
+        expect = _math.sqrt(1.0 / 20)
+        assert abs(sd - expect) / expect < 0.2
+
+        _random.seed(104)
+        tn = AI.Layer(50, 40, activation="linear")
+        AI.init_trunc_normal(tn, std=0.02, cutoff=2.0)
+        vals = self._flat(tn)
+        assert all(abs(v) <= 0.04 + 1e-12 for v in vals)
+        mu, sd = self._stats(vals)
+        assert 0.015 < sd < 0.021
+        assert abs(mu) < 0.005
+
+    def test_zero_bias_and_residual(self):
+        import random as _random
+        _random.seed(105)
+        mlp = AI.MLP([4, 8, 3])
+        for lyr in mlp.layers:
+            lyr.biases = [0.5] * lyr.fan_out
+        AI.zero_bias(mlp)
+        assert all(b == 0.0 for lyr in mlp.layers for b in lyr.biases)
+
+        _random.seed(106)
+        blk = AI.BasicBlock2d(3, kernel_size=3)
+        x = [[[0.1 * (i + j + k) for k in range(4)] for j in range(4)]
+             for i in range(3)]
+        before = blk.forward(x)
+        AI.zero_init_residual(blk)
+        after = blk.forward(x)
+        assert all(g == 0.0 for g in blk.bn2.gamma)
+        ref = [[[max(0.0, x[c][h][w]) for w in range(4)] for h in range(4)]
+               for c in range(3)]
+        for c in range(3):
+            for h in range(4):
+                for w in range(4):
+                    assert abs(after[c][h][w] - ref[c][h][w]) < 1e-12
+        assert any(abs(before[c][h][w] - ref[c][h][w]) > 1e-9
+                   for c in range(3) for h in range(4) for w in range(4))
+
+        # Bottleneck 零的是分支最后一个 BN（bn3），不是捷径的 short_bn
+        _random.seed(107)
+        bn = AI.Bottleneck2d(3, 6)
+        AI.zero_init_residual(bn)
+        assert all(g == 0.0 for g in bn.bn3.gamma)
+        assert any(g != 0.0 for g in bn.short_bn.gamma)
+
+    def test_errors_and_default_unchanged(self):
+        import math as _math
+        import random as _random
+        try:
+            AI.init_lecun_normal(123)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("非层对象应该报错")
+        try:
+            AI.init_lecun_normal(AI.MLP([2, 2]), fan_in=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("fan_in=0 应该报错")
+        try:
+            AI.init_orthogonal(AI.Layer(3, 3), gain=float("inf"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("gain=inf 应该报错")
+        for bad in (1.0, -0.1):
+            try:
+                AI.init_sparse(AI.Layer(3, 3), sparsity=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"sparsity={bad} 应该报错")
+        try:
+            AI.init_trunc_normal(AI.Layer(3, 3), std=0.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("std=0 应该报错")
+        try:
+            AI.init_trunc_normal(AI.Layer(3, 3), cutoff=-1.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("cutoff<0 应该报错")
+        try:
+            AI.zero_init_residual(AI.Layer(3, 3))
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("没有 BN 的块应该报错")
+        # 默认构造仍是 He 初始化，没被这些工具函数改动
+        _random.seed(108)
+        m = AI.MLP([100, 40])
+        vals = [v for lyr in m.layers for v in self._flat(lyr)]
+        _, sd = self._stats(vals)
+        expect = _math.sqrt(2.0 / 100)
+        assert abs(sd - expect) / expect < 0.1

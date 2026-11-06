@@ -145,8 +145,10 @@
 - [x] 激活族（W3-B）：`PReLU`（逐特征可学习斜率，负分支才累计 `da`）、`Snake`（`y = x + sin²(ax)/a`，`a→0` 走极限分支；`dx`/`da` 中心差分 ≤1e-7）
 - [ ] 激活族（剩余）：`Maxout`、`DynamicReLU`、`FReLU`
 - [x] GLU 族（W3-B）：`SwiGLU(gate="swish|silu|gelu|relu|bilinear")` → SwiGLU / GeGLU / ReGLU / Bilinear GLU；默认 `swish` 与原实现逐位一致，各 gate 的 `grad_Wg` 中心差分 ≤1e-6
-- [ ] 初始化族：`init_lecun`、`init_orthogonal`、`init_sparse`、`init_trunc_normal`、零初始化 bias、
-      残差分支零初始化（`zero_init_residual`）
+- [x] 初始化族：`init_lecun_normal`/`init_lecun_uniform`、`init_orthogonal`、`init_sparse`、
+      `init_trunc_normal`、`zero_bias`、`zero_init_residual`（W3-C）
+      —— 正交实现里 Gram-Schmidt 曾漏除 `|prev|²`（行内积 3.997），且 `zero_init_residual` 曾零掉
+      捷径的 `short_bn` 而不是分支的 `bn3`；两处都由中心差分/恒等性质测出。
 - [ ] 数据驱动初始化：LSUV、Fixup/T-Fixup、Mimic Init（NET2NET）
 - [ ] 残差变体：Pre-LN / Post-LN / ReZero / SkipInit / Highway
 

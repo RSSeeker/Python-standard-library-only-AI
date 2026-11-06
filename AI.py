@@ -366,6 +366,210 @@ class Linear(Layer):
         super().__init__(fan_in, fan_out, activation="linear")
 
 
+# ============================================================================
+#  初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
+# ============================================================================
+
+def _init_layers(target):
+    """把 Layer / MLP / 层列表统一成层列表（只收带 2D `weights` 的对象）"""
+    if hasattr(target, "layers"):
+        layers = list(target.layers)
+    elif isinstance(target, (list, tuple)):
+        layers = list(target)
+    else:
+        layers = [target]
+    out = []
+    for i, layer in enumerate(layers):
+        w = getattr(layer, "weights", None)
+        if not w or not isinstance(w[0], (list, tuple)):
+            raise TypeError(
+                f"初始化函数: 第 {i} 个对象没有 2D `weights`（需要 Layer，"
+                f"收到 {type(layer).__name__}）")
+        out.append(layer)
+    if not out:
+        raise ValueError("初始化函数: 目标里没有可初始化的层")
+    return out
+
+
+def init_lecun_normal(target, fan_in: Optional[int] = None):
+    """LeCun 正态初始化：std = sqrt(1/fan_in)
+
+    `fan_in` 显式给出时用它（同一个系数套用到所有层），否则逐层取 `layer.fan_in`。
+    """
+    if fan_in is not None:
+        if isinstance(fan_in, bool) or not isinstance(fan_in, int) or fan_in < 1:
+            raise ValueError(f"init_lecun_normal: fan_in 必须是正整数，收到 {fan_in!r}")
+    for layer in _init_layers(target):
+        n = fan_in if fan_in is not None else layer.fan_in
+        std = math.sqrt(1.0 / n)
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[i])):
+                layer.weights[i][j] = random.gauss(0.0, std)
+    return target
+
+
+def init_lecun_uniform(target, fan_in: Optional[int] = None):
+    """LeCun 均匀初始化：U(-b, b)，b = sqrt(3/fan_in)（与正态同方差）"""
+    if fan_in is not None:
+        if isinstance(fan_in, bool) or not isinstance(fan_in, int) or fan_in < 1:
+            raise ValueError(f"init_lecun_uniform: fan_in 必须是正整数，收到 {fan_in!r}")
+    for layer in _init_layers(target):
+        n = fan_in if fan_in is not None else layer.fan_in
+        bound = math.sqrt(3.0 / n)
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[i])):
+                layer.weights[i][j] = random.uniform(-bound, bound)
+    return target
+
+
+def init_orthogonal(target, gain: float = 1.0):
+    """正交初始化：行（fan_out <= fan_in 时）或列（否则）两两正交、模长 = gain
+
+    用 Gram-Schmidt 逐行正交化；`fan_out > fan_in` 时行不可能全部正交，
+    改为对列做正交化并保持每行模长 = gain（与 PyTorch 的处理一致：
+    在较大的那个维度上做正交化）。
+    """
+    if not isinstance(gain, (int, float)) or isinstance(gain, bool):
+        raise TypeError(f"init_orthogonal: gain 必须是数字，收到 {type(gain).__name__}")
+    if not math.isfinite(float(gain)):
+        raise ValueError(f"init_orthogonal: gain 必须是有限数，收到 {gain!r}")
+    for layer in _init_layers(target):
+        rows = len(layer.weights)
+        cols = len(layer.weights[0])
+        if rows <= cols:
+            # 逐行正交化
+            for i in range(rows):
+                vec = [random.gauss(0.0, 1.0) for _ in range(cols)]
+                for k in range(i):
+                    prev = layer.weights[k]
+                    dot = sum(vec[j] * prev[j] for j in range(cols))
+                    sq = sum(prev[j] * prev[j] for j in range(cols))
+                    if sq < 1e-24:
+                        continue
+                    coef = dot / sq
+                    for j in range(cols):
+                        vec[j] -= coef * prev[j]
+                nrm = math.sqrt(sum(v * v for v in vec))
+                if nrm < 1e-12:
+                    # 退化时退回到单位向量方向（极低概率），保证不产生 NaN
+                    vec = [1.0 if j == i % cols else 0.0 for j in range(cols)]
+                    nrm = 1.0
+                scale = gain / nrm
+                layer.weights[i] = [v * scale for v in vec]
+        else:
+            # 行比列多：按列正交化，再逐行缩放
+            mat = [[random.gauss(0.0, 1.0) for _ in range(rows)] for _ in range(cols)]
+            for i in range(cols):
+                for k in range(i):
+                    dot = sum(mat[i][r] * mat[k][r] for r in range(rows))
+                    sq = sum(mat[k][r] * mat[k][r] for r in range(rows))
+                    if sq < 1e-24:
+                        continue
+                    coef = dot / sq
+                    for r in range(rows):
+                        mat[i][r] -= coef * mat[k][r]
+                nrm = math.sqrt(sum(v * v for v in mat[i]))
+                if nrm < 1e-12:
+                    mat[i] = [1.0 if r == i % rows else 0.0 for r in range(rows)]
+                    nrm = 1.0
+                mat[i] = [v / nrm for v in mat[i]]
+            for i in range(rows):
+                layer.weights[i] = [mat[j][i] * gain for j in range(cols)]
+    return target
+
+
+def init_sparse(target, sparsity: float = 0.9, std: Optional[float] = None):
+    """稀疏初始化（Martens 2010）：以 `sparsity` 比例置零，非零项方差放大 1/(1-sparsity)
+
+    `std` 不给时用 LeCun 正态的系数 sqrt(1/fan_in) 再除以 sqrt(1-sparsity)，
+    使整体方差与稠密初始化同量级。
+    """
+    if not isinstance(sparsity, (int, float)) or isinstance(sparsity, bool):
+        raise TypeError(f"init_sparse: sparsity 必须是数字，收到 {type(sparsity).__name__}")
+    if not (0.0 <= float(sparsity) < 1.0):
+        raise ValueError(f"init_sparse: sparsity 必须在 [0, 1) 内，收到 {sparsity!r}")
+    if std is not None:
+        if not isinstance(std, (int, float)) or isinstance(std, bool) or std < 0:
+            raise ValueError(f"init_sparse: std 必须是非负数，收到 {std!r}")
+    p = float(sparsity)
+    for layer in _init_layers(target):
+        base = float(std) if std is not None else math.sqrt(1.0 / layer.fan_in)
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[i])):
+                if random.random() < p:
+                    layer.weights[i][j] = 0.0
+                else:
+                    layer.weights[i][j] = random.gauss(0.0, base)
+    return target
+
+
+def init_trunc_normal(target, std: float = 0.02, cutoff: float = 2.0,
+                      max_tries: int = 100):
+    """截断正态初始化：|w| <= cutoff*std，且方差近似 std²
+
+    用拒绝采样（ViT 的 trunc_normal_ 同思路）。`max_tries` 次都没采到就取边界值，
+    保证一定终止（截断到 ±2σ 时单次接受率约 95%，连拒 100 次概率可忽略）。
+    """
+    for name, value in (("std", std), ("cutoff", cutoff)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f"init_trunc_normal: {name} 必须是数字，收到 {type(value).__name__}")
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"init_trunc_normal: {name} 必须是正的有限数，收到 {value!r}")
+    if isinstance(max_tries, bool) or not isinstance(max_tries, int) or max_tries < 1:
+        raise ValueError(f"init_trunc_normal: max_tries 必须是正整数，收到 {max_tries!r}")
+    limit = float(cutoff) * float(std)
+    for layer in _init_layers(target):
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[i])):
+                v = None
+                for _ in range(max_tries):
+                    cand = random.gauss(0.0, float(std))
+                    if abs(cand) <= limit:
+                        v = cand
+                        break
+                if v is None:
+                    v = limit if random.random() < 0.5 else -limit
+                layer.weights[i][j] = v
+    return target
+
+
+def zero_bias(target):
+    """把（所有层的）偏置清零 —— 缩放技巧里常与权重零初始化配套使用"""
+    layers = _init_layers(target)
+    for layer in layers:
+        b = getattr(layer, "biases", None)
+        if b is not None:
+            for i in range(len(b)):
+                b[i] = 0.0
+    return target
+
+
+def zero_init_residual(block):
+    """残差分支零初始化：把分支里**最后一个** BatchNorm 的 gamma 置零
+
+    这样训练开始时残差分支输出恰为 0，块退化为 `out = act(x)`（恒等捷径），
+    是 ResNet 论文里的 zero-init residual（Goyal et al. 2017 推广的做法）。
+    支持 `BasicBlock2d`（零 `bn2.gamma`）与 `Bottleneck2d`（零 `bn3.gamma`），
+    识别方式是"块里有 bn1/bn2/... 这类 BatchNorm2d 属性"，取其中**最后**一个；
+    捷径投影的 `short_bn` 不属于分支，不会被清零。
+    """
+    # 只认分支内的 BN；short_bn 属于捷径投影，零它等于改捷径，不是 zero-init residual
+    bn_names = ("bn1", "bn2", "bn3")
+    found = [n for n in bn_names if hasattr(block, n)]
+    if not found:
+        raise TypeError(
+            f"zero_init_residual: {type(block).__name__} 里没有 BatchNorm2d 分支"
+            f"（查找 {bn_names}）")
+    last = getattr(block, found[-1])
+    gamma = getattr(last, "gamma", None)
+    if gamma is None:
+        raise TypeError(
+            f"zero_init_residual: {found[-1]} 没有 gamma（不是 BatchNorm2d？）")
+    for i in range(len(gamma)):
+        gamma[i] = 0.0
+    return block
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

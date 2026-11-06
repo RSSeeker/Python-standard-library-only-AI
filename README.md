@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（818 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（823 项）
 
 ## 特性
 
@@ -714,6 +714,13 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 | `uncertainty_weighting(losses, log_vars)` | Kendall 多任务不确定性加权：`Σ exp(-s_i)·L_i + s_i`，返回 `(total, weights, d_losses, d_log_vars)` 可直接反传 |
 | `gradnorm_weights(losses, grad_norms, alpha=1.5, lr=0.025, weights=None, G0=None)` | GradNorm：按 loss 比例给出目标梯度范数并更新任务权重，最后归一化到均值 1；返回 `weights`/`targets`/`loss`/`gradients` |
 | `pcgrad(grad_a, grad_b, eps=1e-12)` | PCGrad 冲突投影：两任务梯度内积为负时互相投影掉冲突分量，返回投影后的两个梯度（嵌套 list 也支持） |
+| `init_lecun_normal(target, fan_in=None)` | LeCun 正态初始化（`std = sqrt(1/fan_in)`），`fan_in` 缺省取层输入维度 |
+| `init_lecun_uniform(target, fan_in=None)` | LeCun 均匀初始化（`U(±sqrt(3/fan_in))`，方差与上面一致） |
+| `init_orthogonal(target, gain=1.0)` | 正交初始化（Gram-Schmidt）；`fan_out > fan_in` 时改按列正交（此时每行模长不再是 `gain`） |
+| `init_sparse(target, sparsity=0.9, std=None)` | 稀疏初始化：零元素比例恰为 `sparsity`，非零项按 `sqrt(1/fan_in)` 正态 |
+| `init_trunc_normal(target, std=0.02, cutoff=2.0, max_tries=100)` | 截断正态（拒绝采样，全部落在 `±cutoff·std` 内），ViT 类模型的常用初始化 |
+| `zero_bias(target)` | 把所有层的 `biases` 清零 |
+| `zero_init_residual(block)` | 残差分支零初始化：把块里**最后一个**分支 BN 的 `gamma` 置零（`BasicBlock2d` 零 `bn2`、`Bottleneck2d` 零 `bn3`）；捷径投影的 `short_bn` 不动 |
 
 > 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
 > （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
@@ -1048,7 +1055,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-818 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+823 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1127,6 +1134,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPReLU` | 正分支恒等、负分支乘 `a`、`da` 只在负分支累计、`dx`/`da` 中心差分、优化器步与 8 类非法输入 |
 | `TestSnake` | 前向闭式解、`dx = dout·(1+sin2ax)`、`dx`/`da` 中心差分、`a→0` 退化恒等且 `da = dout·x²` |
 | `TestSwiGLUGates` | 默认 swish 与旧实现逐位一致、gelu/relu/bilinear 门控值、各 gate 的 `grad_Wg` 中心差分、非法 gate 校验 |
+| `TestInitFamily` | LeCun 正态/均匀的 `std` 与界内、正交矩阵行模长 `==gain` 且两两正交（fat 矩阵改验列正交）、稀疏零比例、截断正态界内、`zero_bias`、残差零初始化后退化为 `relu(x)`（Bottleneck 零 `bn3` 而非 `short_bn`）、非法输入、默认 He 初始化未被改动 |
 | `TestWeightNorm` | 初始化即等于原层、`dv`（含 `v`/`g` 解耦项）/`dg`/`db` 中心差分、`dx = wᵀdout`、forward 不永久改写内层权重 |
 | `TestSpectralNorm` | 前向 `(v/σ)x+b`、冻结 σ 时 `dv` 中心差分、未冻结时 σ 随权重变化、`power_iter`/维度/未 forward 校验 |
 | `TestFractionalPooling` | 输出尺寸随比例、每个输出等于被选位置原值、同 seed 逐位相同、反向只回传被选位置且总量守恒 |
@@ -1188,7 +1196,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 818 个单元测试
+├── test_ai.py       # 823 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
