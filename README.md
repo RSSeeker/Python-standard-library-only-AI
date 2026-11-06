@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（706 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（714 项）
 
 ## 特性
 
@@ -530,6 +530,9 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `info_nce_loss(anchor, pos, negs, temperature=0.07)` | 对比学习：余弦相似度 + 交叉熵，1 正 + N 负；返回 anchor / 正 / 每个负的梯度 |
 | `dice_loss(pred, target)` | 分割常用 `1 − (2\|p∩t\|+ε)/(\|p\|+\|t\|+ε)`，支持 `(C,H,W)` 或扁平结构 |
 | `ctc_loss(log_probs, targets, blank=0)` | CTC（单样本、log 空间前向后向）：输入 `(T,K)` 的 log 概率，返回对 log 概率的梯度 |
+| `class_balanced_loss(pred, idx, class_counts, beta=0.999, normalize=True)` | Class-Balanced：按「有效样本数」`(1-β)/(1-β^{n_c})` 加权，`normalize=True` 时让加权均值回到 1（配 `softmax` 输出层） |
+| `ldam_loss(logits, idx, class_counts, max_m=0.5, s=30.0)` | LDAM：给稀有类的 logit 加 `max_m/n_y^{1/4}` 的间隔再乘缩放 `s`，直接吃 logits（配 `linear` 输出层） |
+| `ohem_loss(preds, targets, keep_ratio=0.7)` | OHEM（**批级**）：一批概率向量里只保留最难的那部分样本，被丢掉的样本梯度全 0 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
 |------|------|------|
@@ -540,6 +543,8 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `'bce_with_logits'` | `linear` | 0/1 数值（喂 logits） |
 | `'huber'` | 任意 | 数值向量 / 标量 |
 | `'smooth_l1'` / `'l1'` / `'log_cosh'` / `'quantile'` | `linear` | 数值向量 / 标量 |
+| `'class_balanced'` | `softmax` | 类别索引 / one-hot / 软标签（`loss_kwargs` 必须给 `class_counts`） |
+| `'ldam'` | `linear` | 类别索引 / one-hot（`loss_kwargs` 必须给 `class_counts`） |
 
 `kl_divergence` **不在**上面的映射里：它要求 `pred` 是概率分布，而 `softmax` 层的
 反向是 softmax+CE 的联合梯度，任何非 CE 损失叠在 softmax 上都拿到不自洽的梯度
@@ -547,6 +552,9 @@ m = AI.Seq2SeqLM.load("s2s.json")
 `AI.kl_divergence` 并自己反传。
 
 配错「输出层激活 × 损失」会在 `Model(...)` 构造时直接抛 `ValueError`，而不是静默训歪。
+
+`ohem_loss` 是**批级**接口（一次吃一批概率向量、返回整批梯度），不能塞进 `Model(loss_fn=...)`
+（那是逐样本调用约定）；类别不平衡的两个可选项已经接进映射表，用法：
 
 > 所有损失都遵循和 `mse_loss` 相同的返回约定：`(loss, grad)`，
 > 也都可以当成 `Model(loss_fn=...)` 的自定义可调用对象用。
@@ -574,6 +582,11 @@ m.fit(data=train, epochs=20)
 # 二元分类：sigmoid 输出层 + bce
 m2 = AI.Model(AI.MLP([8, 16, 1], activations=["relu", "sigmoid"]),
               loss_fn="bce", task="regression", lr=0.01)
+
+# 长尾分类：按类频次加权（class_counts 用训练集的真实计数）
+m3 = AI.Model(AI.MLP([8, 16, 3], activations=["relu", "softmax"]),
+              loss_fn="class_balanced", task="classification",
+              loss_kwargs={"class_counts": [900, 90, 10], "beta": 0.999})
 ```
 
 ### 评估指标
@@ -972,7 +985,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-706 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+714 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1050,6 +1063,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSeq2SeqLM` | 46 个参数块（两个词表 + enc 16 + dec 26 + 输出头 2）、解码器因果性（改未来目标 token 不动前面 logits）、改源序列影响全部位置、`src_embedding` / 交叉注意力 `W_k` / `out.W` vs 数值梯度、复制作业学会（loss < 0.2×首值且贪心解码正确）、生成同 seed 可复现、非法输入 |
 | `TestCrossAttention` | 输出形状、无因果掩码、改 memory 影响输出、`dx`/`dmemory`/`W_k` vs 数值梯度、dropout train/eval、非法参数 |
 | `TestTransformerDecoder` | 自注意力因果但交叉注意力看全 memory、`dx`/`dmemory`/交叉 `W_k` vs 数值梯度、单层与直接调层逐位一致、多层 `dmemory` 形状、非法 `num_layers` |
+| `TestImbalanceLosses` | Class-Balanced 权重公式与归一化、CB 索引/软标签梯度、LDAM 闭式对齐与梯度、OHEM 选样、Model 接线与两个激活守卫、8 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
 | `TestFlops` | `estimate_flops` 的 MACs / 参数量 / 逐层明细与手算一致、不认识的模块报 TypeError |
@@ -1082,7 +1096,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 706 个单元测试
+├── test_ai.py       # 714 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

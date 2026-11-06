@@ -8713,3 +8713,150 @@ class TestRegressionLosses:
         for q in (0.0, 1.0, -0.1, 1.5):
             with pytest.raises(ValueError):
                 AI.quantile_loss([1.0], [0.0], quantile=q)
+
+
+# ============================================================================
+#  类别不平衡损失（Class-Balanced / LDAM / OHEM）
+# ============================================================================
+class TestImbalanceLosses:
+    """W1-B：类别不平衡损失的正确性与接线"""
+
+    @staticmethod
+    def _softmax(z):
+        mx = max(z)
+        ex = [math.exp(v - mx) for v in z]
+        s = sum(ex)
+        return [e / s for e in ex]
+
+    @staticmethod
+    def _numeric(f, z, eps=1e-6):
+        out = []
+        for i in range(len(z)):
+            zp = list(z)
+            zm = list(z)
+            zp[i] += eps
+            zm[i] -= eps
+            out.append((f(zp) - f(zm)) / (2 * eps))
+        return out
+
+    def test_class_balanced_weights(self):
+        counts = [100.0, 10.0, 1.0]
+        probs = [0.5, 0.3, 0.2]
+        raw = [(1 - 0.999) / (1 - 0.999 ** c) for c in counts]
+        # 未归一化时 loss 就是 -w_c*log p_c
+        for i in range(3):
+            loss, _ = AI.class_balanced_loss(probs, i, counts, beta=0.999, normalize=False)
+            assert abs(loss + raw[i] * math.log(probs[i])) < 1e-12
+        # 样本越少权重越大
+        assert raw[0] < raw[1] < raw[2]
+        # 归一化：按频率加权的权重均值为 1，故 loss 比例为 raw/meanw
+        mean_w = sum(c * w for c, w in zip(counts, raw)) / sum(counts)
+        for i in range(3):
+            loss, _ = AI.class_balanced_loss(probs, i, counts, beta=0.999)
+            assert abs(loss + (raw[i] / mean_w) * math.log(probs[i])) < 1e-12
+        # beta=0 时退化成普通 CE
+        for i in range(3):
+            loss, _ = AI.class_balanced_loss(probs, i, counts, beta=0.0)
+            assert abs(loss + math.log(probs[i])) < 1e-12
+
+    def test_class_balanced_gradient(self):
+        z = [0.7, -1.2, 2.4]
+        cnt = [30.0, 5.0, 2.0]
+        for y in (0, 1, 2):
+            _, g = AI.class_balanced_loss(self._softmax(z), y, cnt, beta=0.99)
+            num = self._numeric(
+                lambda zz: AI.class_balanced_loss(self._softmax(zz), y, cnt, beta=0.99)[0], z)
+            worst = max(abs(a - b) / max(1e-12, abs(a) + abs(b)) for a, b in zip(g, num))
+            assert worst < 1e-7, (y, worst)
+
+    def test_class_balanced_soft_target(self):
+        z = [0.7, -1.2, 2.4]
+        cnt = [30.0, 5.0, 2.0]
+        soft = [0.0, 0.8, 0.2]
+        _, g = AI.class_balanced_loss(self._softmax(z), soft, cnt, beta=0.99)
+        num = self._numeric(
+            lambda zz: AI.class_balanced_loss(self._softmax(zz), soft, cnt, beta=0.99)[0], z)
+        worst = max(abs(a - b) / max(1e-12, abs(a) + abs(b)) for a, b in zip(g, num))
+        assert worst < 1e-7
+        with pytest.raises(ValueError):
+            AI.class_balanced_loss([0.5, 0.5], [0.0, 0.0], [10.0, 3.0])
+
+    def test_ldam_matches_closed_form(self):
+        logits = [0.3, -0.5, 1.1]
+        counts = [200.0, 20.0, 2.0]
+        loss, grad = AI.ldam_loss(logits, 0, counts)
+        m = 0.5 / counts[0] ** 0.25
+        zz = [30.0 * v for v in logits]
+        zz[0] -= 30.0 * m
+        mx = max(zz)
+        ref = -(zz[0] - mx - math.log(sum(math.exp(v - mx) for v in zz)))
+        assert abs(loss - ref) < 1e-12
+        num = self._numeric(lambda ll: AI.ldam_loss(ll, 0, counts)[0], logits)
+        diff = max(abs(a - b) for a, b in zip(grad, num))
+        assert diff < 1e-8, diff
+
+    def test_ldam_margin_grows_for_rare_class(self):
+        rare = AI.ldam_loss([1.0, 0.5], 0, [1.0, 100.0])[0]
+        common = AI.ldam_loss([1.0, 0.5], 0, [100.0, 1.0])[0]
+        assert rare > common
+
+    def test_ohem_selection(self):
+        preds = [[0.9, 0.05, 0.05],
+                 [0.1, 0.8, 0.1],
+                 [0.2, 0.2, 0.6],
+                 [0.34, 0.33, 0.33],
+                 [0.6, 0.2, 0.2]]
+        targets = [0, 1, 2, 2, 1]
+        per_sample = [AI.cross_entropy_loss(p, t)[0] for p, t in zip(preds, targets)]
+        loss, grads = AI.ohem_loss(preds, targets, keep_ratio=0.6)
+        keep = 2
+        hardest = sorted(range(5), key=lambda i: per_sample[i], reverse=True)[:keep]
+        assert abs(loss - sum(per_sample[i] for i in hardest) / keep) < 1e-12
+        for i in range(5):
+            if i not in hardest:
+                assert all(v == 0.0 for v in grads[i])
+            else:
+                ref = AI.cross_entropy_loss(preds[i], targets[i])[1]
+                assert all(abs(a - b) < 1e-12 for a, b in zip(grads[i], ref))
+
+    def test_model_integration_and_guards(self):
+        assert AI.Model._LOSS_MAP["class_balanced"] is AI.class_balanced_loss
+        assert AI.Model._LOSS_MAP["ldam"] is AI.ldam_loss
+        assert "class_balanced" in AI.Model._INDEX_LOSSES
+        assert "ldam" in AI.Model._INDEX_LOSSES
+
+        random.seed(7)
+        mlp = AI.MLP([4, 6, 3], activations=["relu", "softmax"])
+        model = AI.Model(mlp, loss_fn="class_balanced", task="classification",
+                         loss_kwargs={"class_counts": [50.0, 5.0, 1.0], "beta": 0.99})
+        data = [([random.random() for _ in range(4)], random.randrange(3)) for _ in range(30)]
+        model.fit(data=data, epochs=15, batch_size=8, verbose=False, seed=1)
+        losses = [v for _, v in model.history["train_loss"]]
+        assert losses[-1] < losses[0]
+
+        bad = AI.MLP([3, 4, 3], activations=["relu", "softmax"])
+        with pytest.raises(ValueError):
+            AI.Model(bad, loss_fn="ldam", task="classification",
+                     loss_kwargs={"class_counts": [10.0, 10.0, 10.0]})
+        bad2 = AI.MLP([3, 4, 3], activations=["relu", "linear"])
+        with pytest.raises(ValueError):
+            AI.Model(bad2, loss_fn="class_balanced", task="classification",
+                     loss_kwargs={"class_counts": [10.0, 10.0, 10.0]})
+
+    def test_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.class_balanced_loss([0.5, 0.5], 0, [10.0])
+        with pytest.raises(ValueError):
+            AI.class_balanced_loss([0.5, 0.5], 0, [10.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.class_balanced_loss([0.5, 0.5], 0, [10.0, 3.0], beta=1.0)
+        with pytest.raises(TypeError):
+            AI.class_balanced_loss([0.5, 0.5], 0, [10.0, 3.0], normalize=1)
+        with pytest.raises(ValueError):
+            AI.ldam_loss([0.1, 0.2], 0, [5.0, 5.0], max_m=-1.0)
+        with pytest.raises(ValueError):
+            AI.ldam_loss([0.1, 0.2], 0, [5.0, 5.0], s=0.0)
+        with pytest.raises(ValueError):
+            AI.ohem_loss([], [])
+        with pytest.raises(ValueError):
+            AI.ohem_loss([[0.5, 0.5]], [0], keep_ratio=1.0)

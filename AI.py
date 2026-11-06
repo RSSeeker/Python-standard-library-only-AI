@@ -11,6 +11,7 @@
   - Embedding / ResidualBlock / Sequential（基础组件）+ MaxPool2d / AvgPool2d / GlobalAvgPool2d / AdaptiveAvgPool2d（池化）
   - Adam / AdamW / SGD / SGDMomentum / RMSprop（优化器）
   - MSE / L1 / Log-Cosh / Quantile / Smooth-L1 / CrossEntropy / Focal / BCE / Huber / KL 损失函数
+  + 类别不平衡损失（Class-Balanced / LDAM / OHEM）
   - 梯度裁剪 / 学习率调度器（StepLR / ExponentialLR / CosineAnnealingLR / WarmupLR）
   - 训练 / 验证 / 测试集拆分（可分层）+ K 折索引 + Early Stopping + DataLoader
   - StandardScaler / MinMaxScaler 特征缩放、ascii_plot 训练曲线、grad_check 梯度自检
@@ -6549,6 +6550,144 @@ def smooth_l1_loss(pred, target, delta: float = 1.0):
     return huber_loss(pred, target, delta=delta)
 
 
+def _class_counts_vector(class_counts, num_classes, who):
+    """把 class_counts 规范成与类别数等长的正数列表（每类样本数）"""
+    try:
+        counts = [float(c) for c in class_counts]
+    except TypeError:
+        raise TypeError(f"{who}: class_counts 必须是每类样本数的序列，收到 {class_counts!r}")
+    if len(counts) != num_classes:
+        raise ValueError(
+            f"{who}: class_counts 长度 {len(counts)} != 类别数 {num_classes}")
+    if any(c <= 0.0 for c in counts):
+        raise ValueError(f"{who}: class_counts 每项都必须 > 0（样本数），收到 {list(counts)}")
+    return counts
+
+
+def _class_target_weights(target_idx, num_classes, weights, who):
+    """按目标算样本权重：索引/one-hot 取对应类，真软标签取 Σt·w 的加权平均
+
+    返回 (weight, target_is_index, index_or_vector)
+    """
+    if isinstance(target_idx, (list, tuple)):
+        if len(target_idx) != num_classes:
+            raise ValueError(
+                f"{who}: target 长度 {len(target_idx)} != pred 长度 {num_classes}")
+        ts = [float(t) for t in target_idx]
+        if any(t < 0.0 for t in ts):
+            raise ValueError(f"{who}: 目标向量不能含负值")
+        ssum = sum(ts)
+        if ssum <= 0.0:
+            raise ValueError(f"{who}: 目标向量不能全 0")
+        w = sum(t * c for t, c in zip(ts, weights)) / ssum
+        return w, False, ts
+    idx = _ce_scalar_index(target_idx, num_classes, who)
+    return weights[idx], True, idx
+
+
+def class_balanced_loss(pred, target_idx, class_counts, beta: float = 0.999,
+                        normalize: bool = True):
+    """类别均衡损失（Cui et al. 2019）：每类权重 ∝ (1-β)/(1-β^{n_c})
+
+    `n_c` 是类别 c 的样本数，样本越多权重越小（β→1 时退化成 1/n_c）。
+    `normalize=True` 再把权重归一化到「按出现频率加权后的均值为 1」，避免整体学习率被放大。
+    pred 是 softmax 概率；返回 (loss, grad)，grad 是 softmax+CE 的联合梯度（配 softmax 输出层）。
+    支持类别索引与 one-hot/软标签（软标签按 Σt·w/Σt 取样本权重）。
+    """
+    if not isinstance(normalize, bool):
+        raise TypeError(f"class_balanced_loss: normalize 必须是 bool，收到 {normalize!r}")
+    beta = float(beta)
+    if not 0.0 <= beta < 1.0:
+        raise ValueError(f"class_balanced_loss: beta 必须在 [0,1) 内，收到 {beta!r}")
+    V = len(pred)
+    counts = _class_counts_vector(class_counts, V, "class_balanced_loss")
+    if beta == 0.0:
+        raw = [1.0] * V
+    else:
+        raw = [(1.0 - beta) / (1.0 - beta ** n) for n in counts]
+    weights = raw
+    if normalize:
+        total = sum(c * w for c, w in zip(counts, raw))
+        mean_w = total / sum(counts)
+        if mean_w <= 0.0:
+            raise ValueError("class_balanced_loss: 权重归一化失败（均值为 0）")
+        weights = [w / mean_w for w in raw]
+    w, is_index, tgt = _class_target_weights(target_idx, V, weights, "class_balanced_loss")
+    eps = 1e-15
+    if is_index:
+        loss = -w * math.log(max(float(pred[tgt]), eps))
+        grad = [w * float(p) for p in pred]
+        grad[tgt] -= w
+        return loss, grad
+    ssum = sum(tgt)
+    loss = -w * sum(t * math.log(max(float(p), eps)) for t, p in zip(tgt, pred))
+    grad = [w * (ssum * float(p) - t) for p, t in zip(pred, tgt)]
+    return loss, grad
+
+
+def ldam_loss(logits, target_idx, class_counts, max_m: float = 0.5, s: float = 30.0):
+    """LDAM（Cao et al. 2019）：给目标类 logit 减一个与类频率相关的间隔
+
+        m_c = max_m / n_c^{1/4},  z' = s·(z - m_y·e_y),  loss = -log softmax(z')[y]
+
+    `s` 是 logit 缩放（论文取 30），`max_m` 是最大间隔。**输入必须是 logits**，
+    因此输出层要用 `linear`（配 softmax 会在构造时被拒绝）。返回 (loss, grad)，
+    grad 相对 logits，可直接经 linear 层反传。
+    """
+    V = len(logits)
+    counts = _class_counts_vector(class_counts, V, "ldam_loss")
+    max_m = float(max_m)
+    if max_m < 0.0:
+        raise ValueError(f"ldam_loss: max_m 必须 >= 0，收到 {max_m!r}")
+    s = float(s)
+    if s <= 0.0:
+        raise ValueError(f"ldam_loss: s 必须 > 0，收到 {s!r}")
+    y = _ce_scalar_index(target_idx, V, "ldam_loss")
+    z = [s * float(v) for v in logits]
+    z[y] -= s * (max_m / counts[y] ** 0.25)
+    mx = max(z)
+    exps = [math.exp(v - mx) for v in z]
+    total = sum(exps)
+    probs = [e / total for e in exps]
+    loss = -(z[y] - mx - math.log(total))
+    grad = [s * (p - (1.0 if k == y else 0.0)) for k, p in enumerate(probs)]
+    return loss, grad
+
+
+def ohem_loss(preds, targets, keep_ratio: float = 0.7):
+    """OHEM（在线难例挖掘）：只保留损失最大的那一批样本
+
+    `preds` 是**一批**概率向量（list of list），`targets` 是等长类别索引列表；
+    `keep_ratio` 是保留的「容易样本」比例 (0,1)，即丢掉最容易的 `keep_ratio` 部分、
+    只对最难的前 `1-keep_ratio` 训练。返回 `(loss, grads)`：`loss` 是被选中样本的
+    平均损失，`grads` 与输入同形（未选中的样本梯度全 0）。
+
+    注意：这是**批级**接口，不能塞进 `Model(loss_fn=...)`（那是逐样本接口）；
+    自定义训练循环里用它替换逐样本 CE 即可。
+    """
+    if not isinstance(preds, (list, tuple)) or not preds:
+        raise ValueError("ohem_loss: preds 必须是非空的概率向量列表")
+    if not isinstance(targets, (list, tuple)) or len(targets) != len(preds):
+        raise ValueError(
+            f"ohem_loss: targets 长度必须与 preds 一致，收到 {len(targets) if isinstance(targets, (list, tuple)) else targets!r}")
+    kr = float(keep_ratio)
+    if not 0.0 <= kr < 1.0:
+        raise ValueError(f"ohem_loss: keep_ratio 必须在 [0,1) 内，收到 {keep_ratio!r}")
+    n = len(preds)
+    losses = []
+    grads = []
+    for row, tgt in zip(preds, targets):
+        loss, grad = cross_entropy_loss(row, tgt)
+        losses.append(loss)
+        grads.append(grad)
+    keep = max(1, int(round((1.0 - kr) * n)))
+    order = sorted(range(n), key=lambda i: losses[i], reverse=True)[:keep]
+    chosen = set(order)
+    out = [(grads[i] if i in chosen else [0.0] * len(grads[i])) for i in range(n)]
+    mean_loss = sum(losses[i] for i in order) / keep
+    return mean_loss, out
+
+
 def mse_loss(pred: List[float], target):
     """MSE 损失 + 对 pred 的梯度
 
@@ -11121,10 +11260,12 @@ class Model:
         'l1': l1_loss,
         'log_cosh': log_cosh_loss,
         'quantile': quantile_loss,
+        'class_balanced': class_balanced_loss,
+        'ldam': ldam_loss,
     }
 
     # 目标按「类别索引」解释的损失（其余按数值向量解释）
-    _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal')
+    _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal', 'class_balanced', 'ldam')
     # 目标按数值向量解释的损失（标量会被包成 [target]）
     _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber', 'smooth_l1',
                        'l1', 'log_cosh', 'quantile')
@@ -11288,6 +11429,8 @@ class Model:
             'log_cosh': ('linear', "log_cosh_loss 是回归损失，输出层激活请用 'linear'"),
             'quantile': ('linear', "quantile_loss 是回归损失，输出层激活请用 'linear'"),
             'smooth_l1': ('linear', "smooth_l1_loss 是回归损失，输出层激活请用 'linear'"),
+            'class_balanced': ('softmax', "class_balanced_loss 期望 softmax 概率，输出层激活请用 'softmax'"),
+            'ldam': ('linear', "ldam_loss 直接吃 logits，输出层激活请用 'linear'"),
         }
         want_act = _LOSS_ACT_C.get(self._loss_name)
         if want_act is not None and last_act != want_act[0]:
