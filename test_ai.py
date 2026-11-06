@@ -15336,3 +15336,197 @@ class TestGraphPooling:
             AI.TopKPool(2).backward([[1.0, 0.0], [0.0, 1.0]])
         with pytest.raises(RuntimeError):
             AI.SAGPool(2).backward([[1.0, 0.0], [0.0, 1.0]])
+
+
+# ============================================================================
+#  W7-A: 提示微调 / 序列打包 / 前缀缓存
+# ============================================================================
+
+class TestPromptTuning:
+    """软提示：拼接语义、g_prompt 中心差分、累加与优化器"""
+
+    SEQ = [[1.0, 0.5], [0.0, -1.0], [2.0, 1.0]]
+    DOUT = [[0.3, -0.2], [0.1, 0.2], [-0.2, 0.1], [0.4, -0.1], [0.05, 0.15]]
+
+    def test_shape_and_params(self):
+        pt = AI.PromptTuning(2, 2, seed=5)
+        out = pt.forward(self.SEQ)
+        assert len(out) == 5
+        assert out[:2] == [list(r) for r in pt.prompt]
+        assert pt.param_count() == 4
+
+    def test_gradient_finite_difference(self):
+        eps = 1e-6
+        pt = AI.PromptTuning(2, 2, seed=5)
+
+        def loss():
+            o = pt.forward(self.SEQ)
+            return sum(o[a][b] * self.DOUT[a][b] for a in range(5) for b in range(2))
+
+        pt.zero_grad()
+        pt.forward(self.SEQ)
+        dseq = pt.backward(self.DOUT)
+        assert dseq == [list(r) for r in self.DOUT[2:]]
+        for t in range(2):
+            for j in range(2):
+                old = pt.prompt[t][j]
+                pt.prompt[t][j] = old + eps
+                up = loss()
+                pt.prompt[t][j] = old - eps
+                dn = loss()
+                pt.prompt[t][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(pt.g_prompt[t][j] - num) < 2e-5 * max(1.0, abs(num))
+
+    def test_accumulate_and_optimizers(self):
+        pt = AI.PromptTuning(2, 2, seed=5)
+        pt.zero_grad()
+        pt.forward(self.SEQ)
+        pt.backward(self.DOUT)
+        first = pt.g_prompt[0][0]
+        pt.forward(self.SEQ)
+        pt.backward(self.DOUT)
+        assert abs(pt.g_prompt[0][0] - 2.0 * first) < 1e-12
+        pt.zero_grad()
+        assert pt.g_prompt[0][0] == 0.0
+        before = [r[:] for r in pt.prompt]
+        pt.forward(self.SEQ)
+        pt.backward(self.DOUT)
+        pt.sgd_step(0.01)
+        assert pt.prompt != before
+        pt.adam_step(0.01)
+        with pytest.raises(ValueError):
+            AI.PromptTuning(0, 2)
+        with pytest.raises(ValueError):
+            AI.PromptTuning(2, 2).forward([[1.0]])
+        with pytest.raises(RuntimeError):
+            AI.PromptTuning(2, 2).backward(self.DOUT)
+
+
+class TestPTuning:
+    """P-Tuning：MLP 生成的提示、四组梯度、优化器"""
+
+    SEQ = [[1.0, 0.5], [0.0, -1.0], [2.0, 1.0]]
+    DOUT = [[0.3, -0.2], [0.1, 0.2], [-0.2, 0.1], [0.4, -0.1], [0.05, 0.15]]
+
+    def test_shape_and_params(self):
+        pp = AI.P_Tuning(2, 2, hidden=3, seed=7)
+        prompt, _rows = pp.prompt_matrix()
+        o = pp.forward(self.SEQ)
+        for t in range(2):
+            for j in range(2):
+                assert abs(o[t][j] - prompt[t][j]) < 1e-12
+        assert pp.param_count() == 2 * 2 + 3 * 2 + 3 + 2 * 3 + 2
+
+    def test_gradient_finite_difference(self):
+        eps = 1e-6
+        pp = AI.P_Tuning(2, 2, hidden=3, seed=7)
+
+        def loss():
+            o = pp.forward(self.SEQ)
+            return sum(o[a][b] * self.DOUT[a][b] for a in range(5) for b in range(2))
+
+        pp.zero_grad()
+        pp.forward(self.SEQ)
+        pp.backward(self.DOUT)
+        for t in range(2):
+            for j in range(2):
+                old = pp.anchor[t][j]
+                pp.anchor[t][j] = old + eps
+                up = loss()
+                pp.anchor[t][j] = old - eps
+                dn = loss()
+                pp.anchor[t][j] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(pp.g_anchor[t][j] - num) < 2e-5 * max(1.0, abs(num))
+        for r in range(3):
+            for k in range(2):
+                old = pp.W1[r][k]
+                pp.W1[r][k] = old + eps
+                up = loss()
+                pp.W1[r][k] = old - eps
+                dn = loss()
+                pp.W1[r][k] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(pp.g_W1[r][k] - num) < 2e-5 * max(1.0, abs(num))
+        for j in range(2):
+            for r in range(3):
+                old = pp.W2[j][r]
+                pp.W2[j][r] = old + eps
+                up = loss()
+                pp.W2[j][r] = old - eps
+                dn = loss()
+                pp.W2[j][r] = old
+                num = (up - dn) / (2 * eps)
+                assert abs(pp.g_W2[j][r] - num) < 2e-5 * max(1.0, abs(num))
+
+    def test_optimizers_and_errors(self):
+        pp = AI.P_Tuning(2, 2, hidden=3, seed=7)
+        before = [r[:] for r in pp.anchor]
+        pp.zero_grad()
+        pp.forward(self.SEQ)
+        pp.backward(self.DOUT)
+        pp.sgd_step(0.01)
+        assert pp.anchor != before
+        pp.adam_step(0.01)
+        with pytest.raises(ValueError):
+            AI.P_Tuning(0, 2)
+        with pytest.raises(ValueError):
+            AI.P_Tuning(2, 2, hidden=0)
+        with pytest.raises(RuntimeError):
+            AI.P_Tuning(2, 2).backward(self.DOUT)
+
+
+class TestPackingAndPrefixCache:
+    """sequence_packing / packed_causal_mask / PrefixCache"""
+
+    def test_packing(self):
+        pk = AI.sequence_packing([[5, 6], [7, 8, 9]])
+        assert pk['tokens'] == [5, 6, 7, 8, 9]
+        assert pk['segment_ids'] == [0, 0, 1, 1, 1]
+        assert pk['position_ids'] == [0, 1, 0, 1, 2]
+        assert pk['segments'] == [(0, 2), (2, 5)]
+        assert pk['length'] == 5
+
+    def test_packed_mask(self):
+        m = AI.packed_causal_mask([0, 0, 1, 1, 1])
+        assert m[0][2] == 0.0 and m[3][0] == 0.0
+        assert m[4][3] == 1.0 and m[3][4] == 0.0
+        assert all(m[i][i] == 1.0 for i in range(5))
+        full = AI.packed_causal_mask([0, 0], causal=False)
+        assert full[0][1] == 1.0 and full[1][0] == 1.0
+
+    def test_prefix_cache_ops(self):
+        pc = AI.PrefixCache(2, 2)
+        pc.set(0, [[1.0, 2.0]], [[0.5, -0.5]])
+        pc.set(1, [[3.0, 4.0], [5.0, 6.0]], [[1.0, 1.0], [2.0, 2.0]])
+        assert pc.length(0) == 1 and pc.length(1) == 2
+        k0, _v0 = pc.get(0)
+        assert k0 == [[1.0, 2.0]]
+        k0[0][0] = 99.0
+        assert pc.get(0)[0][0][0] == 1.0
+        pc.truncate(1)
+        assert pc.length(1) == 1
+        other = AI.PrefixCache(2, 2)
+        other.set(0, [[7.0, 8.0]], [[9.0, 9.0]])
+        other.set(1, [[1.0, 0.0]], [[0.0, 1.0]])
+        pc.merge(other)
+        assert pc.length(0) == 2 and pc.length(1) == 2
+        d = pc.to_dict()
+        assert AI.PrefixCache.from_dict(d).to_dict() == d
+
+    def test_errors(self):
+        with pytest.raises(ValueError):
+            AI.sequence_packing([])
+        with pytest.raises(ValueError):
+            AI.sequence_packing([[]])
+        with pytest.raises(ValueError):
+            AI.sequence_packing([[1.5]])
+        with pytest.raises(ValueError):
+            AI.packed_causal_mask([])
+        with pytest.raises(ValueError):
+            AI.PrefixCache(0, 2)
+        with pytest.raises(ValueError):
+            AI.PrefixCache(2, 2).set(5, [], [])
+        with pytest.raises(ValueError):
+            AI.PrefixCache(2, 2).set(0, [[1.0]], [[1.0, 2.0]])

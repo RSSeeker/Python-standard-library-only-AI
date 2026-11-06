@@ -196,12 +196,12 @@
 - [ ] 图池化：`TopKPool`、`DiffPool`（简化）、`SAGPool`
 
 ### W7 LLM 微调与推理（P0/P1）
-- [ ] 提示微调：`PrefixTuning` / `P_Tuning` / `PromptTuning`（可学习前缀拼在 Embedding 前）
+- [x] 提示微调：`PromptTuning`（软提示）/ `P_Tuning`（MLP 生成前缀）——`g_prompt` 与 `anchor`/`W1`/`W2` 全部中心差分 ≤2.2e-11；`PrefixTuning`（每层 KV 前缀）留到接进 MHA 时再做，当前用 `PrefixCache` 承载缓存
 - [ ] 参数高效：`QLoRA`（量化基座 + LoRA 接口）/ `DoRA`（幅度+方向分解）/ `AdaLoRA`（重要性分配秩）
 - [ ] 采样扩展：typical / mirostat / eta / top-a / tail-free / contrastive search / diverse beam
 - [ ] 约束解码：JSON Schema / 正则 / CFG（`_sample` 接 mask 回调）
 - [ ] 解码加速：投机解码（草稿模型 + 验证）、自投机/Medusa/EAGLE（概念）、连续批处理、`PagedAttention`（数据结构演示）
-- [ ] `sequence_packing`（segment_ids，复用 `pad_mask`）、`PromptCache` / `PrefixCache` 持久化
+- [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）
 - [ ] 扩散：`DDIM`、`v-prediction` / `x0-prediction` / `Min-SNR` 加权（DDPM 已有）

@@ -8704,6 +8704,394 @@ class SAGPool:
         return self
 
 
+class PromptTuning:
+    """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
+
+    ``forward(seq)`` 返回 ``prompt + seq``（形状 ``num_tokens + T``），反向把
+    前缀部分的梯度累加进 ``g_prompt``、其余原样回传给序列。
+    """
+
+    def __init__(self, num_tokens: int, d_model: int, seed: int = 0,
+                 init=None):
+        _ck_int(num_tokens, 'PromptTuning(num_tokens)', 1)
+        _ck_int(d_model, 'PromptTuning(d_model)', 1)
+        self.num_tokens = num_tokens
+        self.d_model = d_model
+        if init is None:
+            rng = random.Random(seed)
+            scale = 1.0 / math.sqrt(d_model)
+            self.prompt = [[rng.gauss(0.0, scale) for _ in range(d_model)]
+                           for _ in range(num_tokens)]
+        else:
+            if not isinstance(init, list) or len(init) != num_tokens:
+                raise ValueError('PromptTuning(init) 要有 %d 行' % num_tokens)
+            for row in init:
+                if not isinstance(row, list) or len(row) != d_model:
+                    raise ValueError('PromptTuning(init) 每行要有 %d 个分量'
+                                     % d_model)
+                for v in row:
+                    if not _is_num(v):
+                        raise ValueError('PromptTuning(init) 必须是有限数字')
+            self.prompt = [list(row) for row in init]
+        self.g_prompt = [[0.0] * d_model for _ in range(num_tokens)]
+        self.m_prompt = [[0.0] * d_model for _ in range(num_tokens)]
+        self.v_prompt = [[0.0] * d_model for _ in range(num_tokens)]
+        self._t = 0
+        self._cache = None
+
+    def forward(self, seq):
+        if not isinstance(seq, list):
+            raise ValueError('PromptTuning.forward: seq 必须是列表')
+        for row in seq:
+            if not isinstance(row, list) or len(row) != self.d_model:
+                raise ValueError('PromptTuning.forward: seq 每行要有 %d 个分量'
+                                 % self.d_model)
+        self._cache = len(seq)
+        return [list(r) for r in self.prompt] + [list(r) for r in seq]
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('PromptTuning.backward: 需要先 forward')
+        n = self.num_tokens
+        if not isinstance(dout, list) or len(dout) != n + self._cache:
+            raise ValueError('PromptTuning.backward: dout 要有 %d 行'
+                             % (n + self._cache))
+        for t in range(n):
+            for j in range(self.d_model):
+                self.g_prompt[t][j] += dout[t][j]
+        return [list(dout[n + i]) for i in range(self._cache)]
+
+    def zero_grad(self):
+        self.g_prompt = [[0.0] * self.d_model for _ in range(self.num_tokens)]
+
+    def param_count(self) -> int:
+        return self.num_tokens * self.d_model
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'PromptTuning.sgd_step')
+        _la_apply_sgd(self.prompt, self.g_prompt, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'PromptTuning.adam_step')
+        _check_adam_betas(beta1, beta2, 'PromptTuning.adam_step')
+        self._t += 1
+        c1 = 1.0 - beta1 ** self._t
+        c2 = 1.0 - beta2 ** self._t
+        _la_apply_adam(self.prompt, self.g_prompt, self.m_prompt, self.v_prompt,
+                       lr, c1, c2, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class P_Tuning:
+    """P-Tuning（v2 风格）：软提示由 ``tanh(anchor·W1 + b1)·W2 + b2`` 生成
+
+    只有 ``anchor``、``W1/b1``、``W2/b2`` 可学习；前向把生成的 prompt 拼在
+    序列前面，反向沿 MLP 链把梯度回传到 anchor 与两层权重。
+    """
+
+    def __init__(self, num_tokens: int, d_model: int,
+                 hidden: Optional[int] = None, seed: int = 0):
+        _ck_int(num_tokens, 'P_Tuning(num_tokens)', 1)
+        _ck_int(d_model, 'P_Tuning(d_model)', 1)
+        h = d_model if hidden is None else hidden
+        _ck_int(h, 'P_Tuning(hidden)', 1)
+        self.num_tokens = num_tokens
+        self.d_model = d_model
+        self.hidden = h
+        rng = random.Random(seed)
+        s1 = 1.0 / math.sqrt(d_model)
+        s2 = 1.0 / math.sqrt(h)
+        self.anchor = [[rng.gauss(0.0, s1) for _ in range(d_model)]
+                       for _ in range(num_tokens)]
+        self.W1 = [[rng.gauss(0.0, s1) for _ in range(d_model)]
+                   for _ in range(h)]
+        self.b1 = [0.0] * h
+        self.W2 = [[rng.gauss(0.0, s2) for _ in range(h)]
+                   for _ in range(d_model)]
+        self.b2 = [0.0] * d_model
+        self.zero_grad()
+        self.m_anchor = _zeros_like(self.anchor)
+        self.v_anchor = _zeros_like(self.anchor)
+        self.m_W1 = _zeros_like(self.W1)
+        self.v_W1 = _zeros_like(self.W1)
+        self.m_b1 = [0.0] * h
+        self.v_b1 = [0.0] * h
+        self.m_W2 = _zeros_like(self.W2)
+        self.v_W2 = _zeros_like(self.W2)
+        self.m_b2 = [0.0] * d_model
+        self.v_b2 = [0.0] * d_model
+        self._t = 0
+        self._cache = None
+
+    def prompt_matrix(self):
+        rows = []
+        for t in range(self.num_tokens):
+            z1 = [_dot_row(self.W1[r], self.anchor[t]) + self.b1[r]
+                  for r in range(self.hidden)]
+            act = [math.tanh(v) for v in z1]
+            out = [_dot_row(self.W2[j], act) + self.b2[j]
+                   for j in range(self.d_model)]
+            rows.append((z1, act, out))
+        return [r[2] for r in rows], rows
+
+    def forward(self, seq):
+        if not isinstance(seq, list):
+            raise ValueError('P_Tuning.forward: seq 必须是列表')
+        for row in seq:
+            if not isinstance(row, list) or len(row) != self.d_model:
+                raise ValueError('P_Tuning.forward: seq 每行要有 %d 个分量'
+                                 % self.d_model)
+        prompt, rows = self.prompt_matrix()
+        self._cache = (len(seq), rows, prompt)
+        return [list(r) for r in prompt] + [list(r) for r in seq]
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError('P_Tuning.backward: 需要先 forward')
+        n = self.num_tokens
+        t_len, rows, prompt = self._cache
+        if not isinstance(dout, list) or len(dout) != n + t_len:
+            raise ValueError('P_Tuning.backward: dout 要有 %d 行' % (n + t_len))
+        for t in range(n):
+            z1, act, _out = rows[t]
+            dprompt = dout[t]
+            dz1 = [0.0] * self.hidden
+            for j in range(self.d_model):
+                g = dprompt[j]
+                if g == 0.0:
+                    continue
+                self.g_b2[j] += g
+                for r in range(self.hidden):
+                    self.g_W2[j][r] += g * act[r]
+                    dz1[r] += g * self.W2[j][r]
+            for r in range(self.hidden):
+                dz = dz1[r] * (1.0 - act[r] * act[r])
+                self.g_b1[r] += dz
+                for k in range(self.d_model):
+                    self.g_W1[r][k] += dz * self.anchor[t][k]
+                    self.g_anchor[t][k] += dz * self.W1[r][k]
+        return [list(dout[n + i]) for i in range(t_len)]
+
+    def zero_grad(self):
+        self.g_anchor = [[0.0] * self.d_model for _ in range(self.num_tokens)]
+        self.g_W1 = [[0.0] * self.d_model for _ in range(self.hidden)]
+        self.g_b1 = [0.0] * self.hidden
+        self.g_W2 = [[0.0] * self.hidden for _ in range(self.d_model)]
+        self.g_b2 = [0.0] * self.d_model
+
+    def param_count(self) -> int:
+        return (self.num_tokens * self.d_model
+                + self.hidden * self.d_model + self.hidden
+                + self.d_model * self.hidden + self.d_model)
+
+    def _params(self):
+        return ((self.anchor, self.g_anchor), (self.W1, self.g_W1),
+                (self.b1, self.g_b1), (self.W2, self.g_W2),
+                (self.b2, self.g_b2))
+
+    def sgd_step(self, lr: float):
+        lr = _la_check_lr(lr, 'P_Tuning.sgd_step')
+        for param, grad in self._params():
+            _la_apply_sgd(param, grad, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        lr = _la_check_lr(lr, 'P_Tuning.adam_step')
+        _check_adam_betas(beta1, beta2, 'P_Tuning.adam_step')
+        self._t += 1
+        c1 = 1.0 - beta1 ** self._t
+        c2 = 1.0 - beta2 ** self._t
+        pairs = (((self.anchor, self.g_anchor), (self.m_anchor, self.v_anchor)),
+                 ((self.W1, self.g_W1), (self.m_W1, self.v_W1)),
+                 ((self.b1, self.g_b1), (self.m_b1, self.v_b1)),
+                 ((self.W2, self.g_W2), (self.m_W2, self.v_W2)),
+                 ((self.b2, self.g_b2), (self.m_b2, self.v_b2)))
+        for (param, grad), (m, v) in pairs:
+            _la_apply_adam(param, grad, m, v, lr, c1, c2, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+def _dot_row(a, b):
+    """两个等长行向量的点积"""
+    acc = 0.0
+    for i in range(len(a)):
+        acc += a[i] * b[i]
+    return acc
+
+
+def _is_nonneg_int(v):
+    """判断是否为非负整数（bool 不算）"""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def sequence_packing(sequences, pad_id: int = 0):
+    """把多条 token 序列打包成一条（不插入分隔符）
+
+    返回 ``dict(tokens, segment_ids, position_ids, segments, length)``：
+    ``segment_ids`` 标记每个位置属于第几条序列，``position_ids`` 在每条序列
+    内部从 0 重新计数（配合旋转/绝对位置编码时等价于按段重置）。
+    """
+    if not isinstance(sequences, list) or not sequences:
+        raise ValueError('sequence_packing: sequences 必须是非空列表')
+    if not _is_nonneg_int(pad_id) or pad_id < 0:
+        raise ValueError('sequence_packing: pad_id 必须是非负整数')
+    tokens = []
+    seg = []
+    pos = []
+    segments = []
+    for sid, seq in enumerate(sequences):
+        if not isinstance(seq, list) or not seq:
+            raise ValueError('sequence_packing: 第 %d 条序列必须是非空列表'
+                             % sid)
+        start = len(tokens)
+        for p, tok in enumerate(seq):
+            if not _is_nonneg_int(tok) or tok < 0:
+                raise ValueError('sequence_packing: token 必须是非负整数，'
+                                 '第 %d 条序列位置 %d 收到 %r' % (sid, p, tok))
+            tokens.append(tok)
+            seg.append(sid)
+            pos.append(p)
+        segments.append((start, len(tokens)))
+    return {'tokens': tokens, 'segment_ids': seg, 'position_ids': pos,
+            'segments': segments, 'length': len(tokens)}
+
+
+def packed_causal_mask(segment_ids, causal: bool = True):
+    """打包序列的注意力掩码：只允许同段（``causal=True`` 时再加 ``j <= i``）"""
+    if not isinstance(segment_ids, list) or not segment_ids:
+        raise ValueError('packed_causal_mask: segment_ids 必须是非空列表')
+    for sid in segment_ids:
+        if not _is_nonneg_int(sid) or sid < 0:
+            raise ValueError('packed_causal_mask: segment id 必须是非负整数')
+    n = len(segment_ids)
+    mask = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if segment_ids[i] != segment_ids[j]:
+                continue
+            if causal and j > i:
+                continue
+            mask[i][j] = 1.0
+    return mask
+
+
+class PrefixCache:
+    """逐层 KV 前缀缓存（可持久化）
+
+    每层存 ``keys`` / ``values`` 两张 ``(len, d)`` 的行表；``set`` 覆盖某层、
+    ``get`` 取出、``truncate`` 截断到指定长度、``merge`` 追加另一份缓存的同层
+    内容，``to_dict`` / ``from_dict`` / ``save`` / ``load`` 做 JSON 持久化。
+    """
+
+    def __init__(self, num_layers: int, d_model: int):
+        _ck_int(num_layers, 'PrefixCache(num_layers)', 1)
+        _ck_int(d_model, 'PrefixCache(d_model)', 1)
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.keys = [[] for _ in range(num_layers)]
+        self.values = [[] for _ in range(num_layers)]
+
+    def set(self, layer: int, keys, values):
+        self._check_layer(layer)
+        ks = self._check_rows(keys, 'PrefixCache.set(keys)')
+        vs = self._check_rows(values, 'PrefixCache.set(values)')
+        if len(ks) != len(vs):
+            raise ValueError('PrefixCache.set: keys 与 values 长度必须一致')
+        self.keys[layer] = ks
+        self.values[layer] = vs
+
+    def get(self, layer: int):
+        self._check_layer(layer)
+        return ([list(r) for r in self.keys[layer]],
+                [list(r) for r in self.values[layer]])
+
+    def length(self, layer: int) -> int:
+        self._check_layer(layer)
+        return len(self.keys[layer])
+
+    def truncate(self, new_len: int):
+        _ck_int(new_len, 'PrefixCache.truncate(new_len)', 0)
+        for layer in range(self.num_layers):
+            if len(self.keys[layer]) > new_len:
+                self.keys[layer] = self.keys[layer][:new_len]
+                self.values[layer] = self.values[layer][:new_len]
+
+    def merge(self, other):
+        if not isinstance(other, PrefixCache):
+            raise TypeError('PrefixCache.merge: 需要另一个 PrefixCache')
+        if (other.num_layers != self.num_layers
+                or other.d_model != self.d_model):
+            raise ValueError('PrefixCache.merge: 层数或维度不一致')
+        for layer in range(self.num_layers):
+            self.keys[layer] = self.keys[layer] + [list(r) for r in other.keys[layer]]
+            self.values[layer] = (self.values[layer]
+                                  + [list(r) for r in other.values[layer]])
+
+    def to_dict(self):
+        return {'num_layers': self.num_layers, 'd_model': self.d_model,
+                'keys': [list(r) for r in self.keys],
+                'values': [list(r) for r in self.values]}
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError('PrefixCache.from_dict: 需要字典')
+        for key in ('num_layers', 'd_model', 'keys', 'values'):
+            if key not in data:
+                raise ValueError('PrefixCache.from_dict: 缺少字段 %r' % key)
+        obj = cls(data['num_layers'], data['d_model'])
+        if (not isinstance(data['keys'], list)
+                or len(data['keys']) != obj.num_layers):
+            raise ValueError('PrefixCache.from_dict: keys 要以层为单位')
+        for layer in range(obj.num_layers):
+            obj.set(layer, data['keys'][layer], data['values'][layer])
+        return obj
+
+    def save(self, path: str):
+        payload = json.dumps(self.to_dict(), ensure_ascii=False,
+                             allow_nan=False)
+        with io.open(path, 'w', encoding='utf-8') as f:
+            f.write(payload)
+
+    def load(self, path: str):
+        with io.open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        other = PrefixCache.from_dict(data)
+        self.keys = other.keys
+        self.values = other.values
+        return self
+
+    def _check_layer(self, layer):
+        if not _is_nonneg_int(layer) or layer < 0 or layer >= self.num_layers:
+            raise ValueError('PrefixCache: layer 必须在 [0, %d) 内'
+                             % self.num_layers)
+
+    def _check_rows(self, rows, who):
+        if not isinstance(rows, list):
+            raise ValueError('%s 必须是行列表' % who)
+        out = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) != self.d_model:
+                raise ValueError('%s 每行要有 %d 个分量'
+                                 % (who, self.d_model))
+            for v in row:
+                if not _is_num(v):
+                    raise ValueError('%s 必须是有限数字' % who)
+            out.append([float(v) for v in row])
+        return out
+
+
 class Flatten:
     """将 (C, H, W) 展平为 (C*H*W,)"""
 
