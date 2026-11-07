@@ -29028,6 +29028,184 @@ class CrossModalBlock:
         return d_memory, d_text
 
 # ============================================================================
+#  自监督：预测式任务（W16-D：Rotation / Jigsaw）
+# ============================================================================
+
+def rotation_targets(num_samples, seed=None):
+    """Rotation 自监督的标签：每个样本随机取 0/90/180/270 度，返回角度标签列表。"""
+    if not isinstance(num_samples, int) or isinstance(num_samples, bool) or num_samples < 1:
+        raise ValueError(
+            f"rotation_targets: num_samples 必须是 >=1 的整数，收到 {num_samples!r}")
+    rng = random.Random(seed)
+    return [rng.randrange(4) for _ in range(num_samples)]
+
+
+def rotate_image(image, k=1):
+    """把 ``(C, H, W)`` 图像逆时针旋转 ``k*90`` 度（k 取模 4）。"""
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise ValueError(f"rotate_image: k 必须是整数，收到 {k!r}")
+    rows = []
+    for c, chan in enumerate(image):
+        if not isinstance(chan, (list, tuple)) or not chan:
+            raise ValueError(f"rotate_image: 第 {c} 个通道必须是非空列表")
+        rows.append([list(r) for r in chan])
+    channels = len(rows)
+    height = len(rows[0])
+    width = len(rows[0][0])
+    for c in range(channels):
+        if len(rows[c]) != height:
+            raise ValueError(f"rotate_image: 第 {c} 个通道行数不一致")
+        for r in rows[c]:
+            if len(r) != width:
+                raise ValueError(f"rotate_image: 第 {c} 个通道里有宽度不一致的行")
+    kk = k % 4
+    if height != width and kk % 2 == 1:
+        raise ValueError(
+            f"rotate_image: {height}x{width} 旋转 90/270 度会改变形状，"
+            f"非方图只能旋转 0 或 180 度")
+    out = [[[0.0] * width for _ in range(height)] for _ in range(channels)]
+    for c in range(channels):
+        for y in range(height):
+            for x in range(width):
+                v = float(rows[c][y][x])
+                if kk == 0:
+                    ny, nx = y, x
+                elif kk == 1:
+                    ny, nx = x, height - 1 - y
+                elif kk == 2:
+                    ny, nx = height - 1 - y, width - 1 - x
+                else:
+                    ny, nx = width - 1 - x, y
+                out[c][ny][nx] = v
+    return out
+
+
+def jigsaw_permutations(num_patches, num_permutations=1, seed=None):
+    """Jigsaw 自监督的排列：返回 ``num_permutations`` 个 ``range(num_patches)`` 的乱序副本。"""
+    if not isinstance(num_patches, int) or isinstance(num_patches, bool) \
+            or num_patches < 2:
+        raise ValueError(
+            f"jigsaw_permutations: num_patches 必须是 >=2 的整数，收到 {num_patches!r}")
+    if not isinstance(num_permutations, int) or isinstance(num_permutations, bool) \
+            or num_permutations < 1:
+        raise ValueError(
+            f"jigsaw_permutations: num_permutations 必须是 >=1 的整数，"
+            f"收到 {num_permutations!r}")
+    rng = random.Random(seed)
+    base = list(range(num_patches))
+    out = []
+    seen = set()
+    tries = 0
+    while len(out) < num_permutations and tries < 200 * num_permutations:
+        tries += 1
+        perm = list(base)
+        rng.shuffle(perm)
+        if perm == base:
+            continue
+        key = tuple(perm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(perm)
+    if len(out) < num_permutations:
+        raise ValueError(
+            f"jigsaw_permutations: {num_patches} 个 patch 的乱序排列不够 "
+            f"{num_permutations} 个（可用 {len(out)} 个）")
+    return out
+
+
+def jigsaw_shuffle(patches, permutation):
+    """按 ``permutation`` 重排 patch，返回新的 patch 列表（长度必须一致）。"""
+    if not isinstance(patches, (list, tuple)) or not patches:
+        raise ValueError("jigsaw_shuffle: patches 必须是非空列表")
+    if not isinstance(permutation, (list, tuple)) or len(permutation) != len(patches):
+        raise ValueError(
+            f"jigsaw_shuffle: permutation 长度必须等于 patch 数 {len(patches)}")
+    n = len(patches)
+    if sorted(permutation) != list(range(n)):
+        raise ValueError("jigsaw_shuffle: permutation 必须是 0..n-1 的一个排列")
+    return [patches[permutation[i]] for i in range(n)]
+
+
+def rotation_classifier_head(features, num_classes=4):
+    """Rotation 自监督的预测头（线性 + softmax），返回每行四类概率。"""
+    if not isinstance(features, (list, tuple)) or not features:
+        raise ValueError("rotation_classifier_head: features 必须是非空行列表")
+    rows = []
+    for i, row in enumerate(features):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(
+                f"rotation_classifier_head: 第 {i} 行必须是非空列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"rotation_classifier_head: 第 {i} 行第 {j} 列不是数字：{v!r}")
+            vals.append(float(v))
+        rows.append(vals)
+    width = len(rows[0])
+    for i, row in enumerate(rows):
+        if len(row) != width:
+            raise ValueError(
+                f"rotation_classifier_head: 第 {i} 行宽度不一致")
+    if not isinstance(num_classes, int) or isinstance(num_classes, bool) \
+            or num_classes < 2:
+        raise ValueError(
+            f"rotation_classifier_head: num_classes 必须是 >=2 的整数，"
+            f"收到 {num_classes!r}")
+    if width < num_classes:
+        raise ValueError(
+            f"rotation_classifier_head: 特征维度 {width} 小于类别数 {num_classes}")
+    out = []
+    for row in rows:
+        logits = list(row[:num_classes])
+        out.append(_softmax_row(logits))
+    return out
+
+
+def rotation_loss(probs, labels):
+    """Rotation 自监督的交叉熵，返回平均损失。"""
+    if not isinstance(probs, (list, tuple)) or not probs:
+        raise ValueError("rotation_loss: probs 必须是非空行列表")
+    if not isinstance(labels, (list, tuple)) or len(labels) != len(probs):
+        raise ValueError("rotation_loss: labels 长度必须等于批大小")
+    total = 0.0
+    for i, p in enumerate(probs):
+        if not isinstance(p, (list, tuple)) or not p:
+            raise ValueError(f"rotation_loss: 第 {i} 行必须是非空列表")
+        t = labels[i]
+        if isinstance(t, bool) or not isinstance(t, int) or not (0 <= t < len(p)):
+            raise ValueError(
+                f"rotation_loss: labels[{i}]={t!r} 越界（类别数 {len(p)}）")
+        total += -math.log(max(float(p[t]), 1e-300))
+    return total / len(probs)
+
+
+def linear_probe_accuracy(scores, labels):
+    """把「已排好序的得分矩阵」当作分类器，返回 argmax 命中率（Jigsaw 常用评估）。"""
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError("linear_probe_accuracy: scores 必须是非空行列表")
+    if not isinstance(labels, (list, tuple)) or len(labels) != len(scores):
+        raise ValueError("linear_probe_accuracy: labels 长度必须等于样本数")
+    hit = 0
+    for i, row in enumerate(scores):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"linear_probe_accuracy: 第 {i} 行必须是非空列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"linear_probe_accuracy: 第 {i} 行第 {j} 列不是数字：{v!r}")
+            vals.append(float(v))
+        t = labels[i]
+        if isinstance(t, bool) or not isinstance(t, int) or not (0 <= t < len(vals)):
+            raise ValueError(
+                f"linear_probe_accuracy: labels[{i}]={t!r} 越界（类别数 {len(vals)}）")
+        if max(range(len(vals)), key=lambda j: vals[j]) == t:
+            hit += 1
+    return hit / len(scores)
+
+# ============================================================================
 #  自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
 # ============================================================================
 

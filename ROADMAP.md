@@ -510,7 +510,10 @@
   - `clip_similarity` / `clip_loss`（对称 InfoNCE，两侧梯度都对中心差分）/ `contrastive_retrieval_accuracy`
   - `CLIPProjector`：两个线性投影头 + `loss_and_grads` + SGD 更新，30 步实测 loss 1.857 -> 0.376
   - `CrossModalBlock`：文本 query × 图像 memory 的交叉注意力 + 残差 + 逐行归一化，backward 同时回传图像与文本两侧；memory 只有 1 行时 `W_q` 梯度恰为 0（softmax 恒定），测试里专门记了这一条
-- [ ] 预测式自监督：Rotation / Jigsaw
+- [x] 预测式自监督：Rotation / Jigsaw
+  - `rotation_targets` / `rotate_image`（只有 90 度整数倍，非方图只能 0/180）/`rotation_classifier_head` / `rotation_loss`
+  - `jigsaw_permutations`（保证非恒等、互不相同，凑不够时明确报错）/`jigsaw_shuffle` / `linear_probe_accuracy`
+  - 只提供任务构造与评估，不内置训练循环；探针 42 项，测试 `TestPredictiveSelfSupervision` 7 例
 - [ ] RL 环境：`GridWorld` / `CartPole`（内置）
 - [ ] RL 算法：DQN / Double / Dueling / Rainbow（简化）/ REINFORCE / A2C / PPO / SAC / TD3 / DDPG
 - [ ] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型

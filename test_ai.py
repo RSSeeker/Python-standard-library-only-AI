@@ -22751,3 +22751,90 @@ class TestMultimodal:
         assert any(abs(v) > 0 for row in b2.attn.grads["W_q"] for v in row)
         b2.zero_grad()
         assert all(v == 0.0 for row in b2.attn.grads["W_q"] for v in row)
+class TestPredictiveSelfSupervision:
+    """W16-D：预测式自监督（Rotation 旋转预测 + Jigsaw 拼图预测）。"""
+
+    IMG = [
+        [[1.0, 2.0], [3.0, 4.0]],
+        [[5.0, 6.0], [7.0, 8.0]],
+    ]
+
+    def test_rotation_targets(self):
+        t = AI.rotation_targets(20, seed=4)
+        assert len(t) == 20 and all(v in (0, 1, 2, 3) for v in t)
+        assert set(t) == {0, 1, 2, 3}
+        assert AI.rotation_targets(20, seed=4) == t
+        assert AI.rotation_targets(20, seed=5) != t
+        with pytest.raises(ValueError):
+            AI.rotation_targets(0)
+
+    def test_rotate_image_quarter_turns(self):
+        r0 = AI.rotate_image(self.IMG, 0)
+        assert r0 == [[[float(v) for v in row] for row in ch] for ch in self.IMG]
+        r1 = AI.rotate_image(self.IMG, 1)
+        assert r1[0][0][1] == 1.0
+        assert r1[0][1][1] == 2.0
+        assert r1[0][0][0] == 3.0
+        r2 = AI.rotate_image(self.IMG, 2)
+        assert r2[0][1][1] == 1.0
+        assert AI.rotate_image(r2, 2) == r0
+        assert AI.rotate_image(self.IMG, 4) == r0
+        assert AI.rotate_image(self.IMG, -1) == AI.rotate_image(self.IMG, 3)
+
+    def test_rotate_image_validation(self):
+        rect = [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]
+        with pytest.raises(ValueError):
+            AI.rotate_image(rect, 1)
+        assert AI.rotate_image(rect, 2)[0][0] == [6.0, 5.0, 4.0]
+        with pytest.raises(ValueError):
+            AI.rotate_image(self.IMG, 1.5)
+
+    def test_jigsaw_permutations(self):
+        perms = AI.jigsaw_permutations(9, num_permutations=3, seed=7)
+        assert len(perms) == 3
+        assert all(sorted(p) == list(range(9)) for p in perms)
+        assert all(p != list(range(9)) for p in perms)
+        assert len({tuple(p) for p in perms}) == 3
+        assert AI.jigsaw_permutations(9, 3, seed=7) == perms
+        with pytest.raises(ValueError):
+            AI.jigsaw_permutations(2, 5)
+        with pytest.raises(ValueError):
+            AI.jigsaw_permutations(1)
+        with pytest.raises(ValueError):
+            AI.jigsaw_permutations(4, 0)
+
+    def test_jigsaw_shuffle(self):
+        patches = [[i] for i in range(4)]
+        assert AI.jigsaw_shuffle(patches, [2, 0, 3, 1]) == [[2], [0], [3], [1]]
+        with pytest.raises(ValueError):
+            AI.jigsaw_shuffle(patches, [1, 0])
+        with pytest.raises(ValueError):
+            AI.jigsaw_shuffle(patches, [1, 1, 2, 3])
+        with pytest.raises(ValueError):
+            AI.jigsaw_shuffle([], [])
+
+    def test_rotation_head_and_loss(self):
+        feats = [[3.0, 0.0, 0.0, 0.0], [0.0, 3.0, 0.0, 0.0]]
+        probs = AI.rotation_classifier_head(feats, 4)
+        assert all(abs(sum(r) - 1.0) < 1e-12 for r in probs)
+        assert probs[0][0] > probs[0][1] and probs[1][1] > probs[1][0]
+        loss = AI.rotation_loss(probs, [0, 1])
+        assert loss < 0.2
+        assert AI.rotation_loss(probs, [1, 0]) > loss + 1.0
+        with pytest.raises(ValueError):
+            AI.rotation_classifier_head([[1.0, 2.0]], 4)
+        with pytest.raises(ValueError):
+            AI.rotation_classifier_head(feats, 1)
+        with pytest.raises(ValueError):
+            AI.rotation_loss(probs, [0, 4])
+
+    def test_linear_probe_accuracy(self):
+        scores = [[5.0, 0.0], [0.0, 5.0], [5.0, 0.0]]
+        assert AI.linear_probe_accuracy(scores, [0, 1, 0]) == 1.0
+        assert abs(AI.linear_probe_accuracy(scores, [1, 1, 0]) - 2.0 / 3.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.linear_probe_accuracy(scores, [0, 2])
+        with pytest.raises(ValueError):
+            AI.linear_probe_accuracy(scores, [0])
+        with pytest.raises(ValueError):
+            AI.linear_probe_accuracy([[1.0, None]], [0])
