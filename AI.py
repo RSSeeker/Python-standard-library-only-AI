@@ -30907,6 +30907,213 @@ def _w18b_user_why():
     return "要么返回全有限值，要么显式报错——不要静默产生 NaN"
 
 
+# ==== W18-C：回归基线快照（固定 seed 下数值存 JSON，CI 比对） ====
+
+_W18C_FORMAT = 1
+
+
+def _w18c_check_model(model, who):
+    """快照只接受有 `layers` 的模型（MLP 或 Model 包装器）。"""
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if not isinstance(layers, list) or not layers:
+        raise TypeError("%s: 需要 MLP（或带 .model 的 Model 包装器）" % who)
+    return net
+
+
+def _w18c_check_rows(rows, who):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError("%s: xs 必须是非空的样本列表" % who)
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("%s: 第 %d 个样本必须是 非空的 list/tuple" % (who, i))
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 第 %d 个样本含非数字元素 %r" % (who, i, v))
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _w18c_flat(value):
+    """把嵌套 list / None 摊平成 list，用于逐值比较。"""
+    if value is None:
+        return []
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [float(value)]
+    out = []
+    for item in value:
+        out.extend(_w18c_flat(item))
+    return out
+
+
+def snapshot_model(model, xs, seed=12345, include_grads=True):
+    """固定输入下记录 forward 输出与（可选）backward 梯度，得到可比对的快照。
+
+    快照内容是**纯 JSON 可序列化**的结构：
+
+        {"format": 1, "seed": 12345, "layers": ["relu", "linear"],
+         "forward": [[...], ...], "grads": [[[gw, gb], ...], ...]}
+
+    `grads[i][k]` 是第 i 个样本、第 k 层反向得到的 `(grad_w, grad_b)`，
+    无参层为 `None`。上游梯度统一取全 1，因此结果只依赖权重与输入。
+    调用方负责在快照前后保持模型权重不变（本函数不修改权重）。
+    """
+    net = _w18c_check_model(model, "snapshot_model")
+    rows = _w18c_check_rows(xs, "snapshot_model")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("snapshot_model: seed 必须是整数")
+    forward = []
+    grads = []
+    for row in rows:
+        out = net.forward(row)
+        forward.append([float(v) for v in out])
+        if include_grads:
+            flat = _mlp_backward(net, [1.0] * len(out))
+            grads.append([None if pair is None else [pair[0], pair[1]] for pair in flat])
+    names = []
+    for layer in net.layers:
+        names.append(getattr(layer, "activation_name", "unknown"))
+    snap = {
+        "format": _W18C_FORMAT,
+        "seed": int(seed),
+        "layers": names,
+        "forward": forward,
+    }
+    if include_grads:
+        snap["grads"] = grads
+    return snap
+
+
+def snapshot_digest(snapshot):
+    """快照的规范化摘要（sha256），适合在测试里当金标准常量。"""
+    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def save_snapshot(path, snapshot):
+    """把快照写成 JSON 文件（UTF-8、末尾换行、禁止 NaN/Inf）。"""
+    if not isinstance(path, str) or not path:
+        raise TypeError("save_snapshot: path 必须是非空字符串")
+    text = json.dumps(snapshot, sort_keys=True, indent=2, allow_nan=False)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(text + "\n")
+    return path
+
+
+def load_snapshot(path):
+    """读回快照并做基本结构校验。"""
+    if not isinstance(path, str) or not path:
+        raise TypeError("load_snapshot: path 必须是非空字符串")
+    if not os.path.exists(path):
+        raise ValueError("load_snapshot: 文件不存在 %s" % path)
+    try:
+        snap = json.loads(io.open(path, encoding="utf-8").read())
+    except ValueError as exc:
+        raise ValueError("load_snapshot: 不是合法 JSON（%s）" % exc)
+    if not isinstance(snap, dict) or "forward" not in snap:
+        raise ValueError("load_snapshot: 缺少 forward 字段")
+    return snap
+
+
+def _w18c_walk(current, reference, path, rtol, atol, mismatches, stats):
+    if isinstance(reference, dict):
+        if not isinstance(current, dict):
+            mismatches.append("%s: 期望 dict，实际 %s" % (path, type(current).__name__))
+            return
+        for key in sorted(reference):
+            if key not in current:
+                mismatches.append("%s.%s: 缺失" % (path, key))
+                continue
+            _w18c_walk(current[key], reference[key], "%s.%s" % (path, key),
+                       rtol, atol, mismatches, stats)
+        for key in sorted(current):
+            if key not in reference:
+                mismatches.append("%s.%s: 多出" % (path, key))
+        return
+    if isinstance(reference, (list, tuple)):
+        if not isinstance(current, (list, tuple)):
+            mismatches.append("%s: 期望 list，实际 %s" % (path, type(current).__name__))
+            return
+        if len(current) != len(reference):
+            mismatches.append("%s: 长度 %d != %d" % (path, len(current), len(reference)))
+        for i in range(min(len(current), len(reference))):
+            _w18c_walk(current[i], reference[i], "%s[%d]" % (path, i),
+                       rtol, atol, mismatches, stats)
+        return
+    if reference is None:
+        if current is not None:
+            mismatches.append("%s: 期望 None，实际 %r" % (path, current))
+            stats["checked"] += 1
+        return
+    if isinstance(reference, bool) or not isinstance(reference, (int, float)):
+        if current != reference:
+            mismatches.append("%s: %r != %r" % (path, current, reference))
+        stats["checked"] += 1
+        return
+    if isinstance(current, bool) or not isinstance(current, (int, float)):
+        mismatches.append("%s: 期望数字，实际 %r" % (path, current))
+        stats["checked"] += 1
+        return
+    diff = abs(float(current) - float(reference))
+    limit = atol + rtol * abs(float(reference))
+    stats["checked"] += 1
+    if diff > stats["max_diff"]:
+        stats["max_diff"] = diff
+        stats["worst"] = path
+    if diff > limit:
+        mismatches.append("%s: %.17g != %.17g（diff=%.3e > %.3e）"
+                          % (path, float(current), float(reference), diff, limit))
+
+
+def compare_snapshots(current, reference, rtol=1e-9, atol=1e-12):
+    """逐值比较两个快照。
+
+    返回 `{"ok", "checked", "max_diff", "worst", "mismatches"}`；
+    键结构不一致（缺失/多出/类型不同）也算失败。
+    """
+    for name, value in (("rtol", rtol), ("atol", atol)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("compare_snapshots: %s 必须是数字" % name)
+        if value < 0:
+            raise ValueError("compare_snapshots: %s 不能为负" % name)
+    for name, value in (("current", current), ("reference", reference)):
+        if not isinstance(value, dict):
+            raise TypeError("compare_snapshots: %s 必须是 dict" % name)
+    mismatches = []
+    stats = {"checked": 0, "max_diff": 0.0, "worst": ""}
+    _w18c_walk(current, reference, "", rtol, atol, mismatches, stats)
+    return {
+        "ok": not mismatches,
+        "checked": stats["checked"],
+        "max_diff": stats["max_diff"],
+        "worst": stats["worst"],
+        "mismatches": mismatches,
+    }
+
+
+def compare_snapshot_file(path, snapshot, rtol=1e-9, atol=1e-12):
+    """读文件再比较，方便 CI 里一句调用。"""
+    return compare_snapshots(snapshot, load_snapshot(path), rtol=rtol, atol=atol)
+
+
+def baseline_model(layer_sizes=(3, 4, 2), seed=12345,
+                   activations=None):
+    """构造 CI 基线用的固定模型（同样的 seed 必得同样的权重）。"""
+    if not isinstance(layer_sizes, (list, tuple)) or len(layer_sizes) < 2:
+        raise ValueError("baseline_model: layer_sizes 至少要有两层")
+    for v in layer_sizes:
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError("baseline_model: layer_sizes 必须都是正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("baseline_model: seed 必须是整数")
+    if activations is None:
+        activations = ["relu"] * (len(layer_sizes) - 2) + ["linear"]
+    set_seed(seed)
+    return MLP(list(layer_sizes), activations=list(activations))
+
+
 # ======================================================================
 #  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
 # ======================================================================

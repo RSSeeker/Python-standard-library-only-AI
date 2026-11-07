@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1666 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1676 项）
 
 ## 特性
 
@@ -2336,6 +2336,35 @@ print([(c["name"], c["outcome"]) for c in rep["cases"]])
   IEEE 结果，且已有测试锁定该行为。
 - 只覆盖数值叶子，不检查字符串/None 语义，也不做「接近零就报错」这类量纲判断。
 
+### 回归基线快照（W18-C）
+
+| API | 说明 |
+| --- | --- |
+| `baseline_model(layer_sizes=(3, 4, 2), seed=12345, activations=None)` | 构造 CI 基线模型（同 seed 必得同样权重） |
+| `snapshot_model(model, xs, seed=12345, include_grads=True)` | 固定输入下记录 forward 输出与每层 `(grad_w, grad_b)` |
+| `snapshot_digest(snapshot)` | 规范化 JSON 的 sha256，适合在测试里当金标准常量 |
+| `save_snapshot(path, snapshot)` / `load_snapshot(path)` | 写/读 JSON 文件（UTF-8、末尾单个换行、禁止 NaN/Inf） |
+| `compare_snapshots(current, reference, rtol=1e-9, atol=1e-12)` | 逐值比较，返回 `{"ok","checked","max_diff","worst","mismatches"}` |
+| `compare_snapshot_file(path, snapshot, ...)` | 读文件再比较，CI 里一句调用 |
+
+```python
+model = AI.baseline_model()
+snap = AI.snapshot_model(model, [[0.25, -0.5, 0.75], [1.0, 0.0, -1.0]])
+AI.save_snapshot("baseline.json", snap)
+assert AI.compare_snapshot_file("baseline.json", snap)["ok"]
+print(AI.snapshot_digest(snap))
+```
+
+边界与口径：
+
+- 快照只记录**数值**（forward + 逐层梯度），上游梯度统一取全 1，因此结果只依赖权重与输入。
+- 比较器逐值判 `|a-b| <= atol + rtol*|b|`；**键结构不一致（缺失/多出/类型不同/长度不同）一律失败**，
+  并且失败消息带 `forward[0][0]` 这样的路径，`worst` 指向偏差最大的那一项。
+- `test_ai.py` 里用**摘要常量**做金标准（`TestBaselineSnapshot.GOLDEN`），不额外往仓库塞 JSON 文件；
+  自己的项目想存档时再用 `save_snapshot`。
+- 快照不覆盖 BN/Dropout 的随机状态，也不检查层间接口约定——那两条分别由 `grad_check_all`
+  和集成测试负责。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2752,7 +2781,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1666 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1676 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2966,6 +2995,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestOCRAndDetection` | CRNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度、高度未压到 1 报错、CTC 贪心解码三例（含 blank 过滤与全 blank）、YOLO 网格目标/冲突计数/解码阈值/NMS，共 9 例 |
 | `TestGradCheckAll` | 遍历三层 MLP、Model 包装解包、同种子可复现、`max_params` 上限、故意破坏 `backward` 被定位到具体层、非 Layer 持有者进 `skipped`、零梯度归类、容器递归、空模型报错、11 条参数校验，共 10 例 |
 | `TestNumericalStability` | `numeric_scan` 嵌套计数、`assert_all_finite` 报错带标签、六类 case、五种 probe 判定（finite/nan/inf/raised/allow_inf）、softmax 的 ±inf 与 NaN、空损失 ValueError、NaN 输入拒绝、inf 溢出仍为 inf、六个真实入口契约、模型边界如实上报、参数校验，共 12 例 |
+| `TestBaselineSnapshot` | 回归基线快照：决定性、金标准摘要、读写往返、容差与结构差异判定 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3019,7 +3049,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1666 个单元测试
+├── test_ai.py       # 1676 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

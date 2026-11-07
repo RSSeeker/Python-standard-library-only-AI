@@ -25566,3 +25566,123 @@ class TestNumericalStability:
             AI.stability_probe(lambda v: v, cases=[("x",)])
         with pytest.raises(ValueError):
             AI.stability_probe(lambda v: v, cases=[("", [1.0])])
+
+class TestBaselineSnapshot:
+    """W18-C：回归基线快照（固定 seed → JSON → CI 比对）。"""
+
+    XS = [[0.25, -0.5, 0.75], [1.0, 0.0, -1.0], [-0.3, 0.3, 0.1]]
+    GOLDEN = "7bbedc0d699d7127fd1b5f6ee023e1bf73afca311585f897853e607797140039"
+
+    def test_baseline_model_deterministic(self):
+        a = AI.baseline_model()
+        b = AI.baseline_model()
+        ck = [r for L in a.layers for r in L.weights]
+        ck2 = [r for L in b.layers for r in L.weights]
+        assert ck == ck2
+        assert [L.fan_in for L in a.layers] == [3, 4]
+        assert a.layers[-1].activation_name == "linear"
+
+    def test_baseline_model_rejects_bad_sizes(self):
+        with pytest.raises(ValueError):
+            AI.baseline_model((3,))
+        with pytest.raises(ValueError):
+            AI.baseline_model((3, 0))
+        with pytest.raises(TypeError):
+            AI.baseline_model((3, 2), seed=True)
+
+    def test_snapshot_structure(self):
+        m = AI.baseline_model()
+        snap = AI.snapshot_model(m, self.XS)
+        assert snap["format"] == 1
+        assert snap["seed"] == 12345
+        assert snap["layers"] == ["relu", "linear"]
+        assert len(snap["forward"]) == 3 and len(snap["forward"][0]) == 2
+        assert len(snap["grads"]) == 3
+        assert all(len(row) == 2 for row in snap["grads"])
+
+    def test_snapshot_golden_digest(self):
+        snap = AI.snapshot_model(AI.baseline_model(), self.XS)
+        assert AI.snapshot_digest(snap) == self.GOLDEN
+
+    def test_snapshot_without_grads(self):
+        snap = AI.snapshot_model(AI.baseline_model(), self.XS, include_grads=False)
+        assert "grads" not in snap
+        assert snap["forward"][0][0] == pytest.approx(-0.068243, abs=1e-6)
+
+    def test_snapshot_rejects_bad_input(self):
+        m = AI.baseline_model()
+        with pytest.raises(TypeError):
+            AI.snapshot_model(object(), self.XS)
+        with pytest.raises(ValueError):
+            AI.snapshot_model(m, [])
+        with pytest.raises(TypeError):
+            AI.snapshot_model(m, [["a", "b", "c"]])
+        with pytest.raises(TypeError):
+            AI.snapshot_model(m, self.XS, seed=True)
+
+    def test_save_load_round_trip(self, tmp_path):
+        snap = AI.snapshot_model(AI.baseline_model(), self.XS)
+        path = tmp_path / "baseline.json"
+        AI.save_snapshot(str(path), snap)
+        assert path.exists()
+        raw = path.read_bytes()
+        assert raw.endswith(b"\n") and not raw.endswith(b"\n\n")
+        loaded = AI.load_snapshot(str(path))
+        result = AI.compare_snapshots(loaded, snap)
+        assert result["ok"] is True
+        assert result["checked"] > 20
+        assert AI.compare_snapshot_file(str(path), snap)["ok"] is True
+
+    def test_compare_tolerance(self):
+        snap = AI.snapshot_model(AI.baseline_model(), self.XS)
+        near = json.loads(json.dumps(snap))
+        near["forward"][0][0] += 1e-15
+        assert AI.compare_snapshots(near, snap)["ok"] is True
+        off = json.loads(json.dumps(snap))
+        off["forward"][0][0] += 1e-6
+        bad = AI.compare_snapshots(off, snap)
+        assert bad["ok"] is False
+        assert bad["max_diff"] > 1e-6
+        assert bad["worst"] == ".forward[0][0]"
+        assert any("forward[0][0]" in msg for msg in bad["mismatches"])
+        assert AI.compare_snapshots(off, snap, rtol=1e-4)["ok"] is True
+        assert AI.compare_snapshots(near, snap, rtol=0.0, atol=0.0)["ok"] is False
+
+    def test_compare_detects_structure(self):
+        snap = AI.snapshot_model(AI.baseline_model(), self.XS)
+        short = json.loads(json.dumps(snap))
+        short["forward"][0].pop()
+        assert AI.compare_snapshots(short, snap)["ok"] is False
+        gone = json.loads(json.dumps(snap))
+        del gone["seed"]
+        assert AI.compare_snapshots(gone, snap)["ok"] is False
+        extra = json.loads(json.dumps(snap))
+        extra["note"] = "x"
+        assert AI.compare_snapshots(extra, snap)["ok"] is False
+        nulled = json.loads(json.dumps(snap))
+        nulled["grads"][0][0] = None
+        assert AI.compare_snapshots(nulled, snap)["ok"] is False
+        with pytest.raises(TypeError):
+            AI.compare_snapshots([], snap)
+        with pytest.raises(ValueError):
+            AI.compare_snapshots(snap, snap, rtol=-1.0)
+        with pytest.raises(TypeError):
+            AI.compare_snapshots(snap, snap, atol="x")
+
+    def test_load_errors(self, tmp_path):
+        with pytest.raises(ValueError):
+            AI.load_snapshot(str(tmp_path / "missing.json"))
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ValueError):
+            AI.load_snapshot(str(bad))
+        nofwd = tmp_path / "nofwd.json"
+        nofwd.write_text('{"a": 1}', encoding="utf-8")
+        with pytest.raises(ValueError):
+            AI.load_snapshot(str(nofwd))
+        with pytest.raises(TypeError):
+            AI.save_snapshot(123, {})
+        with pytest.raises(TypeError):
+            AI.load_snapshot(None)
+        with pytest.raises(ValueError):
+            AI.snapshot_digest({"forward": [[float("nan")]]})
