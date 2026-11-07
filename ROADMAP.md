@@ -330,7 +330,11 @@
     `gap` 留空档；唯一约束是首折训练集非空。
   - `purged_kfold_indices`：连续分块 + `purge`/`embargo` 剔除测试块附近样本，
     清洗后训练集为空会报错而不是静默返回空折。
-- [ ] Scaler 族：Robust / MaxAbs / QuantileTransformer / PowerTransformer
+- [x] Scaler 族：Robust / MaxAbs / QuantileTransformer / PowerTransformer
+  - `RobustScaler`（中位数 + IQR，可分别关掉中心化/缩放）、`MaxAbsScaler`（不中心化）。
+  - `QuantileTransformer`：分段线性分位数映射，`uniform` / `normal` 两种输出；
+    两端点在 normal 模式有 1e-8 量级逆变换残差（已写进 docstring）。
+  - `PowerTransformer`：Yeo-Johnson / Box-Cox，lambda 用黄金分割搜索近似 MLE。
 - [ ] 缺失值：`SimpleImputer` / `KNNImputer` / `IterativeImputer`
 - [ ] 降维：`PCA` / `t-SNE`（简化）；`SMOTE` / `ADASYN`；特征选择（VarianceThreshold / SelectKBest / RFE / L1）
 - [ ] 文本增强（同义词替换 / EDA / Token Dropout）；音频增强（概念）

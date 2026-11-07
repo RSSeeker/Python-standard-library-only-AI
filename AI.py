@@ -25177,6 +25177,399 @@ class MinMaxScaler:
         return out
 
 
+#  ======================================================================
+#  W11-E：Scaler 族（RobustScaler / MaxAbsScaler /
+#          QuantileTransformer / PowerTransformer）
+#  ======================================================================
+
+def _w11e_matrix(x, who):
+    """校验二维数值矩阵，返回特征宽度。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    if not isinstance(x[0], (list, tuple)) or not x[0]:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    width = len(x[0])
+    for row in x:
+        if not isinstance(row, (list, tuple)) or len(row) != width:
+            raise ValueError("%s: 各样本维度不一致" % who)
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 特征值必须是数字" % who)
+    return width
+
+
+def _w11e_median(values):
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _w11e_quantile(sorted_vals, q):
+    """线性插值分位数（q ∈ [0, 1]），与 numpy 的 linear 一致。"""
+    n = len(sorted_vals)
+    if n == 1:
+        return float(sorted_vals[0])
+    pos = q * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return float(sorted_vals[lo]) * (1.0 - frac) + float(sorted_vals[hi]) * frac
+
+
+class RobustScaler:
+    """中位数中心化 + 四分位距缩放：对离群点不敏感。
+
+    center_ = 中位数；scale_ = q_hi - q_lo（为 0 时按 1 处理，不做缩放）。
+    """
+
+    def __init__(self, with_centering=True, with_scaling=True,
+                 quantile_range=(25.0, 75.0)):
+        if not isinstance(with_centering, bool) or not isinstance(with_scaling, bool):
+            raise TypeError("RobustScaler: with_centering / with_scaling 必须是 bool")
+        lo, hi = quantile_range
+        for v in (lo, hi):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("RobustScaler: quantile_range 的元素必须是数字")
+        if not (0.0 <= lo < hi <= 100.0):
+            raise ValueError("RobustScaler: quantile_range 需要 0 <= lo < hi <= 100")
+        self.with_centering = with_centering
+        self.with_scaling = with_scaling
+        self.quantile_range = (float(lo), float(hi))
+        self.center_ = None
+        self.scale_ = None
+
+    def fit(self, x):
+        width = _w11e_matrix(x, "RobustScaler")
+        lo_q, hi_q = self.quantile_range
+        self.center_ = []
+        self.scale_ = []
+        for j in range(width):
+            col = sorted(row[j] for row in x)
+            self.center_.append(_w11e_median(col) if self.with_centering else 0.0)
+            span = _w11e_quantile(col, hi_q / 100.0) - _w11e_quantile(col, lo_q / 100.0)
+            self.scale_.append(span if (self.with_scaling and span > 0.0) else 1.0)
+        return self
+
+    def transform(self, x):
+        if self.center_ is None:
+            raise ValueError("RobustScaler: 请先 fit")
+        _w11e_matrix(x, "RobustScaler")
+        return [[(row[j] - self.center_[j]) / self.scale_[j]
+                 for j in range(len(self.center_))] for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.center_ is None:
+            raise ValueError("RobustScaler: 请先 fit")
+        _w11e_matrix(x, "RobustScaler")
+        return [[row[j] * self.scale_[j] + self.center_[j]
+                 for j in range(len(self.center_))] for row in x]
+
+
+class MaxAbsScaler:
+    """除以每列绝对值最大值（0 时按 1 处理）；不改变稀疏结构，也不做中心化。"""
+
+    def __init__(self):
+        self.scale_ = None
+
+    def fit(self, x):
+        width = _w11e_matrix(x, "MaxAbsScaler")
+        self.scale_ = []
+        for j in range(width):
+            m = max(abs(row[j]) for row in x)
+            self.scale_.append(m if m > 0.0 else 1.0)
+        return self
+
+    def transform(self, x):
+        if self.scale_ is None:
+            raise ValueError("MaxAbsScaler: 请先 fit")
+        _w11e_matrix(x, "MaxAbsScaler")
+        return [[row[j] / self.scale_[j] for j in range(len(self.scale_))]
+                for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.scale_ is None:
+            raise ValueError("MaxAbsScaler: 请先 fit")
+        _w11e_matrix(x, "MaxAbsScaler")
+        return [[row[j] * self.scale_[j] for j in range(len(self.scale_))]
+                for row in x]
+
+
+def _w11e_norm_ppf(p):
+    """标准正态分位函数（stdlib 的 NormalDist 实现）。"""
+    import statistics
+    return statistics.NormalDist().inv_cdf(p)
+
+
+class QuantileTransformer:
+    """把每列映射到 [0, 1] 上均匀分布（或再映射成正态分布）。
+
+    用 `n_quantiles` 个参考分位数（超过样本数时夹到样本数）做分段线性插值；
+    `output_distribution='normal'` 时再套一次正态分位函数。
+    """
+
+    def __init__(self, n_quantiles=100, output_distribution="uniform",
+                 subsample=None, seed=42):
+        if isinstance(n_quantiles, bool) or not isinstance(n_quantiles, int):
+            raise TypeError("QuantileTransformer: n_quantiles 必须是整数")
+        if n_quantiles < 2:
+            raise ValueError("QuantileTransformer: n_quantiles 必须 >= 2")
+        if output_distribution not in ("uniform", "normal"):
+            raise ValueError(
+                "QuantileTransformer: output_distribution 必须是 'uniform' 或 'normal'")
+        if subsample is not None:
+            if isinstance(subsample, bool) or not isinstance(subsample, int):
+                raise TypeError("QuantileTransformer: subsample 必须是整数或 None")
+            if subsample < 2:
+                raise ValueError("QuantileTransformer: subsample 必须 >= 2")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("QuantileTransformer: seed 必须是整数")
+        self.n_quantiles = n_quantiles
+        self.output_distribution = output_distribution
+        self.subsample = subsample
+        self.seed = seed
+        self.quantiles_ = None
+
+    def fit(self, x):
+        width = _w11e_matrix(x, "QuantileTransformer")
+        rng = random.Random(self.seed)
+        self.quantiles_ = []
+        for j in range(width):
+            col = sorted(row[j] for row in x)
+            if self.subsample is not None and self.subsample < len(col):
+                col = sorted(rng.sample(col, self.subsample))
+            n_q = min(self.n_quantiles, len(col))
+            if n_q < 2:
+                raise ValueError(
+                    "QuantileTransformer: 特征 %d 的有效样本数不足 2" % j)
+            qs = [k / (n_q - 1.0) for k in range(n_q)]
+            self.quantiles_.append([_w11e_quantile(col, q) for q in qs])
+        return self
+
+    def _to_uniform(self, v, ref):
+        if v <= ref[0]:
+            return 0.0
+        if v >= ref[-1]:
+            return 1.0
+        lo, hi = 0, len(ref) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if ref[mid] <= v:
+                lo = mid
+            else:
+                hi = mid
+        span = ref[hi] - ref[lo]
+        frac = 0.0 if span <= 0.0 else (v - ref[lo]) / span
+        step = 1.0 / (len(ref) - 1.0)
+        return min(1.0, max(0.0, (lo + frac) * step))
+
+    def transform(self, x):
+        if self.quantiles_ is None:
+            raise ValueError("QuantileTransformer: 请先 fit")
+        _w11e_matrix(x, "QuantileTransformer")
+        out = []
+        for row in x:
+            new_row = []
+            for j, ref in enumerate(self.quantiles_):
+                u = self._to_uniform(row[j], ref)
+                if self.output_distribution == "normal":
+                    u = min(1.0 - 1e-9, max(1e-9, u))
+                    new_row.append(_w11e_norm_ppf(u))
+                else:
+                    new_row.append(u)
+            out.append(new_row)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.quantiles_ is None:
+            raise ValueError("QuantileTransformer: 请先 fit")
+        _w11e_matrix(x, "QuantileTransformer")
+        out = []
+        for row in x:
+            new_row = []
+            for j, ref in enumerate(self.quantiles_):
+                u = row[j]
+                if self.output_distribution == "normal":
+                    u = 0.5 * (1.0 + math.erf(u / math.sqrt(2.0)))
+                u = min(1.0, max(0.0, u))
+                pos = u * (len(ref) - 1)
+                lo = int(math.floor(pos))
+                hi = min(lo + 1, len(ref) - 1)
+                frac = pos - lo
+                new_row.append(ref[lo] * (1.0 - frac) + ref[hi] * frac)
+            out.append(new_row)
+        return out
+
+
+def _w11e_yj_forward(v, lam):
+    if v >= 0.0:
+        if abs(lam) < 1e-12:
+            return math.log1p(v)
+        return ((v + 1.0) ** lam - 1.0) / lam
+    if abs(lam - 2.0) < 1e-12:
+        return -math.log1p(-v)
+    return -((1.0 - v) ** (2.0 - lam) - 1.0) / (2.0 - lam)
+
+
+def _w11e_yj_inverse(z, lam):
+    if z >= 0.0:
+        if abs(lam) < 1e-12:
+            return math.exp(z) - 1.0
+        base = lam * z + 1.0
+        if base <= 0.0:
+            return -1.0
+        return base ** (1.0 / lam) - 1.0
+    if abs(lam - 2.0) < 1e-12:
+        return 1.0 - math.exp(-z)
+    base = -z * (2.0 - lam) + 1.0
+    if base <= 0.0:
+        return 1.0
+    return 1.0 - base ** (1.0 / (2.0 - lam))
+
+
+def _w11e_bc_forward(v, lam):
+    if abs(lam) < 1e-12:
+        return math.log(v)
+    return (v ** lam - 1.0) / lam
+
+
+def _w11e_bc_inverse(z, lam):
+    if abs(lam) < 1e-12:
+        return math.exp(z)
+    base = lam * z + 1.0
+    if base <= 0.0:
+        raise ValueError("PowerTransformer: 反变换超出定义域（lambda*z + 1 <= 0）")
+    return base ** (1.0 / lam)
+
+
+class PowerTransformer:
+    """Box-Cox / Yeo-Johnson 幂变换，每个特征单独估一个 lambda（MLE）。
+
+    `method='yeo-js'`（默认，支持负数）或 `'box-cox'`（要求该特征全为正）。
+    `standardize=True` 时变换后再做一次零均值单位方差。
+    lambda 用**黄金分割搜索**在 [-5, 5] 上最大化对数似然；结果是近似 MLE，不是网格最优。
+    """
+
+    def __init__(self, method="yeo-js", standardize=True):
+        if method not in ("yeo-js", "box-cox"):
+            raise ValueError("PowerTransformer: method 必须是 'yeo-js' 或 'box-cox'")
+        if not isinstance(standardize, bool):
+            raise TypeError("PowerTransformer: standardize 必须是 bool")
+        self.method = method
+        self.standardize = standardize
+        self.lambdas_ = None
+        self.mean_ = None
+        self.std_ = None
+
+    def _forward_one(self, v, lam):
+        if self.method == "box-cox":
+            return _w11e_bc_forward(v, lam)
+        return _w11e_yj_forward(v, lam)
+
+    def _inverse_one(self, z, lam):
+        if self.method == "box-cox":
+            return _w11e_bc_inverse(z, lam)
+        return _w11e_yj_inverse(z, lam)
+
+    def _nll(self, col, lam):
+        z = [self._forward_one(v, lam) for v in col]
+        n = len(z)
+        mean = sum(z) / n
+        var = sum((v - mean) ** 2 for v in z) / n
+        if var <= 0.0:
+            return float("inf")
+        jac = 0.0
+        for v in col:
+            if self.method == "box-cox":
+                jac += math.log(v)
+            else:
+                jac += math.log1p(abs(v)) * (1.0 if v >= 0.0 else -1.0)
+        return 0.5 * n * math.log(var) - (lam - 1.0) * jac
+
+    def fit(self, x):
+        width = _w11e_matrix(x, "PowerTransformer")
+        self.lambdas_ = []
+        cols = []
+        for j in range(width):
+            col = [float(row[j]) for row in x]
+            if self.method == "box-cox" and min(col) <= 0.0:
+                raise ValueError(
+                    "PowerTransformer: box-cox 要求第 %d 个特征全为正（最小值 %.6g）"
+                    % (j, min(col)))
+            cols.append(col)
+            lo, hi = -5.0, 5.0
+            inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
+            a, b = hi - inv_phi * (hi - lo), lo + inv_phi * (hi - lo)
+            fa, fb = self._nll(col, a), self._nll(col, b)
+            for _ in range(80):
+                if fa < fb:
+                    hi, b, fb = b, a, fa
+                    a = hi - inv_phi * (hi - lo)
+                    fa = self._nll(col, a)
+                else:
+                    lo, a, fa = a, b, fb
+                    b = lo + inv_phi * (hi - lo)
+                    fb = self._nll(col, b)
+                if hi - lo < 1e-6:
+                    break
+            self.lambdas_.append((lo + hi) / 2.0)
+        z = []
+        for j in range(width):
+            lam = self.lambdas_[j]
+            z.append([self._forward_one(v, lam) for v in cols[j]])
+        if self.standardize:
+            self.mean_ = [sum(r) / len(r) for r in z]
+            self.std_ = []
+            for r in z:
+                m = self.mean_[len(self.std_)]
+                s = math.sqrt(sum((v - m) ** 2 for v in r) / len(r))
+                self.std_.append(s if s > 0.0 else 1.0)
+        else:
+            self.mean_ = [0.0] * width
+            self.std_ = [1.0] * width
+        return self
+
+    def transform(self, x):
+        if self.lambdas_ is None:
+            raise ValueError("PowerTransformer: 请先 fit")
+        _w11e_matrix(x, "PowerTransformer")
+        out = []
+        for row in x:
+            new_row = []
+            for j in range(len(self.lambdas_)):
+                z = self._forward_one(float(row[j]), self.lambdas_[j])
+                new_row.append((z - self.mean_[j]) / self.std_[j])
+            out.append(new_row)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, x):
+        if self.lambdas_ is None:
+            raise ValueError("PowerTransformer: 请先 fit")
+        _w11e_matrix(x, "PowerTransformer")
+        out = []
+        for row in x:
+            new_row = []
+            for j in range(len(self.lambdas_)):
+                z = row[j] * self.std_[j] + self.mean_[j]
+                new_row.append(self._inverse_one(z, self.lambdas_[j]))
+            out.append(new_row)
+        return out
+
+
 def ascii_plot(history, keys=("train_loss", "val_loss"), width: int = 60,
                height: int = 12, title: str = None):
     """把 train_history 画成纯 ASCII 折线图（终端里直接看训练曲线）。

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1209 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1217 项）
 
 ## 特性
 
@@ -902,6 +902,35 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
+### Scaler 族（W11-E）
+
+四个按列变换器，接口与既有 `StandardScaler` / `MinMaxScaler` 一致：
+`fit` / `transform` / `fit_transform` / `inverse_transform`，返回新的二维 list、不改入参。
+
+| 类 | 变换 | 特点 |
+|---|---|---|
+| `RobustScaler(with_centering=True, with_scaling=True, quantile_range=(25,75))` | `(x - 中位数) / IQR` | 对离群点不敏感；IQR 为 0 时按 1 处理 |
+| `MaxAbsScaler()` | `x / max|x|` | 不中心化，保留稀疏结构 |
+| `QuantileTransformer(n_quantiles=100, output_distribution='uniform', subsample=None, seed=42)` | 分位数映射到 `[0,1]` 均匀分布，或再套正态分位函数 | 非线性；可以把任意单调变形「拉平」 |
+| `PowerTransformer(method='yeo-js', standardize=True)` | Box-Cox / Yeo-Johnson 幂变换 | 每个特征单独估 `lambda`（黄金分割搜索最大化对数似然），之后零均值单位方差 |
+
+```python
+rob = AI.RobustScaler().fit(train_x)        # 中位数 / IQR
+x_train = rob.transform(train_x)
+
+qt = AI.QuantileTransformer(output_distribution="normal").fit(train_x)
+x_norm = qt.transform(test_x)               # 近似标准正态
+```
+
+诚实边界：
+
+- `QuantileTransformer` 的输出被夹在 `[1e-9, 1-1e-9]` 内再套正态分位函数，所以**两端点**
+  （极小/极大值）在 `output_distribution='normal'` 下逆变换有 `1e-8` 量级残差，内点无损。
+  `uniform` 模式下端点严格是 0 / 1，往返无损。
+- `PowerTransformer` 的 `lambda` 是数值优化的**近似** MLE（黄金分割 80 次，精度 1e-6），
+  不是闭式解；`method='box-cox'` 要求对应特征全为正，否则报 `ValueError`。
+- 四个类都不做缺失值处理（`None` / `NaN` 会直接报 `TypeError`）。
+
 ### 切分扩展（W11-D）
 
 三个纯索引切分器（返回下标列表，不复制数据），补上 `k_fold_indices` 覆盖不到的场景：
@@ -1369,7 +1398,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1209 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1217 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1534,6 +1563,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
 | `TestSplitExtensions` | `GroupKFold` 的「同组不跨折」与折间均衡、时序切分的测试块位置/扩张与滚动窗口/`gap` 留空档、Purged K-Fold 的 `purge`+`embargo` 剔除区间、三类切分的参数校验、既有 `k_fold_indices` 不受影响 |
+| `TestScalerFamily` | `RobustScaler` 的中位数/IQR 闭式值与「不中心化/不缩放」开关、`MaxAbsScaler` 列最大绝对值、`QuantileTransformer` 的参考分位数与插值（整数点 k/9、中点 0.5、越界夹取）与正态模式往返、Yeo-Johnson 的 8×5 个 (λ, x) 格点往返、`PowerTransformer` 的标准化后均值/方差与两种 method 的往返、四类未 fit/坏形状/非数字报错 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1587,7 +1617,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1209 个单元测试
+├── test_ai.py       # 1217 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

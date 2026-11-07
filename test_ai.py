@@ -19559,3 +19559,113 @@ class TestSplitExtensions:
                 call()
         kf = AI.k_fold_indices(20, n_splits=4, seed=1)
         assert len(kf) == 4
+
+
+class TestScalerFamily:
+    """W11-E：Robust / MaxAbs / QuantileTransformer / PowerTransformer"""
+
+    def test_robust_scaler(self):
+        x = [[1.0], [2.0], [3.0], [4.0], [100.0]]
+        rs = AI.RobustScaler().fit(x)
+        assert rs.center_ == [3.0]
+        assert rs.scale_ == [2.0]
+        out = rs.transform(x)
+        assert [r[0] for r in out] == [-1.0, -0.5, 0.0, 0.5, 48.5]
+        back = rs.inverse_transform(out)
+        assert all(abs(a[0] - b[0]) < 1e-12 for a, b in zip(back, x))
+        nc = AI.RobustScaler(with_centering=False).fit(x)
+        assert nc.center_ == [0.0] and nc.transform([[3.0]]) == [[1.5]]
+        ns = AI.RobustScaler(with_scaling=False).fit(x)
+        assert ns.scale_ == [1.0] and ns.transform([[5.0]]) == [[2.0]]
+        assert AI.RobustScaler().fit([[7.0], [7.0]]).scale_ == [1.0]
+        with pytest.raises(ValueError):
+            AI.RobustScaler(quantile_range=(50, 50))
+        with pytest.raises(ValueError):
+            AI.RobustScaler(quantile_range=(-1, 50))
+        with pytest.raises(TypeError):
+            AI.RobustScaler(with_centering=1)
+
+    def test_max_abs_scaler(self):
+        ma = AI.MaxAbsScaler().fit([[-3.0, 1.0], [2.0, -4.0]])
+        assert ma.scale_ == [3.0, 4.0]
+        mt = ma.transform([[-3.0, 1.0], [2.0, -4.0]])
+        assert mt == [[-1.0, 0.25], [2.0 / 3.0, -1.0]]
+        assert ma.inverse_transform(mt) == [[-3.0, 1.0], [2.0, -4.0]]
+        assert AI.MaxAbsScaler().fit([[0.0], [0.0]]).scale_ == [1.0]
+
+    def test_quantile_uniform(self):
+        xq = [[float(i)] for i in range(10)]
+        qt = AI.QuantileTransformer(n_quantiles=10).fit(xq)
+        assert qt.quantiles_[0] == [float(i) for i in range(10)]
+        u = qt.transform([[3.0], [4.5], [-1.0], [20.0]])
+        assert abs(u[0][0] - 3.0 / 9.0) < 1e-12
+        assert abs(u[1][0] - 0.5) < 1e-12
+        assert u[2][0] == 0.0 and u[3][0] == 1.0
+        back = qt.inverse_transform(qt.transform(xq))
+        assert all(abs(a[0] - b[0]) < 1e-9 for a, b in zip(back, xq))
+        assert AI.QuantileTransformer(n_quantiles=1000).fit(xq).quantiles_[0] == \
+            [float(i) for i in range(10)]
+
+    def test_quantile_normal(self):
+        xq = [[float(i)] for i in range(10)]
+        qn = AI.QuantileTransformer(n_quantiles=10,
+                                    output_distribution="normal").fit(xq)
+        assert abs(qn.transform([[4.5]])[0][0]) < 1e-9
+        vals = [r[0] for r in qn.transform(xq)]
+        assert all(vals[i] < vals[i + 1] for i in range(9))
+        assert all(-2.0 < v < 2.0 for v in vals[1:-1])
+        back = qn.inverse_transform(qn.transform(xq))
+        assert all(abs(a[0] - b[0]) < 1e-8 for a, b in zip(back, xq))
+        with pytest.raises(ValueError):
+            AI.QuantileTransformer(n_quantiles=1)
+        with pytest.raises(ValueError):
+            AI.QuantileTransformer(output_distribution="x")
+        with pytest.raises(TypeError):
+            AI.QuantileTransformer(n_quantiles=2.0)
+        with pytest.raises(ValueError):
+            AI.QuantileTransformer(subsample=1)
+        with pytest.raises(TypeError):
+            AI.QuantileTransformer(seed="a")
+
+    def test_yeo_johnson_primitives(self):
+        assert abs(AI._w11e_yj_forward(2.5, 1.0) - 2.5) < 1e-12
+        assert abs(AI._w11e_yj_forward(1.0, 0.0) - math.log(2.0)) < 1e-12
+        assert abs(AI._w11e_yj_forward(-0.5, 2.0) + math.log(1.5)) < 1e-12
+        for lam in (-1.5, -0.3, 0.0, 0.7, 1.0, 1.9, 2.0, 3.0):
+            for v in (-0.7, -0.1, 0.0, 0.4, 2.0):
+                z = AI._w11e_yj_forward(v, lam)
+                assert abs(AI._w11e_yj_inverse(z, lam) - v) < 1e-9
+
+    def test_power_transformer_yeo_js(self):
+        xs = [[float(v)] for v in (0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)]
+        pt = AI.PowerTransformer(method="yeo-js").fit(xs)
+        assert -5.0 <= pt.lambdas_[0] <= 5.0
+        zt = pt.transform(xs)
+        assert abs(sum(r[0] for r in zt) / len(zt)) < 1e-9
+        assert abs(sum(r[0] ** 2 for r in zt) / len(zt) - 1.0) < 1e-9
+        back = pt.inverse_transform(zt)
+        assert all(abs(a[0] - b[0]) < 1e-6 for a, b in zip(back, xs))
+
+    def test_power_transformer_box_cox(self):
+        xp = [[v] for v in (0.5, 1.0, 2.0, 4.0, 8.0)]
+        bc = AI.PowerTransformer(method="box-cox").fit(xp)
+        assert -5.0 <= bc.lambdas_[0] <= 5.0
+        back = bc.inverse_transform(bc.transform(xp))
+        assert all(abs(a[0] - b[0]) < 1e-6 for a, b in zip(back, xp))
+        with pytest.raises(ValueError):
+            AI.PowerTransformer(method="box-cox").fit([[0.0], [1.0]])
+        with pytest.raises(ValueError):
+            AI.PowerTransformer(method="x")
+        with pytest.raises(TypeError):
+            AI.PowerTransformer(standardize=1)
+
+    def test_scaler_common_validation(self):
+        for obj in (AI.RobustScaler(), AI.MaxAbsScaler(),
+                    AI.QuantileTransformer(), AI.PowerTransformer()):
+            with pytest.raises(ValueError):
+                obj.transform([[1.0]])
+            for bad in ([], [[]], [[1.0, 2.0], [3.0]]):
+                with pytest.raises((ValueError, TypeError)):
+                    obj.fit(bad)
+            with pytest.raises(TypeError):
+                obj.fit([["a"]])
