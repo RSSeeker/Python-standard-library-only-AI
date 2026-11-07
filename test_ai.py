@@ -24546,3 +24546,120 @@ class TestSuperResolutionDenoising:
             AI.DnCNN(channels=1, seed=1).denoise(self._const(3, 4, 4, 0.0))
         with pytest.raises(ValueError):
             AI.DnCNN(seed=1).fit([(clean,)])
+
+
+class TestVectorRetrieval:
+    """W17-D：暴力 / IVF / 单层 NSW 三种向量检索。"""
+
+    @staticmethod
+    def _data():
+        import random
+        rng = random.Random(7)
+        vecs = []
+        for cx, cy in ((0.0, 0.0), (10.0, 0.0), (0.0, 10.0)):
+            for _ in range(6):
+                vecs.append([cx + rng.uniform(-0.4, 0.4),
+                             cy + rng.uniform(-0.4, 0.4)])
+        return vecs
+
+    def test_brute_force_matches_manual_scan(self):
+        vecs = self._data()
+        index = AI.BruteForceIndex()
+        index.add(vecs)
+        assert len(index) == 18
+        q = [0.1, 0.1]
+        got = index.search(q, k=3)
+        manual = sorted((AI._w17d_l2(q, v), i) for i, v in enumerate(vecs))[:3]
+        assert [g[0] for g in got] == [i for _, i in manual]
+        for (gid, dist), (want, _) in zip(got, manual):
+            assert abs(dist - want) < 1e-12
+        assert len(index.search(q, k=99)) == 18
+
+    def test_brute_force_ids_and_ip_metric(self):
+        index = AI.BruteForceIndex(metric="ip")
+        index.add([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], ids=[10, 11, 12])
+        assert index.search([2.0, 1.0], k=1)[0][0] == 12
+        with pytest.raises(ValueError):
+            index.add([[1.0, 1.0]], ids=[10])
+
+    def test_brute_force_validation(self):
+        with pytest.raises(ValueError):
+            AI.BruteForceIndex().add([])
+        with pytest.raises(ValueError):
+            AI.BruteForceIndex().add([[0.0, 1.0], [0.0]])
+        with pytest.raises(ValueError):
+            AI.BruteForceIndex(dim=3).add([[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.BruteForceIndex().search([0.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.BruteForceIndex(metric="cos")
+
+    def test_kmeans_partitions_three_clusters(self):
+        import random
+        vecs = self._data()
+        centers = AI._w17d_kmeans(vecs, 3, 20, random.Random(3))
+        assert len(centers) == 3
+        owners = {}
+        for ci, c in enumerate(centers):
+            owners[ci] = min(range(3), key=lambda g: AI._w17d_l2(
+                c, [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)][g]))
+        assert sorted(owners.values()) == [0, 1, 2]
+        for i, v in enumerate(vecs):
+            nearest = min(range(3), key=lambda ci: AI._w17d_l2(v, centers[ci]))
+            assert owners[nearest] == i // 6
+
+    def test_ivf_with_all_probes_equals_brute_force(self):
+        vecs = self._data()
+        brute = AI.BruteForceIndex()
+        brute.add(vecs)
+        index = AI.IVFIndex(n_clusters=3, n_probe=3, n_iter=20, seed=5)
+        index.add(vecs)
+        index.train()
+        assert len(index.assign) == 18
+        assert [g[0] for g in index.search([0.1, 0.1], k=5)] == \
+            [g[0] for g in brute.search([0.1, 0.1], k=5)]
+
+    def test_ivf_single_probe_still_hits_local_cluster(self):
+        vecs = self._data()
+        index = AI.IVFIndex(n_clusters=3, n_probe=1, n_iter=20, seed=5)
+        index.add(vecs)
+        index.train()
+        got = [g[0] for g in index.search([0.1, 0.1], k=5)]
+        truth = list(range(6))
+        assert AI.retrieval_recall(truth, got) >= 0.6, got
+
+    def test_nsw_recall_and_graph_links(self):
+        vecs = self._data()
+        brute = AI.BruteForceIndex()
+        brute.add(vecs)
+        index = AI.NSWIndex(m=6, ef_search=32)
+        index.add(vecs)
+        assert len(index) == 18
+        got = [g[0] for g in index.search([0.1, 0.1], k=5)]
+        truth = [g[0] for g in brute.search([0.1, 0.1], k=5)]
+        assert AI.retrieval_recall(truth, got) >= 0.8, (truth, got)
+        assert len(index.search([0.0, 0.0], k=99)) == 18
+
+    def test_retrieval_recall_values(self):
+        assert AI.retrieval_recall([0, 1, 2, 3], [0, 1, 2, 3]) == 1.0
+        assert AI.retrieval_recall([0, 1, 2, 3], [0, 1, 9, 8]) == 0.5
+        assert AI.retrieval_recall([0], [5]) == 0.0
+        with pytest.raises(ValueError):
+            AI.retrieval_recall([], [1])
+
+    def test_index_validation(self):
+        vecs = self._data()
+        index = AI.BruteForceIndex()
+        index.add(vecs)
+        with pytest.raises(ValueError):
+            index.search([0.0, 0.0], k=0)
+        with pytest.raises(ValueError):
+            index.search([0.0, 0.0], k=1.5)
+        with pytest.raises(ValueError):
+            AI.IVFIndex(n_probe=0)
+        with pytest.raises(ValueError):
+            AI.NSWIndex(m=0)
+        with pytest.raises(ValueError):
+            AI.NSWIndex().search([0.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.IVFIndex().search([0.0, 0.0])

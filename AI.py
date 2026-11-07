@@ -64,6 +64,7 @@ import sys
 
 import math
 import operator
+import heapq
 import random
 import re
 import time
@@ -30525,6 +30526,361 @@ class PatchTSTEmbedding:
 
     def param_count(self):
         return self.d_model * self.patch_len + self.d_model
+
+# ========================================================================
+#  领域应用 W17-D：向量检索（暴力 / IVF / 单层 NSW 图）
+# ========================================================================
+
+
+def _w17d_vector(vec, who, dim=None):
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise ValueError("%s: 向量必须是非空数值列表" % who)
+    out = []
+    for v in vec:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("%s: 向量元素必须是数字，收到 %r" % (who, v))
+        f = float(v)
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError("%s: 向量元素必须是有限数" % who)
+        out.append(f)
+    if dim is not None and len(out) != dim:
+        raise ValueError("%s: 向量维度 %d 与索引维度 %d 不一致" % (who, len(out), dim))
+    return out
+
+
+def _w17d_vectors(vectors, who, dim=None):
+    if not isinstance(vectors, (list, tuple)) or not vectors:
+        raise ValueError("%s: 向量集合必须是非空列表" % who)
+    out = [_w17d_vector(v, who) for v in vectors]
+    d = len(out[0])
+    for v in out:
+        if len(v) != d:
+            raise ValueError("%s: 所有向量维度必须一致（期望 %d）" % (who, d))
+    if dim is not None and d != dim:
+        raise ValueError("%s: 向量维度 %d 与索引维度 %d 不一致" % (who, d, dim))
+    return out
+
+
+def _w17d_l2(a, b):
+    acc = 0.0
+    for i in range(len(a)):
+        diff = a[i] - b[i]
+        acc += diff * diff
+    return acc
+
+
+def _w17d_dot(a, b):
+    acc = 0.0
+    for i in range(len(a)):
+        acc += a[i] * b[i]
+    return acc
+
+
+def _w17d_k(query, vectors, metric):
+    """返回 (距离, 下标) 列表；l2 距离越小越好，ip 内积越大越好。"""
+    if metric == "l2":
+        return [(_w17d_l2(query, v), i) for i, v in enumerate(vectors)]
+    return [(-_w17d_dot(query, v), i) for i, v in enumerate(vectors)]
+
+
+def _w17d_topk(pairs, k):
+    pairs = sorted(pairs, key=lambda p: (p[0], p[1]))
+    return pairs[:k]
+
+
+def _w17d_check_k(k, n, who):
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise ValueError("%s: k 必须是整数" % who)
+    if k < 1:
+        raise ValueError("%s: k 必须 >= 1" % who)
+    return min(k, n)
+
+
+def _w17d_kmeans(vectors, n_clusters, n_iter, rng):
+    """k-means（k-means++ 初始化）返回簇心列表。"""
+    n = len(vectors)
+    if n_clusters > n:
+        raise ValueError("向量数 %d 少于簇数 %d" % (n, n_clusters))
+    centers = [list(vectors[rng.randrange(n)])]
+    while len(centers) < n_clusters:
+        d2 = []
+        for v in vectors:
+            best = min(_w17d_l2(v, c) for c in centers)
+            d2.append(best)
+        total = sum(d2)
+        if total <= 0.0:
+            pick = rng.randrange(n)
+        else:
+            r = rng.random() * total
+            acc = 0.0
+            pick = n - 1
+            for i, val in enumerate(d2):
+                acc += val
+                if r <= acc:
+                    pick = i
+                    break
+        centers.append(list(vectors[pick]))
+    dim = len(vectors[0])
+    for _ in range(max(1, n_iter)):
+        groups = [[] for _ in range(n_clusters)]
+        for v in vectors:
+            best_i = 0
+            best_d = _w17d_l2(v, centers[0])
+            for ci in range(1, n_clusters):
+                d = _w17d_l2(v, centers[ci])
+                if d < best_d:
+                    best_d = d
+                    best_i = ci
+            groups[best_i].append(v)
+        moved = 0.0
+        for ci in range(n_clusters):
+            if not groups[ci]:
+                continue
+            new = [0.0] * dim
+            for v in groups[ci]:
+                for j in range(dim):
+                    new[j] += v[j]
+            cnt = float(len(groups[ci]))
+            new = [x / cnt for x in new]
+            moved += _w17d_l2(new, centers[ci])
+            centers[ci] = new
+        if moved <= 1e-12:
+            break
+    return centers
+
+
+class BruteForceIndex:
+    """暴力检索：线性扫描所有向量，结果与精确最近邻逐位一致。"""
+
+    def __init__(self, metric="l2", dim=None):
+        if metric not in ("l2", "ip"):
+            raise ValueError("BruteForceIndex: metric 只能是 'l2' 或 'ip'")
+        if dim is not None and (isinstance(dim, bool) or not isinstance(dim, int) or dim < 1):
+            raise ValueError("BruteForceIndex: dim 必须是正整数")
+        self.metric = metric
+        self.dim = dim
+        self.vectors = []
+        self.ids = []
+
+    def __len__(self):
+        return len(self.vectors)
+
+    def add(self, vectors, ids=None):
+        vs = _w17d_vectors(vectors, "BruteForceIndex.add", self.dim)
+        if self.dim is None:
+            self.dim = len(vs[0])
+        n = len(vs)
+        if ids is None:
+            base = len(self.vectors)
+            ids = list(range(base, base + n))
+        else:
+            if not isinstance(ids, (list, tuple)) or len(ids) != n:
+                raise ValueError("BruteForceIndex.add: ids 长度必须与 vectors 相同")
+            ids = list(ids)
+            for i in ids:
+                if isinstance(i, bool) or not isinstance(i, int):
+                    raise ValueError("BruteForceIndex.add: ids 必须是整数")
+            if len(set(ids)) != len(ids):
+                raise ValueError("BruteForceIndex.add: ids 不能重复")
+            if set(ids) & set(self.ids):
+                raise ValueError("BruteForceIndex.add: ids 与已有 id 冲突")
+        self.vectors.extend(vs)
+        self.ids.extend(ids)
+        return self
+
+    def search(self, query, k=5):
+        q = _w17d_vector(query, "BruteForceIndex.search", self.dim)
+        if not self.vectors:
+            raise ValueError("BruteForceIndex.search: 索引为空")
+        kk = _w17d_check_k(k, len(self.vectors), "BruteForceIndex.search")
+        pairs = _w17d_topk(_w17d_k(q, self.vectors, self.metric), kk)
+        return [(self.ids[i], d) for d, i in pairs]
+
+
+class IVFIndex:
+    """倒排文件索引：先 k-means 分簇，再只在最近的 n_probe 个簇里扫描。"""
+
+    def __init__(self, n_clusters=2, n_probe=1, n_iter=10, metric="l2", dim=None,
+                 seed=None):
+        if isinstance(n_clusters, bool) or not isinstance(n_clusters, int) or n_clusters < 1:
+            raise ValueError("IVFIndex: n_clusters 必须是正整数")
+        if isinstance(n_probe, bool) or not isinstance(n_probe, int) or n_probe < 1:
+            raise ValueError("IVFIndex: n_probe 必须是正整数")
+        if metric not in ("l2", "ip"):
+            raise ValueError("IVFIndex: metric 只能是 'l2' 或 'ip'")
+        self.n_clusters = n_clusters
+        self.n_probe = n_probe
+        self.n_iter = n_iter
+        self.metric = metric
+        self.dim = dim
+        self.seed = seed
+        self.vectors = []
+        self.ids = []
+        self.centers = []
+        self.assign = []
+
+    def __len__(self):
+        return len(self.vectors)
+
+    def add(self, vectors, ids=None):
+        vs = _w17d_vectors(vectors, "IVFIndex.add", self.dim)
+        if self.dim is None:
+            self.dim = len(vs[0])
+        n = len(vs)
+        if ids is None:
+            base = len(self.vectors)
+            ids = list(range(base, base + n))
+        else:
+            if not isinstance(ids, (list, tuple)) or len(ids) != n:
+                raise ValueError("IVFIndex.add: ids 长度必须与 vectors 相同")
+            ids = list(ids)
+            if len(set(ids)) != len(ids):
+                raise ValueError("IVFIndex.add: ids 不能重复")
+            if set(ids) & set(self.ids):
+                raise ValueError("IVFIndex.add: ids 与已有 id 冲突")
+        self.vectors.extend(vs)
+        self.ids.extend(ids)
+        return self
+
+    def train(self):
+        if not self.vectors:
+            raise ValueError("IVFIndex.train: 索引为空")
+        rng = random.Random(self.seed)
+        self.centers = _w17d_kmeans(self.vectors, self.n_clusters, self.n_iter, rng)
+        self.assign = []
+        for v in self.vectors:
+            best_i = 0
+            best_d = _w17d_l2(v, self.centers[0])
+            for ci in range(1, len(self.centers)):
+                d = _w17d_l2(v, self.centers[ci])
+                if d < best_d:
+                    best_d = d
+                    best_i = ci
+            self.assign.append(best_i)
+        return self
+
+    def search(self, query, k=5):
+        q = _w17d_vector(query, "IVFIndex.search", self.dim)
+        if not self.vectors:
+            raise ValueError("IVFIndex.search: 索引为空")
+        if not self.centers:
+            self.train()
+        kk = _w17d_check_k(k, len(self.vectors), "IVFIndex.search")
+        probe = min(self.n_probe, len(self.centers))
+        cdist = _w17d_k(q, self.centers, self.metric)
+        chosen = set(i for _, i in _w17d_topk(cdist, probe))
+        pairs = []
+        for idx, v in enumerate(self.vectors):
+            if self.assign[idx] in chosen:
+                d = _w17d_l2(q, v) if self.metric == "l2" else -_w17d_dot(q, v)
+                pairs.append((d, idx))
+        pairs = _w17d_topk(pairs, kk)
+        return [(self.ids[i], d) for d, i in pairs]
+
+
+class NSWIndex:
+    """单层可导航小世界图（NSW）近似检索。
+
+    诚实说明：这是**单层**近邻图 + 贪心束搜索，不是论文里的分层 HNSW
+    （没有层级、没有启发式邻居剪枝、没有多 ef 参数），召回率低于真正的 HNSW。
+    """
+
+    def __init__(self, m=6, ef_search=16, metric="l2", dim=None):
+        if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+            raise ValueError("NSWIndex: m 必须是正整数")
+        if isinstance(ef_search, bool) or not isinstance(ef_search, int) or ef_search < 1:
+            raise ValueError("NSWIndex: ef_search 必须是正整数")
+        if metric not in ("l2", "ip"):
+            raise ValueError("NSWIndex: metric 只能是 'l2' 或 'ip'")
+        self.m = m
+        self.ef_search = ef_search
+        self.metric = metric
+        self.dim = dim
+        self.vectors = []
+        self.ids = []
+        self.links = []
+
+    def __len__(self):
+        return len(self.vectors)
+
+    def _dist(self, q, v):
+        return _w17d_l2(q, v) if self.metric == "l2" else -_w17d_dot(q, v)
+
+    def add(self, vectors, ids=None):
+        vs = _w17d_vectors(vectors, "NSWIndex.add", self.dim)
+        if self.dim is None:
+            self.dim = len(vs[0])
+        n = len(vs)
+        if ids is None:
+            base = len(self.vectors)
+            ids = list(range(base, base + n))
+        else:
+            if not isinstance(ids, (list, tuple)) or len(ids) != n:
+                raise ValueError("NSWIndex.add: ids 长度必须与 vectors 相同")
+            ids = list(ids)
+            if len(set(ids)) != len(ids):
+                raise ValueError("NSWIndex.add: ids 不能重复")
+            if set(ids) & set(self.ids):
+                raise ValueError("NSWIndex.add: ids 与已有 id 冲突")
+        for v, vid in zip(vs, ids):
+            new_idx = len(self.vectors)
+            self.vectors.append(list(v))
+            self.ids.append(vid)
+            self.links.append([])
+            if new_idx == 0:
+                continue
+            cand = sorted((self._dist(v, self.vectors[j]), j)
+                          for j in range(new_idx))[:self.m]
+            for _, j in cand:
+                self.links[new_idx].append(j)
+                self.links[j].append(new_idx)
+                if len(self.links[j]) > self.m:
+                    keep = sorted(self.links[j],
+                                  key=lambda z: (self._dist(self.vectors[j],
+                                                            self.vectors[z]), z))
+                    self.links[j] = keep[:self.m]
+        return self
+
+    def search(self, query, k=5):
+        q = _w17d_vector(query, "NSWIndex.search", self.dim)
+        if not self.vectors:
+            raise ValueError("NSWIndex.search: 索引为空")
+        kk = _w17d_check_k(k, len(self.vectors), "NSWIndex.search")
+        entry = 0
+        best_d = self._dist(q, self.vectors[entry])
+        improved = True
+        while improved:
+            improved = False
+            for j in self.links[entry]:
+                d = self._dist(q, self.vectors[j])
+                if d < best_d:
+                    best_d = d
+                    entry = j
+                    improved = True
+        visited = {entry}
+        frontier = [(best_d, entry)]
+        expanded = 0
+        while frontier and expanded < self.ef_search:
+            _, cur = heapq.heappop(frontier)
+            expanded += 1
+            for j in self.links[cur]:
+                if j in visited:
+                    continue
+                visited.add(j)
+                heapq.heappush(frontier, (self._dist(q, self.vectors[j]), j))
+        pairs = sorted((self._dist(q, self.vectors[i]), i) for i in visited)
+        pairs = _w17d_topk(pairs, kk)
+        return [(self.ids[i], d) for d, i in pairs]
+
+
+def retrieval_recall(truth, got):
+    """recall@k：truth / got 都是 id 列表（同长度），返回交集比例。"""
+    if not isinstance(truth, (list, tuple)) or not isinstance(got, (list, tuple)):
+        raise ValueError("retrieval_recall: 两侧都必须是 id 列表")
+    if not truth:
+        raise ValueError("retrieval_recall: truth 不能为空")
+    hits = len(set(truth) & set(got))
+    return hits / float(len(truth))
 
 # ========================================================================
 #  领域应用 W17-C-2：超分（SRCNN 式）/ 去噪（DnCNN 式残差）

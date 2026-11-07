@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1600 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1609 项）
 
 ## 特性
 
@@ -2084,6 +2084,48 @@ print(dn.denoise(noisy)[0][0])
   「噪声接近加性高斯」时语义清楚，其他退化（模糊、压缩伪影）没有承诺。
 - 训练量很小（几十到几百轮、几个 4×4 样本），收敛曲线是「损失下降」的证明，不是质量承诺。
 
+### 向量检索（W17-D）
+
+| 接口 | 说明 |
+|------|------|
+| `BruteForceIndex(metric='l2'|'ip', dim=None)` | 暴力线性扫描，结果与精确最近邻逐位一致；`add` / `search(query, k)` / `__len__` |
+| `IVFIndex(n_clusters=2, n_probe=1, n_iter=10, metric='l2', dim=None, seed=None)` | 先 k-means 分簇再只扫最近的 `n_probe` 个簇；`train()` 在 `add` 之后调用 |
+| `NSWIndex(m=6, ef_search=16, metric='l2', dim=None)` | **单层**可导航小世界图（贪心束搜索），不是分层 HNSW |
+| `retrieval_recall(truth, got)` | 两个 id 列表的交集比例 |
+
+```python
+import AI, random
+
+rng = random.Random(7)
+vecs = [[rng.uniform(0, 1), rng.uniform(0, 1)] for _ in range(50)]
+
+brute = AI.BruteForceIndex()
+brute.add(vecs)
+
+ivf = AI.IVFIndex(n_clusters=4, n_probe=2, seed=1)
+ivf.add(vecs)
+ivf.train()
+
+nsw = AI.NSWIndex(m=6, ef_search=32)
+nsw.add(vecs)
+
+q = [0.5, 0.5]
+truth = [i for i, _ in brute.search(q, k=5)]
+print(AI.retrieval_recall(truth, [i for i, _ in ivf.search(q, k=5)]))
+print(AI.retrieval_recall(truth, [i for i, _ in nsw.search(q, k=5)]))
+```
+
+诚实边界：
+
+- 距离都用「平方 L2」而非开方（排序等价，省一次 `sqrt`）；`metric='ip'` 时返回的是**负内积**，
+  数值越小代表越相似，接口与 `l2` 统一。
+- `IVFIndex` 的 k-means 是 k-means++ 初始化 + 固定迭代，**没有**训练集/查询集分离，
+  也没有重排（re-rank）；`n_probe` 越大越准、越慢。
+- `NSWIndex` 是**单层**近邻图：插入时连最近的 `m` 个点并双向加边（邻居超限时保留最近的 `m` 个），
+  查询先贪心下降再束搜索。没有分层、没有启发式剪枝，召回率明显低于论文里的 HNSW；
+  在 18 个点/3 簇的构造数据上 recall@5 能到 1.0，但不要把它当生产级 ANN。
+- 三个索引都只支持「先批量 `add` 再查」，没有删除、没有持久化、没有多线程。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2500,7 +2542,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1600 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1609 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2707,6 +2749,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDeepFMAndDIN` | DeepFM 的 logit 重算与二阶项闭式、六处中心差分、DIN 的注意力归一与 mask、参数/输入梯度、训练与校验 |
 | `TestStyleTransfer` | Gram 闭式与二次齐次、提取器形状与参数量、`dL/dx` 对中心差分、风格迁移损失下降与 clamp、单步更新等于 `-lr*dL/dx`、9 处参数校验 |
 | `TestSuperResolutionDenoising` | 双线性形状与常量保持、噪声可复现与 `sigma=0`、SRCNN 参数量与两层权重中心差分、`fit` 降损、DnCNN 的 `denoise = 输入 − 噪声`、卷积权重中心差分、600 轮后重建误差小于带噪误差、13 处参数校验 |
+| `TestVectorRetrieval` | 暴力与手工扫描逐位一致、`ip` 度量与显式 id、k-means 三簇划分纯度、IVF 全探测等于暴力/单探测仍命中本簇、NSW recall@5 ≥ 0.8、`retrieval_recall` 取值、9 处参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2760,7 +2803,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1600 个单元测试
+├── test_ai.py       # 1609 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

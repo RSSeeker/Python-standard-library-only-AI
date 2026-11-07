@@ -569,7 +569,10 @@
   - `DnCNN`：预测噪声残差，`denoise = 输入 − 预测`；训练目标 `noisy − clean`
   - **未做 SRGAN**（需要对抗训练 + 感知损失，本库没有 VGG 特征）；探针 33 项
   - `gram_matrix` / `FeatureExtractor` / `style_transfer`：Gram 梯度沿「特征图 -> 逐层反传」回到像素，单步更新与 `-lr*dL/dx` 对齐；特征栈是随机初始化后固定的小卷积，不是 VGG 预训练权重
-- [ ] 检索：Faiss 式暴力 + HNSW（简化）/ IVF（概念）
+- [x] 检索：Faiss 式暴力 + 单层 NSW（HNSW 的简化）/ IVF
+  - `BruteForceIndex`（`l2` / `ip` 两种度量，结果与精确扫描逐位一致）
+  - `IVFIndex`（k-means++ 初始化 + 只在最近 `n_probe` 个簇内扫描，全探测时与暴力完全一致）
+  - `NSWIndex`：**单层**近邻图 + 贪心束搜索，不是分层 HNSW（没有层级/启发式剪枝），构造数据上 recall@5 到 1.0；探针 32 项
 - [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
 
 ### W18 测试与数值稳定性（§15，贯穿各波）
