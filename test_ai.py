@@ -26661,3 +26661,111 @@ class TestLotteryTicket:
         assert info["count_a"] == 10
         assert info["count_b"] == 20
         assert abs(info["ratio"] - 0.5) < 1e-12
+
+
+class TestMixtureOfDepths:
+    """W20-C：MoD 路由与 Early Exit"""
+
+    def test_route_capacity_and_order(self):
+        route = AI.mix_of_depths_route([0.1, 0.9, 0.3, 0.8, 0.2], 0.4)
+        assert route["capacity"] == 2
+        assert route["kept"] == [1, 3]
+        assert route["mask"] == [False, True, False, True, False]
+        tiny = AI.mix_of_depths_route([1.0, 2.0, 3.0], 0.01)
+        assert tiny["capacity"] == 1
+        assert tiny["kept"] == [2]
+        tie = AI.mix_of_depths_route([1.0, 1.0, 1.0], 0.4)
+        assert tie["kept"] == [0, 1]
+
+    def test_route_weights_normalized_within_selected(self):
+        route = AI.mix_of_depths_route([0.1, 0.9, 0.3, 0.8, 0.2], 0.4)
+        probs = AI._softmax_row([0.1, 0.9, 0.3, 0.8, 0.2])
+        denom = probs[1] + probs[3]
+        assert abs(route["weights"][1] - probs[1] / denom) <= 1e-12
+        assert route["weights"][0] == 0.0
+        assert abs(sum(route["weights"]) - 1.0) <= 1e-12
+        assert abs(route["dropped_mass"] - (1.0 - denom)) <= 1e-12
+        full = AI.mix_of_depths_route([0.5, 0.5], 1.0)
+        assert full["mask"] == [True, True]
+        assert full["dropped_mass"] == 0.0
+
+    def test_apply_mod_block_passthrough(self):
+        residual = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+        block = [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]
+        out = AI.apply_mod_block(residual, block, [True, False, False])
+        assert out[0] == [11.0, 22.0]
+        assert out[1] == [3.0, 4.0]
+        assert residual[0] == [1.0, 2.0]
+        out[1][0] = 999.0
+        assert residual[1][0] == 3.0
+
+    def test_early_exit_picks_first_confident_layer(self):
+        layer1 = [[0.6, 0.4], [0.55, 0.45]]
+        layer2 = [[0.95, 0.05], [0.52, 0.48]]
+        layer3 = [[0.99, 0.01], [0.51, 0.49]]
+        result = AI.early_exit([layer1, layer2, layer3], 0.9)
+        assert result["predictions"] == [0, 0]
+        assert result["exit_layer"] == [1, 2]
+        assert all(abs(a - b) <= 1e-12 for a, b in
+                   zip(result["confidence"], [0.95, 0.51]))
+        none_confident = AI.early_exit([layer1, layer2], 0.999)
+        assert none_confident["exit_layer"] == [1, 1]
+        first = AI.early_exit([[[0.91, 0.09]], [[0.5, 0.5]]], 0.9)
+        assert first["exit_layer"] == [0]
+
+    def test_early_exit_savings(self):
+        info = AI.early_exit_savings([0, 1, 2, 3], 4)
+        assert abs(info["mean_depth"] - 2.5) <= 1e-12
+        assert abs(info["relative_depth"] - 0.625) <= 1e-12
+        assert abs(info["savings"] - 0.375) <= 1e-12
+        assert info["n_layers"] == 4
+        assert abs(AI.early_exit_savings([3, 3], 4)["savings"]) <= 1e-12
+        assert abs(AI.early_exit_savings([0, 0], 4)["savings"] - 0.75) <= 1e-12
+
+    def test_route_rejects_bad_scores(self):
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([], 0.5)
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([True, 0.2], 0.5)
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([float("nan"), 0.2], 0.5)
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([float("inf")], 0.5)
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([0.1], 0.0)
+        with pytest.raises(ValueError):
+            AI.mix_of_depths_route([0.1], 1.5)
+
+    def test_apply_mod_block_rejects_shapes(self):
+        with pytest.raises(ValueError):
+            AI.apply_mod_block([], [], [])
+        with pytest.raises(ValueError):
+            AI.apply_mod_block([[1.0]], [], [True])
+        with pytest.raises(ValueError):
+            AI.apply_mod_block([[1.0]], [[2.0]], [True, False])
+        with pytest.raises(ValueError):
+            AI.apply_mod_block([[1.0]], [[2.0, 3.0]], [True])
+        with pytest.raises(ValueError):
+            AI.apply_mod_block([[1.0]], [[2.0]], [1])
+
+    def test_early_exit_rejects_bad_input(self):
+        with pytest.raises(ValueError):
+            AI.early_exit([], 0.9)
+        with pytest.raises(ValueError):
+            AI.early_exit([[[0.5, 0.5]]], 0.0)
+        with pytest.raises(ValueError):
+            AI.early_exit([[[0.5, 0.5]]], 1.5)
+        with pytest.raises(ValueError):
+            AI.early_exit([[[0.5, 0.6]]], 0.9)
+        with pytest.raises(ValueError):
+            AI.early_exit([[[0.5, 0.5]], [[0.5, 0.5], [0.5, 0.5]]], 0.9)
+
+    def test_savings_rejects_bad_input(self):
+        with pytest.raises(ValueError):
+            AI.early_exit_savings([0], 0)
+        with pytest.raises(ValueError):
+            AI.early_exit_savings([4], 4)
+        with pytest.raises(ValueError):
+            AI.early_exit_savings([True], 4)
+        with pytest.raises(ValueError):
+            AI.early_exit_savings([], 4)

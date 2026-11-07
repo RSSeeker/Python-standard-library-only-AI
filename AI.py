@@ -30909,6 +30909,144 @@ def _w18b_user_why():
 
 
 # ============================================================================
+#  研究前沿 W20-C：Mixture-of-Depths 路由与 Early Exit
+# ============================================================================
+
+def _w20c_numbers(values, what):
+    if not isinstance(values, list) or not values:
+        raise ValueError("%s 必须是非空列表" % what)
+    out = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("%s 里必须是数字" % what)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("%s 里不能有 NaN/inf" % what)
+        out.append(float(value))
+    return out
+
+
+def _w20c_ratio(value, what, allow_one=True):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s 必须是数字" % what)
+    number = float(value)
+    upper_ok = number <= 1.0 if allow_one else number < 1.0
+    if not 0.0 < number or not upper_ok:
+        raise ValueError("%s 必须在 (0, %s] 之间" % (what, "1" if allow_one else "1)"))
+    return number
+
+
+def mix_of_depths_route(scores, capacity_ratio=0.5):
+    """MoD 路由：按分数取前 `capacity` 个 token 过这个块，其余走残差直通。
+
+    - `scores`：每个 token 一个路由分数（logit 或概率都可，只用来排序）；
+    - `capacity = max(1, ceil(n * capacity_ratio))`；
+    - 返回 `{"mask", "capacity", "weights", "kept", "dropped_mass"}`，
+      其中 `weights` 是**在入选 token 内**归一化的 softmax（和为 1，未入选为 0），
+      `dropped_mass` 是没入选 token 的概率质量（诊断用，越小说明容量越够）。
+    """
+    values = _w20c_numbers(scores, "mix_of_depths_route.scores")
+    ratio = _w20c_ratio(capacity_ratio, "capacity_ratio")
+    count = len(values)
+    capacity = max(1, int(math.ceil(count * ratio)))
+    capacity = min(count, capacity)
+    order = sorted(range(count), key=lambda i: (-values[i], i))
+    chosen = set(order[:capacity])
+    mask = [i in chosen for i in range(count)]
+    peak = max(values)
+    exps = [math.exp(value - peak) for value in values]
+    total = sum(exps)
+    probs = [value / total for value in exps]
+    kept_denom = sum(probs[i] for i in chosen)
+    weights = [(probs[i] / kept_denom) if i in chosen else 0.0 for i in range(count)]
+    dropped = sum(probs[i] for i in range(count) if i not in chosen)
+    return {"mask": mask, "capacity": capacity, "weights": weights,
+            "kept": sorted(chosen), "dropped_mass": dropped}
+
+
+def apply_mod_block(residual, block_output, mask):
+    """按 MoD 掩码把块输出写回残差：入选 token 加 `block_output`，其余原样透传。"""
+    if not isinstance(residual, list) or not residual:
+        raise ValueError("apply_mod_block.residual 必须是非空列表")
+    if not isinstance(block_output, list) or len(block_output) != len(residual):
+        raise ValueError("apply_mod_block: block_output 与 residual 长度不一致")
+    if not isinstance(mask, list) or len(mask) != len(residual):
+        raise ValueError("apply_mod_block: mask 长度与 token 数不一致")
+    out = []
+    for index, row in enumerate(residual):
+        if not isinstance(row, list):
+            raise ValueError("apply_mod_block: residual 每行必须是列表")
+        if not isinstance(mask[index], bool):
+            # 注意用 isinstance 而不是 in (True, False)：
+            # Python 里 1 == True，后者会放过整数 1。
+            raise ValueError("apply_mod_block: mask 必须是布尔值")
+        if mask[index]:
+            block_row = block_output[index]
+            if not isinstance(block_row, list) or len(block_row) != len(row):
+                raise ValueError("apply_mod_block: 第 %d 行的块输出宽度不一致" % index)
+            out.append([row[j] + block_row[j] for j in range(len(row))])
+        else:
+            out.append(list(row))
+    return out
+
+
+def early_exit(layer_probs, threshold=0.9):
+    """早退：逐样本看第一个「最大类概率 >= threshold」的层，没有就用最后一层。
+
+    `layer_probs` 形如 `[层][样本][类别]`，每层样本数必须相同、每行概率和为 1（容差 1e-6）。
+    返回 `{"predictions", "exit_layer", "confidence"}`，`exit_layer` 是 0 起的层号。
+    """
+    if not isinstance(layer_probs, list) or not layer_probs:
+        raise ValueError("early_exit: 需要至少一层的概率")
+    limit = _w20c_ratio(threshold, "threshold")
+    n_samples = len(layer_probs[0])
+    if n_samples == 0:
+        raise ValueError("early_exit: 每层至少一个样本")
+    for index, layer in enumerate(layer_probs):
+        if not isinstance(layer, list) or len(layer) != n_samples:
+            raise ValueError("early_exit: 第 %d 层样本数与第一层不一致" % index)
+        for row in layer:
+            values = _w20c_numbers(row, "early_exit.layer_probs")
+            if abs(sum(values) - 1.0) > 1e-6:
+                raise ValueError("early_exit: 第 %d 层有概率和不为 1 的行" % index)
+    predictions = []
+    exits = []
+    confidences = []
+    for sample in range(n_samples):
+        exit_at = len(layer_probs) - 1
+        for index, layer in enumerate(layer_probs):
+            row = layer[sample]
+            if max(row) >= limit:
+                exit_at = index
+                break
+        row = layer_probs[exit_at][sample]
+        best = max(range(len(row)), key=lambda c: (row[c], -c))
+        predictions.append(best)
+        exits.append(exit_at)
+        confidences.append(row[best])
+    return {"predictions": predictions, "exit_layer": exits, "confidence": confidences}
+
+
+def early_exit_savings(exit_layers, n_layers):
+    """按早退层号算平均深度与相对全深的计算节省比例。"""
+    if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers < 1:
+        raise ValueError("n_layers 必须是 >= 1 的整数")
+    if not isinstance(exit_layers, list) or not exit_layers:
+        raise ValueError("exit_layers 必须是非空列表")
+    depths = []
+    for value in exit_layers:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("exit_layers 里必须是整数层号")
+        if not 0 <= value < n_layers:
+            raise ValueError("层号 %r 超出 [0, %d)" % (value, n_layers))
+        depths.append(value + 1)
+    mean_depth = sum(depths) / len(depths)
+    full = n_layers * len(depths)
+    return {"mean_depth": mean_depth,
+            "relative_depth": mean_depth / n_layers,
+            "savings": 1.0 - (sum(depths) / full),
+            "n_layers": n_layers}
+
+# ============================================================================
 #  研究前沿 W20-B：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
 # ============================================================================
 

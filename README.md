@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1746 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1755 项）
 
 ## 特性
 
@@ -2390,6 +2390,31 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### MoD 路由与早退（W20-C：动态计算分配）
+
+| API | 语义 |
+|-----|------|
+| `mix_of_depths_route(scores, capacity_ratio=0.5)` | 按分数取 `ceil(n·ratio)` 个 token 过块，返回掩码、入选下标、入选内归一化权重、`dropped_mass` |
+| `apply_mod_block(residual, block_output, mask)` | 入选 token 加块输出，其余残差直通（返回新列表，不改入参） |
+| `early_exit(layer_probs, threshold=0.9)` | 逐样本取第一个「最大类概率 ≥ 阈值」的层，否则最后一层 |
+| `early_exit_savings(exit_layers, n_layers)` | 平均深度、相对深度、计算节省比例 |
+
+```python
+route = mix_of_depths_route([0.1, 0.9, 0.3, 0.8, 0.2], 0.4)   # capacity=2
+out = apply_mod_block(residual, block_out, route["mask"])
+early = early_exit([layer1_probs, layer2_probs, layer3_probs], 0.9)
+print(early["exit_layer"], early_exit_savings(early["exit_layer"], 3)["savings"])
+```
+
+四点说明：
+
+- MoD 的容量是 `max(1, ceil(n·ratio))`，所以 `ratio` 再小也至少过 1 个 token；
+- 排序同分时按 token 下标取小者，保证结果与输入顺序一致、可复现；
+- `weights` 只在**入选 token 内**归一化（和为 1），`dropped_mass` 是没入选的概率质量，
+  用来判断「容量是不是卡掉了很多本该走这条路的 token」；
+- `early_exit` 只做决策，不做前向——它接受「每层每个样本的类别概率」，
+  所以能配任何分层的模型；概率和必须为 1（容差 1e-6），不做静默重新归一化。
+
 ### 彩票假说（W20-B：迭代幅度剪枝 + 掩码内重初始化）
 
 | API | 语义 |
@@ -2954,7 +2979,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1746 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1755 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3175,6 +3200,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
+| `TestMixtureOfDepths` | MoD 容量/排序/权重归一、块输出透传、早退三分支、savings、参数校验 |
 | `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
 | `TestPrivacyAndMembership` | 全局裁剪的范数与比例、加噪的 σ·C 口径与同种子复现、隐私记账的闭式值/单调性/越界、逐样本损失（回归平方误差、分类交叉熵）、成员推断的完美分离/完全反向/无信号三种 AUC、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
@@ -3230,7 +3256,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1746 个单元测试
+├── test_ai.py       # 1755 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

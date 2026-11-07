@@ -643,7 +643,12 @@
   - lottery_ticket 的 keep_ratio 是乘性收缩（0.8 后 0.64），不是每轮重新挑
   - 真 bug：早期用「全量重算掩码再取交集」，零权重参与排序，第二轮比例卡住不动
 
-- [ ] Mixture-of-Depths / Early Exit
+- [x] Mixture-of-Depths / Early Exit
+  - `mix_of_depths_route` 容量 `ceil(n·ratio)`、同分按下标、权重在入选内归一
+  - `apply_mod_block` 入选相加 / 未入选透传，返回新列表不改入参
+  - `early_exit` 逐样本首达阈值即退，否则最后一层；概率和必须为 1，不静默归一
+  - `early_exit_savings` 给平均深度与相对节省；布尔校验用 `isinstance(bool)`
+    （`x in (True, False)` 会放过整数 1，这是本批抓到的真 bug）
 - [ ] 神经符号（规则约束的候选过滤）
 - [ ] 文档化：NTK / 双下降 / grokking 作为「已知边界」
 
