@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1421 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1431 项）
 
 ## 特性
 
@@ -1552,6 +1552,35 @@ print(embedding_visualize(X, labels=y, method="tsne")["ascii"])
 - 二值掩码只有 `2^m` 种，`n_samples` 会被它截断（否则去重采样会死循环）——这是实现里的一处真 bug，已修并加了回归测试。
 - 模型输出多于 1 维时按 softmax 的类别概率当分数，`class_index=None` 锁到 argmax；单输出（回归）模型直接用输出值，且不接受 `class_index`。
 
+### 解释工具扩展（W14-F）
+
+| 函数 | 说明 |
+|---|---|
+| `tcav(model, layer_index, concept, random_set, class_set, class_index=None)` | 概念激活向量（CAV = 概念均值 − 参照均值后归一化），再统计 `dScore/dA · CAV` 为正的比例 |
+| `activation_maximization(model, layer_index, unit=0, steps=50, lr=0.1, l2=1e-3, seed=None, image_shape=None)` | 梯度上升放大第 `layer_index` 层第 `unit` 个单元的响应，返回输入、最终激活与逐步历史 |
+| `network_dissection(model, layer_index, data, labels, activation_threshold=0.0, top_k=2)` | 每个单元对各类别的平均激活、偏好类别、选择性与激活率，并归类 `never` / `always` / `class-selective` / `mixed` |
+| `prototype_examples(model, layer_index, data, labels=None, k=1)` | 每个类别「激活均值最近」的 k 个样本下标 |
+| `counterfactual_example(model, x, class_index=None, steps=100, lr=0.05, l2=1e-3)` | 把预测改成目标类（默认取概率第二高的类）的最小扰动样本 |
+| `influence_scores(model, x, y, train_x, train_y)` | 一阶梯度余弦影响 `-<∇L(x), ∇L(z_i)>`，正数表示该训练样本有帮助 |
+
+```python
+from AI import MLP, tcav, network_dissection, counterfactual_example
+
+net = MLP([8, 16, 3], activations=['relu', 'linear'])
+cav = tcav(net, 1, concept_samples, random_samples, class_samples, class_index=0)
+print(cav['tcav'], cav['cav'][:4])
+
+dissect = network_dissection(net, 1, data, labels, top_k=2)
+print([u['kind'] for u in dissect['units']])
+
+cf = counterfactual_example(net, data[0], class_index=1)
+print(cf['target'], cf['distance'])
+```
+
+- `tcav` / `network_dissection` / `prototype_examples` 只需要前向（或只回传到目标层），可用于卷积容器；`activation_maximization` / `counterfactual_example` / `influence_scores` 要回传到输入或参数，**只支持由 `Layer` 组成的 MLP**，卷积模型请用 `cam_heatmap`。
+- `counterfactual_example` 用「目标类 one-hot 减原类 one-hot」的单次回传做梯度下降，不是 CEM 的对比解释，也没有 line search；距离由 `l2` 约束，不保证最小。
+- `influence_scores` 是一阶梯度余弦，不是「留一重训」的精确影响；只在 MSE、单输出、MLP 上有定义。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1968,7 +1997,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1421 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1431 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2155,6 +2184,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPermutationFeatureMaps` | 置换重要性的基准/常数特征/重要特征/单次重复 std=0/种子复现/自定义 metric/参数校验；特征图 ASCII 的表头、峰值字符、通道选择、下采样宽度、常量与负值、六处非法输入 |
 | `TestCAM` | GradCAM 通道权重闭式解、热图 = 归一化激活、换类别翻转权重、默认类 = argmax、GradCAM++ 与 LayerCAM 对照、relu=False 的混合符号、ScoreCAM 权重和为 1 与 `n_masks`、8 处非法输入 |
 | `TestShapLimeAnchors` | KernelSHAP 线性可加闭式解与效率公理、背景均值与特征名、`n_samples > 2^m` 不死循环；LIME 的排序与符号；Anchors 单特征精度/覆盖率与不可达阈值报错；ASCII 散点与 t-SNE/PCA 嵌入；10 处非法输入 |
+| `TestExplanationExtras` | TCAV、激活最大化、网络解剖、原型、反事实、影响分数的行为与参数校验（10 例） |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2208,7 +2238,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1421 个单元测试
+├── test_ai.py       # 1431 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

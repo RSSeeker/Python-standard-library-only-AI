@@ -472,7 +472,11 @@
   - 已实现：`kernel_shap` / `lime_explain` / `anchor_rule` / `scatter_ascii` / `embedding_visualize`（复用 `TSNE` / `PCA`）
   - 真 bug：二值掩码只有 `2^m` 种，`n_samples` 未截断时「随机抽 + 去重」循环永不结束（探针直接挂死）；已截断并加回归测试
   - 探针 49 项；三者都标注为简化实现（非 TreeSHAP、不建模特征相关性、Anchors 无 beam search）
-- [ ] TCAV；Activation Maximization / Network Dissection；Counterfactual / CEM；Prototypes / Influence（简化）
+- [x] TCAV；Activation Maximization / Network Dissection；Counterfactual / CEM；Prototypes / Influence（简化）
+  - `tcav`：CAV = 概念均值 − 参照均值归一化，敏感度取 `dScore/dA · CAV` 的符号比例；
+  - `activation_maximization` / `network_dissection` / `prototype_examples`；
+  - `counterfactual_example`（目标类 one-hot 减原类 one-hot 的单次回传，非 CEM）与 `influence_scores`（一阶梯度余弦，非留一重训）；
+  - 回传到输入的三件只支持 `Layer` 组成的 MLP，卷积请用 `cam_heatmap`（已在 README 写明）。
 
 ### W15 推理与部署（§11）
 - [ ] 结构化剪枝：通道 / 头 / 层（现有 `prune_magnitude` 是非结构化）

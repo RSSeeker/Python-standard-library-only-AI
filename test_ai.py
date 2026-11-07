@@ -21846,3 +21846,129 @@ class TestShapLimeAnchors:
             AI.embedding_visualize([[1.0, 2.0], [1.0]])
         with pytest.raises(ValueError):
             AI.embedding_visualize([[1.0, 2.0]], method="umap")
+
+
+class TestExplanationExtras:
+    """W14-F：TCAV / 激活最大化 / 网络解剖 / 原型 / 反事实 / 影响分数。"""
+
+    @staticmethod
+    def _identity_net():
+        net = AI.MLP([2, 2, 2], activations=["linear", "linear"])
+        net.layers[0].weights = [[1.0, 0.0], [0.0, 1.0]]
+        net.layers[0].biases = [0.0, 0.0]
+        net.layers[1].weights = [[1.0, 0.0], [0.0, 1.0]]
+        net.layers[1].biases = [0.0, 0.0]
+        return net
+
+    def test_tcav_identity_points_to_concept_axis(self):
+        net = self._identity_net()
+        res = AI.tcav(net, 0, [[5.0, 0.0], [6.0, 0.0]],
+                      [[0.0, 0.0], [0.2, 0.0]], [[4.0, 0.0], [3.0, 0.0]],
+                      class_index=0)
+        assert abs(sum(v * v for v in res["cav"]) - 1.0) < 1e-12
+        assert res["cav"][0] > 0.99
+        assert abs(res["cav"][1]) < 1e-9
+        assert res["tcav"] == 1.0
+        assert res["n"] == 2
+        assert abs(res["sensitivity"][0] - 1.0) < 1e-12
+
+    def test_tcav_zero_difference_raises(self):
+        net = self._identity_net()
+        with pytest.raises(ValueError):
+            AI.tcav(net, 0, [[1.0, 1.0]], [[1.0, 1.0]], [[1.0, 0.0]])
+
+    def test_activation_maximization_monotone(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        res = AI.activation_maximization(net, 0, unit=0, steps=15, lr=0.1,
+                                         l2=1e-4, seed=7)
+        hist = res["history"]
+        assert len(hist) == 15
+        for i in range(len(hist) - 1):
+            assert hist[i] <= hist[i + 1] + 1e-12
+        assert hist[-1] > hist[0]
+        # activation 是最后一次更新后再前向一次的值，故 >= 历史末项
+        assert res["activation"] >= hist[-1] - 1e-12
+
+    def test_activation_maximization_validation(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        with pytest.raises(ValueError):
+            AI.activation_maximization(net, 0, steps=0)
+        with pytest.raises(ValueError):
+            AI.activation_maximization(net, 0, lr=0.0)
+        with pytest.raises(ValueError):
+            AI.activation_maximization(net, 0, unit=99)
+        seq = AI.Sequential([AI.Conv2d(1, 1, 3), AI.Flatten(),
+                             AI.Layer(9, 2, activation="linear")])
+        with pytest.raises(ValueError):
+            AI.activation_maximization(seq, 0, steps=1)
+
+    def test_network_dissection_shapes(self):
+        net = self._identity_net()
+        data = [[5.0, 0.0], [6.0, 0.0], [0.0, 5.0], [0.0, 6.0]]
+        res = AI.network_dissection(net, 0, data, [0, 0, 1, 1], top_k=2)
+        assert len(res["units"]) == 2
+        assert sorted(res["labels"]) == [0, 1]
+        for unit in res["units"]:
+            assert len(unit["mean_by_label"]) == len(res["labels"])
+            assert len(unit["preferred"]) <= 2
+            assert unit["kind"] in ("never", "always", "class-selective", "mixed")
+            assert 0.0 <= unit["activation_rate"] <= 1.0
+        # 第 0 个单元只看 x0：类别 0 均值高于类别 1
+        unit0 = res["units"][0]
+        i0 = res["labels"].index(0)
+        i1 = res["labels"].index(1)
+        assert unit0["mean_by_label"][i0] > unit0["mean_by_label"][i1]
+
+    def test_network_dissection_validation(self):
+        net = self._identity_net()
+        with pytest.raises(ValueError):
+            AI.network_dissection(net, 0, [[1.0, 2.0]], [0, 1])
+        with pytest.raises(ValueError):
+            AI.network_dissection(net, 0, [[1.0, 2.0]], [0], top_k=0)
+
+    def test_prototype_examples_pick_within_class(self):
+        net = self._identity_net()
+        data = [[1.0, 0.0], [1.1, 0.0], [0.0, 1.0], [0.0, 1.1]]
+        res = AI.prototype_examples(net, 0, data, [0, 0, 1, 1], k=2)
+        assert sorted(res.keys()) == [0, 1]
+        assert sorted(res[0]) == [0, 1]
+        assert sorted(res[1]) == [2, 3]
+        with pytest.raises(ValueError):
+            AI.prototype_examples(net, 0, data, [0], k=1)
+
+    def test_counterfactual_changes_prediction(self):
+        net = AI.MLP([2, 2, 2], activations=["linear", "linear"])
+        x = [1.0, 0.0]
+        before = net.forward(x)
+        start = 0 if before[0] >= before[1] else 1
+        res = AI.counterfactual_example(net, x, steps=60, lr=0.2, l2=1e-3)
+        assert res["target"] != start
+        after = net.forward(res["input"])
+        assert (0 if after[0] >= after[1] else 1) == res["target"]
+        assert res["score_after"] < res["score_before"]
+        assert 0.0 <= res["distance"] < 1e3
+
+    def test_counterfactual_validation(self):
+        reg = AI.MLP([2, 1], activations=["linear"])
+        with pytest.raises(ValueError):
+            AI.counterfactual_example(reg, [1.0, 0.0])
+        net = AI.MLP([2, 2, 2], activations=["linear", "linear"])
+        with pytest.raises(ValueError):
+            AI.counterfactual_example(net, [1.0, 0.0], class_index=9)
+
+    def test_influence_scores_sign(self):
+        net = AI.MLP([2, 1], activations=["linear"])
+        net.layers[0].weights = [[1.0, -1.0]]
+        net.layers[0].biases = [0.0]
+        scores = AI.influence_scores(net, [2.0, 0.0], 2.0,
+                                     [[2.0, 0.0], [-2.0, 0.0]], [2.0, -2.0])
+        assert len(scores) == 2
+        assert scores[0] > -1e-9
+        assert scores[1] < 1e-9
+        for s in scores:
+            assert -1.0000001 <= s <= 1.0000001
+        with pytest.raises(ValueError):
+            AI.influence_scores(net, [1.0, 0.0], 1.0, [[1.0, 0.0]], [1.0, 2.0])
+        seq = AI.Sequential([AI.Layer(2, 1, activation="linear")])
+        with pytest.raises(ValueError):
+            AI.influence_scores(seq, [1.0, 0.0], 1.0, [[1.0, 0.0]], [1.0])

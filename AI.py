@@ -28716,6 +28716,481 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响（W14-F）
+# ============================================================================
+
+def _w14f_modules(model):
+    mods = getattr(model, "modules", None)
+    if mods is None:
+        mods = getattr(model, "layers", None)
+    if mods is None:
+        raise ValueError(
+            f"_w14f_modules: {type(model).__name__} 既没有 modules 也没有 layers"
+        )
+    mods = list(mods)
+    if not mods:
+        raise ValueError("_w14f_modules: 容器里没有模块")
+    return mods
+
+
+def _w14f_net(model):
+    return getattr(model, "model", model)
+
+
+def _w14f_flat(value):
+    """把数字/一维/二维/三维结构摊平成一维浮点列表。"""
+    out = []
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, (list, tuple)):
+            for v in reversed(item):
+                stack.append(v)
+        else:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError(f"_w14f_flat: 需要数字，收到 {item!r}")
+            out.append(float(item))
+    return out
+
+
+def _w14f_layer_acts(model, layer_index, rows):
+    """取第 layer_index 层在每行输入上的输出（摊平）。"""
+    mods = _w14f_modules(model)
+    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
+        raise ValueError(f"layer_index 必须是整数，收到 {layer_index!r}")
+    if not (0 <= layer_index < len(mods)):
+        raise ValueError(
+            f"layer_index={layer_index} 超出范围 [0, {len(mods)})"
+        )
+    out = []
+    for row in rows:
+        a = list(row)
+        for i, m in enumerate(mods):
+            a = m.forward(a)
+            if i == layer_index:
+                break
+        out.append(_w14f_flat(a))
+    return out
+
+
+def _w14f_check_rows(rows, who):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"{who}: 需要非空的样本列表")
+    width = None
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 个样本必须是非空列表")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 第 {i} 个样本含非数字 {v!r}")
+            vals.append(float(v))
+        if width is None:
+            width = len(vals)
+        elif len(vals) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 个样本宽度 {len(vals)} 与 {width} 不一致"
+            )
+        out.append(vals)
+    return out
+
+
+def _w14f_out(net, row):
+    out = net.forward(list(row))
+    if not isinstance(out, (list, tuple)) or not out:
+        raise ValueError(
+            f"_w14f_out: 模型输出必须是长度 > 0 的列表，收到 {type(out).__name__}"
+        )
+    return _w14f_flat(out)
+
+
+def _w14f_argmax(values):
+    best = 0
+    for i in range(1, len(values)):
+        if values[i] > values[best]:
+            best = i
+    return best
+
+
+def _w14f_grad_at_layer(model, layer_index, row, class_index=None):
+    """返回 dScore/dLayerOutput（摊平）。"""
+    mods = _w14f_modules(model)
+    acts, grads, _cls = _cam_grad_output(model, mods, list(row), layer_index,
+                                        class_index)
+    return _w14f_flat(acts), _w14f_flat(grads)
+
+
+def _w14f_layer_only(mods, upto, who):
+    """梯度回传到输入需要每层都是 Layer（激活是逐元素函数）。"""
+    for i, m in enumerate(mods[:upto + 1]):
+        if not hasattr(m, "fan_in") or not hasattr(m, "fan_out"):
+            raise ValueError(
+                f"{who}: 第 {i} 层是 {type(m).__name__}，"
+                f"本函数只支持由 Layer 组成的网络（卷积请用 cam_heatmap）"
+            )
+
+
+def _w14f_grad_to_input(model, layer_index, delta_at_layer, row):
+    """从第 layer_index 层的梯度回传到输入。"""
+    mods = _w14f_modules(model)
+    _w14f_layer_only(mods, layer_index, "_w14f_grad_to_input")
+    delta = list(delta_at_layer)
+    for m in reversed(mods[:layer_index + 1]):
+        result = m.backward(delta)
+        if result is None:
+            continue
+        delta = (result[getattr(m, "delta_index", -1)]
+                 if isinstance(result, tuple) else result)
+    return delta
+
+
+def _w14f_unit_delta(acts, unit):
+    """在第 layer_index 层输出上构造「只抬升第 unit 个元素」的梯度。"""
+    if not isinstance(unit, int) or isinstance(unit, bool):
+        raise ValueError(f"unit 必须是整数，收到 {unit!r}")
+    if not (0 <= unit < len(acts)):
+        raise ValueError(f"unit={unit} 超出该层输出长度 {len(acts)}")
+    delta = [0.0] * len(acts)
+    delta[unit] = 1.0
+    return delta
+
+
+def tcav(model, layer_index, concept, random_set, class_set, class_index=None):
+    """TCAV：用概念样本与参照样本的激活差做 CAV，再统计类别敏感度符号比例。
+
+    返回 ``{"cav", "tcav", "sensitivity", "n"}``：``cav`` 是归一化后的概念方向，
+    ``sensitivity_i = <dScore/dA, cav>``，``tcav`` 是其中为正的比例。
+    """
+    concept_rows = _w14f_check_rows(concept, "tcav: concept")
+    random_rows = _w14f_check_rows(random_set, "tcav: random_set")
+    class_rows = _w14f_check_rows(class_set, "tcav: class_set")
+    if not class_rows:
+        raise ValueError("tcav: class_set 不能为空")
+    if len(concept_rows) < 1 or len(random_rows) < 1:
+        raise ValueError("tcav: concept 与 random_set 都不能为空")
+    concept_acts = _w14f_layer_acts(model, layer_index, concept_rows)
+    random_acts = _w14f_layer_acts(model, layer_index, random_rows)
+    dim = len(concept_acts[0])
+    if len(random_acts[0]) != dim:
+        raise ValueError("tcav: concept 与 random_set 的激活维度不一致")
+    cav = [0.0] * dim
+    for acts in concept_acts:
+        for j in range(dim):
+            cav[j] += acts[j] / len(concept_acts)
+    for acts in random_acts:
+        for j in range(dim):
+            cav[j] -= acts[j] / len(random_acts)
+    norm = math.sqrt(sum(v * v for v in cav))
+    if norm <= 0.0:
+        raise ValueError(
+            "tcav: 概念样本与参照样本的平均激活完全相同，CAV 方向无定义"
+        )
+    cav = [v / norm for v in cav]
+
+    sensitivities = []
+    for row in class_rows:
+        _acts, grad = _w14f_grad_at_layer(model, layer_index, row, class_index)
+        if len(grad) != dim:
+            raise ValueError(
+                f"tcav: 第 {layer_index} 层的梯度维度 {len(grad)} 与激活 {dim} 不一致"
+            )
+        sensitivities.append(sum(a * b for a, b in zip(grad, cav)))
+    positive = sum(1 for s in sensitivities if s > 0.0)
+    return {
+        "cav": cav,
+        "tcav": positive / float(len(sensitivities)),
+        "sensitivity": sensitivities,
+        "n": len(sensitivities),
+    }
+
+
+def activation_maximization(model, layer_index, unit=0, steps=50, lr=0.1,
+                            l2=1e-3, seed=None, image_shape=None):
+    """激活最大化：梯度上升让第 ``layer_index`` 层的第 ``unit`` 个单元响应最大。
+
+    只支持由 ``Layer`` 组成的网络（回传到输入需要逐元素激活导数）。返回
+    ``{"input", "activation", "history"}``。
+    """
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError(f"activation_maximization: steps 必须是 >=1 的整数，收到 {steps!r}")
+    if not isinstance(lr, (int, float)) or lr <= 0.0:
+        raise ValueError(f"activation_maximization: lr 必须 > 0，收到 {lr!r}")
+    if not isinstance(l2, (int, float)) or l2 < 0.0:
+        raise ValueError(f"activation_maximization: l2 不能为负，收到 {l2!r}")
+    mods = _w14f_modules(model)
+    if layer_index < 0 or layer_index >= len(mods):
+        raise ValueError(
+            f"activation_maximization: layer_index={layer_index} 超出范围"
+        )
+    _w14f_layer_only(mods, layer_index, "activation_maximization")
+    if image_shape is not None and len(image_shape) == 3 and layer_index == 0 \
+            and hasattr(mods[0], "fan_in"):
+        raise ValueError(
+            "activation_maximization: image_shape 是 (C, H, W) 但第 0 层是 Layer，"
+            "两者形状不匹配"
+        )
+    first = mods[0]
+    if image_shape is not None:
+        if not isinstance(image_shape, (list, tuple)) or len(image_shape) < 1:
+            raise ValueError(
+                "activation_maximization: image_shape 必须是 [n] 或 [C, H, W]"
+            )
+        if len(image_shape) == 1:
+            x = [0.0] * int(image_shape[0])
+        elif len(image_shape) == 3:
+            c, h, w = (int(v) for v in image_shape)
+            x = [[[0.0] * w for _ in range(h)] for _ in range(c)]
+        else:
+            raise ValueError(
+                "activation_maximization: image_shape 只支持 1 维或 (C, H, W)"
+            )
+    else:
+        rows = getattr(first, "weights", None)
+        width = len(rows[0]) if rows else 0
+        if width <= 0:
+            raise ValueError(
+                "activation_maximization: 无法推断输入维度，请显式传 image_shape"
+            )
+        x = [0.0] * width
+    rng = random.Random(seed)
+    x = [(v + rng.gauss(0.0, 0.1)) for v in x]
+    history = []
+    for _step in range(steps):
+        a = list(x)
+        for i, m in enumerate(mods):
+            a = m.forward(a)
+            if i == layer_index:
+                break
+        acts = _w14f_flat(a)
+        delta = _w14f_unit_delta(acts, unit)
+        gx = _w14f_grad_to_input(model, layer_index, delta, x)
+        if len(gx) != len(x):
+            raise ValueError(
+                f"activation_maximization: 输入梯度长度 {len(gx)} 与输入 {len(x)} 不一致"
+            )
+        x = [x[j] + lr * gx[j] - l2 * x[j] for j in range(len(x))]
+        history.append(acts[unit])
+    a = list(x)
+    for i, m in enumerate(mods):
+        a = m.forward(a)
+        if i == layer_index:
+            break
+    return {"input": x, "activation": _w14f_flat(a)[unit], "history": history}
+
+
+def network_dissection(model, layer_index, data, labels, activation_threshold=0.0,
+                       top_k=2):
+    """网络解剖：统计每个单元对各类别标签的平均激活与选择性。
+
+    返回 ``{"units": [...], "labels": [...]}``，每个单元含
+    ``mean_by_label`` / ``preferred`` / ``selectivity`` / ``activation_rate`` /
+    ``kind``（``never`` / ``always`` / ``class-selective`` / ``mixed``）。
+    """
+    rows = _w14f_check_rows(data, "network_dissection: data")
+    if len(rows) != len(labels):
+        raise ValueError(
+            f"network_dissection: data 有 {len(rows)} 行，labels 有 {len(labels)} 个"
+        )
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ValueError(f"network_dissection: top_k 必须是 >=1 的整数，收到 {top_k!r}")
+    acts = _w14f_layer_acts(model, layer_index, rows)
+    dim = len(acts[0])
+    classes = []
+    for v in labels:
+        if v not in classes:
+            classes.append(v)
+    sums = [[0.0] * len(classes) for _ in range(dim)]
+    counts = [0] * len(classes)
+    for acts_row, label in zip(acts, labels):
+        ci = classes.index(label)
+        counts[ci] += 1
+        for j in range(dim):
+            sums[j][ci] += acts_row[j]
+    means = [[s / counts[c] for c, s in enumerate(row)] for row in sums]
+    units = []
+    for j in range(dim):
+        row = means[j]
+        order = sorted(range(len(classes)), key=lambda c: (-row[c], c))
+        top = order[:top_k]
+        best = row[order[0]]
+        second = row[order[1]] if len(order) > 1 else 0.0
+        selectivity = (best - second) / (abs(best) + 1e-9)
+        rate = sum(1 for acts_row in acts
+                   if acts_row[j] > activation_threshold) / float(len(acts))
+        if rate <= 0.0:
+            kind = "never"
+        elif rate >= 1.0:
+            kind = "always"
+        elif selectivity >= 0.3:
+            kind = "class-selective"
+        else:
+            kind = "mixed"
+        units.append({
+            "index": j,
+            "mean_by_label": row,
+            "preferred": [classes[c] for c in top],
+            "selectivity": selectivity,
+            "activation_rate": rate,
+            "kind": kind,
+        })
+    return {"units": units, "labels": classes}
+
+
+def prototype_examples(model, layer_index, data, labels=None, k=1):
+    """原型样本：每个类别激活均值最近（欧氏）的 k 个样本下标。"""
+    rows = _w14f_check_rows(data, "prototype_examples: data")
+    if labels is None:
+        labels = [0] * len(rows)
+    if len(labels) != len(rows):
+        raise ValueError(
+            f"prototype_examples: data 有 {len(rows)} 行，labels 有 {len(labels)} 个"
+        )
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"prototype_examples: k 必须是 >=1 的整数，收到 {k!r}")
+    acts = _w14f_layer_acts(model, layer_index, rows)
+    dim = len(acts[0])
+    classes = []
+    for v in labels:
+        if v not in classes:
+            classes.append(v)
+    out = {}
+    for c in classes:
+        idxs = [i for i, v in enumerate(labels) if v == c]
+        center = [sum(acts[i][j] for i in idxs) / len(idxs) for j in range(dim)]
+        scored = []
+        for i in idxs:
+            d = sum((acts[i][j] - center[j]) ** 2 for j in range(dim))
+            scored.append((d, i))
+        scored.sort()
+        out[c] = [i for _d, i in scored[:k]]
+    return out
+
+
+def counterfactual_example(model, x, class_index=None, steps=100, lr=0.05,
+                           l2=1e-3, seed=None):
+    """反事实样本：梯度下降把预测改到 ``class_index``，同时用 L2 拉住距离。
+
+    ``class_index=None`` 时取当前概率第二高的类。只支持 ``Layer`` 组成的网络
+    （需要回传到输入）。返回 ``{"input", "target", "distance",
+    "score_before", "score_after"}``。
+    """
+    net = _w14f_net(model)
+    xr = _w14f_check_rows([x], "counterfactual_example")[0]
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError(f"counterfactual_example: steps 必须是 >=1 的整数，收到 {steps!r}")
+    if not isinstance(lr, (int, float)) or lr <= 0.0:
+        raise ValueError(f"counterfactual_example: lr 必须 > 0，收到 {lr!r}")
+    if not isinstance(l2, (int, float)) or l2 < 0.0:
+        raise ValueError(f"counterfactual_example: l2 不能为负，收到 {l2!r}")
+    mods = _w14f_modules(model)
+    _w14f_layer_only(mods, len(mods) - 1, "counterfactual_example")
+    out0 = _w14f_out(net, xr)
+    if len(out0) == 1:
+        raise ValueError(
+            "counterfactual_example: 单输出回归模型没有「类别」可换，"
+            "请改用 anchored 回归解释"
+        )
+    current = _w14f_argmax(out0)
+    if class_index is None:
+        candidates = sorted(range(len(out0)),
+                            key=lambda c: (-out0[c], c))
+        target = candidates[1] if len(candidates) > 1 else 0
+    else:
+        if not isinstance(class_index, int) or isinstance(class_index, bool):
+            raise ValueError(
+                f"counterfactual_example: class_index 必须是整数，收到 {class_index!r}"
+            )
+        if not (0 <= class_index < len(out0)):
+            raise ValueError(
+                f"counterfactual_example: class_index={class_index} 超出输出维度 {len(out0)}"
+            )
+        target = class_index
+    if target == current:
+        raise ValueError(
+            "counterfactual_example: 目标类与当前预测相同，没有可解释的反事实"
+        )
+    best = list(xr)
+    best_gap = None
+    z = list(xr)
+    for _step in range(steps):
+        acts, _grad = _w14f_grad_at_layer(model, len(mods) - 1, z, target)
+        delta = _w14f_unit_delta(acts, target)
+        cur = _w14f_unit_delta(acts, current)
+        delta = [delta[i] - cur[i] for i in range(len(delta))]
+        gx = _w14f_grad_to_input(model, len(mods) - 1, delta, z)
+        z = [z[j] + lr * gx[j] - l2 * (z[j] - xr[j]) for j in range(len(z))]
+        out = _w14f_out(net, z)
+        gap = out[current] - out[target]
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best = list(z)
+        if _w14f_argmax(out) == target:
+            best = list(z)
+            break
+    out_after = _w14f_out(net, best)
+    dist = math.sqrt(sum((best[j] - xr[j]) ** 2 for j in range(len(xr))))
+    return {
+        "input": best,
+        "target": target,
+        "distance": dist,
+        "score_before": out0[current] - out0[target],
+        "score_after": out_after[current] - out_after[target],
+    }
+
+
+def influence_scores(model, x, y, train_x, train_y):
+    """一阶 TracIn 影响：``-<∇L(x), ∇L(z_i)>``，正数表示该训练样本有帮助。
+
+    只支持 ``MLP``（用 ``_mlp_backward`` 取参数梯度），损失按 MSE 的
+    ``dL/dpred = 2(pred - y)`` 取。返回与 ``train_x`` 对齐的分数列表。
+    """
+    net = _w14f_net(model)
+    if not hasattr(net, "layers"):
+        raise ValueError(
+            "influence_scores: 只支持 MLP（需要 _mlp_backward 取参数梯度）"
+        )
+    xr = _w14f_check_rows([x], "influence_scores: x")[0]
+    tr = _w14f_check_rows(train_x, "influence_scores: train_x")
+    if len(tr) != len(train_y):
+        raise ValueError(
+            f"influence_scores: train_x 有 {len(tr)} 行，train_y 有 {len(train_y)} 个"
+        )
+
+    def _grad(row, target):
+        pred = net.forward(list(row))
+        pred_v = _w14f_flat(pred)
+        if len(pred_v) != 1:
+            raise ValueError(
+                "influence_scores: 只支持单输出模型（MSE 标量损失）"
+            )
+        dloss = [2.0 * (pred_v[0] - float(target))]
+        grads = _mlp_backward(net, dloss)
+        flat = []
+        for gw, gb in grads:
+            if gw is None:
+                continue
+            flat.extend(_w14f_flat(gw))
+            flat.extend(_w14f_flat(gb))
+        return flat
+
+    test_g = _grad(xr, y)
+    out = []
+    for row, target in zip(tr, train_y):
+        g = _grad(row, target)
+        if len(g) != len(test_g):
+            raise ValueError("influence_scores: 训练样本梯度维度不一致")
+        dot = sum(a * b for a, b in zip(test_g, g))
+        na = math.sqrt(sum(a * a for a in test_g))
+        nb = math.sqrt(sum(b * b for b in g))
+        if na <= 0.0 or nb <= 0.0:
+            out.append(0.0)
+        else:
+            out.append(-dot / (na * nb))
+    return out
+
+
+# ============================================================================
 #  可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors（W14-E）
 # ============================================================================
 
