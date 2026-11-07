@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1464 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1472 项）
 
 ## 特性
 
@@ -1682,6 +1682,30 @@ stats["accept_rate"]   # 实测接受率
    `packed_causal_mask`，投机接受判定见 W7 的 `speculative_accept`；这一节只是把
    它们组装成可直接调用的入口。
 
+### 对比学习（W16-A）
+
+| API | 返回 | 说明 |
+| --- | --- | --- |
+| `nt_xent_loss(z1, z2, temperature=0.5)` | `(loss, gz1, gz2)` | SimCLR 的 NT-Xent，两路增强互为正样本 |
+| `moco_loss(q, k, queue=None, temperature=0.07)` | `(loss, gq, gk)` | MoCo：正样本是 `k[i]`，负样本是其余 `k` 与队列（队列视为常数） |
+| `MoCoQueue(dim, size=1024, seed=None)` | — | 动量队列，先进先出；`enqueue(keys)` / `matrix()` |
+| `byol_loss(pred, target)` | `(loss, gpred)` | BYOL 的 `mean(2 − 2cos)`，目标分支 stop-gradient 所以只给 pred 的梯度 |
+| `barlow_twins_loss(z1, z2, lambda_=0.005)` | 标量 | 互相关矩阵的对角/非对角惩罚 |
+| `vicreg_loss(z1, z2, ...)` | 标量 | 不变项 + 方差 hinge + 协方差非对角项 |
+| `sinkhorn(logits, epsilon=0.05, n_iters=3)` | 矩阵 | SwAV 的分配矩阵（列和精确 1/k，行和近似 1/n） |
+| `swav_loss(out1, out2, prototypes, ...)` | 标量 | 一路的分配当另一路的软标签 |
+| `dino_loss(student_logits, teacher_logits, center, ...)` + `update_dino_center(...)` | 标量 / 列表 | 教师分布去中心化后的软目标交叉熵 |
+
+诚实边界：
+
+1. **只有前三个函数给解析梯度**（`nt_xent_loss` / `moco_loss` / `byol_loss`），
+   且梯度是**对嵌入**的——编码器自己的反向传播不在函数内，本库没有把编码器
+   接进这些损失的训练器。
+2. BarlowTwins / VICReg / SwAV / DINO 只返回损失值：批次标准化、协方差、
+   Sinkhorn 的梯度推导容易写错，与其给一份没核对过的梯度，不如只给损失。
+3. `sinkhorn` 用交替归一化，两个约束只能同时近似成立（最后一步是列归一化，
+   所以列和精确、行和近似）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2098,7 +2122,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1464 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1472 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2290,6 +2314,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
+| `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2343,7 +2368,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1464 个单元测试
+├── test_ai.py       # 1472 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

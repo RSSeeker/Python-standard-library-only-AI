@@ -497,7 +497,11 @@
   - 探针 25 项；测试 `TestPackingAndSpeculative` 5 例。
 
 ### W16 自监督·多模态·RL（§13）
-- [ ] 对比学习训练器：SimCLR / MoCo（队列）/ BYOL / BarlowTwins / VICReg / SwAV / DINO
+- [x] 对比学习训练器：SimCLR / MoCo（队列）/ BYOL / BarlowTwins / VICReg / SwAV / DINO
+  - `nt_xent_loss`（SimCLR）、`moco_loss` + `MoCoQueue`、`byol_loss` 三个函数返回**对嵌入**的解析梯度，探针用中心差分核对（最差 <1e-6）；
+  - `barlow_twins_loss` / `vicreg_loss` / `swav_loss` / `dino_loss` + `sinkhorn` / `update_dino_center` 只返回损失值（批次统计与 Sinkhorn 的梯度容易写错，README 已写明不提供未核对的梯度）；
+  - 实现修正三处：`feat = [ua[i] + ub[i] ...]` 把两行拼成 2d 长的行（应为 `ua + ub`）、BYOL 梯度漏了 `1/n`、`sinkhorn` 的行/列目标写成 `1` 与 `1`（应为 `1/n` 与 `1/k`）；
+  - 探针 38 项；测试 `TestContrastiveLearning` 8 例。
 - [ ] 掩码建模：MAE / BeiT / SimMIM（视觉侧）
 - [ ] 多模态：CLIP（双塔 + InfoNCE）、跨模态融合（CrossAttention 扩展）
 - [ ] 预测式自监督：Rotation / Jigsaw

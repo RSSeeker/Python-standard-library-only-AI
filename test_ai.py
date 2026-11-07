@@ -22393,3 +22393,115 @@ class TestPackingAndSpeculative:
             AI.speculative_generate(object(), model, [1])
         with pytest.raises(ValueError):
             AI.speculative_generate(model, object(), [1])
+
+
+class TestContrastiveLearning:
+    """W16-A：对比学习损失（SimCLR / MoCo / BYOL / Barlow / VICReg / SwAV / DINO）。"""
+
+    _Z1 = [[0.4, -0.2, 0.7], [-0.5, 0.9, 0.1], [0.3, 0.3, -0.8]]
+    _Z2 = [[0.2, 0.5, -0.6], [0.8, -0.1, 0.4], [-0.4, 0.2, 0.9]]
+
+    def test_nt_xent_gradient(self):
+        loss, g1, g2 = AI.nt_xent_loss(self._Z1, self._Z2, temperature=0.5)
+        assert 0.0 < loss < 10.0
+        eps = 1e-6
+        for i in range(3):
+            for j in range(3):
+                plus = [list(r) for r in self._Z1]
+                minus = [list(r) for r in self._Z1]
+                plus[i][j] += eps
+                minus[i][j] -= eps
+                num = (AI.nt_xent_loss(plus, self._Z2, 0.5)[0]
+                       - AI.nt_xent_loss(minus, self._Z2, 0.5)[0]) / (2 * eps)
+                assert abs(num - g1[i][j]) < 1e-6
+
+    def test_nt_xent_validation(self):
+        with pytest.raises(ValueError):
+            AI.nt_xent_loss(self._Z1, self._Z2, 0.0)
+        with pytest.raises(ValueError):
+            AI.nt_xent_loss(self._Z1, self._Z2[:2])
+        with pytest.raises(ValueError):
+            AI.nt_xent_loss([[0.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]])
+
+    def test_moco_gradient_and_queue(self):
+        Q = [[1.0, 0.0], [0.0, 1.0]]
+        K = [[0.9, 0.1], [0.2, 0.8]]
+        loss, gq, _ = AI.moco_loss(Q, K, temperature=0.07)
+        assert 0.0 < loss < 10.0
+        eps = 1e-6
+        for i in range(2):
+            for j in range(2):
+                plus = [list(r) for r in Q]
+                minus = [list(r) for r in Q]
+                plus[i][j] += eps
+                minus[i][j] -= eps
+                num = (AI.moco_loss(plus, K, temperature=0.07)[0]
+                       - AI.moco_loss(minus, K, temperature=0.07)[0]) / (2 * eps)
+                assert abs(num - gq[i][j]) < 1e-6
+
+        queue = AI.MoCoQueue(2, size=3)
+        queue.enqueue([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]])
+        assert len(queue) == 3
+        assert queue.matrix()[0] == [0.5, 0.5]
+        bigger, _, _ = AI.moco_loss(Q, K, queue=queue.matrix(), temperature=0.07)
+        assert bigger > loss
+
+    def test_moco_validation(self):
+        with pytest.raises(ValueError):
+            AI.moco_loss([[1.0, 0.0]], [[1.0, 0.0]])
+        with pytest.raises(ValueError):
+            AI.moco_loss([[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]],
+                         [[1.0, 0.0, 0.0]])
+        with pytest.raises(ValueError):
+            AI.MoCoQueue(0)
+        with pytest.raises(ValueError):
+            AI.MoCoQueue(2, size=0)
+
+    def test_byol(self):
+        P = [[1.0, 0.0], [0.0, 1.0]]
+        T = [[0.8, 0.2], [0.1, 0.9]]
+        assert abs(AI.byol_loss(P, P)[0]) < 1e-12
+        assert abs(AI.byol_loss([[1.0, 0.0]], [[0.0, 1.0]])[0] - 2.0) < 1e-12
+        loss, gp = AI.byol_loss(P, T)
+        eps = 1e-6
+        for i in range(2):
+            for j in range(2):
+                plus = [list(r) for r in P]
+                minus = [list(r) for r in P]
+                plus[i][j] += eps
+                minus[i][j] -= eps
+                num = (AI.byol_loss(plus, T)[0] - AI.byol_loss(minus, T)[0]) / (2 * eps)
+                assert abs(num - gp[i][j]) < 1e-6
+
+    def test_barlow_vicreg(self):
+        assert AI.barlow_twins_loss(self._Z1, self._Z1) >= 0.0
+        assert abs(AI.vicreg_loss(self._Z1, self._Z2, 0.0, 0.0, 0.0)) < 1e-12
+        assert AI.vicreg_loss(self._Z1, self._Z1) >= 0.0
+        with pytest.raises(ValueError):
+            AI.barlow_twins_loss(self._Z1, self._Z2, -1.0)
+        with pytest.raises(ValueError):
+            AI.vicreg_loss(self._Z1, self._Z2, sim_weight=-1.0)
+
+    def test_sinkhorn_and_swav(self):
+        q = AI.sinkhorn([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], epsilon=0.05,
+                        n_iters=200)
+        for j in range(2):
+            assert abs(sum(q[i][j] for i in range(3)) - 1.0 / 2.0) < 1e-9
+        for row in q:
+            assert abs(sum(row) - 1.0 / 3.0) < 5e-3
+        proto = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        assert 0.0 < AI.swav_loss(self._Z1, self._Z2, proto) < 10.0
+        with pytest.raises(ValueError):
+            AI.sinkhorn([[1.0, 2.0]], n_iters=0)
+
+    def test_dino(self):
+        center = [0.0, 0.0, 0.0]
+        d = AI.dino_loss(self._Z1, self._Z2, center)
+        assert 0.0 < d < 50.0
+        mean = [(0.2 + 0.8 - 0.4) / 3, (0.5 - 0.1 + 0.2) / 3, (-0.6 + 0.4 + 0.9) / 3]
+        got = AI.update_dino_center(center, self._Z2, momentum=0.0)
+        assert abs(got[0] - mean[0]) < 1e-12
+        with pytest.raises(ValueError):
+            AI.dino_loss(self._Z1, self._Z2, [0.0])
+        with pytest.raises(ValueError):
+            AI.update_dino_center(center, self._Z2, 1.5)

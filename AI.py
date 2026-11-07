@@ -28716,6 +28716,408 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  自监督：对比学习（W16-A：SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+# ============================================================================
+
+def _ct_rows(z, who):
+    if not isinstance(z, (list, tuple)) or not z:
+        raise ValueError(f"{who}: 嵌入必须是非空的行列表")
+    out = []
+    for i, row in enumerate(z):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 第 {i} 行里必须全是数字，收到 {v!r}")
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 第 {i} 行里有非有限值")
+            vals.append(float(v))
+        out.append(vals)
+    width = len(out[0])
+    for i, row in enumerate(out):
+        if len(row) != width:
+            raise ValueError(f"{who}: 第 {i} 行宽度 {len(row)} 与 {width} 不一致")
+    return out
+
+
+def _ct_norm(row):
+    return math.sqrt(sum(v * v for v in row))
+
+
+def _ct_unit(z, who):
+    out = []
+    for i, row in enumerate(z):
+        n = _ct_norm(row)
+        if n <= 0.0:
+            raise ValueError(f"{who}: 第 {i} 行是零向量，无法归一化")
+        out.append([v / n for v in row])
+    return out
+
+
+def _ct_dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def nt_xent_loss(z1, z2, temperature=0.5):
+    """SimCLR 的 NT-Xent：两路增强的嵌入互相为正样本。
+
+    返回 ``(loss, grad_z1, grad_z2)``，梯度是**对嵌入**的解析梯度（编码器
+    自己的反向传播不在本函数范围内）。
+    """
+    a = _ct_rows(z1, "nt_xent_loss")
+    b = _ct_rows(z2, "nt_xent_loss")
+    if len(a) != len(b):
+        raise ValueError(f"nt_xent_loss: 两路样本数不一致（{len(a)} vs {len(b)}）")
+    if not isinstance(temperature, (int, float)) or temperature <= 0.0:
+        raise ValueError(f"nt_xent_loss: temperature 必须 > 0，收到 {temperature!r}")
+    n = len(a)
+    if len(a[0]) != len(b[0]):
+        raise ValueError("nt_xent_loss: 两路嵌入维度不一致")
+    ua = _ct_unit(a, "nt_xent_loss")
+    ub = _ct_unit(b, "nt_xent_loss")
+    feat = ua + ub                                   # 2n x d，按行归一化
+    m = 2 * n
+    sims = [[_ct_dot(feat[i], feat[j]) / temperature for j in range(m)]
+            for i in range(m)]
+    total = 0.0
+    dsim = [[0.0] * m for _ in range(m)]
+    for i in range(m):
+        # 正样本：i < n 时是 i+n，否则是 i-n
+        pos = i + n if i < n else i - n
+        row = sims[i]
+        mx = max(row[k] for k in range(m) if k != i)
+        exps = [0.0] * m
+        s = 0.0
+        for k in range(m):
+            if k == i:
+                continue
+            exps[k] = math.exp(row[k] - mx)
+            s += exps[k]
+        total += -(row[pos] - mx - math.log(s))
+        for k in range(m):
+            if k == i:
+                continue
+            p = exps[k] / s
+            dsim[i][k] += p
+        dsim[i][pos] -= 1.0
+    scale = 1.0 / (m * temperature)
+    for i in range(m):
+        for k in range(m):
+            if k != i:
+                dsim[i][k] *= scale
+    g = [[0.0] * len(feat[0]) for _ in range(m)]
+    for i in range(m):
+        for k in range(m):
+            if k == i or dsim[i][k] == 0.0:
+                continue
+            w = dsim[i][k]
+            for d in range(len(feat[0])):
+                g[i][d] += w * feat[k][d]
+                g[k][d] += w * feat[i][d]
+    gz = [[0.0] * len(feat[0]) for _ in range(m)]
+    for i in range(m):
+        row = a[i] if i < n else b[i - n]
+        nz = _ct_norm(row)
+        proj = _ct_dot(g[i], feat[i])
+        gz[i] = [(g[i][d] - proj * feat[i][d]) / nz for d in range(len(row))]
+    return total / m, gz[:n], gz[n:]
+
+
+class MoCoQueue:
+    """MoCo 的动量队列：存历史 key 向量，先进先出。"""
+
+    def __init__(self, dim, size=1024, seed=None):
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
+            raise ValueError(f"MoCoQueue: dim 必须是 >=1 的整数，收到 {dim!r}")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            raise ValueError(f"MoCoQueue: size 必须是 >=1 的整数，收到 {size!r}")
+        self.dim = dim
+        self.size = size
+        self.keys = []
+        self.ptr = 0
+        self.rng = random.Random(seed)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def enqueue(self, keys):
+        rows = _ct_rows(keys, "MoCoQueue.enqueue")
+        for row in rows:
+            if len(row) != self.dim:
+                raise ValueError(
+                    f"MoCoQueue.enqueue: 维度 {len(row)} 与 {self.dim} 不一致"
+                )
+            if len(self.keys) < self.size:
+                self.keys.append(row)
+            else:
+                self.keys[self.ptr] = row
+                self.ptr = (self.ptr + 1) % self.size
+        return self
+
+    def matrix(self):
+        return [list(r) for r in self.keys]
+
+
+def moco_loss(q, k, queue=None, temperature=0.07):
+    """MoCo 对比损失：每个 ``q[i]`` 的正样本是 ``k[i]``，负样本是其余 ``k`` 与队列。
+
+    返回 ``(loss, grad_q, grad_k)``（队列视为常数，不产生梯度）。
+    """
+    qa = _ct_rows(q, "moco_loss")
+    ka = _ct_rows(k, "moco_loss")
+    if len(qa) != len(ka):
+        raise ValueError(f"moco_loss: q 与 k 的样本数不一致（{len(qa)} vs {len(ka)}）")
+    if len(qa[0]) != len(ka[0]):
+        raise ValueError("moco_loss: q 与 k 的维度不一致")
+    if not isinstance(temperature, (int, float)) or temperature <= 0.0:
+        raise ValueError(f"moco_loss: temperature 必须 > 0，收到 {temperature!r}")
+    qu = _ct_unit(qa, "moco_loss")
+    ku = _ct_unit(ka, "moco_loss")
+    keys = ku
+    if queue is not None:
+        qd = _ct_rows(queue, "moco_loss")
+        for i, row in enumerate(qd):
+            if len(row) != len(ka[0]):
+                raise ValueError(f"moco_loss: 队列第 {i} 行维度不一致")
+        keys = ku + _ct_unit(qd, "moco_loss")
+    n = len(qu)
+    m = len(keys)
+    if m < 2:
+        raise ValueError("moco_loss: 至少需要 2 个 key（1 正 + 1 负）")
+    logits = [[_ct_dot(qu[i], keys[j]) / temperature for j in range(m)]
+              for i in range(n)]
+    total = 0.0
+    dlog = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        row = logits[i]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        s = sum(exps)
+        total += -(row[i] - mx - math.log(s))
+        for j in range(m):
+            dlog[i][j] = exps[j] / s
+        dlog[i][i] -= 1.0
+    gq = [[0.0] * len(qu[0]) for _ in range(n)]
+    gk = [[0.0] * len(ku[0]) for _ in range(len(ku))]
+    inv = 1.0 / (temperature * n)
+    for i in range(n):
+        for j in range(m):
+            w = dlog[i][j] * inv
+            if w == 0.0:
+                continue
+            for d in range(len(qu[0])):
+                gq[i][d] += w * keys[j][d]
+                if j < len(ku):
+                    gk[j][d] += w * qu[i][d]
+    nq = [_ct_norm(r) for r in qa]
+    nk = [_ct_norm(r) for r in ka]
+    gq2 = [[(gq[i][d] - _ct_dot(gq[i], qu[i]) * qu[i][d]) / nq[i]
+            for d in range(len(qu[0]))] for i in range(n)]
+    gk2 = [[(gk[j][d] - _ct_dot(gk[j], ku[j]) * ku[j][d]) / nk[j]
+            for d in range(len(ku[0]))] for j in range(len(ku))]
+    return total / n, gq2, gk2
+
+
+def byol_loss(pred, target):
+    """BYOL 的负余弦相似损失 ``mean(2 - 2*cos)``。
+
+    目标是 stop-gradient 分支，所以只返回对 ``pred`` 的梯度：``(loss, grad_pred)``。
+    """
+    p = _ct_rows(pred, "byol_loss")
+    t = _ct_rows(target, "byol_loss")
+    if len(p) != len(t):
+        raise ValueError(f"byol_loss: 样本数不一致（{len(p)} vs {len(t)}）")
+    if len(p[0]) != len(t[0]):
+        raise ValueError("byol_loss: 维度不一致")
+    pu = _ct_unit(p, "byol_loss")
+    tu = _ct_unit(t, "byol_loss")
+    total = 0.0
+    g = []
+    n = len(p)
+    for i in range(n):
+        cos = _ct_dot(pu[i], tu[i])
+        total += 2.0 - 2.0 * cos
+        np_ = _ct_norm(p[i])
+        proj = -2.0 * _ct_dot(tu[i], pu[i])
+        row = [(-2.0 * tu[i][d] - proj * pu[i][d]) / (np_ * n)
+               for d in range(len(p[i]))]
+        g.append(row)
+    return total / n, g
+
+
+def barlow_twins_loss(z1, z2, lambda_=0.005):
+    """Barlow Twins：让互相关矩阵接近单位阵（对角 + 非对角两个惩罚项）。
+
+    只返回损失值——批次标准化让梯度推导容易出错，本库不给出未经核对的梯度。
+    """
+    a = _ct_rows(z1, "barlow_twins_loss")
+    b = _ct_rows(z2, "barlow_twins_loss")
+    if len(a) != len(b) or len(a[0]) != len(b[0]):
+        raise ValueError("barlow_twins_loss: 两路的样本数或维度不一致")
+    if not isinstance(lambda_, (int, float)) or lambda_ < 0.0:
+        raise ValueError(f"barlow_twins_loss: lambda_ 必须 >= 0，收到 {lambda_!r}")
+    n = len(a)
+    d = len(a[0])
+    ma = [sum(r[j] for r in a) / n for j in range(d)]
+    mb = [sum(r[j] for r in b) / n for j in range(d)]
+    sa = [0.0] * d
+    sb = [0.0] * d
+    for i in range(n):
+        for j in range(d):
+            sa[j] += (a[i][j] - ma[j]) ** 2
+            sb[j] += (b[i][j] - mb[j]) ** 2
+    sa = [math.sqrt(v / max(1, n - 1)) for v in sa]
+    sb = [math.sqrt(v / max(1, n - 1)) for v in sb]
+    total = 0.0
+    for i in range(d):
+        for j in range(d):
+            c = 0.0
+            for k in range(n):
+                c += ((a[k][i] - ma[i]) / (sa[i] if sa[i] > 0 else 1.0)) * \
+                     ((b[k][j] - mb[j]) / (sb[j] if sb[j] > 0 else 1.0))
+            c /= n
+            if i == j:
+                total += (1.0 - c) ** 2
+            else:
+                total += lambda_ * c * c
+    return total
+
+
+def vicreg_loss(z1, z2, sim_weight=25.0, var_weight=25.0, cov_weight=1.0, eps=1e-4):
+    """VICReg：不变项（MSE）+ 方差 hinge + 协方差非对角项。只返回损失值。"""
+    a = _ct_rows(z1, "vicreg_loss")
+    b = _ct_rows(z2, "vicreg_loss")
+    if len(a) != len(b) or len(a[0]) != len(b[0]):
+        raise ValueError("vicreg_loss: 两路的样本数或维度不一致")
+    for name, w in (("sim_weight", sim_weight), ("var_weight", var_weight),
+                    ("cov_weight", cov_weight)):
+        if not isinstance(w, (int, float)) or w < 0.0:
+            raise ValueError(f"vicreg_loss: {name} 必须 >= 0")
+    n = len(a)
+    d = len(a[0])
+    inv = 0.0
+    for i in range(n):
+        for j in range(d):
+            inv += (a[i][j] - b[i][j]) ** 2
+    inv /= n
+    var = 0.0
+    cov = 0.0
+    for branch in (a, b):
+        mean = [sum(r[j] for r in branch) / n for j in range(d)]
+        sd = [0.0] * d
+        for i in range(n):
+            for j in range(d):
+                sd[j] += (branch[i][j] - mean[j]) ** 2
+        sd = [v / n for v in sd]
+        for j in range(d):
+            var += max(0.0, eps - sd[j])
+        for i in range(d):
+            for j in range(i + 1, d):
+                c = 0.0
+                for k in range(n):
+                    c += (branch[k][i] - mean[i]) * (branch[k][j] - mean[j])
+                cov += (c / n) ** 2
+    return sim_weight * inv + var_weight * var + cov_weight * cov
+
+
+def sinkhorn(logits, epsilon=0.05, n_iters=3):
+    """SwAV 用的 Sinkhorn-Knopp 归一化：交替把行和归一化到 `1/N`、列和到 `1/K`。
+
+    交替归一化只能让两个约束同时近似成立（最后一步是列归一化，所以列和精确、
+    行和近似）；`n_iters` 越大越接近双随机。
+    """
+    a = _ct_rows(logits, "sinkhorn")
+    if not isinstance(n_iters, int) or isinstance(n_iters, bool) or n_iters < 1:
+        raise ValueError(f"sinkhorn: n_iters 必须是 >=1 的整数，收到 {n_iters!r}")
+    if not isinstance(epsilon, (int, float)) or epsilon <= 0.0:
+        raise ValueError(f"sinkhorn: epsilon 必须 > 0，收到 {epsilon!r}")
+    n = len(a)
+    k = len(a[0])
+    q = [[math.exp(a[i][j] / epsilon) for j in range(k)] for i in range(n)]
+    for _ in range(n_iters):
+        for i in range(n):
+            s = sum(q[i])
+            q[i] = [v / (s * n) for v in q[i]]          # 行和 = 1/n
+        for j in range(k):
+            s = sum(q[i][j] for i in range(n))
+            for i in range(n):
+                q[i][j] = q[i][j] / (s * k)             # 列和 = 1/k
+    return q
+
+
+def swav_loss(out1, out2, prototypes, temperature=0.1, epsilon=0.05, n_iters=3):
+    """SwAV：一路的分配当另一路的软标签（交叉熵）。只返回损失值。"""
+    a = _ct_rows(out1, "swav_loss")
+    b = _ct_rows(out2, "swav_loss")
+    p = _ct_rows(prototypes, "swav_loss")
+    if len(a) != len(b):
+        raise ValueError("swav_loss: 两路样本数不一致")
+    if len(a[0]) != len(p[0]):
+        raise ValueError("swav_loss: 嵌入维度与原型维度不一致")
+    if not isinstance(temperature, (int, float)) or temperature <= 0.0:
+        raise ValueError("swav_loss: temperature 必须 > 0")
+    def scores(out):
+        return [[_ct_dot(row, proto) / temperature for proto in p] for row in out]
+    q1 = sinkhorn(scores(a), epsilon=epsilon, n_iters=n_iters)
+    q2 = sinkhorn(scores(b), epsilon=epsilon, n_iters=n_iters)
+    def cross(out_scores, q):
+        total = 0.0
+        for i, row in enumerate(out_scores):
+            mx = max(row)
+            exps = [math.exp(v - mx) for v in row]
+            s = sum(exps)
+            for j in range(len(row)):
+                if q[i][j] > 0.0:
+                    total += -q[i][j] * (row[j] - mx - math.log(s))
+        return total / len(out_scores)
+    return 0.5 * (cross(scores(b), q1) + cross(scores(a), q2))
+
+
+def dino_loss(student_logits, teacher_logits, center, teacher_temp=0.04,
+             student_temp=0.1):
+    """DINO：教师分布去中心化后做软目标交叉熵。只返回损失值。"""
+    s = _ct_rows(student_logits, "dino_loss")
+    t = _ct_rows(teacher_logits, "dino_loss")
+    if len(s) != len(t) or len(s[0]) != len(t[0]):
+        raise ValueError("dino_loss: 学生与教师的形状必须一致")
+    if not isinstance(center, (list, tuple)) or len(center) != len(s[0]):
+        raise ValueError("dino_loss: center 长度必须等于类别数")
+    for temp, name in ((teacher_temp, "teacher_temp"), (student_temp, "student_temp")):
+        if not isinstance(temp, (int, float)) or temp <= 0.0:
+            raise ValueError(f"dino_loss: {name} 必须 > 0")
+    total = 0.0
+    for i in range(len(s)):
+        st = [v / student_temp for v in s[i]]
+        mx = max(st)
+        e = [math.exp(v - mx) for v in st]
+        z = sum(e)
+        lp = [v - mx - math.log(z) for v in st]
+        tt = [(t[i][j] - center[j]) / teacher_temp for j in range(len(t[i]))]
+        mt = max(tt)
+        et = [math.exp(v - mt) for v in tt]
+        zt = sum(et)
+        for j in range(len(s[i])):
+            p = et[j] / zt
+            if p > 0.0:
+                total += -p * lp[j]
+    return total / len(s)
+
+
+def update_dino_center(center, teacher_logits, momentum=0.9):
+    """DINO 的中心 EMA：``center = m*center + (1-m)*mean(teacher_logits)``（返回新列表）。"""
+    t = _ct_rows(teacher_logits, "update_dino_center")
+    if not isinstance(center, (list, tuple)) or len(center) != len(t[0]):
+        raise ValueError("update_dino_center: center 长度必须等于类别数")
+    if not isinstance(momentum, (int, float)) or not (0.0 <= momentum <= 1.0):
+        raise ValueError(
+            f"update_dino_center: momentum 必须在 [0,1]，收到 {momentum!r}"
+        )
+    mean = [sum(r[j] for r in t) / len(t) for j in range(len(t[0]))]
+    return [momentum * float(center[j]) + (1.0 - momentum) * mean[j]
+            for j in range(len(mean))]
+
+# ============================================================================
 #  推理与部署：批内打包与投机解码（W15-D）
 # ============================================================================
 
