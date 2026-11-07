@@ -205,7 +205,11 @@
   - 多样束：`diverse_beam_select` 的组间扣分 + `diverse_beam_search`（模型解耦）+ `diverse_beam_generate`
   - 起手 beam 全为同一前缀、命中 `eos_id` 立即进 finished；`num_return > num_beams` 报错
 - [x] 约束解码：`token_id_mask`（任意 id 白名单）+ `token_prefix_mask`（合法序列前缀约束，含 `eos_id` 收尾）；JSON Schema / 正则 / CFG 的完整语法器留作后续
-- [ ] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
+- [x] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
+  - `RegexGrammar`：自写正则解析（字面量/`.`/`*+?`/`[a-z]`/`[^...]`/`\d`/`|`/分组）+ Thompson NFA，`allowed`/`accepts`/`viable`
+  - `CFGGrammar`：Earley chart，非终结符为 `productions` 的键，终结符支持字符串精确匹配与谓词函数
+  - `json_grammar()` + `json_tokens()`：结构文法（`STR`/`NUM` 类别终结符），语义由 `json.loads` 收尾校验，**不含 JSON Schema 校验**
+  - `grammar_mask`/`grammar_pick`/`grammar_generate`：掩码可直接叠到 logits；无可用 token 时显式报错而不是产出非法串
 - [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）
 - [x] `ContinuousBatcher`：请求随时进出、每步按容量重组批与补位；记账按**准入时**的提示词长度（旧版扣生成后长度会让 `used_tokens` 变负数）；测试 4 例、计数 1014→1018
 - [x] `PagedKVCache`：PagedAttention 的块表数据结构（按 `block_size` 分块、逻辑→物理块映射、释放即复用；3 token 用 2 块、fragmentation=0.25）

@@ -9124,6 +9124,544 @@ def diverse_beam_generate(model, prompt_ids, num_beams: int = 4, num_return: int
                                eos_id=eos_id)
 
 
+#  领域应用 W7-E：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
+# =====================================================================
+
+def _w7e_char_predicate(spec):
+    """把字符类说明（'digit' / 'alpha' / 单字符串）变成 predicate。"""
+    if callable(spec):
+        return spec
+    if not isinstance(spec, str) or not spec:
+        raise TypeError("_w7e_char_predicate: 需要非空字符串或可调用对象")
+    table = {
+        "digit": lambda ch: ch.isdigit(),
+        "alpha": lambda ch: ch.isalpha(),
+        "alnum": lambda ch: ch.isalnum(),
+        "space": lambda ch: ch.isspace(),
+        "lower": lambda ch: ch.islower(),
+        "upper": lambda ch: ch.isupper(),
+        "any": lambda ch: True,
+    }
+    if spec in table:
+        return table[spec]
+    return lambda ch, _s=spec: ch in _s
+
+
+class _W7eNfa:
+    """Thompson NFA：状态是整数，边是 (predicate, target) 或 epsilon。"""
+
+    def __init__(self):
+        self.edges = []
+        self.eps = []
+        self.start = None
+        self.accept = None
+
+    def new_state(self):
+        self.edges.append([])
+        self.eps.append([])
+        return len(self.edges) - 1
+
+    def add(self, src, pred, dst):
+        self.edges[src].append((pred, dst))
+
+    def add_eps(self, src, dst):
+        self.eps[src].append(dst)
+
+    def closure(self, states):
+        out = set(states)
+        stack = list(states)
+        while stack:
+            cur = stack.pop()
+            for nxt in self.eps[cur]:
+                if nxt not in out:
+                    out.add(nxt)
+                    stack.append(nxt)
+        return out
+
+    def step(self, states, token):
+        out = set()
+        for cur in self.closure(states):
+            for pred, dst in self.edges[cur]:
+                if pred(token):
+                    out.add(dst)
+        return self.closure(out)
+
+    def live_states(self):
+        """能到达接受态的状态集合（反向可达）。"""
+        rev = [[] for _ in range(len(self.edges))]
+        for src in range(len(self.edges)):
+            for _, dst in self.edges[src]:
+                rev[dst].append(src)
+            for dst in self.eps[src]:
+                rev[dst].append(src)
+        live = {self.accept}
+        stack = [self.accept]
+        while stack:
+            cur = stack.pop()
+            for pre in rev[cur]:
+                if pre not in live:
+                    live.add(pre)
+                    stack.append(pre)
+        return live
+
+
+def _w7e_regex_parse(pattern):
+    """极简正则解析：字面量、. ^ $ * + ? 与 [..] 字符类、| 与分组。"""
+    if not isinstance(pattern, str):
+        raise TypeError("RegexGrammar: pattern 必须是字符串")
+    if not pattern:
+        raise ValueError("RegexGrammar: pattern 不能为空")
+    pos = [0]
+
+    def peek():
+        return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+    def take():
+        ch = peek()
+        pos[0] += 1
+        return ch
+
+    def parse_alt():
+        branches = [parse_concat()]
+        while peek() == "|":
+            take()
+            branches.append(parse_concat())
+        return branches[0] if len(branches) == 1 else ("alt", branches)
+
+    def parse_concat():
+        items = []
+        while peek() is not None and peek() not in (")", "|"):
+            items.append(parse_repeat())
+        return ("cat", items) if items else ("cat", [])
+
+    def parse_atom():
+        ch = take()
+        if ch == ".":
+            return ("set", _w7e_char_predicate("any"))
+        if ch == "\\":
+            nxt = take()
+            if nxt is None:
+                raise ValueError("RegexGrammar: 结尾多了反斜杠")
+            if nxt == "d":
+                return ("set", _w7e_char_predicate("digit"))
+            if nxt == "w":
+                return ("set", _w7e_char_predicate("alnum"))
+            if nxt == "s":
+                return ("set", _w7e_char_predicate("space"))
+            return ("lit", nxt)
+        if ch == "[":
+            body = []
+            negate = False
+            if peek() == "^":
+                take()
+                negate = True
+            first = True
+            while True:
+                cur = take()
+                if cur is None:
+                    raise ValueError("RegexGrammar: 字符类没有闭合 ]")
+                if cur == "]" and not first:
+                    break
+                if cur == "\\":
+                    nxt = take()
+                    if nxt is None:
+                        raise ValueError("RegexGrammar: 字符类里的转义不完整")
+                    cur = nxt
+                # 区间：a-z（'-' 后面不是 ']' 才当区间）
+                if peek() == "-" and pos[0] + 1 < len(pattern) and pattern[pos[0] + 1] != "]":
+                    take()
+                    hi = take()
+                    if hi is None:
+                        raise ValueError("RegexGrammar: 字符类区间缺少上界")
+                    if ord(hi) < ord(cur):
+                        raise ValueError("RegexGrammar: 字符类区间 %r-%r 上界小于下界"
+                                         % (cur, hi))
+                    body.extend(chr(c) for c in range(ord(cur), ord(hi) + 1))
+                else:
+                    body.append(cur)
+                first = False
+            allowed = set(body)
+
+            def pred(ch, _a=allowed, _n=negate):
+                hit = ch in _a
+                return (not hit) if _n else hit
+
+            return ("set", pred)
+        if ch == "(":
+            inner = parse_alt()
+            if take() != ")":
+                raise ValueError("RegexGrammar: 分组没有闭合 )")
+            return inner
+        return ("lit", ch)
+
+    def parse_repeat():
+        atom = parse_atom()
+        while True:
+            cur = peek()
+            if cur == "*":
+                take()
+                atom = ("star", atom)
+            elif cur == "+":
+                take()
+                atom = ("plus", atom)
+            elif cur == "?":
+                take()
+                atom = ("opt", atom)
+            else:
+                return atom
+
+    ast = parse_alt()
+    if pos[0] != len(pattern):
+        raise ValueError("RegexGrammar: 第 %d 个字符处无法解析（多余 %r）"
+                         % (pos[0], pattern[pos[0]:]))
+    return ast
+
+
+def _w7e_compile(ast, nfa):
+    kind = ast[0]
+    if kind == "lit":
+        a = nfa.new_state()
+        b = nfa.new_state()
+        ch = ast[1]
+        nfa.add(a, lambda t, _c=ch: t == _c, b)
+        return a, b
+    if kind == "set":
+        a = nfa.new_state()
+        b = nfa.new_state()
+        pred = ast[1]
+        nfa.add(a, lambda t, _p=pred: len(t) == 1 and _p(t), b)
+        return a, b
+    if kind == "cat":
+        a = nfa.new_state()
+        cur = a
+        for item in ast[1]:
+            si, ei = _w7e_compile(item, nfa)
+            nfa.add_eps(cur, si)
+            cur = ei
+        return a, cur
+    if kind == "alt":
+        a = nfa.new_state()
+        b = nfa.new_state()
+        for branch in ast[1]:
+            si, ei = _w7e_compile(branch, nfa)
+            nfa.add_eps(a, si)
+            nfa.add_eps(ei, b)
+        return a, b
+    if kind in ("star", "plus", "opt"):
+        a = nfa.new_state()
+        b = nfa.new_state()
+        si, ei = _w7e_compile(ast[1], nfa)
+        nfa.add_eps(a, si)
+        nfa.add_eps(ei, b)
+        if kind in ("star", "opt"):
+            nfa.add_eps(a, b)
+        if kind in ("star", "plus"):
+            nfa.add_eps(ei, si)
+        return a, b
+    raise ValueError("_w7e_compile: 未知节点 %r" % (kind,))
+
+
+class RegexGrammar:
+    """用一个正则约束「下一个 token 能不能接」。
+
+    实现了字面量、`.`、`*` `+` `?`、`[abc]` / `[^abc]`、`\\d` `\\w` `\\s`、
+    `|` 与括号分组；编译成 Thompson NFA 后逐 token 推进。
+    只支持「整段匹配」（相当于 `re.fullmatch`），不处理 `^` `$`（可省）。
+    """
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._nfa = _W7eNfa()
+        ast = _w7e_regex_parse(pattern)
+        a, b = _w7e_compile(ast, self._nfa)
+        self._nfa.start = a
+        self._nfa.accept = b
+        self._live = self._nfa.live_states()
+
+    def _advance(self, prefix, tokens):
+        states = {self._nfa.start}
+        for tok in tokens:
+            states = self._nfa.step(states, tok)
+            if not states:
+                return None
+        return states
+
+    def state(self, prefix):
+        if isinstance(prefix, str):
+            prefix = list(prefix)
+        states = self._advance(None, prefix)
+        if states is None:
+            raise ValueError("RegexGrammar.state: 前缀 %r 已经不可能匹配" % (prefix,))
+        return states
+
+    def viable(self, prefix):
+        states = self._advance(None, list(prefix))
+        return bool(states) and bool(states & self._live)
+
+    def accepts(self, tokens):
+        states = self._advance(None, list(tokens))
+        return bool(states) and self._nfa.accept in states
+
+    def allowed(self, prefix, vocabulary):
+        states = self._advance(None, list(prefix))
+        if states is None:
+            return []
+        out = []
+        for tok in vocabulary:
+            nxt = self._nfa.step(states, tok)
+            if nxt & self._live:
+                out.append(tok)
+        return out
+
+    def choices(self):
+        """一个可用的字符级词表（仅用于演示/测试）。"""
+        return [chr(c) for c in range(32, 127)]
+
+
+class CFGGrammar:
+    """Earley 解析器驱动的 CFG 语法约束。
+
+    `productions` 形如 `{"S": [["A", "b"], []]}`（右部为空 list 表示 ε）；
+    出现在 `productions` 键里的符号是**非终结符**，其余按终结符处理：
+    字符串终结符精确匹配，可调用终结符当谓词（`token -> bool`）。
+    """
+
+    def __init__(self, productions, start):
+        if not isinstance(productions, dict) or not productions:
+            raise ValueError("CFGGrammar: productions 必须是非空 dict")
+        if start not in productions:
+            raise ValueError("CFGGrammar: 起始符号 %r 不在 productions 里" % (start,))
+        self.rules = []
+        self.by_lhs = {}
+        for lhs, alts in productions.items():
+            if not isinstance(lhs, str) or not lhs:
+                raise ValueError("CFGGrammar: 非终结符名必须是非空字符串")
+            if not isinstance(alts, (list, tuple)):
+                raise ValueError("CFGGrammar: %r 的右部必须是列表" % (lhs,))
+            for alt in alts:
+                if not isinstance(alt, (list, tuple)):
+                    raise ValueError("CFGGrammar: %r 的每条右部必须是列表" % (lhs,))
+                idx = len(self.rules)
+                self.rules.append((lhs, list(alt)))
+                self.by_lhs.setdefault(lhs, []).append(idx)
+        self.start = start
+        self.nonterminals = set(productions)
+
+    def _match(self, symbol, token):
+        if callable(symbol):
+            return bool(symbol(token))
+        return symbol == token
+
+    def _chart(self, tokens):
+        n = len(tokens)
+        chart = [set() for _ in range(n + 1)]
+
+        def add(i, state):
+            if state not in chart[i]:
+                chart[i].add(state)
+
+        for idx in self.by_lhs[self.start]:
+            add(0, (idx, 0, 0))
+        for i in range(n + 1):
+            changed = True
+            while changed:
+                changed = False
+                for state in list(chart[i]):
+                    idx, dot, origin = state
+                    lhs, rhs = self.rules[idx]
+                    if dot < len(rhs):
+                        sym = rhs[dot]
+                        if sym in self.nonterminals:
+                            for nidx in self.by_lhs[sym]:
+                                new = (nidx, 0, i)
+                                if new not in chart[i]:
+                                    add(i, new)
+                                    changed = True
+                    else:
+                        for pidx, pdot, porigin in list(chart[origin]):
+                            plhs, prhs = self.rules[pidx]
+                            if pdot < len(prhs) and prhs[pdot] == lhs:
+                                new = (pidx, pdot + 1, porigin)
+                                if new not in chart[i]:
+                                    add(i, new)
+                                    changed = True
+            if i < n:
+                token = tokens[i]
+                for idx, dot, origin in list(chart[i]):
+                    lhs, rhs = self.rules[idx]
+                    if dot < len(rhs):
+                        sym = rhs[dot]
+                        if sym not in self.nonterminals and self._match(sym, token):
+                            new = (idx, dot + 1, origin)
+                            if new not in chart[i + 1]:
+                                add(i + 1, new)
+        return chart
+
+    def accepts(self, tokens):
+        tokens = list(tokens)
+        chart = self._chart(tokens)
+        n = len(tokens)
+        for idx, dot, origin in chart[n]:
+            lhs, rhs = self.rules[idx]
+            if dot == len(rhs) and origin == 0 and lhs == self.start:
+                return True
+        return False
+
+    def expected(self, tokens):
+        """当前前缀下所有「可以接下去」的终结符说明（可能是谓词）。"""
+        tokens = list(tokens)
+        chart = self._chart(tokens)
+        i = len(tokens)
+        out = []
+        for idx, dot, origin in chart[i]:
+            lhs, rhs = self.rules[idx]
+            if dot < len(rhs) and rhs[dot] not in self.nonterminals:
+                sym = rhs[dot]
+                if not any(sym is o for o in out):
+                    out.append(sym)
+        return out
+
+    def allowed(self, prefix, vocabulary):
+        tokens = list(prefix)
+        chart = self._chart(tokens)
+        i = len(tokens)
+        expected = []
+        for idx, dot, origin in chart[i]:
+            lhs, rhs = self.rules[idx]
+            if dot < len(rhs) and rhs[dot] not in self.nonterminals:
+                sym = rhs[dot]
+                if not any(sym is o for o in expected):
+                    expected.append(sym)
+        out = []
+        for tok in vocabulary:
+            for sym in expected:
+                if self._match(sym, tok):
+                    out.append(tok)
+                    break
+        return out
+
+
+def _w7e_json_pred_string(tok):
+    return tok == '"' or tok == "STR"
+
+
+def json_grammar():
+    """JSON 的结构语法（对象/数组/值），字符串与数字用词表里的类别 token 表示。
+
+    终结符：`{` `}` `[` `]` `:` `,` `true` `false` `null`；
+    以及三个谓词终结符 `STR`（形如 `"..."`）、`NUM`（形如 `-?digits(.digits)?`）、
+    `LIT`（`true`/`false`/`null`）。演示里直接把类别名当 token 用即可。
+    """
+    str_tok = lambda t: t == "STR" or (len(t) >= 2 and t[0] == '"' and t[-1] == '"')
+
+    def num_tok(t):
+        if t == "NUM":
+            return True
+        if not isinstance(t, str) or not t:
+            return False
+        body = t[1:] if t[0] == "-" else t
+        if not body:
+            return False
+        if body.count(".") == 0:
+            return body.isdigit()
+        if body.count(".") != 1:
+            return False
+        head, tail = body.split(".")
+        return head.isdigit() and tail.isdigit()
+
+    lit_tok = lambda t: t in ("true", "false", "null", "LIT")
+    return CFGGrammar({
+        "V": [["OBJ"], ["ARR"], [str_tok], [num_tok], [lit_tok]],
+        "OBJ": [["{", "}"], ["{", "MEMBERS", "}"]],
+        "MEMBERS": [["PAIR"], ["MEMBERS", ",", "PAIR"]],
+        "PAIR": [[str_tok, ":", "V"]],
+        "ARR": [["[", "]"], ["[", "ELEMS", "]"]],
+        "ELEMS": [["V"], ["ELEMS", ",", "V"]],
+    }, "V")
+
+
+def json_tokens(text):
+    """把一段 JSON 文本切成语法 token（字符串整体一个 token）。"""
+    import json as _json
+    if not isinstance(text, str):
+        raise TypeError("json_tokens: 需要字符串")
+    tokens = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "{}[]:,":
+            tokens.append(ch)
+            i += 1
+        elif ch.isspace():
+            i += 1
+        elif ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            if j >= n:
+                raise ValueError("json_tokens: 字符串没有闭合")
+            tokens.append(text[i:j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < n and (text[j].isalnum() or text[j] in "-+.eE"):
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    return tokens
+
+
+def grammar_allowed(grammar, prefix, vocabulary):
+    if not isinstance(grammar, (RegexGrammar, CFGGrammar)):
+        raise TypeError("grammar_allowed: 需要 RegexGrammar 或 CFGGrammar")
+    return grammar.allowed(prefix, vocabulary)
+
+
+def grammar_mask(grammar, prefix, vocabulary):
+    allowed = set(grammar_allowed(grammar, prefix, vocabulary))
+    return [tok in allowed for tok in vocabulary]
+
+
+def grammar_pick(grammar, prefix, logits, vocabulary):
+    """在 gramm ar 允许的候选里取 logit 最大者（同分取小下标）。"""
+    if len(logits) != len(vocabulary):
+        raise ValueError("grammar_pick: logits 长度 %d 与词表 %d 不一致"
+                         % (len(logits), len(vocabulary)))
+    allowed = set(grammar_allowed(grammar, prefix, vocabulary))
+    best = None
+    for i, tok in enumerate(vocabulary):
+        if tok not in allowed:
+            continue
+        if best is None or logits[i] > logits[best]:
+            best = i
+    if best is None:
+        raise ValueError("grammar_pick: 没有可用的下一个 token（前缀 %r 已无解）"
+                         % (list(prefix),))
+    return best, vocabulary[best]
+
+
+def grammar_generate(grammar, logits_fn, vocabulary, max_len=16, stop=None):
+    """greedy 语法约束生成：每步只在语法允许的 token 里取最大 logit。"""
+    out = []
+    for _ in range(max_len):
+        logits = logits_fn(list(out))
+        if len(logits) != len(vocabulary):
+            raise ValueError("grammar_generate: logits_fn 返回长度与词表不一致")
+        idx, tok = grammar_pick(grammar, out, logits, vocabulary)
+        out.append(tok)
+        if stop is not None and out == list(stop):
+            break
+        if grammar.accepts(out):
+            break
+    return out
+
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1797 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1807 项）
 
 ## 特性
 
@@ -2673,6 +2673,34 @@ print(res["sequences"])
 3. **多样束的惩罚是「同一步里重复 token」**，不是「整条序列相似」。因此它只保证同一父节点下的扩展不会塌到同一个 token，不保证两条 beam 全程不同；想要更强的多样性要配合长度惩罚或分组（DBS 原文的多组版本）。
 4. **`eos_id` 命中即收尾**，该序列进入 `finished` 后不再扩展；所有 beam 都收尾时搜索提前结束。
 
+### 语法约束解码（W7-E）
+
+| API | 作用 |
+| --- | --- |
+| `RegexGrammar(pattern)` | 自写正则解析 + Thompson NFA；`allowed(prefix, vocab)` / `accepts(tokens)` / `viable(prefix)` |
+| `CFGGrammar(productions, start)` | Earley 解析器；非终结符是 `productions` 的键，终结符可写字符串或谓词函数 |
+| `json_grammar()` | JSON 结构文法（对象/数组/值），字符串与数字用 `STR` / `NUM` 类别终结符 |
+| `json_tokens(text)` | 把 JSON 文本切成语法 token（字符串整体一个 token） |
+| `grammar_mask(grammar, prefix, vocabulary)` | 布尔掩码，可直接叠加到 logits 上 |
+| `grammar_pick(grammar, prefix, logits, vocabulary)` | 在允许集合里取最大 logit（同分取小下标） |
+| `grammar_generate(grammar, logits_fn, vocabulary, max_len=16)` | 贪心语法约束生成，生成到 `accepts` 成立即停 |
+
+```python
+g = CFGGrammar({"S": [["(", "S", ")"], ["x"]]}, "S")
+print(g.allowed(["("], ["(", "x", ")"]))      # ['(', 'x']
+print(grammar_generate(g, lambda p: [0.0, 1.0, 0.0], ["(", "x", ")"], max_len=8))
+
+r = RegexGrammar("a[bc]+d")
+print(r.accepts(["a", "b", "d"]), r.allowed(["a", "b"], ["b", "c", "d"]))
+```
+
+四点边界：
+
+1. **正则不是 `re` 的子集**：实现的是字面量、`.`、`*` `+` `?`、`[a-z]` / `[^...]`、`\d` `\w` `\s`、`|` 与括号分组，语义等价于 `re.fullmatch`；不支持 `{m,n}`、前瞻、反向引用与锚点。
+2. **CFG 是 Earley 全量解析，代价 O(n³)**：每次 `allowed(...)` 都从头重算 chart，因此只适合短序列（语法约束解码的典型 case）；要长序列需要增量 chart。
+3. **JSON 文法只约束结构**：字符串/数字用 `STR` / `NUM` 类别终结符表示（或直接传带引号/数字文本的 token），真正的语义由 `json.loads` 在收尾时校验；它不检查「键是否在 schema 里」——那需要 JSON Schema 层，本库未实现。
+4. **语法与 token 粒度的错配**：词表里的多字符 token 只有在 NFA/Earley 能整段消化时才放行；字符级文法配 BPE 词表时会出现「语法允许但没有任何 token 可接」的空集，`grammar_pick` 会显式报错而不是静默产出非法串。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3089,7 +3117,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1797 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1807 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3311,6 +3339,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
 | `TestSamplingSearch` | 对比搜索单步打分与 α 两端退化、top-k 截断、`top_k=1` 与贪心逐位一致、多样束的扣分让位与无惩罚等价、`eos` 收尾、14 处参数校验 |
+| `TestGrammarConstrained` | 正则 NFA 逐步推进与死前缀报错、字符类与区间/取反、可选项与分组、Earley 接受与谓词终结符、JSON 结构文法与分词、mask/pick/generate 的合法性 |
 | `TestNeuroSymbolic` | 规则集合与掩码、整条序列体检、约束贪心解码、全屏蔽报错 |
 | `TestMixtureOfDepths` | MoD 容量/排序/权重归一、块输出透传、早退三分支、savings、参数校验 |
 | `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
@@ -3368,7 +3397,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1797 个单元测试
+├── test_ai.py       # 1807 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

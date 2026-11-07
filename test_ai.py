@@ -27397,3 +27397,126 @@ class TestSamplingSearch:
             AI.diverse_beam_search(step_const, [0], num_beams=2, num_return=3)
         with pytest.raises(ValueError):
             AI.diverse_beam_search(123, [0], num_beams=1, num_return=1)
+
+
+class TestGrammarConstrained:
+    """语法约束解码（W7-E：正则 NFA / CFG Earley / JSON）"""
+
+    def test_regex_nfa_step_and_accept(self):
+        g = AI.RegexGrammar("a[bc]+d")
+        assert g.allowed([], ["a", "b"]) == ["a"]
+        assert g.allowed(["a"], ["a", "b", "c", "d"]) == ["b", "c"]
+        assert g.allowed(["a", "b"], ["b", "c", "d", "x"]) == ["b", "c", "d"]
+        assert g.accepts(["a", "b", "d"]) is False or g.accepts(["a", "b", "d"])
+        assert g.accepts(["a", "b", "d"]) is True
+        assert g.accepts(["a", "d"]) is False
+        assert g.viable([]) is True
+
+    def test_regex_dead_prefix_raises(self):
+        g = AI.RegexGrammar("(ab|cd)*e")
+        assert g.accepts(["a", "b", "e"]) is True
+        with pytest.raises(ValueError):
+            g.state(["a", "a"])
+
+    def test_regex_char_classes(self):
+        g = AI.RegexGrammar("[0-3]+")
+        assert g.accepts(["0"]) is True
+        assert g.accepts(["3", "2"]) is True
+        assert g.accepts(["7"]) is False
+        neg = AI.RegexGrammar("[^0-3]")
+        assert neg.accepts(["7"]) is True
+        assert neg.accepts(["2"]) is False
+        digits = AI.RegexGrammar("\\d\\d")
+        assert digits.accepts(["7", "3"]) is True
+        assert digits.allowed(["7"], list("0123456789ab")) == list("0123456789")
+
+    def test_regex_optional_and_group(self):
+        g = AI.RegexGrammar("colou?r")
+        assert g.accepts(list("color")) is True
+        assert g.accepts(list("colour")) is True
+        assert g.accepts(list("colorr")) is False
+        with pytest.raises(ValueError):
+            AI.RegexGrammar("a(")
+        with pytest.raises(TypeError):
+            AI.RegexGrammar(5)
+
+    def test_cfg_earley_accepts(self):
+        g = AI.CFGGrammar({"S": [["(", "S", ")"], ["x"]]}, "S")
+        assert g.accepts(["x"]) is True
+        assert g.accepts(["(", "x", ")"]) is True
+        assert g.accepts(["(", "(", "x", ")", ")"]) is True
+        assert g.accepts(["(", "x"]) is False
+        assert g.accepts([]) is False
+        assert g.allowed(["(", "x"], [")", "x"]) == [")"]
+
+    def test_cfg_predicate_terminal(self):
+        g = AI.CFGGrammar({
+            "E": [["T"], ["E", "+", "T"]],
+            "T": [["N"]],
+            "N": [[lambda t: t.isdigit()]],
+        }, "E")
+        assert g.accepts(["1", "+", "2"]) is True
+        assert g.allowed(["1"], ["+", "2"]) == ["+"]
+        assert g.allowed([], ["+", "2"]) == ["2"]
+        assert g.expected(["1", "+"]) == [g.rules[g.by_lhs["N"][0]][1][0]] or len(
+            g.expected(["1", "+"])) == 1
+
+    def test_cfg_validation(self):
+        with pytest.raises(ValueError):
+            AI.CFGGrammar({}, "S")
+        with pytest.raises(ValueError):
+            AI.CFGGrammar({"S": [["a"]]}, "T")
+        with pytest.raises(ValueError):
+            AI.CFGGrammar({"S": "a"}, "S")
+
+    def test_json_grammar(self):
+        g = AI.json_grammar()
+        assert g.accepts(["{", "}"]) is True
+        assert g.accepts(["[", "1", ",", "2", "]"]) is True
+        assert g.accepts(["{", '"a"', ":", "[", "1", "]", "}"]) is True
+        assert g.accepts(["[", "1", ",", "]"]) is False
+        assert g.allowed(["{", "1"], [":", '"a"']) == []
+        assert set(g.allowed(["{", '"k"', ":"], ["}", "STR", "NUM"])) == {
+            "STR", "NUM"}
+        toks = AI.json_tokens('{"a": [1, 2], "b": true}')
+        assert g.accepts(toks) is True
+        with pytest.raises(ValueError):
+            AI.json_tokens('{"a: 1}')
+
+    def test_masks_and_pick(self):
+        g = AI.CFGGrammar({"S": [["(", "S", ")"], ["x"]]}, "S")
+        vocab = ["(", "x", ")"]
+        assert AI.grammar_mask(g, ["("], vocab) == [True, True, False]
+        idx, tok = AI.grammar_pick(g, ["("], [-5.0, 3.0, -1.0], vocab)
+        assert (idx, tok) == (1, "x")
+        with pytest.raises(ValueError):
+            AI.grammar_pick(g, ["(", "x", ")"], [1.0, 2.0, 3.0], vocab)
+        with pytest.raises(ValueError):
+            AI.grammar_pick(g, [], [1.0], vocab)
+        with pytest.raises(TypeError):
+            AI.grammar_allowed("nope", [], vocab)
+
+    def test_grammar_generate_is_valid(self):
+        g = AI.CFGGrammar({"S": [["(", "S", ")"], ["x"]]}, "S")
+        vocab = ["(", "x", ")"]
+
+        def logits(prefix):
+            return [-1.0, 0.5, 1.5 - 0.1 * len(prefix)]
+
+        seq = AI.grammar_generate(g, logits, vocab, max_len=8)
+        assert g.accepts(seq) is True
+        forced = AI.grammar_generate(g, lambda p: [0.0, 1.0, 0.0], vocab, max_len=8)
+        assert g.accepts(forced) is True and forced[0] == "x"
+
+        reg = AI.RegexGrammar("a(b|c)*d")
+
+        def reg_logits(prefix):
+            if not prefix:
+                return [1.0, -1.0, -1.0, -1.0]
+            if len(prefix) < 3:
+                return [0.0, 1.0, -1.0, 0.5]
+            return [0.0, 0.0, 0.0, 2.0]
+
+        out = AI.grammar_generate(reg, reg_logits, ["a", "b", "c", "d"], max_len=8)
+        assert reg.accepts(out) is True
+        assert out[0] == "a" and out[-1] == "d"
