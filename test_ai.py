@@ -20985,3 +20985,81 @@ class TestCalibrationMetrics:
             AI.maximum_calibration_error([0, 1, 5], [[0.7, 0.2, 0.1]] * 3, n_bins=2)
         with pytest.raises(ValueError):
             AI.reliability_diagram([1, 0], ["a", 0.2], n_bins=5)
+
+
+class TestDetectionMetrics:
+    @staticmethod
+    def _gt(boxes, labels):
+        return [{"boxes": [list(b) for b in boxes], "labels": list(labels)}]
+
+    @staticmethod
+    def _pred(boxes, scores, labels):
+        return [{"boxes": [list(b) for b in boxes], "labels": list(labels),
+                 "scores": list(scores)}]
+
+    def test_box_iou(self):
+        assert abs(AI.box_iou([0, 0, 2, 2], [1, 1, 3, 3]) - 1.0 / 7.0) < 1e-12
+        assert AI.box_iou([0, 0, 2, 2], [0, 0, 2, 2]) == 1.0
+        assert AI.box_iou([0, 0, 1, 1], [5, 5, 6, 6]) == 0.0
+        assert AI.box_area([0, 0, 3, 4]) == 12.0
+
+    def test_ap_perfect(self):
+        gt = self._gt([(0, 0, 10, 10)], [0])
+        pred = self._pred([(0, 0, 10, 10)], [0.9], [0])
+        assert abs(AI.detection_average_precision(gt, pred) - 1.0) < 1e-12
+
+    def test_ap_false_positive_first(self):
+        gt = self._gt([(0, 0, 10, 10), (20, 20, 30, 30)], [0, 0])
+        pred = self._pred([(50, 50, 60, 60), (0, 0, 10, 10), (20, 20, 30, 30)],
+                          [0.95, 0.9, 0.8], [0, 0, 0])
+        assert abs(AI.detection_average_precision(gt, pred) - 2.0 / 3.0) < 1e-12
+
+    def test_ap_no_predictions_is_zero(self):
+        gt = self._gt([(0, 0, 10, 10)], [0])
+        empty = self._pred([], [], [])
+        assert AI.detection_average_precision(gt, empty) == 0.0
+        assert AI.average_recall(gt, empty) == 0.0
+
+    def test_threshold_changes_result(self):
+        gt = self._gt([(0, 0, 10, 10), (10, 0, 20, 10)], [0, 0])
+        pred = self._pred([(0, 0, 10, 10), (5, 0, 15, 10)], [0.9, 0.8], [0, 0])
+        assert abs(AI.detection_average_precision(gt, pred, 0.5) - 0.5) < 1e-12
+        assert abs(AI.detection_average_precision(gt, pred, 0.3) - 1.0) < 1e-12
+
+    def test_map_and_range(self):
+        gt = self._gt([(0, 0, 10, 10), (20, 20, 30, 30)], [0, 1])
+        pred = self._pred([(0, 0, 10, 10), (20, 20, 30, 30)], [0.9, 0.8], [0, 1])
+        assert abs(AI.mean_average_precision(gt, pred) - 1.0) < 1e-12
+        assert abs(AI.mean_average_precision_range(gt, pred) - 1.0) < 1e-12
+        half = self._gt([(0, 0, 10, 10)], [0])
+        pred_half = self._pred([(0, 0, 10, 5)], [0.9], [0])
+        assert abs(AI.mean_average_precision_range(half, pred_half, [0.5, 0.6]) - 0.5) < 1e-12
+
+    def test_average_recall_max_dets(self):
+        gt = self._gt([(0, 0, 10, 10), (20, 20, 30, 30)], [0, 0])
+        pred = self._pred([(0, 0, 10, 10), (20, 20, 30, 30)], [0.9, 0.8], [0, 0])
+        assert abs(AI.average_recall(gt, pred) - 1.0) < 1e-12
+        assert abs(AI.average_recall(gt, pred, max_dets=1) - 0.5) < 1e-12
+
+    def test_rejects_bad_inputs(self):
+        gt = self._gt([(0, 0, 10, 10)], [0])
+        pred = self._pred([(0, 0, 10, 10)], [0.9], [0])
+        with pytest.raises(ValueError):
+            AI.mean_average_precision(gt, [])
+        with pytest.raises(ValueError):
+            AI.box_iou([0, 0, 1], [0, 0, 1, 1])
+        with pytest.raises(ValueError):
+            AI.box_iou([2, 0, 1, 1], [0, 0, 1, 1])
+        with pytest.raises(ValueError):
+            AI.mean_average_precision(gt, pred, 1.5)
+        with pytest.raises(ValueError):
+            AI.mean_average_precision(gt, pred, True)
+        with pytest.raises(ValueError):
+            AI.mean_average_precision([{"boxes": [], "labels": []}],
+                                      self._pred([], [], []))
+        with pytest.raises(ValueError):
+            AI.detection_average_precision(
+                self._gt([(0, 0, 1, 1), (2, 2, 3, 3)], [0, 1]),
+                self._pred([(0, 0, 1, 1), (2, 2, 3, 3)], [0.9, 0.8], [0, 1]))
+        with pytest.raises(ValueError):
+            AI.average_recall(gt, pred, max_dets=0)

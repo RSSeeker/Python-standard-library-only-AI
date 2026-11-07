@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1344 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1352 项）
 
 ## 特性
 
@@ -1346,6 +1346,34 @@ for row in reliability_diagram(y, p, n_bins=5):
 - ECE/MCE 只统计非空箱，所以输出恒为「有样本的箱」的加权或最大值；概率要求落在
   `[0,1]`（不做归一化，softmax 输出可直接传）。
 
+### 检测指标（W13-I）
+
+| 函数 | 说明 |
+|---|---|
+| `box_iou(a, b)` / `box_area(box)` | 轴对齐矩形 IoU 与面积 |
+| `detection_average_precision(gt, preds, iou_threshold=0.5)` | 单类 AP（全点插值） |
+| `mean_average_precision(gt, preds, iou_threshold=0.5)` | 多类 mAP（各类 AP 的宏平均） |
+| `mean_average_precision_range(gt, preds, thresholds=None)` | mAP@[.5:.95]，默认 10 档 |
+| `average_recall(gt, preds, iou_threshold=0.5, max_dets=100)` | AR（按 max_dets 截断） |
+
+```python
+gt = [{"boxes": [[0, 0, 10, 10]], "labels": [0]}]
+pred = [{"boxes": [[0, 0, 10, 10]], "labels": [0], "scores": [0.9]}]
+print(mean_average_precision(gt, pred))          # 1.0
+print(mean_average_precision_range(gt, pred))    # 1.0
+print(average_recall(gt, pred))                  # 1.0
+```
+
+四点说明：
+
+- **`gt` / `preds` 是「每张图一个 dict」的列表**：`{"boxes": [[x1,y1,x2,y2], ...],
+  "labels": [...]}`，预测额外带 `"scores"`。坐标要求 `x2 >= x1`、`y2 >= y1`。
+- **匹配是贪心的**：按分数降序，每个预测在「同图、同类、未占用」的真实框里取 IoU
+  最高的一个，达到阈值即 TP，否则 FP（重复命中同一 GT 的第二个预测算 FP）。
+- **AP 用全点插值**：先算 precision 包络（从右往左取最大），再按 recall 增量加权。
+- **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
+  10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1762,7 +1790,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1344 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1352 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1941,6 +1969,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSpeechMetrics` | WER 的五种编辑组合、`_edit_ops` 三元组、CER 的中英文、SER 的值错/缺失/多出与四种非法输入 |
 | `TestClusteringMetrics` | silhouette 含单点簇、CH 手算 400、DB 手算、ARI 的 1/-0.5、NMI 手算、AMI 的负数与细分 0.5333、九条非法输入 |
 | `TestCalibrationMetrics` | ECE/MCE 手算、单列与两列等价、多分类、可靠性图结构与 quantile 分箱、十条非法输入 |
+| `TestDetectionMetrics` | IoU 手算、完美 AP、FP 在前的 2/3、阈值改变结果、mAP 与 mAP@[.5:.95]、AR 的 max_dets、八条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1994,7 +2023,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1344 个单元测试
+├── test_ai.py       # 1352 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

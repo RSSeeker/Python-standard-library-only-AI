@@ -28612,6 +28612,249 @@ def jaccard_score(y_true, y_pred, average: str = "macro",
 #  校准指标（ECE / MCE / Reliability Diagram）
 # ============================================================================
 
+# ============================================================================
+#  检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+# ============================================================================
+
+def _det_box(box, who, tag):
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        raise ValueError(f"{who}: {tag} 必须是 [x1, y1, x2, y2]")
+    vals = [_metric_number(v, f"{who}.{tag}", i) for i, v in enumerate(box)]
+    if vals[2] < vals[0] or vals[3] < vals[1]:
+        raise ValueError(
+            f"{who}: {tag} 需要 x2 >= x1 且 y2 >= y1，收到 {vals}")
+    return vals
+
+
+def box_area(box) -> float:
+    """矩形面积（宽或高为 0 时返回 0）。"""
+    b = _det_box(box, "box_area", "box")
+    return (b[2] - b[0]) * (b[3] - b[1])
+
+
+def box_iou(box_a, box_b) -> float:
+    """两个轴对齐矩形的 IoU；并集为 0 时返回 0。"""
+    a = _det_box(box_a, "box_iou", "box_a")
+    b = _det_box(box_b, "box_iou", "box_b")
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _det_check_images(gt, preds, who):
+    if not isinstance(gt, (list, tuple)) or not isinstance(preds, (list, tuple)):
+        raise ValueError(f"{who}: gt 与 preds 都必须是列表（每项一张图）")
+    if len(gt) != len(preds):
+        raise ValueError(
+            f"{who}: gt 有 {len(gt)} 张图，preds 有 {len(preds)} 张")
+    if not gt:
+        raise ValueError(f"{who}: 至少要有一张图")
+    gts = []
+    for i, item in enumerate(gt):
+        if not isinstance(item, dict):
+            raise ValueError(f"{who}: gt[{i}] 必须是 {{'boxes','labels'}}")
+        boxes = item.get("boxes", [])
+        labels = item.get("labels", [])
+        if not isinstance(boxes, (list, tuple)) or not isinstance(labels, (list, tuple)):
+            raise ValueError(f"{who}: gt[{i}] 的 boxes/labels 必须是列表")
+        if len(boxes) != len(labels):
+            raise ValueError(
+                f"{who}: gt[{i}] 的 boxes 有 {len(boxes)} 个、labels 有 {len(labels)} 个")
+        gts.append((
+            [_det_box(b, who, f"gt[{i}].boxes[{j}]") for j, b in enumerate(boxes)],
+            [_metric_label(v, who, j) for j, v in enumerate(labels)],
+        ))
+    outs = []
+    for i, item in enumerate(preds):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{who}: preds[{i}] 必须是 {{'boxes','labels','scores'}}")
+        boxes = item.get("boxes", [])
+        labels = item.get("labels", [])
+        scores = item.get("scores", [])
+        for name, seq in (("boxes", boxes), ("labels", labels), ("scores", scores)):
+            if not isinstance(seq, (list, tuple)):
+                raise ValueError(f"{who}: preds[{i}].{name} 必须是列表")
+        if not (len(boxes) == len(labels) == len(scores)):
+            raise ValueError(
+                f"{who}: preds[{i}] 的 boxes/labels/scores 长度不一致"
+                f"（{len(boxes)}/{len(labels)}/{len(scores)}）")
+        outs.append((
+            [_det_box(b, who, f"preds[{i}].boxes[{j}]") for j, b in enumerate(boxes)],
+            [_metric_label(v, who, j) for j, v in enumerate(labels)],
+            [_metric_number(v, who, j) for j, v in enumerate(scores)],
+        ))
+    return gts, outs
+
+
+def _det_check_iou(iou_threshold, who):
+    if isinstance(iou_threshold, bool) or not isinstance(iou_threshold, (int, float)):
+        raise ValueError(f"{who}: iou_threshold 必须是数字")
+    if not 0.0 <= float(iou_threshold) <= 1.0:
+        raise ValueError(
+            f"{who}: iou_threshold 必须在 [0, 1]，收到 {iou_threshold}")
+    return float(iou_threshold)
+
+
+def _det_match(gts, preds, iou_threshold, class_id, max_dets=None):
+    """贪心匹配一类：返回 (tp 数组, fp 数组, 分数数组, 该类真实框数)。"""
+    n_gt = 0
+    for boxes, labels in gts:
+        for lab in labels:
+            if lab == class_id:
+                n_gt += 1
+    entries = []
+    for img, (boxes, labels, scores) in enumerate(preds):
+        for j, lab in enumerate(labels):
+            if lab == class_id:
+                entries.append((scores[j], img, j))
+    entries.sort(key=lambda e: (-e[0], e[1], e[2]))
+    if max_dets is not None and len(entries) > max_dets:
+        entries = entries[:max_dets]
+    taken = {}
+    tp = []
+    fp = []
+    conf = []
+    for score, img, j in entries:
+        gt_boxes, gt_labels = gts[img]
+        used = taken.setdefault(img, set())
+        best_iou = -1.0
+        best_k = -1
+        for k, gbox in enumerate(gt_boxes):
+            if gt_labels[k] != class_id or k in used:
+                continue
+            iou = box_iou(preds[img][0][j], gbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_k = k
+        if best_k >= 0 and best_iou >= iou_threshold:
+            used.add(best_k)
+            tp.append(1.0)
+            fp.append(0.0)
+        else:
+            tp.append(0.0)
+            fp.append(1.0)
+        conf.append(score)
+    return tp, fp, conf, n_gt
+
+
+def _det_ap(tp, fp, n_gt):
+    """全点插值 AP（precision 包络 + 逐点 Δrecall 加权）。"""
+    if n_gt == 0:
+        return 0.0
+    tp_run = 0.0
+    fp_run = 0.0
+    precisions = []
+    recalls = []
+    for t, f in zip(tp, fp):
+        tp_run += t
+        fp_run += f
+        precisions.append(tp_run / (tp_run + fp_run))
+        recalls.append(tp_run / float(n_gt))
+    for i in range(len(precisions) - 2, -1, -1):
+        if precisions[i] < precisions[i + 1]:
+            precisions[i] = precisions[i + 1]
+    ap = 0.0
+    prev = 0.0
+    for p, r in zip(precisions, recalls):
+        if r > prev:
+            ap += (r - prev) * p
+            prev = r
+    return ap
+
+
+def _det_classes(gts):
+    out = set()
+    for boxes, labels in gts:
+        out.update(labels)
+    return sorted(out)
+
+
+def detection_average_precision(gt, preds, iou_threshold: float = 0.5):
+    """单类检测的平均精度（AP）。
+
+    `gt` / `preds` 是**每张图一个 dict** 的列表：
+    `{"boxes": [[x1,y1,x2,y2], ...], "labels": [...]}`；
+    `preds` 另外带 `"scores"`。只支持一个类别（多类请用 `mean_average_precision`）。
+    """
+    who = "detection_average_precision"
+    thr = _det_check_iou(iou_threshold, who)
+    gts, outs = _det_check_images(gt, preds, who)
+    classes = _det_classes(gts)
+    if len(classes) > 1:
+        raise ValueError(
+            f"{who}: gt 里有 {len(classes)} 个类别 {classes}，"
+            "请改用 mean_average_precision")
+    class_id = classes[0] if classes else 0
+    tp, fp, _, n_gt = _det_match(gts, outs, thr, class_id)
+    if n_gt == 0:
+        raise ValueError(f"{who}: gt 里没有类别 {class_id} 的真实框")
+    return _det_ap(tp, fp, n_gt)
+
+
+def mean_average_precision(gt, preds, iou_threshold: float = 0.5):
+    """多类 mAP：每个类别各自算 AP（全点插值），再对类别取宏平均。"""
+    who = "mean_average_precision"
+    thr = _det_check_iou(iou_threshold, who)
+    gts, outs = _det_check_images(gt, preds, who)
+    classes = _det_classes(gts)
+    if not classes:
+        raise ValueError(f"{who}: gt 里没有任何真实框")
+    aps = []
+    for class_id in classes:
+        tp, fp, _, n_gt = _det_match(gts, outs, thr, class_id)
+        aps.append(_det_ap(tp, fp, n_gt))
+    return sum(aps) / float(len(aps))
+
+
+def mean_average_precision_range(gt, preds, thresholds=None):
+    """COCO 口径的 mAP@[.5:.95]：默认 10 个 IoU 阈值（0.5 起每 0.05 一档）。"""
+    who = "mean_average_precision_range"
+    gts, _ = _det_check_images(gt, preds, who)
+    if not gts:
+        raise ValueError(f"{who}: 至少要有一张图")
+    if thresholds is None:
+        thresholds = [0.5 + 0.05 * i for i in range(10)]
+    if not isinstance(thresholds, (list, tuple)) or not thresholds:
+        raise ValueError(f"{who}: thresholds 必须是非空列表")
+    vals = []
+    for t in thresholds:
+        thr = _det_check_iou(t, who)
+        vals.append(mean_average_precision(gt, preds, iou_threshold=thr))
+    return sum(vals) / float(len(vals))
+
+
+def average_recall(gt, preds, iou_threshold: float = 0.5, max_dets: int = 100):
+    """AR：每个类别取前 `max_dets` 个预测的召回率，再对类别宏平均。"""
+    who = "average_recall"
+    thr = _det_check_iou(iou_threshold, who)
+    if isinstance(max_dets, bool) or not isinstance(max_dets, int):
+        raise ValueError(f"{who}: max_dets 必须是整数")
+    if max_dets < 1:
+        raise ValueError(f"{who}: max_dets 必须 >= 1，收到 {max_dets}")
+    gts, outs = _det_check_images(gt, preds, who)
+    classes = _det_classes(gts)
+    if not classes:
+        raise ValueError(f"{who}: gt 里没有任何真实框")
+    recalls = []
+    for class_id in classes:
+        tp, _, _, n_gt = _det_match(gts, outs, thr, class_id, max_dets=max_dets)
+        if n_gt == 0:
+            continue
+        recalls.append(sum(tp) / float(n_gt))
+    return sum(recalls) / float(len(recalls))
+
+
 def _cal_check_bins(n_bins, strategy):
     if isinstance(n_bins, bool) or not isinstance(n_bins, int):
         raise ValueError(f"校准: n_bins 必须是整数，收到 {type(n_bins).__name__}")

@@ -421,7 +421,11 @@
   - `strategy='uniform'` 等宽分箱；`'quantile'` 按分位点切，重复值会去重
   - 只统计非空箱；MCE 是各箱偏差绝对值的最大值
   - 探针 30 项（手算 ECE 0.14 / MCE 0.15 + 单列与两列等价 + 十条非法输入）
-- [ ] 检测：mAP / mAP@0.5 / mAP@[.5:.95] / AR（简化）
+- [x] 检测：mAP / mAP@0.5 / mAP@[.5:.95] / AR（简化）
+  - 匹配按分数降序贪心，同图同类未占用框中取 IoU 最大者
+  - AP 用全点插值（precision 包络 + Δrecall 加权）；重复命中算 FP
+  - 不做 NMS / 旋转框 / 忽略区域；mAP@[.5:.95] 是 10 档阈值的均值
+  - 探针 31 项（IoU 手算、FP 在前的 2/3、阈值 0.5 vs 0.3、AR 截断、十二条非法输入）
 - [ ] 图像：PSNR / SSIM / MS-SSIM；FID / KID / IS（简化并标注口径）
 - [ ] 一致性：Fleiss Kappa / Krippendorff Alpha；公平性：Demographic Parity / Equal Opportunity / Disparate Impact
 
