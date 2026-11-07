@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1241 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1252 项）
 
 ## 特性
 
@@ -1056,6 +1056,37 @@ x = train_aug(image)          # (3, 32, 32)
 `GaussianBlur` 的 `sigma` 可以给数字（固定）或 `(low, high)`（每次抽样）。所有类都对
 空输入、行宽不一致、非数字像素、非法超参报 `ValueError` / `TypeError`。
 
+### 文本增强与音频增强（W11-H）
+
+文本增强以 **token 列表**为单位（字符串或整数 token 均可），全部返回新列表、不改入参，
+`seed` 相同的两次调用逐位一致；音频部分只做**一维波形**上的概念性操作（本项目不含
+WAV 读写与重采样），用来演示「训练时对输入加扰动」这类接口的形状。
+
+| 函数 | 说明 |
+|---|---|
+| `synonym_replace(tokens, synonyms, p=0.1, seed=None)` | 逐 token 以概率 `p` 换成一个随机同义词；`synonyms` 里没有的 token 原样保留，空列表表示「无同义词」 |
+| `random_insert(tokens, synonyms, n=1, seed=None)` | EDA 随机插入：随机选一个 token，把它的随机同义词插到随机位置 |
+| `random_swap(tokens, n=1, seed=None)` | EDA 随机交换：随机两个不同位置交换，多集不变 |
+| `random_delete(tokens, p=0.1, seed=None)` | EDA 随机删除；保证至少剩 1 个 token |
+| `token_dropout(tokens, p=0.1, seed=None)` | 训练期 token 丢弃（`p` 是开区间 `[0,1)`），保证至少剩 1 个 |
+| `eda_augment(tokens, synonyms, num_aug=4, alpha_sr=0.1, alpha_ri=0.1, alpha_rs=0.1, p_rd=0.1, seed=None)` | 依次做 替换→插入→交换→删除，返回 `num_aug` 个副本（不含原句） |
+| `audio_gain(waveform, db=0.0)` | 振幅缩放 `10**(db/20)` |
+| `audio_add_noise(waveform, snr_db=10.0, seed=None)` | 按整体信号/噪声功率比加高斯白噪声；全零波形原样返回 |
+| `audio_time_shift(waveform, shift=0, fill=0.0)` | 整段平移，空位填 `fill`（要求 `|shift| < len`） |
+| `audio_clip(waveform, limit=1.0)` | 硬限幅，模拟削波 |
+| `audio_polarity_invert(waveform)` | 极性反转 |
+
+```python
+tokens = ["i", "like", "this", "movie"]
+syn = {"like": ["love", "enjoy"], "movie": ["film"]}
+aug = AI.eda_augment(tokens, syn, num_aug=2, seed=0)
+noisy = AI.audio_add_noise([0.1, -0.2, 0.3], snr_db=20.0, seed=0)
+```
+
+三条诚实边界：①同义词表由调用方提供，库内**不带**词表；②`eda_augment` 的每个操作次数
+按 `alpha * 长度` 取整且至少 1 次（`alpha=0` 才关闭），因此短句上扰动比例会偏高；
+③音频部分**不是**完整的增强库——没有重采样、变速、混响，也没有 WAV 读写。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1472,7 +1503,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1241 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1252 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1640,6 +1671,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestScalerFamily` | `RobustScaler` 的中位数/IQR 闭式值与「不中心化/不缩放」开关、`MaxAbsScaler` 列最大绝对值、`QuantileTransformer` 的参考分位数与插值（整数点 k/9、中点 0.5、越界夹取）与正态模式往返、Yeo-Johnson 的 8×5 个 (λ, x) 格点往返、`PowerTransformer` 的标准化后均值/方差与两种 method 的往返、四类未 fit/坏形状/非数字报错 |
 | `TestImputers` | 三种填补器的闭式值：`SimpleImputer` 的 mean/median/most_frequent/constant 与全缺失列填 0、`KNNImputer` 的 k=1/k=2 与 distance 权重（0.5）与无共享列回退、`IterativeImputer` 对 `y=2x` 与多列缺失的恢复、观测值不被改写、`n_iter_` 与提前停止、列主元消元的 2×2 精确解与奇异返回 None，以及三类坏形状/非法超参报错 |
 | `TestDimReductionSelection` | `PCA` 的秩一数据（`explained_variance_ratio_`=1、成分方向、均值点投到原点、k=1/k=2 往返）与白化后方差为 1、`TSNE` 让三类点的簇内平均距离小于簇间（1.2K 量级 vs 12 量级）且同种子可复现、`SMOTE` 补到4:4 且合成点落在少数类线段上、`ADASYN` 的加权与 `weights_`、`VarianceThreshold` 的方差值与去常量列、`SelectKBest` 的 F=8 与 pearson=2/√5、`RFE` 保留唯一有效列、`L1Selector` 保信号列压正交列，以及各类坏形状/非法超参 |
+| `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1693,7 +1725,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1241 个单元测试
+├── test_ai.py       # 1252 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

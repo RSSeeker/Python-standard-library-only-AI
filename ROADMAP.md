@@ -357,7 +357,13 @@
   - 探针 74 项：PCA 秩一/往返/白化、t-SNE 簇内<簇间且同种子可复现、SMOTE 4:4 与线段约束、
     ADASYN 加权、四个选择器的支持集与分数、28 条非法输入。
 
-- [ ] 文本增强（同义词替换 / EDA / Token Dropout）；音频增强（概念）
+- [x] 文本增强（同义词替换 / EDA / Token Dropout）；音频增强（概念）
+  - `synonym_replace` / `random_insert` / `random_swap` / `random_delete` / `token_dropout` / `eda_augment`，
+    以及 `audio_gain` / `audio_add_noise` / `audio_time_shift` / `audio_clip` / `audio_polarity_invert`。
+  - 判定修正：同义词表里的空列表本来被我判成非法，实际语义应是「这个 token 没有同义词」，已放宽为合法（
+    探针因此改一条期望值，不是改实现去凑数）。
+  - 探针 46 项：替换/插入/交换/删除的确定性与不变量、EDA 的词表闭包与 `p_rd=1` 仍非空、
+    加噪实测 SNR 10.0000 dB、6 dB 增益 1.9953、平移与限幅闭式值、20 条非法输入。
 
 ### W12 分词与批处理（§8）
 - [ ] 特殊 token 统一管理（BOS/EOS/PAD/UNK/SEP/CLS/MASK）

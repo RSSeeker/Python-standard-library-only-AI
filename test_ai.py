@@ -19994,3 +19994,120 @@ class TestDimReductionSelection:
             AI.L1Selector(alpha=1e9).fit(xl, yl)
         with pytest.raises(ValueError):
             AI.L1Selector().transform([[1.0]])
+
+
+class TestTextAudioAugmentation:
+    """W11-H 文本增强（同义词 / EDA）与音频增强（概念）。"""
+
+    def test_synonym_replace_probability_and_validity(self):
+        syn = {"a": ["a1", "a2"], "b": ["b1"], "z": []}
+        toks = ["a", "b", "c", "z"]
+        assert AI.synonym_replace(toks, syn, p=0.0) == toks
+        out = AI.synonym_replace(toks, syn, p=1.0, seed=7)
+        assert out[0] in syn["a"] and out[1] == "b1"
+        assert out[2] == "c" and out[3] == "z"
+        assert len(out) == len(toks)
+        assert AI.synonym_replace(toks, syn, p=1.0, seed=7) == out
+        with pytest.raises(ValueError):
+            AI.synonym_replace(toks, syn, p=1.5)
+        with pytest.raises(TypeError):
+            AI.synonym_replace(toks, [])
+
+    def test_random_insert_adds_synonyms(self):
+        syn = {"a": ["a1", "a2"], "b": ["b1"], "c": [], "z": []}
+        toks = ["a", "b", "c", "z"]
+        out = AI.random_insert(toks, syn, n=2, seed=3)
+        assert len(out) == len(toks) + 2
+        assert all(t in out for t in toks)
+        assert all(t in ("a1", "a2", "b1") for t in out if t not in toks)
+        assert AI.random_insert(toks, syn, n=0) == toks
+        assert AI.random_insert(toks, syn, n=2, seed=3) == out
+        with pytest.raises(ValueError):
+            AI.random_insert(["c", "z"], syn, n=1)
+
+    def test_random_swap_preserves_multiset(self):
+        toks = ["a", "b", "c", "d"]
+        assert AI.random_swap(toks, n=0) == toks
+        out = AI.random_swap(toks, n=3, seed=5)
+        assert sorted(out) == sorted(toks)
+        assert AI.random_swap(toks, n=3, seed=5) == out
+        with pytest.raises(ValueError):
+            AI.random_swap(["only"], n=1)
+
+    def test_random_delete_never_empties(self):
+        toks = ["a", "b", "c", "d"]
+        assert AI.random_delete(toks, p=0.0) == toks
+        assert len(AI.random_delete(toks, p=1.0, seed=1)) == 1
+        out = AI.random_delete(toks, p=0.5, seed=2)
+        assert 1 <= len(out) <= len(toks)
+        assert all(t in toks for t in out)
+
+    def test_token_dropout_bounds(self):
+        toks = ["a", "b", "c"]
+        assert AI.token_dropout(toks, p=0.0) == toks
+        assert len(AI.token_dropout(toks, p=0.999, seed=4)) >= 1
+        with pytest.raises(ValueError):
+            AI.token_dropout(toks, p=1.0)
+
+    def test_eda_augment_invariants(self):
+        base = ["i", "like", "this", "movie", "very", "much"]
+        syn = {"like": ["love", "enjoy"], "movie": ["film"]}
+        aug = AI.eda_augment(base, syn, num_aug=3, alpha_sr=0.3, alpha_ri=0.1,
+                          alpha_rs=0.1, p_rd=0.0, seed=11)
+        assert len(aug) == 3
+        vocab = set(base) | {"love", "enjoy", "film"}
+        for variant in aug:
+            assert len(variant) >= 1
+            assert all(t in vocab for t in variant)
+        assert AI.eda_augment(base, syn, num_aug=3, alpha_sr=0.3, alpha_ri=0.1,
+                           alpha_rs=0.1, p_rd=0.0, seed=11) == aug
+        with pytest.raises(ValueError):
+            AI.eda_augment(base, syn, num_aug=0)
+
+    def test_eda_augment_heavy_deletion_still_nonempty(self):
+        base = ["a", "b", "c"]
+        aug = AI.eda_augment(base, {"a": []}, num_aug=2, alpha_sr=0.0,
+                          alpha_ri=0.0, alpha_rs=0.0, p_rd=1.0, seed=2)
+        assert all(len(v) == 1 for v in aug)
+
+    def test_audio_gain_and_polarity(self):
+        w = [1.0, -0.5, 0.25]
+        assert AI.audio_gain(w, db=0.0) == w
+        g = AI.audio_gain(w, db=6.0)
+        assert abs(g[0] / w[0] - 10 ** (6 / 20.0)) < 1e-12
+        assert AI.audio_polarity_invert(w) == [-1.0, 0.5, -0.25]
+
+    def test_audio_add_noise_snr(self):
+        import math as _math
+        sig = [0.5 * _math.sin(2 * _math.pi * 5 * i / 64.0) for i in range(64)]
+        out = AI.audio_add_noise(sig, snr_db=10.0, seed=21)
+        noise = [out[i] - sig[i] for i in range(len(sig))]
+        p_sig = sum(v * v for v in sig) / len(sig)
+        p_noi = sum(v * v for v in noise) / len(noise)
+        snr = 10.0 * _math.log10(p_sig / p_noi)
+        assert abs(snr - 10.0) < 0.5
+        assert AI.audio_add_noise(sig, snr_db=10.0, seed=21) == out
+        assert AI.audio_add_noise([0.0] * 8, snr_db=5.0, seed=1) == [0.0] * 8
+
+    def test_audio_shift_and_clip(self):
+        assert AI.audio_time_shift([1.0, 2.0, 3.0, 4.0], shift=2, fill=-1.0) == [-1.0, -1.0, 1.0, 2.0]
+        assert AI.audio_time_shift([1.0, 2.0, 3.0, 4.0], shift=-1) == [2.0, 3.0, 4.0, 0.0]
+        assert AI.audio_clip([0.5, 1.5, -2.0], limit=1.0) == [0.5, 1.0, -1.0]
+        with pytest.raises(ValueError):
+            AI.audio_time_shift([1.0, 2.0], shift=2)
+        with pytest.raises(ValueError):
+            AI.audio_clip([0.1], limit=0.0)
+
+    def test_augmentation_rejects_bad_input(self):
+        with pytest.raises(ValueError):
+            AI.synonym_replace([], {"a": ["b"]})
+        with pytest.raises(TypeError):
+            AI.synonym_replace("abc", {"a": ["b"]})
+        with pytest.raises(TypeError):
+            AI.random_insert(["a"], {"a": ["b"]}, n=1.5)
+        with pytest.raises(TypeError):
+            AI.random_delete(["a"], p="0.5")
+        with pytest.raises(ValueError):
+            AI.audio_gain([], 0.0)
+        with pytest.raises(TypeError):
+            AI.audio_add_noise(["a"], 10.0)

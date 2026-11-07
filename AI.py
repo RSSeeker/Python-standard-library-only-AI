@@ -25178,6 +25178,252 @@ class MinMaxScaler:
 
 
 #  ======================================================================
+#  W11-H：文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#  ======================================================================
+
+def _w11h_tokens(tokens, who):
+    if not isinstance(tokens, (list, tuple)):
+        raise TypeError("%s: tokens 必须是列表" % who)
+    if not tokens:
+        raise ValueError("%s: tokens 不能为空" % who)
+    for t in tokens:
+        if not isinstance(t, (str, int)) or isinstance(t, bool):
+            raise TypeError("%s: token 必须是字符串或整数" % who)
+    return list(tokens)
+
+
+def _w11h_synonyms(synonyms, who):
+    if not isinstance(synonyms, dict):
+        raise TypeError("%s: synonyms 必须是 dict（token -> 同义词列表）" % who)
+    for key, vals in synonyms.items():
+        if not isinstance(vals, (list, tuple)):
+            raise TypeError("%s: 同义词表 %r 必须是列表" % (who, key))
+        for v in vals:
+            if not isinstance(v, (str, int)) or isinstance(v, bool):
+                raise TypeError("%s: 同义词必须是字符串或整数" % who)
+    return synonyms
+
+
+def synonym_replace(tokens, synonyms, p=0.1, seed=None):
+    """逐 token 以概率 `p` 换成同义词表里的随机一个（没有同义词的 token 跳过）。"""
+    toks = _w11h_tokens(tokens, "synonym_replace")
+    syn = _w11h_synonyms(synonyms, "synonym_replace")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        raise TypeError("synonym_replace: p 必须是数字")
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("synonym_replace: p 必须在 [0, 1] 内")
+    rng = random.Random(seed)
+    out = []
+    for t in toks:
+        cands = syn.get(t)
+        if cands and rng.random() < p:
+            out.append(cands[rng.randrange(len(cands))])
+        else:
+            out.append(t)
+    return out
+
+
+def random_insert(tokens, synonyms, n=1, seed=None):
+    """EDA 随机插入：每次随机选一个 token，把它随机的一个同义词插入随机位置。"""
+    toks = _w11h_tokens(tokens, "random_insert")
+    syn = _w11h_synonyms(synonyms, "random_insert")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("random_insert: n 必须是整数")
+    if n < 0:
+        raise ValueError("random_insert: n 不能为负")
+    rng = random.Random(seed)
+    out = list(toks)
+    usable = [t for t in toks if syn.get(t)]
+    if n > 0 and not usable:
+        raise ValueError("random_insert: 没有任何 token 有同义词，无法插入")
+    for _ in range(n):
+        src = usable[rng.randrange(len(usable))]
+        cands = syn[src]
+        new = cands[rng.randrange(len(cands))]
+        out.insert(rng.randrange(len(out) + 1), new)
+    return out
+
+
+def random_swap(tokens, n=1, seed=None):
+    """EDA 随机交换：随机挑两个不同位置交换，重复 `n` 次（多集不变）。"""
+    toks = _w11h_tokens(tokens, "random_swap")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("random_swap: n 必须是整数")
+    if n < 0:
+        raise ValueError("random_swap: n 不能为负")
+    if len(toks) < 2:
+        raise ValueError("random_swap: 至少需要 2 个 token")
+    rng = random.Random(seed)
+    out = list(toks)
+    for _ in range(n):
+        i = rng.randrange(len(out))
+        j = rng.randrange(len(out) - 1)
+        if j >= i:
+            j += 1
+        out[i], out[j] = out[j], out[i]
+    return out
+
+
+def random_delete(tokens, p=0.1, seed=None):
+    """EDA 随机删除：逐 token 以概率 `p` 删除，至少保留 1 个 token。"""
+    toks = _w11h_tokens(tokens, "random_delete")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        raise TypeError("random_delete: p 必须是数字")
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("random_delete: p 必须在 [0, 1] 内")
+    rng = random.Random(seed)
+    out = [t for t in toks if rng.random() >= p]
+    if not out:
+        out = [toks[rng.randrange(len(toks))]]
+    return out
+
+
+def token_dropout(tokens, p=0.1, seed=None):
+    """Token Dropout：逐 token 独立丢弃（等价于随机删除，但语义是训练期正则）。
+
+    与 `random_delete` 的差别只在约定：本函数面向「训练时把 token 抹掉」，
+    同样保证至少保留 1 个 token；要按 EDA 的 alpha 比例删除请用 `eda_augment`。
+    """
+    toks = _w11h_tokens(tokens, "token_dropout")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        raise TypeError("token_dropout: p 必须是数字")
+    if not 0.0 <= p < 1.0:
+        raise ValueError("token_dropout: p 必须在 [0, 1) 内")
+    rng = random.Random(seed)
+    out = [t for t in toks if rng.random() >= p]
+    return out if out else [toks[rng.randrange(len(toks))]]
+
+
+def eda_augment(tokens, synonyms, num_aug=4, alpha_sr=0.1, alpha_ri=0.1,
+                alpha_rs=0.1, p_rd=0.1, seed=None):
+    """EDA：对每个副本依次做 同义词替换 → 随机插入 → 随机交换 → 随机删除。
+
+    每个操作的次数按 `alpha * 长度` 取整（至少 0），`p_rd` 是删除概率。
+    返回 `num_aug` 个增强后的 token 列表（不含原句）。
+    """
+    toks = _w11h_tokens(tokens, "eda_augment")
+    syn = _w11h_synonyms(synonyms, "eda_augment")
+    if isinstance(num_aug, bool) or not isinstance(num_aug, int):
+        raise TypeError("eda_augment: num_aug 必须是整数")
+    if num_aug < 1:
+        raise ValueError("eda_augment: num_aug 必须 >= 1")
+    for name, v in (("alpha_sr", alpha_sr), ("alpha_ri", alpha_ri),
+                    ("alpha_rs", alpha_rs), ("p_rd", p_rd)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError("eda_augment: %s 必须是数字" % name)
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("eda_augment: %s 必须在 [0, 1] 内" % name)
+    n = len(toks)
+    n_sr = max(1, int(alpha_sr * n)) if alpha_sr > 0 else 0
+    n_ri = max(1, int(alpha_ri * n)) if alpha_ri > 0 else 0
+    n_rs = max(1, int(alpha_rs * n)) if alpha_rs > 0 else 0
+    rng = random.Random(seed)
+    out = []
+    for _ in range(num_aug):
+        cur = list(toks)
+        if n_sr:
+            idxs = list(range(len(cur)))
+            rng.shuffle(idxs)
+            for pos in idxs[:min(n_sr, len(cur))]:
+                cands = syn.get(cur[pos])
+                if cands:
+                    cur[pos] = cands[rng.randrange(len(cands))]
+        if n_ri:
+            usable = [t for t in cur if syn.get(t)]
+            for _i in range(n_ri):
+                if not usable:
+                    break
+                src = usable[rng.randrange(len(usable))]
+                cands = syn[src]
+                cur.insert(rng.randrange(len(cur) + 1),
+                           cands[rng.randrange(len(cands))])
+        if n_rs and len(cur) >= 2:
+            for _i in range(n_rs):
+                i = rng.randrange(len(cur))
+                j = rng.randrange(len(cur) - 1)
+                if j >= i:
+                    j += 1
+                cur[i], cur[j] = cur[j], cur[i]
+        if p_rd > 0:
+            kept = [t for t in cur if rng.random() >= p_rd]
+            cur = kept if kept else [cur[rng.randrange(len(cur))]]
+        out.append(cur)
+    return out
+
+
+def _w11h_wave(x, who):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 波形必须是非空的一维列表" % who)
+    for v in x:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError("%s: 采样值必须是数字" % who)
+    return [float(v) for v in x]
+
+
+def audio_gain(waveform, db=0.0):
+    """按分贝缩放振幅：`out = x * 10**(db/20)`（0 dB 原样返回）。"""
+    w = _w11h_wave(waveform, "audio_gain")
+    if isinstance(db, bool) or not isinstance(db, (int, float)):
+        raise TypeError("audio_gain: db 必须是数字")
+    g = 10.0 ** (db / 20.0)
+    return [v * g for v in w]
+
+
+def audio_add_noise(waveform, snr_db=10.0, seed=None):
+    """加高斯白噪声，按整体信号功率与噪声功率的比值控制 SNR（dB）。
+
+    噪声幅度按 `sqrt(signal_power / noise_power * 10**(-snr/10))` 缩放；全零波形时
+    直接返回原波形（没有信号功率可参照）。
+    """
+    w = _w11h_wave(waveform, "audio_add_noise")
+    if isinstance(snr_db, bool) or not isinstance(snr_db, (int, float)):
+        raise TypeError("audio_add_noise: snr_db 必须是数字")
+    sig_p = sum(v * v for v in w) / len(w)
+    if sig_p <= 0.0:
+        return list(w)
+    rng = random.Random(seed)
+    noise = [rng.gauss(0.0, 1.0) for _ in w]
+    noise_p = sum(v * v for v in noise) / len(noise)
+    if noise_p <= 0.0:
+        return list(w)
+    scale = math.sqrt(sig_p / noise_p * (10.0 ** (-float(snr_db) / 10.0)))
+    return [w[i] + scale * noise[i] for i in range(len(w))]
+
+
+def audio_time_shift(waveform, shift=0, fill=0.0):
+    """整段平移 `shift` 个采样（正数右移），空出来的位置填 `fill`。"""
+    w = _w11h_wave(waveform, "audio_time_shift")
+    if isinstance(shift, bool) or not isinstance(shift, int):
+        raise TypeError("audio_time_shift: shift 必须是整数")
+    if abs(shift) >= len(w):
+        raise ValueError("audio_time_shift: |shift| 必须小于波形长度 %d" % len(w))
+    if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+        raise TypeError("audio_time_shift: fill 必须是数字")
+    n = len(w)
+    out = [float(fill)] * n
+    for i in range(n):
+        j = i + shift
+        if 0 <= j < n:
+            out[j] = w[i]
+    return out
+
+
+def audio_clip(waveform, limit=1.0):
+    """硬限幅到 `[-limit, limit]`（模拟削波失真）。"""
+    w = _w11h_wave(waveform, "audio_clip")
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise TypeError("audio_clip: limit 必须是数字")
+    if limit <= 0:
+        raise ValueError("audio_clip: limit 必须为正")
+    lim = float(limit)
+    return [lim if v > lim else (-lim if v < -lim else v) for v in w]
+
+
+def audio_polarity_invert(waveform):
+    """极性反转（相位取反），用于测试模型对绝对相位的敏感性。"""
+    return [-v for v in _w11h_wave(waveform, "audio_polarity_invert")]
+
+#  ======================================================================
 #  W11-G：降维 / 不平衡采样 / 特征选择
 #  ======================================================================
 
