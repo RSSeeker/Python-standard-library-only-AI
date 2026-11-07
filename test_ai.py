@@ -20571,3 +20571,77 @@ class TestClassificationMetricsExtra:
             AI.jaccard_score([0, 1], [0, 1], average="binary")
         with pytest.raises(ValueError):
             AI.hamming_score([[1, 0]], [1])
+
+
+class TestRankingMetrics:
+    def test_precision_recall_at_k(self):
+        rel = [1, 0, 1, 0]
+        sc = [0.9, 0.8, 0.7, 0.6]
+        assert abs(AI.precision_at_k(rel, sc, 1) - 1.0) < 1e-12
+        assert abs(AI.precision_at_k(rel, sc, 2) - 0.5) < 1e-12
+        assert abs(AI.precision_at_k(rel, sc) - 0.5) < 1e-12
+        assert abs(AI.recall_at_k(rel, sc, 2) - 0.5) < 1e-12
+        assert abs(AI.recall_at_k(rel, sc, 3) - 1.0) < 1e-12
+
+    def test_precision_reorders_by_score(self):
+        assert abs(AI.precision_at_k([0, 1], [0.1, 0.9], 1) - 1.0) < 1e-12
+        assert abs(AI.precision_at_k([0, 1], [0.5, 0.5], 1)) < 1e-12
+
+    def test_hit_rate(self):
+        assert abs(AI.hit_rate_at_k([1, 0, 0], [0.9, 0.8, 0.7], 1) - 1.0) < 1e-12
+        assert abs(AI.hit_rate_at_k([0, 0, 1], [0.9, 0.8, 0.7], 2)) < 1e-12
+        assert abs(AI.hit_rate_at_k([0, 0, 1], [0.9, 0.8, 0.7], 3) - 1.0) < 1e-12
+
+    def test_reciprocal_rank(self):
+        assert abs(AI.reciprocal_rank([0, 0, 1], [0.9, 0.8, 0.7]) - 1.0 / 3.0) < 1e-12
+        assert abs(AI.reciprocal_rank([1, 0, 0], [0.9, 0.8, 0.7]) - 1.0) < 1e-12
+        assert abs(AI.reciprocal_rank([0, 0, 0], [0.9, 0.8, 0.7])) < 1e-12
+
+    def test_average_precision(self):
+        v = AI.average_precision_at_k([1, 0, 1], [0.9, 0.8, 0.7])
+        assert abs(v - (1.0 + 2.0 / 3.0) / 2.0) < 1e-12
+        assert abs(AI.average_precision_at_k([1, 0, 1], [0.9, 0.8, 0.7], 1) - 1.0) < 1e-12
+        assert abs(AI.average_precision_at_k([1, 1, 0], [0.9, 0.8, 0.1]) - 1.0) < 1e-12
+
+    def test_ndcg(self):
+        rel = [2, 0, 1]
+        sc = [0.9, 0.8, 0.7]
+        dcg = 3.0 / math.log2(2) + 0.0 / math.log2(3) + 1.0 / math.log2(4)
+        idcg = 3.0 / math.log2(2) + 1.0 / math.log2(3) + 0.0 / math.log2(4)
+        assert abs(AI.ndcg_at_k(rel, sc) - dcg / idcg) < 1e-12
+        assert abs(AI.ndcg_at_k([2, 1, 0], [0.9, 0.8, 0.7]) - 1.0) < 1e-12
+        assert abs(AI.ndcg_at_k(rel, sc, 10) - dcg / idcg) < 1e-12
+
+    def test_mean_variants(self):
+        qa = [[1, 0, 1], [0, 1, 0]]
+        qb = [[0.9, 0.8, 0.7], [0.1, 0.9, 0.2]]
+        want = (AI.average_precision_at_k(qa[0], qb[0]) +
+                AI.average_precision_at_k(qa[1], qb[1])) / 2.0
+        assert abs(AI.mean_average_precision_at_k(qa, qb) - want) < 1e-12
+        assert abs(AI.mean_reciprocal_rank(qa, qb) - 1.0) < 1e-12
+        want_ndcg = (AI.ndcg_at_k(qa[0], qb[0]) + AI.ndcg_at_k(qa[1], qb[1])) / 2.0
+        assert abs(AI.mean_ndcg_at_k(qa, qb) - want_ndcg) < 1e-12
+
+    def test_coverage(self):
+        rows = [[0.9, 0.1, 0.1, 0.1],
+                [0.1, 0.9, 0.1, 0.1],
+                [0.9, 0.1, 0.1, 0.1]]
+        assert abs(AI.coverage_at_k(rows, 1) - 0.5) < 1e-12
+        assert abs(AI.coverage_at_k(rows, 4) - 1.0) < 1e-12
+        assert abs(AI.coverage_at_k(rows) - 1.0) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.precision_at_k([1, 0], [0.5])
+        with pytest.raises(ValueError):
+            AI.precision_at_k([1], [0.5], 0)
+        with pytest.raises(ValueError):
+            AI.precision_at_k([2], [0.5])
+        with pytest.raises(ValueError):
+            AI.ndcg_at_k([0, 0], [0.5, 0.4])
+        with pytest.raises(ValueError):
+            AI.recall_at_k([0, 0], [0.5, 0.4])
+        with pytest.raises(ValueError):
+            AI.mean_average_precision_at_k([[1, 0]], [[0.5]])
+        with pytest.raises(ValueError):
+            AI.coverage_at_k([[0.5, 0.4], [0.5]])

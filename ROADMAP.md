@@ -402,7 +402,8 @@
   - `AI.py` 顶部新增 `import tracemalloc`。
 - [x] 分类：BalancedAccuracy / CohenKappa / Brier / LogLoss / PR-AUC / Specificity / Sensitivity / F-beta / Hamming / Jaccard（10 个；`_binary_counts` 统一二元计数、`_proba_matrix` 统一概率矩阵校验；探针 47 项全过，含 kappa 的 pe≥1 无定义、PR-AUC 阶梯面积、log_loss 与 `cross_entropy_loss` 同值）
   - 单位口径：Brier 单列按 `(p−y)²`、多列按 one-hot 求和平方；`log_loss` 单列时标签必须 0/1
-- [ ] 排序：NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage
+- [x] 排序：NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage（10 个函数：单查询 6 + 批量聚合 3 + coverage；`_rank_query`/`_rank_batches` 统一校验，按 `(-score, index)` 稳定排序；探针 48 项全过，含分级相关性 NDCG、AP 分母 `min(rel, k)`、coverage 并列口径）
+  - 口径：`k=None` 取全部、`k>n` 截到 n；P@k 分母是 `min(k, n)`；NDCG 增益 `2^rel−1`
 - [ ] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU
 - [ ] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity
 - [ ] 语音：WER / CER / SER（编辑距离）

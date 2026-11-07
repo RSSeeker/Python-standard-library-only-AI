@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1296 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1305 项）
 
 ## 特性
 
@@ -1197,6 +1197,31 @@ print(AI.brier_score([0, 1], [0.2, 0.8]))   # 0.0400
 
 `pr_auc_score` 用的是**阶梯式**平均精确率（与 sklearn `average_precision_score` 同口径），不是对 PR 曲线做梯形积分；后者在少数点上会高估。
 
+### 排序指标（W13-C）
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `precision_at_k(y_relevance, y_score, k=None)` | P@k：前 k 个里相关文档比例，分母 `min(k, 文档数)`；按分数降序、同分按原下标 |
+| `recall_at_k(...)` | R@k：前 k 个命中数 / 全部相关数；一个相关都没有时无定义（`ValueError`） |
+| `hit_rate_at_k(...)` | HitRate@k：前 k 个里至少命中一个则 1.0，否则 0.0 |
+| `reciprocal_rank(y_relevance, y_score)` | RR：第一个相关文档的排名倒数，没有相关文档则 0.0 |
+| `average_precision_at_k(...)` | AP@k：命中位置的 P@i 求平均，再除以 `min(相关总数, k)` |
+| `ndcg_at_k(y_relevance, y_score, k=None)` | NDCG@k：增益 `2^rel − 1`、折扣 `1/log2(rank+1)`；相关性可以是**分级**非负整数 |
+| `mean_average_precision_at_k(ys, scores, k)` | MAP@k：多条查询 AP@k 的平均 |
+| `mean_ndcg_at_k(...)` / `mean_reciprocal_rank(...)` | 平均 NDCG@k 与 MRR |
+| `coverage_at_k(y_score, k=None)` | 覆盖率：所有查询的 top-k 合起来覆盖的物品数 / 物品总数（列下标即物品） |
+
+```python
+rel = [1, 0, 1, 0]
+scores = [0.9, 0.8, 0.7, 0.6]
+print(AI.precision_at_k(rel, scores, 2))    # 0.5
+print(AI.ndcg_at_k([2, 0, 1], [0.9, 0.8, 0.7]))  # 0.9639
+print(AI.coverage_at_k([[0.9, 0.1], [0.1, 0.9]], 1))  # 1.0
+```
+
+口径说明：`k=None` 表示取全部文档；`k` 大于文档数时按文档数截断。P@k 的分母是 `min(k, n)`
+而不是固定 `k`，所以 3 个文档时 `k=10` 与 `k=3` 结果相同。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1613,7 +1638,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1296 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1305 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1786,6 +1811,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
 | `TestRegressionMetricsExtra` | MedAE 的奇偶中位与抗离群、MSLE/RMSLE 与手算一致且对负值报错、ExplainedVariance 对系统性偏移不惩罚（对照 R²）、调整 R² 与闭式一致且样本不足报错、Pinball 与 `quantile_loss` 一致、`inference_benchmark` 的字段自洽/`params`/峰值内存与参数校验 |
 | `TestClassificationMetricsExtra` | 平衡准确率 / kappa / 敏感度特异度 / F-beta 单调性 / 汉明 / Jaccard 三种 average / Brier 单列多列 / LogLoss 与 CE 同值 / PR-AUC 阶梯面积 |
+| `TestRankingMetrics` | P@k / R@k / HitRate / RR / AP@k / NDCG@k（含分级相关性）/ MAP@k / MRR / 平均 NDCG / Coverage，以及 k 截断与全部非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1839,7 +1865,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1296 个单元测试
+├── test_ai.py       # 1305 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

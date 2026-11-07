@@ -28713,6 +28713,195 @@ def pr_auc_score(y_true, y_score) -> float:
     return area
 
 
+# ============================================================================
+#  排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+# ============================================================================
+
+def _rank_k(k, n, who):
+    """把 k 归一化到 [1, n]；None 表示全取。"""
+    if k is None:
+        return n
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise ValueError(f"{who}: k 必须是整数，收到 {k!r}")
+    if k <= 0:
+        raise ValueError(f"{who}: k 必须大于 0，收到 {k}")
+    return min(k, n)
+
+
+def _rank_query(y_relevance, y_score, who, graded=False):
+    """校验一条查询的相关性/分数，返回 (相关性列表, 按分数降序的下标)。"""
+    if not isinstance(y_relevance, (list, tuple)) or not isinstance(y_score, (list, tuple)):
+        raise ValueError(f"{who}: y_relevance / y_score 必须是列表")
+    if len(y_relevance) != len(y_score):
+        raise ValueError(
+            f"{who}: 相关性长度 {len(y_relevance)} 与分数长度 {len(y_score)} 不一致")
+    if not y_relevance:
+        raise ValueError(f"{who}: 不能是空列表")
+    rel = []
+    for i, v in enumerate(y_relevance):
+        x = _metric_number(v, who, i)
+        if graded:
+            if x < 0.0:
+                raise ValueError(f"{who}: 第 {i} 个相关性不能是负数，收到 {x}")
+        elif x not in (0.0, 1.0):
+            raise ValueError(f"{who}: 第 {i} 个相关性必须是 0 或 1，收到 {x}")
+        rel.append(x)
+    score = [_metric_number(v, who, i) for i, v in enumerate(y_score)]
+    order = sorted(range(len(score)), key=lambda i: (-score[i], i))
+    return rel, order
+
+
+def _rank_top(rel, order, k):
+    return [rel[i] for i in order[:k]]
+
+
+def precision_at_k(y_relevance, y_score, k=None):
+    """P@k：前 k 个里相关文档所占比例（分母是 min(k, 文档数)）。"""
+    who = "precision_at_k"
+    rel, order = _rank_query(y_relevance, y_score, who)
+    k = _rank_k(k, len(rel), who)
+    return sum(_rank_top(rel, order, k)) / float(k)
+
+
+def recall_at_k(y_relevance, y_score, k=None):
+    """R@k：前 k 个里命中的相关文档占全部相关文档的比例。"""
+    who = "recall_at_k"
+    rel, order = _rank_query(y_relevance, y_score, who)
+    k = _rank_k(k, len(rel), who)
+    total = sum(rel)
+    if total <= 0.0:
+        raise ValueError(f"{who}: 该查询没有任何相关文档，召回率无定义")
+    return sum(_rank_top(rel, order, k)) / total
+
+
+def hit_rate_at_k(y_relevance, y_score, k=None):
+    """HitRate@k：前 k 个里至少命中一个相关文档则为 1.0，否则 0.0。"""
+    who = "hit_rate_at_k"
+    rel, order = _rank_query(y_relevance, y_score, who)
+    k = _rank_k(k, len(rel), who)
+    return 1.0 if sum(_rank_top(rel, order, k)) > 0.0 else 0.0
+
+
+def reciprocal_rank(y_relevance, y_score):
+    """RR：第一个相关文档的排名倒数；一个都没有则为 0.0。"""
+    who = "reciprocal_rank"
+    rel, order = _rank_query(y_relevance, y_score, who)
+    for rank, i in enumerate(order, 1):
+        if rel[i] > 0.0:
+            return 1.0 / rank
+    return 0.0
+
+
+def average_precision_at_k(y_relevance, y_score, k=None):
+    """AP@k：每个命中位置的 P@i 取平均，再除以 min(相关总数, k)。"""
+    who = "average_precision_at_k"
+    rel, order = _rank_query(y_relevance, y_score, who)
+    k = _rank_k(k, len(rel), who)
+    total = sum(rel)
+    if total <= 0.0:
+        raise ValueError(f"{who}: 该查询没有任何相关文档，AP 无定义")
+    hits = 0
+    acc = 0.0
+    for rank, r in enumerate(_rank_top(rel, order, k), 1):
+        if r > 0.0:
+            hits += 1
+            acc += hits / float(rank)
+    return acc / min(total, float(k))
+
+
+def ndcg_at_k(y_relevance, y_score, k=None):
+    """NDCG@k：增益 2^rel−1、折扣 1/log2(rank+1)，用理想排序归一化。"""
+    who = "ndcg_at_k"
+    rel, order = _rank_query(y_relevance, y_score, who, graded=True)
+    k = _rank_k(k, len(rel), who)
+    dcg = 0.0
+    for rank, r in enumerate(_rank_top(rel, order, k), 1):
+        dcg += (2.0 ** r - 1.0) / math.log2(rank + 1.0)
+    ideal = sorted(rel, reverse=True)[:k]
+    idcg = 0.0
+    for rank, r in enumerate(ideal, 1):
+        idcg += (2.0 ** r - 1.0) / math.log2(rank + 1.0)
+    if idcg <= 0.0:
+        raise ValueError(f"{who}: 该查询的相关性全为 0，NDCG 无定义")
+    return dcg / idcg
+
+
+def _rank_batches(y_relevance, y_score, who):
+    """校验「多条查询」的输入形状，返回 list 副本。"""
+    if not isinstance(y_relevance, (list, tuple)) or not isinstance(y_score, (list, tuple)):
+        raise ValueError(f"{who}: y_relevance / y_score 必须是「每条查询一个列表」的列表")
+    if len(y_relevance) != len(y_score):
+        raise ValueError(
+            f"{who}: 查询数不一致（{len(y_relevance)} vs {len(y_score)}）")
+    if not y_relevance:
+        raise ValueError(f"{who}: 至少要有一条查询")
+    rel_out, score_out = [], []
+    for i, (a, b) in enumerate(zip(y_relevance, y_score)):
+        if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)):
+            raise ValueError(f"{who}: 第 {i} 条查询的相关性/分数必须是列表")
+        if len(a) != len(b):
+            raise ValueError(
+                f"{who}: 第 {i} 条查询的相关性长度 {len(a)} 与分数长度 {len(b)} 不一致")
+        rel_out.append(list(a))
+        score_out.append(list(b))
+    return rel_out, score_out
+
+
+def mean_average_precision_at_k(y_relevance, y_score, k=None):
+    """MAP@k：各查询 AP@k 的平均。"""
+    who = "mean_average_precision_at_k"
+    rel, score = _rank_batches(y_relevance, y_score, who)
+    vals = [average_precision_at_k(a, b, k) for a, b in zip(rel, score)]
+    return sum(vals) / float(len(vals))
+
+
+def mean_ndcg_at_k(y_relevance, y_score, k=None):
+    """平均 NDCG@k。"""
+    who = "mean_ndcg_at_k"
+    rel, score = _rank_batches(y_relevance, y_score, who)
+    vals = [ndcg_at_k(a, b, k) for a, b in zip(rel, score)]
+    return sum(vals) / float(len(vals))
+
+
+def mean_reciprocal_rank(y_relevance, y_score):
+    """MRR：各查询 RR 的平均。"""
+    who = "mean_reciprocal_rank"
+    rel, score = _rank_batches(y_relevance, y_score, who)
+    vals = [reciprocal_rank(a, b) for a, b in zip(rel, score)]
+    return sum(vals) / float(len(vals))
+
+
+def coverage_at_k(y_score, k=None):
+    """Coverage@k：所有查询的 top-k 合起来覆盖了多少比例的物品。
+
+    传「每条查询一行分数」的矩阵，列下标即物品编号；覆盖率 =
+    曾进入任一 top-k 的物品数 / 物品总数。k=None 时等于全量。
+    """
+    who = "coverage_at_k"
+    if not isinstance(y_score, (list, tuple)):
+        raise ValueError(f"{who}: y_score 必须是「每条查询一行分数」的列表")
+    if not y_score:
+        raise ValueError(f"{who}: 至少要有一条查询")
+    rows = []
+    for i, row in enumerate(y_score):
+        if not isinstance(row, (list, tuple)):
+            raise ValueError(f"{who}: 第 {i} 行必须是列表")
+        if not row:
+            raise ValueError(f"{who}: 第 {i} 行不能为空")
+        rows.append([_metric_number(v, who, j) for j, v in enumerate(row)])
+    width = len(rows[0])
+    for i, row in enumerate(rows):
+        if len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 行宽度 {len(row)} 与第一行 {width} 不一致")
+    k = _rank_k(k, width, who)
+    seen = set()
+    for row in rows:
+        order = sorted(range(width), key=lambda j: (-row[j], j))
+        seen.update(order[:k])
+    return len(seen) / float(width)
+
+
 def median_absolute_error(y_true, y_pred) -> float:
     """MedAE：绝对误差的中位数（比 MAE 抗离群点）。"""
     yt, yp = _regression_pairs(y_true, y_pred, "median_absolute_error")
