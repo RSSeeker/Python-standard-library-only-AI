@@ -460,7 +460,10 @@
   - Rollout 与 Flow 在均匀注意力上本来就不同（前者含单位项），README 写明。
   - 探针 37 项；首跑 4 条失败全是我的期望值错：以为 flow 也加单位项、
     把 `discard_ratio` 的期望方向写反、`max`/`min` 融合的两处算术错。
-- [ ] `permutation_importance`；`feature_maps_ascii`（`attention_ascii` 扩展）
+- [x] `permutation_importance`；`feature_maps_ascii`（`attention_ascii` 扩展）
+  - `permutation_importance`：本地 `random.Random(seed)` 打乱、默认 `model.score`、返回 baseline/mean/std/names，探针 39 项
+  - `feature_maps_ascii`：单张 `H×W` 与 `(C,H,W)` 两种输入、每通道独立归一、块均值下采样
+  - 探针首跑 3 条失败都是我自己的期望值错（重要性的符号、峰值字符、零点字符表）
 - [ ] CNN：GradCAM / GradCAM++ / ScoreCAM / LayerCAM
 - [ ] 嵌入可视化（复用 t-SNE）；SHAP（KernelSHAP 简化）/ LIME（简化）/ Anchors
 - [ ] TCAV；Activation Maximization / Network Dissection；Counterfactual / CEM；Prototypes / Influence（简化）

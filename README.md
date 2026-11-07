@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1391 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1401 项）
 
 ## 特性
 
@@ -1487,6 +1487,26 @@ print(inception_score([[1.0, 0.0], [0.0, 1.0]]))   # 2.0
   先降到 `max_dim` 以内）。FID 不做样本量校正，KID 是无偏估计、小样本可为负值。
 - **Inception Score 接受未归一化的概率行**（内部按行归一），但每个值必须在 `[0,1]`。
 
+### 特征重要性与特征图（W14-C）
+
+| API | 说明 |
+| --- | --- |
+| `permutation_importance(model, x, y, n_repeats=5, seed=None, metric=None, names=None)` | 逐特征打乱 `n_repeats` 次，返回 `{"baseline", "mean", "std", "names"}`；`mean[j]` 是「基准得分 − 打乱第 j 列后的得分」，**越大越重要**，可为负（打乱反而变好） |
+| `feature_maps_ascii(maps, channels=None, max_width=24, max_channels=8)` | 把 `(C,H,W)` 特征图或单张 `H×W` 渲染成 ASCII；每张按**自身峰值**归一，块均值下采样到每行 `max_width` 个字符 |
+
+```python
+imp = permutation_importance(model, X, y, n_repeats=5, seed=0)
+for name, value in zip(imp["names"], imp["mean"]):
+    print(name, round(value, 4))
+
+print(feature_maps_ascii(conv_out))           # 前 8 个通道
+print(feature_maps_ascii(conv_out, channels=[0]))  # 只看第 0 个通道
+```
+
+- `metric` 是 `(x, y) -> float` 的回调，默认用 `model.score`（分类准确率 / 回归 R²）；分类任务想用别的口径就自己传。
+- 打乱用的是本地 `random.Random(seed)`，不推进全局 RNG；同 seed 可复现。
+- `feature_maps_ascii` 与 `attention_ascii` 共用字符表，但**每个通道独立归一**——绝对值不可跨通道比较，只能看同一张图内部的相对分布。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1903,7 +1923,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1391 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1401 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2087,6 +2107,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConsistencyFairness` | Fleiss 完美 1.0 与 Fleiss(1971) 经典例 0.2199、两两相反 0、Krippendorff 单单位手算 0、三种 level 的参考值、缺失值、三项公平性手算与 0.8 边界、十条非法输入 |
 | `TestAttribution` | 线性网络闭式梯度、Grad×Input 与梯度的关系、IG 完备性（线性精确 / ReLU 收敛）、DeepLIFT 完备性、SmoothGrad 退化与可复现、多分类 class_index、九条非法输入、softmax 拒绝 |
 | `TestAttentionAttribution` | 单位/均匀注意力的闭式结果、行和归一、flow 的列守恒、三种头部融合、discard_ratio 丢最小项、`attention_maps` 与多层 CausalLM 输入、八条非法输入 |
+| `TestPermutationFeatureMaps` | 置换重要性的基准/常数特征/重要特征/单次重复 std=0/种子复现/自定义 metric/参数校验；特征图 ASCII 的表头、峰值字符、通道选择、下采样宽度、常量与负值、六处非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2140,7 +2161,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1391 个单元测试
+├── test_ai.py       # 1401 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

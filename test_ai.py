@@ -21449,3 +21449,125 @@ class TestAttentionAttribution:
             AI.attention_rollout(42)
         with pytest.raises(ValueError):
             AI.attention_flow([])
+
+
+import pytest
+
+
+class TestPermutationFeatureMaps:
+    """W14-C：置换重要性 + 特征图 ASCII 渲染。"""
+
+    @staticmethod
+    def _model():
+        net = AI.MLP([2, 1], activations=["linear"])
+        net.layers[0].weights = [[1.0, 0.0]]
+        net.layers[0].biases = [0.0]
+        return AI.Model(net, loss_fn="mse", optimizer="adam", task="regression")
+
+    X = [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0], [4.0, 1.0], [5.0, 1.0],
+         [6.0, 1.0]]
+    Y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+    def test_permutation_shape_and_baseline(self):
+        model = self._model()
+        out = AI.permutation_importance(model, self.X, self.Y, n_repeats=4, seed=1)
+        assert set(out) == {"baseline", "mean", "std", "names"}
+        assert abs(out["baseline"] - 1.0) < 1e-12
+        assert out["names"] == ["f0", "f1"]
+        assert len(out["mean"]) == 2
+
+    def test_permutation_constant_feature_is_zero(self):
+        model = self._model()
+        out = AI.permutation_importance(model, self.X, self.Y, n_repeats=4, seed=1)
+        assert abs(out["mean"][1]) < 1e-12
+
+    def test_permutation_useful_feature_matters(self):
+        model = self._model()
+        out = AI.permutation_importance(model, self.X, self.Y, n_repeats=4, seed=1)
+        assert out["mean"][0] > 0.1
+        assert all(s >= 0.0 for s in out["std"])
+
+    def test_permutation_single_repeat_has_zero_std(self):
+        model = self._model()
+        out = AI.permutation_importance(model, self.X, self.Y, n_repeats=1, seed=2)
+        assert out["std"][0] == 0.0
+
+    def test_permutation_seed_reproducible(self):
+        model = self._model()
+        a = AI.permutation_importance(model, self.X, self.Y, n_repeats=3, seed=7)
+        b = AI.permutation_importance(model, self.X, self.Y, n_repeats=3, seed=7)
+        c = AI.permutation_importance(model, self.X, self.Y, n_repeats=3, seed=8)
+        assert a["mean"] == b["mean"]
+        assert a["mean"] != c["mean"]
+
+    def test_permutation_custom_metric_and_names(self):
+        model = self._model()
+        net = model.model
+
+        def hit_rate(xs, ys):
+            hit = 0
+            for xr, yr in zip(xs, ys):
+                if abs(net.forward(xr)[0] - yr) < 0.5:
+                    hit += 1
+            return hit / float(len(xs))
+
+        out = AI.permutation_importance(model, self.X, self.Y, n_repeats=2,
+                                     metric=hit_rate, names=["温度", "常数"])
+        assert abs(out["baseline"] - 1.0) < 1e-12
+        assert out["names"] == ["温度", "常数"]
+
+    def test_permutation_rejects_bad_input(self):
+        model = self._model()
+        with pytest.raises(ValueError):
+            AI.permutation_importance(model, [], [])
+        with pytest.raises(ValueError):
+            AI.permutation_importance(model, self.X, self.Y[:3])
+        with pytest.raises(ValueError):
+            AI.permutation_importance(model, [[1.0, 2.0], [3.0]], [0.0, 1.0])
+        with pytest.raises(ValueError):
+            AI.permutation_importance(model, self.X, self.Y, n_repeats=0)
+        with pytest.raises(ValueError):
+            AI.permutation_importance(model, self.X, self.Y, names=["a"])
+
+    def test_feature_maps_single_plane(self):
+        plane = [[0.0, 1.0, 2.0, 3.0],
+                 [4.0, 5.0, 6.0, 7.0],
+                 [8.0, 9.0, 10.0, 11.0],
+                 [12.0, 13.0, 14.0, 15.0]]
+        text = AI.feature_maps_ascii(plane, max_width=4)
+        lines = text.split("\n")
+        assert lines[0].startswith("map  (4x4")
+        assert len(lines) == 7
+        assert "@" in lines[4]
+        assert lines[1][0] == " "
+
+    def test_feature_maps_channels(self):
+        plane = [[float(i * 4 + j) for j in range(4)] for i in range(4)]
+        flat = [[1.0] * 4 for _ in range(4)]
+        both = AI.feature_maps_ascii([plane, flat], max_width=4)
+        assert both.count("channel ") == 2
+        only_one = AI.feature_maps_ascii([plane, flat], max_channels=1)
+        assert only_one.count("channel ") == 1
+        picked = AI.feature_maps_ascii([plane, flat], channels=[1])
+        assert "channel 1" in picked and "channel 0" not in picked
+        assert "峰值 1" in picked.split("\n")[0]
+
+    def test_feature_maps_edge_values_and_errors(self):
+        const = AI.feature_maps_ascii([[5.0] * 3 for _ in range(3)], max_width=3)
+        assert "峰值 5" in const.split("\n")[0]
+        neg = AI.feature_maps_ascii([[-3.0, -1.0], [-2.0, 0.0]], max_width=2)
+        assert "峰值 0" in neg.split("\n")[0]
+        wide = [[float(i * 8 + j) for j in range(8)] for i in range(8)]
+        wlines = AI.feature_maps_ascii(wide, max_width=4).split("\n")
+        assert len(wlines) == 7
+        assert len(wlines[1].strip()) <= 4
+        with pytest.raises(ValueError):
+            AI.feature_maps_ascii([])
+        with pytest.raises(ValueError):
+            AI.feature_maps_ascii([[1.0, 2.0], [3.0]])
+        with pytest.raises(ValueError):
+            AI.feature_maps_ascii([[1.0, "x"]])
+        with pytest.raises(ValueError):
+            AI.feature_maps_ascii([[1.0, 2.0]], max_width=0)
+        with pytest.raises(ValueError):
+            AI.feature_maps_ascii([[[1.0, 2.0]]], channels=[])

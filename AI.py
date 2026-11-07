@@ -28714,6 +28714,187 @@ def _cf_matrix(ratings, who, allow_none):
 
 
 # ============================================================================
+#  可解释性：置换重要性 / 特征图字符画（W14-C）
+# ============================================================================
+
+def _w14c_rows(x, who):
+    """校验样本矩阵：非空、每行等长、元素是有限数字。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 样本不能为空")
+    width = None
+    rows = []
+    for i, row in enumerate(x):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 个样本必须是非空序列")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 个样本有 {len(row)} 维，与首样本 {width} 维不一致")
+        rows.append([_metric_number(v, who, i) for v in row])
+    return rows
+
+
+def permutation_importance(model, x, y, n_repeats=5, seed=None, metric=None,
+                           names=None):
+    """置换重要性：逐列打乱后指标掉了多少（掉得越多说明该列越重要）。
+
+    `metric` 是 `(x, y) -> float` 的回调，默认用 `model.score`（分类准确率 /
+    回归 R²，按 `model.task` 自动选）。返回 `{"baseline", "mean", "std", "names"}`，
+    `mean[j]` 是「打乱第 j 列后指标下降量」在 `n_repeats` 次上的平均。
+    """
+    who = "permutation_importance"
+    rows = _w14c_rows(x, who)
+    if not isinstance(y, (list, tuple)) or not y:
+        raise ValueError(f"{who}: y 不能为空")
+    if len(y) != len(rows):
+        raise ValueError(
+            f"{who}: x 有 {len(rows)} 个样本，y 有 {len(y)} 个，数量必须一致")
+    if isinstance(n_repeats, bool) or not isinstance(n_repeats, int):
+        raise ValueError(f"{who}: n_repeats 必须是整数，收到 {n_repeats!r}")
+    if n_repeats < 1:
+        raise ValueError(f"{who}: n_repeats 必须 >= 1，收到 {n_repeats}")
+    if metric is not None and not callable(metric):
+        raise TypeError(f"{who}: metric 必须可调用")
+    width = len(rows[0])
+    if names is None:
+        names = [f"f{j}" for j in range(width)]
+    else:
+        if not isinstance(names, (list, tuple)) or len(names) != width:
+            raise ValueError(
+                f"{who}: names 长度必须等于特征数 {width}")
+        names = [str(n) for n in names]
+    score = metric if metric is not None else (lambda xs, ys: model.score(xs, ys))
+    baseline = float(score(rows, y))
+    rng = random.Random(seed)
+    means = []
+    stds = []
+    for j in range(width):
+        drops = []
+        for _ in range(n_repeats):
+            order = list(range(len(rows)))
+            rng.shuffle(order)
+            col = [rows[i][j] for i in order]
+            shuffled = [list(r) for r in rows]
+            for i, v in enumerate(col):
+                shuffled[i][j] = v
+            drops.append(baseline - float(score(shuffled, y)))
+        n = float(len(drops))
+        mean = sum(drops) / n
+        var = sum((d - mean) ** 2 for d in drops) / n
+        means.append(mean)
+        stds.append(math.sqrt(var))
+    return {"baseline": baseline, "mean": means, "std": stds, "names": names}
+
+
+def _w14c_map(m, who):
+    """校验一张二维特征图。"""
+    if not isinstance(m, (list, tuple)) or not m:
+        raise ValueError(f"{who}: 特征图不能为空")
+    width = None
+    rows = []
+    for i, row in enumerate(m):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空序列")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 行有 {len(row)} 列，与首行 {width} 列不一致")
+        rows.append([_metric_number(v, who, i) for v in row])
+    return rows
+
+
+def _w14c_heat(m, max_width, peak=None):
+    """把一张二维图压成字符画（块均值下采样 + 按峰值缩放）。"""
+    h = len(m)
+    w = len(m[0])
+    step_h = max(1, (h + max_width - 1) // max_width)
+    step_w = max(1, (w + max_width - 1) // max_width)
+    if peak is None:
+        peak = max(max(row) for row in m)
+    out = []
+    for i in range(0, h, step_h):
+        chars = []
+        for j in range(0, w, step_w):
+            total = 0.0
+            count = 0
+            for a in range(i, min(i + step_h, h)):
+                for b in range(j, min(j + step_w, w)):
+                    total += m[a][b]
+                    count += 1
+            v = (total / count) if count else 0.0
+            rel = (v / peak) if peak > 0.0 else 0.0
+            if rel < 0.0:
+                rel = 0.0
+            elif rel > 1.0:
+                rel = 1.0
+            idx = int(rel * (len(_ATTN_RAMP) - 1) + 0.5)
+            chars.append(_ATTN_RAMP[idx])
+        out.append("".join(chars))
+    return out
+
+
+def feature_maps_ascii(maps, channels=None, max_width=24, max_channels=8):
+    """把特征图画成字符热图：`(C, H, W)` 每通道一张，也接受单张 `H×W`。
+
+    字符强度 `0-9` 按**每张图自身**的最大值缩放（负值截到 0）；`max_width`
+    是每行最多多少个字符，块均值下采样。返回多行字符串。
+    """
+    who = "feature_maps_ascii"
+    if isinstance(max_width, bool) or not isinstance(max_width, int):
+        raise ValueError(f"{who}: max_width 必须是整数，收到 {max_width!r}")
+    if max_width < 1:
+        raise ValueError(f"{who}: max_width 必须 >= 1，收到 {max_width}")
+    if isinstance(max_channels, bool) or not isinstance(max_channels, int):
+        raise ValueError(f"{who}: max_channels 必须是整数，收到 {max_channels!r}")
+    if max_channels < 1:
+        raise ValueError(f"{who}: max_channels 必须 >= 1，收到 {max_channels}")
+    if not isinstance(maps, (list, tuple)) or not maps:
+        raise ValueError(f"{who}: maps 不能为空")
+    first = maps[0]
+    if not isinstance(first, (list, tuple)) or not first:
+        raise ValueError(f"{who}: maps 的元素必须是二维列表")
+
+    single = not isinstance(first[0], (list, tuple))
+    if single:
+        planes = [_w14c_map(maps, who)]
+        labels = ["map"]
+    else:
+        planes = []
+        for c, plane in enumerate(maps):
+            if not isinstance(plane, (list, tuple)) or not plane:
+                raise ValueError(f"{who}: 第 {c} 个通道为空")
+            if not isinstance(plane[0], (list, tuple)):
+                raise ValueError(f"{who}: 第 {c} 个通道不是二维")
+            planes.append(_w14c_map(plane, who))
+        labels = [f"channel {c}" for c in range(len(planes))]
+
+    if channels is None:
+        chosen = list(range(min(len(planes), max_channels)))
+    else:
+        if not isinstance(channels, (list, tuple)) or not channels:
+            raise ValueError(f"{who}: channels 必须是非空列表")
+        chosen = []
+        for c in channels:
+            if isinstance(c, bool) or not isinstance(c, int):
+                raise ValueError(f"{who}: channels 里必须都是整数，收到 {c!r}")
+            if c < 0 or c >= len(planes):
+                raise ValueError(
+                    f"{who}: 通道 {c} 越界（共 {len(planes)} 个）")
+            chosen.append(c)
+
+    lines = []
+    for c in chosen:
+        plane = planes[c]
+        peak = max(max(row) for row in plane)
+        lines.append(f"{labels[c]}  ({len(plane)}x{len(plane[0])}，峰值 {peak:.4g})")
+        lines.extend(_w14c_heat(plane, max_width, peak))
+        lines.append("")
+    lines.append("强度：'" + _ATTN_RAMP.strip() + "' = 0 -> 1（每张图按自身最大值缩放）")
+    return "\n".join(lines)
+
+# ============================================================================
 #  可解释性：注意力 Rollout / Flow（W14-B）
 # ============================================================================
 
