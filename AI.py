@@ -29206,6 +29206,356 @@ def linear_probe_accuracy(scores, labels):
     return hit / len(scores)
 
 # ============================================================================
+#  RL 算法（W16-F：DQN 族）
+# ============================================================================
+
+class ReplayBuffer:
+    """定长经验回放：满了以后按写入顺序覆盖最老的样本（FIFO）。"""
+
+    def __init__(self, capacity=1000, seed=None):
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+            raise ValueError(
+                f"ReplayBuffer: capacity 必须是 >=1 的整数，收到 {capacity!r}")
+        self.capacity = capacity
+        self.rng = random.Random(seed)
+        self.data = []
+        self.pos = 0
+
+    def __len__(self):
+        return len(self.data)
+
+    def clear(self):
+        """清空回放池。"""
+        self.data = []
+        self.pos = 0
+
+    def add(self, state, action, reward, next_state, done):
+        """写入一条转移；超出容量时覆盖最老的一条。"""
+        state = list(state) if isinstance(state, (list, tuple)) else state
+        next_state = list(next_state) if isinstance(next_state, (list, tuple)) else next_state
+        if isinstance(action, bool) or not isinstance(action, int):
+            raise ValueError(f"ReplayBuffer.add: action 必须是整数，收到 {action!r}")
+        if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+            raise ValueError(f"ReplayBuffer.add: reward 必须是数字，收到 {reward!r}")
+        item = (state, action, float(reward), next_state, bool(done))
+        if len(self.data) < self.capacity:
+            self.data.append(item)
+        else:
+            self.data[self.pos] = item
+            self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size):
+        """有放回采样 ``batch_size`` 条，返回 ``(states, actions, rewards, next_states, dones)``。"""
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError(
+                f"ReplayBuffer.sample: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        if not self.data:
+            raise ValueError("ReplayBuffer.sample: 回放池为空，先 add 一些转移")
+        picks = [self.data[self.rng.randrange(len(self.data))] for _ in range(batch_size)]
+        states = [p[0] for p in picks]
+        actions = [p[1] for p in picks]
+        rewards = [p[2] for p in picks]
+        next_states = [p[3] for p in picks]
+        dones = [p[4] for p in picks]
+        return states, actions, rewards, next_states, dones
+
+    def all(self):
+        """按写入顺序返回全部转移（调试用）。"""
+        return list(self.data)
+
+
+def dqn_targets(next_q_values, rewards, dones, gamma=0.99):
+    """DQN 的目标：``r + gamma * max_a Q'(s', a)``，终止状态只留 ``r``。"""
+    if not isinstance(next_q_values, (list, tuple)) or not next_q_values:
+        raise ValueError("dqn_targets: next_q_values 必须是非空行列表")
+    n = len(next_q_values)
+    if not isinstance(rewards, (list, tuple)) or len(rewards) != n:
+        raise ValueError("dqn_targets: rewards 长度必须等于样本数")
+    if not isinstance(dones, (list, tuple)) or len(dones) != n:
+        raise ValueError("dqn_targets: dones 长度必须等于样本数")
+    if not isinstance(gamma, (int, float)) or isinstance(gamma, bool) \
+            or not (0.0 <= gamma <= 1.0):
+        raise ValueError(f"dqn_targets: gamma 必须在 [0,1] 内，收到 {gamma!r}")
+    out = []
+    for i in range(n):
+        row = next_q_values[i]
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"dqn_targets: 第 {i} 行必须是非空列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"dqn_targets: 第 {i} 行第 {j} 列不是数字：{v!r}")
+            vals.append(float(v))
+        r = rewards[i]
+        if isinstance(r, bool) or not isinstance(r, (int, float)):
+            raise ValueError(f"dqn_targets: rewards[{i}] 不是数字：{r!r}")
+        if dones[i]:
+            out.append(float(r))
+        else:
+            out.append(float(r) + gamma * max(vals))
+    return out
+
+
+def double_dqn_targets(online_next_q, target_next_q, rewards, dones, gamma=0.99):
+    """Double DQN：用**在线网络**选动作、用**目标网络**评估该动作的价值。"""
+    if not isinstance(online_next_q, (list, tuple)) or not online_next_q:
+        raise ValueError("double_dqn_targets: online_next_q 必须是非空行列表")
+    if not isinstance(target_next_q, (list, tuple)) \
+            or len(target_next_q) != len(online_next_q):
+        raise ValueError("double_dqn_targets: 两个 Q 的行数必须相同")
+    n = len(online_next_q)
+    if not isinstance(rewards, (list, tuple)) or len(rewards) != n:
+        raise ValueError("double_dqn_targets: rewards 长度必须等于样本数")
+    if not isinstance(dones, (list, tuple)) or len(dones) != n:
+        raise ValueError("double_dqn_targets: dones 长度必须等于样本数")
+    if not isinstance(gamma, (int, float)) or isinstance(gamma, bool) \
+            or not (0.0 <= gamma <= 1.0):
+        raise ValueError(f"double_dqn_targets: gamma 必须在 [0,1] 内，收到 {gamma!r}")
+    out = []
+    for i in range(n):
+        row_o = online_next_q[i]
+        row_t = target_next_q[i]
+        if not isinstance(row_o, (list, tuple)) or not row_o:
+            raise ValueError(f"double_dqn_targets: 第 {i} 行必须是非空列表")
+        if not isinstance(row_t, (list, tuple)) or len(row_t) != len(row_o):
+            raise ValueError(f"double_dqn_targets: 第 {i} 行两侧动作数不同")
+        best = max(range(len(row_o)), key=lambda j: float(row_o[j]))
+        r = rewards[i]
+        if isinstance(r, bool) or not isinstance(r, (int, float)):
+            raise ValueError(f"double_dqn_targets: rewards[{i}] 不是数字：{r!r}")
+        if dones[i]:
+            out.append(float(r))
+        else:
+            out.append(float(r) + gamma * float(row_t[best]))
+    return out
+
+
+def huber_td_loss(q_values, action, target, delta=1.0):
+    """单个样本的 Huber TD 损失，返回 ``(loss, grad_q)``（梯度只落在被选动作上）。"""
+    if not isinstance(q_values, (list, tuple)) or not q_values:
+        raise ValueError("huber_td_loss: q_values 必须是非空列表")
+    n = len(q_values)
+    if isinstance(action, bool) or not isinstance(action, int) or not (0 <= action < n):
+        raise ValueError(
+            f"huber_td_loss: action 必须是 0..{n - 1} 的整数，收到 {action!r}")
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        raise ValueError(f"huber_td_loss: target 必须是数字，收到 {target!r}")
+    if not isinstance(delta, (int, float)) or isinstance(delta, bool) or delta <= 0.0:
+        raise ValueError(f"huber_td_loss: delta 必须 > 0，收到 {delta!r}")
+    q = [float(v) for v in q_values]
+    e = q[action] - float(target)
+    if abs(e) < delta:
+        loss = 0.5 * e * e
+        g = e
+    else:
+        loss = delta * (abs(e) - 0.5 * delta)
+        g = delta if e > 0 else -delta
+    grad = [0.0] * n
+    grad[action] = g
+    return loss, grad
+
+
+def dueling_q_values(state_values, advantages):
+    """Dueling 聚合：``Q = V + A - mean(A)``，返回 ``(q, dq_dv, dq_da)``。"""
+    if not isinstance(state_values, (list, tuple)) or not state_values:
+        raise ValueError("dueling_q_values: state_values 必须是非空列表")
+    m = len(state_values)
+    if not isinstance(advantages, (list, tuple)) or len(advantages) != m:
+        raise ValueError("dueling_q_values: advantages 必须与 state_values 等长")
+    for i in range(m):
+        a_row = advantages[i]
+        if not isinstance(a_row, (list, tuple)) or not a_row:
+            raise ValueError(f"dueling_q_values: advantages[{i}] 必须是非空列表")
+    k = len(advantages[0])
+    for i, a_row in enumerate(advantages):
+        if len(a_row) != k:
+            raise ValueError(
+                f"dueling_q_values: advantages[{i}] 长度 {len(a_row)} 与第一个 {k} 不一致")
+    q = []
+    for i in range(m):
+        v = float(state_values[i])
+        row = [float(x) for x in advantages[i]]
+        mean = sum(row) / k
+        q.append([v + row[j] - mean for j in range(k)])
+    # Q_j = V_i + A_ij - mean_j(A_i)：
+    #   dv[i][j] = dQ_j/dV_i = 1 当且仅当 i == j
+    #   da[i][j] = dQ_j/dA_ij = 1 - 1/k
+    dv = [[1.0 if i == j else 0.0 for j in range(k)] for i in range(m)]
+    da = [[(1.0 if i == j else 0.0) - 1.0 / k for j in range(k)] for i in range(m)]
+    return q, dv, da
+
+
+class DQNNetwork:
+    """Q 网络：``MLP(state_dim -> hidden... -> num_actions)`` 的薄封装。
+
+    只做「状态向量 -> 每个动作的 Q 值」这一件事；参数梯度走 `_mlp_backward`。
+    """
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), seed=None):
+        for name, v in (("state_dim", state_dim), ("num_actions", num_actions)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"DQNNetwork: {name} 必须是 >=1 的整数，收到 {v!r}")
+        if not isinstance(hidden, (list, tuple)):
+            raise ValueError("DQNNetwork: hidden 必须是整数列表")
+        for i, h in enumerate(hidden):
+            if not isinstance(h, int) or isinstance(h, bool) or h < 1:
+                raise ValueError(
+                    f"DQNNetwork: hidden[{i}] 必须是 >=1 的整数，收到 {h!r}")
+        sizes = [state_dim] + list(hidden) + [num_actions]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.model = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.sizes = sizes
+
+    def q_values(self, state):
+        """返回 ``[Q(s, a)]`` 共 ``num_actions`` 个。"""
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(
+                f"DQNNetwork.q_values: state 长度必须是 {self.state_dim}")
+        return self.model.forward([float(v) for v in state])
+
+    def q_gradients(self, delta_q):
+        """对 ``delta_q`` 反传到参数，返回 ``[(grad_w, grad_b), ...]``。"""
+        if not isinstance(delta_q, (list, tuple)) or len(delta_q) != self.num_actions:
+            raise ValueError(
+                f"DQNNetwork.q_gradients: delta_q 长度必须是 {self.num_actions}")
+        return _mlp_backward(self.model, [float(v) for v in delta_q])
+
+    def copy_from(self, other):
+        """把 ``other``（同形状的 DQNNetwork）的权重复制过来（目标网络同步用）。"""
+        if not isinstance(other, DQNNetwork) \
+                or other.sizes != self.sizes:
+            raise ValueError("DQNNetwork.copy_from: 只接受同形状的 DQNNetwork")
+        for dst, src in zip(self.model.layers, other.model.layers):
+            for j in range(len(dst.weights)):
+                dst.weights[j][:] = src.weights[j]
+            dst.biases[:] = src.biases
+
+    def param_count(self):
+        """可训练标量个数。"""
+        return sum(layer.fan_out * layer.fan_in + layer.fan_out
+                   for layer in self.model.layers)
+
+
+class DQNAgent:
+    """DQN / Double DQN / Dueling 的简化实现（价值侧）。
+
+    - ``double=True`` 时用 Double DQN 目标（在线网络选动作、目标网络估值）
+    - ``dueling=True`` 时网络输出 ``V`` 与 ``A`` 两段，再按 ``dueling_q_values`` 聚合
+    - 其余照经典 DQN：经验回放 + 目标网络 + ε-greedy + Huber TD
+    """
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), lr=0.01,
+                 gamma=0.99, epsilon=0.1, target_sync=50, buffer_size=2000,
+                 batch_size=16, double=False, dueling=False, seed=None):
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.target_sync = target_sync
+        self.batch_size = batch_size
+        self.double = bool(double)
+        self.dueling = bool(dueling)
+        if not isinstance(gamma, (int, float)) or not (0.0 <= gamma <= 1.0):
+            raise ValueError(f"DQNAgent: gamma 必须在 [0,1] 内，收到 {gamma!r}")
+        if not isinstance(epsilon, (int, float)) or not (0.0 <= epsilon <= 1.0):
+            raise ValueError(f"DQNAgent: epsilon 必须在 [0,1] 内，收到 {epsilon!r}")
+        if self.dueling:
+            out_dim = num_actions + 1
+        else:
+            out_dim = num_actions
+        self.online = DQNNetwork(state_dim, out_dim, hidden, seed=seed)
+        self.target = DQNNetwork(state_dim, out_dim, hidden, seed=seed)
+        self.target.copy_from(self.online)
+        self.optimizer = Adam(self.online.model, lr=lr)
+        self.buffer = ReplayBuffer(buffer_size, seed=seed)
+        self.rng = random.Random(seed)
+        self.steps = 0
+
+    def _split(self, net, state):
+        """把网络输出拆成 ``(q_values, state_value, advantages)``。"""
+        out = net.q_values(state)
+        if not self.dueling:
+            return out, None, None
+        v = out[0]
+        adv = list(out[1:])
+        q, _, _ = dueling_q_values([v], [adv])
+        return q[0], v, adv
+
+    def q_values(self, state):
+        """当前在线网络给出的 Q 值（Dueling 时已聚合）。"""
+        return self._split(self.online, state)[0]
+
+    def act(self, state, greedy=False):
+        """ε-greedy（``greedy=True`` 时纯贪心）。"""
+        if not greedy and self.rng.random() < self.epsilon:
+            return self.rng.randrange(self.num_actions)
+        q = self.q_values(state)
+        return max(range(len(q)), key=lambda j: q[j])
+
+    def observe(self, state, action, reward, next_state, done):
+        """写入一条转移到回放池。"""
+        self.buffer.add(state, action, reward, next_state, done)
+
+    def sync_target(self):
+        """把在线网络的权重同步到目标网络。"""
+        self.target.copy_from(self.online)
+
+    def train_step(self):
+        """采一个 batch、算一次梯度并更新在线网络，返回平均 TD 损失。"""
+        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+        if self.double:
+            online_next = [self._split(self.online, s)[0] for s in next_states]
+            target_next = [self._split(self.target, s)[0] for s in next_states]
+            targets = double_dqn_targets(online_next, target_next,
+                                         rewards, dones, self.gamma)
+        else:
+            target_next = [self._split(self.target, s)[0] for s in next_states]
+            targets = dqn_targets(target_next, rewards, dones, self.gamma)
+        total = 0.0
+        acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                 for layer in self.online.model.layers]
+        acc_b = [[0.0] * layer.fan_out for layer in self.online.model.layers]
+        for i in range(len(states)):
+            q, v, adv = self._split(self.online, states[i])
+            loss, g = huber_td_loss(q, actions[i], targets[i])
+            total += loss
+            if self.dueling:
+                dq = g
+                mean_dq = sum(dq) / len(dq)
+                dv = sum(dq)
+                da = [dq[j] - mean_dq for j in range(len(dq))]
+                delta_out = [dv] + da
+            else:
+                delta_out = g
+            grads = self.online.q_gradients(delta_out)
+            for li, (gw, gb) in enumerate(grads):
+                for j in range(len(gw)):
+                    awj = acc_w[li][j]
+                    for k in range(len(gw[j])):
+                        awj[k] += gw[j][k]
+                    acc_b[li][j] += gb[j]
+        inv = 1.0 / len(states)
+        avg_w = [[[v * inv for v in row] for row in layer] for layer in acc_w]
+        avg_b = [[v * inv for v in row] for row in acc_b]
+        self.optimizer.step([(w, b) for w, b in zip(avg_w, avg_b)])
+        self.steps += 1
+        if self.target_sync and self.steps % self.target_sync == 0:
+            self.sync_target()
+        return total / len(states)
+
+    def param_count(self):
+        """在线网络 + 目标网络的参数总数。"""
+        return self.online.param_count() + self.target.param_count()
+
+# ============================================================================
 #  RL 环境（W16-E：GridWorld / CartPole）
 # ============================================================================
 

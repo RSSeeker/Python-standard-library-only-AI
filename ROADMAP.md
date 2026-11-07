@@ -518,7 +518,13 @@
   - `GridWorld`：撞墙原地不动但照扣 `step_reward`、到达 goal 给 `goal_reward`、超过 `max_steps` 标 `truncated`
   - `CartPole`：显式欧拉 + Gym 原始常数，探针里用**独立重算**核对第一步的 `x`/`x_dot`（差 0.000e+00）
   - 附带 `discounted_returns` 与 `rollout`；测试 `TestRLEnvironments` 8 例
-- [ ] RL 算法：DQN / Double / Dueling / Rainbow（简化）/ REINFORCE / A2C / PPO / SAC / TD3 / DDPG
+- [x] RL 算法：DQN / Double / Dueling / Rainbow（简化）/ REINFORCE / A2C / PPO / SAC / TD3 / DDPG
+  - W16-F 已做价值侧：`ReplayBuffer`（FIFO）+ `dqn_targets` / `double_dqn_targets`
+    + `huber_td_loss`（返回梯度）+ `dueling_q_values` + `DQNNetwork` + `DQNAgent`
+    （`double=` / `dueling=` 开关）。Rainbow 只到 Double + Dueling，不做优先采样 / N-step / 分布式。
+    `probe_w16f.py` 58 项：FIFO 覆盖、Double 与普通目标在构造样本上不同、Huber 两分支与梯度截断、
+    单层权重中心差分 1e-5、单状态赌博机 150 步后 argmax = 最优动作、`sync_target` 逐位一致。
+  - 策略侧（REINFORCE / A2C / PPO / SAC / TD3 / DDPG）与 RLHF 留到后续 Wave。
 - [ ] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型
 - [ ] 元学习：MAML / Reptile / ProtoNet / Matching Networks
 - [ ] 联邦学习：FedAvg / FedProx / FedBN

@@ -22942,3 +22942,158 @@ class TestRLEnvironments:
             AI.rollout(env, 3)
         with pytest.raises(ValueError):
             AI.rollout(env, lambda s: 1, 0)
+
+class TestDQNFamily:
+    """W16-F：经验回放 / DQN 目标 / Huber TD / Dueling 聚合 / DQNAgent"""
+
+    def test_replay_buffer_fifo(self):
+        buf = AI.ReplayBuffer(capacity=3, seed=1)
+        for i in range(5):
+            buf.add([i], i % 2, float(i), [i + 1], i % 2 == 0)
+        assert len(buf) == 3
+        assert sorted(t[2] for t in buf.all()) == [2.0, 3.0, 4.0]
+        states, actions, rewards, next_states, dones = buf.sample(4)
+        assert len(states) == len(actions) == len(rewards) == 4
+        assert all(len(s) == 1 for s in states)
+        assert all(isinstance(a, int) for a in actions)
+        assert len(next_states) == 4 and len(dones) == 4
+        buf.clear()
+        assert len(buf) == 0
+
+    def test_replay_buffer_validation(self):
+        with pytest.raises(ValueError):
+            AI.ReplayBuffer(capacity=0)
+        buf = AI.ReplayBuffer(capacity=2)
+        with pytest.raises(ValueError):
+            buf.sample(1)
+        with pytest.raises(ValueError):
+            buf.add([0.0], 1.5, 0.0, [0.0], False)
+        with pytest.raises(ValueError):
+            buf.add([0.0], 0, "bad", [0.0], False)
+        with pytest.raises(ValueError):
+            buf.sample(0)
+
+    def test_dqn_targets(self):
+        got = AI.dqn_targets([[1.0, 2.0], [3.0, 0.5]], [1.0, 2.0], [False, False],
+                             gamma=0.5)
+        assert abs(got[0] - 2.0) < 1e-12
+        assert abs(got[1] - 3.5) < 1e-12
+        done = AI.dqn_targets([[9.0, 9.0]], [1.5], [True], gamma=0.9)
+        assert abs(done[0] - 1.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.dqn_targets([[1.0]], [0.0], [False], gamma=1.5)
+
+    def test_double_dqn_targets(self):
+        online = [[5.0, 1.0]]
+        target = [[0.0, 4.0]]
+        vanilla = AI.dqn_targets(target, [1.0], [False], gamma=0.5)[0]
+        double = AI.double_dqn_targets(online, target, [1.0], [False], gamma=0.5)[0]
+        assert abs(double - 1.0) < 1e-12
+        assert abs(vanilla - double) > 1e-6
+        assert AI.double_dqn_targets(online, target, [2.0], [True], gamma=0.5)[0] == 2.0
+        with pytest.raises(ValueError):
+            AI.double_dqn_targets([[1.0]], [[1.0], [2.0]], [0.0], [False])
+
+    def test_huber_td_loss(self):
+        loss, grad = AI.huber_td_loss([1.0, 2.0, 3.0], 1, 2.5)
+        assert abs(loss - 0.125) < 1e-12
+        assert abs(grad[1] + 0.5) < 1e-12
+        assert grad[0] == 0.0 and grad[2] == 0.0
+        loss2, grad2 = AI.huber_td_loss([0.0, 10.0], 1, 0.0, delta=1.0)
+        assert abs(loss2 - 9.5) < 1e-12
+        assert abs(grad2[1] - 1.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.huber_td_loss([1.0], 1, 0.0)
+        with pytest.raises(ValueError):
+            AI.huber_td_loss([1.0], 0, 0.0, delta=0.0)
+
+    def test_dueling_q_values(self):
+        q, dv, da = AI.dueling_q_values([1.0], [[3.0, 1.0, 2.0]])
+        mean_a = 2.0
+        for j, a in enumerate([3.0, 1.0, 2.0]):
+            assert abs(q[0][j] - (1.0 + a - mean_a)) < 1e-12
+        assert abs(sum(q[0]) - 3.0) < 1e-12
+        assert dv == [[1.0, 0.0, 0.0]]
+        assert abs(da[0][0] - (1.0 - 1.0 / 3.0)) < 1e-12
+        assert abs(da[0][1] + 1.0 / 3.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.dueling_q_values([1.0], [[1.0], [2.0]])
+
+    def test_dqn_network_gradient(self):
+        net = AI.DQNNetwork(2, 3, hidden=(4,), seed=5)
+        assert len(net.q_values([0.3, -0.2])) == 3
+        assert net.param_count() == (2 * 4 + 4) + (4 * 3 + 3)
+        target = [0.5, -1.0, 2.0]
+        q = net.q_values([0.3, -0.2])
+        grads = net.q_gradients([q[j] - target[j] for j in range(3)])
+
+        def loss_now():
+            cur = net.q_values([0.3, -0.2])
+            return sum(0.5 * (cur[j] - target[j]) ** 2 for j in range(3))
+
+        layer0 = net.model.layers[0]
+        eps = 1e-6
+        layer0.weights[0][0] += eps
+        up = loss_now()
+        layer0.weights[0][0] -= 2 * eps
+        down = loss_now()
+        layer0.weights[0][0] += eps
+        numeric = (up - down) / (2 * eps)
+        assert abs(grads[0][0][0][0] - numeric) < 1e-5
+        with pytest.raises(ValueError):
+            net.q_values([0.0])
+        with pytest.raises(ValueError):
+            AI.DQNNetwork(2, 2, hidden=(0,))
+
+    def test_dqn_agent_bandit(self):
+        agent = AI.DQNAgent(1, 4, hidden=(8,), lr=0.05, gamma=0.99, epsilon=0.5,
+                            target_sync=10, buffer_size=500, batch_size=8, seed=3)
+        for _ in range(120):
+            action = agent.act([1.0])
+            reward = 1.0 if action == 2 else 0.0
+            agent.observe([1.0], action, reward, [1.0], True)
+        before = agent.q_values([1.0])
+        for _ in range(150):
+            agent.train_step()
+        after = agent.q_values([1.0])
+        assert after[2] > before[2] + 0.5
+        assert max(range(4), key=lambda j: after[j]) == 2
+
+    def test_sync_target_and_options(self):
+        agent = AI.DQNAgent(2, 2, hidden=(5,), seed=9)
+        for online_layer, target_layer in zip(agent.online.model.layers,
+                                              agent.target.model.layers):
+            online_layer.weights[0][0] += 0.5
+        agent.sync_target()
+        same = True
+        for online_layer, target_layer in zip(agent.online.model.layers,
+                                              agent.target.model.layers):
+            for row_o, row_t in zip(online_layer.weights, target_layer.weights):
+                for a, b in zip(row_o, row_t):
+                    if a != b:
+                        same = False
+        assert same
+        assert agent.param_count() > 0
+        double_agent = AI.DQNAgent(2, 3, hidden=(6,), double=True, seed=4, batch_size=4)
+        for i in range(20):
+            double_agent.observe([float(i), 1.0], i % 3, float(i % 2),
+                                 [float(i + 1), 1.0], i % 5 == 0)
+        loss = double_agent.train_step()
+        assert loss == loss and abs(loss) < 1e6
+        dueling_agent = AI.DQNAgent(2, 3, hidden=(6,), dueling=True, seed=5, batch_size=4)
+        for i in range(20):
+            dueling_agent.observe([float(i), 1.0], i % 3, float(i % 2),
+                                  [float(i + 1), 1.0], False)
+        loss2 = dueling_agent.train_step()
+        assert loss2 == loss2 and abs(loss2) < 1e6
+        assert len(dueling_agent.q_values([1.0, 2.0])) == 3
+
+    def test_dqn_agent_validation(self):
+        with pytest.raises(ValueError):
+            AI.DQNAgent(2, 2, gamma=1.5)
+        with pytest.raises(ValueError):
+            AI.DQNAgent(2, 2, epsilon=-0.1)
+        with pytest.raises(ValueError):
+            AI.DQNAgent(2, 0)
+        with pytest.raises(ValueError):
+            AI.DQNNetwork(2, 2).copy_from(AI.DQNNetwork(3, 2))

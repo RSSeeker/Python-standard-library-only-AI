@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1505 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1515 项）
 
 ## 特性
 
@@ -1785,6 +1785,38 @@ print(env.render(), AI.discounted_returns(traj["rewards"], 0.9)[:3])
 
 三条边界：`GridWorld` 是**确定性**环境（没有随机转移，随机性只在重置 RNG 上）；`CartPole` 用显式欧拉步进，常数与 Gym 一致，但**不带**它的 seed 兼容保证；`rollout` 只在 `done` 时提前停，不做 `max_steps` 之外的截断判断。
 
+### DQN 族（W16-F）
+
+| API | 说明 |
+|-----|------|
+| `ReplayBuffer(capacity=1000, seed=None)` | 定长经验回放，满了按写入顺序覆盖最老的（FIFO） |
+| `dqn_targets(next_q_values, rewards, dones, gamma=0.99)` | `r + gamma*max Q'`，终止状态只留 `r` |
+| `double_dqn_targets(online_next_q, target_next_q, rewards, dones, gamma=0.99)` | 在线网络选动作、目标网络估值 |
+| `huber_td_loss(q_values, action, target, delta=1.0)` | 单样本 Huber TD，返回 `(loss, grad_q)` |
+| `dueling_q_values(state_values, advantages)` | `Q = V + A - mean(A)`，返回 `(q, dv, da)` |
+| `DQNNetwork(state_dim, num_actions, hidden=(32,), seed=None)` | Q 网络的薄封装（`q_values` / `q_gradients` / `copy_from`） |
+| `DQNAgent(...)` | 回放 + 目标网络 + ε-greedy + Huber TD，`double=True` / `dueling=True` 切换变体 |
+
+```python
+import AI
+
+env = AI.GridWorld(3, 3, start=(0, 0), goal=(2, 2), max_steps=20, seed=1)
+agent = AI.DQNAgent(2, 4, hidden=(16,), lr=0.02, gamma=0.9, epsilon=0.3, seed=2)
+for episode in range(60):
+    state = env.reset(seed=episode)
+    done = False
+    while not done:
+        action = agent.act(state)
+        next_state, reward, done, info = env.step(action)
+        agent.observe(state, action, reward, next_state, done)
+        state = next_state
+    if len(agent.buffer) >= 8:
+        agent.train_step()
+print(agent.q_values(env.reset(seed=0)))
+```
+
+四条边界：`DQNAgent` 是**价值侧**实现，不做 N-step 回报、不做优先采样、不做分布式 Q（Rainbow 只到 Double + Dueling 这一档）；`dueling_q_values` 的 `dv` / `da` 是「单个输出的雅可比」，用于手推梯度，不是反向传播接口；`train_step` 每次只更新一个 batch 且**不**自动 `sync_target` 之外的调度（`target_sync` 按步数硬同步，不是 Polyak 软更新）；`DQNNetwork` 的初始化走全局 `random` 的临时种子，同 `seed` 可复现。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2201,7 +2233,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1505 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1515 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2398,6 +2430,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMultimodal` | CLIP 相似度/损失手算、两侧梯度对中心差分（<1e-6）、检索准确率、投影头 30 步 SGD 降 loss、跨模态融合块两侧梯度对中心差分（<1e-5）、单 key 时 `W_q` 梯度为 0 |
 | `TestPredictiveSelfSupervision` | 旋转标签分布与复现、四次旋转的像素位置与 `k` 取模、非方图限制、Jigsaw 排列合法性、线性头与交叉熵、线性探针命中率 |
 | `TestRLEnvironments` | GridWorld 移动/撞墙/目标奖励/步数截断/障碍与坐标校验、渲染字符、CartPole 状态范围与物理独立重算（1e-12）、折现回报手算、rollout 长度与提前终止 |
+| `TestDQNFamily` | W16-F：回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2451,7 +2484,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1505 个单元测试
+├── test_ai.py       # 1515 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
