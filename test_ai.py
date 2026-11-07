@@ -21256,3 +21256,111 @@ class TestConsistencyFairness:
         with pytest.raises(ValueError):
             AI.equal_opportunity_difference([1, 0, 0, 0], [1, 0, 0, 0],
                                            ["a", "a", "b", "b"])
+
+class TestAttribution:
+    """W14-A：输入归因（Saliency / Grad×Input / SmoothGrad / IG / DeepLIFT）。"""
+
+    @staticmethod
+    def _linear():
+        net = AI.MLP([2, 1], activations=["linear"])
+        net.layers[0].weights = [[1.0, 0.0]]
+        net.layers[0].biases = [0.0]
+        return net
+
+    @staticmethod
+    def _relu():
+        net = AI.MLP([2, 3, 1], activations=["relu", "linear"])
+        net.layers[0].weights = [[1.0, 1.0], [-1.0, 2.0], [0.5, 0.0]]
+        net.layers[0].biases = [0.0, 0.5, 0.0]
+        net.layers[1].weights = [[1.0, -2.0, 3.0]]
+        net.layers[1].biases = [0.1]
+        return net
+
+    def test_saliency_linear(self):
+        net = self._linear()
+        assert AI.saliency_map(net, [3.0, 4.0]) == [1.0, 0.0]
+        assert AI.saliency_map(net, [-3.0, 4.0]) == [1.0, 0.0]
+
+    def test_gradient_x_input(self):
+        net = self._linear()
+        assert AI.gradient_x_input(net, [3.0, 4.0]) == [3.0, 0.0]
+        relu = self._relu()
+        grad = AI.saliency_map(relu, [1.0, 2.0], absolute=False)
+        got = AI.gradient_x_input(relu, [1.0, 2.0])
+        assert all(abs(got[i] - [1.0, 2.0][i] * grad[i]) < 1e-15
+                   for i in range(2))
+
+    def test_integrated_gradients_completeness(self):
+        net = self._relu()
+        fx = net.forward([1.0, 2.0])[0]
+        fb = net.forward([0.0, 0.0])[0]
+        ig = AI.integrated_gradients(net, [1.0, 2.0], steps=4096)
+        assert abs(sum(ig) - (fx - fb)) < 5e-3
+
+    def test_integrated_gradients_linear_exact(self):
+        net = self._linear()
+        ig = AI.integrated_gradients(net, [3.0, 4.0], steps=8)
+        assert abs(ig[0] - 3.0) < 1e-12 and abs(ig[1]) < 1e-12
+
+    def test_deep_lift_completeness(self):
+        net = self._relu()
+        dl = AI.deep_lift(net, [1.0, 2.0])
+        fx = net.forward([1.0, 2.0])[0]
+        fb = net.forward([0.0, 0.0])[0]
+        assert abs(sum(dl) - (fx - fb)) < 1e-12
+        # 线性网络的 DeepLIFT 等于 IG
+        lin = self._linear()
+        assert abs(AI.integrated_gradients(lin, [3.0, -2.0], steps=16)[0]
+                   - AI.deep_lift(lin, [3.0, -2.0])[0]) < 1e-12
+
+    def test_smooth_grad_degenerate(self):
+        net = self._linear()
+        assert AI.smooth_grad(net, [3.0, 4.0], samples=5, sigma=0.0) == [1.0, 0.0]
+        a = AI.smooth_grad(net, [3.0, 4.0], samples=50, sigma=0.5, seed=1)
+        assert abs(a[0] - 1.0) < 1e-12 and abs(a[1]) < 1e-12
+        b = AI.smooth_grad(net, [3.0, 4.0], samples=20, sigma=0.3, seed=7)
+        c = AI.smooth_grad(net, [3.0, 4.0], samples=20, sigma=0.3, seed=7)
+        assert b == c
+
+    def test_multiclass_class_index(self):
+        net = AI.MLP([2, 2], activations=["linear"])
+        net.layers[0].weights = [[1.0, 0.0], [0.0, 2.0]]
+        net.layers[0].biases = [0.0, 0.0]
+        assert AI.gradient_x_input(net, [3.0, 4.0], class_index=0) == [3.0, 0.0]
+        assert AI.gradient_x_input(net, [3.0, 4.0], class_index=1) == [0.0, 8.0]
+        # 省略时取 argmax
+        assert AI.gradient_x_input(net, [3.0, 4.0]) == [0.0, 8.0]
+
+    def test_validation(self):
+        net = self._linear()
+        with pytest.raises(ValueError):
+            AI.saliency_map(net, [])
+        with pytest.raises(ValueError):
+            AI.saliency_map(net, [[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.saliency_map(net, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            AI.smooth_grad(net, [1.0, 2.0], samples=0)
+        with pytest.raises(ValueError):
+            AI.smooth_grad(net, [1.0, 2.0], sigma=-1.0)
+        with pytest.raises(ValueError):
+            AI.integrated_gradients(net, [1.0, 2.0], steps=0)
+        with pytest.raises(ValueError):
+            AI.integrated_gradients(net, [1.0, 2.0], baseline=[0.0])
+        with pytest.raises(ValueError):
+            AI.deep_lift(net, [1.0, 2.0], eps=0.0)
+        with pytest.raises(ValueError):
+            AI.saliency_map(net, [1.0, 2.0], class_index=3)
+
+    def test_deep_lift_rejects_softmax(self):
+        net = AI.MLP([2, 2], activations=["softmax"])
+        with pytest.raises(ValueError):
+            AI.deep_lift(net, [1.0, 2.0])
+        assert len(AI.saliency_map(net, [1.0, 2.0])) == 2
+
+    def test_model_wrapper(self):
+        wrapper = AI.Model(AI.MLP([2, 2], activations=["linear"]),
+                           loss_fn="mse", optimizer="adam")
+        wrapper.model.layers[0].weights = [[1.0, 0.0], [0.0, 1.0]]
+        wrapper.model.layers[0].biases = [0.0, 0.0]
+        assert AI.saliency_map(wrapper, [2.0, 5.0]) == [0.0, 1.0]

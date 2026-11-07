@@ -444,7 +444,14 @@
     独立参考对照。
 
 ### W14 可解释性（§10）
-- [ ] 归因：Saliency / Gradient×Input / SmoothGrad / IntegratedGradients / DeepLIFT（简化）
+- [x] 归因：Saliency / Gradient×Input / SmoothGrad / IntegratedGradients / DeepLIFT（简化）
+
+  - 已实现：`saliency_map` / `gradient_x_input` / `smooth_grad` /
+    `integrated_gradients`（中点黎曼和）/ `deep_lift`（Rescale 乘子回传）。
+  - `deep_lift` 只支持逐元素激活，`softmax` 直接报错（规则限制，不是实现省略）；
+    线性网络与 ReLU 网络上完备性 `Σ attr = f(x) − f(baseline)` 精确到 1e-12。
+  - 探针 41 项；两处首跑失败都是我的期望值错（`smooth_grad` 在小 sigma 下采到同一
+    ReLU 分片、`Model` 包装器的 saliency 期望写成两类都有梯度）。
 - [ ] 注意力：Attention Rollout / Attention Flow（在 `attention_maps` 上做矩阵连乘）
 - [ ] `permutation_importance`；`feature_maps_ascii`（`attention_ascii` 扩展）
 - [ ] CNN：GradCAM / GradCAM++ / ScoreCAM / LayerCAM

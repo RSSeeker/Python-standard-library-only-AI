@@ -28713,6 +28713,202 @@ def _cf_matrix(ratings, who, allow_none):
     return rows, width
 
 
+# ============================================================================
+#  可解释性：输入归因（W14-A）
+# ============================================================================
+
+def _attr_x(x, who):
+    """校验归因输入：非空、扁平、元素是有限数字。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: x 不能为空")
+    out = []
+    for i, v in enumerate(x):
+        if isinstance(v, (list, tuple)):
+            raise ValueError(
+                f"{who}: x 必须是单样本扁平向量（第 {i} 个是嵌套列表）")
+        out.append(_metric_number(v, who, i))
+    return out
+
+
+def _attr_net(model, who):
+    """取出真正的前向网络（`Model` 包装器则取 `.model`）。"""
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if layers is None:
+        raise TypeError(f"{who}: 需要 MLP 或 Model 包装的 MLP，收到 {type(model).__name__}")
+    return net
+
+
+def _attr_target(pred, class_index, who):
+    """目标类：省略时取 argmax；否则校验是非负整数且在范围内。"""
+    if class_index is None:
+        best = 0
+        for i in range(1, len(pred)):
+            if pred[i] > pred[best]:
+                best = i
+        return best
+    c = _metric_label(class_index, who, 0)
+    if c >= len(pred):
+        raise ValueError(
+            f"{who}: class_index={c} 越界（输出维度 {len(pred)}）")
+    return c
+
+
+def _attr_grad(net, x, c, who):
+    """目标类 logit 对输入的梯度（通过一次前向 + 反向链传到底）。"""
+    pred = net.forward(x)
+    if len(pred) <= c:
+        raise ValueError(f"{who}: 输出维度 {len(pred)} 不足以取第 {c} 类")
+    delta = [0.0] * len(pred)
+    delta[c] = 1.0
+    for layer in reversed(net.layers):
+        _, _, delta = layer.backward(delta)
+    return delta
+
+
+def saliency_map(model, x, class_index=None, absolute=True):
+    """Saliency：目标类 logit 对输入的梯度（`|∂y_c/∂x_i|`，可关掉绝对值）。"""
+    who = "saliency_map"
+    net = _attr_net(model, who)
+    xs = _attr_x(x, who)
+    c = _attr_target(net.forward(xs), class_index, who)
+    grad = _attr_grad(net, xs, c, who)
+    return [abs(g) for g in grad] if absolute else list(grad)
+
+
+def gradient_x_input(model, x, class_index=None):
+    """Gradient×Input：`x_i · ∂y_c/∂x_i`（保留符号）。"""
+    who = "gradient_x_input"
+    net = _attr_net(model, who)
+    xs = _attr_x(x, who)
+    c = _attr_target(net.forward(xs), class_index, who)
+    grad = _attr_grad(net, xs, c, who)
+    return [xi * gi for xi, gi in zip(xs, grad)]
+
+
+def smooth_grad(model, x, samples=50, sigma=0.1, seed=None, class_index=None):
+    """SmoothGrad：对 `N(x, σ²)` 采样得到的梯度取平均，压低高频噪声。"""
+    who = "smooth_grad"
+    net = _attr_net(model, who)
+    xs = _attr_x(x, who)
+    if isinstance(samples, bool) or not isinstance(samples, int):
+        raise ValueError(f"{who}: samples 必须是整数，收到 {samples!r}")
+    if samples < 1:
+        raise ValueError(f"{who}: samples 必须 >= 1，收到 {samples}")
+    sigma = _metric_number(sigma, who, 0)
+    if sigma < 0.0:
+        raise ValueError(f"{who}: sigma 必须 >= 0，收到 {sigma}")
+    c = _attr_target(net.forward(xs), class_index, who)
+    rng = random.Random(seed)
+    total = [0.0] * len(xs)
+    for _ in range(samples):
+        noisy = [xi + rng.gauss(0.0, sigma) for xi in xs]
+        grad = _attr_grad(net, noisy, c, who)
+        for i in range(len(total)):
+            total[i] += grad[i]
+    return [t / float(samples) for t in total]
+
+
+def integrated_gradients(model, x, baseline=None, steps=64, class_index=None):
+    """Integrated Gradients：沿 `baseline → x` 直线做中点黎曼平均再乘位移。
+
+    满足完备性 `Σ attribution ≈ f(x) − f(baseline)`（在 `steps` 足够时）。
+    """
+    who = "integrated_gradients"
+    net = _attr_net(model, who)
+    xs = _attr_x(x, who)
+    if baseline is None:
+        base = [0.0] * len(xs)
+    else:
+        base = _attr_x(baseline, who)
+        if len(base) != len(xs):
+            raise ValueError(
+                f"{who}: baseline 长度 {len(base)} 与 x 长度 {len(xs)} 不一致")
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise ValueError(f"{who}: steps 必须是整数，收到 {steps!r}")
+    if steps < 1:
+        raise ValueError(f"{who}: steps 必须 >= 1，收到 {steps}")
+    c = _attr_target(net.forward(xs), class_index, who)
+    total = [0.0] * len(xs)
+    for k in range(steps):
+        scale = (k + 0.5) / float(steps)
+        point = [b + scale * (xi - b) for xi, b in zip(xs, base)]
+        grad = _attr_grad(net, point, c, who)
+        for i in range(len(total)):
+            total[i] += grad[i]
+    return [(xi - b) * t / float(steps) for xi, b, t in zip(xs, base, total)]
+
+
+def _attr_supported_activation(layer):
+    """DeepLIFT 的 rescale 规则要求逐元素激活。"""
+    return layer.activation_name in ("linear", "relu", "leaky_relu", "gelu",
+                                     "silu", "mish", "elu", "selu", "sigmoid")
+
+
+def _attr_trace(net, x):
+    """手工前向，返回每层的 `(z, a)`（`Layer.forward` 只留最后一次缓存）。"""
+    zs = []
+    acts = []
+    cur = list(x)
+    for layer in net.layers:
+        z = [layer.biases[j]
+             + sum(layer.weights[j][i] * cur[i] for i in range(layer.fan_in))
+             for j in range(layer.fan_out)]
+        a = layer.act_fn(z)
+        zs.append(z)
+        acts.append(a)
+        cur = a
+    return zs, acts
+
+
+def deep_lift(model, x, baseline=None, class_index=None, eps=1e-12):
+    """DeepLIFT（Rescale 规则）：用 `Δa/Δz` 乘子把输出差回传到输入。
+
+    只支持逐元素激活（`softmax` 之类的非对角激活会报错）。`Δz` 接近 0 时
+    用该点导数代替（论文里 `δ→0` 的极限近似），这会在 docstring 之外的多层
+    非线性上带来小的数值差异；对线性网络与 ReLU 网络都是精确的。
+    """
+    who = "deep_lift"
+    net = _attr_net(model, who)
+    xs = _attr_x(x, who)
+    if baseline is None:
+        base = [0.0] * len(xs)
+    else:
+        base = _attr_x(baseline, who)
+        if len(base) != len(xs):
+            raise ValueError(
+                f"{who}: baseline 长度 {len(base)} 与 x 长度 {len(xs)} 不一致")
+    eps = _metric_number(eps, who, 0)
+    if eps <= 0.0:
+        raise ValueError(f"{who}: eps 必须 > 0，收到 {eps}")
+    for layer in net.layers:
+        if not _attr_supported_activation(layer):
+            raise ValueError(
+                f"{who}: 第 {net.layers.index(layer)} 层激活 "
+                f"{layer.activation_name!r} 不是逐元素激活，Rescale 规则不适用")
+    zs_x, acts_x = _attr_trace(net, xs)
+    zs_b, acts_b = _attr_trace(net, base)
+    c = _attr_target(acts_x[-1], class_index, who)
+    mult = [0.0] * len(acts_x[-1])
+    mult[c] = 1.0
+    for l in range(len(net.layers) - 1, -1, -1):
+        layer = net.layers[l]
+        za = zs_x[l]
+        zb = zs_b[l]
+        deriv = layer.act_deriv(zb)
+        slope = []
+        for j in range(layer.fan_out):
+            dz = za[j] - zb[j]
+            if abs(dz) > eps:
+                slope.append((acts_x[l][j] - acts_b[l][j]) / dz)
+            else:
+                slope.append(deriv[j])
+        mz = [mult[j] * slope[j] for j in range(layer.fan_out)]
+        mult = [sum(mz[j] * layer.weights[j][i] for j in range(layer.fan_out))
+                for i in range(layer.fan_in)]
+    return [mult[i] * (xs[i] - base[i]) for i in range(len(xs))]
+
+
 def fleiss_kappa(ratings, categories=None) -> float:
     """Fleiss' Kappa：多名评分者对同一批对象做**固定类别**标注的一致性。
 

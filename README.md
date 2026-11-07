@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1372 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1382 项）
 
 ## 特性
 
@@ -1374,6 +1374,36 @@ print(average_recall(gt, pred))                  # 1.0
 - **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
   10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
 
+### 输入归因（W14-A）
+
+| 函数 | 说明 |
+|---|---|
+| `saliency_map(model, x, class_index=None)` | 目标类 logit 对输入的梯度（默认取绝对值） |
+| `gradient_x_input(model, x, class_index=None)` | `x_i · ∂y_c/∂x_i`，保留符号 |
+| `smooth_grad(model, x, samples=50, sigma=0.1, seed=None)` | 对 `N(x, σ²)` 采样的梯度取平均 |
+| `integrated_gradients(model, x, baseline=None, steps=64)` | 中点黎曼平均 × 位移，满足完备性 |
+| `deep_lift(model, x, baseline=None)` | Rescale 规则：`Δa/Δz` 乘子回传 |
+
+```python
+net = MLP([2, 3, 1], activations=["relu", "linear"])
+print(saliency_map(net, [1.0, 2.0]))            # 梯度绝对值
+print(gradient_x_input(net, [1.0, 2.0]))        # 带符号
+print(integrated_gradients(net, [1.0, 2.0]))    # Σ ≈ f(x) - f(0)
+print(deep_lift(net, [1.0, 2.0]))               # 同一差值的乘子分解
+```
+
+口径说明：
+
+- `class_index` 省略时取**干净输入的 argmax**；`smooth_grad` 的所有噪声样本都用同
+  一个目标类，否则平均没有意义。
+- `integrated_gradients` 用中点黎曼和（不是左端点），`steps` 越大越接近完备性
+  `Σ attribution = f(x) − f(baseline)`；`deep_lift` 的 Rescale 规则在逐元素激活上
+  是**精确**完备的，`Δz ≈ 0` 时退化为该点导数。
+- `deep_lift` 只接受逐元素激活（`linear/relu/leaky_relu/gelu/silu/mish/elu/selu/sigmoid`），
+  遇到 `softmax` 这类非对角激活直接报错——这是规则本身的限制，不是实现偷懒。
+- 归因值都是相对某个 `baseline`（默认全零）说的，换 baseline 结果会变，别把它当
+  绝对贡献。
+
 ### 一致性与公平性（W13-K）
 
 | 函数 | 说明 |
@@ -1849,7 +1879,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1372 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1382 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2031,6 +2061,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDetectionMetrics` | IoU 手算、完美 AP、FP 在前的 2/3、阈值改变结果、mAP 与 mAP@[.5:.95]、AR 的 max_dets、八条非法输入 |
 | `TestImageQualityMetrics` | PSNR 的 inf/0dB/`data_range`、SSIM 与独立参考实现对照、MS-SSIM 两个尺度、FID 三种方差组合、KID 单调性、IS 的 1 与 2、十条非法输入 |
 | `TestConsistencyFairness` | Fleiss 完美 1.0 与 Fleiss(1971) 经典例 0.2199、两两相反 0、Krippendorff 单单位手算 0、三种 level 的参考值、缺失值、三项公平性手算与 0.8 边界、十条非法输入 |
+| `TestAttribution` | 线性网络闭式梯度、Grad×Input 与梯度的关系、IG 完备性（线性精确 / ReLU 收敛）、DeepLIFT 完备性、SmoothGrad 退化与可复现、多分类 class_index、九条非法输入、softmax 拒绝 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2084,7 +2115,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1372 个单元测试
+├── test_ai.py       # 1382 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
