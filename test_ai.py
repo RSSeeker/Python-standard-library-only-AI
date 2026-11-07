@@ -23512,3 +23512,138 @@ class TestMetaLearning:
             AI.prototype_embeddings([], [])
         with pytest.raises(ValueError):
             AI.prototype_logits([[0.0, 0.0]], {0: [0.0, 0.0]}, temperature=0.0)
+
+
+class TestFederatedLearning:
+    """W16-I：FedAvg / FedProx / FedBN / 参数摊平。"""
+
+    def test_named_params_roundtrip(self):
+        AI.set_seed(21)
+        net = AI.MLP([2, 4, 1], activations=["relu", "linear"])
+        before = [([list(r) for r in layer.weights], list(layer.biases))
+                  for layer in net.layers]
+        named = AI.named_params(net)
+        assert sorted(named.keys()) == ["L0.W", "L0.b", "L1.W", "L1.b"]
+        assert len(named["L0.W"]) == 8 and len(named["L0.b"]) == 4
+        AI.load_named_params(net, dict((k, [0.0] * len(v)) for k, v in named.items()))
+        assert all(v == 0.0 for layer in net.layers for row in layer.weights for v in row)
+        AI.load_named_params(net, named)
+        after = [([list(r) for r in layer.weights], list(layer.biases))
+                 for layer in net.layers]
+        assert before == after
+
+    def test_named_params_validation(self):
+        net = AI.MLP([2, 3, 1], activations=["relu", "linear"])
+        named = AI.named_params(net)
+        with pytest.raises(ValueError):
+            AI.load_named_params(net, {"L0.W": [0.0] * 6})
+        bad = dict(named)
+        bad["L0.W"] = [0.0] * 5
+        with pytest.raises(ValueError):
+            AI.load_named_params(net, bad)
+        bad_b = dict(named)
+        bad_b["L1.b"] = [0.0] * 2
+        with pytest.raises(ValueError):
+            AI.load_named_params(net, bad_b)
+        with pytest.raises(ValueError):
+            AI.named_params(3)
+
+    def test_fedavg_equal_and_weighted(self):
+        a = {"w": [1.0, 2.0], "b": [0.0]}
+        b = {"w": [3.0, 4.0], "b": [2.0]}
+        avg = AI.fedavg([a, b])
+        assert avg["w"] == [2.0, 3.0] and avg["b"] == [1.0]
+        wavg = AI.fedavg([a, b], [0.75, 0.25])
+        assert wavg["w"] == [1.5, 2.5] and wavg["b"] == [0.5]
+        assert AI.fedavg([a])["w"] == [1.0, 2.0]
+
+    def test_fedavg_validation(self):
+        a = {"w": [1.0, 2.0], "b": [0.0]}
+        b = {"w": [3.0, 4.0], "b": [2.0]}
+        with pytest.raises(ValueError):
+            AI.fedavg([])
+        with pytest.raises(ValueError):
+            AI.fedavg([a, {"w": [1.0, 2.0]}])
+        with pytest.raises(ValueError):
+            AI.fedavg([a, {"w": [1.0], "b": [0.0]}])
+        with pytest.raises(ValueError):
+            AI.fedavg([a, b], [1.0, -1.0])
+        with pytest.raises(ValueError):
+            AI.fedavg([a, b], [0.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.fedavg([a, b], [1.0])
+        with pytest.raises(ValueError):
+            AI.fedavg([{"w": ["x"]}])
+        with pytest.raises(ValueError):
+            AI.fedavg([{"w": 1.0}])
+
+    def test_fedprox_closed_form(self):
+        local = {"w": [1.0, 3.0], "b": [2.0]}
+        glob = {"w": [0.0, 1.0], "b": [0.0]}
+        pen, grad = AI.fedprox_penalty(local, glob, mu=0.5)
+        assert abs(pen - 0.5 * 0.5 * 9.0) < 1e-12
+        assert grad["w"] == [0.5, 1.0] and grad["b"] == [1.0]
+
+    def test_fedprox_gradient_matches_finite_diff(self):
+        local = {"w": [1.0, 3.0], "b": [2.0]}
+        glob = {"w": [0.0, 1.0], "b": [0.0]}
+        _pen, grad = AI.fedprox_penalty(local, glob, mu=0.5)
+        eps = 1e-6
+        for key in ("w", "b"):
+            for i in range(len(local[key])):
+                hi = dict((k, list(v)) for k, v in local.items())
+                hi[key][i] += eps
+                lo = dict((k, list(v)) for k, v in local.items())
+                lo[key][i] -= eps
+                num = (AI.fedprox_penalty(hi, glob, mu=0.5)[0]
+                       - AI.fedprox_penalty(lo, glob, mu=0.5)[0]) / (2 * eps)
+                assert abs(num - grad[key][i]) < 1e-9
+
+    def test_fedprox_validation(self):
+        local = {"w": [1.0], "b": [2.0]}
+        glob = {"w": [0.0], "b": [0.0]}
+        pen0, grad0 = AI.fedprox_penalty(local, glob, mu=0.0)
+        assert pen0 == 0.0
+        assert all(v == 0.0 for vec in grad0.values() for v in vec)
+        with pytest.raises(ValueError):
+            AI.fedprox_penalty(local, glob, mu=-0.1)
+        with pytest.raises(ValueError):
+            AI.fedprox_penalty(local, {"w": [0.0]}, mu=0.1)
+        with pytest.raises(ValueError):
+            AI.fedprox_penalty(local, {"w": [0.0], "b": [0.0, 1.0]}, mu=0.1)
+
+    def test_fedbn_split(self):
+        client = {"bn.gamma": [1.0, 2.0], "fc.w": [3.0], "norm.beta": [4.0]}
+        shared, private = AI.fedbn_split(client)
+        assert sorted(shared.keys()) == ["fc.w"]
+        assert sorted(private.keys()) == ["bn.gamma", "norm.beta"]
+        with pytest.raises(ValueError):
+            AI.fedbn_split(client, [""])
+        with pytest.raises(ValueError):
+            AI.fedbn_split({})
+
+    def test_fedbn_average(self):
+        c1 = {"bn.gamma": [1.0], "fc.w": [1.0, 2.0]}
+        c2 = {"bn.gamma": [5.0], "fc.w": [3.0, 4.0]}
+        avg, privs = AI.fedbn_average([c1, c2])
+        assert avg["fc.w"] == [2.0, 3.0]
+        assert privs[0]["bn.gamma"] == [1.0] and privs[1]["bn.gamma"] == [5.0]
+        with pytest.raises(ValueError):
+            AI.fedbn_average([{"bn.gamma": [1.0]}, {"bn.gamma": [2.0]}])
+        with pytest.raises(ValueError):
+            AI.fedbn_average([c1, {"bn.gamma": [1.0]}])
+
+    def test_federated_roundtrip(self):
+        AI.set_seed(22)
+        m1 = AI.MLP([2, 3, 1], activations=["relu", "linear"])
+        m2 = AI.MLP([2, 3, 1], activations=["relu", "linear"])
+        p1 = AI.named_params(m1)
+        p2 = AI.named_params(m2)
+        merged = AI.fedavg([p1, p2])
+        AI.load_named_params(m1, merged)
+        assert AI.named_params(m1) == merged
+        pen, grad = AI.fedprox_penalty(p1, merged, mu=0.1)
+        assert pen >= 0.0
+        assert sorted(grad.keys()) == sorted(p1.keys())
+        AI.load_named_params(m1, p1)
+        assert AI.named_params(m1) == p1

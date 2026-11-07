@@ -30147,6 +30147,189 @@ class PPOAgent:
         return self.policy.param_count() + self.value.param_count()
 
 # ============================================================================
+#  联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
+# ============================================================================
+
+def _fed_check_updates(updates, who):
+    """校验「客户端更新列表」：非空、每项是 dict、键集合完全一致。"""
+    if not isinstance(updates, (list, tuple)) or not updates:
+        raise ValueError(f"{who}: updates 必须是非空列表")
+    first = None
+    for i, up in enumerate(updates):
+        if not isinstance(up, dict) or not up:
+            raise ValueError(f"{who}: updates[{i}] 必须是非空 dict")
+        keys = set(up.keys())
+        if first is None:
+            first = keys
+        elif keys != first:
+            missing = sorted(first - keys)
+            extra = sorted(keys - first)
+            raise ValueError(
+                f"{who}: updates[{i}] 的键与第一个客户端不一致"
+                f"（缺 {missing}，多 {extra}）")
+        for key, vec in up.items():
+            if not isinstance(vec, (list, tuple)) or not vec:
+                raise ValueError(f"{who}: updates[{i}][{key!r}] 必须是非空列表")
+            for v in vec:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(
+                        f"{who}: updates[{i}][{key!r}] 含非数字元素 {v!r}")
+    return list(updates[0].keys())
+
+
+def _fed_check_weights(updates, weights, who):
+    """校验客户端权重（省略时为等权）。"""
+    if weights is None:
+        return [1.0] * len(updates)
+    if not isinstance(weights, (list, tuple)) or len(weights) != len(updates):
+        raise ValueError(f"{who}: weights 长度必须与 updates 相同")
+    out = []
+    total = 0.0
+    for i, w in enumerate(weights):
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0.0:
+            raise ValueError(f"{who}: weights[{i}] 必须是非负数字，收到 {w!r}")
+        out.append(float(w))
+        total += float(w)
+    if total <= 0.0:
+        raise ValueError(f"{who}: weights 之和必须 > 0")
+    return out
+
+
+def _fed_same_shape(a, b, who, key):
+    if len(a) != len(b):
+        raise ValueError(
+            f"{who}: 键 {key!r} 的向量长度不一致（{len(a)} vs {len(b)}）")
+
+
+def fedavg(updates, weights=None):
+    """FedAvg：按客户端权重对同名参数做加权平均。"""
+    keys = _fed_check_updates(updates, "fedavg")
+    ws = _fed_check_weights(updates, weights, "fedavg")
+    total = sum(ws)
+    out = {}
+    for key in keys:
+        base = updates[0][key]
+        acc = [0.0] * len(base)
+        for up, w in zip(updates, ws):
+            vec = up[key]
+            _fed_same_shape(base, vec, "fedavg", key)
+            for i in range(len(vec)):
+                acc[i] += w * float(vec[i])
+        out[key] = [v / total for v in acc]
+    return out
+
+
+def fedprox_penalty(local, global_params, mu=0.01):
+    """FedProx 的近端项 ``0.5*mu*||local-global||^2`` 及其对 local 的梯度。"""
+    keys = _fed_check_updates([local], "fedprox_penalty")
+    if not isinstance(global_params, dict) or not global_params:
+        raise ValueError("fedprox_penalty: global_params 必须是非空 dict")
+    if set(global_params.keys()) != set(keys):
+        raise ValueError("fedprox_penalty: local 与 global_params 的键不一致")
+    if isinstance(mu, bool) or not isinstance(mu, (int, float)) or mu < 0.0:
+        raise ValueError(f"fedprox_penalty: mu 必须是非负数字，收到 {mu!r}")
+    penalty = 0.0
+    grad = {}
+    for key in keys:
+        loc = local[key]
+        glo = global_params[key]
+        _fed_same_shape(loc, glo, "fedprox_penalty", key)
+        g = [0.0] * len(loc)
+        for i in range(len(loc)):
+            diff = float(loc[i]) - float(glo[i])
+            penalty += 0.5 * float(mu) * diff * diff
+            g[i] = float(mu) * diff
+        grad[key] = g
+    return penalty, grad
+
+
+def _fed_is_private(key, private_prefixes):
+    for prefix in private_prefixes:
+        if key.startswith(prefix):
+            return True
+    return False
+
+
+def fedbn_split(update, private_prefixes=("bn.", "norm.")):
+    """把一份客户端参数拆成「共享」与「私有」（FedBN 的本地 BatchNorm）。"""
+    if not isinstance(update, dict) or not update:
+        raise ValueError("fedbn_split: update 必须是非空 dict")
+    if not isinstance(private_prefixes, (list, tuple)):
+        raise ValueError("fedbn_split: private_prefixes 必须是字符串列表")
+    for prefix in private_prefixes:
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(
+                f"fedbn_split: private_prefixes 里必须是非空字符串，收到 {prefix!r}")
+    shared = {}
+    private = {}
+    for key, vec in update.items():
+        (private if _fed_is_private(key, private_prefixes) else shared)[key] = vec
+    return shared, private
+
+
+def fedbn_average(updates, private_prefixes=("bn.", "norm."), weights=None):
+    """FedBN：只平均共享参数，私有参数各自保留。
+
+    返回 ``(shared_avg, private_list)``，``private_list`` 与 ``updates`` 等长。
+    """
+    keys = _fed_check_updates(updates, "fedbn_average")
+    ws = _fed_check_weights(updates, weights, "fedbn_average")
+    shared_keys = [k for k in keys if not _fed_is_private(k, private_prefixes)]
+    if not shared_keys:
+        raise ValueError(
+            "fedbn_average: 所有键都是私有参数，没有可平均的共享参数")
+    shareds = []
+    privates = []
+    for up in updates:
+        s, p = fedbn_split(up, private_prefixes)
+        if sorted(s.keys()) != sorted(shared_keys):
+            raise ValueError("fedbn_average: 各客户端的共享键集合不一致")
+        shareds.append(s)
+        privates.append(p)
+    avg = fedavg(shareds, ws)
+    return avg, privates
+
+
+def named_params(model):
+    """把 MLP 的参数摊平成 ``{"L0.W": [...], "L0.b": [...]}``（行主序）。"""
+    mlp = _meta_mlp(model, "named_params")
+    out = {}
+    for i, layer in enumerate(mlp.layers):
+        flat = []
+        for row in layer.weights:
+            flat.extend(float(v) for v in row)
+        out["L%d.W" % i] = flat
+        out["L%d.b" % i] = [float(v) for v in layer.biases]
+    return out
+
+
+def load_named_params(model, params):
+    """``named_params`` 的逆操作；形状不符直接报错。"""
+    mlp = _meta_mlp(model, "load_named_params")
+    if not isinstance(params, dict) or not params:
+        raise ValueError("load_named_params: params 必须是非空 dict")
+    for i, layer in enumerate(mlp.layers):
+        wkey = "L%d.W" % i
+        bkey = "L%d.b" % i
+        if wkey not in params or bkey not in params:
+            raise ValueError(f"load_named_params: 缺少 {wkey!r} 或 {bkey!r}")
+        wvec = params[wkey]
+        bvec = params[bkey]
+        if len(wvec) != layer.fan_out * layer.fan_in:
+            raise ValueError(
+                f"load_named_params: {wkey!r} 长度 {len(wvec)} "
+                f"应为 {layer.fan_out * layer.fan_in}")
+        if len(bvec) != layer.fan_out:
+            raise ValueError(
+                f"load_named_params: {bkey!r} 长度 {len(bvec)} 应为 {layer.fan_out}")
+        k = 0
+        for j in range(layer.fan_out):
+            for col in range(layer.fan_in):
+                layer.weights[j][col] = float(wvec[k])
+                k += 1
+        layer.biases[:] = [float(v) for v in bvec]
+
+# ============================================================================
 #  元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
 # ============================================================================
 

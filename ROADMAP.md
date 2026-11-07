@@ -541,7 +541,11 @@
   - `prototype_embeddings` / `prototype_logits` / `prototypical_loss`
   - `matching_attention` / `matching_logits`
   - 探针 41 项；修掉 `prototypical_loss` 梯度漏除样本数（差 1/2）
-- [ ] 联邦学习：FedAvg / FedProx / FedBN
+- [x] 联邦学习：FedAvg / FedProx / FedBN
+  - `named_params` / `load_named_params`（MLP 参数摊平与写回）
+  - `fedavg`（等权/加权平均）/ `fedprox_penalty`（近端项与梯度）
+  - `fedbn_split` / `fedbn_average`（按前缀区分私有参数）
+  - 探针 40 项；不含客户端训练循环与通信调度（README 已写明）
 
 ### W17 领域应用（§16）
 - [ ] 时序：TCN / Informer（简化）/ Autoformer（简化）/ PatchTST

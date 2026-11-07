@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1541 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1551 项）
 
 ## 特性
 
@@ -1898,6 +1898,36 @@ loss, d_query = prototypical_loss(query_emb, query_labels, support_emb, support_
 - MAML / Reptile 的参数字典是**逐行原地写回**（保持层对象与优化器状态引用），所以 `maml_inner_step` 内部用 `finally` 恢复原参数，返回的是参数副本。
 - `matches_attention` 之类只做一次前向/相似度，不涉及反向；ProtoNet 的梯度只对**查询嵌入**给出，对支撑集/原型本身没有梯度。
 
+### 联邦学习（W16-I：FedAvg / FedProx / FedBN）
+
+| API | 说明 |
+| --- | --- |
+| `named_params(model)` | 把 MLP 参数摊平成 `{"L0.W": [...], "L0.b": [...]}`（行主序） |
+| `load_named_params(model, params)` | 逆操作，形状不符直接报错 |
+| `fedavg(updates, weights=None)` | 按客户端权重对同名参数加权平均 |
+| `fedprox_penalty(local, global_params, mu=0.01)` | 近端项 `0.5*mu*||local-global||²` 及其梯度 |
+| `fedbn_split(update, private_prefixes=("bn.","norm."))` | 拆成「共享」与「私有」两组参数 |
+| `fedbn_average(updates, private_prefixes, weights=None)` | 只平均共享参数，私有参数各自保留 |
+
+```python
+# 各客户端本地训练后，把参数交给服务器
+updates = [named_params(client_a), named_params(client_b)]
+global_params = fedavg(updates, [size_a, size_b])
+load_named_params(server_model, global_params)
+
+# FedProx：客户端目标里加近端项
+pen, grad = fedprox_penalty(named_params(client_a), global_params, mu=0.01)
+
+# FedBN：BatchNorm 参数留在本地
+shared_avg, privates = fedbn_average(updates)
+```
+
+三条边界：
+
+- 这些函数只做**参数聚合与正则项**，不含客户端训练循环、通信调度、差分隐私；`fedavg` 是同步等权/加权平均，不是异步或压缩方案。
+- `fedprox_penalty` 的梯度是对 `local` 的（`mu*(local-global)`），客户端把它加到自己的梯度上即可，本库不替你合并。
+- `fedbn_split` 按**键名前缀**区分私有参数，`fedbn_average` 只平均共享键；若所有键都是私有会直接报错，而不是静默返回空。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2314,7 +2344,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1541 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1551 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2515,6 +2545,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPolicyGradient` | W16-F2：策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
 | `TestRLInfrastructure` | W16-G：ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
 | `TestMetaLearning` | MAML 内/外循环、Reptile 均值更新、ProtoNet 梯度、Matching 注意力 |
+| `TestFederatedLearning` | 参数摊平往返、FedAvg 加权平均、FedProx 梯度、FedBN 拆分与聚合 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2568,7 +2599,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1541 个单元测试
+├── test_ai.py       # 1551 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
