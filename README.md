@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1561 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1571 项）
 
 ## 特性
 
@@ -1958,6 +1958,41 @@ patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
 - `prob_sparse_attention` 是 Informer 的**简化前向近似**：只让稀疏度评分最高的 u 个查询看全部键，其余查询退化为值的均值，没有反向实现；`Autoformer` 的聚合同样是简化版（无 FFT、无频域）。
 - `PatchTSTEmbedding` 只做 patch 嵌入与 RevIN 归一化/反归一化，不含通道独立的多变量建模与预测头。
 
+### 推荐模型（W17-B-1：矩阵分解 / NCF / Wide&Deep）
+
+| API | 说明 |
+| --- | --- |
+| `matrix_factorization(ratings, num_factors=8, epochs=100, lr=0.02, reg=0.05, seed=None)` | 显式反馈 MF，逐条 SGD + L2，返回因子与逐轮 MSE |
+| `mf_predict(user_factors, item_factors, user, item)` | 单对预测 `P[u]·Q[i]` |
+| `mf_rmse(ratings, user_factors, item_factors)` | 在给定评分上的 RMSE |
+| `NCF(num_users, num_items, factors=8, hidden=(16,), seed=None)` | GMF（逐元素积）+ MLP 的融合排序模型 |
+| `WideAndDeep(num_wide, num_deep, hidden=(8,), seed=None)` | 线性宽侧 + ReLU 深侧，logit 相加 |
+
+```python
+res = matrix_factorization([(0, 0, 5.0), (0, 1, 3.0), (1, 1, 4.0)],
+                           num_factors=8, epochs=100, seed=42)
+pred = mf_predict(res["user_factors"], res["item_factors"], 0, 1)
+
+ncf = NCF(num_users=100, num_items=50, factors=8, hidden=(16,))
+loss, grads = ncf.loss_and_grads([0, 1], [3, 4], [1.0, 0.0])
+ncf.apply_grads(grads, lr=0.05)
+
+wd = WideAndDeep(num_wide=6, num_deep=4, hidden=(8,))
+logit = wd.logits([[1.0, 0, 0, 0, 0, 0]], [[0.5, -0.2, 0.1, 0.3]])[0]
+```
+
+三个模型的梯度都是**手写**的（`NCF` / `WideAndDeep` 的 `loss_and_grads` 返回逐参数梯度，
+逐权重中心差分误差 < 1e-7）。四条边界：
+
+- `matrix_factorization` 只有 `P·Q`：没有用户/物品偏置、没有隐式反馈、没有 ALS；
+  因子用 `N(0, 0.1)` 初始化，`seed` 只控制初始化与每轮打乱顺序。
+- `NCF` 的批量反传是**逐样本**做的（`Layer` 的缓存只保留最后一次前向），
+  与 `_mlp_backward` 同一策略；`loss_and_grads` 已按样本数平均。
+- `WideAndDeep` 的宽侧吃稠密向量（本库没有稀疏特征/嵌入表），
+  两侧只在 logit 处相加，没有联合训练技巧。
+- 三者都只做二分类/回归打分，不含负采样、召回评估与特征工程；
+  `DeepFM` / `DIN` 尚未实现（`ROADMAP.md` 的 W17-B-2）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2374,7 +2409,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1561 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1571 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2577,6 +2612,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMetaLearning` | MAML 内/外循环、Reptile 均值更新、ProtoNet 梯度、Matching 注意力 |
 | `TestFederatedLearning` | 参数摊平往返、FedAvg 加权平均、FedProx 梯度、FedBN 拆分与聚合 |
 | `TestTimeSeriesModels` | 因果卷积闭式与反向、TCN 梯度与因果性、Informer 稀疏注意力、Autoformer 分解、PatchTST 嵌入 |
+| `TestRecommenders` | 矩阵分解收敛与可复现、NCF 的 logit 重算与逐权重梯度、Wide&Deep 训练与宽侧梯度、三者的参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2630,7 +2666,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1561 个单元测试
+├── test_ai.py       # 1571 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

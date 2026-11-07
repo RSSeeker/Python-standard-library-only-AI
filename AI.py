@@ -30526,6 +30526,494 @@ class PatchTSTEmbedding:
     def param_count(self):
         return self.d_model * self.patch_len + self.d_model
 
+# ======================================================================
+#  领域应用 W17-B：推荐（矩阵分解 / NCF / Wide&Deep）
+# ======================================================================
+
+
+def _w17b_rng(seed):
+    """局部随机数发生器（不推进全局 random 状态）。"""
+    return random.Random(seed) if seed is not None else random.Random()
+
+
+def _w17b_float(value, who, name="value"):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{who}: {name} 必须是数字，收到 {type(value).__name__}")
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{who}: {name} 不能是 nan/inf")
+    return float(value)
+
+
+def _w17b_int(value, who, name="value", minimum=0):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{who}: {name} 必须是整数，收到 {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(f"{who}: {name} 必须 >= {minimum}，收到 {value}")
+    return value
+
+
+def _w17b_rows(rows, width, who):
+    """校验「等宽数值矩阵」。"""
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"{who}: 需要一个非空的二维列表")
+    out = []
+    for r, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(f"{who}: 第 {r} 行不是列表")
+        if len(row) != width:
+            raise ValueError(f"{who}: 第 {r} 行长度 {len(row)}，应为 {width}")
+        out.append([_w17b_float(v, who, f"第 {r} 行") for v in row])
+    return out
+
+
+def _w17b_dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _w17b_check_ratings(ratings, who):
+    """校验 (user, item, value) 三元组列表。"""
+    if not isinstance(ratings, (list, tuple)) or not ratings:
+        raise ValueError(f"{who}: ratings 需要非空的 (user, item, value) 列表")
+    out = []
+    for idx, row in enumerate(ratings):
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError(f"{who}: 第 {idx} 条不是 (user, item, value) 三元组")
+        user = _w17b_int(row[0], who, f"第 {idx} 条的 user")
+        item = _w17b_int(row[1], who, f"第 {idx} 条的 item")
+        value = _w17b_float(row[2], who, f"第 {idx} 条的 value")
+        out.append((user, item, value))
+    return out
+
+
+def matrix_factorization(ratings, num_factors=8, epochs=100, lr=0.02,
+                         reg=0.05, seed=None):
+    """矩阵分解（显式反馈，SGD 逐条更新 + L2 正则）。
+
+    `ratings` 是 `(user, item, value)` 三元组列表；返回 dict：
+    `{"user_factors", "item_factors", "losses", "num_users", "num_items"}`。
+    `losses[e]` 是第 `e` 轮后的全量均方误差（确定性评估，不受采样顺序影响）。
+
+    这是最朴素的 MF：只学 `P[u]·Q[i]`，没有偏置项、没有隐式反馈、没有
+    交替最小二乘，`epochs` 轮全量遍历，学习率与正则都是固定值。
+    """
+    data = _w17b_check_ratings(ratings, "matrix_factorization")
+    f = _w17b_int(num_factors, "matrix_factorization", "num_factors", 1)
+    n_epochs = _w17b_int(epochs, "matrix_factorization", "epochs", 1)
+    lr = _w17b_float(lr, "matrix_factorization", "lr")
+    if lr <= 0.0:
+        raise ValueError("matrix_factorization: lr 必须 > 0")
+    reg = _w17b_float(reg, "matrix_factorization", "reg")
+    if reg < 0.0:
+        raise ValueError("matrix_factorization: reg 必须 >= 0")
+
+    n_users = max(r[0] for r in data) + 1
+    n_items = max(r[1] for r in data) + 1
+    rng = _w17b_rng(seed)
+    P = [[rng.gauss(0.0, 0.1) for _ in range(f)] for _ in range(n_users)]
+    Q = [[rng.gauss(0.0, 0.1) for _ in range(f)] for _ in range(n_items)]
+
+    order = list(range(len(data)))
+    losses = []
+    for _epoch in range(n_epochs):
+        if seed is not None:
+            rng.shuffle(order)
+        for idx in order:
+            u, i, value = data[idx]
+            pu, qi = P[u], Q[i]
+            err = value - _w17b_dot(pu, qi)
+            # 用更新前的 pu 计算 qi 的梯度（标准的「冻结另一侧」写法）
+            snapshot = list(pu)
+            for k in range(f):
+                pu[k] += lr * (err * qi[k] - reg * snapshot[k])
+            for k in range(f):
+                qi[k] += lr * (err * snapshot[k] - reg * qi[k])
+        total = 0.0
+        for u, i, value in data:
+            diff = value - _w17b_dot(P[u], Q[i])
+            total += diff * diff
+        losses.append(total / len(data))
+
+    return {
+        "user_factors": P,
+        "item_factors": Q,
+        "losses": losses,
+        "num_users": n_users,
+        "num_items": n_items,
+    }
+
+
+def mf_predict(user_factors, item_factors, user, item):
+    """用学到的因子预测单个 (user, item) 的评分。"""
+    if not user_factors or not item_factors:
+        raise ValueError("mf_predict: 因子矩阵不能为空")
+    u = _w17b_int(user, "mf_predict", "user")
+    i = _w17b_int(item, "mf_predict", "item")
+    if u >= len(user_factors):
+        raise ValueError(f"mf_predict: user 下标 {u} 越界（共 {len(user_factors)} 个）")
+    if i >= len(item_factors):
+        raise ValueError(f"mf_predict: item 下标 {i} 越界（共 {len(item_factors)} 个）")
+    return _w17b_dot(user_factors[u], item_factors[i])
+
+
+def mf_rmse(ratings, user_factors, item_factors):
+    """矩阵分解在给定评分上的 RMSE。"""
+    data = _w17b_check_ratings(ratings, "mf_rmse")
+    total = 0.0
+    for u, i, value in data:
+        diff = value - mf_predict(user_factors, item_factors, u, i)
+        total += diff * diff
+    return math.sqrt(total / len(data))
+
+
+def _w17b_bce(logit, target):
+    """数值稳定的二分类交叉熵。"""
+    if logit >= 0.0:
+        return logit - target * logit + math.log1p(math.exp(-logit))
+    return -target * logit + math.log1p(math.exp(logit))
+
+
+class NCF:
+    """神经协同过滤（GMF + MLP 的双塔融合，逐样本手写反向）。
+
+    `scores` 用的是 GMF 的逐元素积 + 一个隐层 MLP，最终 logit 相加；
+    因为 `Layer` 的缓存是「最后一次前向」，批量反传只能逐样本做
+    （与本库 `_mlp_backward` 同一策略），`loss_and_grads` 内部已按样本数平均。
+    """
+
+    def __init__(self, num_users, num_items, factors=8, hidden=(16,), seed=None):
+        self.num_users = _w17b_int(num_users, "NCF", "num_users", 1)
+        self.num_items = _w17b_int(num_items, "NCF", "num_items", 1)
+        self.factors = _w17b_int(factors, "NCF", "factors", 1)
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("NCF: hidden 需要非空的层宽列表")
+        self.hidden_sizes = [_w17b_int(h, "NCF", "hidden", 1) for h in hidden]
+        if seed is not None:
+            _w17b_int(seed, "NCF", "seed", 0)
+        self.seed = seed
+
+        rng = _w17b_rng(seed)
+        std = 0.1
+        f = self.factors
+        self.user_emb = [[rng.gauss(0.0, std) for _ in range(f)]
+                         for _ in range(self.num_users)]
+        self.item_emb = [[rng.gauss(0.0, std) for _ in range(f)]
+                         for _ in range(self.num_items)]
+        self.gmf_w = [rng.gauss(0.0, std) for _ in range(f)]
+        self.gmf_b = 0.0
+
+        # Layer 用全局 random 初始化，用「保存-设置-恢复」保证可复现
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed + 1)
+            self.hidden = []
+            fan_in = 2 * f
+            for width in self.hidden_sizes:
+                self.hidden.append(Layer(fan_in, width, activation="relu"))
+                fan_in = width
+        finally:
+            random.setstate(state)
+        self.out_w = [rng.gauss(0.0, std) for _ in range(fan_in)]
+        self.out_b = 0.0
+
+    # --- 前向 -------------------------------------------------------
+    def _forward_one(self, user, item):
+        u = _w17b_int(user, "NCF.scores", "user")
+        i = _w17b_int(item, "NCF.scores", "item")
+        if u >= self.num_users:
+            raise ValueError(f"NCF.scores: user 下标 {u} 越界")
+        if i >= self.num_items:
+            raise ValueError(f"NCF.scores: item 下标 {i} 越界")
+        eu, ei = self.user_emb[u], self.item_emb[i]
+        g = [eu[k] * ei[k] for k in range(self.factors)]
+        logit_gmf = _w17b_dot(self.gmf_w, g) + self.gmf_b
+        h = eu + ei
+        for layer in self.hidden:
+            h = layer.forward(h)
+        logit_mlp = _w17b_dot(self.out_w, h) + self.out_b
+        return logit_gmf + logit_mlp, g, h
+
+    def scores(self, user_ids, item_ids):
+        """返回逐对的 logit（未过 sigmoid）。"""
+        if not isinstance(user_ids, (list, tuple)) or not isinstance(item_ids, (list, tuple)):
+            raise TypeError("NCF.scores: user_ids / item_ids 必须是列表")
+        if len(user_ids) != len(item_ids):
+            raise ValueError("NCF.scores: user_ids 与 item_ids 长度不一致")
+        if not user_ids:
+            raise ValueError("NCF.scores: 至少需要一个样本")
+        return [self._forward_one(u, i)[0] for u, i in zip(user_ids, item_ids)]
+
+    def predict_proba(self, user_ids, item_ids):
+        """交互概率（sigmoid）。"""
+        return [1.0 / (1.0 + math.exp(-z)) for z in self.scores(user_ids, item_ids)]
+
+    # --- 反向 -------------------------------------------------------
+    def loss_and_grads(self, user_ids, item_ids, labels):
+        """二分类交叉熵 + 逐参数梯度；返回 `(loss, grads)`。"""
+        if not isinstance(labels, (list, tuple)):
+            raise TypeError("NCF.loss_and_grads: labels 必须是列表")
+        if len(labels) != len(user_ids):
+            raise ValueError("NCF.loss_and_grads: labels 长度与样本数不一致")
+        pairs = list(zip(user_ids, item_ids))
+        n = len(pairs)
+        if n == 0:
+            raise ValueError("NCF.loss_and_grads: 至少需要一个样本")
+        ys = []
+        for idx, y in enumerate(labels):
+            v = _w17b_float(y, "NCF.loss_and_grads", f"第 {idx} 个 label")
+            if v < 0.0 or v > 1.0:
+                raise ValueError("NCF.loss_and_grads: label 必须在 [0, 1] 内")
+            ys.append(v)
+
+        grads = {
+            "user_emb": [[0.0] * self.factors for _ in range(self.num_users)],
+            "item_emb": [[0.0] * self.factors for _ in range(self.num_items)],
+            "gmf_w": [0.0] * self.factors,
+            "gmf_b": 0.0,
+            "hidden": [
+                ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                 [0.0] * layer.fan_out)
+                for layer in self.hidden
+            ],
+            "out_w": [0.0] * len(self.out_w),
+            "out_b": 0.0,
+        }
+        total_loss = 0.0
+        for (u, i), y in zip(pairs, ys):
+            logit, g, h = self._forward_one(u, i)
+            total_loss += _w17b_bce(logit, y)
+            dlogit = 1.0 / (1.0 + math.exp(-logit)) - y
+
+            for k in range(self.factors):
+                grads["gmf_w"][k] += dlogit * g[k]
+            grads["gmf_b"] += dlogit
+            for j in range(len(self.out_w)):
+                grads["out_w"][j] += dlogit * h[j]
+            grads["out_b"] += dlogit
+
+            dh = [dlogit * self.out_w[j] for j in range(len(self.out_w))]
+            for idx in range(len(self.hidden) - 1, -1, -1):
+                layer = self.hidden[idx]
+                gw, gb, dh = layer.backward(dh)
+                acc_w, acc_b = grads["hidden"][idx]
+                for r in range(layer.fan_out):
+                    for c in range(layer.fan_in):
+                        acc_w[r][c] += gw[r][c]
+                    acc_b[r] += gb[r]
+
+            # concat 的梯度：前半给 user，后半给 item
+            for k in range(self.factors):
+                dg = dlogit * self.gmf_w[k]
+                grads["user_emb"][u][k] += dg * self.item_emb[i][k] + dh[k]
+                grads["item_emb"][i][k] += dg * self.user_emb[u][k] + dh[k + self.factors]
+
+        scale = 1.0 / n
+        for row in grads["user_emb"]:
+            for k in range(self.factors):
+                row[k] *= scale
+        for row in grads["item_emb"]:
+            for k in range(self.factors):
+                row[k] *= scale
+        for k in range(self.factors):
+            grads["gmf_w"][k] *= scale
+        grads["gmf_b"] *= scale
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    acc_w[r][c] *= scale
+                acc_b[r] *= scale
+        for j in range(len(self.out_w)):
+            grads["out_w"][j] *= scale
+        grads["out_b"] *= scale
+        return total_loss / n, grads
+
+    def apply_grads(self, grads, lr=0.05):
+        """原地 SGD 一步。"""
+        lr = _w17b_float(lr, "NCF.apply_grads", "lr")
+        if lr < 0.0:
+            raise ValueError("NCF.apply_grads: lr 必须 >= 0")
+        for u in range(self.num_users):
+            for k in range(self.factors):
+                self.user_emb[u][k] -= lr * grads["user_emb"][u][k]
+        for i in range(self.num_items):
+            for k in range(self.factors):
+                self.item_emb[i][k] -= lr * grads["item_emb"][i][k]
+        for k in range(self.factors):
+            self.gmf_w[k] -= lr * grads["gmf_w"][k]
+        self.gmf_b -= lr * grads["gmf_b"]
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    layer.weights[r][c] -= lr * acc_w[r][c]
+                layer.biases[r] -= lr * acc_b[r]
+        for j in range(len(self.out_w)):
+            self.out_w[j] -= lr * grads["out_w"][j]
+        self.out_b -= lr * grads["out_b"]
+
+    def param_count(self):
+        """可训练标量个数。"""
+        total = (self.num_users + self.num_items) * self.factors
+        total += len(self.gmf_w) + 1
+        for layer in self.hidden:
+            total += layer.fan_out * layer.fan_in + layer.fan_out
+        total += len(self.out_w) + 1
+        return total
+
+
+class WideAndDeep:
+    """Wide&Deep：线性宽侧 + 单/多层深侧，logit 相加。
+
+    宽侧吃稀疏特征（这里用稠密向量表示），深侧是 ReLU MLP；
+    两侧只在 logit 处相加，没有联合训练技巧（也不需要）。
+    """
+
+    def __init__(self, num_wide, num_deep, hidden=(8,), seed=None):
+        self.num_wide = _w17b_int(num_wide, "WideAndDeep", "num_wide", 1)
+        self.num_deep = _w17b_int(num_deep, "WideAndDeep", "num_deep", 1)
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("WideAndDeep: hidden 需要非空的层宽列表")
+        self.hidden_sizes = [_w17b_int(h, "WideAndDeep", "hidden", 1) for h in hidden]
+        if seed is not None:
+            _w17b_int(seed, "WideAndDeep", "seed", 0)
+        self.seed = seed
+
+        rng = _w17b_rng(seed)
+        self.wide_w = [rng.gauss(0.0, 0.1) for _ in range(self.num_wide)]
+        self.wide_b = 0.0
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed + 1)
+            self.hidden = []
+            fan_in = self.num_deep
+            for width in self.hidden_sizes:
+                self.hidden.append(Layer(fan_in, width, activation="relu"))
+                fan_in = width
+        finally:
+            random.setstate(state)
+        self.deep_w = [rng.gauss(0.0, 0.1) for _ in range(fan_in)]
+        self.deep_b = 0.0
+
+    def _check_pair(self, wide_x, deep_x, who):
+        w = _w17b_rows([wide_x], self.num_wide, who)[0]
+        d = _w17b_rows([deep_x], self.num_deep, who)[0]
+        return w, d
+
+    def logits(self, wide_features, deep_features):
+        """返回逐样本 logit。"""
+        if len(wide_features) != len(deep_features):
+            raise ValueError("WideAndDeep.logits: 宽侧与深侧样本数不一致")
+        if not wide_features:
+            raise ValueError("WideAndDeep.logits: 至少需要一个样本")
+        out = []
+        for wide_x, deep_x in zip(wide_features, deep_features):
+            w, d = self._check_pair(wide_x, deep_x, "WideAndDeep.logits")
+            h = d
+            for layer in self.hidden:
+                h = layer.forward(h)
+            out.append(_w17b_dot(self.wide_w, w) + self.wide_b
+                       + _w17b_dot(self.deep_w, h) + self.deep_b)
+        return out
+
+    def loss_and_grads(self, wide_features, deep_features, labels):
+        """二分类交叉熵 + 梯度；返回 `(loss, grads)`。"""
+        if not isinstance(labels, (list, tuple)):
+            raise TypeError("WideAndDeep.loss_and_grads: labels 必须是列表")
+        if len(labels) != len(wide_features):
+            raise ValueError("WideAndDeep.loss_and_grads: labels 长度与样本数不一致")
+        n = len(labels)
+        if n == 0:
+            raise ValueError("WideAndDeep.loss_and_grads: 至少需要一个样本")
+        ys = []
+        for idx, y in enumerate(labels):
+            v = _w17b_float(y, "WideAndDeep.loss_and_grads", f"第 {idx} 个 label")
+            if v < 0.0 or v > 1.0:
+                raise ValueError("WideAndDeep.loss_and_grads: label 必须在 [0, 1] 内")
+            ys.append(v)
+
+        grads = {
+            "wide_w": [0.0] * self.num_wide,
+            "wide_b": 0.0,
+            "hidden": [
+                ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                 [0.0] * layer.fan_out)
+                for layer in self.hidden
+            ],
+            "deep_w": [0.0] * len(self.deep_w),
+            "deep_b": 0.0,
+        }
+        total_loss = 0.0
+        for wide_x, deep_x, y in zip(wide_features, deep_features, ys):
+            w, d = self._check_pair(wide_x, deep_x, "WideAndDeep.loss_and_grads")
+            h = d
+            for layer in self.hidden:
+                h = layer.forward(h)
+            logit = (_w17b_dot(self.wide_w, w) + self.wide_b
+                     + _w17b_dot(self.deep_w, h) + self.deep_b)
+            total_loss += _w17b_bce(logit, y)
+            dlogit = 1.0 / (1.0 + math.exp(-logit)) - y
+
+            for j in range(self.num_wide):
+                grads["wide_w"][j] += dlogit * w[j]
+            grads["wide_b"] += dlogit
+            for j in range(len(self.deep_w)):
+                grads["deep_w"][j] += dlogit * h[j]
+            grads["deep_b"] += dlogit
+
+            dh = [dlogit * self.deep_w[j] for j in range(len(self.deep_w))]
+            for idx in range(len(self.hidden) - 1, -1, -1):
+                layer = self.hidden[idx]
+                gw, gb, dh = layer.backward(dh)
+                acc_w, acc_b = grads["hidden"][idx]
+                for r in range(layer.fan_out):
+                    for c in range(layer.fan_in):
+                        acc_w[r][c] += gw[r][c]
+                    acc_b[r] += gb[r]
+
+        scale = 1.0 / n
+        for j in range(self.num_wide):
+            grads["wide_w"][j] *= scale
+        grads["wide_b"] *= scale
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    acc_w[r][c] *= scale
+                acc_b[r] *= scale
+        for j in range(len(self.deep_w)):
+            grads["deep_w"][j] *= scale
+        grads["deep_b"] *= scale
+        return total_loss / n, grads
+
+    def apply_grads(self, grads, lr=0.05):
+        """原地 SGD 一步。"""
+        lr = _w17b_float(lr, "WideAndDeep.apply_grads", "lr")
+        if lr < 0.0:
+            raise ValueError("WideAndDeep.apply_grads: lr 必须 >= 0")
+        for j in range(self.num_wide):
+            self.wide_w[j] -= lr * grads["wide_w"][j]
+        self.wide_b -= lr * grads["wide_b"]
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    layer.weights[r][c] -= lr * acc_w[r][c]
+                layer.biases[r] -= lr * acc_b[r]
+        for j in range(len(self.deep_w)):
+            self.deep_w[j] -= lr * grads["deep_w"][j]
+        self.deep_b -= lr * grads["deep_b"]
+
+    def param_count(self):
+        """可训练标量个数。"""
+        total = self.num_wide + 1
+        for layer in self.hidden:
+            total += layer.fan_out * layer.fan_in + layer.fan_out
+        total += len(self.deep_w) + 1
+        return total
+
+
 # ============================================================================
 #  联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
 # ============================================================================

@@ -555,6 +555,10 @@
   - `PatchTSTEmbedding`（patch + 线性嵌入 + RevIN）
   - 探针 47 项；修掉 `TCNBlock` 反向漏掉第二道 ReLU 掩码（conv2 梯度多算，差 1.768e-01）
 - [ ] 推荐：MF / NCF / Wide&Deep / DeepFM / DIN
+  - `matrix_factorization` / `mf_predict` / `mf_rmse`（显式反馈，逐条 SGD）
+  - `NCF`（GMF + MLP 融合，逐样本手写反向）、`WideAndDeep`（宽 + 深，logit 相加）
+  - 探针 42 项（含 8 组参数的中心差分 < 1e-7）
+  - 待做：`DeepFM`（FM 二阶交叉 + 深侧）、`DIN`（序列注意力池化）
 - [ ] 图像：风格迁移（NST）/ 超分（SRCNN / SRGAN）/ 去噪（DnCNN）
 - [ ] 检索：Faiss 式暴力 + HNSW（简化）/ IVF（概念）
 - [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）

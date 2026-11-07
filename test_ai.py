@@ -23828,3 +23828,181 @@ class TestTimeSeriesModels:
             AI.PatchTSTEmbedding(patch_len=8, stride=4, d_model=2).forward([1.0, 2.0])
         with pytest.raises(ValueError):
             AI.PatchTSTEmbedding(stride=0)
+
+
+class TestRecommenders:
+    """W17-B-1：矩阵分解 / NCF / Wide&Deep。"""
+
+    def test_matrix_factorization_converges(self):
+        true_p = [[1.0, 0.5], [0.2, -1.5], [-0.8, 0.3]]
+        true_q = [[1.0, -0.4], [0.6, 0.9]]
+        data = []
+        for u in range(3):
+            for i in range(2):
+                v = sum(true_p[u][k] * true_q[i][k] for k in range(2))
+                data.append((u, i, v))
+        res = AI.matrix_factorization(data, num_factors=2, epochs=400,
+                                      lr=0.05, reg=0.01, seed=11)
+        rmse = AI.mf_rmse(data, res["user_factors"], res["item_factors"])
+        assert rmse < 0.05
+        assert res["losses"][-1] < res["losses"][0]
+        assert len(res["losses"]) == 400
+        assert res["num_users"] == 3 and res["num_items"] == 2
+
+    def test_matrix_factorization_reproducible(self):
+        data = [(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]
+        a = AI.matrix_factorization(data, num_factors=2, epochs=30, seed=4)
+        b = AI.matrix_factorization(data, num_factors=2, epochs=30, seed=4)
+        c = AI.matrix_factorization(data, num_factors=2, epochs=30, seed=5)
+        assert a["losses"] == b["losses"]
+        assert a["losses"] != c["losses"]
+
+    def test_mf_predict_and_rmse(self):
+        assert abs(AI.mf_predict([[1.0, 2.0]], [[3.0, 4.0]], 0, 0) - 11.0) < 1e-12
+        assert abs(AI.mf_rmse([(0, 0, 11.0)], [[1.0, 2.0]], [[3.0, 4.0]])) < 1e-12
+        with pytest.raises(ValueError):
+            AI.mf_predict([], [[1.0]], 0, 0)
+        with pytest.raises(ValueError):
+            AI.mf_predict([[1.0]], [[1.0]], 2, 0)
+
+    def test_matrix_factorization_validation(self):
+        with pytest.raises(ValueError):
+            AI.matrix_factorization([])
+        with pytest.raises(ValueError):
+            AI.matrix_factorization([(0, 0)])
+        with pytest.raises(ValueError):
+            AI.matrix_factorization([(0, 0, 1.0)], num_factors=0)
+        with pytest.raises(ValueError):
+            AI.matrix_factorization([(0, 0, 1.0)], lr=0.0)
+        with pytest.raises(ValueError):
+            AI.matrix_factorization([(0, 0, 1.0)], reg=-1.0)
+        with pytest.raises(TypeError):
+            AI.matrix_factorization([("a", 0, 1.0)])
+
+    def test_ncf_scores_and_param_count(self):
+        net = AI.NCF(num_users=3, num_items=2, factors=2, hidden=(3,), seed=7)
+        # (3 用户 + 2 物品) * 2 因子 + gmf_w(2) + gmf_b(1) + 隐层(3*4+3) + out_w(3) + out_b(1)
+        assert net.param_count() == 6 + 4 + 2 + 1 + 15 + 3 + 1
+        scores = net.scores([0, 1, 2], [0, 1, 0])
+        probs = net.predict_proba([0, 1, 2], [0, 1, 0])
+        for z, p in zip(scores, probs):
+            assert abs(p - 1.0 / (1.0 + math.exp(-z))) < 1e-12
+
+        # 独立重算第一条的 logit
+        eu, ei = net.user_emb[0], net.item_emb[0]
+        g = [eu[k] * ei[k] for k in range(2)]
+        lg = sum(net.gmf_w[k] * g[k] for k in range(2)) + net.gmf_b
+        h = eu + ei
+        for layer in net.hidden:
+            h = layer.forward(h)
+        lg += sum(net.out_w[j] * h[j] for j in range(len(net.out_w))) + net.out_b
+        assert abs(scores[0] - lg) < 1e-12
+
+    def test_ncf_gradients(self):
+        net = AI.NCF(num_users=3, num_items=2, factors=2, hidden=(3,), seed=7)
+        users, items, labels = [0, 1, 2, 1], [0, 1, 0, 1], [1.0, 0.0, 1.0, 0.0]
+        loss, grads = net.loss_and_grads(users, items, labels)
+        eps = 1e-6
+
+        def total():
+            return net.loss_and_grads(users, items, labels)[0]
+
+        def fd(getter, setter, analytic, label):
+            old = getter()
+            setter(old + eps)
+            hi = total()
+            setter(old - eps)
+            lo = total()
+            setter(old)
+            num = (hi - lo) / (2 * eps)
+            assert abs(num - analytic) < 1e-6, (label, num, analytic)
+
+        fd(lambda: net.user_emb[0][1], lambda v: net.user_emb[0].__setitem__(1, v),
+           grads["user_emb"][0][1], "user_emb")
+        fd(lambda: net.item_emb[1][0], lambda v: net.item_emb[1].__setitem__(0, v),
+           grads["item_emb"][1][0], "item_emb")
+        fd(lambda: net.gmf_w[0], lambda v: net.gmf_w.__setitem__(0, v),
+           grads["gmf_w"][0], "gmf_w")
+        fd(lambda: net.hidden[0].weights[2][1],
+           lambda v: net.hidden[0].weights[2].__setitem__(1, v),
+           grads["hidden"][0][0][2][1], "hidden.W")
+        fd(lambda: net.out_w[2], lambda v: net.out_w.__setitem__(2, v),
+           grads["out_w"][2], "out_w")
+        fd(lambda: net.gmf_b, lambda v: setattr(net, "gmf_b", v),
+           grads["gmf_b"], "gmf_b")
+        assert loss > 0.0
+
+    def test_ncf_trains_on_diagonal(self):
+        net = AI.NCF(num_users=4, num_items=4, factors=3, hidden=(6,), seed=3)
+        pairs = [(u, i) for u in range(4) for i in range(4)]
+        labels = [1.0 if u == i else 0.0 for u, i in pairs]
+        users = [p[0] for p in pairs]
+        items = [p[1] for p in pairs]
+        first = net.loss_and_grads(users, items, labels)[0]
+        for _ in range(400):
+            _loss, grads = net.loss_and_grads(users, items, labels)
+            net.apply_grads(grads, lr=0.3)
+        final = net.loss_and_grads(users, items, labels)[0]
+        assert final < first * 0.2
+        probs = net.predict_proba(users, items)
+        hits = sum(1 for p, y in zip(probs, labels) if (p >= 0.5) == (y == 1.0))
+        assert hits == 16
+
+    def test_ncf_validation(self):
+        net = AI.NCF(num_users=2, num_items=2, factors=2, hidden=(3,), seed=1)
+        with pytest.raises(ValueError):
+            AI.NCF(0, 2)
+        with pytest.raises(ValueError):
+            AI.NCF(2, 2, factors=0)
+        with pytest.raises(ValueError):
+            AI.NCF(2, 2, hidden=())
+        with pytest.raises(ValueError):
+            net.scores([0, 1], [0])
+        with pytest.raises(ValueError):
+            net.scores([9], [0])
+        with pytest.raises(ValueError):
+            net.loss_and_grads([0], [0], [2.0])
+        with pytest.raises(ValueError):
+            net.loss_and_grads([], [], [])
+        with pytest.raises(ValueError):
+            net.apply_grads({"user_emb": [[0.0, 0.0]], "item_emb": [[0.0, 0.0]],
+                             "gmf_w": [0.0, 0.0], "gmf_b": 0.0,
+                             "hidden": [([[0.0, 0.0, 0.0]] * 3, [0.0] * 3)],
+                             "out_w": [0.0] * 3, "out_b": 0.0}, lr=-1.0)
+
+    def test_wide_and_deep(self):
+        wd = AI.WideAndDeep(num_wide=2, num_deep=2, hidden=(4,), seed=2)
+        assert wd.param_count() == (2 + 1) + (4 * 2 + 4) + (4 + 1)
+        x_wide = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]]
+        x_deep = [[1.0, 1.0], [1.0, 0.0], [0.5, 0.5], [-1.0, -1.0]]
+        y = [1.0, 0.0, 1.0, 0.0]
+        first = wd.loss_and_grads(x_wide, x_deep, y)[0]
+        for _ in range(300):
+            _loss, grads = wd.loss_and_grads(x_wide, x_deep, y)
+            wd.apply_grads(grads, lr=0.5)
+        final = wd.loss_and_grads(x_wide, x_deep, y)[0]
+        assert final < 0.1 and final < first
+
+        # 宽侧梯度对中心差分
+        eps = 1e-6
+        _l, grads = wd.loss_and_grads(x_wide, x_deep, y)
+        old = wd.wide_w[1]
+        wd.wide_w[1] = old + eps
+        hi = wd.loss_and_grads(x_wide, x_deep, y)[0]
+        wd.wide_w[1] = old - eps
+        lo = wd.loss_and_grads(x_wide, x_deep, y)[0]
+        wd.wide_w[1] = old
+        assert abs((hi - lo) / (2 * eps) - grads["wide_w"][1]) < 1e-6
+
+    def test_wide_and_deep_validation(self):
+        wd = AI.WideAndDeep(num_wide=3, num_deep=2, hidden=(4,), seed=5)
+        with pytest.raises(ValueError):
+            AI.WideAndDeep(3, 2, hidden=())
+        with pytest.raises(ValueError):
+            wd.logits([[0.0, 0.0]], [[0.0, 0.0]])
+        with pytest.raises(ValueError):
+            wd.logits([[0.0, 0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]])
+        with pytest.raises(ValueError):
+            wd.logits([[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+        with pytest.raises(ValueError):
+            wd.loss_and_grads([[0.0, 0.0, 0.0]], [[0.0, 0.0]], [1.0, 0.0])
