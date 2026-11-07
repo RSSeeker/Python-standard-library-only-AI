@@ -23097,3 +23097,143 @@ class TestDQNFamily:
             AI.DQNAgent(2, 0)
         with pytest.raises(ValueError):
             AI.DQNNetwork(2, 2).copy_from(AI.DQNNetwork(3, 2))
+
+class TestPolicyGradient:
+    """W16-F2：REINFORCE / A2C(GAE) / PPO 的策略梯度与裁剪"""
+
+    def test_policy_gradient_loss(self):
+        logits = [1.0, 0.0, -1.0]
+        loss, grad = AI.policy_gradient_loss(logits, 1, 2.0)
+        probs = AI._rl_softmax(logits)
+        assert abs(grad[1] - (-2.0 * (1.0 - probs[1]))) < 1e-12
+        assert abs(grad[0] - (2.0 * probs[0])) < 1e-12
+        assert abs(loss - (-2.0 * AI._rl_log_softmax(logits)[1])) < 1e-12
+        zero_loss, zero_grad = AI.policy_gradient_loss(logits, 0, 0.0)
+        assert zero_loss == 0.0 and all(v == 0.0 for v in zero_grad)
+        with pytest.raises(ValueError):
+            AI.policy_gradient_loss([1.0], 1, 1.0)
+
+    def test_policy_gradient_matches_finite_difference(self):
+        base = AI.policy_gradient_loss([0.4, -0.2, 1.1], 2, 0.7)
+        eps = 1e-6
+        for j in range(3):
+            up = [0.4, -0.2, 1.1]
+            up[j] += eps
+            down = [0.4, -0.2, 1.1]
+            down[j] -= eps
+            numeric = (AI.policy_gradient_loss(up, 2, 0.7)[0]
+                       - AI.policy_gradient_loss(down, 2, 0.7)[0]) / (2 * eps)
+            assert abs(base[1][j] - numeric) < 1e-6
+
+    def test_entropy_term(self):
+        h, grad = AI.entropy_term([0.0, 0.0])
+        assert abs(h - 0.6931471805599453) < 1e-12
+        assert abs(grad[0]) < 1e-12 and abs(grad[1]) < 1e-12
+        h2, _ = AI.entropy_term([30.0, 0.0])
+        assert h2 < 1e-6
+        eps = 1e-6
+        _, grad3 = AI.entropy_term([0.3, 0.9])
+        for j in range(2):
+            up = [0.3, 0.9]
+            up[j] += eps
+            down = [0.3, 0.9]
+            down[j] -= eps
+            numeric = (AI.entropy_term(up)[0] - AI.entropy_term(down)[0]) / (2 * eps)
+            assert abs(grad3[j] - numeric) < 1e-6
+
+    def test_value_loss(self):
+        loss, grad = AI.value_loss([1.0, 2.0], [1.5, 1.0])
+        assert abs(loss - 0.3125) < 1e-12
+        assert abs(grad[0] + 0.25) < 1e-12
+        assert abs(grad[1] - 0.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.value_loss([1.0], [1.0, 2.0])
+        with pytest.raises(ValueError):
+            AI.value_loss([], [])
+
+    def test_gae_advantages(self):
+        adv, ret = AI.gae_advantages([1.0, 1.0, 1.0], [0.5, 0.5, 0.5],
+                                     [False, False, True], gamma=0.5, lam=0.5)
+        assert abs(adv[2] - 0.5) < 1e-12
+        assert abs(adv[1] - 0.875) < 1e-12
+        for i in range(3):
+            assert abs(ret[i] - (adv[i] + 0.5)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.gae_advantages([1.0], [0.0], [False], gamma=2.0)
+        with pytest.raises(ValueError):
+            AI.gae_advantages([1.0, 2.0], [0.0], [False, False])
+
+    def test_ppo_loss_unclipped(self):
+        logits = [0.0, 0.0]
+        old_logp = AI._rl_log_softmax(logits)[0]
+        loss, grad, info = AI.ppo_loss(logits, old_logp, 0, 1.0, clip_ratio=0.2)
+        assert abs(info["ratio"] - 1.0) < 1e-12
+        assert info["clipped"] is False
+        assert abs(loss + 1.0) < 1e-12
+        assert abs(grad[0] - (-(1.0 - 0.5))) < 1e-12
+        assert abs(grad[1] - 0.5) < 1e-12
+
+    def test_ppo_loss_clipping(self):
+        # ratio 远大于 1 且优势为正 ⇒ 裁剪，梯度为 0
+        loss, grad, info = AI.ppo_loss([3.0, -3.0], -5.0, 0, 1.0, clip_ratio=0.2)
+        assert info["ratio"] > 1.2 and info["clipped"] is True
+        assert all(v == 0.0 for v in grad)
+        # 优势为负、ratio 很小 ⇒ 同样裁剪
+        _, grad2, info2 = AI.ppo_loss([-3.0, 3.0], 5.0, 0, -1.0, clip_ratio=0.2)
+        assert info2["ratio"] < 0.8 and info2["clipped"] is True
+        assert all(v == 0.0 for v in grad2)
+        with pytest.raises(ValueError):
+            AI.ppo_loss([0.0, 0.0], 0.0, 0, 1.0, clip_ratio=0.0)
+        with pytest.raises(ValueError):
+            AI.ppo_loss([0.0, 0.0], 0.0, 0, 1.0, entropy_coef=-1.0)
+
+    def test_ppo_loss_gradient_matches_finite_difference(self):
+        old_logp = -0.6931471805599453
+        eps = 1e-6
+        grad = AI.ppo_loss([0.1, -0.1], old_logp, 0, 0.8, clip_ratio=0.9)[1]
+        for j in range(2):
+            up = [0.1, -0.1]
+            up[j] += eps
+            down = [0.1, -0.1]
+            down[j] -= eps
+            numeric = (AI.ppo_loss(up, old_logp, 0, 0.8, clip_ratio=0.9)[0]
+                       - AI.ppo_loss(down, old_logp, 0, 0.8, clip_ratio=0.9)[0]) / (2 * eps)
+            assert abs(grad[j] - numeric) < 1e-6
+
+    def test_policy_and_value_network(self):
+        policy = AI.PolicyNetwork(2, 3, hidden=(5,), seed=1)
+        probs = policy.probs([0.5, -0.5])
+        assert abs(sum(probs) - 1.0) < 1e-12
+        assert abs(policy.log_probs([0.5, -0.5])[0] - math.log(probs[0])) < 1e-12
+        action, logp = policy.sample([0.5, -0.5], seed=42)
+        assert 0 <= action < 3
+        assert (action, logp) == policy.sample([0.5, -0.5], seed=42)
+        assert len(policy.gradients([0.1, 0.2, 0.3])) == 2
+        assert policy.param_count() == (2 * 5 + 5) + (5 * 3 + 3)
+        value = AI.ValueNetwork(2, hidden=(4,), seed=2)
+        assert isinstance(value.value([1.0, 2.0]), float)
+        assert len(value.gradients(1.0)) == 2
+        with pytest.raises(ValueError):
+            AI.PolicyNetwork(2, 2).copy_from(AI.PolicyNetwork(3, 2))
+        with pytest.raises(ValueError):
+            AI.ValueNetwork(2).copy_from(AI.ValueNetwork(3))
+
+    def test_ppo_agent_trains_on_gridworld(self):
+        env = AI.GridWorld(3, 3, start=(0, 0), goal=(2, 2), max_steps=12, seed=5)
+        agent = AI.PPOAgent(2, 4, hidden=(16,), lr=0.02, gamma=0.9, lam=0.9,
+                            clip_ratio=0.2, entropy_coef=0.01, epochs=3,
+                            batch_size=8, seed=7)
+        for _ in range(20):
+            policy_loss, value_loss_v = agent.train(env)
+            assert policy_loss == policy_loss and abs(policy_loss) < 1e6
+            assert value_loss_v == value_loss_v and abs(value_loss_v) < 1e6
+        batch = agent.collect(env)
+        keys = ("states", "actions", "logps", "rewards", "advantages", "returns")
+        assert all(k in batch for k in keys)
+        assert len(batch["states"]) == len(batch["actions"]) == len(batch["rewards"])
+        assert all(0 <= a < 4 for a in batch["actions"])
+        assert agent.param_count() > 0
+        with pytest.raises(ValueError):
+            AI.PPOAgent(2, 2, lr=0.0)
+        with pytest.raises(ValueError):
+            AI.PPOAgent(2, 2, epochs=0)

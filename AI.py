@@ -29556,6 +29556,415 @@ class DQNAgent:
         return self.online.param_count() + self.target.param_count()
 
 # ============================================================================
+#  RL 策略侧（W16-F2：REINFORCE / A2C(GAE) / PPO）
+# ============================================================================
+
+def _rl_softmax(logits):
+    """数值稳定的行 softmax（RL 内部用）。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("softmax: logits 必须是非空列表")
+    z = [float(v) for v in logits]
+    m = max(z)
+    e = [_math_exp(v - m) for v in z]
+    total = sum(e)
+    return [v / total for v in e]
+
+
+def _rl_log_softmax(logits):
+    """行 log-softmax，返回与 `logits` 等长的列表。"""
+    p = _rl_softmax(logits)
+    out = []
+    for v in p:
+        out.append(_rl_log(v) if v > 0.0 else -745.0)
+    return out
+
+
+def policy_gradient_loss(logits, action, advantage):
+    """REINFORCE / A2C 的策略梯度损失：``-A * log pi(a|s)``，返回 ``(loss, dlogits)``。
+
+    梯度：``dL/dz_j = -A * (onehot_j - p_j)``。
+    """
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("policy_gradient_loss: logits 必须是非空列表")
+    n = len(logits)
+    if isinstance(action, bool) or not isinstance(action, int) or not (0 <= action < n):
+        raise ValueError(
+            f"policy_gradient_loss: action 必须是 0..{n - 1} 的整数，收到 {action!r}")
+    if isinstance(advantage, bool) or not isinstance(advantage, (int, float)):
+        raise ValueError(
+            f"policy_gradient_loss: advantage 必须是数字，收到 {advantage!r}")
+    probs = _rl_softmax(logits)
+    logs = _rl_log_softmax(logits)
+    loss = -float(advantage) * logs[action]
+    grad = []
+    for j in range(n):
+        onehot = 1.0 if j == action else 0.0
+        grad.append(-float(advantage) * (onehot - probs[j]))
+    return loss, grad
+
+
+def entropy_term(logits):
+    """策略熵与它对 logits 的导数：``H = -sum p log p``，``dH/dz_j = -p_j (log p_j + H)``。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("entropy_term: logits 必须是非空列表")
+    probs = _rl_softmax(logits)
+    logs = _rl_log_softmax(logits)
+    h = 0.0
+    for j in range(len(probs)):
+        if probs[j] > 0.0:
+            h -= probs[j] * logs[j]
+    grad = [-probs[j] * (logs[j] + h) for j in range(len(probs))]
+    return h, grad
+
+
+def value_loss(values, returns):
+    """价值网络的 MSE：``0.5 * (v - R)^2``，返回 ``(loss, dvalues)``。"""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("value_loss: values 必须是非空列表")
+    if not isinstance(returns, (list, tuple)) or len(returns) != len(values):
+        raise ValueError("value_loss: returns 长度必须与 values 相同")
+    total = 0.0
+    grads = []
+    for i, v in enumerate(values):
+        e = float(v) - float(returns[i])
+        total += 0.5 * e * e
+        grads.append(e)
+    return total / len(values), [g / len(values) for g in grads]
+
+
+def gae_advantages(rewards, values, dones, gamma=0.99, lam=0.95):
+    """GAE(``gamma``, ``lam``)：返回 ``(advantages, returns)``。
+
+    ``delta_t = r_t + gamma * V(s_{t+1}) * (1 - done_t) - V(s_t)``，
+    ``A_t = delta_t + gamma * lam * (1 - done_t) * A_{t+1}``；
+    ``returns = advantages + values``（作为价值网络的回归目标）。
+    """
+    if not isinstance(rewards, (list, tuple)) or not rewards:
+        raise ValueError("gae_advantages: rewards 必须是非空列表")
+    n = len(rewards)
+    if not isinstance(values, (list, tuple)) or len(values) != n:
+        raise ValueError("gae_advantages: values 长度必须与 rewards 相同")
+    if not isinstance(dones, (list, tuple)) or len(dones) != n:
+        raise ValueError("gae_advantages: dones 长度必须与 rewards 相同")
+    for name, v in (("gamma", gamma), ("lam", lam)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 <= v <= 1.0):
+            raise ValueError(f"gae_advantages: {name} 必须在 [0,1] 内，收到 {v!r}")
+    adv = [0.0] * n
+    running = 0.0
+    for t in range(n - 1, -1, -1):
+        next_value = 0.0 if (t == n - 1 or dones[t]) else float(values[t + 1])
+        delta = float(rewards[t]) + gamma * next_value - float(values[t])
+        running = delta + gamma * lam * (0.0 if dones[t] else running)
+        adv[t] = running
+    returns = [adv[t] + float(values[t]) for t in range(n)]
+    return adv, returns
+
+
+def ppo_loss(logits, old_logp, action, advantage, clip_ratio=0.2, entropy_coef=0.0):
+    """PPO 裁剪目标（单样本），返回 ``(loss, dlogits, info)``。
+
+    ``ratio = exp(logp_new - logp_old)``，``L = -min(ratio*A, clip(ratio, 1-eps, 1+eps)*A)``；
+    被裁掉时梯度为 0。``info`` 里给 ``ratio`` / ``clipped`` / ``entropy``。
+    """
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("ppo_loss: logits 必须是非空列表")
+    n = len(logits)
+    if isinstance(action, bool) or not isinstance(action, int) or not (0 <= action < n):
+        raise ValueError(f"ppo_loss: action 必须是 0..{n - 1} 的整数，收到 {action!r}")
+    if isinstance(old_logp, bool) or not isinstance(old_logp, (int, float)):
+        raise ValueError(f"ppo_loss: old_logp 必须是数字，收到 {old_logp!r}")
+    if isinstance(advantage, bool) or not isinstance(advantage, (int, float)):
+        raise ValueError(f"ppo_loss: advantage 必须是数字，收到 {advantage!r}")
+    if isinstance(clip_ratio, bool) or not isinstance(clip_ratio, (int, float)) \
+            or not (0.0 < clip_ratio < 1.0):
+        raise ValueError(
+            f"ppo_loss: clip_ratio 必须在 (0,1) 内，收到 {clip_ratio!r}")
+    if isinstance(entropy_coef, bool) or not isinstance(entropy_coef, (int, float)) \
+            or entropy_coef < 0.0:
+        raise ValueError(
+            f"ppo_loss: entropy_coef 必须 >= 0，收到 {entropy_coef!r}")
+    probs = _rl_softmax(logits)
+    logs = _rl_log_softmax(logits)
+    logp = logs[action]
+    ratio = _math_exp(logp - float(old_logp))
+    lo = 1.0 - clip_ratio
+    hi = 1.0 + clip_ratio
+    clipped_ratio = lo if ratio < lo else (hi if ratio > hi else ratio)
+    unclipped_term = ratio * float(advantage)
+    clipped_term = clipped_ratio * float(advantage)
+    use_unclipped = unclipped_term <= clipped_term
+    loss = -min(unclipped_term, clipped_term)
+    grad = [0.0] * n
+    if use_unclipped:
+        for j in range(n):
+            onehot = 1.0 if j == action else 0.0
+            grad[j] = -float(advantage) * ratio * (onehot - probs[j])
+    if entropy_coef:
+        h, dh = entropy_term(logits)
+        loss -= entropy_coef * h
+        for j in range(n):
+            grad[j] += entropy_coef * dh[j]
+    info = {"ratio": ratio, "clipped": not use_unclipped, "entropy": entropy_term(logits)[0]}
+    return loss, grad, info
+
+
+def _math_exp(x):
+    return math.exp(x)
+
+
+def _exp_clip(x):
+    if x > 700.0:
+        return float("inf")
+    if x < -745.0:
+        return 0.0
+    return math.exp(x)
+
+
+def _rl_log(x):
+    return math.log(x) if x > 0.0 else -745.0
+
+
+class PolicyNetwork:
+    """离散动作策略网络：``MLP(state -> hidden -> num_actions)`` + 行 softmax。"""
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), seed=None):
+        for name, v in (("state_dim", state_dim), ("num_actions", num_actions)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"PolicyNetwork: {name} 必须是 >=1 的整数，收到 {v!r}")
+        sizes = [state_dim] + list(hidden) + [num_actions]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.model = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.sizes = sizes
+
+    def logits(self, state):
+        """返回未归一化的动作分数。"""
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(f"PolicyNetwork.logits: state 长度必须是 {self.state_dim}")
+        return self.model.forward([float(v) for v in state])
+
+    def probs(self, state):
+        """动作概率。"""
+        return _rl_softmax(self.logits(state))
+
+    def log_probs(self, state):
+        """动作对数概率。"""
+        return _rl_log_softmax(self.logits(state))
+
+    def sample(self, state, seed=None):
+        """按概率采样一个动作，返回 ``(action, logp)``。"""
+        probs = self.probs(state)
+        logs = _rl_log_softmax(self.logits(state))
+        rng = random.Random(seed) if seed is not None else random
+        x = rng.random()
+        acc = 0.0
+        pick = len(probs) - 1
+        for j in range(len(probs)):
+            acc += probs[j]
+            if x < acc:
+                pick = j
+                break
+        return pick, logs[pick]
+
+    def gradients(self, dlogits):
+        """把 ``dlogits`` 反传到参数。"""
+        return _mlp_backward(self.model, [float(v) for v in dlogits])
+
+    def copy_from(self, other):
+        """复制同形状网络的权重。"""
+        if not isinstance(other, PolicyNetwork) or other.sizes != self.sizes:
+            raise ValueError("PolicyNetwork.copy_from: 只接受同形状的 PolicyNetwork")
+        for dst, src in zip(self.model.layers, other.model.layers):
+            for j in range(len(dst.weights)):
+                dst.weights[j][:] = src.weights[j]
+            dst.biases[:] = src.biases
+
+    def param_count(self):
+        """可训练标量个数。"""
+        return sum(layer.fan_out * layer.fan_in + layer.fan_out
+                   for layer in self.model.layers)
+
+
+class ValueNetwork:
+    """状态价值网络：``MLP(state -> hidden -> 1)``。"""
+
+    def __init__(self, state_dim, hidden=(32,), seed=None):
+        if not isinstance(state_dim, int) or isinstance(state_dim, bool) or state_dim < 1:
+            raise ValueError(
+                f"ValueNetwork: state_dim 必须是 >=1 的整数，收到 {state_dim!r}")
+        sizes = [state_dim] + list(hidden) + [1]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.model = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.state_dim = state_dim
+        self.sizes = sizes
+
+    def value(self, state):
+        """单个状态的 V(s)（标量）。"""
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(f"ValueNetwork.value: state 长度必须是 {self.state_dim}")
+        return self.model.forward([float(v) for v in state])[0]
+
+    def gradients(self, dvalue):
+        """把 ``dvalue`` 反传到参数。"""
+        if isinstance(dvalue, bool) or not isinstance(dvalue, (int, float)):
+            raise ValueError(f"ValueNetwork.gradients: dvalue 必须是数字，收到 {dvalue!r}")
+        return _mlp_backward(self.model, [float(dvalue)])
+
+    def copy_from(self, other):
+        """复制同形状网络的权重。"""
+        if not isinstance(other, ValueNetwork) or other.sizes != self.sizes:
+            raise ValueError("ValueNetwork.copy_from: 只接受同形状的 ValueNetwork")
+        for dst, src in zip(self.model.layers, other.model.layers):
+            for j in range(len(dst.weights)):
+                dst.weights[j][:] = src.weights[j]
+            dst.biases[:] = src.biases
+
+    def param_count(self):
+        """可训练标量个数。"""
+        return sum(layer.fan_out * layer.fan_in + layer.fan_out
+                   for layer in self.model.layers)
+
+
+class PPOAgent:
+    """PPO（裁剪目标 + GAE + 熵正则）的离散动作实现。
+
+    ``train(episode)`` 里先把整条轨迹跑完，再按 ``epochs`` 轮、``batch_size``
+    随机切分做策略与价值的更新。
+    """
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), lr=0.01, gamma=0.99,
+                 lam=0.95, clip_ratio=0.2, entropy_coef=0.01, epochs=4,
+                 batch_size=8, seed=None):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0.0:
+            raise ValueError(f"PPOAgent: lr 必须 > 0，收到 {lr!r}")
+        for name, v in (("gamma", gamma), ("lam", lam)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not (0.0 <= v <= 1.0):
+                raise ValueError(f"PPOAgent: {name} 必须在 [0,1] 内，收到 {v!r}")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"PPOAgent: epochs 必须是 >=1 的整数，收到 {epochs!r}")
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError(
+                f"PPOAgent: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.policy = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.value = ValueNetwork(state_dim, hidden, seed=seed)
+        self.policy_opt = Adam(self.policy.model, lr=lr)
+        self.value_opt = Adam(self.value.model, lr=lr)
+        self.rng = random.Random(seed)
+
+    def act(self, state):
+        """按当前策略采样动作，返回 ``(action, logp)``。"""
+        return self.policy.sample(state, seed=self.rng.randrange(1 << 30))
+
+    def collect(self, env, max_steps=None):
+        """跑一条完整轨迹，返回训练所需的张量字典。"""
+        state = env.reset()
+        states, actions, rewards, logps, values, dones = [], [], [], [], [], []
+        steps = 0
+        while True:
+            action, logp = self.act(state)
+            next_state, reward, done, info = env.step(action)
+            states.append(list(state))
+            actions.append(action)
+            rewards.append(float(reward))
+            logps.append(float(logp))
+            values.append(float(self.value.value(state)))
+            dones.append(bool(done))
+            state = next_state
+            steps += 1
+            if done or (max_steps is not None and steps >= max_steps):
+                break
+        adv, returns = gae_advantages(rewards, values, dones, self.gamma, self.lam)
+        return {"states": states, "actions": actions, "logps": logps,
+                "rewards": rewards, "values": values, "dones": dones,
+                "advantages": adv, "returns": returns}
+
+    def train(self, env, max_steps=None):
+        """采一条轨迹并做 ``epochs`` 轮更新，返回 ``(policy_loss, value_loss)``。"""
+        batch = self.collect(env, max_steps=max_steps)
+        n = len(batch["states"])
+        adv = list(batch["advantages"])
+        mean_adv = sum(adv) / n
+        std_adv = (sum((a - mean_adv) ** 2 for a in adv) / n) ** 0.5
+        if std_adv > 1e-8:
+            adv = [(a - mean_adv) / std_adv for a in adv]
+        else:
+            adv = [0.0] * n
+        p_loss_total = 0.0
+        v_loss_total = 0.0
+        updates = 0
+        for _ in range(self.epochs):
+            order = list(range(n))
+            self.rng.shuffle(order)
+            for start in range(0, n, self.batch_size):
+                chunk = order[start:start + self.batch_size]
+                if not chunk:
+                    continue
+                acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                         for layer in self.policy.model.layers]
+                acc_b = [[0.0] * layer.fan_out for layer in self.policy.model.layers]
+                vacc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                          for layer in self.value.model.layers]
+                vacc_b = [[0.0] * layer.fan_out for layer in self.value.model.layers]
+                for i in chunk:
+                    logits = self.policy.logits(batch["states"][i])
+                    loss, grad, info = ppo_loss(
+                        logits, batch["logps"][i], batch["actions"][i], adv[i],
+                        self.clip_ratio, self.entropy_coef)
+                    p_loss_total += loss
+                    grads = self.policy.gradients(grad)
+                    for li, (gw, gb) in enumerate(grads):
+                        for j in range(len(gw)):
+                            row = acc_w[li][j]
+                            for k in range(len(gw[j])):
+                                row[k] += gw[j][k]
+                            acc_b[li][j] += gb[j]
+                    v = self.value.value(batch["states"][i])
+                    vloss, dv = value_loss([v], [batch["returns"][i]])
+                    v_loss_total += vloss
+                    vgrads = self.value.gradients(dv[0])
+                    for li, (gw, gb) in enumerate(vgrads):
+                        for j in range(len(gw)):
+                            row = vacc_w[li][j]
+                            for k in range(len(gw[j])):
+                                row[k] += gw[j][k]
+                            vacc_b[li][j] += gb[j]
+                inv = 1.0 / len(chunk)
+                avg_w = [[[v * inv for v in row] for row in layer] for layer in acc_w]
+                avg_b = [[v * inv for v in row] for row in acc_b]
+                self.policy_opt.step([(w, b) for w, b in zip(avg_w, avg_b)])
+                vavg_w = [[[v * inv for v in row] for row in layer] for layer in vacc_w]
+                vavg_b = [[v * inv for v in row] for row in vacc_b]
+                self.value_opt.step([(w, b) for w, b in zip(vavg_w, vavg_b)])
+                updates += 1
+        return p_loss_total / max(1, updates * 1.0), v_loss_total / max(1, updates * 1.0)
+
+    def param_count(self):
+        """策略网络 + 价值网络的参数总数。"""
+        return self.policy.param_count() + self.value.param_count()
+
+# ============================================================================
 #  RL 环境（W16-E：GridWorld / CartPole）
 # ============================================================================
 

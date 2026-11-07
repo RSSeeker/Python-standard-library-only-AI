@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1515 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1525 项）
 
 ## 特性
 
@@ -1817,6 +1817,31 @@ print(agent.q_values(env.reset(seed=0)))
 
 四条边界：`DQNAgent` 是**价值侧**实现，不做 N-step 回报、不做优先采样、不做分布式 Q（Rainbow 只到 Double + Dueling 这一档）；`dueling_q_values` 的 `dv` / `da` 是「单个输出的雅可比」，用于手推梯度，不是反向传播接口；`train_step` 每次只更新一个 batch 且**不**自动 `sync_target` 之外的调度（`target_sync` 按步数硬同步，不是 Polyak 软更新）；`DQNNetwork` 的初始化走全局 `random` 的临时种子，同 `seed` 可复现。
 
+### 策略梯度与 PPO（W16-F2）
+
+| API | 说明 |
+|-----|------|
+| `policy_gradient_loss(logits, action, advantage)` | `-A·log π(a)`，返回 `(loss, dlogits)` |
+| `entropy_term(logits)` | 策略熵 `H` 与 `dH/dlogits` |
+| `value_loss(values, returns)` | 价值网络 MSE，返回 `(loss, dvalues)` |
+| `gae_advantages(rewards, values, dones, gamma, lam)` | GAE，返回 `(advantages, returns)` |
+| `ppo_loss(logits, old_logp, action, advantage, clip_ratio, entropy_coef)` | 裁剪目标，返回 `(loss, dlogits, info)` |
+| `PolicyNetwork(state_dim, num_actions, hidden=(32,))` | 离散策略网络（`probs` / `log_probs` / `sample` / `gradients`） |
+| `ValueNetwork(state_dim, hidden=(32,))` | 状态价值网络（`value` / `gradients`） |
+| `PPOAgent(...)` | 采轨迹 → GAE → 多轮 minibatch 更新，`train(env)` 返回两个损失 |
+
+```python
+import AI
+
+env = AI.GridWorld(3, 3, start=(0, 0), goal=(2, 2), max_steps=12, seed=5)
+agent = AI.PPOAgent(2, 4, hidden=(16,), lr=0.02, gamma=0.9, lam=0.9, seed=7)
+for episode in range(40):
+    policy_loss, value_loss = agent.train(env)
+print(agent.policy.probs(env.reset(seed=0)))
+```
+
+四条边界：只有离散动作（连续控制要另写高斯策略的 reparameterization，SAC/TD3/DDPG 尚未实现）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2233,7 +2258,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1515 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1525 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2431,6 +2456,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPredictiveSelfSupervision` | 旋转标签分布与复现、四次旋转的像素位置与 `k` 取模、非方图限制、Jigsaw 排列合法性、线性头与交叉熵、线性探针命中率 |
 | `TestRLEnvironments` | GridWorld 移动/撞墙/目标奖励/步数截断/障碍与坐标校验、渲染字符、CartPole 状态范围与物理独立重算（1e-12）、折现回报手算、rollout 长度与提前终止 |
 | `TestDQNFamily` | W16-F：回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
+| `TestPolicyGradient` | W16-F2：策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2484,7 +2510,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1515 个单元测试
+├── test_ai.py       # 1525 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

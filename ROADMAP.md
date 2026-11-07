@@ -524,7 +524,10 @@
     （`double=` / `dueling=` 开关）。Rainbow 只到 Double + Dueling，不做优先采样 / N-step / 分布式。
     `probe_w16f.py` 58 项：FIFO 覆盖、Double 与普通目标在构造样本上不同、Huber 两分支与梯度截断、
     单层权重中心差分 1e-5、单状态赌博机 150 步后 argmax = 最优动作、`sync_target` 逐位一致。
-  - 策略侧（REINFORCE / A2C / PPO / SAC / TD3 / DDPG）与 RLHF 留到后续 Wave。
+  - W16-F2 已做策略侧（离散）：`policy_gradient_loss` / `entropy_term` / `value_loss` /
+    `gae_advantages` / `ppo_loss`（裁剪目标）+ `PolicyNetwork` / `ValueNetwork` / `PPOAgent`，
+    probe 51 项（策略梯度与 PPO 梯度都对中心差分、裁剪分支梯度为 0、GAE 手算）。
+  - 仍未做：SAC / TD3 / DDPG（连续动作，需要高斯策略的 reparameterization）与 RLHF。
 - [ ] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型
 - [ ] 元学习：MAML / Reptile / ProtoNet / Matching Networks
 - [ ] 联邦学习：FedAvg / FedProx / FedBN
