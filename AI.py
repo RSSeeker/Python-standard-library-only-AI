@@ -8709,6 +8709,193 @@ class SAGPool:
         return self
 
 
+class DiffPool:
+    """DiffPool 软分配池化：``Z = GCN_embed(X, A)``、``S = softmax(GCN_pool(X, A))``
+
+    池化输出 ``X' = Sᵀ Z``（``n_clusters x out_features``）与
+    ``A' = Sᵀ A S``（``n_clusters x n_clusters``）。``S`` 每行和为 1（软分配），
+    所以 ``X'`` 是「按簇归属加权的节点特征」、``A'`` 是簇间连边的加权和。
+    与 ``TopKPool``/``SAGPool`` 的硬选择不同，所有节点都参与，梯度因此能回到
+    未选中节点——这也是 DiffPool 要两层 GCN（embed + pool）的原因。
+
+    ``backward(dout, d_adj=None)`` 返回输入特征梯度 ``dX``；邻接矩阵被视为
+    结构常量（与 ``GCNLayer`` 一致），它对 ``A`` 的梯度是 ``S dA' Sᵀ``，
+    不向下传。``d_adj`` 给 ``A'`` 提供上游梯度（例如图级损失用到 ``A'`` 时）。
+    """
+
+    def __init__(self, in_features: int, out_features: int, n_clusters: int = 2,
+                 seed: int = 0):
+        _ck_int(in_features, 'DiffPool(in_features)', 1)
+        _ck_int(out_features, 'DiffPool(out_features)', 1)
+        _ck_int(n_clusters, 'DiffPool(n_clusters)', 1)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_clusters = n_clusters
+        self.embed = GCNLayer(in_features, out_features, activation='linear',
+                              seed=seed)
+        self.pool = GCNLayer(in_features, n_clusters, activation='linear',
+                             seed=seed + 1)
+        self._cache = None
+
+    @staticmethod
+    def _softmax_row(row):
+        mx = max(row)
+        ex = [math.exp(v - mx) for v in row]
+        tot = sum(ex)
+        return [v / tot for v in ex]
+
+    def forward(self, X, adj):
+        n = _g_check_x(X, 'DiffPool.forward')
+        _g_check_adj(adj, n, 'DiffPool.forward')
+        k = self.n_clusters
+        d = self.out_features
+        Z = self.embed.forward(X, adj)
+        logits = self.pool.forward(X, adj)
+        S = [self._softmax_row(logits[i]) for i in range(n)]
+        xp = [[0.0] * d for _ in range(k)]
+        for i in range(n):
+            si = S[i]
+            zi = Z[i]
+            for p in range(k):
+                w = si[p]
+                row = xp[p]
+                for j in range(d):
+                    row[j] += w * zi[j]
+        a_s = [[0.0] * k for _ in range(n)]
+        for i in range(n):
+            ai = adj[i]
+            row = a_s[i]
+            for j in range(n):
+                w = ai[j]
+                if w == 0.0:
+                    continue
+                sj = S[j]
+                for q in range(k):
+                    row[q] += w * sj[q]
+        ap = [[0.0] * k for _ in range(k)]
+        for i in range(n):
+            si = S[i]
+            asi = a_s[i]
+            for p in range(k):
+                w = si[p]
+                if w == 0.0:
+                    continue
+                row = ap[p]
+                for q in range(k):
+                    row[q] += w * asi[q]
+        self._cache = (X, adj, S, Z, a_s)
+        return xp, ap
+
+    def backward(self, dout, d_adj=None):
+        if self._cache is None:
+            raise RuntimeError('DiffPool.backward: 需要先 forward')
+        X, adj, S, Z, a_s = self._cache
+        n = len(X)
+        k = self.n_clusters
+        d = self.out_features
+        if not isinstance(dout, list) or len(dout) != k:
+            raise ValueError('DiffPool.backward: dout 要有 %d 行' % k)
+        for row in dout:
+            if not isinstance(row, list) or len(row) != d:
+                raise ValueError('DiffPool.backward: dout 每行要有 %d 个分量' % d)
+        if d_adj is None:
+            dap = [[0.0] * k for _ in range(k)]
+        else:
+            if not isinstance(d_adj, list) or len(d_adj) != k:
+                raise ValueError('DiffPool.backward: d_adj 要有 %d 行' % k)
+            for row in d_adj:
+                if not isinstance(row, list) or len(row) != k:
+                    raise ValueError('DiffPool.backward: d_adj 每行要有 %d 个分量' % k)
+            dap = d_adj
+        dz = [[0.0] * d for _ in range(n)]
+        for i in range(n):
+            si = S[i]
+            row = dz[i]
+            for p in range(k):
+                w = si[p]
+                if w == 0.0:
+                    continue
+                dp = dout[p]
+                for j in range(d):
+                    row[j] += w * dp[j]
+        ds = [[0.0] * k for _ in range(n)]
+        for i in range(n):
+            zi = Z[i]
+            row = ds[i]
+            for p in range(k):
+                acc = 0.0
+                dp = dout[p]
+                for j in range(d):
+                    acc += dp[j] * zi[j]
+                row[p] = acc
+        for i in range(n):
+            ai = adj[i]
+            row = ds[i]
+            for p in range(k):
+                acc = 0.0
+                for j in range(n):
+                    w = ai[j]
+                    if w == 0.0:
+                        continue
+                    # (A S dAp^T)_{ip} = sum_j A_ij * sum_q S_jq * dAp_pq
+                    sj = S[j]
+                    for q in range(k):
+                        acc += w * sj[q] * dap[p][q]
+                row[p] += acc
+        # A 对称的常见情形仍用通用式，避免依赖对称性
+        for i in range(n):
+            si = S[i]
+            row = ds[i]
+            for p in range(k):
+                acc = 0.0
+                for j in range(n):
+                    w = adj[j][i]
+                    if w == 0.0:
+                        continue
+                    sj = S[j]
+                    for q in range(k):
+                        acc += w * sj[q] * dap[q][p]
+                row[p] += acc
+        dlogits = [[0.0] * k for _ in range(n)]
+        for i in range(n):
+            si = S[i]
+            di = ds[i]
+            dot = 0.0
+            for p in range(k):
+                dot += di[p] * si[p]
+            out = dlogits[i]
+            for p in range(k):
+                out[p] = si[p] * (di[p] - dot)
+        dx = self.embed.backward(dz)
+        dxp = self.pool.backward(dlogits)
+        for i in range(n):
+            for j in range(self.in_features):
+                dx[i][j] += dxp[i][j]
+        return dx
+
+    def zero_grad(self):
+        self.embed.zero_grad()
+        self.pool.zero_grad()
+
+    def param_count(self) -> int:
+        return self.embed.param_count() + self.pool.param_count()
+
+    def sgd_step(self, lr: float):
+        self.embed.sgd_step(lr)
+        self.pool.sgd_step(lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        self.embed.adam_step(lr, beta1, beta2, eps)
+        self.pool.adam_step(lr, beta1, beta2, eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 

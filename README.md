@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1779 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1786 项）
 
 ## 特性
 
@@ -2624,6 +2624,28 @@ train_mse 9.1e-01 5.4e-01 4.1e-01 9.7e-02 6.4e-21 6.1e-23 5.9e-25 1.2e-25
 `(ΦΦᵀ + λI)α = y`——`p << n` 时 `ΦΦᵀ` 只有 `p` 个非零特征值，`ridge=1e-10` 会把对偶解放大到
 1e7 量级（实测 `dims=4` 时 `test_mse=7.9e7`），把双下降的峰彻底盖住。
 
+### 图池化（W6 补完：DiffPool）
+
+| API | 说明 |
+| --- | --- |
+| `DiffPool(in_features, out_features, n_clusters=2, seed=0)` | `Z = GCN_embed(X, A)`、`S = softmax(GCN_pool(X, A))`；池化 `X' = Sᵀ Z`（`k x out_features`）、`A' = Sᵀ A S`（`k x k`） |
+| `forward(X, adj)` | 返回 `(X', A')`；`S` 每行和为 1，所有节点都参与加权 |
+| `backward(dout, d_adj=None)` | 返回 `dX`；`d_adj` 给 `A'` 的上游梯度（默认全零） |
+| `zero_grad()` / `param_count()` / `adam_step(lr)` | 两层 GCN 一起管理 |
+
+```python
+pool = DiffPool(in_features=8, out_features=4, n_clusters=3)
+xp, ap = pool.forward(X, adj)         # (3, 4) 与 (3, 3)
+dX = pool.backward(dxp, dap)          # 所有节点都拿到梯度
+```
+
+- 与 `TopKPool` / `SAGPool` 的**硬选择**不同，DiffPool 用软分配，因此未「胜出」的
+  节点也能收到梯度；代价是 `A'` 需要三次矩阵乘、推理比硬池化慢。
+- 邻接被视为结构常量（与 `GCNLayer` 一致）：`A'` 对输入 `A` 的梯度是 `S dA' Sᵀ`，
+  本实现**不向下传**；`d_adj` 只影响 `Z`/`S` 的梯度路径。
+- 软分配是**逐节点** softmax，`n_clusters` 不宜大于节点数（大于时部分簇拿不到质量，
+  `X'` 会出现全零行，但不报错——这是定义决定的，不是 bug）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3040,7 +3062,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1779 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1786 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3318,7 +3340,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1779 个单元测试
+├── test_ai.py       # 1786 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

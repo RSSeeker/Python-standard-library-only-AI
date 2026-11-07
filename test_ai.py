@@ -27087,3 +27087,172 @@ class TestTrainAugment:
         with pytest.raises(ValueError):
             self._model(5).fit(x=xs, y=ys, epochs=1, val_split=0.0,
                                train_augment=lambda a, b: (a, b[:1]))
+
+
+class TestDiffPool:
+    """W6 补完：`DiffPool` 软分配池化。"""
+
+    def _graph(self):
+        rng = random.Random(7)
+        n, din = 6, 3
+        X = [[rng.uniform(-1.0, 1.0) for _ in range(din)] for _ in range(n)]
+        adj = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            adj[i][(i + 1) % n] = 0.7
+            adj[(i + 1) % n][i] = 0.7
+        return X, adj
+
+    def _loss(self, pool, xs, u, V):
+        xp, ap = pool.forward(xs, pool._cache and self._adj)
+        acc = 0.0
+        for a in range(len(xp)):
+            for b in range(len(xp[a])):
+                acc += u[a][b] * xp[a][b]
+        for a in range(len(ap)):
+            for b in range(len(ap[a])):
+                acc += V[a][b] * ap[a][b]
+        return acc
+
+    def test_shapes_and_soft_assignment(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        xp, ap = pool.forward(X, adj)
+        assert len(xp) == 2 and all(len(r) == 2 for r in xp)
+        assert len(ap) == 2 and all(len(r) == 2 for r in ap)
+        S = pool._cache[2]
+        for row in S:
+            assert abs(sum(row) - 1.0) <= 1e-12
+            assert all(v >= 0.0 for v in row)
+
+    def test_pooling_matches_definition(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        xp, ap = pool.forward(X, adj)
+        S, Z = pool._cache[2], pool._cache[3]
+        n = len(X)
+        for a in range(2):
+            for b in range(2):
+                want = sum(S[i][a] * Z[i][b] for i in range(n))
+                assert abs(xp[a][b] - want) <= 1e-12
+        for a in range(2):
+            for b in range(2):
+                want = 0.0
+                for i in range(n):
+                    for j in range(n):
+                        want += S[i][a] * adj[i][j] * S[j][b]
+                assert abs(ap[a][b] - want) <= 1e-12
+        assert abs(ap[0][1] - ap[1][0]) <= 1e-12
+
+    def test_input_gradient_matches_finite_difference(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        rng = random.Random(11)
+        u = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        V = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        pool.forward(X, adj)
+        dX = pool.backward(u, V)
+
+        def loss(xs):
+            xp, ap = pool.forward(xs, adj)
+            acc = 0.0
+            for a in range(2):
+                for b in range(2):
+                    acc += u[a][b] * xp[a][b]
+                    acc += V[a][b] * ap[a][b]
+            return acc
+
+        eps = 1e-6
+        for i in range(len(X)):
+            for j in range(len(X[i])):
+                old = X[i][j]
+                X[i][j] = old + eps
+                lp = loss(X)
+                X[i][j] = old - eps
+                lm = loss(X)
+                X[i][j] = old
+                assert abs((lp - lm) / (2 * eps) - dX[i][j]) <= 1e-6
+
+    def test_all_nodes_receive_gradient(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        rng = random.Random(13)
+        u = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        V = [[0.0] * 2 for _ in range(2)]
+        pool.forward(X, adj)
+        dX = pool.backward(u, V)
+        for row in dX:
+            assert any(abs(v) > 1e-9 for v in row)
+
+    def test_layer_parameter_gradients(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        rng = random.Random(17)
+        u = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        V = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        pool.zero_grad()
+        pool.forward(X, adj)
+        pool.backward(u, V)
+
+        def loss():
+            xp, ap = pool.forward(X, adj)
+            acc = 0.0
+            for a in range(2):
+                for b in range(2):
+                    acc += u[a][b] * xp[a][b] + V[a][b] * ap[a][b]
+            return acc
+
+        eps = 1e-6
+        for layer in (pool.embed, pool.pool):
+            W = layer.dense.W
+            for i in range(len(W)):
+                for j in range(len(W[i])):
+                    old = W[i][j]
+                    W[i][j] = old + eps
+                    lp = loss()
+                    W[i][j] = old - eps
+                    lm = loss()
+                    W[i][j] = old
+                    assert abs((lp - lm) / (2 * eps) - layer.dense.gW[i][j]) <= 1e-6
+
+    def test_param_count_and_optimizer(self):
+        X, adj = self._graph()
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=3)
+        assert pool.param_count() == 2 * (3 * 2 + 2)
+        rng = random.Random(19)
+        u = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(2)]
+        V = [[0.0] * 2 for _ in range(2)]
+
+        def loss():
+            xp, ap = pool.forward(X, adj)
+            return sum(u[a][b] * xp[a][b] for a in range(2) for b in range(2))
+
+        before = loss()
+        pool.forward(X, adj)
+        pool.backward(u, V)
+        pool.adam_step(0.05)
+        assert loss() < before
+        pool.zero_grad()
+        assert all(v == 0.0 for row in pool.pool.dense.gW for v in row)
+
+    def test_validation(self):
+        X, adj = self._graph()
+        with pytest.raises(ValueError):
+            AI.DiffPool(0, 2)
+        with pytest.raises(ValueError):
+            AI.DiffPool(2, 0)
+        with pytest.raises(ValueError):
+            AI.DiffPool(2, 2, 0)
+        with pytest.raises((TypeError, ValueError)):
+            AI.DiffPool(2, 2, 1.5)
+        pool = AI.DiffPool(3, 2, n_clusters=2, seed=1)
+        with pytest.raises(RuntimeError):
+            pool.backward([[0.0] * 2 for _ in range(2)])
+        pool.forward(X, adj)
+        with pytest.raises(ValueError):
+            pool.backward([[0.0] * 2])
+        with pytest.raises(ValueError):
+            pool.backward([[0.0] * 3 for _ in range(2)])
+        with pytest.raises(ValueError):
+            pool.forward([], [])
+        with pytest.raises(ValueError):
+            pool.forward(X, [[0.0] * (len(X) - 1) for _ in range(len(X))])
