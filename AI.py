@@ -28725,6 +28725,306 @@ def pr_auc_score(y_true, y_score) -> float:
 #  语音识别指标（WER / CER / SER）
 # ============================================================================
 
+# ============================================================================
+#  聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+# ============================================================================
+
+def _cluster_matrix(X, who):
+    """校验样本矩阵：非空、每行等长、元素是有限数字。"""
+    if not isinstance(X, (list, tuple)) or not X:
+        raise ValueError(f"{who}: X 必须是非空列表")
+    rows = []
+    width = None
+    for i, row in enumerate(X):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 个样本必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 第 {i} 个样本维度 {len(row)} 与第一个 {width} 不一致")
+        rows.append([_metric_number(v, who, i) for v in row])
+    return rows, width
+
+
+def _cluster_labels(labels, n, who):
+    """校验标签：长度等于样本数、非负整数。"""
+    if not isinstance(labels, (list, tuple)):
+        raise ValueError(f"{who}: labels 必须是列表")
+    if len(labels) != n:
+        raise ValueError(f"{who}: 标签数 {len(labels)} 与样本数 {n} 不一致")
+    return [_metric_label(v, who, i) for i, v in enumerate(labels)]
+
+
+def _cluster_groups(labels):
+    """把标签转成 {簇: [样本下标]}。"""
+    groups = {}
+    for i, lab in enumerate(labels):
+        groups.setdefault(lab, []).append(i)
+    return groups
+
+
+def _euclidean(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def _cluster_centroids(X, groups):
+    out = {}
+    for lab, idxs in groups.items():
+        dim = len(X[0])
+        out[lab] = [sum(X[i][d] for i in idxs) / float(len(idxs)) for d in range(dim)]
+    return out
+
+
+def silhouette_score(X, labels):
+    """Silhouette：每个点 (b−a)/max(a,b) 的平均；单点簇记 0，需要 2..n−1 个簇。"""
+    who = "silhouette_score"
+    rows, _ = _cluster_matrix(X, who)
+    lab = _cluster_labels(labels, len(rows), who)
+    groups = _cluster_groups(lab)
+    k = len(groups)
+    if k < 2:
+        raise ValueError(f"{who}: 至少需要 2 个簇，收到 {k}")
+    if k >= len(rows):
+        raise ValueError(f"{who}: 簇数 {k} 不能等于样本数 {len(rows)}")
+    vals = []
+    for i in range(len(rows)):
+        own = lab[i]
+        same = [j for j in groups[own] if j != i]
+        if not same:
+            vals.append(0.0)
+            continue
+        a = sum(_euclidean(rows[i], rows[j]) for j in same) / float(len(same))
+        b = None
+        for other, idxs in groups.items():
+            if other == own:
+                continue
+            mean_d = sum(_euclidean(rows[i], rows[j]) for j in idxs) / float(len(idxs))
+            if b is None or mean_d < b:
+                b = mean_d
+        denom = max(a, b)
+        vals.append(0.0 if denom <= 0.0 else (b - a) / denom)
+    return sum(vals) / float(len(vals))
+
+
+def _cluster_dispersion(X, labels, groups, centroids):
+    """返回 (簇内平方和, 簇间平方和, 全局质心)。"""
+    dim = len(X[0])
+    n = len(X)
+    centroids_all = [sum(row[d] for row in X) / float(n) for d in range(dim)]
+    within = 0.0
+    between = 0.0
+    for lab, idxs in groups.items():
+        c = centroids[lab]
+        within += sum(sum((X[i][d] - c[d]) ** 2 for d in range(dim)) for i in idxs)
+        dist2 = sum((c[d] - centroids_all[d]) ** 2 for d in range(dim))
+        between += len(idxs) * dist2
+    return within, between, centroids_all
+
+
+def calinski_harabasz_score(X, labels):
+    """Calinski-Harabasz：簇间/簇内离散度之比 × (n−k)/(k−1)，越大越好。"""
+    who = "calinski_harabasz_score"
+    rows, _ = _cluster_matrix(X, who)
+    lab = _cluster_labels(labels, len(rows), who)
+    groups = _cluster_groups(lab)
+    k = len(groups)
+    n = len(rows)
+    if k < 2:
+        raise ValueError(f"{who}: 至少需要 2 个簇，收到 {k}")
+    if k >= n:
+        raise ValueError(f"{who}: 簇数 {k} 不能等于样本数 {n}")
+    centroids = _cluster_centroids(rows, groups)
+    within, between, _ = _cluster_dispersion(rows, lab, groups, centroids)
+    if within <= 0.0:
+        raise ValueError(f"{who}: 簇内离散度为 0（每个簇内样本完全相同），比值无定义")
+    return (between / float(within)) * ((n - k) / float(k - 1))
+
+
+def davies_bouldin_score(X, labels):
+    """Davies-Bouldin：每簇取最相似簇的 (s_i+s_j)/d(c_i,c_j) 再平均，越小越好。"""
+    who = "davies_bouldin_score"
+    rows, _ = _cluster_matrix(X, who)
+    lab = _cluster_labels(labels, len(rows), who)
+    groups = _cluster_groups(lab)
+    k = len(groups)
+    if k < 2:
+        raise ValueError(f"{who}: 至少需要 2 个簇，收到 {k}")
+    centroids = _cluster_centroids(rows, groups)
+    spread = {}
+    for lab_id, idxs in groups.items():
+        c = centroids[lab_id]
+        spread[lab_id] = sum(_euclidean(rows[i], c) for i in idxs) / float(len(idxs))
+    keys = list(groups)
+    vals = []
+    for i, ki in enumerate(keys):
+        best = None
+        for kj in keys:
+            if kj == ki:
+                continue
+            d = _euclidean(centroids[ki], centroids[kj])
+            if d <= 0.0:
+                continue
+            r = (spread[ki] + spread[kj]) / d
+            if best is None or r > best:
+                best = r
+        vals.append(0.0 if best is None else best)
+    return sum(vals) / float(len(vals))
+
+
+def _contingency(labels_true, labels_pred):
+    """返回 (混淆计数矩阵, 行和, 列和, 总数)。"""
+    rows_t = []
+    rows_p = []
+    for i in range(len(labels_true)):
+        rows_t.append(labels_true[i])
+        rows_p.append(labels_pred[i])
+    t_keys = sorted(set(rows_t))
+    p_keys = sorted(set(rows_p))
+    ti = {v: i for i, v in enumerate(t_keys)}
+    pi = {v: i for i, v in enumerate(p_keys)}
+    table = [[0] * len(p_keys) for _ in range(len(t_keys))]
+    for a, b in zip(rows_t, rows_p):
+        table[ti[a]][pi[b]] += 1
+    row_sums = [sum(row) for row in table]
+    col_sums = [sum(table[i][j] for i in range(len(t_keys))) for j in range(len(p_keys))]
+    return table, row_sums, col_sums, float(len(rows_t))
+
+
+def _comb2(n):
+    return n * (n - 1) / 2.0
+
+
+def _entropy(counts, total):
+    h = 0.0
+    for c in counts:
+        if c > 0:
+            p = c / total
+            h -= p * math.log(p)
+    return h
+
+
+def _mutual_info(table, row_sums, col_sums, total):
+    mi = 0.0
+    for i, row in enumerate(table):
+        for j, n_ij in enumerate(row):
+            if n_ij > 0:
+                mi += (n_ij / total) * math.log(
+                    (n_ij * total) / (row_sums[i] * col_sums[j]))
+    return mi
+
+
+def adjusted_rand_score(labels_true, labels_pred):
+    """ARI：用组合数做机会校正的成对一致率，1 为完全一致、0 为随机。"""
+    who = "adjusted_rand_score"
+    if not isinstance(labels_true, (list, tuple)) or not isinstance(labels_pred, (list, tuple)):
+        raise ValueError(f"{who}: 两个标签序列都必须是列表")
+    if len(labels_true) != len(labels_pred):
+        raise ValueError(
+            f"{who}: 长度不一致（{len(labels_true)} vs {len(labels_pred)}）")
+    if not labels_true:
+        raise ValueError(f"{who}: 不能是空列表")
+    t = [_metric_label(v, who, i) for i, v in enumerate(labels_true)]
+    p = [_metric_label(v, who, i) for i, v in enumerate(labels_pred)]
+    table, row_sums, col_sums, total_n = _contingency(t, p)
+    sum_ij = sum(_comb2(n) for row in table for n in row)
+    sum_a = sum(_comb2(n) for n in row_sums)
+    sum_b = sum(_comb2(n) for n in col_sums)
+    total = _comb2(total_n)
+    expected = sum_a * sum_b / total if total > 0 else 0.0
+    max_index = 0.5 * (sum_a + sum_b)
+    if max_index == expected:
+        return 1.0 if sum_ij == expected else 0.0
+    return (sum_ij - expected) / (max_index - expected)
+
+
+def normalized_mutual_info_score(labels_true, labels_pred, average_method="arithmetic"):
+    """NMI：互信息 / 两个熵的聚合（arithmetic / geometric / min / max）。"""
+    who = "normalized_mutual_info_score"
+    if average_method not in ("arithmetic", "geometric", "min", "max"):
+        raise ValueError(
+            f"{who}: average_method 必须是 arithmetic/geometric/min/max，收到 {average_method!r}")
+    if not isinstance(labels_true, (list, tuple)) or not isinstance(labels_pred, (list, tuple)):
+        raise ValueError(f"{who}: 两个标签序列都必须是列表")
+    if len(labels_true) != len(labels_pred):
+        raise ValueError(
+            f"{who}: 长度不一致（{len(labels_true)} vs {len(labels_pred)}）")
+    if not labels_true:
+        raise ValueError(f"{who}: 不能是空列表")
+    t = [_metric_label(v, who, i) for i, v in enumerate(labels_true)]
+    p = [_metric_label(v, who, i) for i, v in enumerate(labels_pred)]
+    table, row_sums, col_sums, total = _contingency(t, p)
+    mi = _mutual_info(table, row_sums, col_sums, total)
+    h_t = _entropy(row_sums, total)
+    h_p = _entropy(col_sums, total)
+    if mi <= 0.0:
+        return 0.0
+    if average_method == "arithmetic":
+        denom = 0.5 * (h_t + h_p)
+    elif average_method == "geometric":
+        denom = math.sqrt(h_t * h_p)
+    elif average_method == "min":
+        denom = min(h_t, h_p)
+    else:
+        denom = max(h_t, h_p)
+    if denom <= 0.0:
+        return 1.0
+    return mi / denom
+
+
+def _expected_mutual_info(table, row_sums, col_sums, total):
+    """AMI 的机会校正项：按超几何分布对 (行, 列, n_ij) 三重求和。"""
+    n = int(total)
+    emi = 0.0
+    for i, a_i in enumerate(row_sums):
+        for j, b_j in enumerate(col_sums):
+            low = max(1, a_i + b_j - n)
+            high = min(a_i, b_j)
+            for n_ij in range(low, high + 1):
+                term = (n_ij / float(n)) * math.log(
+                    (n_ij * n) / float(a_i * b_j))
+                log_p = (math.lgamma(a_i + 1) + math.lgamma(b_j + 1) +
+                         math.lgamma(n - a_i + 1) + math.lgamma(n - b_j + 1) -
+                         math.lgamma(n + 1) - math.lgamma(n_ij + 1) -
+                         math.lgamma(a_i - n_ij + 1) - math.lgamma(b_j - n_ij + 1) -
+                         math.lgamma(n - a_i - b_j + n_ij + 1))
+                emi += term * math.exp(log_p)
+    return emi
+
+
+def adjusted_mutual_info_score(labels_true, labels_pred, average_method="arithmetic"):
+    """AMI：互信息减去机会期望后归一化；对簇数不敏感，随机标签约 0。"""
+    who = "adjusted_mutual_info_score"
+    if average_method not in ("arithmetic", "geometric", "min", "max"):
+        raise ValueError(
+            f"{who}: average_method 必须是 arithmetic/geometric/min/max，收到 {average_method!r}")
+    if not isinstance(labels_true, (list, tuple)) or not isinstance(labels_pred, (list, tuple)):
+        raise ValueError(f"{who}: 两个标签序列都必须是列表")
+    if len(labels_true) != len(labels_pred):
+        raise ValueError(
+            f"{who}: 长度不一致（{len(labels_true)} vs {len(labels_pred)}）")
+    if not labels_true:
+        raise ValueError(f"{who}: 不能是空列表")
+    t = [_metric_label(v, who, i) for i, v in enumerate(labels_true)]
+    p = [_metric_label(v, who, i) for i, v in enumerate(labels_pred)]
+    table, row_sums, col_sums, total = _contingency(t, p)
+    mi = _mutual_info(table, row_sums, col_sums, total)
+    emi = _expected_mutual_info(table, row_sums, col_sums, total)
+    h_t = _entropy(row_sums, total)
+    h_p = _entropy(col_sums, total)
+    if average_method == "arithmetic":
+        norm = 0.5 * (h_t + h_p)
+    elif average_method == "geometric":
+        norm = math.sqrt(h_t * h_p)
+    elif average_method == "min":
+        norm = min(h_t, h_p)
+    else:
+        norm = max(h_t, h_p)
+    denom = norm - emi
+    if abs(denom) <= 1e-15:
+        return 1.0 if abs(mi - emi) <= 1e-15 else 0.0
+    return (mi - emi) / denom
+
+
 def _edit_ops(reference, hypothesis):
     """编辑距离的 (替换, 删除, 插入) 计数（把参考变成假设的最短路径）。"""
     n = len(reference)

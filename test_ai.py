@@ -20843,3 +20843,74 @@ class TestSpeechMetrics:
             AI.slot_error_rate([("a", 1), ("a", 2)], {"a": 1})
         with pytest.raises(ValueError):
             AI.slot_error_rate(3, {"a": 1})
+
+
+class TestClusteringMetrics:
+    X = [[0.0, 0.0], [0.0, 1.0], [10.0, 10.0], [10.0, 11.0]]
+    Y = [0, 0, 1, 1]
+
+    def test_silhouette_two_clusters(self):
+        val = AI.silhouette_score(self.X, self.Y)
+        assert abs(val - 0.9292895427118657) < 1e-9
+
+    def test_silhouette_singleton_point_scores_zero(self):
+        val = AI.silhouette_score([[0.0], [1.0], [10.0]], [0, 0, 1])
+        assert abs(val - 0.5962962962962963) < 1e-9
+
+    def test_silhouette_rejects_bad_shapes(self):
+        with pytest.raises(ValueError):
+            AI.silhouette_score(self.X, [0, 0, 0, 0])
+        with pytest.raises(ValueError):
+            AI.silhouette_score([[0.0], [1.0]], [0, 1])
+        with pytest.raises(ValueError):
+            AI.silhouette_score(self.X, [0, 0, 1])
+
+    def test_calinski_harabasz_and_davies_bouldin(self):
+        assert abs(AI.calinski_harabasz_score(self.X, self.Y) - 400.0) < 1e-9
+        assert abs(AI.davies_bouldin_score(self.X, self.Y) - 0.07071067811865475) < 1e-9
+        with pytest.raises(ValueError):
+            AI.calinski_harabasz_score(self.X, [0, 0, 0, 0])
+        with pytest.raises(ValueError):
+            AI.davies_bouldin_score(self.X, [0, 0, 0, 0])
+
+    def test_calinski_harabasz_rejects_zero_within(self):
+        with pytest.raises(ValueError):
+            AI.calinski_harabasz_score([[0.0], [0.0], [1.0], [1.0]], [0, 0, 1, 1])
+
+    def test_adjusted_rand_score(self):
+        assert abs(AI.adjusted_rand_score(self.Y, self.Y) - 1.0) < 1e-12
+        assert abs(AI.adjusted_rand_score(self.Y, [5, 5, 9, 9]) - 1.0) < 1e-12
+        assert abs(AI.adjusted_rand_score(self.Y, [0, 1, 0, 1]) + 0.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.adjusted_rand_score([], [])
+        with pytest.raises(ValueError):
+            AI.adjusted_rand_score([-1, 0], [0, 1])
+
+    def test_normalized_mutual_info(self):
+        assert abs(AI.normalized_mutual_info_score(self.Y, self.Y) - 1.0) < 1e-12
+        assert abs(AI.normalized_mutual_info_score(self.Y, [0, 1, 0, 1])) < 1e-12
+        assert abs(AI.normalized_mutual_info_score([0, 0, 1, 1], [0, 0, 0, 1])
+                   - 0.3437110184854508) < 1e-9
+        assert abs(AI.normalized_mutual_info_score([0, 0, 0, 0, 1, 1, 1, 1],
+                                                   [0, 0, 1, 1, 2, 2, 3, 3])
+                   - 2.0 / 3.0) < 1e-9
+        with pytest.raises(ValueError):
+            AI.normalized_mutual_info_score(self.Y, self.Y, "mean")
+
+    def test_adjusted_mutual_info(self):
+        assert abs(AI.adjusted_mutual_info_score(self.Y, self.Y) - 1.0) < 1e-12
+        assert abs(AI.adjusted_mutual_info_score(self.Y, [0, 1, 0, 1]) + 0.5) < 1e-12
+        assert abs(AI.adjusted_mutual_info_score([0, 0, 0, 0, 1, 1, 1, 1],
+                                                 [0, 0, 1, 1, 2, 2, 3, 3])
+                   - 0.5333333333333332) < 1e-9
+        assert AI.adjusted_mutual_info_score([0, 0, 1, 1], [0, 0, 0, 1]) <= \
+            AI.normalized_mutual_info_score([0, 0, 1, 1], [0, 0, 0, 1]) + 1e-12
+        with pytest.raises(ValueError):
+            AI.adjusted_mutual_info_score(self.Y, self.Y, "maxx")
+        with pytest.raises(ValueError):
+            AI.adjusted_mutual_info_score([], [])
+
+    def test_mean_silhouette_prefers_separated_clusters(self):
+        near = AI.silhouette_score([[0.0], [1.0], [2.0], [3.0]], [0, 0, 1, 1])
+        far = AI.silhouette_score([[0.0], [1.0], [100.0], [101.0]], [0, 0, 1, 1])
+        assert far > near

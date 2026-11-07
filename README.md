@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1327 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1336 项）
 
 ## 特性
 
@@ -1294,6 +1294,32 @@ print(AI.slot_error_rate({"city": "北京"}, {"city": "上海"}))  # 1.0
 假设可以为空串（WER 会是 1.0）。SER 的分子把「多出来的槽位」也算错误，
 所以删词与加词都会让分数上升。
 
+### 聚类指标（W13-G）
+
+| 函数 | 说明 |
+|---|---|
+| `silhouette_score(X, labels)` | 每点 `(b-a)/max(a,b)` 的均值；单点簇记 0 |
+| `calinski_harabasz_score(X, labels)` | 簇间/簇内离散度 × `(n-k)/(k-1)`，越大越好 |
+| `davies_bouldin_score(X, labels)` | 每簇与最相似簇的 `(s_i+s_j)/d(c_i,c_j)` 均值，越小越好 |
+| `adjusted_rand_score(labels_true, labels_pred)` | 组合数机会校正的成对一致率 |
+| `normalized_mutual_info_score(..., average_method=)` | 互信息 / 熵的四种聚合 |
+| `adjusted_mutual_info_score(..., average_method=)` | 互信息减去超几何期望后再归一 |
+
+```python
+X = [[0.0, 0.0], [0.0, 1.0], [10.0, 10.0], [10.0, 11.0]]
+y = [0, 0, 1, 1]
+print(silhouette_score(X, y))            # 0.9293
+print(calinski_harabasz_score(X, y))     # 400.0
+print(davies_bouldin_score(X, y))        # 0.0707
+print(adjusted_rand_score(y, [7, 7, 3, 3]))  # 1.0（标签重命名不影响）
+```
+
+三个边界说明：
+
+- **聚类的「标签」只用于分组**：ARI/NMI/AMI 对标签重命名完全不变，但标签必须是非负整数（内部按整数做列联表）。
+- **AMI 在小样本上可以是负数**：`adjusted_mutual_info_score([0,0,1,1], [0,1,0,1])` 返回 `-0.5`，因为机会校正后的期望互信息高于 0，这比随机划分还差；NMI 同场景是 0。聚类数多于真实类数时（细分）AMI 会明显低于 NMI，这是 AMI 的预期行为。
+- **silhouette 需要 `2 <= k < n`**：全单点簇（k == n）没有簇内距离，直接报错而不是返回 1。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1710,7 +1736,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1327 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1336 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1887,6 +1913,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSegmentationMetrics` | PixelAcc / mIoU / Dice / FW-IoU 手算对照、ignore_index、BoundaryF1 的 tolerance 两档、HD95 双向分位数、形状与标签校验 |
 | `TestTextGenerationMetrics` | corpus BLEU（手算四阶精度 / 多参考 / 简短惩罚）/ ROUGE-1·2 / METEOR 闭式（含片段惩罚）/ CIDEr 三个端点 / Self-BLEU 相同与互异 |
 | `TestSpeechMetrics` | WER 的五种编辑组合、`_edit_ops` 三元组、CER 的中英文、SER 的值错/缺失/多出与四种非法输入 |
+| `TestClusteringMetrics` | silhouette 含单点簇、CH 手算 400、DB 手算、ARI 的 1/-0.5、NMI 手算、AMI 的负数与细分 0.5333、九条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1940,7 +1967,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1327 个单元测试
+├── test_ai.py       # 1336 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

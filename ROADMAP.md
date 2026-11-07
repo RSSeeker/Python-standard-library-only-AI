@@ -410,7 +410,12 @@
   - 口径：多参考必须写「列表的列表」；`cider_score` 的 IDF 只在本条候选的参考集内统计；smooth 只对「该阶零命中」生效
 - [x] 语音：WER / CER / SER（编辑距离）（`_edit_ops` 做 DP 回溯给出替换/删除/插入三元组、`_speech_check_empty` 统一空参考；探针 26 项全过，含中文字符级 CER 与 SER 的多出槽位）
   - 口径：参考为空抛 ValueError，假设可为空；SER 的分子包含「多出的槽位」
-- [ ] 聚类：Silhouette / Calinski-Harabasz / Davies-Bouldin / ARI / NMI / AMI
+- [x] 聚类：Silhouette / Calinski-Harabasz / Davies-Bouldin / ARI / NMI / AMI
+  - silhouette 每点 `(b-a)/max(a,b)`，单点簇记 0，要求 `2 <= k < n`
+  - CH 与 DB 只依赖质心距离，常数维样本会报错而不是除以 0
+  - ARI 用组合数做机会校正；AMI 用超几何期望（`lgamma` 实现），小样本可为负（`[0,0,1,1]` vs `[0,1,0,1]` = -0.5）
+  - NMI/AMI 支持 arithmetic / geometric / min / max 四种归一化
+  - 探针 33 项（含独立参考实现逐步对照 silhouette 与 DB）
 - [ ] 校准：ECE / MCE / ReliabilityDiagram
 - [ ] 检测：mAP / mAP@0.5 / mAP@[.5:.95] / AR（简化）
 - [ ] 图像：PSNR / SSIM / MS-SSIM；FID / KID / IS（简化并标注口径）
