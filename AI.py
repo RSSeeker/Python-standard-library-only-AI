@@ -12141,11 +12141,27 @@ def _transpose(M):
     return [[M[i][j] for i in range(m)] for j in range(n)]
 
 
+def _reject_nan_row(v, who):
+    """softmax 前置检查：NaN 无法通过「取最大值」被发现，必须显式扫一遍"""
+    for i, x in enumerate(v):
+        if x != x:
+            raise ValueError("%s: 第 %d 个 logit 是 NaN" % (who, i))
+
+
 def _softmax_row(v):
-    """对一维列表做 softmax（整行都是 -inf 时返回全 0，避免 exp(-inf-(-inf))=NaN）"""
+    """对一维列表做 softmax（整行都是 -inf 时返回全 0，避免 exp(-inf-(-inf))=NaN）
+
+    数值边界（W18-B）：含 NaN 抛 ValueError；含 +inf 时把概率均分给所有 +inf 项
+    （否则 exp(inf-inf)=NaN）；整行 -inf 返回全 0。
+    """
+    _reject_nan_row(v, "_softmax_row")
     mx = max(v)
     if mx == float("-inf"):
         return [0.0] * len(v)
+    if mx == float("inf"):
+        hits = sum(1 for x in v if x == float("inf"))
+        share = 1.0 / hits
+        return [(share if x == float("inf") else 0.0) for x in v]
     exps = [math.exp(x - mx) for x in v]
     s = sum(exps)
     return [e / s for e in exps]
@@ -17061,10 +17077,19 @@ def _adam_apply(param, grad, m, v, t, lr, b1=0.9, b2=0.999, eps=1e-8):
 
 
 def _log_softmax_row(v):
-    """对一维列表做 log-softmax（数值稳定版，供束搜索累加对数概率用）"""
+    """对一维列表做 log-softmax（数值稳定版，供束搜索累加对数概率用）
+
+    数值边界（W18-B）：含 NaN 抛 ValueError；含 +inf 时 +inf 项得 -log(个数)、
+    其余得 -inf；整行 -inf 返回全 -inf。
+    """
+    _reject_nan_row(v, "_log_softmax_row")
     mx = max(v)
     if mx == float("-inf"):
         return [float("-inf")] * len(v)
+    if mx == float("inf"):
+        hits = sum(1 for x in v if x == float("inf"))
+        share = -math.log(hits)
+        return [(share if x == float("inf") else float("-inf")) for x in v]
     exps = [math.exp(x - mx) for x in v]
     log_s = math.log(sum(exps)) + mx
     return [x - log_s for x in v]
@@ -19184,15 +19209,29 @@ def lr_finder(model, data=None, x=None, y=None, start_lr: float = 1e-5,
 # ============================================================================
 
 def _numeric_pair(pred, target, who):
-    """把 (pred, target) 规范成等长 float 列表；target 允许标量（只能配单输出）"""
+    """把 (pred, target) 规范成等长 float 列表；target 允许标量（只能配单输出）
+
+    W18-B 起拒绝 NaN 输入：NaN 会让损失静默变成 nan（而且它还会被 ReLU 这类
+    `x if x > 0 else 0` 的写法吞掉，看起来「一切正常」）。±Inf 仍按 IEEE 语义放行——
+    溢出成 inf 是可见的，而 NaN 会无声扩散。
+    """
     if isinstance(target, (list, tuple)):
         if len(target) != len(pred):
             raise ValueError(f"{who}: target 长度 {len(target)} != pred 长度 {len(pred)}")
-        return [float(t) for t in target], [float(p) for p in pred]
-    ps = [float(p) for p in pred]
-    if len(ps) != 1:
-        raise ValueError(f"{who}: 标量 target 只能配单个输出，pred 长度是 {len(ps)}")
-    return [float(target)], ps
+        ts = [float(t) for t in target]
+        ps = [float(p) for p in pred]
+    else:
+        ps = [float(p) for p in pred]
+        if len(ps) != 1:
+            raise ValueError(f"{who}: 标量 target 只能配单个输出，pred 长度是 {len(ps)}")
+        ts = [float(target)]
+    for i, v in enumerate(ps):
+        if v != v:
+            raise ValueError(f"{who}: pred 第 {i} 个值是 NaN")
+    for i, v in enumerate(ts):
+        if v != v:
+            raise ValueError(f"{who}: target 第 {i} 个值是 NaN")
+    return ts, ps
 
 
 def l1_loss(pred, target):
@@ -19203,6 +19242,8 @@ def l1_loss(pred, target):
     """
     ts, ps = _numeric_pair(pred, target, "l1_loss")
     n = len(ts)
+    if n == 0:
+        raise ValueError("l1_loss: pred 不能为空")
     loss = 0.0
     grad = []
     for y, p in zip(ts, ps):
@@ -19220,6 +19261,8 @@ def log_cosh_loss(pred, target):
     """
     ts, ps = _numeric_pair(pred, target, "log_cosh_loss")
     n = len(ts)
+    if n == 0:
+        raise ValueError("log_cosh_loss: pred 不能为空")
     loss = 0.0
     grad = []
     log2 = math.log(2.0)
@@ -19758,6 +19801,12 @@ def mse_loss(pred: List[float], target):
             f"请对齐维度（单输出回归请传 y=[value]，多输出请传 y=[v1, v2, ...]）"
         )
     n = len(pred)
+    # W18-B：NaN 输入显式报错（±Inf 放行，平方后溢出成 inf 是可见的 IEEE 行为）
+    for i in range(n):
+        if float(pred[i]) != float(pred[i]):
+            raise ValueError("mse_loss: pred 第 %d 个值是 NaN" % i)
+        if float(target[i]) != float(target[i]):
+            raise ValueError("mse_loss: target 第 %d 个值是 NaN" % i)
     # 用乘法而不是 `** 2`：CPython 的 float pow 在 |差值| >~1.34e154 时会抛
     # OverflowError（而 mse_loss([1e308],[-1e308]) 又返回 inf，行为不一致）；
     # 乘法按 IEEE 溢出成 inf，语义统一
@@ -30706,6 +30755,158 @@ def grad_check_all(module, eps: float = 1e-6, tol: float = 1e-5,
             "worst": worst, "modules": reports, "skipped": skipped}
 
 
+# ============================================================================
+#  W18-B：数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+# ============================================================================
+
+_W18B_OK_EXCEPTIONS = (ValueError, TypeError, OverflowError,
+                       ZeroDivisionError, RuntimeError, AssertionError)
+
+
+def _w18b_iter_numbers(obj):
+    """递归遍历 list / tuple / dict 里的数值叶子（bool 不算）"""
+    if isinstance(obj, dict):
+        for key in obj:
+            for item in _w18b_iter_numbers(obj[key]):
+                yield item
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            for value in _w18b_iter_numbers(item):
+                yield value
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        yield float(obj)
+
+
+def numeric_scan(value):
+    """扫描任意嵌套结构里的数值：返回计数、NaN 数、Inf 数与最大绝对值。
+
+    返回 dict：{'count', 'nan', 'inf', 'max_abs', 'finite'}
+    （空结构算有限：count=0 时 finite=True）
+    """
+    count = 0
+    nans = 0
+    infs = 0
+    max_abs = 0.0
+    for v in _w18b_iter_numbers(value):
+        count += 1
+        if v != v:
+            nans += 1
+            continue
+        if v == float("inf") or v == float("-inf"):
+            infs += 1
+            continue
+        if abs(v) > max_abs:
+            max_abs = abs(v)
+    return {"count": count, "nan": nans, "inf": infs,
+            "max_abs": max_abs, "finite": nans == 0 and infs == 0}
+
+
+def is_all_finite(value):
+    """`numeric_scan(...)['finite']` 的便捷封装。"""
+    return numeric_scan(value)["finite"]
+
+
+def assert_all_finite(label, value):
+    """断言任意嵌套结构里的所有数值都有限，否则抛 ValueError 并指出数量。"""
+    scan = numeric_scan(value)
+    if scan["finite"]:
+        return True
+    raise ValueError(
+        "%s: 结果里出现非有限数（nan=%d, inf=%d, 共 %d 个数）"
+        % (label, scan["nan"], scan["inf"], scan["count"]))
+
+
+def stability_cases(size: int = 3):
+    """六类极端输入（与 ROADMAP 的 W18-B 一一对应）：巨大 / 极小 / NaN / Inf / 全零 / 空。"""
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise TypeError("stability_cases: size 必须是整数")
+    if size <= 0:
+        raise ValueError("stability_cases: size 必须为正数")
+    return [
+        ("huge", [1e300] * size),
+        ("tiny", [1e-300] * size),
+        ("nan", [float("nan")] + [1.0] * (size - 1)),
+        ("inf", [float("inf")] + [1.0] * (size - 1)),
+        ("zeros", [0.0] * size),
+        ("empty", []),
+    ]
+
+
+def stability_probe(fn, cases=None, ok_exceptions=None, allow_inf=False):
+    """对 `fn` 逐一喂入极端输入，判定「要么给出可解释的结果，要么显式报错」。
+
+    判定标准（核心是**不静默出 NaN**）：
+      - 没有 NaN，且（allow_inf 或没有 inf）  -> outcome='finite'
+      - 没有 NaN，但有 ±inf 且 allow_inf=False -> outcome='inf'（不合格）
+      - 出现 NaN                               -> outcome='nan'（永远不合格）
+      - 抛出了异常                             -> outcome='raised'（合格）
+
+    为什么 inf 可以放行：IEEE 的溢出结果是可见的 ±inf，调用方能用 `math.isfinite`
+    一键判断；而 NaN 一旦进入 `x if x > 0 else 0` 这类分支就被吞成 0，问题会藏起来。
+    因此 `allow_inf=True` 用于「溢出成 inf 属正常语义」的标量函数（mse / l1 / dft）。
+
+    参数：
+        fn:             接受一个 list 的函数
+        cases:          [(名字, 输入 list), ...]，默认 `stability_cases()`
+        ok_exceptions:  允许的异常类型元组，默认 ValueError/TypeError/
+                        OverflowError/ZeroDivisionError/RuntimeError/AssertionError
+        allow_inf:      是否接受返回值里出现 ±inf（NaN 永远不接受）
+
+    返回 dict：{'ok', 'failed': [名字], 'cases': [
+        {'name', 'outcome', 'exc', 'message', 'nan', 'inf', 'count', 'max_abs'}]}
+    """
+    if not callable(fn):
+        raise TypeError("stability_probe: fn 必须是可调用对象")
+    if cases is None:
+        cases = stability_cases()
+    allowed = _W18B_OK_EXCEPTIONS if ok_exceptions is None else tuple(ok_exceptions)
+    if not isinstance(cases, (list, tuple)) or not cases:
+        raise ValueError("stability_probe: cases 必须是非空列表")
+
+    reports = []
+    failed = []
+    for item in cases:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("stability_probe: cases 的每一项必须是 (名字, 输入) 二元组")
+        name, payload = item
+        if not isinstance(name, str) or not name:
+            raise ValueError("stability_probe: case 名字必须是非空字符串")
+        entry = {"name": name, "outcome": "finite", "exc": "",
+                 "message": "", "nan": 0, "inf": 0, "count": 0, "max_abs": 0.0}
+        try:
+            out = fn(payload)
+        except allowed as exc:
+            entry["outcome"] = "raised"
+            entry["exc"] = type(exc).__name__
+            entry["message"] = str(exc)[:160]
+            reports.append(entry)
+            continue
+        except Exception as exc:                # 不在白名单里的异常也算不合格
+            entry["outcome"] = "raised"
+            entry["exc"] = type(exc).__name__
+            entry["message"] = str(exc)[:160]
+            failed.append(name)
+            reports.append(entry)
+            continue
+        scan = numeric_scan(out)
+        entry.update({"nan": scan["nan"], "inf": scan["inf"],
+                      "count": scan["count"], "max_abs": scan["max_abs"]})
+        if scan["nan"] > 0:
+            entry["outcome"] = "nan"
+            failed.append(name)
+        elif scan["inf"] > 0 and not allow_inf:
+            entry["outcome"] = "inf"
+            failed.append(name)
+        reports.append(entry)
+
+    return {"ok": not failed, "failed": failed, "cases": reports}
+
+
+def _w18b_user_why():
+    """占位助手（保持本分节自洽，无外部依赖）"""
+    return "要么返回全有限值，要么显式报错——不要静默产生 NaN"
+
+
 # ======================================================================
 #  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
 # ======================================================================
@@ -40080,8 +40281,16 @@ def r2_score(y_true, y_pred) -> float:
     """
     yt, yp = _regression_pairs(y_true, y_pred, "r2_score")
     mean = sum(yt) / len(yt)
-    ss_tot = sum((t - mean) ** 2 for t in yt)
-    ss_res = sum((t - p) ** 2 for t, p in zip(yt, yp))
+    ss_tot = 0.0
+    ss_res = 0.0
+    for t, p in zip(yt, yp):
+        d = t - mean
+        ss_tot += d * d
+        r = t - p
+        ss_res += r * r
+    if not (ss_tot < float("inf") and ss_res < float("inf")):
+        raise ValueError(
+            "r2_score: 平方和溢出（目标值量级过大），请先把 y 归一化")
     if ss_tot == 0.0:
         return 1.0 if ss_res == 0.0 else 0.0
     return 1.0 - ss_res / ss_tot

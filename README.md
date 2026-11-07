@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1654 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1666 项）
 
 ## 特性
 
@@ -2296,6 +2296,46 @@ dout = U(-1, 1)^len(y)         gw, gb, _ = layer.backward(dout)
 - `zeros` 沿用 `grad_check` 的口径：解析与数值都 < 1e-8 的标量不参与相对误差
   （ReLU 死单元、softmax 前的平移不变偏置都会出现这种参数）。
 
+### 数值稳定性检测（W18-B）
+
+| 接口 | 说明 |
+|------|------|
+| `numeric_scan(value)` | 递归扫描 list/tuple/dict 里的数值，返回 `{count, nan, inf, max_abs, finite}` |
+| `is_all_finite(value)` / `assert_all_finite(label, value)` | 布尔判定 / 失败时抛带标签的 `ValueError` |
+| `stability_cases(size=3)` | 六类极端输入：`huge`(1e300) / `tiny`(1e-300) / `nan` / `inf` / `zeros` / `empty` |
+| `stability_probe(fn, cases=None, allow_inf=False)` | 逐个跑 case，判定「给出可解释结果或显式报错」 |
+
+```python
+import AI
+
+rep = AI.stability_probe(AI._softmax_row)
+assert rep["ok"]
+print([(c["name"], c["outcome"]) for c in rep["cases"]])
+# [('huge','finite'), ('tiny','finite'), ('nan','raised'), ('inf','finite'),
+#  ('zeros','finite'), ('empty','raised')]
+```
+
+判定口径：**NaN 永远不合格**（它会被 `x if x > 0 else 0` 这类分支吞成 0，问题藏起来）；
+`±inf` 默认也不合格，但 `allow_inf=True` 时放行——标量函数的 IEEE 溢出结果 `inf` 是
+可见的，调用方用 `math.isfinite` 就能判断。
+
+本轮据此修掉的静默问题：
+
+- `_softmax_row` / `_log_softmax_row` 遇到 NaN 现在抛 `ValueError`（原来返回一列 NaN）；
+  遇到 `+inf` 把概率均分给所有 `+inf` 项（原来 `exp(inf-inf)=NaN`）。
+- `l1_loss` / `log_cosh_loss` 空输入从 `ZeroDivisionError` 改成 `ValueError`。
+- `_numeric_pair`（l1 / log_cosh 等损失的公共入口）与 `mse_loss` 对 NaN 输入显式报错。
+- `r2_score` 的平方和溢出从 `OverflowError` 改成带建议的 `ValueError`。
+
+诚实边界：
+
+- 这是**检测工具**，不是全库消毒。`MLP.forward` / `Layer.forward` 不校验输入：
+  `inf` 输入经过 `0 * inf` 会得到 NaN，探针会如实报 `outcome='nan'`——模型热路径上
+  不加逐元素校验（那会让每次前向多一遍扫描），需要时请自己包一层 `assert_all_finite`。
+- `inf` 溢出（如 `mse_loss([1e308], [-1e308])`）仍然是 `inf`，不改成异常：它是可见的
+  IEEE 结果，且已有测试锁定该行为。
+- 只覆盖数值叶子，不检查字符串/None 语义，也不做「接近零就报错」这类量纲判断。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2712,7 +2752,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1654 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1666 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2925,6 +2965,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVideoModels` | 3D-CNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度对中心差分、`zero_grad` 清空、双流拼接形状与参数量、两路输入梯度与 head 权重梯度、9 处参数校验 |
 | `TestOCRAndDetection` | CRNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度、高度未压到 1 报错、CTC 贪心解码三例（含 blank 过滤与全 blank）、YOLO 网格目标/冲突计数/解码阈值/NMS，共 9 例 |
 | `TestGradCheckAll` | 遍历三层 MLP、Model 包装解包、同种子可复现、`max_params` 上限、故意破坏 `backward` 被定位到具体层、非 Layer 持有者进 `skipped`、零梯度归类、容器递归、空模型报错、11 条参数校验，共 10 例 |
+| `TestNumericalStability` | `numeric_scan` 嵌套计数、`assert_all_finite` 报错带标签、六类 case、五种 probe 判定（finite/nan/inf/raised/allow_inf）、softmax 的 ±inf 与 NaN、空损失 ValueError、NaN 输入拒绝、inf 溢出仍为 inf、六个真实入口契约、模型边界如实上报、参数校验，共 12 例 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2978,7 +3019,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1654 个单元测试
+├── test_ai.py       # 1666 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

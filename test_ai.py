@@ -25437,3 +25437,132 @@ class TestGradCheckAll:
             AI.grad_check_all(net, max_params=2.5)
         with pytest.raises(TypeError):
             AI.grad_check_all(net, max_params=True)
+
+
+class TestNumericalStability:
+    """W18-B：NaN/Inf 扫描、六类极端输入探针，以及本轮修掉的静默 NaN。"""
+
+    def test_numeric_scan(self):
+        scan = AI.numeric_scan([1.0, [2, 3.5], {"a": float("nan")}, ("x", True)])
+        assert scan["count"] == 4
+        assert scan["nan"] == 1 and scan["inf"] == 0
+        assert scan["finite"] is False
+        assert scan["max_abs"] == 3.5
+        assert AI.numeric_scan([])["finite"] is True
+        assert AI.numeric_scan([True, False])["count"] == 0
+        inf_scan = AI.numeric_scan([float("-inf"), 2.0])
+        assert inf_scan["inf"] == 1 and inf_scan["finite"] is False
+
+    def test_assert_all_finite(self):
+        assert AI.assert_all_finite("ok", [1.0, [2.0, 3.0]]) is True
+        assert AI.is_all_finite([1e300, 1e-300]) is True
+        assert AI.is_all_finite([float("nan")]) is False
+        with pytest.raises(ValueError):
+            AI.assert_all_finite("demo", [[1.0], [float("nan")]])
+
+    def test_stability_cases(self):
+        cases = AI.stability_cases()
+        assert [c[0] for c in cases] == ["huge", "tiny", "nan", "inf", "zeros", "empty"]
+        assert cases[0][1][0] == 1e300 and cases[1][1][0] == 1e-300
+        assert len(AI.stability_cases(5)[0][1]) == 5
+        with pytest.raises(ValueError):
+            AI.stability_cases(0)
+        with pytest.raises(TypeError):
+            AI.stability_cases(True)
+
+    def test_probe_outcomes(self):
+        rep = AI.stability_probe(lambda v: [0.0] * len(v))
+        assert rep["ok"] is True
+        assert all(c["outcome"] == "finite" for c in rep["cases"])
+
+        rep_nan = AI.stability_probe(lambda v: [float("nan")])
+        assert rep_nan["ok"] is False
+        assert all(c["outcome"] == "nan" for c in rep_nan["cases"])
+
+        rep_inf = AI.stability_probe(lambda v: [float("inf")])
+        assert rep_inf["ok"] is False
+        assert all(c["outcome"] == "inf" for c in rep_inf["cases"])
+        assert AI.stability_probe(lambda v: [float("inf")], allow_inf=True)["ok"] is True
+        assert AI.stability_probe(lambda v: [float("nan")], allow_inf=True)["ok"] is False
+
+    def test_probe_accepts_raising(self):
+        def raiser(v):
+            if not v:
+                raise ValueError("空输入")
+            return [1.0]
+
+        rep = AI.stability_probe(raiser)
+        assert rep["ok"] is True
+        assert rep["cases"][-1]["outcome"] == "raised"
+        assert rep["cases"][-1]["exc"] == "ValueError"
+
+    def test_softmax_numeric_edges(self):
+        assert AI._softmax_row([float("inf"), 1.0, float("inf")]) == [0.5, 0.0, 0.5]
+        assert AI._softmax_row([float("-inf")] * 3) == [0.0, 0.0, 0.0]
+        assert abs(sum(AI._softmax_row([1.0, 2.0, 3.0])) - 1.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI._softmax_row([1.0, float("nan"), 3.0])
+        lsm = AI._log_softmax_row([float("inf"), 0.5, float("inf")])
+        assert abs(lsm[0] + math.log(2.0)) < 1e-12
+        assert lsm[1] == float("-inf")
+        with pytest.raises(ValueError):
+            AI._log_softmax_row([float("nan")])
+
+    def test_empty_losses_raise_value_error(self):
+        for fn in (AI.l1_loss, AI.log_cosh_loss):
+            with pytest.raises(ValueError):
+                fn([], [])
+
+    def test_nan_inputs_rejected(self):
+        nan = float("nan")
+        with pytest.raises(ValueError):
+            AI.l1_loss([nan], [0.0])
+        with pytest.raises(ValueError):
+            AI.l1_loss([0.0], [nan])
+        with pytest.raises(ValueError):
+            AI.mse_loss([nan], [0.0])
+        with pytest.raises(ValueError):
+            AI.mse_loss([0.0], [nan])
+        with pytest.raises(ValueError):
+            AI.log_cosh_loss([nan], [0.0])
+        with pytest.raises(ValueError):
+            AI.mean_absolute_error([nan], [0.0])
+
+    def test_inf_overflow_stays_inf(self):
+        loss = AI.mse_loss([1e308], [-1e308])[0]
+        assert loss == float("inf")
+        assert loss == loss
+
+    def test_key_entries_satisfy_contract(self):
+        entries = [
+            ("_softmax_row", AI._softmax_row, False),
+            ("_log_softmax_row", AI._log_softmax_row, True),
+            ("mse_loss", lambda v: AI.mse_loss(v, [0.0] * len(v)), True),
+            ("l1_loss", lambda v: AI.l1_loss(v, [0.0] * len(v)), True),
+            ("mean_absolute_error", lambda v: AI.mean_absolute_error(v, [0.0] * len(v)), False),
+            ("dft_power", AI.dft_power, True),
+        ]
+        for name, fn, allow_inf in entries:
+            rep = AI.stability_probe(fn, allow_inf=allow_inf)
+            bad = [c for c in rep["cases"] if c["outcome"] in ("nan", "silent")]
+            assert rep["ok"] is True, (name, bad)
+
+    def test_model_boundary_is_reported_not_hidden(self):
+        AI.set_seed(1)
+        net = AI.MLP([3, 4, 2], activations=["relu", "linear"])
+        rep = AI.stability_probe(net.forward)
+        by_name = {c["name"]: c for c in rep["cases"]}
+        # 模型不校验输入：inf 输入可能算出 inf 或 0*inf=NaN，探针必须如实报出来
+        assert by_name["inf"]["outcome"] in ("inf", "nan")
+        assert by_name["zeros"]["outcome"] == "finite"
+        assert by_name["empty"]["outcome"] == "raised"
+
+    def test_validation(self):
+        with pytest.raises(TypeError):
+            AI.stability_probe(None)
+        with pytest.raises(ValueError):
+            AI.stability_probe(lambda v: v, cases=[])
+        with pytest.raises(ValueError):
+            AI.stability_probe(lambda v: v, cases=[("x",)])
+        with pytest.raises(ValueError):
+            AI.stability_probe(lambda v: v, cases=[("", [1.0])])

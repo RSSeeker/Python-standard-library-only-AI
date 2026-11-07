@@ -583,7 +583,8 @@
 ### W18 测试与数值稳定性（§15，贯穿各波）
 - [x] `grad_check_all(model, ...)`：自动遍历所有带参数的子模块
   - 已实现：沿 `__dict__` 深度优先收集 Layer 式子模块，逐个用随机输入 + 随机上游梯度做中心差分；非 Layer 参数持有者进 `skipped` 并说明原因；支持 `max_params` 抽查与 `seed` 复现；探针 34 项
-- [ ] 数值稳定性套件：1e300 / 1e-300 / NaN / Inf / 全零 / 空序列 不静默出 NaN
+- [x] 数值稳定性套件：1e300 / 1e-300 / NaN / Inf / 全零 / 空序列 不静默出 NaN
+  - 已实现 `numeric_scan` / `is_all_finite` / `assert_all_finite` / `stability_cases` / `stability_probe`；据此修掉 softmax 的 +inf→NaN 与 NaN 静默、l1/log_cosh 空输入 ZeroDivisionError、`_numeric_pair` 与 `mse_loss` 的 NaN 输入、`r2_score` 的 OverflowError；模型热路径不校验输入（已写进 README）；探针 54 项
 - [ ] 回归基线快照：固定 seed 下 forward/backward 输出存 JSON，CI 比对
 - [ ] 集成测试（toy 数据集训练到达标）；doctest；属性测试（随机输入验证不变量）
 
