@@ -24070,6 +24070,340 @@ class PreprocessCache:
         return removed
 
 
+# ============================================================================
+#  W11-B：编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+# ============================================================================
+
+def _w11b_check_rows(x, who):
+    """校验二维表：非空、每行列数一致，返回列数"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 输入必须是非空的二维列表")
+    width = len(x[0])
+    if width == 0:
+        raise ValueError(f"{who}: 每行至少要有 1 列")
+    for row in x:
+        if not isinstance(row, (list, tuple)):
+            raise ValueError(f"{who}: 每个样本必须是 list/tuple")
+        if len(row) != width:
+            raise ValueError(f"{who}: 各行列数不一致（{len(row)} != {width}）")
+    return width
+
+
+class LabelEncoder:
+    """把一维类别标签映射成 0..k-1（按排序后的类别名，结果可复现）"""
+
+    def __init__(self):
+        self.classes_ = None
+        self._index = None
+
+    def fit(self, y):
+        if not isinstance(y, (list, tuple)) or not y:
+            raise ValueError("LabelEncoder: 输入必须是非空的一维列表")
+        classes = sorted(set(y))
+        self.classes_ = classes
+        self._index = {c: i for i, c in enumerate(classes)}
+        return self
+
+    def transform(self, y):
+        if self._index is None:
+            raise ValueError("LabelEncoder: 请先 fit")
+        if not isinstance(y, (list, tuple)):
+            raise ValueError("LabelEncoder: 输入必须是一维列表")
+        out = []
+        for v in y:
+            if v not in self._index:
+                raise ValueError(f"LabelEncoder: 未知类别 {v!r}")
+            out.append(self._index[v])
+        return out
+
+    def fit_transform(self, y):
+        return self.fit(y).transform(y)
+
+    def inverse_transform(self, codes):
+        if self._index is None:
+            raise ValueError("LabelEncoder: 请先 fit")
+        out = []
+        for c in codes:
+            if isinstance(c, bool) or not isinstance(c, int):
+                raise TypeError(f"LabelEncoder: 编码必须是整数，收到 {type(c).__name__}")
+            if c < 0 or c >= len(self.classes_):
+                raise ValueError(f"LabelEncoder: 编码 {c} 越界（共 {len(self.classes_)} 类）")
+            out.append(self.classes_[c])
+        return out
+
+
+class OrdinalEncoder:
+    """把多列类别特征按列映射成整数（每列独立编码，未见的类别报错）"""
+
+    def __init__(self):
+        self.categories_ = None
+        self._index = None
+
+    def fit(self, x):
+        width = _w11b_check_rows(x, "OrdinalEncoder")
+        self.categories_ = []
+        self._index = []
+        for j in range(width):
+            cats = sorted(set(row[j] for row in x))
+            self.categories_.append(cats)
+            self._index.append({c: i for i, c in enumerate(cats)})
+        return self
+
+    def transform(self, x):
+        if self._index is None:
+            raise ValueError("OrdinalEncoder: 请先 fit")
+        width = _w11b_check_rows(x, "OrdinalEncoder")
+        if width != len(self._index):
+            raise ValueError(
+                f"OrdinalEncoder: 列数 {width} 与 fit 时的 {len(self._index)} 不一致"
+            )
+        out = []
+        for row in x:
+            codes = []
+            for j, v in enumerate(row):
+                if v not in self._index[j]:
+                    raise ValueError(f"OrdinalEncoder: 第 {j} 列出现未知类别 {v!r}")
+                codes.append(self._index[j][v])
+            out.append(codes)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, codes):
+        if self._index is None:
+            raise ValueError("OrdinalEncoder: 请先 fit")
+        width = _w11b_check_rows(codes, "OrdinalEncoder")
+        if width != len(self.categories_):
+            raise ValueError("OrdinalEncoder: 列数与 fit 时不一致")
+        out = []
+        for row in codes:
+            values = []
+            for j, c in enumerate(row):
+                if c < 0 or c >= len(self.categories_[j]):
+                    raise ValueError(f"OrdinalEncoder: 第 {j} 列编码 {c} 越界")
+                values.append(self.categories_[j][c])
+            out.append(values)
+        return out
+
+
+class OneHotEncoder:
+    """多列类别特征 One-Hot 展开成 0/1 浮点列
+
+    ``drop='first'`` 每列去掉第一个类别（避免共线）；``handle_unknown='ignore'``
+    时未见的类别整列留 0，``'error'`` 时报错。
+    """
+
+    def __init__(self, drop=None, handle_unknown="error"):
+        if drop not in (None, "first"):
+            raise ValueError(f"OneHotEncoder: drop 只能是 None 或 'first'，收到 {drop!r}")
+        if handle_unknown not in ("error", "ignore"):
+            raise ValueError(
+                f"OneHotEncoder: handle_unknown 只能是 'error'/'ignore'，收到 {handle_unknown!r}"
+            )
+        self.drop = drop
+        self.handle_unknown = handle_unknown
+        self.categories_ = None
+        self._index = None
+
+    def fit(self, x):
+        width = _w11b_check_rows(x, "OneHotEncoder")
+        self.categories_ = []
+        self._index = []
+        for j in range(width):
+            cats = sorted(set(row[j] for row in x))
+            if self.drop == "first" and len(cats) == 1:
+                raise ValueError(
+                    f"OneHotEncoder: 第 {j} 列只有 1 个类别，drop='first' 会把它整列删掉"
+                )
+            kept = cats[1:] if self.drop == "first" else cats
+            self.categories_.append(kept)
+            self._index.append({c: i for i, c in enumerate(cats)})
+        return self
+
+    def transform(self, x):
+        if self._index is None:
+            raise ValueError("OneHotEncoder: 请先 fit")
+        width = _w11b_check_rows(x, "OneHotEncoder")
+        if width != len(self._index):
+            raise ValueError(
+                f"OneHotEncoder: 列数 {width} 与 fit 时的 {len(self._index)} 不一致"
+            )
+        out = []
+        for row in x:
+            codes = []
+            for j, v in enumerate(row):
+                if v not in self._index[j]:
+                    if self.handle_unknown == "error":
+                        raise ValueError(f"OneHotEncoder: 第 {j} 列出现未知类别 {v!r}")
+                    codes.extend([0.0] * len(self.categories_[j]))
+                    continue
+                idx = self._index[j][v]
+                base = 0 if self.drop != "first" else 1
+                width_j = len(self.categories_[j])
+                vec = [0.0] * width_j
+                if idx >= base:
+                    vec[idx - base] = 1.0
+                codes.extend(vec)
+            out.append(codes)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def get_feature_names(self):
+        """返回展开后的列名，形如 ``x0=red``"""
+        if self.categories_ is None:
+            raise ValueError("OneHotEncoder: 请先 fit")
+        names = []
+        for j, cats in enumerate(self.categories_):
+            for c in cats:
+                names.append(f"x{j}={c}")
+        return names
+
+
+class TargetEncoder:
+    """目标编码（带平滑）：``(sum_i + smoothing * prior) / (count_i + smoothing)``
+
+    未见类别用全局均值。必须**只在训练集上 fit**，否则会泄漏标签。
+    """
+
+    def __init__(self, smoothing=1.0):
+        if smoothing is None or isinstance(smoothing, bool) \
+                or not isinstance(smoothing, (int, float)) or smoothing < 0.0:
+            raise ValueError(f"TargetEncoder: smoothing 必须 >= 0，收到 {smoothing!r}")
+        self.smoothing = float(smoothing)
+        self.prior_ = None
+        self.maps_ = None
+
+    def fit(self, x, y):
+        width = _w11b_check_rows(x, "TargetEncoder")
+        if not isinstance(y, (list, tuple)) or len(y) != len(x):
+            raise ValueError("TargetEncoder: y 必须与 x 等长")
+        for v in y:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"TargetEncoder: y 只能包含数值，收到 {v!r}")
+        self.prior_ = sum(float(v) for v in y) / len(y)
+        self.maps_ = []
+        for j in range(width):
+            sums = {}
+            counts = {}
+            for row, target in zip(x, y):
+                key = row[j]
+                sums[key] = sums.get(key, 0.0) + float(target)
+                counts[key] = counts.get(key, 0) + 1
+            table = {}
+            for key, total in sums.items():
+                table[key] = ((total + self.smoothing * self.prior_)
+                              / (counts[key] + self.smoothing))
+            self.maps_.append(table)
+        return self
+
+    def transform(self, x):
+        if self.maps_ is None:
+            raise ValueError("TargetEncoder: 请先 fit")
+        width = _w11b_check_rows(x, "TargetEncoder")
+        if width != len(self.maps_):
+            raise ValueError("TargetEncoder: 列数与 fit 时不一致")
+        out = []
+        for row in x:
+            out.append([self.maps_[j].get(row[j], self.prior_) for j in range(width)])
+        return out
+
+    def fit_transform(self, x, y):
+        return self.fit(x, y).transform(x)
+
+
+class FrequencyEncoder:
+    """频率编码：类别出现次数 / 样本总数（未见类别记 0）"""
+
+    def __init__(self):
+        self.maps_ = None
+
+    def fit(self, x):
+        width = _w11b_check_rows(x, "FrequencyEncoder")
+        n = float(len(x))
+        self.maps_ = []
+        for j in range(width):
+            counts = {}
+            for row in x:
+                counts[row[j]] = counts.get(row[j], 0) + 1
+            self.maps_.append({k: v / n for k, v in counts.items()})
+        return self
+
+    def transform(self, x):
+        if self.maps_ is None:
+            raise ValueError("FrequencyEncoder: 请先 fit")
+        width = _w11b_check_rows(x, "FrequencyEncoder")
+        if width != len(self.maps_):
+            raise ValueError("FrequencyEncoder: 列数与 fit 时不一致")
+        return [[self.maps_[j].get(row[j], 0.0) for j in range(width)] for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+
+class WOEEncoder:
+    """Weight of Evidence 编码（二分类）：
+
+    ``WOE = log( (bad_i / bad_total) / (good_i / good_total) )``，
+    ``bad`` 是 ``y=1``；加 ``smoothing`` 防止某一侧为 0 时取到 ``log(0)``。
+    未见类别返回 0.0（既不支持也不反对）。
+    """
+
+    def __init__(self, smoothing=0.5):
+        if smoothing is None or isinstance(smoothing, bool) \
+                or not isinstance(smoothing, (int, float)) or smoothing <= 0.0:
+            raise ValueError(f"WOEEncoder: smoothing 必须 > 0，收到 {smoothing!r}")
+        self.smoothing = float(smoothing)
+        self.maps_ = None
+
+    def fit(self, x, y):
+        width = _w11b_check_rows(x, "WOEEncoder")
+        if not isinstance(y, (list, tuple)) or len(y) != len(x):
+            raise ValueError("WOEEncoder: y 必须与 x 等长")
+        bad = 0
+        good = 0
+        for v in y:
+            if v not in (0, 1, 0.0, 1.0):
+                raise ValueError(f"WOEEncoder: y 只能是 0/1，收到 {v!r}")
+            if int(v) == 1:
+                bad += 1
+            else:
+                good += 1
+        if bad == 0 or good == 0:
+            raise ValueError("WOEEncoder: y 必须同时包含 0 和 1")
+        self.maps_ = []
+        for j in range(width):
+            stats = {}
+            for row, target in zip(x, y):
+                key = row[j]
+                b, g = stats.get(key, (0, 0))
+                if int(target) == 1:
+                    b += 1
+                else:
+                    g += 1
+                stats[key] = (b, g)
+            table = {}
+            for key, (b, g) in stats.items():
+                p_bad = (b + self.smoothing) / (bad + 2 * self.smoothing)
+                p_good = (g + self.smoothing) / (good + 2 * self.smoothing)
+                table[key] = math.log(p_bad / p_good)
+            self.maps_.append(table)
+        return self
+
+    def transform(self, x):
+        if self.maps_ is None:
+            raise ValueError("WOEEncoder: 请先 fit")
+        width = _w11b_check_rows(x, "WOEEncoder")
+        if width != len(self.maps_):
+            raise ValueError("WOEEncoder: 列数与 fit 时不一致")
+        return [[self.maps_[j].get(row[j], 0.0) for j in range(width)] for row in x]
+
+    def fit_transform(self, x, y):
+        return self.fit(x, y).transform(x)
+
+
 class DataLoader:
     """简易数据加载器：按 batch 迭代，支持 shuffle / 自定义 sampler
 

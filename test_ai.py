@@ -19257,3 +19257,91 @@ class TestDataPipeline:
             AI.DataLoader(items, sampler=[0], batch_sampler=[[0]])
         with pytest.raises(ValueError):
             AI.DataLoader(items, batch_size=0)
+
+
+class TestEncoders:
+    """W11-B：六种编码器"""
+
+    def test_label_encoder(self):
+        le = AI.LabelEncoder().fit(["b", "a", "c", "a"])
+        assert le.classes_ == ["a", "b", "c"]
+        assert le.transform(["c", "a"]) == [2, 0]
+        assert le.inverse_transform([2, 0]) == ["c", "a"]
+        with pytest.raises(ValueError):
+            le.transform(["z"])
+        with pytest.raises(ValueError):
+            le.inverse_transform([3])
+        with pytest.raises(ValueError):
+            AI.LabelEncoder().transform([1])
+
+    def test_ordinal_encoder(self):
+        rows = [["r", 1], ["g", 2], ["r", 2]]
+        oe = AI.OrdinalEncoder().fit(rows)
+        assert oe.transform([["g", 1]]) == [[0, 0]]
+        assert oe.transform([["r", 2]]) == [[1, 1]]
+        assert oe.inverse_transform(oe.transform(rows)) == rows
+        with pytest.raises(ValueError):
+            oe.transform([["b", 1]])
+        with pytest.raises(ValueError):
+            oe.transform([[1]])
+
+    def test_one_hot_encoder(self):
+        x = [["red", "s"], ["green", "m"], ["blue", "s"]]
+        oh = AI.OneHotEncoder().fit(x)
+        enc = oh.transform([["green", "m"], ["red", "s"]])
+        assert [sum(r) for r in enc] == [2.0, 2.0]
+        assert len(enc[0]) == 5
+        assert len(oh.get_feature_names()) == 5
+        drop = AI.OneHotEncoder(drop="first").fit(x)
+        assert drop.transform([["green", "m"]]) == [[1.0, 0.0, 0.0]]
+        ign = AI.OneHotEncoder(handle_unknown="ignore").fit(x)
+        assert ign.transform([["purple", "s"]]) == [[0.0, 0.0, 0.0, 0.0, 1.0]]
+        with pytest.raises(ValueError):
+            oh.transform([["purple", "s"]])
+        with pytest.raises(ValueError):
+            AI.OneHotEncoder(drop="first").fit([["only"]])
+        with pytest.raises(ValueError):
+            AI.OneHotEncoder(drop="if_binary")
+
+    def test_target_encoder(self):
+        x = [["a"], ["a"], ["b"], ["c"]]
+        y = [1.0, 3.0, 10.0, 2.0]
+        te0 = AI.TargetEncoder(smoothing=0.0).fit(x, y)
+        assert te0.transform([["a"], ["b"], ["c"]]) == [[2.0], [10.0], [2.0]]
+        prior = sum(y) / 4
+        te1 = AI.TargetEncoder(smoothing=1.0).fit(x, y)
+        assert abs(te1.transform([["a"]])[0][0] - (4.0 + prior) / 3) < 1e-12
+        assert abs(te1.transform([["zzz"]])[0][0] - prior) < 1e-12
+        assert abs(te1.prior_ - prior) < 1e-12
+        with pytest.raises(ValueError):
+            AI.TargetEncoder(smoothing=-1.0)
+        with pytest.raises(ValueError):
+            te1.fit(x, [1.0, "x", 2.0, 3.0])
+
+    def test_frequency_and_woe_encoder(self):
+        fr = AI.FrequencyEncoder().fit([["a"], ["a"], ["b"], ["c"]])
+        assert fr.transform([["a"], ["b"], ["zzz"]]) == [[0.5], [0.25], [0.0]]
+        xw = [["u"], ["u"], ["v"], ["v"]]
+        yw = [1, 1, 0, 0]
+        woe = AI.WOEEncoder(smoothing=0.5).fit(xw, yw)
+        got = woe.transform([["u"], ["v"], ["w"]])
+        p_bad = 2.5 / 3.0
+        p_good = 0.5 / 3.0
+        want = math.log(p_bad / p_good)
+        assert abs(got[0][0] - want) < 1e-12
+        assert abs(got[1][0] + want) < 1e-12
+        assert got[2][0] == 0.0
+        with pytest.raises(ValueError):
+            AI.WOEEncoder().fit(xw, [1, 1, 1, 1])
+        with pytest.raises(ValueError):
+            AI.WOEEncoder().fit(xw, [0, 1, 2, 3])
+        with pytest.raises(ValueError):
+            AI.WOEEncoder(smoothing=0.0)
+
+    def test_encoder_input_validation(self):
+        for bad in ([], [[]], [[1, 2], [3]]):
+            for maker in (AI.OrdinalEncoder, AI.FrequencyEncoder):
+                with pytest.raises(ValueError):
+                    maker().fit(bad)
+        with pytest.raises(ValueError):
+            AI.TargetEncoder().fit([["a"]], [1.0, 2.0])

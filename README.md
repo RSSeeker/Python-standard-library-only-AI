@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1188 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1194 项）
 
 ## 特性
 
@@ -875,6 +875,33 @@ ids, hit = cache.get({"vocab": 8000}, lambda: [encode(line) for line in lines])
 诚实说明：`LazyDataset` 的淘汰是 FIFO 而不是 LRU（不引第三方库，避免维护链表）；
 `PreprocessCache` 用 JSON 存结果，只适合能 JSON 序列化的中间产物。
 
+### 编码器（W11-B）
+
+类别特征编码，全部只吃 list：`fit` 记住映射、`transform` 应用、能往返的还提供
+`inverse_transform`；未见类别的处理方式按编码器语义各自定义（见下表）。
+
+| 类 | 说明 | 未见类别 |
+|---|---|---|
+| `LabelEncoder` | 一维标签 → `0..k-1`（按类别名排序，可复现） | 报错 |
+| `OrdinalEncoder` | 多列类别 → 每列独立整数 | 报错 |
+| `OneHotEncoder(drop=None, handle_unknown='error')` | 展开成 0/1；`drop='first'` 去掉每列首类别，`handle_unknown='ignore'` 时未知整列留 0 | 报错 / 全 0 |
+| `TargetEncoder(smoothing=1.0)` | `(Σy + s·prior) / (count + s)`，只在训练集 `fit` 否则泄漏标签 | 全局均值 |
+| `FrequencyEncoder` | 类别频率 = 出现次数 / 样本数 | 0.0 |
+| `WOEEncoder(smoothing=0.5)` | `log((bad_i/bad) / (good_i/good))`，`bad` 是 `y=1`，加平滑避免 `log(0)` | 0.0 |
+
+```python
+enc = AI.OneHotEncoder()
+x_train = enc.fit_transform(train_rows)      # 每行 0/1
+x_test = enc.transform(test_rows)            # 列数一致
+
+te = AI.TargetEncoder(smoothing=1.0).fit(train_rows, y_train)
+x_num = te.transform(test_rows)              # 数值列，可直接喂模型
+```
+
+`TargetEncoder` 与 `WOEEncoder` 的 `fit` 需要标签，返回的是**数值**；其它四个返回
+整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
+`ValueError` / `TypeError`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1291,7 +1318,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1188 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1194 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1453,6 +1480,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSemiSupervised` | `softmax_rows` 与手算 softmax 一致、一致性损失的自身为 0/对称性/手算核对、`consistency_regularizer` 梯度对有限差分、VAT 扰动 L2 范数 = eps 与 `eps=0` 恒等、伪标签置信度过滤、`soft_target_ce` 与 CE 一致 + 梯度差分 + 零权重、FixMatch 置信度阈值 1.0 时损失 0、MixMatch 平均与锐化、MeanTeacher 的 EMA 与「教师前向不污染学生权重」、11 类非法参数 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
+| `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1506,7 +1534,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1188 个单元测试
+├── test_ai.py       # 1194 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

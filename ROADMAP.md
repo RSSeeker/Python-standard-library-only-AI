@@ -313,7 +313,12 @@
   - `bucket_by_length`：乱序 → 按长度排序 → 桶内再乱序 → 切 batch，`drop_last` 可选。
   - `PreprocessCache`：键 = 源文件内容哈希（或 size+mtime）+ 参数指纹，命中直接读
     JSON，未命中构建后先写临时文件再 `os.replace`。
-- [ ] 编码器：`OneHotEncoder` / `LabelEncoder` / `OrdinalEncoder` / `TargetEncoder` / `FrequencyEncoder` / `WOEEncoder`
+- [x] 编码器：`OneHotEncoder` / `LabelEncoder` / `OrdinalEncoder` / `TargetEncoder` / `FrequencyEncoder` / `WOEEncoder`
+  - `LabelEncoder`（排序类别 + 往返）、`OrdinalEncoder`（逐列独立）、
+    `OneHotEncoder`（`drop='first'`、`handle_unknown='error'|'ignore'`、
+    `get_feature_names`）。
+  - `TargetEncoder`（平滑到全局均值，docstring 警告只能 fit 训练集）、
+    `FrequencyEncoder`、`WOEEncoder`（`log(bad/good)` + 平滑，未见类别 0）。
 - [ ] 图像增强管道：`Compose` / `RandomCrop` / `RandomResizedCrop` / `RandomRotation` / `ColorJitter` / `GaussianBlur` / `Normalize`
 - [ ] 切分扩展：`GroupKFold` / 时间序列切分
 - [ ] Scaler 族：Robust / MaxAbs / QuantileTransformer / PowerTransformer
