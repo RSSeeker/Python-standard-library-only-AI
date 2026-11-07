@@ -28716,6 +28716,106 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  推理与部署：批内打包与投机解码（W15-D）
+# ============================================================================
+
+def pack_decode_batch(sequences, pad_id=0):
+    """把多条待解码序列打包成一次前向需要的张量。
+
+    返回 ``{"tokens", "segment_ids", "attention_mask", "lengths"}``：
+    ``tokens`` 是 ``sequence_packing`` 的拼接结果，``segment_ids`` 标出每个位置
+    属于哪条序列，``attention_mask`` 是 ``packed_causal_mask`` 的段内因果掩码
+    （不同序列互相看不见）。``lengths`` 保留原始长度，便于拆分输出。
+    """
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError("pack_decode_batch: sequences 必须是非空列表")
+    lengths = []
+    for i, seq in enumerate(sequences):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError(f"pack_decode_batch: 第 {i} 条序列必须是非空列表")
+        lengths.append(len(seq))
+    packed = sequence_packing([list(s) for s in sequences], pad_id=pad_id)
+    segment_ids = packed["segment_ids"]
+    return {
+        "tokens": packed["tokens"],
+        "segment_ids": segment_ids,
+        "position_ids": packed["position_ids"],
+        "attention_mask": packed_causal_mask(segment_ids, causal=True),
+        "lengths": lengths,
+    }
+
+
+def _w15d_next_probs(model, ids):
+    """取「给定 ids 之后」下一个 token 的概率分布。"""
+    logits = model.forward(list(ids))
+    if isinstance(logits, (list, tuple)) and logits and \
+            isinstance(logits[0], (list, tuple)):
+        row = logits[-1]
+    else:
+        row = logits
+    vals = []
+    for v in row:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("_w15d_next_probs: 模型输出必须是数字")
+        vals.append(float(v))
+    return _softmax_row(vals)
+
+
+def speculative_generate(draft, target, prompt_ids, max_new_tokens=16, gamma=4,
+                         seed=None):
+    """投机解码：草稿模型连出 ``gamma`` 个 token，目标模型一次验证。
+
+    每一轮先用 ``draft`` 贪心/采样出至多 ``gamma`` 个候选 token，再逐个位置算
+    两个模型的分布，交给 ``speculative_accept`` 做拒绝采样：接受前 ``k`` 个，
+    第一个被拒的位置用残差分布 ``max(0, p_target - p_draft)`` 重采样。
+
+    返回 ``(ids, stats)``，``stats`` 里有 ``"rounds"``（轮数）、``"proposed"``
+    （草稿提出的 token 数）、``"accepted"``（被接受的 token 数），用于算接受率。
+    只在 ``temperature=1.0`` 下保证分布等价，所以不给温度参数。
+    """
+    if not hasattr(draft, "generate") or not hasattr(target, "forward"):
+        raise ValueError("speculative_generate: draft 需要 generate，target 需要 forward")
+    if not isinstance(prompt_ids, (list, tuple)) or not prompt_ids:
+        raise ValueError("speculative_generate: prompt_ids 必须是非空列表")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 1:
+        raise ValueError(
+            f"speculative_generate: max_new_tokens 必须是 >=1 的整数，收到 {max_new_tokens!r}"
+        )
+    if not isinstance(gamma, int) or isinstance(gamma, bool) or gamma < 1:
+        raise ValueError(f"speculative_generate: gamma 必须是 >=1 的整数，收到 {gamma!r}")
+    rng = random.Random(seed)
+    ids = [int(t) for t in prompt_ids]
+    produced = 0
+    rounds = 0
+    proposed = 0
+    accepted_total = 0
+    while produced < max_new_tokens:
+        want = min(gamma, max_new_tokens - produced)
+        out = draft.generate(ids, max_new_tokens=want, temperature=1.0, rng=rng)
+        drafted = [int(t) for t in out[len(ids):]]
+        if not drafted:
+            break
+        rounds += 1
+        proposed += len(drafted)
+        draft_probs = []
+        target_probs = []
+        for k in range(len(drafted)):
+            prefix = ids + drafted[:k]
+            draft_probs.append(_w15d_next_probs(draft, prefix))
+            target_probs.append(_w15d_next_probs(target, prefix))
+        n_ok, resid = speculative_accept(drafted, draft_probs, target_probs, rng=rng)
+        ids.extend(drafted[:n_ok])
+        accepted_total += n_ok
+        produced += n_ok
+        if resid is not None and produced < max_new_tokens:
+            ids.append(int(resid))
+            produced += 1
+    stats = {"rounds": rounds, "proposed": proposed, "accepted": accepted_total}
+    stats["accept_rate"] = (accepted_total / proposed) if proposed else 0.0
+    return ids, stats
+
+# ============================================================================
 #  推理与部署：集成学习（W15-C：Voting / Bagging / Stacking / AdaBoost）
 # ============================================================================
 

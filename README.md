@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1459 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1464 项）
 
 ## 特性
 
@@ -1658,6 +1658,30 @@ stack.predict([1.0, -1.0])
 3. `Bagging` 的子模型必须自带 `fit`；`Stacking` 只传 `epochs`，学习率通过
    `meta_model.optimizer.lr` 设置（`meta_lr` 会写进去）。
 
+### 批内打包与投机解码（W15-D）
+
+| API | 语义 |
+| --- | --- |
+| `pack_decode_batch(sequences, pad_id=0)` | 把多条序列打包成一次前向：返回 `tokens` / `segment_ids` / `position_ids` / `attention_mask` / `lengths`，掩码是**段内因果**（不同样本互相看不见） |
+| `speculative_generate(draft, target, prompt_ids, max_new_tokens=16, gamma=4, seed=None)` | 草稿模型连出 `gamma` 个 token，目标模型验证；返回 `(ids, stats)`，`stats` 含 `rounds` / `proposed` / `accepted` / `accept_rate` |
+
+```python
+packed = AI.pack_decode_batch([[1, 2, 3], [4, 5]])
+ids, stats = AI.speculative_generate(draft, target, [1, 2, 3], max_new_tokens=8, gamma=4)
+stats["accept_rate"]   # 实测接受率
+```
+
+三条边界：
+
+1. 投机解码只在 `temperature=1.0` 下保证「与目标模型自身采样同分布」，所以接口
+   不给温度参数；要采样温度就先改模型的 logits 缩放方式。
+2. 每轮验证都要对每个候选位置各跑一次前向（`gamma` 次），这是**教学实现**：
+   真正省时间要靠一次前向算多个位置（本库没有这个 kernel），所以它演示的是
+   接受/拒绝逻辑与统计口径，不是吞吐优化。
+3. 连续批处理见 W7 的 `ContinuousBatcher`，序列打包见 W7 的 `sequence_packing` /
+   `packed_causal_mask`，投机接受判定见 W7 的 `speculative_accept`；这一节只是把
+   它们组装成可直接调用的入口。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2074,7 +2098,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1459 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1464 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2265,6 +2289,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStructuredPruning` | 通道分数、掩码式通道剪枝、头分数与剪枝、删层重建、稀疏度统计（8 例） |
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
+| `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2318,7 +2343,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1459 个单元测试
+├── test_ai.py       # 1464 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

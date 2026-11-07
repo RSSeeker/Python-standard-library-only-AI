@@ -490,7 +490,11 @@
   - `VotingEnsemble`（soft 平均概率 / hard 多数票，类别数不一致直接报错）、`BaggingEnsemble`（有放回重采样 + 局部 RNG）、`stack_features` + `StackingEnsemble`（元特征再训元模型）、`AdaBoostStumps`（二分类桩，`alpha = lr·½ln((1−err)/err)`）。
   - 实现修正：`StackingEnsemble.fit` 一开始给 `Model.fit` 传了 `lr=`，而 `fit` 没有这个参数（学习率在 `Model` 构造时给）⇒ 改成写进 `meta_model.optimizer.lr`。
   - 探针 39 项；测试 `TestEnsembles` 10 例。
-- [ ] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理（W7 已实现 `ContinuousBatcher`）、并行概念（文档）
+- [x] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理（W7 已实现 `ContinuousBatcher`）、并行概念（文档）
+  - `pack_decode_batch` 把 `sequence_packing` + `packed_causal_mask` 组装成一次前向的入参（`tokens`/`segment_ids`/`position_ids`/`attention_mask`/`lengths`）；
+  - `speculative_generate(draft, target, ...)` 是草稿-验证循环：`gamma` 个候选、逐位置算两个模型的分布、交给 `speculative_accept` 拒绝采样，返回接受率统计；
+  - 实现修正：`pack_decode_batch` 一开始把 `sequence_packing` 的**整个 dict** 当成 `tokens` 返回（掩码对、token 错），改成取 `packed["tokens"]` / `packed["segment_ids"]` / `packed["position_ids"]`；
+  - 探针 25 项；测试 `TestPackingAndSpeculative` 5 例。
 
 ### W16 自监督·多模态·RL（§13）
 - [ ] 对比学习训练器：SimCLR / MoCo（队列）/ BYOL / BarlowTwins / VICReg / SwAV / DINO

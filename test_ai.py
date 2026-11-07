@@ -22326,3 +22326,70 @@ class TestEnsembles:
             AI.AdaBoostStumps(learning_rate=0.0)
         with pytest.raises(ValueError):
             AI.AdaBoostStumps().fit(data, [0])
+
+
+class TestPackingAndSpeculative:
+    """W15-D：批内打包 + 投机解码集成。"""
+
+    def test_pack_decode_batch(self):
+        packed = AI.pack_decode_batch([[1, 2, 3], [4, 5]], pad_id=0)
+        assert packed["tokens"] == [1, 2, 3, 4, 5]
+        assert packed["segment_ids"] == [0, 0, 0, 1, 1]
+        assert packed["position_ids"] == [0, 1, 2, 0, 1]
+        assert packed["lengths"] == [3, 2]
+        mask = packed["attention_mask"]
+        assert mask[2][0] == 1.0
+        assert mask[0][2] == 0.0
+        assert mask[0][3] == 0.0
+        assert mask[4][4] == 1.0
+
+    def test_pack_decode_batch_validation(self):
+        with pytest.raises(ValueError):
+            AI.pack_decode_batch([])
+        with pytest.raises(ValueError):
+            AI.pack_decode_batch([[1], []])
+
+    def test_speculative_identical_models(self):
+        AI.set_seed(11)
+        model = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=32)
+        prompt = [1, 2, 3]
+        ids, stats = AI.speculative_generate(model, model, prompt,
+                                             max_new_tokens=6, gamma=3, seed=5)
+        assert len(ids) == len(prompt) + 6
+        assert ids[:3] == prompt
+        assert stats["accepted"] == stats["proposed"]
+        assert abs(stats["accept_rate"] - 1.0) < 1e-12
+        assert stats["rounds"] >= 2
+
+    def test_speculative_different_draft(self):
+        AI.set_seed(3)
+        target = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                             num_layers=1, max_len=32)
+        draft = AI.CausalLM(vocab_size=7, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=32)
+        prompt = [1, 2, 3]
+        ids, stats = AI.speculative_generate(draft, target, prompt,
+                                             max_new_tokens=8, gamma=4, seed=9)
+        assert len(ids) == len(prompt) + 8
+        assert set(stats) == {"rounds", "proposed", "accepted", "accept_rate"}
+        assert stats["accepted"] <= stats["proposed"]
+        assert 0.0 <= stats["accept_rate"] <= 1.0
+        assert all(0 <= t < 7 for t in ids)
+        again = AI.speculative_generate(draft, target, prompt, 8, 4, seed=9)
+        assert again[0] == ids
+
+    def test_speculative_validation(self):
+        AI.set_seed(1)
+        model = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=16)
+        with pytest.raises(ValueError):
+            AI.speculative_generate(model, model, [1], 0, 4)
+        with pytest.raises(ValueError):
+            AI.speculative_generate(model, model, [1], 4, 0)
+        with pytest.raises(ValueError):
+            AI.speculative_generate(model, model, [], 4, 4)
+        with pytest.raises(ValueError):
+            AI.speculative_generate(object(), model, [1])
+        with pytest.raises(ValueError):
+            AI.speculative_generate(model, object(), [1])
