@@ -426,7 +426,12 @@
   - AP 用全点插值（precision 包络 + Δrecall 加权）；重复命中算 FP
   - 不做 NMS / 旋转框 / 忽略区域；mAP@[.5:.95] 是 10 档阈值的均值
   - 探针 31 项（IoU 手算、FP 在前的 2/3、阈值 0.5 vs 0.3、AR 截断、十二条非法输入）
-- [ ] 图像：PSNR / SSIM / MS-SSIM；FID / KID / IS（简化并标注口径）
+- [x] 图像：PSNR / SSIM / MS-SSIM；FID / KID / IS（简化并标注口径）
+  - SSIM 用均匀窗口（无高斯加权），窗口大于图像时退化为全局统计
+  - MS-SSIM 用 2×2 平均池化，尺寸不足时减少级数并重新归一化权重
+  - FID/KID 直接吃特征向量（无预训练 Inception）；FID 不做样本量校正，协方差维数 > `max_dim` 报错并提示先 PCA
+  - KID 是无偏 MMD²，小样本可为负值（docstring 与 README 都写明）
+  - 探针 35 项（SSIM 与独立参考实现逐窗口对照、FID 三种方差组合、KID 与参考 MMD 一致）
 - [ ] 一致性：Fleiss Kappa / Krippendorff Alpha；公平性：Demographic Parity / Equal Opportunity / Disparate Impact
 
 ### W14 可解释性（§10）

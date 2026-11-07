@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1352 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1360 项）
 
 ## 特性
 
@@ -1374,6 +1374,35 @@ print(average_recall(gt, pred))                  # 1.0
 - **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
   10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
 
+### 图像质量指标（W13-J）
+
+| 函数 | 说明 |
+|---|---|
+| `psnr_score(a, b, data_range=1.0)` | `10·log10(range²/MSE)`，完全相同时为 `inf` |
+| `ssim_score(a, b, data_range=1.0, win_size=7)` | 均匀窗口 SSIM，通道间平均 |
+| `ms_ssim_score(a, b, weights=(...))` | 多尺度 SSIM：CS 项连乘 + 末级亮度 |
+| `fid_score(features_a, features_b)` | `‖Δμ‖² + tr(Σa+Σb−2(ΣaΣb)^{1/2})` |
+| `kid_score(features_a, features_b)` | RBF 核无偏 MMD²（`σ` 取成对距离中位数） |
+| `inception_score(probs)` | `exp(mean KL(p(y|x)‖p(y)))` |
+
+```python
+a = [[[0.0, 1.0], [1.0, 0.0]]]          # (C, H, W) 嵌套列表
+b = [[[0.0, 0.8], [1.0, 0.2]]]
+print(psnr_score(a, b))                  # 16.9897
+print(ssim_score(a, b, win_size=2))      # 0.9525
+print(inception_score([[1.0, 0.0], [0.0, 1.0]]))   # 2.0
+```
+
+五点说明（这几条都是「简化」的具体边界）：
+
+- **图像是 `(C, H, W)` 嵌套列表**，值域不强制；`data_range` 只用于 PSNR/SSIM 的常数项。
+- **SSIM 用均匀（box）窗口，不是高斯加权**；`win_size` 覆盖整幅图时退化为全局统计
+  （所以 2×2 小图不会报错）。
+- **MS-SSIM 用 2×2 平均池化下采样**，图像太小时自动减少级数并重新归一化权重。
+- **FID/KID 直接吃特征向量**：本库没有预训练 Inception，特征要自己给（可用 `PCA`
+  先降到 `max_dim` 以内）。FID 不做样本量校正，KID 是无偏估计、小样本可为负值。
+- **Inception Score 接受未归一化的概率行**（内部按行归一），但每个值必须在 `[0,1]`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1790,7 +1819,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1352 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1360 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1970,6 +1999,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestClusteringMetrics` | silhouette 含单点簇、CH 手算 400、DB 手算、ARI 的 1/-0.5、NMI 手算、AMI 的负数与细分 0.5333、九条非法输入 |
 | `TestCalibrationMetrics` | ECE/MCE 手算、单列与两列等价、多分类、可靠性图结构与 quantile 分箱、十条非法输入 |
 | `TestDetectionMetrics` | IoU 手算、完美 AP、FP 在前的 2/3、阈值改变结果、mAP 与 mAP@[.5:.95]、AR 的 max_dets、八条非法输入 |
+| `TestImageQualityMetrics` | PSNR 的 inf/0dB/`data_range`、SSIM 与独立参考实现对照、MS-SSIM 两个尺度、FID 三种方差组合、KID 单调性、IS 的 1 与 2、十条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2023,7 +2053,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1352 个单元测试
+├── test_ai.py       # 1360 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

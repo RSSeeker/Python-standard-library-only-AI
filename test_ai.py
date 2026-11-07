@@ -21063,3 +21063,74 @@ class TestDetectionMetrics:
                 self._pred([(0, 0, 1, 1), (2, 2, 3, 3)], [0.9, 0.8], [0, 1]))
         with pytest.raises(ValueError):
             AI.average_recall(gt, pred, max_dets=0)
+
+
+class TestImageQualityMetrics:
+    A = [[[(r * 5 + c) / 25.0 for c in range(5)] for r in range(5)]]
+    B = [[[((r * 5 + c) % 7) / 7.0 for c in range(5)] for r in range(5)]]
+
+    def test_psnr_values(self):
+        one = [[[0.0]]]
+        assert AI.psnr_score(one, one) == float("inf")
+        assert AI.psnr_score([[[0.0]]], [[[1.0]]]) == 0.0
+        assert abs(AI.psnr_score([[[0.0]]], [[[0.5]]]) - 10.0 * math.log10(4.0)) < 1e-12
+        assert abs(AI.psnr_score([[[0.0]]], [[[1.0]]], data_range=255.0)
+                   - 10.0 * math.log10(255.0 ** 2)) < 1e-12
+
+    def test_ssim(self):
+        assert abs(AI.ssim_score(self.A, self.A, win_size=3) - 1.0) < 1e-12
+        assert abs(AI.ssim_score(self.A, self.B, win_size=3)
+                   + 0.0026727086158507027) < 1e-9
+        small = [[[0.1, 0.2], [0.3, 0.4]]]
+        assert abs(AI.ssim_score(small, small, win_size=7) - 1.0) < 1e-12
+
+    def test_ssim_constant_images(self):
+        flat = [[[0.5] * 8 for _ in range(8)]]
+        assert abs(AI.ssim_score(flat, flat, win_size=7) - 1.0) < 1e-12
+
+    def test_ms_ssim(self):
+        big = [[[(r + c) / 64.0 for c in range(32)] for r in range(32)]]
+        assert abs(AI.ms_ssim_score(big, big) - 1.0) < 1e-9
+        assert abs(AI.ms_ssim_score(self.A, self.B) - 0.43420933608311674) < 1e-9
+        assert AI.ms_ssim_score(self.A, self.B) <= 1.0
+
+    def test_fid(self):
+        fa = [[0.0], [2.0]]
+        assert abs(AI.fid_score(fa, [[1.0], [3.0]]) - 1.0) < 1e-9
+        assert abs(AI.fid_score(fa, fa)) < 1e-12
+        assert abs(AI.fid_score(fa, [[0.0], [4.0]]) - 3.0) < 1e-9
+
+    def test_kid(self):
+        ka = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        kb = [[0.1, 0.1], [1.1, 0.1], [0.1, 1.1]]
+        far = [[9.0, 9.0], [10.0, 9.0], [9.0, 10.0]]
+        assert abs(AI.kid_score(ka, ka)) < 0.4
+        assert AI.kid_score(ka, far) > AI.kid_score(ka, kb)
+
+    def test_inception_score(self):
+        assert abs(AI.inception_score([[0.5, 0.5], [0.5, 0.5]]) - 1.0) < 1e-12
+        assert abs(AI.inception_score([[1.0, 0.0], [0.0, 1.0]]) - 2.0) < 1e-12
+        assert abs(AI.inception_score([[0.6, 0.6], [0.6, 0.6]]) - 1.0) < 1e-12
+
+    def test_rejects_bad_inputs(self):
+        one = [[[0.0]]]
+        with pytest.raises(ValueError):
+            AI.psnr_score(one, [[[0.0]], [[0.0]]])
+        with pytest.raises(ValueError):
+            AI.psnr_score([], one)
+        with pytest.raises(ValueError):
+            AI.psnr_score(one, one, data_range=0.0)
+        with pytest.raises(ValueError):
+            AI.ssim_score(self.A, self.A, win_size=0)
+        with pytest.raises(ValueError):
+            AI.ms_ssim_score(self.A, self.A, weights=[0.5, -0.1])
+        with pytest.raises(ValueError):
+            AI.fid_score([[0.0], [1.0]], [[0.0, 1.0], [1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.fid_score([[0.0]], [[1.0]])
+        with pytest.raises(ValueError):
+            AI.kid_score([[0.0]], [[1.0]])
+        with pytest.raises(ValueError):
+            AI.inception_score([[1.5, -0.5]])
+        with pytest.raises(ValueError):
+            AI.inception_score([[0.0, 0.0]])

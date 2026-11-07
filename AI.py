@@ -28626,6 +28626,424 @@ def _det_box(box, who, tag):
     return vals
 
 
+# ============================================================================
+#  图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+# ============================================================================
+
+def _img_check(a, b, who):
+    """校验两张 (C, H, W) 图像形状一致且非空。"""
+    if not isinstance(a, (list, tuple)) or not a:
+        raise ValueError(f"{who}: 第一张图不能为空")
+    if not isinstance(b, (list, tuple)) or not b:
+        raise ValueError(f"{who}: 第二张图不能为空")
+    if len(a) != len(b):
+        raise ValueError(f"{who}: 通道数不同（{len(a)} vs {len(b)}）")
+    out_a = []
+    out_b = []
+    height = None
+    width = None
+    for c in range(len(a)):
+        cha, chb = a[c], b[c]
+        if not isinstance(cha, (list, tuple)) or not isinstance(chb, (list, tuple)):
+            raise ValueError(f"{who}: 第 {c} 个通道必须是二维列表")
+        if len(cha) != len(chb):
+            raise ValueError(f"{who}: 第 {c} 个通道高度不同（{len(cha)} vs {len(chb)}）")
+        if not cha:
+            raise ValueError(f"{who}: 第 {c} 个通道为空")
+        if height is None:
+            height = len(cha)
+            width = len(cha[0])
+        elif len(cha) != height:
+            raise ValueError(f"{who}: 各通道高度不一致")
+        row_a = []
+        row_b = []
+        for r in range(len(cha)):
+            ra, rb = cha[r], chb[r]
+            if not isinstance(ra, (list, tuple)) or not isinstance(rb, (list, tuple)):
+                raise ValueError(f"{who}: 第 {c} 通道第 {r} 行必须是列表")
+            if len(ra) != len(rb):
+                raise ValueError(
+                    f"{who}: 第 {c} 通道第 {r} 行宽度不同（{len(ra)} vs {len(rb)}）")
+            if len(ra) != width:
+                raise ValueError(f"{who}: 第 {c} 通道第 {r} 行宽度与首行不一致")
+            row_a.append([_metric_number(v, f"{who}.a[{c}][{r}]", i)
+                          for i, v in enumerate(ra)])
+            row_b.append([_metric_number(v, f"{who}.b[{c}][{r}]", i)
+                          for i, v in enumerate(rb)])
+        out_a.append(row_a)
+        out_b.append(row_b)
+    return out_a, out_b
+
+
+def _img_range(data_range, who):
+    if isinstance(data_range, bool) or not isinstance(data_range, (int, float)):
+        raise ValueError(f"{who}: data_range 必须是数字")
+    if float(data_range) <= 0.0:
+        raise ValueError(f"{who}: data_range 必须 > 0，收到 {data_range}")
+    return float(data_range)
+
+
+def psnr_score(a, b, data_range: float = 1.0) -> float:
+    """PSNR = `10*log10(range²/MSE)`；完全相同时返回 `inf`。"""
+    who = "psnr_score"
+    rng = _img_range(data_range, who)
+    ia, ib = _img_check(a, b, who)
+    total = 0.0
+    count = 0
+    for ca, cb in zip(ia, ib):
+        for ra, rb in zip(ca, cb):
+            for va, vb in zip(ra, rb):
+                d = va - vb
+                total += d * d
+                count += 1
+    mse = total / float(count)
+    if mse <= 0.0:
+        return float("inf")
+    return 10.0 * math.log10(rng * rng / mse)
+
+
+def _img_channel_stats(ia, ib):
+    """返回 (mean_a, mean_b, var_a, var_b, cov, n)。"""
+    total_n = 0
+    sum_a = 0.0
+    sum_b = 0.0
+    for ca, cb in zip(ia, ib):
+        for ra, rb in zip(ca, cb):
+            for va, vb in zip(ra, rb):
+                sum_a += va
+                sum_b += vb
+                total_n += 1
+    mean_a = sum_a / total_n
+    mean_b = sum_b / total_n
+    var_a = 0.0
+    var_b = 0.0
+    cov = 0.0
+    for ca, cb in zip(ia, ib):
+        for ra, rb in zip(ca, cb):
+            for va, vb in zip(ra, rb):
+                da = va - mean_a
+                db = vb - mean_b
+                var_a += da * da
+                var_b += db * db
+                cov += da * db
+    var_a /= total_n
+    var_b /= total_n
+    cov /= total_n
+    return mean_a, mean_b, var_a, var_b, cov, total_n
+
+
+def _ssim_global(ia, ib, rng):
+    """无窗口时的全局 SSIM（小图或 win_size 覆盖整幅图）。"""
+    mean_a, mean_b, var_a, var_b, cov, _ = _img_channel_stats(ia, ib)
+    c1 = (0.01 * rng) ** 2
+    c2 = (0.03 * rng) ** 2
+    return ((2 * mean_a * mean_b + c1) * (2 * cov + c2)) / \
+        ((mean_a * mean_a + mean_b * mean_b + c1) * (var_a + var_b + c2))
+
+
+def ssim_score(a, b, data_range: float = 1.0, win_size: int = 7) -> float:
+    """SSIM：均匀窗口（box）的均值，通道间再平均。
+
+    窗口比图像大时退化为全局统计（README 有说明）；不做高斯加权。
+    """
+    who = "ssim_score"
+    rng = _img_range(data_range, who)
+    if isinstance(win_size, bool) or not isinstance(win_size, int):
+        raise ValueError(f"{who}: win_size 必须是整数")
+    if win_size < 1:
+        raise ValueError(f"{who}: win_size 必须 >= 1，收到 {win_size}")
+    ia, ib = _img_check(a, b, who)
+    height = len(ia[0])
+    width = len(ia[0][0])
+    if win_size >= height or win_size >= width:
+        return _ssim_global(ia, ib, rng)
+    c1 = (0.01 * rng) ** 2
+    c2 = (0.03 * rng) ** 2
+    total = 0.0
+    windows = 0
+    for ca, cb in zip(ia, ib):
+        for r0 in range(height - win_size + 1):
+            for c0 in range(width - win_size + 1):
+                n = float(win_size * win_size)
+                sa = 0.0
+                sb = 0.0
+                for dr in range(win_size):
+                    for dc in range(win_size):
+                        sa += ca[r0 + dr][c0 + dc]
+                        sb += cb[r0 + dr][c0 + dc]
+                ma = sa / n
+                mb = sb / n
+                va = 0.0
+                vb = 0.0
+                cv = 0.0
+                for dr in range(win_size):
+                    for dc in range(win_size):
+                        da = ca[r0 + dr][c0 + dc] - ma
+                        db = cb[r0 + dr][c0 + dc] - mb
+                        va += da * da
+                        vb += db * db
+                        cv += da * db
+                va /= n
+                vb /= n
+                cv /= n
+                num = (2 * ma * mb + c1) * (2 * cv + c2)
+                den = (ma * ma + mb * mb + c1) * (va + vb + c2)
+                total += num / den
+                windows += 1
+    return total / float(windows)
+
+
+def _img_downsample(img):
+    """2×2 平均池化（尺寸为奇数时丢掉最后一行/列）。"""
+    out = []
+    for ch in img:
+        h = len(ch) // 2
+        w = len(ch[0]) // 2
+        rows = []
+        for r in range(h):
+            row = []
+            for c in range(w):
+                s = ch[2 * r][2 * c] + ch[2 * r][2 * c + 1] + \
+                    ch[2 * r + 1][2 * c] + ch[2 * r + 1][2 * c + 1]
+                row.append(s / 4.0)
+            rows.append(row)
+        out.append(rows)
+    return out
+
+
+def ms_ssim_score(a, b, data_range: float = 1.0,
+                  weights=(0.0448, 0.2856, 0.3001, 0.2363, 0.1333)) -> float:
+    """MS-SSIM：多尺度对比度-结构项连乘，最后一级再乘亮度项。
+
+    每级用 2×2 平均池化下采样；图像太小时会**减少级数并重新归一化权重**。
+    """
+    who = "ms_ssim_score"
+    rng = _img_range(data_range, who)
+    if not isinstance(weights, (list, tuple)) or not weights:
+        raise ValueError(f"{who}: weights 必须是非空列表")
+    ws = []
+    for i, w in enumerate(weights):
+        v = _metric_number(w, f"{who}.weights", i)
+        if v <= 0.0:
+            raise ValueError(f"{who}: weights[{i}] 必须 > 0，收到 {v}")
+        ws.append(v)
+    ia, ib = _img_check(a, b, who)
+    levels = len(ws)
+    cur_a = ia
+    cur_b = ib
+    used = 0
+    cs_terms = []
+    last_lum = None
+    c1 = (0.01 * rng) ** 2
+    c2 = (0.03 * rng) ** 2
+    for level in range(levels):
+        mean_a, mean_b, var_a, var_b, cov, _ = _img_channel_stats(cur_a, cur_b)
+        lum = (2 * mean_a * mean_b + c1) / (mean_a * mean_a + mean_b * mean_b + c1)
+        cs = (2 * cov + c2) / (var_a + var_b + c2)
+        last_lum = lum
+        cs_terms.append(cs)
+        used += 1
+        h = len(cur_a[0])
+        w = len(cur_a[0][0])
+        if h < 4 or w < 4:
+            break
+        cur_a = _img_downsample(cur_a)
+        cur_b = _img_downsample(cur_b)
+    total_w = sum(ws[:used])
+    norm = [w / total_w for w in ws[:used]]
+    out = 1.0
+    for i, cs in enumerate(cs_terms):
+        if i == used - 1:
+            out *= (cs ** norm[i]) * (last_lum ** norm[i])
+        else:
+            out *= cs ** norm[i]
+    return out
+
+
+def _feat_check(features, who, tag):
+    if not isinstance(features, (list, tuple)) or not features:
+        raise ValueError(f"{who}: {tag} 不能为空")
+    rows = []
+    width = None
+    for i, row in enumerate(features):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: {tag}[{i}] 必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: {tag}[{i}] 维度 {len(row)} 与首个 {width} 不同")
+        rows.append([_metric_number(v, f"{who}.{tag}[{i}]", j)
+                     for j, v in enumerate(row)])
+    return rows, width
+
+
+def _feat_stats(rows):
+    n = len(rows)
+    dim = len(rows[0])
+    mean = [sum(r[d] for r in rows) / float(n) for d in range(dim)]
+    cov = [[0.0] * dim for _ in range(dim)]
+    denom = float(n - 1) if n > 1 else 1.0
+    for r in rows:
+        diff = [r[d] - mean[d] for d in range(dim)]
+        for i in range(dim):
+            di = diff[i]
+            row_i = cov[i]
+            for j in range(i, dim):
+                row_i[j] += di * diff[j]
+    for i in range(dim):
+        for j in range(i, dim):
+            v = cov[i][j] / denom
+            cov[i][j] = v
+            cov[j][i] = v
+    return mean, cov, n, dim
+
+
+def _sym_sqrt_trace(m):
+    """对称半正定矩阵的 `trace(m^{1/2})`（Jacobi 特征分解）。"""
+    vals, _ = _jacobi_eigh(m)
+    return sum(math.sqrt(v) for v in vals if v > 0.0)
+
+
+def _mat_mul_sym(a, b):
+    n = len(a)
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            s = 0.0
+            for k in range(n):
+                s += a[i][k] * b[k][j]
+            out[i][j] = s
+    return out
+
+
+def _mat_add(a, b, sign=1.0):
+    n = len(a)
+    return [[a[i][j] + sign * b[i][j] for j in range(n)] for i in range(n)]
+
+
+def fid_score(features_a, features_b, max_dim: int = 128) -> float:
+    """简化 FID：`‖μa−μb‖² + tr(Σa+Σb−2(Σa Σb)^{1/2})`，直接吃特征向量。
+
+    不做 Inception 前向（本库没有预训练网络），也**不做**协方差的样本量校正。
+    """
+    who = "fid_score"
+    ra, dim_a = _feat_check(features_a, who, "features_a")
+    rb, dim_b = _feat_check(features_b, who, "features_b")
+    if dim_a != dim_b:
+        raise ValueError(f"{who}: 特征维度不同（{dim_a} vs {dim_b}）")
+    if isinstance(max_dim, bool) or not isinstance(max_dim, int):
+        raise ValueError(f"{who}: max_dim 必须是整数")
+    if dim_a > max_dim:
+        raise ValueError(
+            f"{who}: 特征维度 {dim_a} 超过 max_dim={max_dim}；"
+            "请先用 AI.PCA 降维（协方差矩阵是 dim×dim，维度过大不实用）")
+    if len(ra) < 2 or len(rb) < 2:
+        raise ValueError(f"{who}: 每组至少需要 2 个样本才能估协方差")
+    ma, ca, _, _ = _feat_stats(ra)
+    mb, cb, _, _ = _feat_stats(rb)
+    mean_diff = sum((ma[d] - mb[d]) ** 2 for d in range(dim_a))
+    # (Σa Σb) 有 (Σb^{1/2} Σa Σb^{1/2}) 相同的特征值，故可用对称形式取迹
+    sqrt_b = [[0.0] * dim_a for _ in range(dim_a)]
+    vals, vecs = _jacobi_eigh(cb)
+    for k, lam in enumerate(vals):
+        if lam <= 0.0:
+            continue
+        r = math.sqrt(lam)
+        for i in range(dim_a):
+            for j in range(dim_a):
+                sqrt_b[i][j] += r * vecs[i][k] * vecs[j][k]
+    inner = _mat_mul_sym(_mat_mul_sym(sqrt_b, ca), sqrt_b)
+    cross = _sym_sqrt_trace(inner)
+    tr_a = sum(ca[i][i] for i in range(dim_a))
+    tr_b = sum(cb[i][i] for i in range(dim_a))
+    return mean_diff + tr_a + tr_b - 2.0 * cross
+
+
+def _rbf_kernel(x, y, sigma):
+    s = 0.0
+    for a, b in zip(x, y):
+        d = a - b
+        s += d * d
+    return math.exp(-s / (2.0 * sigma * sigma))
+
+
+def kid_score(features_a, features_b) -> float:
+    """简化 KID：RBF 核的无偏 MMD²（`sigma` 取两组间成对距离的中位数）。
+
+    返回的是 MMD² 本身；官方 KID 常乘 1000，README 已说明。
+    无偏估计在小样本上**可能给出负值**（两组几乎相同时是正常的采样噪声），
+    需要非负值时请自行 `max(value, 0.0)`。
+    """
+    who = "kid_score"
+    ra, dim_a = _feat_check(features_a, who, "features_a")
+    rb, dim_b = _feat_check(features_b, who, "features_b")
+    if dim_a != dim_b:
+        raise ValueError(f"{who}: 特征维度不同（{dim_a} vs {dim_b}）")
+    if len(ra) < 2 or len(rb) < 2:
+        raise ValueError(f"{who}: 每组至少需要 2 个样本才能算无偏 MMD")
+    dists = []
+    for x in ra:
+        for y in rb:
+            d = math.sqrt(sum((p - q) ** 2 for p, q in zip(x, y)))
+            dists.append(d)
+    dists.sort()
+    sigma = dists[len(dists) // 2]
+    if sigma <= 0.0:
+        sigma = 1.0
+    n = len(ra)
+    m = len(rb)
+    sum_aa = 0.0
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sum_aa += _rbf_kernel(ra[i], ra[j], sigma)
+    sum_bb = 0.0
+    for i in range(m):
+        for j in range(m):
+            if i != j:
+                sum_bb += _rbf_kernel(rb[i], rb[j], sigma)
+    sum_ab = 0.0
+    for x in ra:
+        for y in rb:
+            sum_ab += _rbf_kernel(x, y, sigma)
+    return (sum_aa / float(n * (n - 1)) + sum_bb / float(m * (m - 1)) -
+            2.0 * sum_ab / float(n * m))
+
+
+def inception_score(probs, eps: float = 1e-12) -> float:
+    """Inception Score：`exp(mean_i KL(p(y|x_i) ‖ p(y)))`，`probs` 是概率行。"""
+    who = "inception_score"
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        raise ValueError(f"{who}: eps 必须是数字")
+    if not 0.0 < float(eps) < 1.0:
+        raise ValueError(f"{who}: eps 必须在 (0, 1)，收到 {eps}")
+    rows, width = _feat_check(probs, who, "probs")
+    for i, row in enumerate(rows):
+        for j, v in enumerate(row):
+            if v < 0.0:
+                raise ValueError(f"{who}: probs[{i}][{j}] = {v} 为负")
+            if v > 1.0 + 1e-9:
+                raise ValueError(f"{who}: probs[{i}][{j}] = {v} 超过 1")
+    mean_p = [0.0] * width
+    for row in rows:
+        total = sum(row)
+        if total <= 0.0:
+            raise ValueError(f"{who}: 有一行概率全为 0")
+        for j in range(width):
+            mean_p[j] += row[j] / total
+    for j in range(width):
+        mean_p[j] /= float(len(rows))
+    kl = 0.0
+    for row in rows:
+        total = sum(row)
+        p = [v / total for v in row]
+        for j in range(width):
+            if p[j] > 0.0:
+                kl += p[j] * math.log(p[j] / max(mean_p[j], float(eps)))
+    kl /= float(len(rows))
+    return math.exp(kl)
+
+
 def box_area(box) -> float:
     """矩形面积（宽或高为 0 时返回 0）。"""
     b = _det_box(box, "box_area", "box")
