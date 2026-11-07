@@ -25142,3 +25142,169 @@ class TestVideoModels:
         fuse.forward([0.1, 0.2, 0.3], [0.1, 0.2])
         with pytest.raises(ValueError):
             fuse.backward([1.0])
+
+
+class TestOCRAndDetection:
+    """W17-E-3：简化 CRNN + CTC 贪心解码、YOLO 网格编解码 + NMS。"""
+
+    def _img(self, fill=0.2, c=1, h=2, w=8):
+        return [[[fill + 0.01 * (cc + hh + ww) for ww in range(w)]
+                 for hh in range(h)] for cc in range(c)]
+
+    def test_crnn_forward_and_param_count(self):
+        net = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                      kernel_size=3, pool=2, seed=3)
+        logits = net.forward(self._img())
+        assert len(logits) == 4
+        assert all(len(row) == 5 for row in logits)
+        # Conv2d(1->2, k=3): 2*1*9 + 2 = 20；head Layer(2->5): 2*5 + 5 = 15
+        assert net.param_count() == 20 + 15
+
+    def test_crnn_input_gradient(self):
+        net = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                      kernel_size=3, pool=2, seed=3)
+        img = self._img()
+        net.forward(img)
+        dlog = [[0.1, -0.2, 0.3, 0.0, 0.05] for _ in range(4)]
+        dx = net.backward(dlog)
+        assert len(dx) == 1 and len(dx[0]) == 2 and len(dx[0][0]) == 8
+        ref = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                      kernel_size=3, pool=2, seed=3)
+        eps = 1e-6
+        worst = 0.0
+        for h in range(2):
+            for w in range(8):
+                plus = self._img()
+                minus = self._img()
+                plus[0][h][w] += eps
+                minus[0][h][w] -= eps
+                fp = sum(dlog[a][b] * v for a, step in enumerate(ref.forward(plus))
+                         for b, v in enumerate(step))
+                fm = sum(dlog[a][b] * v for a, step in enumerate(ref.forward(minus))
+                         for b, v in enumerate(step))
+                worst = max(worst, abs((fp - fm) / (2 * eps) - dx[0][h][w]))
+        assert worst < 1e-6, worst
+
+    def test_crnn_weight_gradient(self):
+        net = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                      kernel_size=3, pool=2, seed=3)
+        img = self._img()
+        net.forward(img)
+        dlog = [[0.1, -0.2, 0.3, 0.0, 0.05] for _ in range(4)]
+        net.backward(dlog)
+        conv_grads, head_grads = net.grads()
+        assert head_grads is not None
+        eps = 1e-6
+        worst = 0.0
+        for oc in range(2):
+            for kh in range(3):
+                for kw in range(3):
+                    plus = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                                   kernel_size=3, pool=2, seed=3)
+                    minus = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,),
+                                    kernel_size=3, pool=2, seed=3)
+                    plus.convs[0].weights[oc][0][kh][kw] += eps
+                    minus.convs[0].weights[oc][0][kh][kw] -= eps
+                    fp = sum(dlog[a][b] * v for a, step in enumerate(plus.forward(img))
+                             for b, v in enumerate(step))
+                    fm = sum(dlog[a][b] * v for a, step in enumerate(minus.forward(img))
+                             for b, v in enumerate(step))
+                    worst = max(worst, abs((fp - fm) / (2 * eps)
+                                           - conv_grads[0][0][oc][0][kh][kw]))
+        assert worst < 1e-5, worst
+        net.zero_grad()
+        assert net.grads()[1] is None
+
+    def test_crnn_validation(self):
+        with pytest.raises(ValueError):
+            AI.CRNN(num_classes=0)
+        with pytest.raises(ValueError):
+            AI.CRNN(conv_channels=[])
+        with pytest.raises(ValueError):
+            AI.CRNN(conv_channels=(0,))
+        with pytest.raises(ValueError):
+            AI.CRNN(seed="x")
+        net = AI.CRNN(in_channels=1, num_classes=3, conv_channels=(2,), seed=1)
+        with pytest.raises(RuntimeError):
+            net.backward([[0.0, 0.0, 0.0]])
+        with pytest.raises(ValueError):
+            net.forward([[0.0]])
+        tall = AI.CRNN(in_channels=1, num_classes=3, conv_channels=(2,),
+                       kernel_size=3, pool=1, seed=1)
+        with pytest.raises(ValueError):
+            tall.forward(self._img())
+        net.forward(self._img())
+        with pytest.raises(ValueError):
+            net.backward([[0.0] * 3])
+
+    def test_ctc_greedy_decode(self):
+        seq = [[0.0, 0.9, 0.1], [0.0, 0.8, 0.2], [0.9, 0.05, 0.05],
+               [0.1, 0.1, 0.8], [0.1, 0.1, 0.7], [0.1, 0.1, 0.2]]
+        assert AI.ctc_greedy_decode(seq) == [1, 2]
+        assert AI.ctc_greedy_decode(seq, blank=2) == [1, 0]
+        assert AI.ctc_greedy_decode([[0.0, 1.0, 0.0]] * 3, blank=1) == []
+
+    def test_ctc_validation(self):
+        seq = [[0.0, 0.9, 0.1]]
+        with pytest.raises(ValueError):
+            AI.ctc_greedy_decode([])
+        with pytest.raises(ValueError):
+            AI.ctc_greedy_decode([[]])
+        with pytest.raises(ValueError):
+            AI.ctc_greedy_decode([[0.1, 0.2], [0.1]])
+        with pytest.raises(ValueError):
+            AI.ctc_greedy_decode(seq, blank=-1)
+        with pytest.raises(ValueError):
+            AI.ctc_greedy_decode(seq, blank=5)
+
+    def test_yolo_grid_targets(self):
+        tgt = AI.yolo_grid_targets([[0.6, 0.6, 0.2, 0.2], [0.1, 0.1, 0.2, 0.2]],
+                                   [1, 0], grid=4, num_classes=2)
+        assert len(tgt["obj"]) == 4 and len(tgt["obj"][0]) == 4
+        assert tgt["obj"][2][2] == 1.0 and tgt["obj"][0][0] == 1.0
+        assert tgt["obj"][1][1] == 0.0
+        assert tgt["box"][2][2] == [0.6, 0.6, 0.2, 0.2]
+        assert tgt["cls"][2][2] == [0.0, 1.0] and tgt["cls"][0][0] == [1.0, 0.0]
+        assert tgt["conflicts"] == 0
+        conf = AI.yolo_grid_targets([[0.6, 0.6, 0.2, 0.2], [0.62, 0.58, 0.1, 0.1]],
+                                    [0, 1], grid=4, num_classes=2)
+        assert conf["conflicts"] == 1
+
+    def test_yolo_grid_target_validation(self):
+        with pytest.raises(ValueError):
+            AI.yolo_grid_targets([], [], grid=0)
+        with pytest.raises(ValueError):
+            AI.yolo_grid_targets([[0.5, 0.5, 0.1]], [0])
+        with pytest.raises(ValueError):
+            AI.yolo_grid_targets([[1.5, 0.5, 0.1, 0.1]], [0])
+        with pytest.raises(ValueError):
+            AI.yolo_grid_targets([[0.5, 0.5, 0.0, 0.1]], [0])
+        with pytest.raises(ValueError):
+            AI.yolo_grid_targets([[0.5, 0.5, 0.1, 0.1]], [3], num_classes=2)
+
+    def test_yolo_decode_and_nms(self):
+        pred = {"obj": [[0.0, 0.0, 0.0, 0.0], [0.0, 0.9, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                "box": [[[0.0] * 4 for _ in range(4)] for _ in range(4)],
+                "cls": [[[0.0] * 2 for _ in range(4)] for _ in range(4)]}
+        pred["box"][1][1] = [0.375, 0.375, 0.25, 0.25]
+        pred["cls"][1][1] = [0.2, 0.8]
+        dec = AI.yolo_decode(pred, conf_threshold=0.5)
+        assert len(dec) == 1
+        assert dec[0][:4] == (0.375, 0.375, 0.25, 0.25)
+        assert dec[0][4] == 0.9 and dec[0][5] == 1
+        assert AI.yolo_decode(pred, conf_threshold=0.95) == []
+        with pytest.raises(ValueError):
+            AI.yolo_decode({"obj": [[1.0]]})
+        with pytest.raises(ValueError):
+            AI.yolo_decode(pred, conf_threshold=1.5)
+
+        boxes = [[0.0, 0.0, 1.0, 1.0], [0.05, 0.05, 0.95, 0.95], [2.0, 2.0, 3.0, 3.0]]
+        scores = [0.9, 0.8, 0.7]
+        assert AI.nms(boxes, scores, iou_threshold=0.5) == [0, 2]
+        assert AI.nms(boxes, scores, 1.0) == [0, 1, 2]
+        assert AI.nms([], []) == []
+        with pytest.raises(ValueError):
+            AI.nms(boxes, scores[1:])
+        with pytest.raises(ValueError):
+            AI.nms(boxes, scores, 1.5)

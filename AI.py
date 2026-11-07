@@ -30528,6 +30528,293 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ======================================================================
+#  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
+# ======================================================================
+
+
+class _w17e3_relu2d:
+    """作用于 `(C, H, W)` 的 ReLU，保存掩码供反向使用。"""
+
+    def __init__(self):
+        self._mask = None
+
+    def forward(self, x):
+        self._mask = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+        return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+    def backward(self, dout):
+        if self._mask is None:
+            raise RuntimeError("_w17e3_relu2d.backward: 必须先调用 forward")
+        return [[[dout[c][h][w] * self._mask[c][h][w]
+                  for w in range(len(dout[c][h]))]
+                 for h in range(len(dout[c]))]
+                for c in range(len(dout))]
+
+
+class CRNN:
+    """简化 CRNN：卷积特征提取 + 逐列分类器（**省略循环层**）+ CTC 贪心解码。
+
+    输入 `(C, H, W)` 灰度/彩色图像，卷积栈把高度压到 1，之后把宽度方向当作
+    时间步，每一步用一层 `Layer` 输出 `num_classes` 个 logits。
+    真正的 CRNN 在卷积与分类之间还有 BiLSTM/GRU；这里省略，`forward` 的
+    `(T, num_classes)` 仍可直接喂给 CTC 损失 `ctc_loss` 或 `ctc_greedy_decode`。
+    """
+
+    def __init__(self, in_channels=1, num_classes=10, hidden=16,
+                 conv_channels=(4,), kernel_size=3, pool=2, seed=None):
+        for name, v in (("in_channels", in_channels), ("num_classes", num_classes),
+                        ("hidden", hidden), ("kernel_size", kernel_size),
+                        ("pool", pool)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"CRNN: {name} 必须是 >= 1 的整数，收到 {v!r}")
+        if isinstance(conv_channels, bool) \
+                or not isinstance(conv_channels, (list, tuple)) or not conv_channels:
+            raise ValueError(
+                f"CRNN: conv_channels 必须是非空列表，收到 {conv_channels!r}")
+        for v in conv_channels:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"CRNN: conv_channels 里的元素必须是正整数，收到 {v!r}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"CRNN: seed 必须是整数或 None，收到 {seed!r}")
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.convs = []
+            self.relus = []
+            self.pools = []
+            prev = in_channels
+            for out in conv_channels:
+                self.convs.append(Conv2d(prev, out, kernel_size, stride=1,
+                                         padding=kernel_size // 2))
+                self.relus.append(_w17e3_relu2d())
+                self.pools.append(MaxPool2d(pool))
+                prev = out
+            self.feature_channels = prev
+            self.head = Layer(prev, num_classes, activation="linear")
+        finally:
+            random.setstate(saved)
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.hidden = hidden
+        self.kernel_size = kernel_size
+        self.pool = pool
+        self.conv_channels = tuple(int(v) for v in conv_channels)
+        self._cache = None
+        self._head_grads = None
+
+    def forward(self, image):
+        x = _w17e2b_clip([[list(row) for row in image]], "CRNN.forward",
+                         in_channels=None)[0]
+        x = [[list(row) for row in ch] for ch in x]
+        for conv, relu, pool in zip(self.convs, self.relus, self.pools):
+            x = pool.forward(relu.forward(conv.forward(x)))
+        c, h, w = len(x), len(x[0]), len(x[0][0])
+        if h != 1:
+            raise ValueError(
+                f"CRNN.forward: 卷积后高度应为 1，实际 {h}（减小 pool 或输入高度）")
+        steps = []
+        for t in range(w):
+            steps.append([x[i][0][t] for i in range(c)])
+        logits = [list(self.head.forward(step)) for step in steps]
+        self._cache = (c, h, w, steps)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("CRNN.backward: 必须先调用 forward")
+        c, h, w, steps = self._cache
+        if not isinstance(dlogits, (list, tuple)) or len(dlogits) != w:
+            raise ValueError(f"CRNN.backward: dlogits 时间步数必须是 {w}")
+        if self._head_grads is None:
+            self._head_grads = ([[0.0] * self.head.fan_in
+                                 for _ in range(self.head.fan_out)],
+                                [0.0] * self.head.fan_out)
+        dcols = [[0.0] * c for _ in range(w)]
+        for t in range(w):
+            row = list(dlogits[t])
+            if len(row) != self.num_classes:
+                raise ValueError(
+                    f"CRNN.backward: 第 {t} 步梯度长度必须是 {self.num_classes}")
+            self.head.forward(steps[t])
+            gw, gb, dstep = self.head.backward(row)
+            acc_w, acc_b = self._head_grads
+            for r in range(len(gw)):
+                arow = acc_w[r]
+                for col in range(len(gw[r])):
+                    arow[col] += gw[r][col]
+            for r in range(len(gb)):
+                acc_b[r] += gb[r]
+            for i in range(c):
+                dcols[t][i] = dstep[i]
+        delta = [[[dcols[t][i] for t in range(w)]] for i in range(c)]
+        for conv, relu, pool in zip(reversed(self.convs), reversed(self.relus),
+                                    reversed(self.pools)):
+            delta = conv.backward(relu.backward(pool.backward(delta)))
+        return delta
+
+    def param_count(self):
+        # Conv2d 没有 param_count()（只有 Conv3d 有），用既有的 _conv_param_count
+        total = sum(_conv_param_count(conv) for conv in self.convs)
+        return total + self.head.fan_in * self.head.fan_out + self.head.fan_out
+
+    def zero_grad(self):
+        for conv in self.convs:
+            conv.zero_grad()
+        self._head_grads = None
+
+    def grads(self):
+        conv_grads = [(conv.grad_w, conv.grad_b) for conv in self.convs]
+        return conv_grads, self._head_grads
+
+
+def ctc_greedy_decode(logits, blank=0):
+    """CTC 贪心解码：每步取 argmax，合并连续重复，去掉 blank。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("ctc_greedy_decode: logits 必须是非空序列")
+    if isinstance(blank, bool) or not isinstance(blank, int) or blank < 0:
+        raise ValueError(f"ctc_greedy_decode: blank 必须是非负整数，收到 {blank!r}")
+    width = None
+    best = []
+    for t, row in enumerate(logits):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"ctc_greedy_decode: 第 {t} 步必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"ctc_greedy_decode: 第 {t} 步宽度与首步不一致")
+        top = 0
+        for i in range(1, len(row)):
+            if row[i] > row[top]:
+                top = i
+        best.append(top)
+    if blank >= width:
+        raise ValueError(
+            f"ctc_greedy_decode: blank={blank} 超出类别数 {width}")
+    out = []
+    prev = None
+    for idx in best:
+        if idx != prev and idx != blank:
+            out.append(idx)
+        prev = idx
+    return out
+
+
+def yolo_grid_targets(boxes, labels, grid=4, num_classes=1):
+    """把归一化框 `(cx, cy, w, h)` 编码成 YOLO 风格网格目标。
+
+    返回 `{"obj", "box", "cls"}`：
+      `obj[gy][gx]` 为 0/1；
+      `box[gy][gx]` 为 `[cx, cy, w, h]`（原图归一化坐标）；
+      `cls[gy][gx]` 为 one-hot（同一个格子出现多个框时，后写入的覆盖前者，
+      并在返回值里给出 `"conflicts"` 计数）。
+    """
+    if isinstance(grid, bool) or not isinstance(grid, int) or grid < 1:
+        raise ValueError(f"yolo_grid_targets: grid 必须是 >= 1 的整数，收到 {grid!r}")
+    if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 1:
+        raise ValueError(
+            f"yolo_grid_targets: num_classes 必须是 >= 1 的整数，收到 {num_classes!r}")
+    if not isinstance(boxes, (list, tuple)) or not isinstance(labels, (list, tuple)):
+        raise ValueError("yolo_grid_targets: boxes 与 labels 必须是列表")
+    if len(boxes) != len(labels):
+        raise ValueError(
+            f"yolo_grid_targets: boxes {len(boxes)} 个与 labels {len(labels)} 个不一致")
+    obj = [[0.0] * grid for _ in range(grid)]
+    box = [[[0.0] * 4 for _ in range(grid)] for _ in range(grid)]
+    cls = [[[0.0] * num_classes for _ in range(grid)] for _ in range(grid)]
+    conflicts = 0
+    for i, b in enumerate(boxes):
+        if not isinstance(b, (list, tuple)) or len(b) != 4:
+            raise ValueError(f"yolo_grid_targets: 第 {i} 个框必须是 (cx, cy, w, h)")
+        vals = []
+        for v in b:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"yolo_grid_targets: 第 {i} 个框的坐标不是数字")
+            fv = float(v)
+            if fv != fv or fv in (float("inf"), float("-inf")):
+                raise ValueError(f"yolo_grid_targets: 第 {i} 个框的坐标不是有限数")
+            if not (0.0 <= fv <= 1.0):
+                raise ValueError(
+                    f"yolo_grid_targets: 第 {i} 个框的坐标必须归一化到 [0, 1]，收到 {fv}")
+            vals.append(fv)
+        if vals[2] <= 0.0 or vals[3] <= 0.0:
+            raise ValueError(f"yolo_grid_targets: 第 {i} 个框的宽高必须为正")
+        lab = labels[i]
+        if isinstance(lab, bool) or not isinstance(lab, int) or lab < 0:
+            raise ValueError(f"yolo_grid_targets: 第 {i} 个标签必须是非负整数")
+        if lab >= num_classes:
+            raise ValueError(
+                f"yolo_grid_targets: 第 {i} 个标签 {lab} 超出类别数 {num_classes}")
+        gx = min(grid - 1, int(vals[0] * grid))
+        gy = min(grid - 1, int(vals[1] * grid))
+        if obj[gy][gx] > 0.0:
+            conflicts += 1
+        obj[gy][gx] = 1.0
+        box[gy][gx] = vals
+        cls[gy][gx] = [1.0 if k == lab else 0.0 for k in range(num_classes)]
+    return {"obj": obj, "box": box, "cls": cls, "conflicts": conflicts}
+
+
+def yolo_decode(pred, conf_threshold=0.5):
+    """把网格预测解码成 `[(cx, cy, w, h, score, class_index)]`（原始归一化坐标）。"""
+    for key in ("obj", "box", "cls"):
+        if key not in pred:
+            raise ValueError(f"yolo_decode: 预测缺少 {key!r}")
+    obj, box, cls = pred["obj"], pred["box"], pred["cls"]
+    if not isinstance(obj, (list, tuple)) or not obj:
+        raise ValueError("yolo_decode: obj 必须是非空二维列表")
+    grid = len(obj)
+    if not isinstance(conf_threshold, (int, float)) or isinstance(conf_threshold, bool):
+        raise ValueError("yolo_decode: conf_threshold 必须是数字")
+    if not (0.0 <= float(conf_threshold) <= 1.0):
+        raise ValueError("yolo_decode: conf_threshold 必须在 [0, 1] 内")
+    out = []
+    for gy in range(grid):
+        for gx in range(grid):
+            score = float(obj[gy][gx])
+            if score < float(conf_threshold):
+                continue
+            vals = box[gy][gx]
+            if len(vals) != 4:
+                raise ValueError("yolo_decode: box 每个格子必须是 4 个数")
+            probs = cls[gy][gx]
+            if not probs:
+                raise ValueError("yolo_decode: cls 每个格子必须是非空列表")
+            best = 0
+            for i in range(1, len(probs)):
+                if probs[i] > probs[best]:
+                    best = i
+            out.append((float(vals[0]), float(vals[1]), float(vals[2]),
+                        float(vals[3]), score, best))
+    return out
+
+
+def nms(boxes, scores, iou_threshold=0.5):
+    """非极大值抑制：返回保留下标（按分数降序）。
+
+    `boxes` 用 `[x1, y1, x2, y2]`（与 `box_iou` / 检测指标同一套坐标），
+    `yolo_decode` 输出的是 `(cx, cy, w, h)`，两者不要混用。
+    """
+    if not isinstance(boxes, (list, tuple)) or not isinstance(scores, (list, tuple)):
+        raise ValueError("nms: boxes 与 scores 必须是列表")
+    if len(boxes) != len(scores):
+        raise ValueError(f"nms: boxes {len(boxes)} 个与 scores {len(scores)} 个不一致")
+    if not (0.0 <= float(iou_threshold) <= 1.0):
+        raise ValueError("nms: iou_threshold 必须在 [0, 1] 内")
+    order = sorted(range(len(boxes)), key=lambda i: (-float(scores[i]), i))
+    keep = []
+    while order:
+        i = order[0]
+        keep.append(i)
+        rest = []
+        for j in order[1:]:
+            if box_iou(boxes[i], boxes[j]) <= float(iou_threshold):
+                rest.append(j)
+        order = rest
+    return keep
+
+
+# ======================================================================
 #  领域应用 W17-E-2b：视频（3D-CNN / Two-Stream 融合）
 # ======================================================================
 

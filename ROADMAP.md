@@ -573,10 +573,12 @@
   - `BruteForceIndex`（`l2` / `ip` 两种度量，结果与精确扫描逐位一致）
   - `IVFIndex`（k-means++ 初始化 + 只在最近 `n_probe` 个簇内扫描，全探测时与暴力完全一致）
   - `NSWIndex`：**单层**近邻图 + 贪心束搜索，不是分层 HNSW（没有层级/启发式剪枝），构造数据上 recall@5 到 1.0；探针 32 项
-- [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
+- [x] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
   - 语音前端已完成：`mel_filterbank` / `frame_signal` / `dft_power`（朴素 DFT）/ `log_mel_spectrogram` / `dct_matrix` / `mfcc`；`ConformerBlock` 只做前向，无 GLU / 相对位置 / 手写反向；探针 34 项
   - 点云已完成：`farthest_point_indices` / `chamfer_distance` / `voxelize_points` / `PointNetEncoder`（逐点 MLP + 最大池化，只做编码，无 T-Net、无分类头）；探针 24 项
   - 视频已完成：`Video3DCNN`（Conv3d/ReLU/MaxPool3d 串成可反传整网 + 全局平均池化 + Layer 分类）、`TwoStreamFusion`（两路特征各投影后拼接分类，**不含光流**）；探针 17 项
+  - OCR / YOLO 已完成：`CRNN`（卷积 + 逐列分类，**省略循环层**）、`ctc_greedy_decode`、`yolo_grid_targets` / `yolo_decode` / `nms`；探针 30 项
+  - 深度 / 姿态估计**不做实现**：真实做法依赖大规模 3D/关键点数据集与数百 MB 的预训练骨干，本库无权重可用；只在此说明取舍，不放空壳接口。
 
 ### W18 测试与数值稳定性（§15，贯穿各波）
 - [ ] `grad_check_all(model, ...)`：自动遍历所有带参数的子模块

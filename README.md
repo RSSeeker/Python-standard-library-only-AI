@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1635 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1644 项）
 
 ## 特性
 
@@ -2225,6 +2225,39 @@ dsp, dtp = fuse.backward([0.4, -0.6])
 - 两个类的权重梯度都由自己累积（`Layer` 只返回梯度、不保存），
   `grads()` 在未反传过时返回 `None`，`zero_grad()` 把它清回 `None`。
 
+### OCR 与检测（W17-E-3）
+
+| 接口 | 说明 |
+|------|------|
+| `CRNN(in_channels=1, num_classes=10, conv_channels=(4,), kernel_size=3, pool=2, seed=None)` | 卷积特征提取 + 逐列分类器（**省略循环层**），`forward` 返回 `(T, num_classes)` |
+| `ctc_greedy_decode(logits, blank=0)` | CTC 贪心解码：逐步 argmax、合并相邻重复、去掉 blank |
+| `yolo_grid_targets(boxes, labels, grid=4, num_classes=1)` | 归一化框 `(cx, cy, w, h)` → 网格目标 `{obj, box, cls, conflicts}` |
+| `yolo_decode(pred, conf_threshold=0.5)` | 网格预测 → `[(cx, cy, w, h, score, class)]` |
+| `nms(boxes, scores, iou_threshold=0.5)` | 非极大值抑制，`boxes` 用 `[x1, y1, x2, y2]` |
+
+```python
+import AI
+
+net = AI.CRNN(in_channels=1, num_classes=5, conv_channels=(2,), pool=2, seed=3)
+logits = net.forward([[[0.2 + 0.01 * (h + w) for w in range(8)] for h in range(2)]])
+text = AI.ctc_greedy_decode(logits)            # 时间步上的类别序列
+
+tgt = AI.yolo_grid_targets([[0.6, 0.6, 0.2, 0.2]], [1], grid=4, num_classes=2)
+keep = AI.nms([[0.0, 0.0, 1.0, 1.0], [0.05, 0.05, 0.95, 0.95]], [0.9, 0.8], 0.5)
+```
+
+诚实边界：
+
+- `CRNN` 的 **R 省略了**：卷积与分类之间没有 BiLSTM/GRU，每列特征直接经一层 `Linear`
+  得到该时间步的 logits。CTC 损失可直接用既有的 `ctc_loss`，但本类没做端到端训练循环。
+- 卷积后高度必须压到 1（`pool` 与输入高度的组合不对会 `ValueError`），否则「按列当时间步」
+  的前提不成立。
+- `yolo_grid_targets` 同一格子出现多个框时**后写覆盖前写**，并累计 `conflicts` 计数；
+  这里不做 anchor 匹配、不做 CIoU 损失、不做多尺度特征金字塔。
+- `nms` 的坐标是 `[x1, y1, x2, y2]`（与 `box_iou`、检测指标一致），而 `yolo_decode`
+- **深度 / 姿态估计不做实现**：它们依赖大规模关键点数据集与数百 MB 的预训练骨干，本库没有可用的权重；与其放一个永远返回占位值的空壳，不如在这里说明取舍。
+  返回 `(cx, cy, w, h)`——两者不要混用。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2641,7 +2674,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1635 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1644 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2852,6 +2885,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSpeechFrontendConformer` | 梅尔刻度往返与单调、滤波器组形状/峰值/频点递增、切帧数量与偏移、DFT 常量与余弦闭式、log-mel 静音等于 `log(eps)`、DCT 正交性与 MFCC 形状、Conformer 形状/逐位置零均值/同种子复现、9 处参数校验 |
 | `TestPointCloud` | 最远点采样与手工复算一致、Chamfer 闭式与对称、体素化形状/单点自动边界/越界夹紧、PointNet 形状与置换不变、逐点梯度对中心差分、逐权重梯度对中心差分、参数校验 |
 | `TestVideoModels` | 3D-CNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度对中心差分、`zero_grad` 清空、双流拼接形状与参数量、两路输入梯度与 head 权重梯度、9 处参数校验 |
+| `TestOCRAndDetection` | CRNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度、高度未压到 1 报错、CTC 贪心解码三例（含 blank 过滤与全 blank）、YOLO 网格目标/冲突计数/解码阈值/NMS，共 9 例 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2905,7 +2939,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1635 个单元测试
+├── test_ai.py       # 1644 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
