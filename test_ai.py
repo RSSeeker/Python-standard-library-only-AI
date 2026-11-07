@@ -20645,3 +20645,97 @@ class TestRankingMetrics:
             AI.mean_average_precision_at_k([[1, 0]], [[0.5]])
         with pytest.raises(ValueError):
             AI.coverage_at_k([[0.5, 0.4], [0.5]])
+
+
+class TestSegmentationMetrics:
+    @staticmethod
+    def _gt():
+        return [[0, 0, 1, 1] for _ in range(4)]
+
+    @staticmethod
+    def _pred():
+        return [[0, 0, 0, 1] for _ in range(4)]
+
+    def test_perfect(self):
+        gt = self._gt()
+        assert abs(AI.pixel_accuracy(gt, gt) - 1.0) < 1e-12
+        assert abs(AI.mean_iou(gt, gt) - 1.0) < 1e-12
+        assert abs(AI.dice_score(gt, gt) - 1.0) < 1e-12
+        assert abs(AI.frequency_weighted_iou(gt, gt) - 1.0) < 1e-12
+
+    def test_shifted_hand_values(self):
+        gt = self._gt()
+        pred = self._pred()
+        assert abs(AI.pixel_accuracy(gt, pred) - 0.75) < 1e-12
+        iou0 = 8.0 / 12.0
+        iou1 = 4.0 / 8.0
+        assert abs(AI.mean_iou(gt, pred) - (iou0 + iou1) / 2.0) < 1e-12
+        assert abs(AI.dice_score(gt, pred) - (0.8 + 8.0 / 12.0) / 2.0) < 1e-12
+        assert abs(AI.frequency_weighted_iou(gt, pred) - (iou0 + iou1) / 2.0) < 1e-12
+
+    def test_ignore_index(self):
+        gt = self._gt()
+        pred = self._pred()
+        gt2 = [row[:] for row in gt]
+        pred2 = [row[:] for row in pred]
+        gt2[0][0] = 255
+        pred2[0][0] = 255
+        assert abs(AI.pixel_accuracy(gt2, pred2, ignore_index=255) - 11.0 / 15.0) < 1e-12
+        assert abs(AI.pixel_accuracy(gt2, pred2) - 0.75) < 1e-12
+        assert abs(AI.mean_iou(gt2, gt2, ignore_index=255) - 1.0) < 1e-12
+
+    def test_boundary_f1(self):
+        gt = self._gt()
+        pred = self._pred()
+        assert abs(AI.boundary_f1(gt, gt) - 1.0) < 1e-12
+        assert abs(AI.boundary_f1(gt, pred, tolerance=0) - 0.5) < 1e-12
+        assert abs(AI.boundary_f1(gt, pred, tolerance=1) - 1.0) < 1e-12
+        flat = [[0] * 4 for _ in range(4)]
+        assert abs(AI.boundary_f1(gt, flat)) < 1e-12
+        assert abs(AI.boundary_f1(flat, flat) - 1.0) < 1e-12
+
+    def test_hd95(self):
+        gt = self._gt()
+        pred = self._pred()
+        assert abs(AI.hd95(gt, gt)) < 1e-12
+        assert abs(AI.hd95(gt, pred) - 1.0) < 1e-12
+        flat = [[0] * 4 for _ in range(4)]
+        assert abs(AI.hd95(flat, flat)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.hd95(gt, flat)
+
+    def test_inverted_labels_still_perfect(self):
+        a = [[0, 1], [0, 1], [0, 1]]
+        b = [[1, 0], [1, 0], [1, 0]]
+        assert abs(AI.boundary_f1(a, b, tolerance=0) - 1.0) < 1e-12
+        assert abs(AI.hd95(a, b)) < 1e-12
+
+    def test_shape_validation(self):
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[0]], [[0], [0]])
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[0, 1]], [[0]])
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([], [])
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[]], [[]])
+
+    def test_label_validation(self):
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[-1]], [[0]])
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[0.5]], [[0]])
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[True]], [[0]])
+        with pytest.raises(ValueError):
+            AI.mean_iou([[2]], [[2]], num_classes=2)
+        with pytest.raises(ValueError):
+            AI.pixel_accuracy([[255]], [[255]], ignore_index=255)
+
+    def test_tolerance_validation(self):
+        gt = self._gt()
+        pred = self._pred()
+        with pytest.raises(ValueError):
+            AI.boundary_f1(gt, pred, tolerance=-1)
+        with pytest.raises(ValueError):
+            AI.boundary_f1(gt, pred, tolerance=True)

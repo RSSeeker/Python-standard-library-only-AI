@@ -28755,6 +28755,218 @@ def _rank_top(rel, order, k):
     return [rel[i] for i in order[:k]]
 
 
+# ============================================================================
+#  分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+# ============================================================================
+
+def _seg_check_ignore(ignore_index, who):
+    """忽略标签必须是整数（允许负数，bool 不算）；None 表示不忽略。"""
+    if ignore_index is None:
+        return None
+    if isinstance(ignore_index, bool) or not isinstance(ignore_index, int):
+        raise ValueError(f"{who}: ignore_index 必须是整数或 None，收到 {ignore_index!r}")
+    return ignore_index
+
+
+def _seg_maps(y_true, y_pred, who, ignore_index=None):
+    """校验两张同形的二维标签图，返回 list[list[int]] 副本。"""
+    ignore_index = _seg_check_ignore(ignore_index, who)
+    if not isinstance(y_true, (list, tuple)) or not isinstance(y_pred, (list, tuple)):
+        raise ValueError(f"{who}: y_true / y_pred 必须是「行列表」的二维标签图")
+    if not y_true or not y_pred:
+        raise ValueError(f"{who}: 标签图不能为空")
+    if len(y_true) != len(y_pred):
+        raise ValueError(f"{who}: 高度不一致（{len(y_true)} vs {len(y_pred)}）")
+    rows_t, rows_p = [], []
+    width = None
+    for i, (rt, rp) in enumerate(zip(y_true, y_pred)):
+        if not isinstance(rt, (list, tuple)) or not isinstance(rp, (list, tuple)):
+            raise ValueError(f"{who}: 第 {i} 行必须是列表")
+        if len(rt) != len(rp):
+            raise ValueError(
+                f"{who}: 第 {i} 行宽度不一致（{len(rt)} vs {len(rp)}）")
+        if not rt:
+            raise ValueError(f"{who}: 第 {i} 行不能为空")
+        if width is None:
+            width = len(rt)
+        elif len(rt) != width:
+            raise ValueError(f"{who}: 第 {i} 行宽度 {len(rt)} 与第一行 {width} 不一致")
+        rows_t.append([_metric_label(v, who, j) for j, v in enumerate(rt)])
+        rows_p.append([_metric_label(v, who, j) for j, v in enumerate(rp)])
+    return rows_t, rows_p, ignore_index
+
+
+def _seg_confusion(y_true, y_pred, num_classes, ignore_index, who):
+    """按像素统计 num_classes×num_classes 混淆矩阵，返回 (矩阵, 类别数)。"""
+    rows_t, rows_p, ignore_index = _seg_maps(y_true, y_pred, who, ignore_index)
+    labels = []
+    for rt, rp in zip(rows_t, rows_p):
+        for a, b in zip(rt, rp):
+            if ignore_index is not None and a == ignore_index:
+                continue
+            labels.append(a)
+            labels.append(b)
+    if not labels:
+        raise ValueError(f"{who}: 有效像素为 0（全被 ignore_index 排除了）")
+    if num_classes is None:
+        num_classes = max(labels) + 1
+    else:
+        if isinstance(num_classes, bool) or not isinstance(num_classes, int):
+            raise ValueError(f"{who}: num_classes 必须是整数或 None")
+        if num_classes <= 0:
+            raise ValueError(f"{who}: num_classes 必须大于 0")
+        top = max(labels)
+        if top >= num_classes:
+            raise ValueError(
+                f"{who}: 标签 {top} 超出 num_classes={num_classes} 的范围")
+    cm = [[0] * num_classes for _ in range(num_classes)]
+    for rt, rp in zip(rows_t, rows_p):
+        for a, b in zip(rt, rp):
+            if ignore_index is not None and a == ignore_index:
+                continue
+            cm[a][b] += 1
+    return cm, num_classes
+
+
+def _seg_counts(cm, k):
+    """第 k 类的 (tp, fp, fn)。"""
+    tp = cm[k][k]
+    fp = sum(cm[i][k] for i in range(len(cm))) - tp
+    fn = sum(cm[k]) - tp
+    return tp, fp, fn
+
+
+def pixel_accuracy(y_true, y_pred, ignore_index=None):
+    """PixelAcc：逐像素预测正确的比例（跳过 ignore_index）。"""
+    who = "pixel_accuracy"
+    cm, _ = _seg_confusion(y_true, y_pred, None, ignore_index, who)
+    total = sum(sum(row) for row in cm)
+    diag = sum(cm[k][k] for k in range(len(cm)))
+    return diag / float(total)
+
+
+def mean_iou(y_true, y_pred, num_classes=None, ignore_index=None):
+    """mIoU：每类 IoU 的平均，只对「联合集非空」的类取平均。"""
+    who = "mean_iou"
+    cm, n = _seg_confusion(y_true, y_pred, num_classes, ignore_index, who)
+    vals = []
+    for k in range(n):
+        tp, fp, fn = _seg_counts(cm, k)
+        union = tp + fp + fn
+        if union > 0:
+            vals.append(tp / float(union))
+    if not vals:
+        raise ValueError(f"{who}: 所有类别的联合集都为空，mIoU 无定义")
+    return sum(vals) / float(len(vals))
+
+
+def dice_score(y_true, y_pred, num_classes=None, ignore_index=None):
+    """Dice：每类 2TP/(2TP+FP+FN) 的平均（同样只统计联合集非空的类）。"""
+    who = "dice_score"
+    cm, n = _seg_confusion(y_true, y_pred, num_classes, ignore_index, who)
+    vals = []
+    for k in range(n):
+        tp, fp, fn = _seg_counts(cm, k)
+        denom = 2 * tp + fp + fn
+        if denom > 0:
+            vals.append(2.0 * tp / float(denom))
+    if not vals:
+        raise ValueError(f"{who}: 所有类别的联合集都为空，Dice 无定义")
+    return sum(vals) / float(len(vals))
+
+
+def frequency_weighted_iou(y_true, y_pred, num_classes=None, ignore_index=None):
+    """FW-IoU：按真实像素频率加权的 IoU（权重只在联合集非空的类上归一化）。"""
+    who = "frequency_weighted_iou"
+    cm, n = _seg_confusion(y_true, y_pred, num_classes, ignore_index, who)
+    ious, weights = [], []
+    for k in range(n):
+        tp, fp, fn = _seg_counts(cm, k)
+        union = tp + fp + fn
+        if union > 0:
+            ious.append(tp / float(union))
+            weights.append(float(sum(cm[k])))
+    total = sum(weights)
+    if total <= 0.0:
+        raise ValueError(f"{who}: 没有可加权的前景像素，FW-IoU 无定义")
+    return sum(i * w for i, w in zip(ious, weights)) / total
+
+
+def _seg_boundary(labels, ignore_index=None):
+    """返回边界像素坐标集合：与四邻域标签不同的像素（图像外的邻域视为相同）。"""
+    h = len(labels)
+    w = len(labels[0])
+    pts = set()
+    for i in range(h):
+        for j in range(w):
+            cur = labels[i][j]
+            if ignore_index is not None and cur == ignore_index:
+                continue
+            for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ni, nj = i + di, j + dj
+                if ni < 0 or ni >= h or nj < 0 or nj >= w:
+                    continue
+                other = labels[ni][nj]
+                if ignore_index is not None and other == ignore_index:
+                    continue
+                if other != cur:
+                    pts.add((i, j))
+                    break
+    return pts
+
+
+def _seg_min_dist(pt, pts):
+    best = float("inf")
+    for q in pts:
+        d = (pt[0] - q[0]) ** 2 + (pt[1] - q[1]) ** 2
+        if d < best:
+            best = d
+    return math.sqrt(best)
+
+
+def boundary_f1(y_true, y_pred, tolerance=2.0, ignore_index=None):
+    """Boundary F1：预测边界在 tolerance 像素内命中真实边界的 precision/recall 调和均值。"""
+    who = "boundary_f1"
+    rows_t, rows_p, ignore_index = _seg_maps(y_true, y_pred, who, ignore_index)
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError(f"{who}: tolerance 必须是数字")
+    tolerance = float(tolerance)
+    if tolerance < 0.0 or tolerance != tolerance:
+        raise ValueError(f"{who}: tolerance 必须是有限的非负数，收到 {tolerance}")
+    gt = _seg_boundary(rows_t, ignore_index)
+    pd = _seg_boundary(rows_p, ignore_index)
+    if not gt and not pd:
+        return 1.0
+    if not gt or not pd:
+        return 0.0
+    hit_t = sum(1 for q in pd if _seg_min_dist(q, gt) <= tolerance)
+    hit_p = sum(1 for q in gt if _seg_min_dist(q, pd) <= tolerance)
+    precision = hit_t / float(len(pd))
+    recall = hit_p / float(len(gt))
+    if precision + recall <= 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def hd95(y_true, y_pred, ignore_index=None):
+    """HD95：两组边界点双向最近距离合并后的第 95 百分位（像素单位）。"""
+    who = "hd95"
+    rows_t, rows_p, ignore_index = _seg_maps(y_true, y_pred, who, ignore_index)
+    gt = _seg_boundary(rows_t, ignore_index)
+    pd = _seg_boundary(rows_p, ignore_index)
+    if not gt and not pd:
+        return 0.0
+    if not gt or not pd:
+        raise ValueError(f"{who}: 一侧没有任何边界像素，HD95 无定义")
+    dists = [_seg_min_dist(q, pd) for q in gt]
+    dists += [_seg_min_dist(q, gt) for q in pd]
+    dists.sort()
+    idx = int(math.ceil(0.95 * len(dists))) - 1
+    if idx < 0:
+        idx = 0
+    return dists[idx]
+
+
 def precision_at_k(y_relevance, y_score, k=None):
     """P@k：前 k 个里相关文档所占比例（分母是 min(k, 文档数)）。"""
     who = "precision_at_k"

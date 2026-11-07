@@ -404,7 +404,8 @@
   - 单位口径：Brier 单列按 `(p−y)²`、多列按 one-hot 求和平方；`log_loss` 单列时标签必须 0/1
 - [x] 排序：NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage（10 个函数：单查询 6 + 批量聚合 3 + coverage；`_rank_query`/`_rank_batches` 统一校验，按 `(-score, index)` 稳定排序；探针 48 项全过，含分级相关性 NDCG、AP 分母 `min(rel, k)`、coverage 并列口径）
   - 口径：`k=None` 取全部、`k>n` 截到 n；P@k 分母是 `min(k, n)`；NDCG 增益 `2^rel−1`
-- [ ] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU
+- [x] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU（6 个；`_seg_confusion` 统一混淆矩阵与 `ignore_index`，`_seg_boundary` 用四邻域差分取边界；探针 37 项全过，含手算 IoU/Dice、tolerance=0/1 两档 BoundaryF1、HD95=1.0、一侧空边界的两种处理）
+  - 口径：边界只在图像内部判定（图外邻域不制造边界）；HD95 是双向距离合并后取第 95 百分位
 - [ ] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity
 - [ ] 语音：WER / CER / SER（编辑距离）
 - [ ] 聚类：Silhouette / Calinski-Harabasz / Davies-Bouldin / ARI / NMI / AMI

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1305 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1314 项）
 
 ## 特性
 
@@ -1222,6 +1222,33 @@ print(AI.coverage_at_k([[0.9, 0.1], [0.1, 0.9]], 1))  # 1.0
 口径说明：`k=None` 表示取全部文档；`k` 大于文档数时按文档数截断。P@k 的分母是 `min(k, n)`
 而不是固定 `k`，所以 3 个文档时 `k=10` 与 `k=3` 结果相同。
 
+### 分割指标（W13-D）
+
+标签图是「行列表」的二维整数图（`[[0, 0, 1], ...]`），预测图必须同形。
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `pixel_accuracy(y_true, y_pred, ignore_index=None)` | 逐像素正确的比例；`ignore_index` 命中的**真实**像素整点排除 |
+| `mean_iou(y_true, y_pred, num_classes=None, ignore_index=None)` | mIoU：每类 `TP/(TP+FP+FN)` 的平均，只对联合集非空的类取平均 |
+| `dice_score(...)` | 每类 `2TP/(2TP+FP+FN)` 的平均（同上，跳过空类） |
+| `frequency_weighted_iou(...)` | 按真实像素频率加权的 IoU，权重只在联合集非空的类上归一化 |
+| `boundary_f1(y_true, y_pred, tolerance=2.0, ignore_index=None)` | 边界 F1：预测边界点在 `tolerance` 像素内命中真实边界的 P/R 调和均值 |
+| `hd95(y_true, y_pred, ignore_index=None)` | 双向最近距离合并后的第 95 百分位（像素单位） |
+
+```python
+gt = [[0, 0, 1, 1] for _ in range(4)]
+pred = [[0, 0, 0, 1] for _ in range(4)]
+print(AI.pixel_accuracy(gt, pred))   # 0.75
+print(AI.mean_iou(gt, pred))         # 0.5833
+print(AI.boundary_f1(gt, pred, tolerance=0))  # 0.5
+print(AI.hd95(gt, pred))             # 1.0
+```
+
+边界定义：像素与四邻域标签不同即算边界像素，**图像外**的邻域视为相同（所以整幅图单一标签时边界集为空）。
+两张图都无边界时 `boundary_f1` 返回 1.0、`hd95` 返回 0.0；只有一侧无边界时前者返回 0.0、后者抛 `ValueError`
+（距离无定义）。`hd95` 用的是双向距离合并后取分位数，与 MONAI 的 `compute_hausdorff_distance(percent=95)`
+同口径但只做二维、不降采样。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1638,7 +1665,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1305 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1314 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1812,6 +1839,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRegressionMetricsExtra` | MedAE 的奇偶中位与抗离群、MSLE/RMSLE 与手算一致且对负值报错、ExplainedVariance 对系统性偏移不惩罚（对照 R²）、调整 R² 与闭式一致且样本不足报错、Pinball 与 `quantile_loss` 一致、`inference_benchmark` 的字段自洽/`params`/峰值内存与参数校验 |
 | `TestClassificationMetricsExtra` | 平衡准确率 / kappa / 敏感度特异度 / F-beta 单调性 / 汉明 / Jaccard 三种 average / Brier 单列多列 / LogLoss 与 CE 同值 / PR-AUC 阶梯面积 |
 | `TestRankingMetrics` | P@k / R@k / HitRate / RR / AP@k / NDCG@k（含分级相关性）/ MAP@k / MRR / 平均 NDCG / Coverage，以及 k 截断与全部非法输入 |
+| `TestSegmentationMetrics` | PixelAcc / mIoU / Dice / FW-IoU 手算对照、ignore_index、BoundaryF1 的 tolerance 两档、HD95 双向分位数、形状与标签校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1865,7 +1893,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1305 个单元测试
+├── test_ai.py       # 1314 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
