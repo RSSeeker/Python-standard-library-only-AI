@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1716 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1727 项）
 
 ## 特性
 
@@ -2390,6 +2390,39 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### 配置 / 日志 / 内存 / 注册表（W19-C）
+
+| API | 说明 |
+| --- | --- |
+| `load_config(path)` / `save_config(path, cfg, fmt=None)` | 按扩展名读写 `.json` / `.yaml` / `.toml` / `.ini` |
+| `parse_config_text(text, fmt)` / `dump_config(cfg, fmt)` | 只在内存里转换；写回只支持 json 与 yaml |
+| `parse_simple_yaml(text)` / `dump_simple_yaml(value)` | 自带 YAML 子集解析（嵌套映射、块列表、标量、`#` 注释） |
+| `setup_logging(level='INFO', path=None, fmt=...)` / `get_logger(name)` | 给 `ai` logger 装一个 handler，重复调用不叠加 |
+| `log_metrics(metrics, logger=None, prefix='')` | 把数字指标写成一行 `key=value` 日志 |
+| `memory_usage()` / `track_memory(label=None)` | `tracemalloc` 的当前/峰值；上下文管理器给增量与耗时 |
+| `ModelRegistry(directory)` | `register` / `versions` / `latest` / `get` / `describe` / `rollback` |
+
+```python
+cfg = AI.load_config("train.yaml")            # 也可以 .json / .toml / .ini
+AI.save_config("snapshot.yaml", cfg, "yaml")
+log = AI.setup_logging("INFO")                 # 不传 path 就写 stderr
+AI.log_metrics({"loss": 0.5, "acc": 0.98}, logger=log, prefix="step=10 ")
+
+reg = AI.ModelRegistry("runs/registry")
+reg.register("xor", model, metrics={"acc": 1.0})
+version, model = reg.get("xor", 1)             # 取回指定版本（rollback 只是再登记一次）
+```
+
+约定与边界：
+
+- YAML 是**子集**实现：不支持锚点/别名、多文档、块标量（`|` / `>`）、复杂键；
+  需要完整 YAML 请自行安装 PyYAML，本库只保证「配置文件够用」；
+- TOML 走标准库 `tomllib`（Python 3.11+，**只读**），所以 `dump_config` 拒绝写回 toml；
+- INI 用 `configparser`，返回 `{section: {key: str}}`，值一律是字符串；
+- 注册表把每次 `register` 存成 `<root>/<name>/v<n>.json` 并更新 `index.json`
+  （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
+  所以注册表里的文件和手动 `model.save()` 的格式完全一致。
+
 ### 命令行入口（W19-B）
 
 `ai_cli.py` 是仓库里唯一新增的可执行脚本，五个子命令都只依赖 `argparse` 与 `json`：
@@ -2864,7 +2897,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1716 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1727 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3084,6 +3117,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInvariants` | 随机输入下的不变量（概率分布、形状、因果性、池化、IoU 等） |
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
+| `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3137,7 +3171,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1716 个单元测试
+├── test_ai.py       # 1727 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

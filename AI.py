@@ -30908,6 +30908,557 @@ def _w18b_user_why():
     return "要么返回全有限值，要么显式报错——不要静默产生 NaN"
 
 
+# ============================================================================
+#  工程化收尾 W19-C：配置文件 / 日志 / 内存监控 / 模型注册表
+# ============================================================================
+
+_W19C_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _w19c_text(value, what):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s 必须是非空字符串" % what)
+    return value
+
+
+def _w19c_scalar(text):
+    """把 YAML/JSON 风格的标量文本转成 Python 值。"""
+    low = text.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if low in ("null", "none", "~"):
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise ValueError("配置里的内联 JSON 无法解析: %r" % text)
+    return text
+
+
+def _w19c_strip_comment(line):
+    """去掉 `#` 之后的注释，但保留引号里的 `#`。"""
+    out = []
+    quote = None
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def parse_simple_yaml(text):
+    """解析 YAML 的一个实用子集：嵌套映射、块列表、标量、`#` 注释。
+
+    明确不支持：锚点/别名、多文档、块标量（`|` / `>`）、复杂键、标签。
+    需要完整 YAML 请自己装 PyYAML，本库只保证「配置文件够用」。
+    """
+    if not isinstance(text, str):
+        raise ValueError("parse_simple_yaml 需要字符串")
+    raw = []
+    for line in text.splitlines():
+        stripped = _w19c_strip_comment(line)
+        if not stripped.strip():
+            continue
+        if "\t" in stripped[:len(stripped) - len(stripped.lstrip())]:
+            raise ValueError("YAML 缩进不能用制表符")
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        raw.append((indent, stripped.strip()))
+    if not raw:
+        return {}
+
+    def parse_block(start, indent):
+        if raw[start][1].startswith("- "):
+            return parse_list(start, indent)
+        return parse_map(start, indent)
+
+    def parse_map(start, indent):
+        result = {}
+        i = start
+        while i < len(raw):
+            cur_indent, content = raw[i]
+            if cur_indent < indent:
+                break
+            if cur_indent > indent:
+                raise ValueError("第 %d 行缩进不一致: %r" % (i + 1, content))
+            if content.startswith("- "):
+                break
+            if ":" not in content:
+                raise ValueError("第 %d 行不是 key: value: %r" % (i + 1, content))
+            key, _, rest = content.partition(":")
+            key = key.strip()
+            rest = rest.strip()
+            if not key:
+                raise ValueError("第 %d 行缺少键名" % (i + 1))
+            if rest:
+                result[key] = _w19c_scalar(rest)
+                i += 1
+                continue
+            i += 1
+            if i < len(raw) and raw[i][0] > indent:
+                result[key], i = parse_block(i, raw[i][0])
+            else:
+                result[key] = {}
+        return result, i
+
+    def parse_list(start, indent):
+        result = []
+        i = start
+        while i < len(raw):
+            cur_indent, content = raw[i]
+            if cur_indent < indent or not content.startswith("- "):
+                break
+            if cur_indent > indent:
+                raise ValueError("第 %d 行缩进不一致: %r" % (i + 1, content))
+            item = content[2:].strip()
+            if not item:
+                i += 1
+                if i < len(raw) and raw[i][0] > indent:
+                    value, i = parse_block(i, raw[i][0])
+                    result.append(value)
+                else:
+                    result.append(None)
+                continue
+            if ":" in item and not item.startswith(("'", '"')):
+                key, _, rest = item.partition(":")
+                entry = {key.strip(): _w19c_scalar(rest.strip())} if rest.strip() else {key.strip(): {}}
+                i += 1
+                if rest.strip() == "" and i < len(raw) and raw[i][0] > indent:
+                    entry[key.strip()], i = parse_block(i, raw[i][0])
+                while i < len(raw) and raw[i][0] > indent and not raw[i][1].startswith("- "):
+                    sub_indent, sub = raw[i]
+                    if ":" not in sub:
+                        raise ValueError("第 %d 行不是 key: value: %r" % (i + 1, sub))
+                    k2, _, r2 = sub.partition(":")
+                    entry[k2.strip()] = _w19c_scalar(r2.strip()) if r2.strip() else {}
+                    i += 1
+                result.append(entry)
+                continue
+            result.append(_w19c_scalar(item))
+            i += 1
+        return result, i
+
+    value, pos = parse_block(0, raw[0][0])
+    if pos != len(raw):
+        raise ValueError("YAML 解析在第 %d 行停下，剩余内容无法归并" % (pos + 1))
+    return value
+
+
+def dump_simple_yaml(value, indent=0):
+    """把 dict/list/标量写成 `parse_simple_yaml` 能读回的文本。"""
+    pad = " " * indent
+    lines = []
+    if isinstance(value, dict):
+        for key in value:
+            item = value[key]
+            if isinstance(item, (dict, list)) and item:
+                lines.append("%s%s:" % (pad, key))
+                lines.append(dump_simple_yaml(item, indent + 2))
+            else:
+                lines.append("%s%s: %s" % (pad, key, _w19c_render(item)))
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict) and item:
+                keys = list(item)
+                first = keys[0]
+                rest = item[first]
+                if isinstance(rest, (dict, list)) and rest:
+                    lines.append("%s- %s:" % (pad, first))
+                    lines.append(dump_simple_yaml(rest, indent + 4))
+                else:
+                    lines.append("%s- %s: %s" % (pad, first, _w19c_render(rest)))
+                for key in keys[1:]:
+                    sub = item[key]
+                    if isinstance(sub, (dict, list)) and sub:
+                        lines.append("%s  %s:" % (pad, key))
+                        lines.append(dump_simple_yaml(sub, indent + 4))
+                    else:
+                        lines.append("%s  %s: %s" % (pad, key, _w19c_render(sub)))
+            elif isinstance(item, list) and item:
+                lines.append("%s-" % pad)
+                lines.append(dump_simple_yaml(item, indent + 2))
+            else:
+                lines.append("%s- %s" % (pad, _w19c_render(item)))
+    else:
+        lines.append(pad + _w19c_render(value))
+    return "\n".join(lines)
+
+
+def _w19c_render(value):
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+            raise ValueError("配置文件里不能写 NaN/inf")
+        return repr(value)
+    if isinstance(value, str):
+        if value == "" or any(ch in value for ch in ":#'\""):
+            return "'%s'" % value.replace("'", "''")
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    raise ValueError("不支持写进配置的类型: %r" % type(value))
+
+
+def load_config(path):
+    """按扩展名读配置：`.json` / `.yaml` / `.yml` / `.toml` / `.ini` / `.cfg`。
+
+    TOML 走标准库 `tomllib`（Python 3.11+，只读）；INI 走 `configparser`，
+    返回 `{section: {key: str}}`，`[DEFAULT]` 段并入每个 section。
+    """
+    _w19c_text(path, "配置路径")
+    if not os.path.exists(path):
+        raise ValueError("配置文件不存在: %s" % path)
+    suffix = os.path.splitext(path)[1].lower()
+    text = io.open(path, encoding="utf-8").read()
+    return parse_config_text(text, suffix.lstrip(".") or "json", source=path)
+
+
+def parse_config_text(text, fmt="json", source=None):
+    """把配置文本解析成 dict；`fmt` 取 `json` / `yaml` / `yml` / `toml` / `ini`。"""
+    if not isinstance(text, str):
+        raise ValueError("parse_config_text 需要字符串")
+    if not isinstance(fmt, str) or not fmt.strip():
+        raise ValueError("fmt 必须是非空字符串")
+    fmt = fmt.strip().lower()
+    where = ("（%s）" % source) if source else ""
+    if fmt == "json":
+        try:
+            value = json.loads(text)
+        except ValueError as exc:
+            raise ValueError("JSON 配置解析失败%s: %s" % (where, exc))
+    elif fmt in ("yaml", "yml"):
+        value = parse_simple_yaml(text)
+    elif fmt == "toml":
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - 3.11+ 才有
+            raise ValueError("当前 Python 没有 tomllib，TOML 配置需要 3.11+")
+        try:
+            value = tomllib.loads(text)
+        except Exception as exc:
+            raise ValueError("TOML 配置解析失败%s: %s" % (where, exc))
+    elif fmt in ("ini", "cfg"):
+        parser = _configparser().ConfigParser()
+        parser.read_string(text)
+        value = {section: dict(parser.items(section)) for section in parser.sections()}
+        if parser.defaults():
+            value["DEFAULT"] = dict(parser.defaults())
+    else:
+        raise ValueError("不支持的配置格式: %r（可用 json/yaml/toml/ini）" % fmt)
+    if not isinstance(value, dict):
+        raise ValueError("配置文件的顶层必须是映射（dict），实际是 %s%s" % (type(value).__name__, where))
+    return value
+
+
+def _configparser():
+    import configparser
+    return configparser
+
+
+def dump_config(config, fmt="json"):
+    """把 dict 写成配置文本；只支持 json 与 yaml（TOML 没有写回是刻意的）。"""
+    if not isinstance(config, dict):
+        raise ValueError("dump_config 只接受 dict")
+    fmt = (fmt or "json").strip().lower()
+    if fmt == "json":
+        return json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    if fmt in ("yaml", "yml"):
+        return dump_simple_yaml(config) + "\n"
+    raise ValueError("dump_config 只支持 json/yaml，收到 %r" % fmt)
+
+
+def save_config(path, config, fmt=None):
+    """写配置文件；`fmt=None` 时按扩展名推断。返回路径。"""
+    _w19c_text(path, "配置路径")
+    if fmt is None:
+        suffix = os.path.splitext(path)[1].lower().lstrip(".")
+        fmt = suffix or "json"
+    text = dump_config(config, fmt)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(text)
+    return path
+
+
+_W19C_LOGGER_NAME = "ai"
+_W19C_HANDLER_TAG = "_w19c_handler"
+
+
+def setup_logging(level="INFO", path=None, fmt="%(asctime)s %(levelname)s %(name)s %(message)s"):
+    """给名为 `ai` 的 logger 装一个 stderr（或文件）handler，重复调用不会叠加。
+
+    返回配置好的 logger；`path` 给定时写文件（UTF-8，append），否则写 stderr。
+    """
+    if not isinstance(level, str):
+        raise ValueError("level 必须是字符串，如 'INFO'")
+    level_value = getattr(logging, level.strip().upper(), None)
+    if not isinstance(level_value, int):
+        raise ValueError("未知日志级别: %r" % level)
+    logger = logging.getLogger(_W19C_LOGGER_NAME)
+    logger.setLevel(level_value)
+    for handler in list(logger.handlers):
+        if getattr(handler, _W19C_HANDLER_TAG, False):
+            logger.removeHandler(handler)
+            handler.close()
+    if path:
+        _w19c_text(path, "日志路径")
+        handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    else:
+        handler = logging.StreamHandler()
+    setattr(handler, _W19C_HANDLER_TAG, True)
+    handler.setFormatter(logging.Formatter(fmt))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def get_logger(name=_W19C_LOGGER_NAME):
+    """取（或创建）一个 logger；名字不是 `ai` 时挂在 `ai.` 之下。"""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("logger 名字必须是非空字符串")
+    name = name.strip()
+    if name != _W19C_LOGGER_NAME and not name.startswith(_W19C_LOGGER_NAME + "."):
+        name = _W19C_LOGGER_NAME + "." + name
+    return logging.getLogger(name)
+
+
+def log_metrics(metrics, logger=None, prefix=""):
+    """把指标写成一行日志（`key=value` 空格分隔），返回这一行文本。"""
+    if not isinstance(metrics, dict):
+        raise ValueError("log_metrics 需要 dict")
+    parts = []
+    for key in sorted(metrics):
+        value = metrics[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("log_metrics 只收数字，%r 是 %s" % (key, type(value).__name__))
+        parts.append("%s=%s" % (key, ("%.6g" % value) if isinstance(value, float) else value))
+    line = prefix + " ".join(parts)
+    log = logger or get_logger()
+    log.info(line)
+    return line
+
+
+class track_memory:
+    """上下文管理器：统计这段代码的 `tracemalloc` 增量与峰值。
+
+    with 结束后 `stats` 含 `current` / `peak` / `delta_current` / `started_here` / `seconds`。
+    之前没开 `tracemalloc` 时会自己开、退出时自己关（不改变调用方状态）。
+    """
+
+    def __init__(self, label=None):
+        self.label = label
+        self.stats = {}
+
+    def __enter__(self):
+        self._started_here = not tracemalloc.is_tracing()
+        if self._started_here:
+            tracemalloc.start()
+        self._base = tracemalloc.get_traced_memory()[0]
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        current, peak = tracemalloc.get_traced_memory()
+        elapsed = time.perf_counter() - self._t0
+        if self._started_here:
+            tracemalloc.stop()
+        self.stats = {
+            "label": self.label,
+            "started_here": self._started_here,
+            "current": current,
+            "peak": peak,
+            "delta_current": current - self._base,
+            "seconds": elapsed,
+        }
+        return False
+
+
+def memory_usage():
+    """当前 Python 堆用量；没在追踪时返回 `tracing=False` 而不是报错。"""
+    if not tracemalloc.is_tracing():
+        return {"tracing": False, "current": None, "peak": None}
+    current, peak = tracemalloc.get_traced_memory()
+    return {"tracing": True, "current": current, "peak": peak}
+
+
+class ModelRegistry:
+    """按名字 + 版本号存模型的目录注册表。
+
+    目录结构：`<root>/index.json` 加 `<root>/<name>/v<version>.json`；
+    每次 register 写新版本（自增），旧版本保留，`rollback` 只是把 latest 指回去。
+    """
+
+    INDEX = "index.json"
+
+    def __init__(self, directory):
+        _w19c_text(directory, "注册表目录")
+        self.directory = directory
+        if not os.path.isdir(self.directory):
+            os.makedirs(self.directory)
+        self._index_path = os.path.join(self.directory, self.INDEX)
+        self._index = self._load_index()
+
+    def _load_index(self):
+        if not os.path.exists(self._index_path):
+            return {}
+        try:
+            data = json.loads(io.open(self._index_path, encoding="utf-8").read())
+        except ValueError as exc:
+            raise ValueError("注册表索引损坏（%s）: %s" % (self._index_path, exc))
+        if not isinstance(data, dict):
+            raise ValueError("注册表索引顶层必须是 dict")
+        return data
+
+    def _save_index(self):
+        text = json.dumps(self._index, ensure_ascii=False, sort_keys=True, indent=2)
+        tmp = self._index_path + ".tmp"
+        io.open(tmp, "w", encoding="utf-8", newline="\n").write(text + "\n")
+        os.replace(tmp, self._index_path)
+
+    @staticmethod
+    def _check_name(name):
+        if not isinstance(name, str) or not _W19C_NAME_RE.match(name):
+            raise ValueError("模型名只能是字母/数字/下划线/点/短横线: %r" % (name,))
+        return name
+
+    def register(self, name, model, metrics=None, extra=None):
+        """登记一个模型（传 `Model` 实例或已有的 JSON 路径），返回版本号。"""
+        self._check_name(name)
+        metric_map = _w19c_metric_map(metrics, "registry.metrics")
+        if isinstance(model, str):
+            if not os.path.exists(model):
+                raise ValueError("模型文件不存在: %s" % model)
+            payload = io.open(model, encoding="utf-8").read()
+        else:
+            payload = self._payload_of(model)
+        entries = self._index.setdefault(name, [])
+        version = 1 + max([int(item["version"]) for item in entries], default=0)
+        folder = os.path.join(self.directory, name)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        target = os.path.join(folder, "v%d.json" % version)
+        if os.path.exists(target):
+            raise ValueError("版本文件已存在: %s" % target)
+        io.open(target, "w", encoding="utf-8", newline="\n").write(payload)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        entries.append({
+            "version": version,
+            "path": target,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "sha256": digest,
+            "metrics": metric_map,
+            "extra": dict(extra) if extra else {},
+        })
+        self._save_index()
+        return version
+
+    @staticmethod
+    def _payload_of(model):
+        """把模型变成 JSON 文本：`Model` 走 `save`，MLP 走 `to_save_dict` 风格。"""
+        if hasattr(model, "save") and hasattr(model, "predict"):
+            import contextlib
+            import shutil
+            import tempfile
+            tmpdir = tempfile.mkdtemp(prefix="w19c_")
+            try:
+                path = os.path.join(tmpdir, "model.json")
+                with track_memory(), contextlib.redirect_stdout(io.StringIO()):
+                    model.save(path)
+                return io.open(path, encoding="utf-8").read()
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        if hasattr(model, "to_dict"):
+            text = json.dumps(model.to_dict(), ensure_ascii=False, sort_keys=True,
+                              indent=2, allow_nan=False)
+            return text + "\n"
+        raise ValueError("register 需要 Model 实例（有 save/predict）或它的 JSON 路径")
+
+    @staticmethod
+    def _dict_of(model):
+        if hasattr(model, "to_dict"):
+            return model.to_dict()
+        net = getattr(model, "model", None)
+        if net is not None and hasattr(net, "to_dict"):
+            return net.to_dict()
+        raise ValueError("register 需要 Model 实例或它的 JSON 路径")
+
+    def versions(self, name):
+        self._check_name(name)
+        return [int(item["version"]) for item in self._index.get(name, [])]
+
+    def latest(self, name):
+        self._check_name(name)
+        entries = self._index.get(name, [])
+        if not entries:
+            raise ValueError("注册表里没有模型: %s" % name)
+        item = max(entries, key=lambda it: int(it["version"]))
+        return int(item["version"]), item["path"]
+
+    def get(self, name, version=None):
+        """按名字（可选版本）取回 `Model`；返回 `(version, model)`。"""
+        if version is None:
+            version, path = self.latest(name)
+        else:
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise ValueError("version 必须是整数")
+            matches = [it for it in self._index.get(name, []) if int(it["version"]) == version]
+            if not matches:
+                raise ValueError("模型 %s 没有版本 %d（已有 %s）"
+                                 % (name, version, self.versions(name)))
+            path = matches[0]["path"]
+        with track_memory():
+            model = Model.load(path)
+        return version, model
+
+    def describe(self, name=None):
+        """返回索引的深拷贝（`name` 给定时只返回该模型的版本列表）。"""
+        if name is None:
+            return json.loads(json.dumps(self._index, ensure_ascii=False))
+        self._check_name(name)
+        return json.loads(json.dumps(self._index.get(name, []), ensure_ascii=False))
+
+    def rollback(self, name, version):
+        """把某版本重新登记为最新（不删除历史）；返回新版本号。"""
+        _, model = self.get(name, version)
+        return self.register(name, model, extra={"rollback_from": int(version)})
+
+
+def _w19c_metric_map(metrics, what):
+    if metrics is None:
+        return {}
+    if not isinstance(metrics, dict):
+        raise ValueError("%s 必须是 dict" % what)
+    out = {}
+    for key, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("%s 只收数字，%r 是 %s" % (what, key, type(value).__name__))
+        out[key] = value
+    return out
+
 # ==== W19-A：实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据 ====
 
 def git_hash(directory=None):

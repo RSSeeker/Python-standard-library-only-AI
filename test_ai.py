@@ -26230,3 +26230,163 @@ class TestCLI:
             ai_cli.main(["--help"])
         assert excinfo.value.code == 0
         assert "train" in capsys.readouterr().out
+class TestConfigRegistry:
+    """配置文件（YAML/JSON/TOML/INI）、日志、内存监控与模型注册表。"""
+
+    YAML_TEXT = (
+        "task: classification\n"
+        "lr: 0.01\n"
+        "model:\n"
+        "  hidden:\n"
+        "    - 16\n"
+        "    - 8\n"
+        "flags:\n"
+        "  verbose: true\n"
+        "  cache: null\n"
+        "note: 'has # inside'\n"
+    )
+
+    def test_yaml_subset(self):
+        cfg = AI.parse_simple_yaml(self.YAML_TEXT)
+        assert cfg["task"] == "classification"
+        assert cfg["lr"] == 0.01
+        assert cfg["model"]["hidden"] == [16, 8]
+        assert cfg["flags"] == {"verbose": True, "cache": None}
+        assert cfg["note"] == "has # inside"
+        assert AI.parse_simple_yaml(AI.dump_simple_yaml(cfg)) == cfg
+
+    def test_yaml_errors(self):
+        for text in ("a: 1\n   b: 2\n", "a 1\n", "a:\n\tb: 1\n"):
+            with pytest.raises(ValueError):
+                AI.parse_simple_yaml(text)
+        with pytest.raises(ValueError):
+            AI.parse_simple_yaml(123)
+
+    def test_load_config_formats(self, tmp_path):
+        yaml_path = os.path.join(str(tmp_path), "c.yaml")
+        io.open(yaml_path, "w", encoding="utf-8", newline="\n").write(self.YAML_TEXT)
+        cfg = AI.load_config(yaml_path)
+        assert cfg["model"]["hidden"] == [16, 8]
+
+        json_path = os.path.join(str(tmp_path), "c.json")
+        AI.save_config(json_path, cfg, "json")
+        assert AI.load_config(json_path) == cfg
+
+        toml_path = os.path.join(str(tmp_path), "c.toml")
+        io.open(toml_path, "w", encoding="utf-8", newline="\n").write(
+            'name = "x"\n[server]\nport = 8080\n')
+        assert AI.load_config(toml_path) == {"name": "x", "server": {"port": 8080}}
+
+        ini_path = os.path.join(str(tmp_path), "c.ini")
+        io.open(ini_path, "w", encoding="utf-8", newline="\n").write("[db]\nhost = local\n")
+        assert AI.load_config(ini_path) == {"db": {"host": "local"}}
+
+    def test_config_errors(self, tmp_path):
+        with pytest.raises(ValueError):
+            AI.parse_config_text("a: 1\n", "xml")
+        with pytest.raises(ValueError):
+            AI.parse_config_text("[1, 2]", "json")
+        with pytest.raises(ValueError):
+            AI.parse_config_text("{oops", "json", source="c.json")
+        with pytest.raises(ValueError):
+            AI.load_config(os.path.join(str(tmp_path), "missing.yaml"))
+        with pytest.raises(ValueError):
+            AI.dump_config({"a": 1}, "toml")
+        with pytest.raises(ValueError):
+            AI.dump_config([1, 2])
+        with pytest.raises(ValueError):
+            AI.dump_config({"a": float("nan")})
+
+    def test_logging_setup(self, tmp_path):
+        log_path = os.path.join(str(tmp_path), "run.log")
+        logger = AI.setup_logging("DEBUG", path=log_path)
+        assert logger.name == "ai"
+        assert logger.level == logging.DEBUG
+        AI.setup_logging("INFO", path=log_path)
+        owned = [h for h in logger.handlers if getattr(h, "_w19c_handler", False)]
+        assert len(owned) == 1
+        line = AI.log_metrics({"loss": 0.5, "acc": 1}, logger=logger, prefix="step=1 ")
+        assert line == "step=1 acc=1 loss=0.5"
+        assert AI.get_logger("train").name == "ai.train"
+        for handler in list(logger.handlers):
+            if getattr(handler, "_w19c_handler", False):
+                logger.removeHandler(handler)
+                handler.close()
+
+    def test_logging_errors(self):
+        with pytest.raises(ValueError):
+            AI.log_metrics({"ok": True})
+        with pytest.raises(ValueError):
+            AI.setup_logging("LOUD")
+        with pytest.raises(ValueError):
+            AI.get_logger("")
+
+    def test_track_memory(self):
+        before = AI.memory_usage()
+        with AI.track_memory("alloc") as meter:
+            blobs = [list(range(2000)) for _ in range(50)]
+        stats = meter.stats
+        assert stats["label"] == "alloc"
+        assert stats["peak"] > 0
+        assert stats["delta_current"] != 0
+        assert stats["seconds"] >= 0.0
+        assert AI.memory_usage()["tracing"] == before["tracing"]
+        del blobs
+
+    def _model(self):
+        return AI.quick_train([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+                              [0, 1, 1, 0], task="classification", hidden_layers=(6,),
+                              epochs=40, val_split=0.0, verbose=False, seed=5)
+
+    def test_registry_versions(self, tmp_path):
+        reg = AI.ModelRegistry(os.path.join(str(tmp_path), "reg"))
+        model = self._model()
+        assert reg.register("xor", model, metrics={"acc": 1.0}, extra={"n": 1}) == 1
+        assert reg.register("xor", model) == 2
+        assert reg.versions("xor") == [1, 2]
+        assert reg.latest("xor")[0] == 2
+        entry = reg.describe("xor")[0]
+        assert sorted(entry) == ["created_at", "extra", "metrics", "path", "sha256", "version"]
+        assert len(entry["sha256"]) == 64
+        assert entry["metrics"] == {"acc": 1.0}
+        assert entry["extra"] == {"n": 1}
+        assert os.path.exists(os.path.join(str(tmp_path), "reg", "index.json"))
+
+    def test_registry_get_and_rollback(self, tmp_path):
+        reg = AI.ModelRegistry(os.path.join(str(tmp_path), "reg"))
+        model = self._model()
+        reg.register("xor", model)
+        reg.register("xor", model)
+        version, loaded = reg.get("xor", 1)
+        assert version == 1
+        assert loaded.predict([0.0, 0.0]) == model.predict([0.0, 0.0])
+        assert reg.rollback("xor", 1) == 3
+        assert reg.versions("xor") == [1, 2, 3]
+        assert AI.ModelRegistry(os.path.join(str(tmp_path), "reg")).versions("xor") == [1, 2, 3]
+
+    def test_registry_errors(self, tmp_path):
+        reg = AI.ModelRegistry(os.path.join(str(tmp_path), "reg"))
+        model = self._model()
+        reg.register("xor", model)
+        with pytest.raises(ValueError):
+            reg.get("xor", 9)
+        with pytest.raises(ValueError):
+            reg.get("nope")
+        with pytest.raises(ValueError):
+            reg.get("xor", "1")
+        with pytest.raises(ValueError):
+            reg.register("bad name", model)
+        with pytest.raises(ValueError):
+            reg.register("x2", os.path.join(str(tmp_path), "missing.json"))
+        # 登记失败不应在索引里留下空壳
+        assert sorted(reg.describe()) == ["xor"]
+
+    def test_registry_from_path(self, tmp_path):
+        reg = AI.ModelRegistry(os.path.join(str(tmp_path), "reg"))
+        model = self._model()
+        path = os.path.join(str(tmp_path), "outside.json")
+        model.save(path)
+        assert reg.register("from_path", path) == 1
+        assert sorted(reg.describe()) == ["from_path"]
+        with pytest.raises(ValueError):
+            reg.register("y", 123)

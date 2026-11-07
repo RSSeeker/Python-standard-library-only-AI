@@ -616,7 +616,18 @@
     `export` 写 `{"format": "ai-export-1", "model", "metadata"}`（元数据复用 `model_metadata`）。
   - 探针 12 项（`C:\Users\Jiang\AppData\Local\Temp\probe_w19b.py`）+ `TestCLI` 11 例；
     全库 1705 -> 1716 passed。
-- [ ] 配置支持 YAML/TOML；`logging` 集成；内存监控（tracemalloc）；模型注册表/版本管理
+- [x] 配置支持 YAML/TOML；`logging` 集成；内存监控（tracemalloc）；模型注册表/版本管理
+  - 已实现 `load_config` / `save_config` / `parse_config_text` / `dump_config` +
+    自带 `parse_simple_yaml` / `dump_simple_yaml`（YAML 子集：嵌套映射、块列表、标量、注释；
+    不支持锚点/多文档/块标量）；TOML 走标准库 `tomllib`（只读），INI 走 `configparser`。
+  - `setup_logging` / `get_logger` / `log_metrics`：重复调用不叠加 handler，指标只收数字。
+  - `memory_usage` / `track_memory`：`tracemalloc` 当前值与峰值，退出恢复调用方追踪状态。
+  - `ModelRegistry`：`register`（`Model` 或 JSON 路径）/ `versions` / `latest` / `get` /
+    `describe` / `rollback`，每次登记写 `<name>/v<n>.json` + `index.json`（含 sha256），旧版本不删。
+  - 真 bug（探针抓到）：`register` 原先先 `setdefault(name, [])` 再校验，登记失败会在索引里
+    留一个空壳模型名；改为「先解析 payload 再动索引」。
+  - 探针 40 项（`C:\\Users\\Jiang\\AppData\\Local\\Temp\\probe_w19c.py`）+ `TestConfigRegistry` 11 例；
+    全库 1716 -> 1727 passed。
 
 ### W20 研究前沿（§17，文档 + 最小演示）
 - [ ] DP-SGD（梯度裁剪 + 高斯噪声 + 隐私预算记账）
