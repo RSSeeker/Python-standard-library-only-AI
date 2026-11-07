@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1202 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1209 项）
 
 ## 特性
 
@@ -902,6 +902,28 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
+### 切分扩展（W11-D）
+
+三个纯索引切分器（返回下标列表，不复制数据），补上 `k_fold_indices` 覆盖不到的场景：
+
+| 函数 | 用途 |
+|---|---|
+| `group_k_fold_indices(groups, n_splits=5)` | 按**组**切折：同一组的样本永远在同一侧（患者/用户/文件 id 之类），避免同组泄漏。分配确定性：组按 `(-样本数, str(id))` 排序后塞进当前最空的折；折间样本数极差 ≤ 1 |
+| `time_series_split_indices(n_samples, n_splits=5, test_size=None, gap=0, expanding=True, window=None)` | 时间序列：测试块一律在训练块**之后**。`expanding=True` 训练窗口从 0 扩张；`False` 时滚动窗口（长度默认取首折训练长）。`gap` 在训练与测试之间留空档 |
+| `purged_kfold_indices(n_samples, n_splits=5, purge=0, embargo=0)` | 连续分块 K 折 + 清洗：训练集剔除 `[a-purge, b+purge+embargo)`（`[a, b)` 是测试块） |
+
+```python
+for tr, va in AI.group_k_fold_indices(patient_ids, n_splits=5):
+    model.fit(data=[rows[i] for i in tr])
+
+for tr, te in AI.time_series_split_indices(len(series), n_splits=4, gap=3):
+    assert max(tr) < min(te)          # 永远不看过未来
+```
+
+`test_size` 默认 `n_samples // (n_splits + 1)`；约束只有一条——**首折训练集非空**
+（`n_samples > n_splits*test_size + gap`）。三个函数都对非整数/布尔超参、
+`n_splits` 越界、清洗后训练集为空报 `ValueError` / `TypeError`。
+
 ### 图像增强（W11-C）
 
 全部作用于 `(C, H, W)` 的嵌套 list（与卷积层的输入约定一致），返回新图、不改入参；
@@ -1347,7 +1369,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1202 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1209 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1511,6 +1533,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
+| `TestSplitExtensions` | `GroupKFold` 的「同组不跨折」与折间均衡、时序切分的测试块位置/扩张与滚动窗口/`gap` 留空档、Purged K-Fold 的 `purge`+`embargo` 剔除区间、三类切分的参数校验、既有 `k_fold_indices` 不受影响 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1564,7 +1587,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1202 个单元测试
+├── test_ai.py       # 1209 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

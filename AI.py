@@ -24910,6 +24910,152 @@ def k_fold_indices(n_samples: int, n_splits: int = 5, shuffle: bool = True,
     return out
 
 
+#  ======================================================================
+#  W11-D：切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#  ======================================================================
+
+def _w11d_int(value, who, name, minimum=None):
+    """校验整数超参（bool 不算整数）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("%s: %s 必须是整数" % (who, name))
+    if minimum is not None and value < minimum:
+        raise ValueError("%s: %s 必须 >= %d，收到 %d" % (who, name, minimum, value))
+    return value
+
+
+def group_k_fold_indices(groups, n_splits=5, seed=42):
+    """按**组**切 K 折：同一组的样本永远落在同一侧，避免同组信息泄漏。
+
+    groups: 与样本等长的组 id 序列（任意可哈希对象）
+    返回 [(train_idx, val_idx)] * n_splits。
+
+    分配是确定性的：组按「样本数降序、组 id 升序」排列后，依次塞进当前
+    样本数最少的折；`seed` 目前只用于参数校验不参与分配（保留兼容位）。
+    """
+    if not isinstance(groups, (list, tuple)) or not groups:
+        raise ValueError("group_k_fold_indices: groups 必须是非空序列")
+    n_samples = len(groups)
+    n_splits = _w11d_int(n_splits, "group_k_fold_indices", "n_splits", 2)
+    _w11d_int(seed, "group_k_fold_indices", "seed")
+
+    counts = {}
+    for idx, g in enumerate(groups):
+        try:
+            counts[g] = counts.get(g, 0) + 1
+        except TypeError:
+            raise TypeError(
+                "group_k_fold_indices: 第 %d 个组 id 不可哈希（%r）" % (idx, g))
+    n_groups = len(counts)
+    if n_splits > n_groups:
+        raise ValueError(
+            "group_k_fold_indices: n_splits=%d 超过不同组数 %d"
+            % (n_splits, n_groups))
+
+    order = sorted(counts.keys(), key=lambda g: (-counts[g], str(g)))
+    fold_of = {}
+    load = [0] * n_splits
+    for g in order:
+        best = 0
+        for k in range(1, n_splits):
+            if load[k] < load[best]:
+                best = k
+        fold_of[g] = best
+        load[best] += counts[g]
+
+    folds = [[] for _ in range(n_splits)]
+    for idx, g in enumerate(groups):
+        folds[fold_of[g]].append(idx)
+    out = []
+    for k in range(n_splits):
+        val_idx = sorted(folds[k])
+        val_set = set(val_idx)
+        train_idx = [i for i in range(n_samples) if i not in val_set]
+        out.append((train_idx, val_idx))
+    return out
+
+
+def time_series_split_indices(n_samples, n_splits=5, test_size=None, gap=0,
+                              expanding=True, window=None):
+    """时间序列切分：每一折的测试块都**在**训练块之后，绝不看未来。
+
+    n_samples:  样本总数
+    n_splits:   折数（>=1）
+    test_size:  每块测试集大小；None 时取 n_samples // (n_splits + 1)
+    gap:        训练块与测试块之间隔开的样本数（防标签泄漏）
+    expanding:  True 时训练窗口从 0 开始扩张；False 时滚动窗口（长度默认取首折训练长）
+    window:     滚动窗口长度；只在不扩张时生效
+    """
+    n_samples = _w11d_int(n_samples, "time_series_split_indices", "n_samples", 1)
+    n_splits = _w11d_int(n_splits, "time_series_split_indices", "n_splits", 1)
+    gap = _w11d_int(gap, "time_series_split_indices", "gap", 0)
+    if test_size is None:
+        test_size = n_samples // (n_splits + 1)
+    test_size = _w11d_int(test_size, "time_series_split_indices", "test_size", 1)
+    #  唯一真正的约束是「首折的训练集非空」：n_samples - n_splits*test_size - gap > 0。
+    need = n_splits * test_size + gap
+    if need >= n_samples:
+        raise ValueError(
+            "time_series_split_indices: 样本数 %d 不够（需要 > n_splits*test_size + "
+            "gap = %d）" % (n_samples, need))
+    if window is not None:
+        window = _w11d_int(window, "time_series_split_indices", "window", 1)
+
+    starts = [n_samples - (n_splits - k) * test_size for k in range(n_splits)]
+    base_train = starts[0] - gap
+    if base_train <= 0:
+        raise ValueError(
+            "time_series_split_indices: 首折训练集为空（test_size=%d、gap=%d、"
+            "n_samples=%d）" % (test_size, gap, n_samples))
+    win = base_train if window is None else window
+    out = []
+    for start in starts:
+        train_end = start - gap
+        if expanding:
+            train_idx = list(range(0, train_end))
+        else:
+            train_idx = list(range(max(0, train_end - win), train_end))
+        test_idx = list(range(start, min(start + test_size, n_samples)))
+        out.append((train_idx, test_idx))
+    return out
+
+
+def purged_kfold_indices(n_samples, n_splits=5, purge=0, embargo=0):
+    """连续分块的 K 折 + 清洗（purge）/ 禁运（embargo）。
+
+    测试块是连续的 `[a, b)`；训练集剔除 `[a-purge, b+purge)`，再禁运测试块之后
+    紧邻的 `embargo` 个样本——时间序列里模型在测试块附近「背答案」就靠这两刀。
+
+    返回 (train_idx, val_idx) 列表，共 n_splits 个。
+    """
+    n_samples = _w11d_int(n_samples, "purged_kfold_indices", "n_samples", 2)
+    n_splits = _w11d_int(n_splits, "purged_kfold_indices", "n_splits", 2)
+    purge = _w11d_int(purge, "purged_kfold_indices", "purge", 0)
+    embargo = _w11d_int(embargo, "purged_kfold_indices", "embargo", 0)
+    if n_splits > n_samples:
+        raise ValueError(
+            "purged_kfold_indices: n_splits=%d 超过样本数 %d" % (n_splits, n_samples))
+
+    out = []
+    for k in range(n_splits):
+        a = (k * n_samples) // n_splits
+        b = ((k + 1) * n_samples) // n_splits
+        if b <= a:
+            raise ValueError(
+                "purged_kfold_indices: 第 %d 折为空（n_samples=%d、n_splits=%d）"
+                % (k, n_samples, n_splits))
+        ban_lo = max(0, a - purge)
+        ban_hi = min(n_samples, b + purge + embargo)
+        val_idx = list(range(a, b))
+        train_idx = [i for i in range(n_samples)
+                     if i < ban_lo or i >= ban_hi]
+        if not train_idx:
+            raise ValueError(
+                "purged_kfold_indices: 第 %d 折清洗后训练集为空（purge=%d、embargo=%d）"
+                % (k, purge, embargo))
+        out.append((train_idx, val_idx))
+    return out
+
+
 class StandardScaler:
     """逐特征标准化：(x - mean) / std（std 为 0 时按 1 处理，不做缩放）"""
 

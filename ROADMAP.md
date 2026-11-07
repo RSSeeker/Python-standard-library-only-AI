@@ -324,7 +324,12 @@
   - `RandomResizedCrop` 10 次采样失败退化为中心裁剪；`RandomRotation` 逆映射双线性 + `fill`。
   - `ColorJitter` 的 hue 用行和恒为 1 的亮度保持矩阵（灰度图抖动后仍是同一灰度）。
   - `GaussianBlur` 边界按实际权重重新归一化 ⇒ 常量图模糊不变；核/`sigma` 非法报错。
-- [ ] 切分扩展：`GroupKFold` / 时间序列切分
+- [x] 切分扩展：`GroupKFold` / 时间序列切分 / Purged K-Fold
+  - `group_k_fold_indices`：同组不跨折，组按样本数降序塞进最空的折（折间极差 ≤ 1）。
+  - `time_series_split_indices`：测试块恒在训练块之后；`expanding` 扩张 / 滚动窗口，
+    `gap` 留空档；唯一约束是首折训练集非空。
+  - `purged_kfold_indices`：连续分块 + `purge`/`embargo` 剔除测试块附近样本，
+    清洗后训练集为空会报错而不是静默返回空折。
 - [ ] Scaler 族：Robust / MaxAbs / QuantileTransformer / PowerTransformer
 - [ ] 缺失值：`SimpleImputer` / `KNNImputer` / `IterativeImputer`
 - [ ] 降维：`PCA` / `t-SNE`（简化）；`SMOTE` / `ADASYN`；特征选择（VarianceThreshold / SelectKBest / RFE / L1）

@@ -19473,3 +19473,89 @@ class TestImageAugmentation:
         assert build()(src) == out
         assert pipe(src) != out
         assert src[0][0][0] == 0.5 and len(src[0]) == 10
+
+
+class TestSplitExtensions:
+    """W11-D：GroupKFold / 时间序列切分 / Purged K-Fold"""
+
+    def test_group_k_fold(self):
+        groups = ["a", "a", "a", "b", "b", "c", "d", "d", "e", "f"]
+        folds = AI.group_k_fold_indices(groups, n_splits=3)
+        assert len(folds) == 3
+        seen = set()
+        for tr, va in folds:
+            assert sorted(tr + va) == list(range(10))
+            assert not seen & set(va)
+            seen |= set(va)
+            assert not ({groups[i] for i in tr} & {groups[i] for i in va})
+        assert seen == set(range(10))
+        sizes = [sum(len(groups[i]) for i in tr) for tr, _ in folds]
+        assert max(sizes) - min(sizes) <= 1
+        assert AI.group_k_fold_indices(groups, 3) == folds
+        assert AI.group_k_fold_indices(["a", "b", "c"], 3)[0][1] != []
+
+    def test_group_k_fold_validation(self):
+        with pytest.raises(ValueError):
+            AI.group_k_fold_indices([], 2)
+        with pytest.raises(ValueError):
+            AI.group_k_fold_indices(["a"], 2)
+        with pytest.raises(ValueError):
+            AI.group_k_fold_indices(["a", "b"], 1)
+        with pytest.raises(TypeError):
+            AI.group_k_fold_indices(["a", "b"], 2.0)
+        with pytest.raises(TypeError):
+            AI.group_k_fold_indices(["a", "b"], 2, seed=1.5)
+
+    def test_time_series_expanding(self):
+        splits = AI.time_series_split_indices(100, n_splits=4)
+        assert len(splits) == 4
+        assert [va[0] for _tr, va in splits] == [20, 40, 60, 80]
+        assert [va[-1] for _tr, va in splits] == [39, 59, 79, 99]
+        assert [len(tr) for tr, _ in splits] == [20, 40, 60, 80]
+        assert all(tr[0] == 0 and max(tr) < min(va) for tr, va in splits)
+        assert [len(va) for _tr, va in AI.time_series_split_indices(30, 2)] == [10, 10]
+        assert len(AI.time_series_split_indices(30, 1)) == 1
+
+    def test_time_series_gap_and_rolling(self):
+        g = AI.time_series_split_indices(100, n_splits=4, gap=5)
+        assert all(tr[-1] == min(va) - 6 for tr, va in g)
+        r = AI.time_series_split_indices(100, n_splits=4, expanding=False, window=10)
+        assert all(len(tr) == 10 and max(tr) < min(va) for tr, va in r)
+        r0 = AI.time_series_split_indices(100, n_splits=4, expanding=False)
+        assert [len(tr) for tr, _ in r0] == [20, 20, 20, 20]
+
+    def test_time_series_validation(self):
+        for call in (
+            lambda: AI.time_series_split_indices(0),
+            lambda: AI.time_series_split_indices(10, n_splits=0),
+            lambda: AI.time_series_split_indices(10, n_splits=2, test_size=0),
+            lambda: AI.time_series_split_indices(5, n_splits=5),
+            lambda: AI.time_series_split_indices(20, n_splits=2, gap=9),
+            lambda: AI.time_series_split_indices(20, n_splits=2.0),
+            lambda: AI.time_series_split_indices(100, n_splits=2, window=0),
+        ):
+            with pytest.raises((ValueError, TypeError)):
+                call()
+
+    def test_purged_k_fold(self):
+        p = AI.purged_kfold_indices(50, n_splits=5)
+        assert [va for _tr, va in p] == [list(range(i, i + 10)) for i in (0, 10, 20, 30, 40)]
+        assert all(sorted(tr + va) == list(range(50)) for tr, va in p)
+        tr2, va2 = AI.purged_kfold_indices(50, n_splits=5, purge=2, embargo=3)[2]
+        assert all(i not in tr2 for i in range(18, 32))
+        assert all(i not in tr2 for i in range(32, 35))
+        assert 35 in tr2 and 17 in tr2
+
+    def test_purged_validation_and_legacy(self):
+        for call in (
+            lambda: AI.purged_kfold_indices(1),
+            lambda: AI.purged_kfold_indices(10, n_splits=1),
+            lambda: AI.purged_kfold_indices(10, n_splits=20),
+            lambda: AI.purged_kfold_indices(10, n_splits=2, purge=-1),
+            lambda: AI.purged_kfold_indices(10, n_splits=2, embargo=1.0),
+            lambda: AI.purged_kfold_indices(10, n_splits=2, purge=8, embargo=8),
+        ):
+            with pytest.raises((ValueError, TypeError)):
+                call()
+        kf = AI.k_fold_indices(20, n_splits=4, seed=1)
+        assert len(kf) == 4
