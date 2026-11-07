@@ -378,7 +378,14 @@
   - 探针 31 项：特殊 token、裁剪两侧、pre/post 补齐、`max_len` 截断、按值掩码、
     `batch_sequences` 的 lengths 与两种掩码、歧义对照、真实 `WordPieceTokenizer` 端到端、22 条非法输入。
 
-- [ ] `SentencePieceTokenizer`（Unigram LM 简化版）；`WordTokenizer` / `WhitespaceTokenizer` / `RegexTokenizer`
+- [x] `SentencePieceTokenizer`（Unigram LM 简化版）；`WordTokenizer` / `WhitespaceTokenizer` / `RegexTokenizer`
+  - 四个分词器统一 `fit/encode/decode` 契约，词表固定 `[PAD]=0`、`[UNK]=1`，可直接喂 `batch_sequences`。
+  - `SentencePieceTokenizer`：子串频次建 unigram + Viterbi 切分，强制收录语料里的全部单字符，
+    未登录字符退 `<unk>`；docstring 写明与真 SentencePiece 的四点差别（无 EM、无字节回退、
+    只支持 `▁`、无 dummy prefix 开关）。
+  - 为避免引入新依赖，`RegexTokenizer` 用的是标准库 `re`（`AI.py` 顶部新增 `import re`）。
+  - 探针 51 项：四种分词器的词表顺序与往返、标点/大小写/正则切分、SentencePiece 的 id 固定、
+    子词复现、`max_piece_len` 约束、未登录与中文单字、与 `tokenize_batch` 的协作、30 条非法输入。
 
 ### W13 指标扩展（§9）
 - [ ] 回归：MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Quantile

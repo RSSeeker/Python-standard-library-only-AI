@@ -65,6 +65,7 @@ import sys
 import math
 import operator
 import random
+import re
 import time
 from typing import List, Tuple, Optional, Callable, Any
 
@@ -27304,6 +27305,366 @@ def tokenize_batch(tokenizer, texts, max_len=None, pad_value=0, truncate="post",
         encoded.append(list(ids))
     return batch_sequences(encoded, max_len=max_len, pad_value=pad_value,
                            truncate=truncate, padding=padding)
+
+
+#  ======================================================================
+#  W12-B：分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#  ======================================================================
+
+def _w12b_text(text, who):
+    if not isinstance(text, str):
+        raise TypeError("%s: text 必须是字符串" % who)
+    return text
+
+
+def _w12b_texts(texts, who):
+    if isinstance(texts, str):
+        texts = [texts]
+    if not isinstance(texts, (list, tuple)):
+        raise TypeError("%s: texts 必须是字符串或字符串列表" % who)
+    if not texts:
+        raise ValueError("%s: texts 不能为空" % who)
+    out = []
+    for t in texts:
+        if not isinstance(t, str):
+            raise TypeError("%s: 每条文本必须是字符串" % who)
+        out.append(t)
+    return out
+
+
+def _w12b_ids(ids, who):
+    if not isinstance(ids, (list, tuple)):
+        raise TypeError("%s: ids 必须是列表" % who)
+    out = []
+    for v in ids:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TypeError("%s: id 必须是整数" % who)
+        if v < 0:
+            raise ValueError("%s: id 不能为负" % who)
+        out.append(v)
+    return out
+
+
+class _WordLevelTokenizer:
+    """词级分词器公共部分：`fit` 建词表、`encode` 查 id、`decode` 拼回文本。
+
+    子类只需实现 `tokenize(text) -> list[str]`。词表顺序固定为
+    `[PAD], [UNK], 其余按 (频次降序, 字典序)`，因此 `pad_id == 0`、`unk_id == 1`，
+    可以直接喂给 `batch_sequences(..., pad_value=0)`。
+    """
+
+    def __init__(self, lower=False, unk_token="[UNK]", pad_token="[PAD]"):
+        if not isinstance(lower, bool):
+            raise TypeError("tokenizer: lower 必须是 bool")
+        for name, tok in (("unk_token", unk_token), ("pad_token", pad_token)):
+            if not isinstance(tok, str):
+                raise TypeError("tokenizer: %s 必须是字符串" % name)
+            if not tok or tok.strip() != tok:
+                raise ValueError("tokenizer: %s 不能为空或带首尾空白" % name)
+        if unk_token == pad_token:
+            raise ValueError("tokenizer: unk_token 与 pad_token 不能相同")
+        self.lower = lower
+        self.unk_token = unk_token
+        self.pad_token = pad_token
+        self.vocab = None
+        self.token_to_id = {}
+        self.id_to_token = []
+        self.unk_id = None
+        self.pad_id = None
+
+    # ---------------------------------------------------------- 子类实现
+    def tokenize(self, text):
+        raise NotImplementedError
+
+    # ---------------------------------------------------------- 建词表
+    def fit(self, texts, min_frequency=1, max_size=None, vocab=None):
+        """建词表。`vocab` 给了就直接用它（不再统计），否则按频次取前 `max_size` 个。"""
+        if isinstance(min_frequency, bool) or not isinstance(min_frequency, int):
+            raise TypeError("%s.fit: min_frequency 必须是整数" % type(self).__name__)
+        if min_frequency < 1:
+            raise ValueError("%s.fit: min_frequency 必须 >= 1" % type(self).__name__)
+        if max_size is not None:
+            if isinstance(max_size, bool) or not isinstance(max_size, int):
+                raise TypeError("%s.fit: max_size 必须是整数或 None" % type(self).__name__)
+            if max_size < 2:
+                raise ValueError("%s.fit: max_size 至少为 2（要为 PAD/UNK 留位置）"
+                                 % type(self).__name__)
+        if vocab is not None:
+            if not isinstance(vocab, (list, tuple)):
+                raise TypeError("%s.fit: vocab 必须是列表" % type(self).__name__)
+            toks = []
+            for t in vocab:
+                if not isinstance(t, str):
+                    raise TypeError("%s.fit: vocab 元素必须是字符串" % type(self).__name__)
+                if t not in (self.pad_token, self.unk_token) and t not in toks:
+                    toks.append(t)
+            if max_size is not None:
+                toks = toks[:max(0, max_size - 2)]
+        else:
+            rows = _w12b_texts(texts, "%s.fit" % type(self).__name__)
+            counts = {}
+            for text in rows:
+                for tok in self.tokenize(text):
+                    counts[tok] = counts.get(tok, 0) + 1
+            toks = [t for t, c in counts.items() if c >= min_frequency]
+            toks.sort(key=lambda t: (-counts[t], t))
+            if max_size is not None:
+                toks = toks[:max(0, max_size - 2)]
+        self.id_to_token = [self.pad_token, self.unk_token] + toks
+        self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
+        self.vocab = list(self.id_to_token)
+        self.pad_id = 0
+        self.unk_id = 1
+        return self
+
+    def _ready(self, who):
+        if self.vocab is None:
+            raise ValueError("%s: 先调用 fit(...) 建词表" % who)
+
+    # ---------------------------------------------------------- 编码/解码
+    def encode(self, text):
+        self._ready("%s.encode" % type(self).__name__)
+        toks = self.tokenize(_w12b_text(text, "%s.encode" % type(self).__name__))
+        if not isinstance(toks, (list, tuple)):
+            raise TypeError("%s.encode: tokenize 必须返回列表" % type(self).__name__)
+        return [self.token_to_id.get(t, self.unk_id) for t in toks]
+
+    def decode(self, ids):
+        self._ready("%s.decode" % type(self).__name__)
+        vals = _w12b_ids(ids, "%s.decode" % type(self).__name__)
+        out = []
+        for v in vals:
+            if v >= len(self.id_to_token):
+                raise ValueError("%s.decode: id %d 超出词表大小 %d"
+                                 % (type(self).__name__, v, len(self.id_to_token)))
+            out.append(self.id_to_token[v])
+        return " ".join(out)
+
+    @property
+    def vocab_size(self):
+        return 0 if self.vocab is None else len(self.vocab)
+
+    def __repr__(self):
+        return "%s(vocab_size=%d)" % (type(self).__name__, self.vocab_size)
+
+
+class WordTokenizer(_WordLevelTokenizer):
+    """按「词 + 标点」切分（`\\w+` 与单个标点各算一个 token）。
+
+    `split_punct=False` 时只取 `\\w+`，标点直接丢掉——两种行为都写在
+    `tokenize` 的 docstring 里，不做隐式猜测。
+    """
+
+    def __init__(self, lower=False, split_punct=True, unk_token="[UNK]",
+                 pad_token="[PAD]"):
+        _WordLevelTokenizer.__init__(self, lower=lower, unk_token=unk_token,
+                                     pad_token=pad_token)
+        if not isinstance(split_punct, bool):
+            raise TypeError("WordTokenizer: split_punct 必须是 bool")
+        self.split_punct = split_punct
+
+    def tokenize(self, text):
+        s = _w12b_text(text, "WordTokenizer.tokenize")
+        if self.lower:
+            s = s.lower()
+        pattern = r"\w+|[^\w\s]" if self.split_punct else r"\w+"
+        return [m.group(0) for m in re.finditer(pattern, s)]
+
+
+class WhitespaceTokenizer(_WordLevelTokenizer):
+    """只按空白切分（`text.split()`），保留标点原样贴在词上。"""
+
+    def tokenize(self, text):
+        s = _w12b_text(text, "WhitespaceTokenizer.tokenize")
+        if self.lower:
+            s = s.lower()
+        return s.split()
+
+
+class RegexTokenizer(_WordLevelTokenizer):
+    """用调用方给的正则切分（`pattern` 必须能匹配到至少一个 token）。"""
+
+    def __init__(self, pattern=r"\w+|[^\w\s]", lower=False, unk_token="[UNK]",
+                 pad_token="[PAD]"):
+        _WordLevelTokenizer.__init__(self, lower=lower, unk_token=unk_token,
+                                     pad_token=pad_token)
+        if not isinstance(pattern, str):
+            raise TypeError("RegexTokenizer: pattern 必须是字符串")
+        if not pattern:
+            raise ValueError("RegexTokenizer: pattern 不能为空")
+        try:
+            self._rx = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError("RegexTokenizer: 非法正则 %r（%s）" % (pattern, exc))
+        if not self._rx.findall("a b 1."):
+            raise ValueError("RegexTokenizer: pattern %r 在样例文本上一个 token 都没匹配到"
+                             % (pattern,))
+        self.pattern = pattern
+
+    def tokenize(self, text):
+        s = _w12b_text(text, "RegexTokenizer.tokenize")
+        if self.lower:
+            s = s.lower()
+        return [m.group(0) for m in self._rx.finditer(s)]
+
+
+class SentencePieceTokenizer:
+    """Unigram LM 的**简化版**：子串频次建 unigram 表 + Viterbi 最大似然切分。
+
+    与真正的 SentencePiece 的差别（写进 docstring 免得误用）：
+      - 没有 EM 训练、没有概率修剪，词表直接取高频子串；
+      - 没有字节回退（BBPE），未登录字符退化成 `unk`；
+      - 只用 `▁` 代替空格（不开 `add_dummy_prefix`/`remove_extra_whitespaces` 开关）。
+
+    词表固定为 `[PAD]=0`、`<unk>=1`、其余子串；`max_piece_len` 同时限制训练候选长度和
+    Viterbi 的跳步上限。
+    """
+
+    def __init__(self, vocab_size=512, max_piece_len=8, unk_token="<unk>",
+                 pad_token="[PAD]"):
+        for name, v in (("vocab_size", vocab_size), ("max_piece_len", max_piece_len)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TypeError("SentencePieceTokenizer: %s 必须是整数" % name)
+            if v < 2:
+                raise ValueError("SentencePieceTokenizer: %s 必须 >= 2" % name)
+        for name, tok in (("unk_token", unk_token), ("pad_token", pad_token)):
+            if not isinstance(tok, str) or not tok:
+                raise ValueError("SentencePieceTokenizer: %s 必须是非空字符串" % name)
+        if unk_token == pad_token:
+            raise ValueError("SentencePieceTokenizer: unk 与 pad 不能相同")
+        self.vocab_size = vocab_size
+        self.max_piece_len = max_piece_len
+        self.unk_token = unk_token
+        self.pad_token = pad_token
+        self.pieces_ = None
+        self.scores_ = {}
+        self.token_to_id = {}
+        self.unk_id = 1
+        self.pad_id = 0
+        self._unk_score = -20.0
+
+    # ---------------------------------------------------------- 归一化
+    def _normalize(self, text):
+        s = _w12b_text(text, "SentencePieceTokenizer")
+        s = " ".join(s.split())
+        if not s:
+            return ""
+        return "\u2581" + s.replace(" ", "\u2581")
+
+    @staticmethod
+    def _substrings(norm, max_len):
+        n = len(norm)
+        for i in range(n):
+            for j in range(i + 1, min(n, i + max_len) + 1):
+                yield norm[i:j]
+
+    # ---------------------------------------------------------- 训练
+    def train(self, texts, vocab_size=None, min_frequency=1, max_piece_len=None):
+        rows = _w12b_texts(texts, "SentencePieceTokenizer.train")
+        if vocab_size is None:
+            vocab_size = self.vocab_size
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int):
+            raise TypeError("SentencePieceTokenizer.train: vocab_size 必须是整数")
+        if vocab_size < 4:
+            raise ValueError("SentencePieceTokenizer.train: vocab_size 至少为 4")
+        if isinstance(min_frequency, bool) or not isinstance(min_frequency, int):
+            raise TypeError("SentencePieceTokenizer.train: min_frequency 必须是整数")
+        if min_frequency < 1:
+            raise ValueError("SentencePieceTokenizer.train: min_frequency 必须 >= 1")
+        if max_piece_len is None:
+            max_piece_len = self.max_piece_len
+        if isinstance(max_piece_len, bool) or not isinstance(max_piece_len, int):
+            raise TypeError("SentencePieceTokenizer.train: max_piece_len 必须是整数")
+        if max_piece_len < 1:
+            raise ValueError("SentencePieceTokenizer.train: max_piece_len 必须 >= 1")
+        counts = {}
+        total = 0
+        chars = set()
+        for text in rows:
+            norm = self._normalize(text)
+            for piece in self._substrings(norm, max_piece_len):
+                counts[piece] = counts.get(piece, 0) + 1
+                total += 1
+            chars.update(norm)
+        if not counts:
+            raise ValueError("SentencePieceTokenizer.train: 训练文本里没有可用的字符")
+        single = [c for c in sorted(chars) if c in counts]
+        cand = [p for p in counts if len(p) > 1 and counts[p] >= min_frequency]
+        cand.sort(key=lambda p: (-counts[p], -len(p), p))
+        room = vocab_size - 2 - len(single)
+        if room < 0:
+            raise ValueError("SentencePieceTokenizer.train: vocab_size=%d 装不下 %d 个字符，"
+                             "至少需要 %d" % (vocab_size, len(single), len(single) + 2))
+        pieces = single + cand[:room]
+        self.pieces_ = [self.pad_token, self.unk_token] + pieces
+        self.token_to_id = {p: i for i, p in enumerate(self.pieces_)}
+        denom = float(sum(counts[p] for p in pieces) + 1)
+        self.scores_ = {p: math.log((counts[p] + 1) / denom) for p in pieces}
+        self.unk_id = 1
+        self.pad_id = 0
+        self.vocab_size = len(self.pieces_)
+        self.max_piece_len = max_piece_len
+        return self
+
+    def _ready(self, who):
+        if self.pieces_ is None:
+            raise ValueError("%s: 先调用 train(...) 训练子词表" % who)
+
+    # ---------------------------------------------------------- 切分
+    def tokenize(self, text):
+        self._ready("SentencePieceTokenizer.tokenize")
+        norm = self._normalize(text)
+        if not norm:
+            return []
+        n = len(norm)
+        best = [-1e18] * (n + 1)
+        back = [None] * (n + 1)
+        best[0] = 0.0
+        for i in range(n):
+            if best[i] <= -1e17:
+                continue
+            for j in range(i + 1, min(n, i + self.max_piece_len) + 1):
+                piece = norm[i:j]
+                score = self.scores_.get(piece)
+                if score is None:
+                    if j - i != 1:
+                        continue
+                    score = self._unk_score
+                cand = best[i] + score
+                if cand > best[j]:
+                    best[j] = cand
+                    back[j] = (i, piece)
+        if best[n] <= -1e17:
+            return [self.unk_token]
+        out = []
+        cur = n
+        while cur > 0:
+            i, piece = back[cur]
+            out.append(piece if piece in self.scores_ else self.unk_token)
+            cur = i
+        out.reverse()
+        return out
+
+    def encode(self, text):
+        toks = self.tokenize(text)
+        return [self.token_to_id.get(t, self.unk_id) for t in toks]
+
+    def decode(self, ids):
+        self._ready("SentencePieceTokenizer.decode")
+        vals = _w12b_ids(ids, "SentencePieceTokenizer.decode")
+        out = []
+        for v in vals:
+            if v >= len(self.pieces_):
+                raise ValueError("SentencePieceTokenizer.decode: id %d 超出词表大小 %d"
+                                 % (v, len(self.pieces_)))
+            if v in (self.pad_id, self.unk_id):
+                continue
+            out.append(self.pieces_[v])
+        return "".join(out).replace("\u2581", " ").strip()
+
+    def __repr__(self):
+        return "SentencePieceTokenizer(vocab_size=%s)" % (
+            0 if self.pieces_ is None else len(self.pieces_))
 
 
 _WP_SPECIALS = ("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]")

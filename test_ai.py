@@ -20228,3 +20228,146 @@ class TestSpecialTokensAndBatching:
             AI.tokenize_batch(AI.WordPieceTokenizer(), [1])
         with pytest.raises(TypeError):
             AI.tokenize_batch(object(), ["a"])
+
+class TestTokenizers:
+    """W12-B：Whitespace / Word / Regex / SentencePiece（简化版）。"""
+
+    def test_whitespace_tokenizer(self):
+        tok = AI.WhitespaceTokenizer().fit(["a b c", "a b"], min_frequency=1)
+        assert tok.vocab == ["[PAD]", "[UNK]", "a", "b", "c"]
+        assert tok.pad_id == 0 and tok.unk_id == 1
+        assert tok.encode("a c z") == [2, 4, 1]
+        assert tok.decode([2, 4, 1]) == "a c [UNK]"
+        assert tok.vocab_size == 5
+        assert tok.encode("") == []
+        assert AI.WhitespaceTokenizer().tokenize("hi, there") == ["hi,", "there"]
+        assert AI.WhitespaceTokenizer(lower=True).tokenize("Hi Hi") == ["hi", "hi"]
+
+    def test_word_tokenizer_splits_punctuation(self):
+        tok = AI.WordTokenizer().fit(["hello, world!", "hello there"], min_frequency=1)
+        assert "," in tok.vocab and "!" in tok.vocab
+        assert AI.WordTokenizer().tokenize("a,b c") == ["a", ",", "b", "c"]
+        assert AI.WordTokenizer(split_punct=False).tokenize("a,b c") == ["a", "b", "c"]
+        assert tok.encode("zzz") == [1]
+        assert tok.decode(tok.encode("hello world")) == "hello world"
+
+    def test_regex_tokenizer(self):
+        tok = AI.RegexTokenizer(pattern=r"[a-z]+").fit(["abc def"], min_frequency=1)
+        assert AI.RegexTokenizer(r"\d+").tokenize("a1b22") == ["1", "22"]
+        assert tok.decode(tok.encode("abc def")) == "abc def"
+        assert tok.encode("") == []
+
+    def test_regex_tokenizer_validation(self):
+        with pytest.raises(TypeError):
+            AI.RegexTokenizer(pattern=1)
+        with pytest.raises(ValueError):
+            AI.RegexTokenizer(pattern="")
+        with pytest.raises(ValueError):
+            AI.RegexTokenizer(pattern="([a-z")
+        with pytest.raises(ValueError):
+            AI.RegexTokenizer(pattern="zzz")
+
+    def test_sentencepiece_ids_and_roundtrip(self):
+        texts = ["hello world", "hello there world", "the world is big"]
+        sp = AI.SentencePieceTokenizer(vocab_size=40, max_piece_len=5).train(texts)
+        assert sp.pad_id == 0 and sp.unk_id == 1
+        assert sp.pieces_[0] == "[PAD]" and sp.pieces_[1] == "<unk>"
+        assert sp.vocab_size == len(sp.pieces_) and sp.vocab_size <= 40
+        ids = sp.encode("hello world")
+        assert ids and all(0 <= i < sp.vocab_size for i in ids)
+        assert sp.decode(ids) == "hello world"
+        assert sp.encode("hello world") == ids
+        assert any(len(p) > 1 for p in sp.tokenize("hello world"))
+        assert all(len(p) <= 5 for p in sp.pieces_ if p not in ("[PAD]", "<unk>"))
+
+    def test_sentencepiece_unknown_and_whitespace(self):
+        texts = ["hello world", "hello there world"]
+        sp = AI.SentencePieceTokenizer(vocab_size=40, max_piece_len=5).train(texts)
+        unk = sp.encode("zzz")
+        assert sp.unk_id in unk
+        assert sp.decode(unk) == ""
+        assert sp.encode("") == [] and sp.decode([]) == ""
+        assert sp.decode(sp.encode("  hello   world  ")) == "hello world"
+
+    def test_sentencepiece_cjk_single_chars(self):
+        sp = AI.SentencePieceTokenizer(vocab_size=30, max_piece_len=3).train(["你好世界"])
+        ids = sp.encode("你好")
+        assert ids and all(0 <= i < sp.vocab_size for i in ids)
+
+    def test_tokenizers_feed_batch_sequences(self):
+        ws = AI.WhitespaceTokenizer().fit(["a b c", "a"], min_frequency=1)
+        batch = AI.tokenize_batch(ws, ["a b c", "a"], pad_value=0)
+        assert batch["input_ids"] == [[2, 3, 4], [2, 0, 0]]
+        assert batch["attention_mask"] == [[1, 1, 1], [1, 0, 0]]
+        sp = AI.SentencePieceTokenizer(vocab_size=40, max_piece_len=5).train(
+            ["hello world", "the world"])
+        spb = AI.tokenize_batch(sp, ["hello world", "the world"], pad_value=0)
+        assert len(spb["input_ids"]) == 2
+        assert len(spb["input_ids"][0]) == len(spb["input_ids"][1])
+
+    def test_tokenizer_construction_validation(self):
+        with pytest.raises(TypeError):
+            AI.WhitespaceTokenizer(lower=1)
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer(unk_token="")
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer(pad_token=" [PAD]")
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer(unk_token="[PAD]")
+        with pytest.raises(TypeError):
+            AI.WordTokenizer(split_punct=1)
+        with pytest.raises(TypeError):
+            AI.SentencePieceTokenizer(vocab_size=1.5)
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer(vocab_size=1)
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer(unk_token="")
+        with pytest.raises(TypeError):
+            AI.SentencePieceTokenizer(max_piece_len=True)
+
+    def test_fit_validation(self):
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer().fit([])
+        with pytest.raises(TypeError):
+            AI.WhitespaceTokenizer().fit(1)
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer().fit(["a"], min_frequency=0)
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer().fit(["a"], max_size=1)
+        with pytest.raises(TypeError):
+            AI.WhitespaceTokenizer().fit(["a"], min_frequency=1.5)
+
+    def test_use_before_fit_raises(self):
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer().encode("a")
+        with pytest.raises(ValueError):
+            AI.WhitespaceTokenizer().decode([0])
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer().encode("a")
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer().decode([0])
+
+    def test_encode_decode_validation(self):
+        tok = AI.WhitespaceTokenizer().fit(["a b"], min_frequency=1)
+        with pytest.raises(TypeError):
+            tok.encode(1)
+        with pytest.raises(TypeError):
+            tok.decode("0")
+        with pytest.raises(TypeError):
+            tok.decode([True])
+        with pytest.raises(ValueError):
+            tok.decode([-1])
+        with pytest.raises(ValueError):
+            tok.decode([99])
+
+    def test_sentencepiece_train_validation(self):
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer().train(["abcdef"], vocab_size=3)
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer().train([])
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer().train([""])
+        with pytest.raises(ValueError):
+            AI.SentencePieceTokenizer(vocab_size=4).train(["abcdefgh"])
+        with pytest.raises(TypeError):
+            AI.SentencePieceTokenizer().train(["abc"], vocab_size=1.5)
