@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1736 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1746 项）
 
 ## 特性
 
@@ -2390,6 +2390,33 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### 彩票假说（W20-B：迭代幅度剪枝 + 掩码内重初始化）
+
+| API | 语义 |
+|-----|------|
+| `weight_mask(model, keep_ratio=0.5)` | 按 `|w|` 生成**跨层统一阈值**的布尔掩码 |
+| `mask_sparsity(mask)` | 掩码的零比例 |
+| `apply_weight_mask(model, mask)` | 把掩码外权重清零，返回清零个数 |
+| `masked_reinit(model, mask, seed=None)` | 掩码内重新做 He 初始化，掩码外清零 |
+| `lottery_ticket(model, train_fn, score_fn, rounds=3, prune_rate=0.2, reinit=True, seed=None)` | 训练→评分→剪→（可选）重初始化的迭代循环 |
+| `ticket_smaller_than(model_a, model_b)` | 只统计两侧非零参数个数与比例，不训练 |
+
+```python
+model = Model(MLP([4, 32, 32, 3]), loss_fn="cross_entropy", optimizer="adam")
+history = lottery_ticket(model, lambda m: m.fit(data), lambda m: m.score(test_x, test_y),
+                         rounds=5, prune_rate=0.2)
+print([(h["round"], round(h["keep_ratio"], 3), h["score"]) for h in history])
+```
+
+四点说明：
+
+- 掩码是**累积**的：每轮只在上一轮保留的参数里再排序，所以第二轮的 `keep_ratio`
+  是 `(1-prune_rate)` 的**乘性**结果，不是重新从全量里挑；
+- 阈值是**全局**的（跨层统一），不是逐层按比例剪——后者会让小层被剪得比大层更狠；
+- `reinit=True` 只在掩码内重抽权重，这正是彩票假说关心的「结构 + 初始分布」；
+- 循环里的 `train_fn` / `score_fn` 由调用方给，本函数不碰 `Model.fit` 的任何参数，
+  这样它既能用于全量重训，也能用于只评估。
+
 ### 隐私保护与成员推断（W20-A）
 
 | API | 说明 |
@@ -2927,7 +2954,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1736 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1746 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3148,6 +3175,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
+| `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
 | `TestPrivacyAndMembership` | 全局裁剪的范数与比例、加噪的 σ·C 口径与同种子复现、隐私记账的闭式值/单调性/越界、逐样本损失（回归平方误差、分类交叉熵）、成员推断的完美分离/完全反向/无信号三种 AUC、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
@@ -3202,7 +3230,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1736 个单元测试
+├── test_ai.py       # 1746 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

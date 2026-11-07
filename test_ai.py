@@ -26511,3 +26511,153 @@ class TestPrivacyAndMembership:
         assert delta["attack_auc"] == 1.0
         assert sorted(delta) == ["attack_accuracy", "attack_auc", "loss_gap",
                                  "mean_member", "mean_nonmember"]
+
+
+class TestLotteryTicket:
+    """W20-B：迭代幅度剪枝 + 掩码内重初始化（彩票假说的工程件）"""
+
+    @staticmethod
+    def _model(seed=7, sizes=(3, 4, 2)):
+        random.seed(seed)
+        return AI.MLP(list(sizes), activations=["relu"] * (len(sizes) - 2) + ["linear"])
+
+    @staticmethod
+    def _flat(model):
+        out = []
+        for layer in model.layers:
+            for row in layer.weights:
+                out.extend(row)
+        return out
+
+    @staticmethod
+    def _count(mask):
+        return sum(1 for rows in mask.values() for row in rows for v in row if v)
+
+    def test_weight_mask_keeps_everything(self):
+        model = self._model()
+        mask = AI.weight_mask(model, 1.0)
+        assert self._count(mask) == len(self._flat(model))
+        assert AI.mask_sparsity(mask) == 0.0
+        assert sorted(mask) == list(range(len(model.layers)))
+
+    def test_weight_mask_keeps_largest(self):
+        model = self._model()
+        total = len(self._flat(model))
+        mask = AI.weight_mask(model, 0.5)
+        assert self._count(mask) == int(round(0.5 * total))
+        kept = []
+        dropped = []
+        for idx, layer in enumerate(model.layers):
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    value = abs(layer.weights[r][c])
+                    (kept if mask[idx][r][c] else dropped).append(value)
+        assert min(kept) >= max(dropped) - 1e-12
+
+    def test_apply_weight_mask_prunes_and_keeps_forward(self):
+        model = self._model()
+        mask = AI.weight_mask(model, 0.5)
+        pruned = AI.apply_weight_mask(model, mask)
+        assert pruned == int(round(0.5 * len(self._flat(model))))
+        assert sum(1 for v in self._flat(model) if v == 0.0) == pruned
+        assert AI.apply_weight_mask(model, mask) == 0
+        assert len(model.forward([0.5, -0.2, 0.1])) == 2
+
+    def test_masked_reinit_respects_mask(self):
+        model = self._model(seed=11)
+        mask = AI.weight_mask(model, 0.5)
+        before = [row[:] for rows in mask.values() for row in rows]
+        touched = AI.masked_reinit(model, mask, seed=3)
+        assert touched == self._count(mask)
+        assert [row[:] for rows in mask.values() for row in rows] == before
+        for idx, layer in enumerate(model.layers):
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    keep = mask[idx][r][c]
+                    if keep:
+                        assert layer.weights[r][c] != 0.0
+                    else:
+                        assert layer.weights[r][c] == 0.0
+        want_biases = [layer.biases for layer in self._model(seed=11).layers]
+        assert [layer.biases for layer in model.layers] == want_biases
+
+    def test_masked_reinit_is_reproducible(self):
+        a = self._model(seed=11)
+        AI.masked_reinit(a, AI.weight_mask(a, 0.5), seed=99)
+        b = self._model(seed=11)
+        AI.masked_reinit(b, AI.weight_mask(b, 0.5), seed=99)
+        assert self._flat(a) == self._flat(b)
+        c = self._model(seed=11)
+        AI.masked_reinit(c, AI.weight_mask(c, 0.5), seed=100)
+        assert self._flat(c) != self._flat(a)
+
+    def test_lottery_ticket_shrinks_monotonically(self):
+        model = self._model(seed=5)
+        total = len(self._flat(model))
+        scores = iter([0.9, 0.88, 0.86])
+        history = AI.lottery_ticket(model, lambda _m: None, lambda _m: next(scores),
+                                    rounds=3, prune_rate=0.2, reinit=False)
+        assert len(history) == 3
+        assert [h["round"] for h in history] == [1, 2, 3]
+        assert [h["score"] for h in history] == [0.9, 0.88, 0.86]
+        ratios = [h["keep_ratio"] for h in history]
+        assert ratios[0] == 1.0
+        assert abs(ratios[1] - 0.8) < 0.05
+        assert abs(ratios[2] - 0.64) < 0.05
+        kept = [h["kept_params"] for h in history]
+        assert kept[0] >= kept[1] >= kept[2]
+        assert kept[2] == int(round(0.8 * int(round(0.8 * total))))
+        assert sum(1 for v in self._flat(model) if v == 0.0) == total - kept[2]
+
+    def test_lottery_ticket_reinit_keeps_structure(self):
+        model = self._model(seed=5)
+        total = len(self._flat(model))
+        history = AI.lottery_ticket(model, lambda _m: None, lambda _m: 1.0,
+                                    rounds=2, prune_rate=0.5, reinit=True, seed=42)
+        assert abs(history[-1]["keep_ratio"] - 0.5) < 0.05
+        assert sum(1 for v in self._flat(model) if v == 0.0) ==                total - history[-1]["kept_params"]
+
+    def test_lottery_ticket_rejects_bad_arguments(self):
+        model = self._model()
+        with pytest.raises(ValueError):
+            AI.weight_mask(model, 1.5)
+        with pytest.raises(ValueError):
+            AI.weight_mask(model, True)
+        with pytest.raises(ValueError):
+            AI.weight_mask(object(), 0.5)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, lambda _m: None, lambda _m: 0.0, rounds=0)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, lambda _m: None, lambda _m: 0.0, rounds=1.5)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, lambda _m: None, lambda _m: 0.0, prune_rate=0.0)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, lambda _m: None, lambda _m: 0.0, prune_rate=1.0)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, 3, lambda _m: 0.0)
+        with pytest.raises(ValueError):
+            AI.lottery_ticket(model, lambda _m: None, 3)
+        with pytest.raises(ValueError):
+            AI.apply_weight_mask(model, {})
+        with pytest.raises(ValueError):
+            AI.mask_sparsity({})
+
+    def test_mask_shape_mismatch_is_rejected(self):
+        model = self._model()
+        mask = AI.weight_mask(model, 1.0)
+        mask[0] = [[True] * 2 for _ in range(4)]
+        with pytest.raises(ValueError):
+            AI.apply_weight_mask(model, mask)
+        with pytest.raises(ValueError):
+            AI.masked_reinit(model, mask)
+        with pytest.raises(ValueError):
+            AI.apply_weight_mask(model, {0: [[True] * 3 for _ in range(4)]})
+
+    def test_ticket_smaller_than_counts_parameters(self):
+        pruned = self._model(seed=1)
+        dense = self._model(seed=2)
+        AI.apply_weight_mask(pruned, AI.weight_mask(pruned, 0.5))
+        info = AI.ticket_smaller_than(pruned, dense)
+        assert info["count_a"] == 10
+        assert info["count_b"] == 20
+        assert abs(info["ratio"] - 0.5) < 1e-12

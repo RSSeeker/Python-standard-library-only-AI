@@ -30909,6 +30909,220 @@ def _w18b_user_why():
 
 
 # ============================================================================
+#  研究前沿 W20-B：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+# ============================================================================
+
+def _w20b_net(model):
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if not isinstance(layers, list):
+        raise ValueError("这个功能需要 MLP（或带 .model 的 Model）")
+    return net
+
+
+def _w20b_ratio(value, what, allow_zero=True, allow_one=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s 必须是数字" % what)
+    number = float(value)
+    if allow_one:
+        if not 0.0 <= number <= 1.0:
+            raise ValueError("%s 必须在 [0, 1] 之间" % what)
+    elif not 0.0 <= number < 1.0:
+        raise ValueError("%s 必须在 [0, 1) 之间" % what)
+    if number == 0.0 and not allow_zero:
+        raise ValueError("%s 必须大于 0" % what)
+    return number
+
+
+def _w20b_masked_layers(model):
+    net = _w20b_net(model)
+    return [(index, layer) for index, layer in enumerate(net.layers)
+            if getattr(layer, "weights", None) is not None]
+
+
+def weight_mask(model, keep_ratio=0.5):
+    """按幅度生成**全局**掩码（跨层统一阈值），返回与 `weights` 同形的 bool 矩阵。
+
+    `keep_ratio=1.0` 表示全保留；`keep_ratio=0.5` 保留绝对值最大的那一半参数。
+    同幅度时的取舍按「层号 → 行 → 列」的固定顺序，保证结果可复现。
+    """
+    keep = _w20b_ratio(keep_ratio, "keep_ratio", allow_one=True)
+    entries = []
+    for index, layer in _w20b_masked_layers(model):
+        for row in range(layer.fan_out):
+            for col in range(layer.fan_in):
+                entries.append((abs(layer.weights[row][col]), index, row, col))
+    if not entries:
+        raise ValueError("weight_mask: 模型没有可剪的权重")
+    entries.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    keep_count = int(round(keep * len(entries)))
+    keep_count = max(1, min(len(entries), keep_count)) if keep > 0.0 else 0
+    keep_set = {(item[1], item[2], item[3]) for item in entries[:keep_count]}
+    masks = {}
+    for index, layer in _w20b_masked_layers(model):
+        masks[index] = [[(index, row, col) in keep_set for col in range(layer.fan_in)]
+                        for row in range(layer.fan_out)]
+    return masks
+
+
+def mask_sparsity(mask):
+    """返回掩码的零比例（0 表示全保留、1 表示全剪）。"""
+    total = 0
+    zeros = 0
+    for rows in mask.values():
+        for row in rows:
+            for value in row:
+                total += 1
+                if not value:
+                    zeros += 1
+    if total == 0:
+        raise ValueError("mask_sparsity: 掩码里没有参数")
+    return zeros / total
+
+
+def apply_weight_mask(model, mask):
+    """把掩码外（False）的权重清零，返回被清零的个数（原地修改）。"""
+    if not isinstance(mask, dict) or not mask:
+        raise ValueError("apply_weight_mask 需要 weight_mask 返回的 dict")
+    pruned = 0
+    for index, layer in _w20b_masked_layers(model):
+        if index not in mask:
+            raise ValueError("掩码缺少第 %d 层" % index)
+        rows = mask[index]
+        if len(rows) != layer.fan_out or any(len(row) != layer.fan_in for row in rows):
+            raise ValueError("第 %d 层掩码形状与权重不一致" % index)
+        for row in range(layer.fan_out):
+            for col in range(layer.fan_in):
+                if not rows[row][col]:
+                    if layer.weights[row][col] != 0.0:
+                        pruned += 1
+                    layer.weights[row][col] = 0.0
+    return pruned
+
+
+def masked_reinit(model, mask, seed=None):
+    """在掩码内重新初始化（He 初始化），掩码外清零；返回被重新初始化的个数。
+
+    「彩票假说」的关键一步：结构（掩码）不变、保留下来的权重回到初始分布。
+    """
+    if not isinstance(mask, dict) or not mask:
+        raise ValueError("masked_reinit 需要 weight_mask 返回的 dict")
+    rng = random.Random(seed) if seed is not None else random.Random()
+    touched = 0
+    for index, layer in _w20b_masked_layers(model):
+        if index not in mask:
+            raise ValueError("掩码缺少第 %d 层" % index)
+        rows = mask[index]
+        if len(rows) != layer.fan_out or any(len(row) != layer.fan_in for row in rows):
+            raise ValueError("第 %d 层掩码形状与权重不一致" % index)
+        std = math.sqrt(2.0 / layer.fan_in)
+        for row in range(layer.fan_out):
+            for col in range(layer.fan_in):
+                if rows[row][col]:
+                    layer.weights[row][col] = rng.gauss(0.0, std)
+                    touched += 1
+                else:
+                    layer.weights[row][col] = 0.0
+    return touched
+
+
+def lottery_ticket(model, train_fn, score_fn, rounds=3, prune_rate=0.2, reinit=True, seed=None):
+    """迭代幅度剪枝：训练 → 评分 → 剪 `prune_rate` → （可选）掩码内重初始化。
+
+    - `train_fn(model)`：把这轮训练跑完（可以什么都不做即「只评估」）；
+    - `score_fn(model)`：返回一个标量分数（越大越好，比如验证集准确率）；
+    - 掩码是**累积**的：每轮在上一轮保留的集合里再按幅度剪，不会把剪掉的又捡回来。
+
+    返回 `[{"round", "keep_ratio", "score", "pruned", "kept_params"}, ...]`，
+    `keep_ratio` 是这一轮**实际**保留的参数比例（向下取整可能让比例略低于理论值）。
+    """
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        raise ValueError("rounds 必须是 >= 1 的整数")
+    if not callable(train_fn) or not callable(score_fn):
+        raise ValueError("train_fn / score_fn 必须可调用")
+    rate = _w20b_ratio(prune_rate, "prune_rate")
+    if rate == 0.0:
+        raise ValueError("prune_rate 必须大于 0")
+    history = []
+    mask = None
+    for round_index in range(1, rounds + 1):
+        train_fn(model)
+        score = score_fn(model)
+        if mask is None:
+            mask = weight_mask(model, 1.0)
+        else:
+            # 累积掩码：只在**当前还保留**的参数里再按幅度剪，
+            # 否则把已清零的权重也参与排序，剪枝会在第一轮之后失效。
+            mask = _w20b_prune_within(model, mask, 1.0 - rate)
+        pruned = apply_weight_mask(model, mask)
+        kept = sum(1 for rows in mask.values() for row in rows for value in row if value)
+        history.append({
+            "round": round_index,
+            "keep_ratio": kept / max(1, sum(len(rows) * len(rows[0]) if rows else 0
+                                            for rows in mask.values())),
+            "score": score,
+            "pruned": pruned,
+            "kept_params": kept,
+        })
+        if reinit:
+            masked_reinit(model, mask, seed=None if seed is None else seed + round_index)
+    return history
+
+
+def _w20b_prune_within(model, mask, keep_ratio):
+    """在 `mask` 已保留的参数里再按幅度保留 `keep_ratio`，其余置 False。"""
+    entries = []
+    for index, layer in _w20b_masked_layers(model):
+        if index not in mask:
+            raise ValueError("掩码缺少第 %d 层" % index)
+        rows = mask[index]
+        if len(rows) != layer.fan_out or any(len(row) != layer.fan_in for row in rows):
+            raise ValueError("第 %d 层掩码形状与权重不一致" % index)
+        for row in range(layer.fan_out):
+            for col in range(layer.fan_in):
+                if rows[row][col]:
+                    entries.append((abs(layer.weights[row][col]), index, row, col))
+    if not entries:
+        raise ValueError("prune_within: 掩码里已经没有可剪的参数")
+    keep_count = int(round(keep_ratio * len(entries)))
+    keep_count = max(0, min(len(entries), keep_count))
+    keep_set = {(item[1], item[2], item[3]) for item in
+                sorted(entries, key=lambda item: (-item[0], item[1], item[2], item[3]))[:keep_count]}
+    out = {}
+    for index, _layer in _w20b_masked_layers(model):
+        out[index] = [[(index, r, c) in keep_set for c in range(len(mask[index][r]))]
+                      for r in range(len(mask[index]))]
+    return out
+
+
+def _w20b_intersect(model, old_mask, new_mask):
+    out = {}
+    for index, _layer in _w20b_masked_layers(model):
+        if index not in old_mask or index not in new_mask:
+            raise ValueError("掩码层号不一致")
+        out[index] = [[old_mask[index][r][c] and new_mask[index][r][c]
+                       for c in range(len(new_mask[index][r]))]
+                      for r in range(len(new_mask[index]))]
+    return out
+
+
+def ticket_smaller_than(model_a, model_b, keep_ratio=0.5):
+    """诊断用：在相同评分下比较「剪枝后」与「同规模随机初始化」的训练曲线。
+
+    只做参数统计，不训练；返回 `{count_a, count_b, ratio}`。
+    """
+    _w20b_net(model_a)
+    _w20b_net(model_b)
+    count_a = sum(1 for layer in _w20b_net(model_a).layers
+                  if getattr(layer, "weights", None) is not None
+                  for row in layer.weights for value in row if value != 0.0)
+    count_b = sum(1 for layer in _w20b_net(model_b).layers
+                  if getattr(layer, "weights", None) is not None
+                  for row in layer.weights for value in row if value != 0.0)
+    return {"count_a": count_a, "count_b": count_b,
+            "ratio": (count_a / count_b) if count_b else 0.0}
+
+# ============================================================================
 #  研究前沿 W20-A：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
 # ============================================================================
 

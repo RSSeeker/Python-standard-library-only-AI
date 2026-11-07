@@ -637,7 +637,12 @@
   - 口径写在 README：这是偏松上界，**不是** RDP / 矩记账，不与 opacus 对数字。
   - 探针 43 项 + `TestPrivacyAndMembership` 9 例；全库 1727 -> 1736 passed。
 - [ ] 成员推断攻击与防御（最简版）
-- [ ] Lottery Ticket（迭代剪枝 + 重初始化）
+- [x] Lottery Ticket（迭代剪枝 + 重初始化）
+  - weight_mask 跨层统一阈值 + 累积掩码（第二轮起只在保留集合里排序）
+  - masked_reinit 掩码内 He 初始化，掩码外清零，偏置不动
+  - lottery_ticket 的 keep_ratio 是乘性收缩（0.8 后 0.64），不是每轮重新挑
+  - 真 bug：早期用「全量重算掩码再取交集」，零权重参与排序，第二轮比例卡住不动
+
 - [ ] Mixture-of-Depths / Early Exit
 - [ ] 神经符号（规则约束的候选过滤）
 - [ ] 文档化：NTK / 双下降 / grokking 作为「已知边界」
