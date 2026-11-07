@@ -30147,6 +30147,365 @@ class PPOAgent:
         return self.policy.param_count() + self.value.param_count()
 
 # ============================================================================
+#  元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
+# ============================================================================
+
+def _meta_mlp(model, who):
+    """取出内部的 MLP（接受 `MLP` 或 `Model` 包装器）。"""
+    mlp = getattr(model, "model", model)
+    if not hasattr(mlp, "layers"):
+        raise ValueError(f"{who}: 需要 MLP（或带 .model 的 Model），收到 {type(model).__name__}")
+    return mlp
+
+
+def _meta_copy_params(mlp):
+    """深拷贝每层的 ``(weights, biases)``。"""
+    return [([list(row) for row in layer.weights], list(layer.biases))
+            for layer in mlp.layers]
+
+
+def _meta_load_params(mlp, params):
+    """把参数写回模型（逐行原地赋值，保持层对象与优化器引用不变）。"""
+    if not isinstance(params, (list, tuple)) or len(params) != len(mlp.layers):
+        raise ValueError(
+            f"元学习: 参数层数 {len(params) if isinstance(params, (list, tuple)) else '?'} "
+            f"与模型层数 {len(mlp.layers)} 不一致")
+    for layer, (weights, biases) in zip(mlp.layers, params):
+        if len(weights) != layer.fan_out or len(biases) != layer.fan_out:
+            raise ValueError("元学习: 参数形状与模型不一致")
+        for j in range(layer.fan_out):
+            if len(weights[j]) != layer.fan_in:
+                raise ValueError("元学习: 权重列数与模型不一致")
+            layer.weights[j][:] = weights[j]
+        layer.biases[:] = biases
+
+
+def _meta_grads_to_params(mlp, grads):
+    """``[(gw, gb)]`` → 与 ``_meta_copy_params`` 同形的参数列表（方便做加/减）。"""
+    out = []
+    for (gw, gb) in grads:
+        out.append(([list(row) for row in gw], list(gb)))
+    return out
+
+
+def _meta_sub(params, deltas, scale):
+    """``params - scale * deltas``（逐元素，返回新列表）。"""
+    out = []
+    for (w, b), (dw, db) in zip(params, deltas):
+        out.append(([[w[j][i] - scale * dw[j][i] for i in range(len(w[j]))]
+                     for j in range(len(w))],
+                    [b[j] - scale * db[j] for j in range(len(b))]))
+    return out
+
+
+def _meta_add_scaled(base, other, scale):
+    """``base + scale * other``（逐元素，返回新列表）。"""
+    out = []
+    for (w, b), (ow, ob) in zip(base, other):
+        out.append(([[w[j][i] + scale * ow[j][i] for i in range(len(w[j]))]
+                     for j in range(len(w))],
+                    [b[j] + scale * ob[j] for j in range(len(b))]))
+    return out
+
+
+def maml_inner_step(model, xs, ys, inner_lr=0.1, inner_steps=1, loss_fn=None):
+    """MAML 的内循环：在给定任务上做 ``inner_steps`` 步 SGD，返回 ``(params, losses)``。
+
+    ``inner_lr`` 是任务内学习率；``params`` 是**适配后**的参数副本（不改动传入模型）。
+    """
+    mlp = _meta_mlp(model, "maml_inner_step")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("maml_inner_step: xs 必须是非空列表")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("maml_inner_step: ys 长度必须与 xs 相同")
+    if isinstance(inner_lr, bool) or not isinstance(inner_lr, (int, float)) or inner_lr <= 0.0:
+        raise ValueError(f"maml_inner_step: inner_lr 必须 > 0，收到 {inner_lr!r}")
+    if isinstance(inner_steps, bool) or not isinstance(inner_steps, int) or inner_steps < 1:
+        raise ValueError(
+            f"maml_inner_step: inner_steps 必须是 >=1 的整数，收到 {inner_steps!r}")
+    original = _meta_copy_params(mlp)
+    params = _meta_copy_params(mlp)
+    losses = []
+    try:
+        for _ in range(inner_steps):
+            acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                     for layer in mlp.layers]
+            acc_b = [[0.0] * layer.fan_out for layer in mlp.layers]
+            total = 0.0
+            for i in range(len(xs)):
+                _meta_load_params(mlp, params)
+                pred = mlp.forward(list(xs[i]))
+                if loss_fn is None:
+                    loss, grad = mse_loss(pred, list(ys[i]))
+                else:
+                    loss, grad = loss_fn(pred, list(ys[i]))
+                total += loss
+                grads = _mlp_backward(mlp, grad)
+                for li, (gw, gb) in enumerate(grads):
+                    for j in range(len(gw)):
+                        row = acc_w[li][j]
+                        for k in range(len(gw[j])):
+                            row[k] += gw[j][k]
+                        acc_b[li][j] += gb[j]
+            inv = 1.0 / len(xs)
+            avg = [([[v * inv for v in row] for row in layer], [v * inv for v in b])
+                   for layer, b in zip(acc_w, acc_b)]
+            params = _meta_sub(params, avg, inner_lr)
+            losses.append(total / len(xs))
+    finally:
+        _meta_load_params(mlp, original)
+    return params, losses
+
+
+def maml_outer_grads(model, tasks, inner_lr=0.1, inner_steps=1, loss_fn=None):
+    """一阶 MAML 的外循环梯度：每个任务适配后算 query 梯度，按任务平均。
+
+    返回 ``(loss, grads)``，``grads`` 与 ``_mlp_backward`` 同形。**这是一阶近似**
+    （不展开内循环的二阶项），docstring 与 README 都写明。
+    """
+    mlp = _meta_mlp(model, "maml_outer_grads")
+    if not isinstance(tasks, (list, tuple)) or not tasks:
+        raise ValueError("maml_outer_grads: tasks 必须是非空列表")
+    total_loss = 0.0
+    acc = None
+    original = _meta_copy_params(mlp)
+    try:
+        for task in tasks:
+            if not isinstance(task, (list, tuple)) or len(task) != 4:
+                raise ValueError(
+                    "maml_outer_grads: 每个任务必须是 (support_x, support_y, query_x, query_y)")
+            support_x, support_y, query_x, query_y = task
+            adapted, _ = maml_inner_step(mlp, support_x, support_y,
+                                         inner_lr=inner_lr, inner_steps=inner_steps,
+                                         loss_fn=loss_fn)
+            _meta_load_params(mlp, adapted)
+            layer_acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                           for layer in mlp.layers]
+            layer_acc_b = [[0.0] * layer.fan_out for layer in mlp.layers]
+            for i in range(len(query_x)):
+                pred = mlp.forward(list(query_x[i]))
+                if loss_fn is None:
+                    loss, grad = mse_loss(pred, list(query_y[i]))
+                else:
+                    loss, grad = loss_fn(pred, list(query_y[i]))
+                total_loss += loss
+                grads = _mlp_backward(mlp, grad)
+                for li, (gw, gb) in enumerate(grads):
+                    for j in range(len(gw)):
+                        row = layer_acc_w[li][j]
+                        for k in range(len(gw[j])):
+                            row[k] += gw[j][k]
+                        layer_acc_b[li][j] += gb[j]
+            inv = 1.0 / len(query_x)
+            cur = []
+            for li in range(len(mlp.layers)):
+                cur.append(([[v * inv for v in row] for row in layer_acc_w[li]],
+                            [v * inv for v in layer_acc_b[li]]))
+            if acc is None:
+                acc = [([list(r) for r in gw], list(gb)) for (gw, gb) in cur]
+            else:
+                merged = []
+                for li in range(len(mlp.layers)):
+                    w = [[acc[li][0][j][k] + cur[li][0][j][k]
+                          for k in range(len(acc[li][0][j]))]
+                         for j in range(len(acc[li][0]))]
+                    b = [acc[li][1][j] + cur[li][1][j] for j in range(len(acc[li][1]))]
+                    merged.append((w, b))
+                acc = merged
+    finally:
+        _meta_load_params(mlp, original)
+    n_tasks = float(len(tasks))
+    if not acc:
+        raise ValueError("maml_outer_grads: 没有可用的任务梯度")
+    grads = [([[v / n_tasks for v in row] for row in gw],
+              [v / n_tasks for v in gb]) for (gw, gb) in acc]
+    return total_loss / (n_tasks * max(1, len(tasks[0][2]))), grads
+
+
+def reptile_step(model, tasks, inner_lr=0.1, inner_steps=1, meta_lr=0.1, loss_fn=None):
+    """Reptile：对每个任务做内循环，再朝「各任务适配后参数的均值」走一步。
+
+    直接**原地更新**传入模型，返回 ``(meta_loss, mean_delta_norm)``。
+    """
+    mlp = _meta_mlp(model, "reptile_step")
+    if not isinstance(tasks, (list, tuple)) or not tasks:
+        raise ValueError("reptile_step: tasks 必须是非空列表")
+    if isinstance(meta_lr, bool) or not isinstance(meta_lr, (int, float)) or meta_lr <= 0.0:
+        raise ValueError(f"reptile_step: meta_lr 必须 > 0，收到 {meta_lr!r}")
+    original = _meta_copy_params(mlp)
+    deltas = []
+    losses = []
+    try:
+        for task in tasks:
+            if not isinstance(task, (list, tuple)) or len(task) != 4:
+                raise ValueError("reptile_step: 每个任务必须是四元组")
+            support_x, support_y, _, _ = task
+            adapted, task_losses = maml_inner_step(
+                mlp, support_x, support_y, inner_lr=inner_lr,
+                inner_steps=inner_steps, loss_fn=loss_fn)
+            deltas.append((adapted, original))
+            losses.append(task_losses[-1])
+    finally:
+        pass
+    mean_delta = []
+    for li in range(len(original)):
+        w = [[0.0] * original[li][0][0].__len__() for _ in range(len(original[li][0]))]
+        for j in range(len(original[li][0])):
+            for k in range(len(original[li][0][j])):
+                acc = 0.0
+                for (adapted, base) in deltas:
+                    acc += adapted[li][0][j][k] - base[li][0][j][k]
+                w[j][k] = acc / len(deltas)
+        b = []
+        for j in range(len(original[li][1])):
+            acc = 0.0
+            for (adapted, base) in deltas:
+                acc += adapted[li][1][j] - base[li][1][j]
+            b.append(acc / len(deltas))
+        mean_delta.append((w, b))
+    updated = _meta_add_scaled(original, mean_delta, meta_lr)
+    _meta_load_params(mlp, updated)
+    norm = 0.0
+    for (w, b) in mean_delta:
+        for row in w:
+            for v in row:
+                norm += v * v
+        for v in b:
+            norm += v * v
+    return sum(losses) / len(losses), math.sqrt(norm)
+
+
+def prototype_embeddings(embeddings, labels):
+    """每类嵌入的均值（原型），返回 ``{label: [均值...]}``。"""
+    if not isinstance(embeddings, (list, tuple)) or not embeddings:
+        raise ValueError("prototype_embeddings: embeddings 必须是非空列表")
+    if not isinstance(labels, (list, tuple)) or len(labels) != len(embeddings):
+        raise ValueError("prototype_embeddings: labels 长度必须与 embeddings 相同")
+    groups = {}
+    for i, label in enumerate(labels):
+        groups.setdefault(label, []).append([float(v) for v in embeddings[i]])
+    out = {}
+    for label, rows in groups.items():
+        dim = len(rows[0])
+        if any(len(r) != dim for r in rows):
+            raise ValueError("prototype_embeddings: 同类嵌入维度不一致")
+        out[label] = [sum(r[d] for r in rows) / len(rows) for d in range(dim)]
+    return out
+
+
+def prototype_logits(query_embeddings, prototypes, temperature=1.0):
+    """负平方距离 → softmax 前的 logits：``-||q - p_c||^2 / T``。"""
+    if not isinstance(query_embeddings, (list, tuple)) or not query_embeddings:
+        raise ValueError("prototype_logits: query_embeddings 必须是非空列表")
+    if not isinstance(prototypes, dict) or not prototypes:
+        raise ValueError("prototype_logits: prototypes 必须是非空 dict")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or temperature <= 0.0:
+        raise ValueError(
+            f"prototype_logits: temperature 必须 > 0，收到 {temperature!r}")
+    labels = list(prototypes.keys())
+    out = []
+    for i, q in enumerate(query_embeddings):
+        dim = len(prototypes[labels[0]])
+        if len(q) != dim:
+            raise ValueError(f"prototype_logits: 第 {i} 个查询维度 {len(q)} 与原型 {dim} 不一致")
+        row = []
+        for label in labels:
+            p = prototypes[label]
+            dist = 0.0
+            for d in range(dim):
+                diff = float(q[d]) - p[d]
+                dist += diff * diff
+            row.append(-dist / float(temperature))
+        out.append(row)
+    return out, labels
+
+
+def prototypical_loss(query_embeddings, query_labels, support_embeddings,
+                      support_labels, temperature=1.0):
+    """ProtoNet 损失：负对数 softmax + 对查询嵌入的梯度，返回 ``(loss, dquery)``。"""
+    if not isinstance(query_labels, (list, tuple)) \
+            or len(query_labels) != len(query_embeddings):
+        raise ValueError("prototypical_loss: query_labels 长度必须与查询数相同")
+    prototypes = prototype_embeddings(support_embeddings, support_labels)
+    logits, labels = prototype_logits(query_embeddings, prototypes, temperature)
+    index = {label: i for i, label in enumerate(labels)}
+    total = 0.0
+    dquery = []
+    inv_n = 1.0 / len(query_embeddings)
+    for i, label in enumerate(query_labels):
+        if label not in index:
+            raise ValueError(
+                f"prototypical_loss: 查询标签 {label!r} 不在支持集类别里")
+        row = logits[i]
+        probs = _rl_softmax(row)
+        target = index[label]
+        total -= _rl_log(max(probs[target], 1e-300))
+        grad_row = list(probs)
+        grad_row[target] -= 1.0
+        dim = len(query_embeddings[i])
+        g = [0.0] * dim
+        for c, lab in enumerate(labels):
+            p = prototypes[lab]
+            for d in range(dim):
+                diff = float(query_embeddings[i][d]) - p[d]
+                g[d] += inv_n * grad_row[c] * (-2.0 * diff / float(temperature))
+        dquery.append(g)
+    return total / len(query_embeddings), dquery
+
+
+def matching_attention(query, support, temperature=1.0):
+    """Matching Networks 的注意力：对余弦相似度做 softmax。"""
+    if not isinstance(query, (list, tuple)) or not query:
+        raise ValueError("matching_attention: query 必须是向量")
+    if not isinstance(support, (list, tuple)) or not support:
+        raise ValueError("matching_attention: support 必须是非空列表")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or temperature <= 0.0:
+        raise ValueError(
+            f"matching_attention: temperature 必须 > 0，收到 {temperature!r}")
+    qn = _norm_vec([float(v) for v in query], "matching_attention")
+    sims = []
+    for i, s in enumerate(support):
+        if len(s) != len(query):
+            raise ValueError(
+                f"matching_attention: support[{i}] 维度 {len(s)} 与查询 {len(query)} 不一致")
+        sn = _norm_vec([float(v) for v in s], "matching_attention")
+        sims.append(sum(qn[d] * sn[d] for d in range(len(qn))) / float(temperature))
+    return _rl_softmax(sims)
+
+
+def _norm_vec(vec, who):
+    """L2 归一化（零向量报错）。"""
+    total = 0.0
+    for v in vec:
+        total += v * v
+    if total <= 0.0:
+        raise ValueError(f"{who}: 向量不能是零向量")
+    n = math.sqrt(total)
+    return [v / n for v in vec]
+
+
+def matching_logits(query, support, support_labels, num_classes):
+    """Matching Networks 的类概率：support 注意力按标签加权。"""
+    if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 1:
+        raise ValueError(
+            f"matching_logits: num_classes 必须是 >=1 的整数，收到 {num_classes!r}")
+    if not isinstance(support_labels, (list, tuple)) \
+            or len(support_labels) != len(support):
+        raise ValueError("matching_logits: support_labels 长度必须与 support 相同")
+    weights = matching_attention(query, support)
+    out = [0.0] * num_classes
+    for i, label in enumerate(support_labels):
+        if isinstance(label, bool) or not isinstance(label, int) \
+                or not (0 <= label < num_classes):
+            raise ValueError(
+                f"matching_logits: support_labels[{i}] 必须是 0..{num_classes - 1}，"
+                f"收到 {label!r}")
+        out[label] += weights[i]
+    return out
+
+# ============================================================================
 #  RL 环境（W16-E：GridWorld / CartPole）
 # ============================================================================
 

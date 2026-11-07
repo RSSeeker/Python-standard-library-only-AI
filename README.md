@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1531 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1541 项）
 
 ## 特性
 
@@ -1869,6 +1869,35 @@ shaped = AI.rlhf_reward([1.0, 0.0], [-0.2, -1.0], [-0.2, -0.6], beta=0.5)
 
 三条边界：`bradley_terry_loss` 只算**成对**比较（批量就是逐对求均值），不建模平局；`rlhf_reward` 只做奖励塑形，**没有**封装完整的 PPO-RLHF 训练循环（策略 / 参考 / 奖励 / 价值四模型联动要自己拼，README 这段就是拼法）；`ucb1_action` 的 `total` 由 `counts` 求和得到，调用方不需要另外传步数。
 
+### 元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
+
+| API | 说明 |
+| --- | --- |
+| `maml_inner_step(model, xs, ys, inner_lr=0.1, inner_steps=1, loss_fn=None)` | 任务内 SGD，返回 `(适配后参数, 每步 loss)`，不改动传入模型 |
+| `maml_outer_grads(model, tasks, ...)` | 一阶 MAML 外循环梯度；`tasks` 每项是 `(support_x, support_y, query_x, query_y)` |
+| `reptile_step(model, tasks, inner_lr, inner_steps, meta_lr)` | 朝「各任务适配后参数的均值」走一步，原地更新 |
+| `prototype_embeddings(embeddings, labels)` | 每类嵌入均值（原型） |
+| `prototype_logits(query, prototypes, temperature=1.0)` | `-||q-p_c||^2 / T`，返回 `(logits, labels)` |
+| `prototypical_loss(query, y, support, y_support, temperature)` | ProtoNet 损失 + 对查询嵌入的梯度 |
+| `matching_attention(query, support, temperature=1.0)` | 余弦相似度 softmax（Matching Networks） |
+| `matching_logits(query, support, y_support, num_classes)` | 注意力按标签累加成类概率 |
+
+```python
+net = MLP([4, 16, 1], activations=['relu', 'linear'])
+tasks = [(sx, sy, qx, qy), ...]              # 每个任务四个列表
+loss, grads = maml_outer_grads(net, tasks, inner_lr=0.1, inner_steps=1)
+reptile_step(net, tasks, inner_lr=0.1, inner_steps=1, meta_lr=0.3)
+
+proto = prototype_embeddings(support_emb, support_labels)
+loss, d_query = prototypical_loss(query_emb, query_labels, support_emb, support_labels)
+```
+
+三条边界：
+
+- `maml_outer_grads` 是 **一阶近似**（不展开内循环的二阶项），小 `inner_lr` 下与「直接取 query 梯度」几乎重合，`inner_lr` 大时会偏差。
+- MAML / Reptile 的参数字典是**逐行原地写回**（保持层对象与优化器状态引用），所以 `maml_inner_step` 内部用 `finally` 恢复原参数，返回的是参数副本。
+- `matches_attention` 之类只做一次前向/相似度，不涉及反向；ProtoNet 的梯度只对**查询嵌入**给出，对支撑集/原型本身没有梯度。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2285,7 +2314,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1531 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1541 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2485,6 +2514,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDQNFamily` | W16-F：回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
 | `TestPolicyGradient` | W16-F2：策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
 | `TestRLInfrastructure` | W16-G：ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
+| `TestMetaLearning` | MAML 内/外循环、Reptile 均值更新、ProtoNet 梯度、Matching 注意力 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2538,7 +2568,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1531 个单元测试
+├── test_ai.py       # 1541 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

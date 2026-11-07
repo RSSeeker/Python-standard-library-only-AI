@@ -536,7 +536,11 @@
   - 完整的 PPO-RLHF 四模型训练循环**没有**封装（README 给了拼法），策略侧复用 W16-F2 的 `PPOAgent`。
   - probe_w16g.py 48 项：ε 单调不增、UCB 稀疏臂优先、Thompson 200 轮后最优臂后验最高、
     Bradley-Terry 在 ±50 的分数差下不溢出且梯度与中心差分一致。
-- [ ] 元学习：MAML / Reptile / ProtoNet / Matching Networks
+- [x] 元学习：MAML / Reptile / ProtoNet / Matching Networks
+  - `maml_inner_step` / `maml_outer_grads`（一阶）/ `reptile_step`
+  - `prototype_embeddings` / `prototype_logits` / `prototypical_loss`
+  - `matching_attention` / `matching_logits`
+  - 探针 41 项；修掉 `prototypical_loss` 梯度漏除样本数（差 1/2）
 - [ ] 联邦学习：FedAvg / FedProx / FedBN
 
 ### W17 领域应用（§16）

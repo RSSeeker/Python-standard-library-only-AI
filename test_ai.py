@@ -23330,3 +23330,185 @@ class TestRLInfrastructure:
             AI.kl_penalty([-1.0], [-1.0, -2.0])
         with pytest.raises(ValueError):
             AI.rlhf_reward([1.0], [0.0], [0.0], beta=-1.0)
+
+
+class TestMetaLearning:
+    """W16-H：MAML / Reptile / ProtoNet / Matching Networks。"""
+
+    @staticmethod
+    def _flat(mlp):
+        out = []
+        for layer in mlp.layers:
+            for row in layer.weights:
+                out.extend(row)
+            out.extend(layer.biases)
+        return out
+
+    @staticmethod
+    def _task(n=6, slope=2.0, seed=0):
+        import random
+        rng = random.Random(seed)
+        xs, ys = [], []
+        for _ in range(n):
+            x = rng.uniform(-1.0, 1.0)
+            xs.append([x])
+            ys.append([slope * x])
+        return xs, ys
+
+    def test_maml_inner_step_reduces_loss_and_restores(self):
+        AI.set_seed(11)
+        net = AI.MLP([1, 6, 1], activations=["relu", "linear"])
+        before = self._flat(net)
+        sx, sy = self._task(seed=1)
+        adapted, losses = AI.maml_inner_step(net, sx, sy, inner_lr=0.05, inner_steps=30)
+        assert len(losses) == 30
+        assert losses[-1] < losses[0] * 0.5
+        assert self._flat(net) == before  # 内循环不改动传入模型
+        assert adapted is not None and len(adapted) == len(net.layers)
+
+    def test_maml_inner_step_validation(self):
+        net = AI.MLP([1, 3, 1], activations=["relu", "linear"])
+        sx, sy = self._task(n=3)
+        with pytest.raises(ValueError):
+            AI.maml_inner_step(net, sx, sy, inner_lr=0.0)
+        with pytest.raises(ValueError):
+            AI.maml_inner_step(net, sx, sy, inner_steps=0)
+        with pytest.raises(ValueError):
+            AI.maml_inner_step(net, [], [])
+        with pytest.raises(ValueError):
+            AI.maml_inner_step(net, sx, sy[:-1])
+
+    def test_maml_outer_grads_first_order_limit(self):
+        AI.set_seed(12)
+        net = AI.MLP([1, 5, 1], activations=["relu", "linear"])
+        tasks = []
+        for s in (2, 3):
+            sxx, syy = self._task(n=4, seed=s)
+            qxx, qyy = self._task(n=3, seed=100 + s)
+            tasks.append((sxx, syy, qxx, qyy))
+        before = self._flat(net)
+        loss, grads = AI.maml_outer_grads(net, tasks, inner_lr=1e-9, inner_steps=1)
+        assert loss == loss and len(grads) == len(net.layers)
+        assert self._flat(net) == before
+        # inner_lr 极小时一阶近似应等于「各任务 query 梯度的平均」
+        acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                 for layer in net.layers]
+        acc_b = [[0.0] * layer.fan_out for layer in net.layers]
+        for (sxx, syy, qxx, qyy) in tasks:
+            for i in range(len(qxx)):
+                _l, g = AI.mse_loss(net.forward(list(qxx[i])), list(qyy[i]))
+                for li, (gw, gb) in enumerate(AI._mlp_backward(net, g)):
+                    for j in range(len(gw)):
+                        for k in range(len(gw[j])):
+                            acc_w[li][j][k] += gw[j][k]
+                        acc_b[li][j] += gb[j]
+        n = float(len(tasks) * len(tasks[0][2]))
+        for li in range(len(net.layers)):
+            for j in range(len(net.layers[li].weights)):
+                for k in range(len(net.layers[li].weights[j])):
+                    assert abs(grads[li][0][j][k] - acc_w[li][j][k] / n) < 1e-6
+            for j in range(len(net.layers[li].biases)):
+                assert abs(grads[li][1][j] - acc_b[li][j] / n) < 1e-6
+
+    def test_maml_outer_grads_validation(self):
+        net = AI.MLP([1, 3, 1], activations=["relu", "linear"])
+        with pytest.raises(ValueError):
+            AI.maml_outer_grads(net, [])
+        sx, sy = self._task(n=3)
+        with pytest.raises(ValueError):
+            AI.maml_outer_grads(net, [(sx, sy)])
+
+    def test_reptile_matches_mean_delta(self):
+        AI.set_seed(13)
+        net = AI.MLP([1, 4, 1], activations=["relu", "linear"])
+        init = [([list(r) for r in layer.weights], list(layer.biases))
+                for layer in net.layers]
+        tasks = []
+        for s in (2, 3):
+            sxx, syy = self._task(n=4, seed=s)
+            qxx, qyy = self._task(n=3, seed=100 + s)
+            tasks.append((sxx, syy, qxx, qyy))
+        adapted = [AI.maml_inner_step(net, t[0], t[1], inner_lr=0.05, inner_steps=2)[0]
+                   for t in tasks]
+        meta_lr = 0.3
+        loss, norm = AI.reptile_step(net, tasks, inner_lr=0.05, inner_steps=2,
+                                     meta_lr=meta_lr)
+        assert loss == loss and norm >= 0.0
+        for li in range(len(init)):
+            for j in range(len(init[li][0])):
+                for k in range(len(init[li][0][j])):
+                    delta = sum(a[li][0][j][k] - init[li][0][j][k] for a in adapted) / len(adapted)
+                    want = init[li][0][j][k] + meta_lr * delta
+                    assert abs(net.layers[li].weights[j][k] - want) < 1e-12
+
+    def test_reptile_validation(self):
+        net = AI.MLP([1, 3, 1], activations=["relu", "linear"])
+        sx, sy = self._task(n=3)
+        with pytest.raises(ValueError):
+            AI.reptile_step(net, [], meta_lr=0.1)
+        with pytest.raises(ValueError):
+            AI.reptile_step(net, [(sx, sy, sx, sy)], meta_lr=0.0)
+
+    def test_prototype_embeddings_and_logits(self):
+        support = [[0.0, 0.0], [0.2, 0.1], [1.0, 1.0], [1.1, 0.9]]
+        labels = [0, 0, 1, 1]
+        proto = AI.prototype_embeddings(support, labels)
+        assert abs(proto[0][0] - 0.1) < 1e-12
+        assert abs(proto[0][1] - 0.05) < 1e-12
+        assert abs(proto[1][0] - 1.05) < 1e-12
+        logits, order = AI.prototype_logits([[0.1, 0.0]], proto, temperature=1.0)
+        assert order == [0, 1]
+        assert abs(logits[0][0] + 0.0025) < 1e-12
+        assert AI._rl_softmax(logits[0])[0] > AI._rl_softmax(logits[0])[1]
+
+    def test_prototypical_loss_gradient(self):
+        support = [[0.0, 0.0], [1.0, 1.0]]
+        labels = [0, 1]
+        q = [[0.2, 0.1], [0.9, 1.2]]
+        loss, dq = AI.prototypical_loss(q, [0, 1], support, labels, temperature=1.0)
+        assert loss == loss
+        eps = 1e-6
+        for i in range(len(q)):
+            for k in range(len(q[0])):
+                hi = [list(r) for r in q]
+                hi[i][k] += eps
+                lo = [list(r) for r in q]
+                lo[i][k] -= eps
+                num = (AI.prototypical_loss(hi, [0, 1], support, labels)[0]
+                       - AI.prototypical_loss(lo, [0, 1], support, labels)[0]) / (2 * eps)
+                assert abs(num - dq[i][k]) < 1e-6
+        with pytest.raises(ValueError):
+            AI.prototypical_loss(q, [2, 0], support, labels)
+
+    def test_matching_attention_and_logits(self):
+        att = AI.matching_attention([1.0, 0.0], [[0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]])
+        assert abs(sum(att) - 1.0) < 1e-12
+        assert att.index(max(att)) == 0
+        ml = AI.matching_logits([1.0, 0.0], [[0.9, 0.1], [0.0, 1.0]], [0, 1], 2)
+        assert abs(sum(ml) - 1.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.matching_attention([0.0, 0.0], [[1.0, 0.0]])
+        with pytest.raises(ValueError):
+            AI.matching_attention([1.0, 0.0], [[1.0]])
+        with pytest.raises(ValueError):
+            AI.matching_logits([1.0, 0.0], [[0.9, 0.1]], [3], 2)
+
+    def test_meta_helpers_validation(self):
+        with pytest.raises(ValueError):
+            AI._meta_mlp(3, "x")
+        model = AI.Model(AI.MLP([1, 2, 1], activations=["relu", "linear"]),
+                         loss_fn="mse", optimizer="adam")
+        inner = AI._meta_mlp(model, "x")
+        assert inner is model.model
+        params = AI._meta_copy_params(inner)
+        AI._meta_load_params(inner, params)
+        with pytest.raises(ValueError):
+            AI._meta_load_params(inner, params[:-1])
+        bad = [([[0.0] * (layer.fan_in - 1) for _ in range(layer.fan_out)], list(layer.biases))
+               for layer in inner.layers]
+        with pytest.raises(ValueError):
+            AI._meta_load_params(inner, bad)
+        with pytest.raises(ValueError):
+            AI.prototype_embeddings([], [])
+        with pytest.raises(ValueError):
+            AI.prototype_logits([[0.0, 0.0]], {0: [0.0, 0.0]}, temperature=0.0)
