@@ -213,7 +213,11 @@
 - [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）
 - [x] `ContinuousBatcher`：请求随时进出、每步按容量重组批与补位；记账按**准入时**的提示词长度（旧版扣生成后长度会让 `used_tokens` 变负数）；测试 4 例、计数 1014→1018
 - [x] `PagedKVCache`：PagedAttention 的块表数据结构（按 `block_size` 分块、逻辑→物理块映射、释放即复用；3 token 用 2 块、fragmentation=0.25）
-- [ ] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）
+- [x] 解码加速剩余：完整草稿-验证循环、自投机/Medusa/EAGLE（概念）
+  - `speculative_decode(draft_probs_fn, target_probs_fn, ...)`：两个纯回调，含 `rounds/proposed/accepted/target_calls/accept_rate/tokens_per_target_call`
+  - `self_speculative_probs(model, draft_layers)` 用前 n 个编码器块做草稿，`target_probs(model)` 做验证；层数越界构造时即报错
+  - 探针用 4000 次试验核对「gamma=1 与 gamma=3 的输出分布都对目标分布最大偏差 <0.03」
+  - Medusa / EAGLE 只说明机制不实现（需要额外训练的多头 / 特征级草稿）
 - [x] `sequence_packing`（返回 `segment_ids` / `position_ids`）+ `packed_causal_mask` + `PrefixCache`（逐层 KV、可 `merge`/`truncate`、JSON 往返）
 
 ### W8 生成模型（§12）

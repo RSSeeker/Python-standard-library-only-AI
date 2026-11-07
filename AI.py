@@ -9662,6 +9662,208 @@ def grammar_generate(grammar, logits_fn, vocabulary, max_len=16, stop=None):
     return out
 
 
+# ============================================================================
+#  领域应用 W7-F：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+# ============================================================================
+
+def _w7f_ids(ids, who):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"{who}: ids 必须是非空列表")
+    out = []
+    for i, t in enumerate(ids):
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise ValueError(f"{who}: ids[{i}] 必须是整数，收到 {t!r}")
+        out.append(int(t))
+    return out
+
+
+def _w7f_probs(fn, ids, vocab_size=None, who="speculative_decode"):
+    """调用用户的「下一个 token 概率」回调并校验。"""
+    row = fn(list(ids))
+    if not isinstance(row, (list, tuple)) or not row:
+        raise ValueError(f"{who}: 概率回调必须返回非空列表")
+    vals = []
+    for j, p in enumerate(row):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise ValueError(f"{who}: 概率[{j}] 必须是数字，收到 {p!r}")
+        p = float(p)
+        if p != p or p < 0.0 or p == float("inf"):
+            raise ValueError(f"{who}: 概率[{j}] 必须是有限非负数，收到 {p!r}")
+        vals.append(p)
+    if vocab_size is not None and len(vals) != vocab_size:
+        raise ValueError(f"{who}: 概率长度 {len(vals)} 与词表 {vocab_size} 不一致")
+    total = sum(vals)
+    if total <= 0.0:
+        raise ValueError(f"{who}: 概率之和必须 > 0")
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"{who}: 概率之和必须为 1，实测 {total:.6f}")
+    return vals
+
+
+def _w7f_sample(probs, rng):
+    """按累积分布采样一个下标（浮点误差兜底到最后一个非零项）。"""
+    u = rng.random()
+    acc = 0.0
+    last = 0
+    for i, p in enumerate(probs):
+        if p > 0.0:
+            last = i
+        acc += p
+        if u < acc:
+            return i
+    return last
+
+
+def speculative_decode(draft_probs_fn, target_probs_fn, prompt_ids,
+                       max_new_tokens=8, gamma=4, seed=None, eos_id=None):
+    """完整的草稿-验证循环（与 ``speculative_accept`` 配套）
+
+    ``draft_probs_fn(ids) -> probs`` 和 ``target_probs_fn(ids) -> probs`` 是
+    「下一个 token 的概率分布」回调；每轮草稿连出至多 ``gamma`` 个 token，
+    再用 ``speculative_accept`` 做拒绝采样：接受前 k 个，第一个被拒位置用残差
+    ``max(0, p_target - p_draft)`` 重采样。
+
+    与 ``speculative_generate``（W15-D，要求草稿模型有 ``generate``）的区别：
+    这里只要求两个纯回调，因此可以拿任意合成分布做端到端校验，也不依赖模型类。
+
+    返回 ``{"ids", "stats"}``；``stats`` 含 ``rounds`` / ``proposed`` /
+    ``accepted`` / ``draft_calls`` / ``target_calls`` / ``accept_rate`` /
+    ``tokens_per_target_call``。``target_calls`` 是目标模型被调用的次数——
+    这正是投机解码要省的资源，比值越高质量越好。
+    """
+    prompt = _w7f_ids(prompt_ids, "speculative_decode")
+    if not callable(draft_probs_fn) or not callable(target_probs_fn):
+        raise ValueError("speculative_decode: 两个概率回调都必须可调用")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 1:
+        raise ValueError(
+            f"speculative_decode: max_new_tokens 必须是 >=1 的整数，收到 {max_new_tokens!r}")
+    if not isinstance(gamma, int) or isinstance(gamma, bool) or gamma < 1:
+        raise ValueError(f"speculative_decode: gamma 必须是 >=1 的整数，收到 {gamma!r}")
+    if eos_id is not None and (isinstance(eos_id, bool) or not isinstance(eos_id, int)
+                               or eos_id < 0):
+        raise ValueError(f"speculative_decode: eos_id 必须是非负整数，收到 {eos_id!r}")
+
+    rng = random.Random(seed)
+    ids = list(prompt)
+    produced = 0
+    rounds = 0
+    proposed = 0
+    accepted_total = 0
+    draft_calls = 0
+    target_calls = 0
+    vocab = None
+
+    while produced < max_new_tokens:
+        want = min(gamma, max_new_tokens - produced)
+        drafted = []
+        draft_probs = []
+        ctx = list(ids)
+        for _ in range(want):
+            p = _w7f_probs(draft_probs_fn, ctx, vocab)
+            draft_calls += 1
+            if vocab is None:
+                vocab = len(p)
+            tok = _w7f_sample(p, rng)
+            drafted.append(tok)
+            draft_probs.append(p)
+            ctx = ctx + [tok]
+        rounds += 1
+        proposed += len(drafted)
+
+        target_probs = []
+        for k in range(len(drafted)):
+            p = _w7f_probs(target_probs_fn, ids + drafted[:k], vocab)
+            target_calls += 1
+            target_probs.append(p)
+
+        n_ok, resid = speculative_accept(drafted, draft_probs, target_probs, rng=rng)
+        ids.extend(drafted[:n_ok])
+        accepted_total += n_ok
+        produced += n_ok
+        if resid is not None and produced < max_new_tokens:
+            ids.append(int(resid))
+            produced += 1
+        if eos_id is not None and eos_id in ids[len(prompt):]:
+            break
+
+    stats = {
+        "rounds": rounds,
+        "proposed": proposed,
+        "accepted": accepted_total,
+        "draft_calls": draft_calls,
+        "target_calls": target_calls,
+        "accept_rate": (accepted_total / proposed) if proposed else 0.0,
+        "tokens_per_target_call": (produced / target_calls) if target_calls else 0.0,
+    }
+    return {"ids": ids, "stats": stats}
+
+
+def _w7f_partial_logits(model, ids, n_layers):
+    """只跑前 ``n_layers`` 个编码器块（自投机草稿的机制演示）。"""
+    for name in ("embedding", "pos", "encoder", "W_out", "b_out", "vocab_size"):
+        if not hasattr(model, name):
+            raise ValueError(
+                f"self_speculative_probs: 模型缺少 {name}，需要 CausalLM 这类结构")
+    emb = model.embedding.forward(list(ids))
+    x = model.pos.forward(emb) if getattr(model, "use_abs_pos", False) else emb
+    layers = model.encoder.layers
+    if not isinstance(n_layers, int) or isinstance(n_layers, bool) \
+            or not 1 <= n_layers <= len(layers):
+        raise ValueError(
+            f"self_speculative_probs: draft_layers 必须在 1..{len(layers)}，收到 {n_layers!r}")
+    for layer in layers[:n_layers]:
+        x = layer.forward(x)
+    logits = _matmul(x, _transpose(model.W_out))
+    for t in range(len(x)):
+        for v in range(model.vocab_size):
+            logits[t][v] += model.b_out[v]
+    return logits
+
+
+def self_speculative_probs(model, draft_layers=1):
+    """自投机解码的草稿回调：用同一模型的前 ``draft_layers`` 个块当草稿。
+
+    这是「自投机（self-speculative）」的最小机制演示：草稿与目标共享词嵌入与
+    输出头，只少跑几层 Transformer，所以不需要第二个模型；代价是草稿质量随层数
+    下降，接受率也随之下降。返回 ``fn(ids) -> probs``，可直接传给
+    ``speculative_decode``。
+
+    Medusa（多个解码头 + 树状验证）与 EAGLE（在特征空间上做草稿）本库**只解释
+    机制、不实现**：前者需要训练额外的头，后者需要特征级对齐，都不是纯前向
+    能演示的，README 里写清了这条边界。
+    """
+    if not isinstance(draft_layers, int) or isinstance(draft_layers, bool) \
+            or draft_layers < 1:
+        raise ValueError(
+            f"self_speculative_probs: draft_layers 必须是 >=1 的整数，收到 {draft_layers!r}")
+    layers = getattr(getattr(model, "encoder", None), "layers", None)
+    if layers is not None and draft_layers > len(layers):
+        raise ValueError(
+            f"self_speculative_probs: draft_layers={draft_layers} 超过模型的 "
+            f"{len(layers)} 个编码器块")
+
+    def probs_fn(ids):
+        logits = _w7f_partial_logits(model, ids, draft_layers)
+        return _softmax_row(list(logits[-1]))
+
+    return probs_fn
+
+
+def target_probs(model):
+    """把模型的完整前向包装成 ``fn(ids) -> probs``（目标模型侧回调）。"""
+    if not hasattr(model, "forward"):
+        raise ValueError("target_probs: 模型必须有 forward")
+
+    def probs_fn(ids):
+        logits = model.forward(list(ids))
+        row = logits[-1] if isinstance(logits, (list, tuple)) and logits and \
+            isinstance(logits[0], (list, tuple)) else logits
+        return _softmax_row(list(row))
+
+    return probs_fn
+
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 

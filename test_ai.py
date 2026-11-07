@@ -27520,3 +27520,133 @@ class TestGrammarConstrained:
         out = AI.grammar_generate(reg, reg_logits, ["a", "b", "c", "d"], max_len=8)
         assert reg.accepts(out) is True
         assert out[0] == "a" and out[-1] == "d"
+
+
+class TestSpeculativeDecoding:
+    """完整草稿-验证循环（W7-F）"""
+
+    PROBS = [0.1, 0.2, 0.3, 0.25, 0.15]
+
+    def _same(self, ids):
+        return list(self.PROBS)
+
+    def test_draft_equals_target_accepts_all(self):
+        out = AI.speculative_decode(self._same, self._same, [0], max_new_tokens=6,
+                                    gamma=3, seed=1)
+        st = out["stats"]
+        assert st["accepted"] == st["proposed"]
+        assert st["accept_rate"] == 1.0
+        assert len(out["ids"]) == 7
+        assert out["ids"][0] == 0
+
+    def test_rejection_still_lands_on_target_mode(self):
+        def target(ids):
+            return [0.0, 0.0, 1.0, 0.0, 0.0]
+
+        def draft(ids):
+            return [0.2] * 5
+
+        out = AI.speculative_decode(draft, target, [0], max_new_tokens=4, gamma=2,
+                                    seed=3)
+        assert out["stats"]["accept_rate"] < 0.9
+        assert all(t == 2 for t in out["ids"][1:])
+        assert out["stats"]["target_calls"] >= 1
+
+    def test_output_distribution_matches_target(self):
+        target = [0.05, 0.1, 0.15, 0.55, 0.15]
+        trials = 3000
+        counts = [0] * len(target)
+        for s in range(trials):
+            out = AI.speculative_decode(lambda ids: [0.2] * 5,
+                                        lambda ids: list(target), [0],
+                                        max_new_tokens=1, gamma=1, seed=s)
+            counts[out["ids"][1]] += 1
+        freq = [c / trials for c in counts]
+        worst = max(abs(freq[i] - target[i]) for i in range(len(target)))
+        assert worst < 0.04, (freq, worst)
+
+    def test_gamma_greater_than_one_also_exact(self):
+        target = [0.05, 0.1, 0.15, 0.55, 0.15]
+        trials = 3000
+        counts = [0] * len(target)
+        for s in range(trials):
+            out = AI.speculative_decode(lambda ids: [0.2] * 5,
+                                        lambda ids: list(target), [0],
+                                        max_new_tokens=3, gamma=3, seed=s)
+            for t in out["ids"][1:4]:
+                counts[t] += 1
+        total = sum(counts)
+        freq = [c / total for c in counts]
+        worst = max(abs(freq[i] - target[i]) for i in range(len(target)))
+        assert worst < 0.04, (freq, worst)
+
+    def test_eos_stops_early(self):
+        out = AI.speculative_decode(lambda ids: [0.2] * 5,
+                                    lambda ids: [0.0, 0.0, 1.0, 0.0, 0.0],
+                                    [0], max_new_tokens=6, gamma=3, seed=5,
+                                    eos_id=2)
+        assert 2 in out["ids"]
+        assert len(out["ids"]) < 7
+
+    def test_stats_are_consistent(self):
+        out = AI.speculative_decode(lambda ids: [0.2] * 5,
+                                    lambda ids: list(self.PROBS), [0],
+                                    max_new_tokens=5, gamma=2, seed=7)
+        st = out["stats"]
+        assert st["accepted"] <= st["proposed"]
+        assert st["rounds"] >= 1
+        assert st["draft_calls"] == st["proposed"]
+        assert abs(st["accept_rate"] - st["accepted"] / st["proposed"]) < 1e-12
+        assert st["tokens_per_target_call"] > 0.0
+
+    def test_bad_inputs(self):
+        for bad_prompt in ([], "ab", [1.5], [True]):
+            with pytest.raises((ValueError, TypeError)):
+                AI.speculative_decode(lambda ids: [0.2] * 5,
+                                      lambda ids: list(self.PROBS), bad_prompt)
+        with pytest.raises(ValueError):
+            AI.speculative_decode(lambda ids: [0.5, 0.5],
+                                  lambda ids: list(self.PROBS), [0])
+        with pytest.raises(ValueError):
+            AI.speculative_decode(lambda ids: [0.5] * 5,
+                                  lambda ids: list(self.PROBS), [0])
+        with pytest.raises(ValueError):
+            AI.speculative_decode(lambda ids: [float("nan"), 0.25, 0.25, 0.25, 0.25],
+                                  lambda ids: list(self.PROBS), [0])
+        for bad_len in (0, -1, 1.5, True):
+            with pytest.raises(ValueError):
+                AI.speculative_decode(lambda ids: [0.2] * 5,
+                                      lambda ids: list(self.PROBS), [0],
+                                      max_new_tokens=bad_len)
+        with pytest.raises(ValueError):
+            AI.speculative_decode(lambda ids: [0.2] * 5,
+                                  lambda ids: list(self.PROBS), [0], gamma=0)
+
+    def test_self_speculative_layers(self):
+        AI.set_seed(11)
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16, num_layers=3,
+                         max_len=16, dropout=0.0)
+        lm.eval()
+        draft = AI.self_speculative_probs(lm, draft_layers=2)
+        target = AI.target_probs(lm)
+
+        p_draft = draft([0, 1, 2])
+        p_target = target([0, 1, 2])
+        assert abs(sum(p_draft) - 1.0) < 1e-6
+        assert abs(sum(p_target) - 1.0) < 1e-6
+
+        out = AI.speculative_decode(draft, target, [0, 1], max_new_tokens=4,
+                                    gamma=2, seed=2)
+        assert len(out["ids"]) == 6
+        assert all(0 <= t < 8 for t in out["ids"])
+
+        full = AI.self_speculative_probs(lm, draft_layers=3)
+        st = AI.speculative_decode(full, target, [0, 1], max_new_tokens=4, gamma=2,
+                                   seed=2)["stats"]
+        assert st["accept_rate"] == 1.0
+
+        for bad in (0, 4, -1, 1.5, True):
+            with pytest.raises(ValueError):
+                AI.self_speculative_probs(lm, draft_layers=bad)
+        with pytest.raises(ValueError):
+            AI.target_probs("not a model")

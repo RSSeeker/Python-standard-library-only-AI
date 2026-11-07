@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1807 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1815 项）
 
 ## 特性
 
@@ -2701,6 +2701,35 @@ print(r.accepts(["a", "b", "d"]), r.allowed(["a", "b"], ["b", "c", "d"]))
 3. **JSON 文法只约束结构**：字符串/数字用 `STR` / `NUM` 类别终结符表示（或直接传带引号/数字文本的 token），真正的语义由 `json.loads` 在收尾时校验；它不检查「键是否在 schema 里」——那需要 JSON Schema 层，本库未实现。
 4. **语法与 token 粒度的错配**：词表里的多字符 token 只有在 NFA/Earley 能整段消化时才放行；字符级文法配 BPE 词表时会出现「语法允许但没有任何 token 可接」的空集，`grammar_pick` 会显式报错而不是静默产出非法串。
 
+### 完整草稿-验证循环（W7-F）
+
+| 函数 | 语义要点 |
+|---|---|
+| `speculative_decode(draft_probs_fn, target_probs_fn, prompt_ids, max_new_tokens=8, gamma=4, seed=None, eos_id=None)` | 只接受两个纯回调（`ids -> 概率向量`）的草稿-验证循环，返回 `{"ids", "stats"}`；`stats` 里有 `rounds / proposed / accepted / draft_calls / target_calls / accept_rate / tokens_per_target_call` |
+| `_w7f_probs(fn, ids, vocab_size=None)` | 校验回调输出（非空、长度一致、非负数、和为 1±1e-6、拒绝 bool/NaN/inf） |
+| `speculative_accept(...)`（已有） | 单个位置的拒绝采样原语，本项在循环里复用 |
+| `self_speculative_probs(model, draft_layers=1)` | 自投机草稿：只用前 `draft_layers` 个编码器块算 logits；层数越界在**构造时**报错 |
+| `target_probs(model)` | 用整模型的 logits 构造目标分布回调 |
+
+```python
+import AI
+
+def draft(ids):    # 任意合成分布都可以，这里演示"猜测偏乐观"
+    return [0.4, 0.3, 0.2, 0.1]
+
+def target(ids):
+    return [0.1, 0.2, 0.3, 0.4]
+
+out = AI.speculative_decode(draft, target, [0], max_new_tokens=8, gamma=3, seed=7)
+print(out["ids"], out["stats"]["accept_rate"])
+```
+
+三条边界：
+
+- **分布等价只在采样温度 1 下成立**。拒绝采样修正的是「按概率接受、否则用残差分布重采样」，任何温度缩放/截断采样都必须放到两个回调内部，本函数不再做二次修正。
+- **`target_calls` 才是真正省下的量**。`draft_calls` 每个候选都要算一次，所以草稿比目标便宜才有收益；`tokens_per_target_call` 小于 1 时这轮投机是亏的。
+- **Medusa / EAGLE 只解释机制、不实现**。Medusa 需要额外训练多个预测头并做树形验证，EAGLE 需要特征级草稿与对齐训练；本库没有这些权重，故只在本节说明差异，不提供空壳接口。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3117,7 +3146,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1807 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1815 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3340,6 +3369,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
 | `TestSamplingSearch` | 对比搜索单步打分与 α 两端退化、top-k 截断、`top_k=1` 与贪心逐位一致、多样束的扣分让位与无惩罚等价、`eos` 收尾、14 处参数校验 |
 | `TestGrammarConstrained` | 正则 NFA 逐步推进与死前缀报错、字符类与区间/取反、可选项与分组、Earley 接受与谓词终结符、JSON 结构文法与分词、mask/pick/generate 的合法性 |
+| `TestSpeculativeDecoding` | 草稿=目标时全接受、拒绝后仍落目标众数、单步与 `gamma=3` 的输出分布对目标最大偏差 <0.04、`eos_id` 提前停、`stats` 自洽、8 类非法输入、真实 `CausalLM` 上自投机与满层接受率 1.0 |
 | `TestNeuroSymbolic` | 规则集合与掩码、整条序列体检、约束贪心解码、全屏蔽报错 |
 | `TestMixtureOfDepths` | MoD 容量/排序/权重归一、块输出透传、早退三分支、savings、参数校验 |
 | `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
@@ -3397,7 +3427,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1807 个单元测试
+├── test_ai.py       # 1815 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
