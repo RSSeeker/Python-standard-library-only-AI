@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1181 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1188 项）
 
 ## 特性
 
@@ -834,6 +834,47 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 > 指标全部是**纯标准库实现**，输入会做防御性校验（空列表、长度不符、负类别索引、
 > 非有限数值都直接报 `ValueError`，不会静默给出 `nan`）。
 
+### 数据管道（W11-A）
+
+Dataset 抽象、Sampler 体系、长度分桶与预处理缓存。它们都只吃「list + 下标」，
+不依赖 numpy，也不需要把数据转成张量。
+
+| 类 / 函数 | 说明 |
+|---|---|
+| `Dataset` | 抽象基类：子类实现 `__len__` / `__getitem__` |
+| `ListDataset(items)` / `Subset(dataset, indices)` | 把 list 包成 Dataset / 按下标查看子集 |
+| `LazyDataset(length, loader, cache=True, max_cache=None)` | 懒加载：取到才调用 `loader(i)`；`hits` / `misses` 可观察命中，`max_cache` 为 FIFO 上限 |
+| `IterableDataset` | 流式数据集基类：只需实现 `__iter__`，不需要长度 |
+| `SequentialSampler` / `RandomSampler(n, replacement, seed)` | 顺序 / 随机（有放回可重复） |
+| `WeightedSampler(weights, num_samples, replacement, seed)` | 按权重采样；无放回时用指数键（Gumbel）技巧 |
+| `StratifiedSampler(labels, seed, shuffle)` | 分层：按标签轮流取，整体再打乱 |
+| `SubsetSampler(indices)` / `BatchSampler(sampler, batch_size, drop_last)` | 直接给下标 / 把下标切成 batch |
+| `bucket_by_length(lengths, batch_size, bucket_size_multiplier=4, shuffle, seed, drop_last)` | 长度分桶：长度相近的样本进同一个 batch，减少 padding 浪费 |
+| `PreprocessCache(directory, files, hash_content=True, digest='sha256')` | 预处理结果的磁盘缓存：键 = 源文件内容哈希 + 参数指纹；`get(params, build_fn)` 返回 `(值, 是否命中)` |
+
+`DataLoader` 现在可以直接接采样器（默认路径不变，仍与旧版逐位相同）：
+
+```python
+sampler = AI.StratifiedSampler(labels, seed=7)
+loader = AI.DataLoader(dataset, batch_size=8, sampler=sampler)
+for batch in loader:
+    ...
+
+# 分桶 + batch 采样器（适合变长序列）
+batches = AI.bucket_by_length([len(x) for x in data], batch_size=8, seed=7)
+loader = AI.DataLoader(data, batch_sampler=batches)
+```
+
+`PreprocessCache` 的典型用法是「分词/编码只做一次」：
+
+```python
+cache = AI.PreprocessCache("cache/", files=["corpus.txt"])
+ids, hit = cache.get({"vocab": 8000}, lambda: [encode(line) for line in lines])
+```
+
+诚实说明：`LazyDataset` 的淘汰是 FIFO 而不是 LRU（不引第三方库，避免维护链表）；
+`PreprocessCache` 用 JSON 存结果，只适合能 JSON 序列化的中间产物。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1250,7 +1291,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1181 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1188 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1411,6 +1452,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestNoiseCurriculumEnsemble` | 权重/梯度/输入噪声的零均值零方差与可复现、`curriculum_fraction` 三种 schedule、采样器「只取最简比例」且同种子可复现、manifold mixup 端点与中点、快照集成的单快照=普通前向与无副作用、13 类非法参数 |
 | `TestSemiSupervised` | `softmax_rows` 与手算 softmax 一致、一致性损失的自身为 0/对称性/手算核对、`consistency_regularizer` 梯度对有限差分、VAT 扰动 L2 范数 = eps 与 `eps=0` 恒等、伪标签置信度过滤、`soft_target_ce` 与 CE 一致 + 梯度差分 + 零权重、FixMatch 置信度阈值 1.0 时损失 0、MixMatch 平均与锐化、MeanTeacher 的 EMA 与「教师前向不污染学生权重」、11 类非法参数 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
+| `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1464,7 +1506,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1181 个单元测试
+├── test_ai.py       # 1188 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

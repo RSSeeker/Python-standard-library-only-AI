@@ -19129,3 +19129,131 @@ class TestCheckpointMixedPrecision:
                 AI.mixed_precision_grads(model, xs, ys, scale=scale)
         with pytest.raises(ValueError):
             AI.mixed_precision_grads(model, xs, ys, dtype="fp32")
+
+
+class TestDataPipeline:
+    """W11-A：Dataset / Sampler / 长度分桶 / 预处理缓存"""
+
+    def test_dataset_abstraction(self):
+        for call in (lambda: len(AI.Dataset()), lambda: AI.Dataset()[0]):
+            with pytest.raises(NotImplementedError):
+                call()
+        ds = AI.ListDataset([10, 20, 30])
+        assert len(ds) == 3
+        assert ds[1] == 20
+        sub = AI.Subset(ds, [2, 0])
+        assert [sub[i] for i in range(len(sub))] == [30, 10]
+        with pytest.raises(TypeError):
+            AI.ListDataset("abc")
+
+    def test_lazy_dataset_cache(self):
+        calls = []
+
+        def loader(i):
+            calls.append(i)
+            return i * i
+
+        lazy = AI.LazyDataset(3, loader)
+        assert calls == []
+        assert lazy[1] == 1
+        assert lazy[-1] == 4
+        assert calls == [1, 2]
+        lazy[1]
+        assert calls == [1, 2]
+        assert (lazy.hits, lazy.misses) == (1, 2)
+        lazy.clear_cache()
+        lazy[1]
+        assert len(calls) == 3
+        with pytest.raises(IndexError):
+            lazy[9]
+        fifo = AI.LazyDataset(4, lambda i: i, max_cache=2)
+        fifo[0], fifo[1], fifo[2]
+        fifo[0]
+        assert fifo.misses == 4
+
+    def test_samplers(self):
+        assert list(AI.SequentialSampler(4)) == [0, 1, 2, 3]
+        assert list(AI.RandomSampler(6, seed=3)) == list(AI.RandomSampler(6, seed=3))
+        assert sorted(AI.RandomSampler(6, seed=3)) == list(range(6))
+        assert len(list(AI.RandomSampler(5, replacement=True, seed=1))) == 5
+        w = AI.WeightedSampler([0.0, 0.0, 1.0], num_samples=4, seed=2)
+        assert list(w) == [2, 2, 2, 2]
+        now = list(AI.WeightedSampler([1.0, 1.0, 2.0], num_samples=3,
+                                      replacement=False, seed=5))
+        assert len(set(now)) == 3
+        st = list(AI.StratifiedSampler([0, 0, 0, 1, 1, 2], seed=4, shuffle=True))
+        assert sorted(st) == list(range(6))
+        assert list(AI.SubsetSampler([3, 1])) == [3, 1]
+
+    def test_batch_sampler(self):
+        bs = AI.BatchSampler(AI.SequentialSampler(5), 2)
+        assert [len(b) for b in bs] == [2, 2, 1]
+        assert len(bs) == 3
+        drop = AI.BatchSampler(AI.SequentialSampler(5), 2, drop_last=True)
+        assert [len(b) for b in drop] == [2, 2]
+        assert len(drop) == 2
+        for bad in (0, -1, 1.5, True):
+            with pytest.raises(ValueError):
+                AI.BatchSampler(AI.SequentialSampler(3), bad)
+
+    def test_bucket_by_length(self):
+        lengths = [10, 1, 5, 9, 2, 6, 8, 3, 7, 4]
+        batches = AI.bucket_by_length(lengths, 3, bucket_size_multiplier=1, seed=7)
+        flat = [i for b in batches for i in b]
+        assert sorted(flat) == list(range(10))
+        assert all(
+            max(lengths[i] for i in b) - min(lengths[i] for i in b) <= 2
+            for b in batches if len(b) > 1
+        )
+        assert batches == AI.bucket_by_length(lengths, 3, bucket_size_multiplier=1, seed=7)
+        dropped = AI.bucket_by_length(lengths, 3, bucket_size_multiplier=1, seed=7,
+                                      drop_last=True)
+        assert all(len(b) == 3 for b in dropped)
+        with pytest.raises(ValueError):
+            AI.bucket_by_length([], 3)
+
+    def test_preprocess_cache(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_text("hello", encoding="utf-8")
+        cache = AI.PreprocessCache(str(tmp_path / "cache"), files=[str(src)])
+        built = []
+
+        def build():
+            built.append(1)
+            return {"tokens": [1, 2, 3]}
+
+        v1, hit1 = cache.get({"mode": "a"}, build)
+        v2, hit2 = cache.get({"mode": "a"}, build)
+        assert (hit1, hit2) == (False, True)
+        assert len(built) == 1
+        assert v1 == v2
+        _v3, hit3 = cache.get({"mode": "b"}, build)
+        assert hit3 is False and len(built) == 2
+        src.write_text("hello!", encoding="utf-8")
+        _v4, hit4 = cache.get({"mode": "a"}, build)
+        assert hit4 is False and len(built) == 3
+        assert cache.clear() >= 3
+        with pytest.raises(ValueError):
+            AI.PreprocessCache(str(tmp_path), digest="sha1")
+        with pytest.raises(FileNotFoundError):
+            AI.PreprocessCache(str(tmp_path), files=[str(tmp_path / "nope")]).key()
+
+    def test_dataloader_sampler_paths(self):
+        items = [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)]
+        order = list(range(5))
+        random.Random(7).shuffle(order)
+        plain = [x for batch in AI.DataLoader(items, batch_size=2, shuffle=True, seed=7)
+                 for x in batch]
+        assert plain == [items[i] for i in order]
+        assert len(AI.DataLoader(items, batch_size=2)) == 3
+        with_sampler = AI.DataLoader(items, batch_size=2, sampler=AI.SubsetSampler([4, 0, 2]))
+        assert [x for b in with_sampler for x in b] == [items[4], items[0], items[2]]
+        assert len(with_sampler) == 2
+        with_batch = AI.DataLoader(items, batch_sampler=[[0, 1], [4]])
+        assert [len(b) for b in with_batch] == [2, 1]
+        assert len(with_batch) == 2
+        assert list(AI.DataLoader([], batch_size=4)) == []
+        with pytest.raises(ValueError):
+            AI.DataLoader(items, sampler=[0], batch_sampler=[[0]])
+        with pytest.raises(ValueError):
+            AI.DataLoader(items, batch_size=0)

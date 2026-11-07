@@ -303,8 +303,16 @@
   - 混合精度**只模拟舍入**，不做半精度矩阵乘，因此没有真实加速。
 
 ### W11 数据管道（§7）
-- [ ] `Dataset` 抽象 + 流式/懒加载；`Sampler` 体系（Weighted / Stratified / Curriculum / Subset / BatchSampler）
-- [ ] 长度分桶 `bucket_by_length`；预处理缓存（文件哈希命中）
+- [x] `Dataset` 抽象 + 流式/懒加载；`Sampler` 体系（Weighted / Stratified / Curriculum / Subset / BatchSampler）
+  - `Dataset` / `ListDataset` / `Subset` / `LazyDataset`（FIFO 缓存 + 命中计数）/
+    `IterableDataset`（流式，无需长度）。
+  - `Sampler` / `SequentialSampler` / `RandomSampler` / `WeightedSampler`（无放回用
+    Gumbel 指数键）/ `StratifiedSampler` / `SubsetSampler` / `BatchSampler`。
+  - `DataLoader` 新增 `sampler=` / `batch_sampler=`（默认路径仍与旧版逐位相同）。
+- [x] 长度分桶 `bucket_by_length`；预处理缓存（文件哈希命中）
+  - `bucket_by_length`：乱序 → 按长度排序 → 桶内再乱序 → 切 batch，`drop_last` 可选。
+  - `PreprocessCache`：键 = 源文件内容哈希（或 size+mtime）+ 参数指纹，命中直接读
+    JSON，未命中构建后先写临时文件再 `os.replace`。
 - [ ] 编码器：`OneHotEncoder` / `LabelEncoder` / `OrdinalEncoder` / `TargetEncoder` / `FrequencyEncoder` / `WOEEncoder`
 - [ ] 图像增强管道：`Compose` / `RandomCrop` / `RandomResizedCrop` / `RandomRotation` / `ColorJitter` / `GaussianBlur` / `Normalize`
 - [ ] 切分扩展：`GroupKFold` / 时间序列切分

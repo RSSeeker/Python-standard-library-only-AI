@@ -54,6 +54,7 @@
 #  23. Main: 回归 + 分类 + CNN 完整示例
 
 
+import hashlib
 import io
 import itertools
 import json
@@ -23664,13 +23665,428 @@ def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int 
     return train_set, val_set, test_set
 
 
+# ============================================================================
+#  W11-A：Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+# ============================================================================
+
+class Dataset:
+    """数据集抽象基类：子类实现 ``__len__`` 与 ``__getitem__``"""
+
+    def __len__(self):
+        raise NotImplementedError("Dataset 子类必须实现 __len__")
+
+    def __getitem__(self, index):
+        raise NotImplementedError("Dataset 子类必须实现 __getitem__")
+
+
+class ListDataset(Dataset):
+    """把已有的 list 包成 Dataset（不复制数据）"""
+
+    def __init__(self, items):
+        if not isinstance(items, (list, tuple)):
+            raise TypeError("ListDataset: items 必须是 list/tuple")
+        self.items = items
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+
+class LazyDataset(Dataset):
+    """懒加载：只有真正取到某个下标时才调用 ``loader(index)``
+
+    可选把结果缓存起来（``cache=True``），并用 ``hits`` / ``misses`` 观察命中情况；
+    ``max_cache`` 给出时按 FIFO 淘汰（本库不引第三方库，故不做 LRU 链表）。
+    """
+
+    def __init__(self, length, loader, cache=True, max_cache=None):
+        if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+            raise ValueError(f"LazyDataset: length 必须是 >=0 的整数，收到 {length!r}")
+        if not callable(loader):
+            raise TypeError("LazyDataset: loader 必须可调用")
+        if max_cache is not None and (isinstance(max_cache, bool)
+                                      or not isinstance(max_cache, int)
+                                      or max_cache < 1):
+            raise ValueError(f"LazyDataset: max_cache 必须是 >=1 的整数或 None，收到 {max_cache!r}")
+        self.length = length
+        self.loader = loader
+        self.cache = bool(cache)
+        self.max_cache = max_cache
+        self._store = {}
+        self._order = []
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(f"LazyDataset: 下标必须是整数，收到 {type(index).__name__}")
+        if index < 0:
+            index += self.length
+        if index < 0 or index >= self.length:
+            raise IndexError(f"LazyDataset: 下标 {index} 越界（长度 {self.length}）")
+        if self.cache and index in self._store:
+            self.hits += 1
+            return self._store[index]
+        value = self.loader(index)
+        if self.cache:
+            self.misses += 1
+            self._store[index] = value
+            self._order.append(index)
+            if self.max_cache is not None and len(self._order) > self.max_cache:
+                old = self._order.pop(0)
+                self._store.pop(old, None)
+        return value
+
+    def clear_cache(self):
+        """清空缓存（命中计数保留）"""
+        self._store.clear()
+        self._order.clear()
+
+
+class IterableDataset:
+    """流式数据集基类：子类实现 ``__iter__`` 即可，**不需要** ``__len__``"""
+
+    def __iter__(self):
+        raise NotImplementedError("IterableDataset 子类必须实现 __iter__")
+
+
+class Subset(Dataset):
+    """按下标子集查看另一个 Dataset（与 torch.utils.data.Subset 同义）"""
+
+    def __init__(self, dataset, indices):
+        if not hasattr(dataset, "__getitem__"):
+            raise TypeError("Subset: dataset 必须支持 __getitem__")
+        self.dataset = dataset
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
+
+
+class Sampler:
+    """采样器基类：``__iter__`` 产出样本下标"""
+
+    def __iter__(self):
+        raise NotImplementedError("Sampler 子类必须实现 __iter__")
+
+    def __len__(self):
+        raise NotImplementedError("Sampler 子类必须实现 __len__")
+
+
+class SequentialSampler(Sampler):
+    """按 0..n-1 顺序产出下标"""
+
+    def __init__(self, n_samples):
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples < 0:
+            raise ValueError(f"SequentialSampler: n_samples 必须是 >=0 的整数，收到 {n_samples!r}")
+        self.n_samples = n_samples
+
+    def __iter__(self):
+        return iter(range(self.n_samples))
+
+    def __len__(self):
+        return self.n_samples
+
+
+class RandomSampler(Sampler):
+    """随机采样；``replacement=True`` 时可重复（有放回）"""
+
+    def __init__(self, n_samples, replacement=False, seed=None):
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples < 0:
+            raise ValueError(f"RandomSampler: n_samples 必须是 >=0 的整数，收到 {n_samples!r}")
+        if replacement and n_samples == 0:
+            raise ValueError("RandomSampler: 有放回采样要求 n_samples > 0")
+        self.n_samples = n_samples
+        self.replacement = bool(replacement)
+        self._rng = random.Random(seed)
+
+    def __iter__(self):
+        if self.n_samples == 0:
+            return iter([])
+        if self.replacement:
+            return iter([self._rng.randrange(self.n_samples) for _ in range(self.n_samples)])
+        out = list(range(self.n_samples))
+        self._rng.shuffle(out)
+        return iter(out)
+
+    def __len__(self):
+        return self.n_samples
+
+
+class WeightedSampler(Sampler):
+    """按权重采样：``replacement=True`` 时是多项分布，否则用指数键做无放回加权抽样"""
+
+    def __init__(self, weights, num_samples=None, replacement=True, seed=None):
+        weights = [float(w) for w in weights]
+        if not weights:
+            raise ValueError("WeightedSampler: weights 不能为空")
+        if any(w < 0.0 for w in weights):
+            raise ValueError("WeightedSampler: weights 不能为负")
+        if sum(weights) <= 0.0:
+            raise ValueError("WeightedSampler: weights 之和必须 > 0")
+        if num_samples is None:
+            num_samples = len(weights)
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples < 1:
+            raise ValueError(f"WeightedSampler: num_samples 必须是 >=1 的整数，收到 {num_samples!r}")
+        if not replacement and num_samples > len(weights):
+            raise ValueError(
+                f"WeightedSampler: 无放回采样最多 {len(weights)} 个，收到 {num_samples}"
+            )
+        self.weights = weights
+        self.num_samples = num_samples
+        self.replacement = bool(replacement)
+        self._rng = random.Random(seed)
+
+    def __iter__(self):
+        if self.replacement:
+            total = sum(self.weights)
+            out = []
+            for _ in range(self.num_samples):
+                r = self._rng.random() * total
+                acc = 0.0
+                for i, w in enumerate(self.weights):
+                    acc += w
+                    if r < acc:
+                        out.append(i)
+                        break
+                else:
+                    out.append(len(self.weights) - 1)
+            return iter(out)
+        # Gumbel 技巧：key = -log(u)/w，取 key 最小的 k 个即无放回加权抽样
+        keys = []
+        for i, w in enumerate(self.weights):
+            if w <= 0.0:
+                continue
+            u = max(self._rng.random(), 1e-12)
+            keys.append((-math.log(u) / w, i))
+        keys.sort()
+        return iter([i for _k, i in keys[:self.num_samples]])
+
+    def __len__(self):
+        return self.num_samples
+
+
+class StratifiedSampler(Sampler):
+    """分层采样：按标签轮流取，保证每个 batch 里类别尽量均衡
+
+    实现上是「先把各类打散，再按轮次依次从每类取一个」，最后整体打乱顺序。
+    """
+
+    def __init__(self, labels, seed=None, shuffle=True):
+        labels = list(labels)
+        if not labels:
+            raise ValueError("StratifiedSampler: labels 不能为空")
+        self.labels = labels
+        self.shuffle = bool(shuffle)
+        self._rng = random.Random(seed)
+
+    def __iter__(self):
+        groups = {}
+        for idx, label in enumerate(self.labels):
+            groups.setdefault(label, []).append(idx)
+        keys = sorted(groups, key=lambda v: (str(type(v)), v))
+        for k in keys:
+            if self.shuffle:
+                self._rng.shuffle(groups[k])
+        out = []
+        pos = 0
+        while True:
+            added = False
+            for k in keys:
+                bucket = groups[k]
+                if pos < len(bucket):
+                    out.append(bucket[pos])
+                    added = True
+            if not added:
+                break
+            pos += 1
+        if self.shuffle:
+            self._rng.shuffle(out)
+        return iter(out)
+
+    def __len__(self):
+        return len(self.labels)
+
+
+class SubsetSampler(Sampler):
+    """直接按给定下标序列产出（常用于把 k 折的索引接上 DataLoader）"""
+
+    def __init__(self, indices):
+        self.indices = [int(i) for i in indices]
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
+class BatchSampler(Sampler):
+    """把另一个 sampler 的下标切成 batch（``drop_last`` 尾批不足则丢弃）"""
+
+    def __init__(self, sampler, batch_size, drop_last=False):
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError(f"BatchSampler: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.drop_last = bool(drop_last)
+
+    def __iter__(self):
+        batch = []
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        n = len(self.sampler)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+
+def bucket_by_length(lengths, batch_size, bucket_size_multiplier=4, shuffle=True,
+                     seed=None, drop_last=False):
+    """按长度分桶：把长度接近的样本放进同一个 batch，减少 padding 浪费
+
+    做法：下标先打乱 → 按长度排序 → 每 ``batch_size * bucket_size_multiplier`` 个
+    切片成一个桶 → 桶内再打乱 → 按 ``batch_size`` 切 batch。返回**下标**的列表的列表。
+    """
+    lengths = [int(v) for v in lengths]
+    n = len(lengths)
+    if n == 0:
+        raise ValueError("bucket_by_length: lengths 不能为空")
+    if any(v < 0 for v in lengths):
+        raise ValueError("bucket_by_length: lengths 不能为负")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError(f"bucket_by_length: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+    if (isinstance(bucket_size_multiplier, bool)
+            or not isinstance(bucket_size_multiplier, int)
+            or bucket_size_multiplier < 1):
+        raise ValueError(
+            f"bucket_by_length: bucket_size_multiplier 必须是 >=1 的整数，"
+            f"收到 {bucket_size_multiplier!r}"
+        )
+    rng = random.Random(seed)
+    order = list(range(n))
+    if shuffle:
+        rng.shuffle(order)
+    order.sort(key=lambda i: lengths[i])
+    buckets = []
+    span = batch_size * bucket_size_multiplier
+    for b in range(0, n, span):
+        chunk = order[b:b + span]
+        if shuffle:
+            rng.shuffle(chunk)
+        buckets.extend(chunk)
+    batches = []
+    for b in range(0, len(buckets), batch_size):
+        batch = buckets[b:b + batch_size]
+        if len(batch) < batch_size and drop_last:
+            continue
+        batches.append(batch)
+    return batches
+
+
+class PreprocessCache:
+    """预处理结果的文件级缓存：键 = 源文件内容哈希 + 参数指纹
+
+    ``get(params, build_fn)``：命中则读 JSON，否则调用 ``build_fn()`` 并把结果写盘
+    （先写临时文件再 ``os.replace``，避免中断留下半个文件）。
+    """
+
+    def __init__(self, directory, files=None, hash_content=True, digest="sha256"):
+        if not isinstance(directory, str) or not directory:
+            raise ValueError("PreprocessCache: directory 必须是非空字符串")
+        if digest not in ("sha256", "md5"):
+            raise ValueError(f"PreprocessCache: digest 只支持 'sha256'/'md5'，收到 {digest!r}")
+        self.directory = directory
+        self.files = list(files or [])
+        self.hash_content = bool(hash_content)
+        self.digest = digest
+        os.makedirs(directory, exist_ok=True)
+
+    def _file_entry(self, path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"PreprocessCache: 源文件不存在 {path!r}")
+        h = hashlib.new(self.digest)
+        if self.hash_content:
+            with io.open(path, "rb") as f:
+                while True:
+                    block = f.read(65536)
+                    if not block:
+                        break
+                    h.update(block)
+            return [os.path.basename(path), h.hexdigest()]
+        st = os.stat(path)
+        return [os.path.basename(path), st.st_size, st.st_mtime_ns]
+
+    def key(self, params=None):
+        """返回本次（文件 + 参数）的缓存键"""
+        entries = [self._file_entry(p) for p in self.files]
+        payload = json.dumps({"files": entries, "params": params},
+                             sort_keys=True, ensure_ascii=False, default=str)
+        h = hashlib.new(self.digest)
+        h.update(payload.encode("utf-8"))
+        return h.hexdigest()
+
+    def path_for(self, key):
+        return os.path.join(self.directory, key + ".json")
+
+    def get(self, params=None, build_fn=None):
+        """命中返回 ``(value, True)``，未命中构建后返回 ``(value, False)``"""
+        key = self.key(params)
+        path = self.path_for(key)
+        if os.path.isfile(path):
+            with io.open(path, "r", encoding="utf-8") as f:
+                return json.load(f), True
+        if not callable(build_fn):
+            raise ValueError("PreprocessCache: 未命中缓存时必须提供可调用的 build_fn")
+        value = build_fn()
+        tmp = path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(value, f, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp, path)
+        return value, False
+
+    def clear(self):
+        """删除目录里所有 ``*.json`` 缓存文件，返回删除个数"""
+        removed = 0
+        for name in sorted(os.listdir(self.directory)):
+            if name.endswith(".json"):
+                os.remove(os.path.join(self.directory, name))
+                removed += 1
+        return removed
+
+
 class DataLoader:
-    """简易数据加载器：按 batch 迭代，支持 shuffle"""
+    """简易数据加载器：按 batch 迭代，支持 shuffle / 自定义 sampler
+
+    ``sampler``（产出下标）与 ``batch_sampler``（直接产出下标 batch）给出时，
+    两者优先于 ``shuffle``；默认路径（两个都不传）的行为与旧版逐位相同。
+    """
 
     def __init__(self, dataset: list, batch_size: int = 32, shuffle: bool = True,
-                 seed=None, collate_fn=None):
-        if batch_size is None or batch_size <= 0:
+                 seed=None, collate_fn=None, sampler=None, batch_sampler=None):
+        if batch_sampler is None and (batch_size is None or batch_size <= 0):
             raise ValueError(f"DataLoader: batch_size 必须 >= 1，收到 {batch_size!r}")
+        if sampler is not None and batch_sampler is not None:
+            raise ValueError("DataLoader: sampler 与 batch_sampler 只能给一个")
+        if sampler is not None and not hasattr(sampler, "__iter__"):
+            raise TypeError("DataLoader: sampler 必须可迭代")
+        if batch_sampler is not None and not hasattr(batch_sampler, "__iter__"):
+            raise TypeError("DataLoader: batch_sampler 必须可迭代")
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -23678,18 +24094,35 @@ class DataLoader:
         self._rng = random.Random(seed)
         # collate_fn(batch) -> batch：自定义批次拼装（padding、转张量等）
         self.collate_fn = collate_fn
+        self.sampler = sampler
+        self.batch_sampler = batch_sampler
+
+    def _collate(self, batch):
+        if self.collate_fn is not None:
+            return self.collate_fn(batch)
+        return batch
 
     def __iter__(self):
-        items = list(self.dataset)
-        if self.shuffle:
-            self._rng.shuffle(items)
-        for b in range(0, len(items), self.batch_size):
-            batch = items[b:b + self.batch_size]
-            if self.collate_fn is not None:
-                batch = self.collate_fn(batch)
-            yield batch
+        if self.batch_sampler is not None:
+            for indices in self.batch_sampler:
+                yield self._collate([self.dataset[i] for i in indices])
+            return
+        if self.sampler is not None:
+            order = list(self.sampler)
+        else:
+            order = list(range(len(self.dataset)))
+            if self.shuffle:
+                self._rng.shuffle(order)
+        for b in range(0, len(order), self.batch_size):
+            chunk = order[b:b + self.batch_size]
+            yield self._collate([self.dataset[i] for i in chunk])
 
     def __len__(self):
+        if self.batch_sampler is not None:
+            return len(self.batch_sampler)
+        if self.sampler is not None:
+            n = len(self.sampler)
+            return (n + self.batch_size - 1) // self.batch_size
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
