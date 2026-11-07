@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1705 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1716 项）
 
 ## 特性
 
@@ -2390,6 +2390,33 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### 命令行入口（W19-B）
+
+`ai_cli.py` 是仓库里唯一新增的可执行脚本，五个子命令都只依赖 `argparse` 与 `json`：
+
+| 子命令 | 作用 | 关键参数 |
+| --- | --- | --- |
+| `train` | 训练新模型并写成 JSON | `--data` `--out` `--task` `--hidden 16,8` `--epochs` `--lr` `--val-split` `--seed` |
+| `predict` | 用已有模型预测 | `--model` `--input`，可用 `--classes` 输出类别下标 |
+| `eval` | 在带标签数据上打分 | `--model` `--data` |
+| `export` | 导出「模型 + 元数据」包装 | `--model` `--out`，元数据来自 `model_metadata` |
+| `finetune` | 在已有模型上继续训练 | `--model` `--data` `--out` `--epochs` `--lr` |
+
+```
+python ai_cli.py train  --data train.json --out model.json --task classification --hidden 16
+python ai_cli.py predict --model model.json --input x.json --classes
+python ai_cli.py eval    --model model.json --data test.json
+```
+
+数据文件接受三种形状：`{"x": [...], "y": [...]}`、`{"data": [[x, y], ...]}`，或直接就是
+`[[x, y], ...]` 列表。约定：
+
+- 成功返回 `0`，参数或文件问题返回 `2`，原因写到 stderr（stdout 只有一行 JSON，方便管道）；
+- 库里那些「模型已保存到…」「模型已从…加载」的中文提示会先被收进内存缓冲，不会污染 stdout；
+- `--task auto` 按第一个标签的类型猜：数字当回归，其余当分类；
+- `export` 写出 `{"format": "ai-export-1", "model": {...}, "metadata": {...}}`，
+  其中 `metadata` 就是 `model_metadata` 的返回值（含 `param_count` / `git_hash` / `created_at`）。
+
 ### 实验追踪与模型元数据（W19-A）
 
 | API | 说明 |
@@ -2837,7 +2864,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1705 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1716 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3056,6 +3083,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDoctests` | docstring 示例可运行 + 反例确实被抓到 |
 | `TestInvariants` | 随机输入下的不变量（概率分布、形状、因果性、池化、IoU 等） |
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
+| `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3109,7 +3137,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1705 个单元测试
+├── test_ai.py       # 1716 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

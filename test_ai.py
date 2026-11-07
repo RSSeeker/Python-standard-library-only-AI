@@ -26076,3 +26076,157 @@ class TestExperimentTracking:
         assert AI.git_hash(str(tmp_path / "nope")) is None
         with pytest.raises(TypeError):
             AI.git_hash(123)
+class TestCLI:
+    """命令行入口（ai_cli.main）：五个子命令 + 错误退出码。"""
+
+    def _tmp(self, tmp_path):
+        return str(tmp_path)
+
+    def _write(self, path, payload):
+        io.open(path, "w", encoding="utf-8", newline="\n").write(
+            json.dumps(payload, ensure_ascii=False))
+        return path
+
+    def _data(self, tmp_path, kind="dict"):
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [0, 1, 1, 0]
+        path = os.path.join(str(tmp_path), "train.json")
+        if kind == "dict":
+            return self._write(path, {"x": xs, "y": ys})
+        if kind == "data":
+            return self._write(path, {"data": [[x, y] for x, y in zip(xs, ys)]})
+        return self._write(path, [[x, y] for x, y in zip(xs, ys)])
+
+    def _train(self, tmp_path, capsys, extra=()):
+        import ai_cli
+        data = self._data(tmp_path)
+        model = os.path.join(str(tmp_path), "model.json")
+        argv = ["train", "--data", data, "--out", model, "--task", "classification",
+                "--hidden", "8", "--epochs", "400", "--val-split", "0.0", "--seed", "7"]
+        assert ai_cli.main(argv + list(extra)) == 0
+        out = capsys.readouterr().out.strip().splitlines()
+        return model, json.loads(out[-1])
+
+    def test_train_writes_model(self, tmp_path, capsys):
+        import AI
+        model_path, payload = self._train(tmp_path, capsys)
+        assert os.path.exists(model_path)
+        assert payload["command"] == "train"
+        assert payload["task"] == "classification"
+        assert payload["samples"] == 4
+        assert payload["param_count"] == 42
+        reloaded = AI.Model.load(model_path)
+        assert reloaded is not None
+
+    def test_predict_matches_model(self, tmp_path, capsys):
+        import AI
+        import ai_cli
+        model_path, _ = self._train(tmp_path, capsys)
+        capsys.readouterr()
+        x_path = self._write(os.path.join(str(tmp_path), "x.json"),
+                             {"x": [[0.0, 0.0], [1.0, 1.0]]})
+        assert ai_cli.main(["predict", "--model", model_path, "--input", x_path]) == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["count"] == 2
+        model = AI.Model.load(model_path)
+        for got, row in zip(payload["predictions"], [[0.0, 0.0], [1.0, 1.0]]):
+            want = model.predict(row)
+            assert len(got) == len(want)
+            assert abs(got[0] - want[0]) < 1e-12
+
+    def test_predict_classes(self, tmp_path, capsys):
+        import ai_cli
+        model_path, _ = self._train(tmp_path, capsys)
+        capsys.readouterr()
+        x_path = self._write(os.path.join(str(tmp_path), "x.json"),
+                             {"x": [[0.0, 0.0], [1.0, 1.0]]})
+        assert ai_cli.main(["predict", "--model", model_path, "--input", x_path,
+                            "--classes"]) == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["predictions"] == [0, 0]
+
+    def test_eval_scores(self, tmp_path, capsys):
+        import ai_cli
+        model_path, _ = self._train(tmp_path, capsys)
+        capsys.readouterr()
+        data = self._write(os.path.join(str(tmp_path), "test.json"),
+                           {"data": [[[0.0, 0.0], 0], [[1.0, 1.0], 0]]})
+        assert ai_cli.main(["eval", "--model", model_path, "--data", data]) == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["samples"] == 2
+        assert payload["score"] == 1.0
+
+    def test_export_has_metadata(self, tmp_path, capsys):
+        import ai_cli
+        model_path, _ = self._train(tmp_path, capsys)
+        capsys.readouterr()
+        out_path = os.path.join(str(tmp_path), "exported.json")
+        assert ai_cli.main(["export", "--model", model_path, "--out", out_path]) == 0
+        payload = json.loads(io.open(out_path, encoding="utf-8").read())
+        assert payload["format"] == "ai-export-1"
+        assert sorted(payload.keys()) == ["format", "metadata", "model"]
+        assert payload["metadata"]["param_count"] == 42
+        assert payload["metadata"]["extra"]["task"] == "classification"
+        assert payload["model"]["type"] == "MLP"
+        assert payload["model"]["task"] == "classification"
+        assert len(payload["model"]["layers"]) == 2
+
+    def test_finetune_writes_new_model(self, tmp_path, capsys):
+        import ai_cli
+        model_path, _ = self._train(tmp_path, capsys)
+        capsys.readouterr()
+        data = self._data(tmp_path)
+        out_path = os.path.join(str(tmp_path), "tuned.json")
+        assert ai_cli.main(["finetune", "--model", model_path, "--data", data,
+                            "--out", out_path, "--epochs", "20", "--lr", "0.002"]) == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["epochs"] == 20
+        assert payload["final_train_loss"] is not None
+        assert os.path.exists(out_path)
+
+    def test_missing_file_exit_2(self, tmp_path, capsys):
+        import ai_cli
+        missing = os.path.join(str(tmp_path), "nope.json")
+        assert ai_cli.main(["train", "--data", missing,
+                            "--out", os.path.join(str(tmp_path), "m.json")]) == 2
+        captured = capsys.readouterr()
+        assert "数据文件不存在" in captured.err
+        assert captured.out == ""
+
+    def test_bad_hidden_exit_2(self, tmp_path, capsys):
+        import ai_cli
+        data = self._data(tmp_path)
+        assert ai_cli.main(["train", "--data", data, "--out",
+                            os.path.join(str(tmp_path), "m.json"), "--hidden", "8,x"]) == 2
+        assert "--hidden" in capsys.readouterr().err
+
+    def test_bad_dataset_exit_2(self, tmp_path, capsys):
+        import ai_cli
+        out = os.path.join(str(tmp_path), "m.json")
+        bad_len = self._write(os.path.join(str(tmp_path), "a.json"),
+                              {"x": [[0.0], [1.0]], "y": [0]})
+        assert ai_cli.main(["train", "--data", bad_len, "--out", out]) == 2
+        empty = self._write(os.path.join(str(tmp_path), "b.json"), {"x": [], "y": []})
+        assert ai_cli.main(["train", "--data", empty, "--out", out]) == 2
+        broken = os.path.join(str(tmp_path), "c.json")
+        io.open(broken, "w", encoding="utf-8", newline="\n").write("{not json")
+        assert ai_cli.main(["train", "--data", broken, "--out", out]) == 2
+        assert "不是合法 JSON" in capsys.readouterr().err
+
+    def test_parse_hidden(self):
+        import ai_cli
+        assert ai_cli.parse_hidden("16,8") == (16, 8)
+        assert ai_cli.parse_hidden("") == ()
+        assert ai_cli.parse_hidden(None) == (32,)
+        for bad in ("0", "-3", "8,,8", "8,", "a"):
+            with pytest.raises(ValueError):
+                ai_cli.parse_hidden(bad)
+        with pytest.raises(ValueError):
+            ai_cli.parse_hidden(8)
+
+    def test_help_exits_zero(self, capsys):
+        import ai_cli
+        with pytest.raises(SystemExit) as excinfo:
+            ai_cli.main(["--help"])
+        assert excinfo.value.code == 0
+        assert "train" in capsys.readouterr().out

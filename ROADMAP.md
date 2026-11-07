@@ -609,7 +609,13 @@
     `load_model_metadata` / `git_hash`（取不到返回 None，不抛异常）。
   - 口径：指标只收数字（拒绝 bool）；`clock` 可注入以便测试断言耗时；不做可视化面板。
   - 探针 55 项 + `TestExperimentTracking` 8 例。
-- [ ] CLI 子命令：train / predict / eval / export / finetune
+- [x] CLI 子命令：train / predict / eval / export / finetune
+  - 已实现 `ai_cli.py`（新文件，纯 `argparse` + `json`）：五个子命令、三种数据形状、
+    成功 0 / 出错 2 的退出码约定，stdout 只有一行 JSON，库里的中文提示走 `redirect_stdout` 收进缓冲。
+  - `train` 走 `quick_train`，`finetune` 直接改 `model.optimizer.lr` 后 `fit`，
+    `export` 写 `{"format": "ai-export-1", "model", "metadata"}`（元数据复用 `model_metadata`）。
+  - 探针 12 项（`C:\Users\Jiang\AppData\Local\Temp\probe_w19b.py`）+ `TestCLI` 11 例；
+    全库 1705 -> 1716 passed。
 - [ ] 配置支持 YAML/TOML；`logging` 集成；内存监控（tracemalloc）；模型注册表/版本管理
 
 ### W20 研究前沿（§17，文档 + 最小演示）
