@@ -30909,6 +30909,175 @@ def _w18b_user_why():
 
 
 # ============================================================================
+#  研究前沿 W20-E：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+# ============================================================================
+
+def _w20e_net(model):
+    net = getattr(model, "model", model)
+    if getattr(net, "layers", None) is None:
+        raise ValueError("empirical_ntk 需要 MLP（或带 .model 的 Model）")
+    return net
+
+
+def _w20e_flat_grads(grads):
+    out = []
+    for item in grads:
+        if item is None:
+            continue
+        grad_w, grad_b = item
+        for row in grad_w:
+            out.extend(row)
+        out.extend(grad_b)
+    return out
+
+
+def empirical_ntk(model, xs):
+    """经验 NTK：`K_ij = <∂f(x_i)/∂θ, ∂f(x_j)/∂θ>`（单输出网络）。
+
+    **这是有限宽网络的经验核，不是无穷宽极限的理论 NTK**：它依赖当前权重，
+    训练过程中会变；只有在「网络很宽 + 学习率小」时才近似常数核。
+    输入 `xs` 是若干样本（每行一个），返回 `n × n` 对称半正定矩阵。
+    """
+    net = _w20e_net(model)
+    if not isinstance(xs, list) or not xs:
+        raise ValueError("empirical_ntk.xs 必须是非空列表")
+    rows = []
+    for sample in xs:
+        if not isinstance(sample, list) or not sample:
+            raise ValueError("empirical_ntk.xs 里每个样本必须是非空列表")
+        for value in sample:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("empirical_ntk.xs 里必须是数字")
+        out = net.forward(sample)
+        if len(out) != 1:
+            raise ValueError("empirical_ntk 只支持单输出网络（当前输出 %d 维）" % len(out))
+        grads = _mlp_backward(net, [1.0])
+        rows.append(_w20e_flat_grads(grads))
+    width = len(rows[0])
+    for row in rows:
+        if len(row) != width:
+            raise ValueError("empirical_ntk: 各样本的参数梯度长度不一致")
+    matrix = []
+    for i in range(len(rows)):
+        line = []
+        for j in range(len(rows)):
+            total = 0.0
+            for k in range(width):
+                total += rows[i][k] * rows[j][k]
+            line.append(total)
+        matrix.append(line)
+    return matrix
+
+
+def ntk_kernel_regression(k_train, y_train, k_test, ridge=1e-8):
+    """用核岭回归做预测：`α = (K + ridge·I)^{-1} y`，`pred = K_test · α`。
+
+    `k_train` 是训练集自身核矩阵、`k_test` 是「测试 × 训练」核矩阵。
+    这是 NTK 视角下的「闭式解」，和梯度下降训练不是同一个东西（只在
+    线性化/小步长下才等价）。
+    """
+    if not isinstance(k_train, list) or not k_train:
+        raise ValueError("ntk_kernel_regression.k_train 必须是非空矩阵")
+    n = len(k_train)
+    for row in k_train:
+        if not isinstance(row, list) or len(row) != n:
+            raise ValueError("ntk_kernel_regression.k_train 必须是方阵")
+    if not isinstance(y_train, list) or len(y_train) != n:
+        raise ValueError("ntk_kernel_regression.y_train 长度与 k_train 不一致")
+    for k_test_row in k_test:
+        if not isinstance(k_test_row, list) or len(k_test_row) != n:
+            raise ValueError("ntk_kernel_regression.k_test 每行长度必须是训练样本数")
+    if isinstance(ridge, bool) or not isinstance(ridge, (int, float)) or ridge <= 0.0:
+        raise ValueError("ntk_kernel_regression.ridge 必须是正数")
+    system = [[k_train[i][j] + (ridge if i == j else 0.0) for j in range(n)]
+              for i in range(n)]
+    alpha = _w11f_solve(system, [float(value) for value in y_train])
+    if alpha is None:
+        raise ValueError("ntk_kernel_regression: 核矩阵奇异，请增大 ridge")
+    return [sum(k_test_row[j] * alpha[j] for j in range(n)) for k_test_row in k_test]
+
+
+def double_descent_curve(n_samples=30, dims=(4, 8, 16, 24, 30, 40, 60, 120),
+                         n_test=200, n_inputs=20, noise=0.1, ridge=1e-10, seed=12345):
+    """随机特征模型上的双下降曲线（最小范数解）。
+
+    模型：`f(x) = Σ_{j=1}^{p} a_j · relu(w_j · x)`，`p` 是特征数（模型容量）。
+    `p <= n` 时解原始空间 `(ΦᵀΦ + ridge·I)w = Φᵀy`（数值稳定），`p > n` 时解
+    对偶空间 `(ΦΦᵀ + ridge·I)α = y`（给出最小范数解）。当 `p ≈ n` 时参数刚好
+    够插值训练集，测试误差出现峰值；`p` 继续增大则最小范数解重新变得平滑，
+    误差二次下降——这就是「双下降」。
+
+    返回 `{"dims", "train_mse", "test_mse", "peak_dim"}`；
+    这是**线性化/闭式解**下的演示，不是用 SGD 训练出来的曲线。
+    """
+    if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples < 2:
+        raise ValueError("double_descent_curve.n_samples 必须是 >= 2 的整数")
+    if not isinstance(dims, (list, tuple)) or not dims:
+        raise ValueError("double_descent_curve.dims 必须是非空序列")
+    for value in dims:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("double_descent_curve.dims 里必须是 >= 1 的整数")
+    if isinstance(n_test, bool) or not isinstance(n_test, int) or n_test < 1:
+        raise ValueError("double_descent_curve.n_test 必须是 >= 1 的整数")
+    if isinstance(noise, bool) or not isinstance(noise, (int, float)) or noise < 0.0:
+        raise ValueError("double_descent_curve.noise 必须是非负数")
+    rng = random.Random(seed)
+    true_w = [rng.gauss(0.0, 1.0) for _ in range(n_inputs)]
+
+    def sample():
+        return [rng.gauss(0.0, 1.0) for _ in range(n_inputs)]
+
+    def target(x):
+        return math.tanh(sum(true_w[d] * x[d] for d in range(n_inputs)))
+
+    xs = [sample() for _ in range(n_samples)]
+    ys = [target(x) + rng.gauss(0.0, noise) for x in xs]
+    test_xs = [sample() for _ in range(n_test)]
+    test_ys = [target(x) for x in test_xs]
+
+    out_dims = []
+    train_mse = []
+    test_mse = []
+    for width in dims:
+        ws = [[rng.gauss(0.0, 1.0) for _ in range(n_inputs)] for _ in range(width)]
+        phi = [[max(0.0, sum(ws[j][d] * x[d] for d in range(n_inputs))) for j in range(width)]
+               for x in xs]
+        phi_test = [[max(0.0, sum(ws[j][d] * x[d] for d in range(n_inputs))) for j in range(width)]
+                    for x in test_xs]
+        if width <= n_samples:
+            # 欠参数化端：直接解 (ΦᵀΦ + λI) w = Φᵀy。p × p 系统比对偶的 n × n 更稳定：
+            # p << n 时 ΦΦᵀ 只有 p 个非零特征值，ridge 再小也会把对偶解放大到 1e7 量级
+            # （实测 dims=4、ridge=1e-10 时 test_mse 曾达 7.9e7，把双下降的峰盖掉了）。
+            gram = [[sum(phi[i][a] * phi[i][b] for i in range(n_samples)) for b in range(width)]
+                    for a in range(width)]
+            rhs = [sum(phi[i][j] * ys[i] for i in range(n_samples)) for j in range(width)]
+            weights = _w11f_solve([[gram[a][b] + (ridge if a == b else 0.0)
+                                    for b in range(width)] for a in range(width)], rhs)
+            if weights is None:
+                raise ValueError("double_descent_curve: 特征 Gram 矩阵奇异（把 ridge 调大）")
+            fit = [sum(phi[i][j] * weights[j] for j in range(width)) for i in range(n_samples)]
+            preds = [sum(phi_test[t][j] * weights[j] for j in range(width))
+                     for t in range(n_test)]
+        else:
+            # 过参数化端：对偶形式天然给出最小范数解（p > n 时 Φᵀ(ΦΦᵀ)^{-1} y）
+            kernel = [[sum(phi[i][j] * phi[k][j] for j in range(width)) for k in range(n_samples)]
+                      for i in range(n_samples)]
+            system = [[kernel[i][j] + (ridge if i == j else 0.0) for j in range(n_samples)]
+                      for i in range(n_samples)]
+            alpha = _w11f_solve(system, ys)
+            if alpha is None:
+                raise ValueError("double_descent_curve: 核矩阵奇异（把 ridge 调大）")
+            fit = [sum(kernel[i][j] * alpha[j] for j in range(n_samples)) for i in range(n_samples)]
+            preds = [sum(sum(phi_test[t][j] * phi[i][j] for j in range(width)) * alpha[i]
+                         for i in range(n_samples)) for t in range(n_test)]
+        out_dims.append(width)
+        train_mse.append(sum((fit[i] - ys[i]) ** 2 for i in range(n_samples)) / n_samples)
+        test_mse.append(sum((preds[t] - test_ys[t]) ** 2 for t in range(n_test)) / n_test)
+    peak_index = max(range(len(out_dims)), key=lambda i: test_mse[i])
+    return {"dims": out_dims, "train_mse": train_mse, "test_mse": test_mse,
+            "peak_dim": out_dims[peak_index]}
+
+# ============================================================================
 #  研究前沿 W20-D：神经符号（规则约束的候选过滤）
 # ============================================================================
 

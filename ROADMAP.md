@@ -636,7 +636,11 @@
     `eps_step = q·sqrt(2 ln(1.25/δ))/σ`，`advanced=True` 取高级组合与简单组合的较小者。
   - 口径写在 README：这是偏松上界，**不是** RDP / 矩记账，不与 opacus 对数字。
   - 探针 43 项 + `TestPrivacyAndMembership` 9 例；全库 1727 -> 1736 passed。
-- [ ] 成员推断攻击与防御（最简版）
+- [x] 成员推断攻击与防御（最简版）
+  - membership_inference_attack（按损失阈值判成员，阈值取 balanced accuracy 最优；
+    返回 accuracy / tpr / fpr / Mann-Whitney AUC）与 membership_defense_delta
+    （成员/非成员损失差与攻击 AUC 的防御前后对照），与 DP-SGD 同一批交付
+  - 口径：单特征阈值攻击，不是 shadow-model 训练攻击；README 写明它是「下界演示」
 - [x] Lottery Ticket（迭代剪枝 + 重初始化）
   - weight_mask 跨层统一阈值 + 累积掩码（第二轮起只在保留集合里排序）
   - masked_reinit 掩码内 He 初始化，掩码外清零，偏置不动
@@ -654,7 +658,7 @@
   - `check` 逐位置列出违规规则，`mask`/`filter` 给单步可用候选
   - `apply_rule_mask` 全屏蔽时报错（避免下游 softmax 变 NaN）
   - `constrained_generate` 是解码期过滤，不是可微符号层（docstring/README 写明）
-- [ ] 文档化：NTK / 双下降 / grokking 作为「已知边界」
+- [x] 文档化：NTK / 双下降 / grokking 作为「已知边界」——`empirical_ntk`（有限宽经验核，线性模型闭式 `xᵀx+1`）、`ntk_kernel_regression`（核视角闭式解，不等价于 SGD）、`double_descent_curve`（`p≈n` 处 test_mse 峰 11.94、`p>n` 二次下降到 0.48）；grokking 只解释机制不跑实验
 
 ---
 

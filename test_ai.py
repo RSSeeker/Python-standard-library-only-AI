@@ -26895,3 +26895,98 @@ class TestNeuroSymbolic:
             rules.check("abc")
         with pytest.raises(ValueError):
             rules.filter([0], [True])
+
+
+class TestCaseStudies:
+    """W20-E：NTK / 双下降作为「已知边界」的可测量演示。"""
+
+    def _linear(self, w):
+        random.seed(0)
+        model = AI.MLP([len(w), 1], activations=["linear"])
+        model.layers[0].weights[0][:] = list(w)
+        model.layers[0].biases[0] = 0.0
+        return model
+
+    def test_ntk_linear_closed_form(self):
+        model = self._linear([0.5, -1.0, 2.0])
+        xs = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+        kernel = AI.empirical_ntk(model, xs)
+        assert len(kernel) == 3 and all(len(row) == 3 for row in kernel)
+        for i in range(3):
+            for j in range(3):
+                # 偏置也是参数（∂f/∂b = 1），所以核是 xᵀx + 1
+                want = sum(xs[i][d] * xs[j][d] for d in range(3)) + 1.0
+                assert abs(kernel[i][j] - want) < 1e-12
+                assert abs(kernel[i][j] - kernel[j][i]) < 1e-12
+        same = AI.empirical_ntk(model, [xs[0], xs[0]])
+        assert abs(same[0][1] - same[0][0]) < 1e-12
+
+    def test_ntk_deep_differs_from_linear_kernel(self):
+        xs = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        linear = AI.empirical_ntk(self._linear([1.0, 1.0, 0.0]), xs)
+        random.seed(3)
+        deep = AI.empirical_ntk(AI.MLP([3, 4, 1], activations=["relu", "linear"]), xs)
+        assert any(abs(deep[i][j] - linear[i][j]) > 1e-9
+                   for i in range(2) for j in range(2))
+
+    def test_ntk_rejects_wrong_shape(self):
+        model = self._linear([1.0, 1.0, 1.0])
+        with pytest.raises(ValueError):
+            AI.empirical_ntk(model, [])
+        with pytest.raises(ValueError):
+            AI.empirical_ntk(model, [1.0, 2.0])
+        with pytest.raises(ValueError):
+            AI.empirical_ntk(model, [[True, 0.0, 0.0]])
+        with pytest.raises(ValueError):
+            AI.empirical_ntk(AI.MLP([2, 2], activations=["linear"]), [[1.0, 0.0]])
+
+    def test_ntk_kernel_regression_interpolates(self):
+        xs = [[1.0], [2.0], [3.0]]
+        ys = [2.0, 4.0, 6.0]
+        kernel = AI.empirical_ntk(self._linear([2.0]), xs)
+        interp = AI.ntk_kernel_regression(kernel, ys, kernel, ridge=1e-10)
+        for i in range(3):
+            assert abs(interp[i] - ys[i]) < 1e-6
+        one = AI.ntk_kernel_regression(kernel, ys, [[1.0, 2.0, 3.0]], ridge=1e-10)
+        assert abs(one[0] - 2.0) < 1e-5
+
+    def test_ntk_kernel_regression_validates(self):
+        with pytest.raises(ValueError):
+            AI.ntk_kernel_regression([[1.0, 2.0]], [1.0], [[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.ntk_kernel_regression([[1.0]], [1.0, 2.0], [[1.0]])
+        with pytest.raises(ValueError):
+            AI.ntk_kernel_regression([[1.0]], [1.0], [[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.ntk_kernel_regression([[1.0]], [1.0], [[1.0]], ridge=0.0)
+
+    def test_double_descent_peak_near_interpolation(self):
+        curve = AI.double_descent_curve(n_samples=30, n_test=150, seed=7)
+        assert curve["dims"] == [4, 8, 16, 24, 30, 40, 60, 120]
+        assert len(curve["train_mse"]) == len(curve["test_mse"]) == 8
+        assert 24 <= curve["peak_dim"] <= 40
+        peak = curve["dims"].index(curve["peak_dim"])
+        assert curve["test_mse"][peak] > curve["test_mse"][0]
+        assert curve["test_mse"][peak] > curve["test_mse"][-1]
+
+    def test_double_descent_train_error_vanishes_after_interpolation(self):
+        curve = AI.double_descent_curve(n_samples=30, n_test=100, seed=7)
+        assert curve["train_mse"][-1] < 1e-6
+        assert curve["train_mse"][0] > 1e-3
+
+    def test_double_descent_is_deterministic(self):
+        first = AI.double_descent_curve(n_samples=20, n_test=80, seed=11)
+        second = AI.double_descent_curve(n_samples=20, n_test=80, seed=11)
+        assert first["test_mse"] == second["test_mse"]
+        other = AI.double_descent_curve(n_samples=20, n_test=80, seed=12)
+        assert other["test_mse"] != first["test_mse"]
+
+    def test_double_descent_validates(self):
+        with pytest.raises(ValueError):
+            AI.double_descent_curve(dims=())
+        with pytest.raises(ValueError):
+            AI.double_descent_curve(dims=(0, 4))
+        with pytest.raises(ValueError):
+            AI.double_descent_curve(n_samples=1)
+        with pytest.raises(ValueError):
+            AI.double_descent_curve(noise=-0.1)
