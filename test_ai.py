@@ -20111,3 +20111,120 @@ class TestTextAudioAugmentation:
             AI.audio_gain([], 0.0)
         with pytest.raises(TypeError):
             AI.audio_add_noise(["a"], 10.0)
+
+class TestSpecialTokensAndBatching:
+    """W12-A：SpecialTokens 统一管理 + pad / truncate / mask / 批量分词。"""
+
+    def test_special_tokens_defaults_and_lookup(self):
+        st = AI.SpecialTokens.defaults()
+        assert st.tokens() == ("[PAD]", "[UNK]", "[BOS]", "[EOS]", "[SEP]", "[CLS]", "[MASK]")
+        assert st.as_dict()["bos"] == "[BOS]"
+        assert len(st.as_dict()) == 7
+        vocab = ["[PAD]", "[UNK]", "hello", "[CLS]", "[SEP]", "[MASK]"]
+        assert st.id_of("pad", vocab) == 0
+        assert st.id_of("cls", vocab) == 3
+        assert st.id_of("unk", {t: i for i, t in enumerate(vocab)}) == 1
+        assert AI.SPECIAL_TOKENS.mask == "[MASK]"
+        assert AI.SpecialTokens(bos="<s>").bos == "<s>"
+        got = AI.SpecialTokens.from_dict({"eos": "</s>"})
+        assert got.eos == "</s>" and got.pad == "[PAD]"
+
+    def test_special_tokens_validation(self):
+        with pytest.raises(TypeError):
+            AI.SpecialTokens(nope="x")
+        with pytest.raises(TypeError):
+            AI.SpecialTokens(pad=1)
+        with pytest.raises(ValueError):
+            AI.SpecialTokens(pad="")
+        with pytest.raises(ValueError):
+            AI.SpecialTokens(pad=" [PAD]")
+        with pytest.raises(ValueError):
+            AI.SpecialTokens(pad="[UNK]")
+        with pytest.raises(TypeError):
+            AI.SpecialTokens.from_dict([])
+        with pytest.raises(ValueError):
+            AI.SpecialTokens.defaults().id_of("nope", ["[PAD]"])
+        with pytest.raises(KeyError):
+            AI.SpecialTokens.defaults().id_of("bos", ["[PAD]"])
+
+    def test_truncate_sides(self):
+        assert AI.truncate([1, 2, 3, 4], 2) == [1, 2]
+        assert AI.truncate([1, 2, 3, 4], 2, side="pre") == [3, 4]
+        assert AI.truncate([1, 2], 5) == [1, 2]
+        with pytest.raises(ValueError):
+            AI.truncate([1, 2], 0)
+        with pytest.raises(ValueError):
+            AI.truncate([1, 2], 1, side="middle")
+        with pytest.raises(TypeError):
+            AI.truncate("ab", 1)
+
+    def test_pad_sequences_post_and_pre(self):
+        assert AI.pad_sequences([[1, 2, 3], [4]]) == [[1, 2, 3], [4, 0, 0]]
+        assert AI.pad_sequences([[1, 2, 3], [4]], padding="pre", pad_value=-1) ==             [[1, 2, 3], [-1, -1, 4]]
+        assert AI.pad_sequences([[1, 2, 3, 4], [5, 6]], max_len=3) == [[1, 2, 3], [5, 6, 0]]
+        assert AI.pad_sequences([[1, 2, 3, 4]], max_len=2, truncate="pre") == [[3, 4]]
+        assert AI.pad_sequences([[1, 2]]) == [[1, 2]]
+
+    def test_pad_sequences_validation(self):
+        with pytest.raises(ValueError):
+            AI.pad_sequences([])
+        with pytest.raises(TypeError):
+            AI.pad_sequences("abc")
+        with pytest.raises(TypeError):
+            AI.pad_sequences([[1], [True]])
+        with pytest.raises(ValueError):
+            AI.pad_sequences([[1]], 0)
+        with pytest.raises(ValueError):
+            AI.pad_sequences([[1]], 2, 0, "middle")
+        with pytest.raises(TypeError):
+            AI.pad_sequences([[1]], None, True)
+
+    def test_attention_mask_by_value(self):
+        m = AI.attention_mask([[1, 2, 0, 0], [0, 3, 4, 5]], pad_value=0)
+        assert m == [[1, 1, 0, 0], [0, 1, 1, 1]]
+        with pytest.raises(TypeError):
+            AI.attention_mask([[1]], True)
+
+    def test_batch_sequences_masks_from_lengths(self):
+        b = AI.batch_sequences([[1, 2, 3], [4]], pad_value=0)
+        assert b["input_ids"] == [[1, 2, 3], [4, 0, 0]]
+        assert b["lengths"] == [3, 1]
+        assert b["attention_mask"] == [[1, 1, 1], [1, 0, 0]]
+        bp = AI.batch_sequences([[1, 2, 3], [4]], padding="pre", pad_value=0)
+        assert bp["attention_mask"] == [[1, 1, 1], [0, 0, 1]]
+        bt = AI.batch_sequences([[1, 2, 3, 4], [5, 6]], max_len=3)
+        assert bt["lengths"] == [3, 2]
+        assert bt["attention_mask"] == [[1, 1, 1], [1, 1, 0]]
+
+    def test_batch_sequences_disambiguates_pad_token(self):
+        amb = AI.batch_sequences([[0, 5], [0]], pad_value=0)
+        assert amb["attention_mask"] == [[1, 1], [1, 0]]
+        assert AI.attention_mask(amb["input_ids"], 0) == [[0, 1], [0, 0]]
+
+    def test_tokenize_batch_with_dummy_and_real(self):
+        class Dummy:
+            table = {"a": [1, 2, 3], "b": [4]}
+
+            def encode(self, text):
+                return list(Dummy.table[text])
+
+        tb = AI.tokenize_batch(Dummy(), ["a", "b"], pad_value=0)
+        assert tb["input_ids"] == [[1, 2, 3], [4, 0, 0]]
+        assert tb["attention_mask"] == [[1, 1, 1], [1, 0, 0]]
+        tok = AI.WordPieceTokenizer()
+        tok.train("hello world hello there world", vocab_size=40, min_frequency=1)
+        sp = AI.tokenize_batch(tok, ["hello world", "hello"], pad_value=0)
+        assert len(sp["input_ids"]) == 2
+        assert len(sp["input_ids"][0]) == len(sp["input_ids"][1])
+        assert sum(sp["attention_mask"][0]) == sp["lengths"][0]
+        assert sp["lengths"][0] >= sp["lengths"][1]
+
+    def test_tokenize_batch_validation(self):
+        with pytest.raises(TypeError):
+            AI.tokenize_batch(None, ["a"])
+        with pytest.raises(ValueError):
+            AI.tokenize_batch(AI.WordPieceTokenizer(), [])
+        with pytest.raises(TypeError):
+            AI.tokenize_batch(AI.WordPieceTokenizer(), [1])
+        with pytest.raises(TypeError):
+            AI.tokenize_batch(object(), ["a"])

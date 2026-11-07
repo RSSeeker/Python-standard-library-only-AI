@@ -366,8 +366,18 @@
     加噪实测 SNR 10.0000 dB、6 dB 增益 1.9953、平移与限幅闭式值、20 条非法输入。
 
 ### W12 分词与批处理（§8）
-- [ ] 特殊 token 统一管理（BOS/EOS/PAD/UNK/SEP/CLS/MASK）
-- [ ] 批处理：`pad_sequences` / `truncate` / `attention_mask` / `tokenize_batch`
+- [x] 特殊 token 统一管理（BOS/EOS/PAD/UNK/SEP/CLS/MASK）
+  - `SpecialTokens`（默认与 `WordPieceTokenizer` 兼容）+ 模块级 `SPECIAL_TOKENS`，
+    `tokens()` / `as_dict()` / `id_of(name, vocab)`，validate 覆盖空串、首尾空白、重复、未知字段。
+  - 探针 8 项（含 `from_dict` 局部覆盖与 `id_of` 对 list/dict 两种词表）。
+- [x] 批处理：`pad_sequences` / `truncate` / `attention_mask` / `tokenize_batch`
+  - 另加 `batch_sequences(...)`：返回 `lengths` 并按**真实长度**生成掩码，避免「pad 值也是
+    合法 token」时 `attention_mask` 按值判断的歧义；两者都保留、docstring 写明差别。
+  - **真 bug**：`pad_sequences` 的参数名 `truncate=` 把模块函数 `truncate` 遮蔽了（
+    `TypeError: 'str' object is not callable`）；抽出内部 `_w12_truncate` 供两者共用。
+  - 探针 31 项：特殊 token、裁剪两侧、pre/post 补齐、`max_len` 截断、按值掩码、
+    `batch_sequences` 的 lengths 与两种掩码、歧义对照、真实 `WordPieceTokenizer` 端到端、22 条非法输入。
+
 - [ ] `SentencePieceTokenizer`（Unigram LM 简化版）；`WordTokenizer` / `WhitespaceTokenizer` / `RegexTokenizer`
 
 ### W13 指标扩展（§9）

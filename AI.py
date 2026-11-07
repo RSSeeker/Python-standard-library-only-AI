@@ -27096,6 +27096,216 @@ class BytePairTokenizer:
         return f"BytePairTokenizer(vocab_size={self.vocab_size})"
 
 
+#  ======================================================================
+#  W12-A：特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#  ======================================================================
+
+class SpecialTokens:
+    """BOS / EOS / PAD / UNK / SEP / CLS / MASK 的**统一管理**。
+
+    只保存 token 字符串，不绑定词表；需要 id 时用 `id_of(name, vocab)` 现场查。
+    默认值与 `WordPieceTokenizer` 的 `[PAD]`/`[UNK]`/`[CLS]`/`[SEP]`/`[MASK]` 兼容，
+    额外的 `[BOS]`/`[EOS]` 供生成任务使用。
+    """
+
+    _NAMES = ("pad", "unk", "bos", "eos", "sep", "cls", "mask")
+    _DEFAULTS = {
+        "pad": "[PAD]", "unk": "[UNK]", "bos": "[BOS]", "eos": "[EOS]",
+        "sep": "[SEP]", "cls": "[CLS]", "mask": "[MASK]",
+    }
+
+    def __init__(self, **kwargs):
+        unknown = [k for k in kwargs if k not in self._NAMES]
+        if unknown:
+            raise TypeError("SpecialTokens: 未知字段 %r" % (unknown,))
+        vals = []
+        for name in self._NAMES:
+            v = kwargs.get(name, self._DEFAULTS[name])
+            if not isinstance(v, str):
+                raise TypeError("SpecialTokens: %s 必须是字符串" % name)
+            if not v or v.strip() != v:
+                raise ValueError("SpecialTokens: %s 不能为空或带首尾空白" % name)
+            vals.append(v)
+        if len(set(vals)) != len(vals):
+            raise ValueError("SpecialTokens: 七个特殊 token 不能重复")
+        for name, v in zip(self._NAMES, vals):
+            setattr(self, name, v)
+
+    @classmethod
+    def defaults(cls):
+        return cls()
+
+    @classmethod
+    def from_dict(cls, mapping):
+        if not isinstance(mapping, dict):
+            raise TypeError("SpecialTokens.from_dict: 需要 dict")
+        return cls(**mapping)
+
+    def as_dict(self):
+        return {name: getattr(self, name) for name in self._NAMES}
+
+    def tokens(self):
+        """按固定顺序返回七个 token（pad, unk, bos, eos, sep, cls, mask）。"""
+        return tuple(getattr(self, name) for name in self._NAMES)
+
+    def id_of(self, name, vocab):
+        """在 `vocab`（list 或 dict）里查某个特殊 token 的 id。"""
+        if name not in self._NAMES:
+            raise ValueError("SpecialTokens.id_of: name 必须是 %r 之一" % (self._NAMES,))
+        tok = getattr(self, name)
+        if isinstance(vocab, dict):
+            if tok not in vocab:
+                raise KeyError("SpecialTokens.id_of: 词表里没有 %r" % (tok,))
+            return vocab[tok]
+        if isinstance(vocab, (list, tuple)):
+            try:
+                return list(vocab).index(tok)
+            except ValueError:
+                raise KeyError("SpecialTokens.id_of: 词表里没有 %r" % (tok,))
+        raise TypeError("SpecialTokens.id_of: vocab 必须是 list 或 dict")
+
+    def __repr__(self):
+        body = ", ".join("%s=%r" % (name, getattr(self, name)) for name in self._NAMES)
+        return "SpecialTokens(%s)" % body
+
+
+SPECIAL_TOKENS = SpecialTokens.defaults()
+
+
+def _w12_seqs(sequences, who):
+    if not isinstance(sequences, (list, tuple)):
+        raise TypeError("%s: sequences 必须是列表" % who)
+    if not sequences:
+        raise ValueError("%s: sequences 不能为空" % who)
+    out = []
+    for seq in sequences:
+        if not isinstance(seq, (list, tuple)):
+            raise TypeError("%s: 每条序列必须是列表" % who)
+        row = []
+        for v in seq:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 序列元素必须是 int 或 float" % who)
+            row.append(v)
+        out.append(row)
+    return out
+
+
+def _w12_side(side, who):
+    if side not in ("pre", "post"):
+        raise ValueError("%s: side 只能是 'pre' 或 'post'" % who)
+    return side
+
+
+def _w12_truncate(sequence, max_len, side="post"):
+    """内部实现：裁剪一条序列（公开 API `truncate` 与 `pad_sequences` 共用）。"""
+    if not isinstance(sequence, (list, tuple)):
+        raise TypeError("truncate: sequence 必须是列表")
+    if isinstance(max_len, bool) or not isinstance(max_len, int):
+        raise TypeError("truncate: max_len 必须是整数")
+    if max_len < 1:
+        raise ValueError("truncate: max_len 必须 >= 1")
+    _w12_side(side, "truncate")
+    seq = list(sequence)
+    if len(seq) <= max_len:
+        return seq
+    return seq[:max_len] if side == "post" else seq[-max_len:]
+
+
+def truncate(sequence, max_len, side="post"):
+    """把一条序列裁到 `max_len`（`side='post'` 保留前段，`'pre'` 保留后段）。"""
+    return _w12_truncate(sequence, max_len, side=side)
+
+
+def pad_sequences(sequences, max_len=None, pad_value=0, truncate="post",
+                  padding="post"):
+    """把一批序列补齐到同一长度（默认补到本批最长）。
+
+    `max_len=None` 时取 `max(len(seq))`；给了 `max_len` 就同时裁掉超长部分。
+    `pad_value` 只做校验（不是 bool），实际补齐值就是它。
+    """
+    rows = _w12_seqs(sequences, "pad_sequences")
+    _w12_side(truncate, "pad_sequences")
+    _w12_side(padding, "pad_sequences")
+    if isinstance(pad_value, bool) or not isinstance(pad_value, (int, float)):
+        raise TypeError("pad_sequences: pad_value 必须是数字")
+    if max_len is None:
+        width = max(len(r) for r in rows)
+    else:
+        if isinstance(max_len, bool) or not isinstance(max_len, int):
+            raise TypeError("pad_sequences: max_len 必须是整数或 None")
+        if max_len < 1:
+            raise ValueError("pad_sequences: max_len 必须 >= 1")
+        width = max_len
+    out = []
+    for row in rows:
+        cur = _w12_truncate(row, width, side=truncate)
+        need = width - len(cur)
+        if need > 0:
+            pad = [pad_value] * need
+            cur = cur + pad if padding == "post" else pad + cur
+        out.append(cur)
+    return out
+
+
+def attention_mask(padded, pad_value=0):
+    """按**值相等**生成 0/1 掩码（1 = 有效位置，0 = 补齐位）。
+
+    注意：如果 `pad_value` 也是合法 token 值，这个函数分不出来——那种情况请用
+    `batch_sequences(...)`，它按真实长度生成掩码，不存在歧义。
+    """
+    rows = _w12_seqs(padded, "attention_mask")
+    if isinstance(pad_value, bool) or not isinstance(pad_value, (int, float)):
+        raise TypeError("attention_mask: pad_value 必须是数字")
+    return [[0 if v == pad_value else 1 for v in row] for row in rows]
+
+
+def batch_sequences(sequences, max_len=None, pad_value=0, truncate="post",
+                    padding="post"):
+    """一次拿到 `input_ids` / `attention_mask` / `lengths`（掩码按**真实长度**算）。
+
+    `lengths` 是截断后的有效长度（不含补齐位），因此即使 `pad_value` 与真实 token
+    取值相同，掩码也不会错。
+    """
+    rows = _w12_seqs(sequences, "batch_sequences")
+    padded = pad_sequences(rows, max_len=max_len, pad_value=pad_value,
+                           truncate=truncate, padding=padding)
+    lengths = []
+    for row in rows:
+        n = len(row)
+        if max_len is not None and n > max_len:
+            n = max_len
+        lengths.append(n)
+    masks = []
+    for n in lengths:
+        if padding == "post":
+            masks.append([1] * n + [0] * (len(padded[0]) - n))
+        else:
+            masks.append([0] * (len(padded[0]) - n) + [1] * n)
+    return {"input_ids": padded, "attention_mask": masks, "lengths": lengths}
+
+
+def tokenize_batch(tokenizer, texts, max_len=None, pad_value=0, truncate="post",
+                   padding="post"):
+    """对一批文本逐条 `tokenizer.encode(...)` 再走 `batch_sequences`。"""
+    if not isinstance(texts, (list, tuple)):
+        raise TypeError("tokenize_batch: texts 必须是列表")
+    if not texts:
+        raise ValueError("tokenize_batch: texts 不能为空")
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        raise TypeError("tokenize_batch: tokenizer 必须有 encode 方法")
+    encoded = []
+    for text in texts:
+        if not isinstance(text, str):
+            raise TypeError("tokenize_batch: 每条文本必须是字符串")
+        ids = encode(text)
+        if not isinstance(ids, (list, tuple)):
+            raise TypeError("tokenize_batch: encode 必须返回 id 列表")
+        encoded.append(list(ids))
+    return batch_sequences(encoded, max_len=max_len, pad_value=pad_value,
+                           truncate=truncate, padding=padding)
+
+
 _WP_SPECIALS = ("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]")
 _WP_CONT = "##"
 

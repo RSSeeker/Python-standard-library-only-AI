@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1252 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1262 项）
 
 ## 特性
 
@@ -1087,6 +1087,33 @@ noisy = AI.audio_add_noise([0.1, -0.2, 0.3], snr_db=20.0, seed=0)
 按 `alpha * 长度` 取整且至少 1 次（`alpha=0` 才关闭），因此短句上扰动比例会偏高；
 ③音频部分**不是**完整的增强库——没有重采样、变速、混响，也没有 WAV 读写。
 
+### 特殊 token 与批处理（W12-A）
+
+`SpecialTokens` 把 BOS / EOS / PAD / UNK / SEP / CLS / MASK 七个标记收在一处，只存
+**字符串**、不绑定词表（默认值与 `WordPieceTokenizer` 兼容，另加 `[BOS]`/`[EOS]` 给生成任务）。
+批处理四个函数刻意分开：补齐、裁剪、生成掩码各自可单独用，组合起来才是一次成批。
+
+| API | 说明 |
+|---|---|
+| `SpecialTokens(**kw)` | 七个字段可单独覆盖；空串/首尾空白/重复/未知字段/us 非字符串都报错 |
+| `SpecialTokens.tokens()` / `.as_dict()` | 按 `pad, unk, bos, eos, sep, cls, mask` 固定顺序返回 |
+| `SpecialTokens.id_of(name, vocab)` | 在 list 或 dict 词表里查 id；查不到报 `KeyError` |
+| `truncate(sequence, max_len, side='post')` | 单条裁剪，`side='pre'` 保留后段 |
+| `pad_sequences(sequences, max_len=None, pad_value=0, truncate='post', padding='post')` | 补齐到本批最长（或 `max_len`），同时按 `truncate`/`padding` 两侧对齐 |
+| `attention_mask(padded, pad_value=0)` | 按**值相等**生成 0/1 掩码（`pad_value` 与真实 token 同值时有歧义，见下） |
+| `batch_sequences(...)` | 返回 `{"input_ids", "attention_mask", "lengths"}`，掩码按**真实长度**算，无歧义 |
+| `tokenize_batch(tokenizer, texts, max_len=None, pad_value=0, ...)` | 逐条 `tokenizer.encode` 后走 `batch_sequences` |
+
+```python
+st = AI.SpecialTokens.defaults()
+ids = st.id_of("pad", vocab)
+batch = AI.batch_sequences(encoded, max_len=64, pad_value=ids)
+```
+
+一个刻意的取舍：`attention_mask` 只能看值，如果 `pad_value` 恰好也是合法 token 值就分不出来；
+需要严格掩码时用 `batch_sequences`（它按截断后的真实长度生成，`lengths` 也一起返回）。
+所以两个都保留，并在各自 docstring 里写明差别，而不是让其中一个静默近似。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1503,7 +1530,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1252 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1262 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1672,6 +1699,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestImputers` | 三种填补器的闭式值：`SimpleImputer` 的 mean/median/most_frequent/constant 与全缺失列填 0、`KNNImputer` 的 k=1/k=2 与 distance 权重（0.5）与无共享列回退、`IterativeImputer` 对 `y=2x` 与多列缺失的恢复、观测值不被改写、`n_iter_` 与提前停止、列主元消元的 2×2 精确解与奇异返回 None，以及三类坏形状/非法超参报错 |
 | `TestDimReductionSelection` | `PCA` 的秩一数据（`explained_variance_ratio_`=1、成分方向、均值点投到原点、k=1/k=2 往返）与白化后方差为 1、`TSNE` 让三类点的簇内平均距离小于簇间（1.2K 量级 vs 12 量级）且同种子可复现、`SMOTE` 补到4:4 且合成点落在少数类线段上、`ADASYN` 的加权与 `weights_`、`VarianceThreshold` 的方差值与去常量列、`SelectKBest` 的 F=8 与 pearson=2/√5、`RFE` 保留唯一有效列、`L1Selector` 保信号列压正交列，以及各类坏形状/非法超参 |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
+| `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1725,7 +1753,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1252 个单元测试
+├── test_ai.py       # 1262 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
