@@ -21707,3 +21707,142 @@ class TestCAM:
         heat, _ = AI.cam_heatmap(model, self.X, 0, class_index=0)
         text = AI.cam_ascii(heat, max_width=3)
         assert "(3x3" in text.split("\n")[0]
+
+
+import pytest
+
+
+class _Lin:
+    """单输出线性模型：y = Σ w_j x_j。"""
+
+    def __init__(self, w):
+        self.w = list(w)
+
+    def forward(self, x):
+        return [sum(a * b for a, b in zip(self.w, x))]
+
+
+class _Two:
+    """两类模型：logits = [x0, -x0]，类别只由第 0 维符号决定。"""
+
+    def forward(self, x):
+        return [x[0], -x[0]]
+
+
+class TestShapLimeAnchors:
+    """W14-E：KernelSHAP / LIME / Anchors / 嵌入可视化。"""
+
+    W = [2.0, -3.0, 0.5]
+    X = [1.0, 2.0, -1.0]
+
+    def test_kernel_shap_additive_closed_form(self):
+        lin = _Lin(self.W)
+        out = AI.kernel_shap(lin, self.X, n_samples=60, seed=3)
+        assert set(out) == {"base_value", "output_value", "values", "names"}
+        assert abs(out["base_value"]) < 1e-12
+        assert abs(out["output_value"] - (2.0 - 6.0 - 0.5)) < 1e-12
+        for j, wj in enumerate(self.W):
+            assert abs(out["values"][j] - wj * self.X[j]) < 1e-6
+        assert out["names"] == ["f0", "f1", "f2"]
+
+    def test_kernel_shap_efficiency_axiom(self):
+        lin = _Lin(self.W)
+        out = AI.kernel_shap(lin, self.X, n_samples=60, seed=3)
+        total = sum(out["values"])
+        assert abs(total - (out["output_value"] - out["base_value"])) < 1e-9
+
+    def test_kernel_shap_background_and_names(self):
+        lin = _Lin(self.W)
+        out = AI.kernel_shap(lin, self.X, background=[[1.0, 1.0, 1.0]],
+                          n_samples=40, seed=3, feature_names=["a", "b", "c"])
+        assert abs(out["base_value"] - (2.0 - 3.0 + 0.5)) < 1e-12
+        assert out["names"] == ["a", "b", "c"]
+        assert abs(sum(out["values"]) -
+                   (out["output_value"] - out["base_value"])) < 1e-9
+
+    def test_kernel_shap_many_samples_terminates(self):
+        # 三个特征只有 8 种掩码：n_samples 远大于 2^m 时必须收敛，不能死循环
+        lin = _Lin(self.W)
+        out = AI.kernel_shap(lin, self.X, n_samples=500, seed=1)
+        assert len(out["values"]) == 3
+        assert abs(sum(out["values"]) -
+                   (out["output_value"] - out["base_value"])) < 1e-9
+
+    def test_lime_shape_and_ranking(self):
+        lin = _Lin(self.W)
+        out = AI.lime_explain(lin, self.X, n_samples=300, kernel_width=1.0, seed=5)
+        assert set(out) == {"intercept", "coefs", "names", "score"}
+        assert abs(out["score"] - lin.forward(self.X)[0]) < 1e-12
+        assert abs(out["intercept"]) < 1e-12
+        contrib = [abs(wj * self.X[j]) for j, wj in enumerate(self.W)]
+        top_model = max(range(3), key=lambda j: contrib[j])
+        top_lime = max(range(3), key=lambda j: abs(out["coefs"][j]))
+        assert top_model == top_lime
+        for j in range(3):
+            if abs(self.W[j] * self.X[j]) > 1e-6:
+                assert out["coefs"][j] * (self.W[j] * self.X[j]) >= 0
+
+    def test_lime_many_samples_terminates(self):
+        lin = _Lin(self.W)
+        out = AI.lime_explain(lin, self.X, n_samples=500, seed=2)
+        assert len(out["coefs"]) == 3
+
+    def test_anchor_rule_finds_single_feature(self):
+        pool = [[1.5, 0.0], [-1.5, 0.0], [1.5, 1.0], [-1.5, 1.0],
+                [1.5, -1.0]]
+        rule = AI.anchor_rule(_Two(), [1.5, 0.0], pool, threshold=0.9)
+        assert rule["features"] == [0]
+        assert abs(rule["values"][0] - 1.5) < 1e-12
+        assert abs(rule["precision"] - 1.0) < 1e-12
+        assert abs(rule["coverage"] - 0.6) < 1e-12
+
+    def test_anchor_rule_rejects_unreachable_threshold(self):
+        pool = [[-1.5, 0.0], [-1.5, 1.0]]
+        with pytest.raises(ValueError):
+            AI.anchor_rule(_Two(), [1.5, 0.0], pool, threshold=0.9)
+
+    def test_scatter_and_embedding(self):
+        pts = [[0.0, 0.0], [1.0, 1.0], [0.5, 0.5]]
+        grid = AI.scatter_ascii(pts, width=5, height=3)
+        lines = grid.split("\n")
+        assert len(lines) == 3
+        assert all(len(r) == 5 for r in lines)
+        assert lines[0][4] != " "
+        assert lines[2][0] != " "
+        labelled = AI.scatter_ascii(pts, labels=["cat", "dog", 7], width=5, height=3)
+        chars = set(labelled.replace("\n", "").replace(" ", ""))
+        assert chars == {"c", "d", "7"}
+
+        data = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]]
+        emb = AI.embedding_visualize(data, labels=[0, 0, 1, 1, 0, 1],
+                                 method="pca", width=20, height=8)
+        assert len(emb["coords"]) == 6
+        assert len(emb["coords"][0]) == 2
+        assert len(emb["ascii"].split("\n")) == 8
+        other = AI.embedding_visualize(data, method="tsne", seed=1, width=12,
+                                   height=6)
+        assert len(other["coords"]) == 6
+
+    def test_explainer_rejects_bad_input(self):
+        lin = _Lin(self.W)
+        with pytest.raises(ValueError):
+            AI.kernel_shap(lin, self.X, n_samples=1)
+        with pytest.raises(ValueError):
+            AI.kernel_shap(lin, [1.0, "a"], n_samples=10)
+        with pytest.raises(ValueError):
+            AI.kernel_shap(lin, self.X, class_index=0)
+        with pytest.raises(ValueError):
+            AI.kernel_shap(lin, self.X, background=[[1.0]])
+        with pytest.raises(ValueError):
+            AI.kernel_shap(lin, self.X, feature_names=["a"])
+        with pytest.raises(ValueError):
+            AI.lime_explain(lin, self.X, kernel_width=0.0)
+        with pytest.raises(ValueError):
+            AI.anchor_rule(_Two(), [1.5, 0.0], [[1.5, 0.0]], threshold=0.0)
+        with pytest.raises(ValueError):
+            AI.scatter_ascii([[1.0, 2.0, 3.0]])
+        with pytest.raises(ValueError):
+            AI.embedding_visualize([[1.0, 2.0], [1.0]])
+        with pytest.raises(ValueError):
+            AI.embedding_visualize([[1.0, 2.0]], method="umap")

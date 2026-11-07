@@ -28715,6 +28715,493 @@ def _cf_matrix(ratings, who, allow_none):
 
 # ============================================================================
 # ============================================================================
+# ============================================================================
+#  可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors（W14-E）
+# ============================================================================
+
+def _w14e_net(model):
+    """取出真正的前向对象（兼容 Model 包装器）。"""
+    net = getattr(model, "model", model)
+    if not hasattr(net, "forward"):
+        raise ValueError(
+            f"_w14e_net: {type(model).__name__} 没有 forward()，无法解释"
+        )
+    return net
+
+
+def _w14e_row(x, who):
+    """校验一维数值样本。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 样本必须是长度 > 0 的一维列表")
+    out = []
+    for v in x:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{who}: 样本元素必须是数字，收到 {v!r}")
+        out.append(float(v))
+    return out
+
+
+def _w14e_pool(rows, width, who):
+    """校验二维数值矩阵，且每行宽度必须等于 width。"""
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"{who}: 需要非空的二维列表")
+    out = []
+    for i, row in enumerate(rows):
+        vals = _w14e_row(row, f"{who}[{i}]")
+        if len(vals) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 行宽度 {len(vals)} 与 {width} 不一致"
+            )
+        out.append(vals)
+    return out
+
+
+def _w14e_forward(net, row):
+    """前向一次，返回数值列表。"""
+    out = net.forward(list(row))
+    if not isinstance(out, (list, tuple)) or not out:
+        raise ValueError(
+            f"_w14e_forward: 模型输出必须是长度 > 0 的列表，收到 {type(out).__name__}"
+        )
+    vals = []
+    for v in out:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("_w14e_forward: 模型输出里必须全是数字")
+        vals.append(float(v))
+    return vals
+
+
+def _w14e_score(net, row, class_index=None):
+    """把模型输出压成一个标量分数：单输出直取，多输出取类别概率。"""
+    out = _w14e_forward(net, row)
+    if len(out) == 1:
+        if class_index is not None:
+            raise ValueError(
+                "_w14e_score: 单输出模型（回归）不接受 class_index"
+            )
+        return out[0]
+    if class_index is None:
+        best = 0
+        for i in range(1, len(out)):
+            if out[i] > out[best]:
+                best = i
+        class_index = best
+    if not isinstance(class_index, int) or isinstance(class_index, bool):
+        raise ValueError(
+            f"_w14e_score: class_index 必须是整数，收到 {class_index!r}"
+        )
+    if not (0 <= class_index < len(out)):
+        raise ValueError(
+            f"_w14e_score: class_index={class_index} 超出输出维度 {len(out)}"
+        )
+    probs = _softmax_row(out)
+    return probs[class_index]
+
+
+def _w14e_resolve_class(net, row, class_index):
+    """多输出模型在 class_index=None 时锁到 argmax，避免解释过程中类别漂移。"""
+    out = _w14e_forward(net, row)
+    if len(out) == 1:
+        if class_index is not None:
+            raise ValueError("单输出模型（回归）不接受 class_index")
+        return None
+    if class_index is None:
+        best = 0
+        for i in range(1, len(out)):
+            if out[i] > out[best]:
+                best = i
+        return best
+    if not isinstance(class_index, int) or isinstance(class_index, bool):
+        raise ValueError(f"class_index 必须是整数，收到 {class_index!r}")
+    if not (0 <= class_index < len(out)):
+        raise ValueError(
+            f"class_index={class_index} 超出输出维度 {len(out)}"
+        )
+    return class_index
+
+
+def _w14e_masks(n_features, count, rng, skip_trivial=False):
+    """生成至多 count 个互不相同的二值掩码。
+
+    二值掩码总共只有 `2^n_features` 种，所以样本数必须被它截断——否则
+    「随机抽 + 去重」的循环在特征极少时永远凑不够，会直接挂死。
+    """
+    if count <= 0:
+        return []
+    want = count + (2 if skip_trivial else 0)
+    out = []
+    seen = set()
+    if n_features <= 12:
+        codes = list(range(1 << n_features))
+        rng.shuffle(codes)
+        for code in codes:
+            mask = [(code >> j) & 1 for j in range(n_features)]
+            total = sum(mask)
+            if skip_trivial and (total == 0 or total == n_features):
+                continue
+            key = tuple(mask)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(mask)
+            if len(out) >= want:
+                break
+        return out[:count]
+    attempts = 0
+    limit = 200 * want
+    while len(out) < want and attempts < limit:
+        attempts += 1
+        mask = [1 if rng.random() < 0.5 else 0 for _ in range(n_features)]
+        total = sum(mask)
+        if skip_trivial and (total == 0 or total == n_features):
+            continue
+        key = tuple(mask)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(mask)
+    return out[:count]
+
+
+def _w14e_hybrid(x, background, mask):
+    """把「不在 mask 里」的特征换成背景值。"""
+    return [x[j] if mask[j] else background[j] for j in range(len(x))]
+
+
+def _w14e_weights_ls(features, targets, weights, ridge=1e-10):
+    """加权最小二乘：解 (XᵀWX + ridge·I) β = XᵀWy。"""
+    n = len(features)
+    m = len(features[0])
+    ata = [[0.0] * m for _ in range(m)]
+    atb = [0.0] * m
+    for i in range(n):
+        w = weights[i]
+        if w <= 0.0:
+            continue
+        row = features[i]
+        y = targets[i]
+        for a in range(m):
+            wa = w * row[a]
+            if wa == 0.0:
+                continue
+            atb[a] += wa * y
+            ata_row = ata[a]
+            for b in range(m):
+                ata_row[b] += wa * row[b]
+    for a in range(m):
+        ata[a][a] += ridge
+    sol = _w11f_solve(ata, atb)
+    if sol is None:
+        raise ValueError(
+            "_w14e_weights_ls: 正规方程奇异（样本掩码重复过多），"
+            "请增大 n_samples 或检查特征是否常量"
+        )
+    return sol
+
+
+def _shap_kernel_weight(n_features, size):
+    """KernelSHAP 的 Shapley kernel 权重。"""
+    if size == 0 or size == n_features:
+        return 1e6
+    return (n_features - 1.0) / (
+        _binom(n_features, size) * size * (n_features - size)
+    )
+
+
+def _binom(n, k):
+    """二项系数（只用在小 n 上，直接连乘）。"""
+    if k < 0 or k > n:
+        return 0.0
+    k = min(k, n - k)
+    out = 1.0
+    for i in range(k):
+        out = out * (n - i) / (i + 1.0)
+    return out
+
+
+def kernel_shap(model, x, background=None, class_index=None, n_samples=100,
+                seed=None, feature_names=None):
+    """KernelSHAP（简化版）：返回 ``{"base_value", "output_value", "values", "names"}``。
+
+    对每个特征子集 `S` 用「`S` 里保留 x 的值、其余换成背景值」构造混合样本，
+    用 Shapley kernel 权重做加权最小二乘拟合线性代理模型；最后按效率公理
+    做常数平移，保证 ``sum(values) == output_value - base_value``。
+    """
+    net = _w14e_net(model)
+    xr = _w14e_row(x, "kernel_shap")
+    m = len(xr)
+    if not isinstance(n_samples, int) or isinstance(n_samples, bool):
+        raise ValueError(f"kernel_shap: n_samples 必须是整数，收到 {n_samples!r}")
+    if n_samples < 2:
+        raise ValueError(f"kernel_shap: n_samples 必须 >= 2，收到 {n_samples}")
+    cls = _w14e_resolve_class(net, xr, class_index)
+    if background is None:
+        bg = [0.0] * m
+    else:
+        rows = _w14e_pool(background, m, "kernel_shap: background")
+        bg = [sum(row[j] for row in rows) / len(rows) for j in range(m)]
+    if feature_names is not None:
+        names = list(feature_names)
+        if len(names) != m:
+            raise ValueError(
+                f"kernel_shap: feature_names 长度 {len(names)} 与特征数 {m} 不一致"
+            )
+    else:
+        names = [f"f{j}" for j in range(m)]
+
+    rng = random.Random(seed)
+    masks = []
+    seen = set()
+    for mask in ([1] * m, [0] * m):
+        key = tuple(mask)
+        seen.add(key)
+        masks.append(mask)
+    # 只有 2^m 种掩码，n_samples 被它截断（空/满两个已经放进去）
+    cap = min(n_samples, 1 << m) if m <= 20 else n_samples
+    if cap < 3:
+        raise ValueError(
+            f"kernel_shap: 只有 {m} 个特征时可用的掩码太少，无法拟合线性代理模型"
+        )
+    for mask in _w14e_masks(m, cap - len(masks), rng):
+        key = tuple(mask)
+        if key in seen:
+            continue
+        seen.add(key)
+        masks.append(mask)
+
+    rows = []
+    targets = []
+    weights = []
+    for mask in masks:
+        row = _w14e_hybrid(xr, bg, mask)
+        rows.append([float(v) for v in mask])
+        targets.append(_w14e_score(net, row, cls))
+        weights.append(_shap_kernel_weight(m, sum(mask)))
+
+    full = _w14e_score(net, xr, cls)
+    base = _w14e_score(net, bg, cls)
+    values = _w14e_weights_ls(rows, targets, weights)
+    drift = (full - base) - sum(values)
+    shift = drift / m
+    values = [v + shift for v in values]
+    return {
+        "base_value": base,
+        "output_value": full,
+        "values": values,
+        "names": names,
+    }
+
+
+def lime_explain(model, x, class_index=None, n_samples=200, kernel_width=0.75,
+                 seed=None, feature_names=None):
+    """LIME（简化版表格）：返回 ``{"intercept", "coefs", "names", "score"}``。
+
+    可解释表示是「该特征是否仍等于 x 的第 j 维」的二值向量；扰动用
+    `Bernoulli(0.5)` 决定每维是否保留原值（不保留时取背景 0 或训练均值），
+    距离用归一化汉明距离，权重 `exp(-d² / kernel_width²)`。
+    """
+    net = _w14e_net(model)
+    xr = _w14e_row(x, "lime_explain")
+    m = len(xr)
+    if not isinstance(n_samples, int) or isinstance(n_samples, bool):
+        raise ValueError(f"lime_explain: n_samples 必须是整数，收到 {n_samples!r}")
+    if n_samples < 2:
+        raise ValueError(f"lime_explain: n_samples 必须 >= 2，收到 {n_samples}")
+    if not isinstance(kernel_width, (int, float)) or kernel_width <= 0.0:
+        raise ValueError(
+            f"lime_explain: kernel_width 必须 > 0，收到 {kernel_width!r}"
+        )
+    cls = _w14e_resolve_class(net, xr, class_index)
+    if feature_names is None:
+        names = [f"f{j}" for j in range(m)]
+    else:
+        names = list(feature_names)
+        if len(names) != m:
+            raise ValueError(
+                f"lime_explain: feature_names 长度 {len(names)} 与特征数 {m} 不一致"
+            )
+
+    rng = random.Random(seed)
+    rows = [[1.0] * m, [0.0] * m]
+    targets = [_w14e_score(net, xr, cls), _w14e_score(net, [0.0] * m, cls)]
+    weights = [1.0, 1.0]
+    # 同样受 2^m 限制：全 0 / 全 1 已经手动放进去了
+    cap = min(n_samples, 1 << m) if m <= 20 else n_samples
+    for keep in _w14e_masks(m, cap - len(rows), rng, skip_trivial=True):
+        sample = [xr[j] if keep[j] else 0.0 for j in range(m)]
+        dist = sum(1 for j in range(m) if not keep[j]) / float(m)
+        rows.append([float(v) for v in keep])
+        targets.append(_w14e_score(net, sample, cls))
+        weights.append(math.exp(-(dist * dist) / (kernel_width * kernel_width)))
+
+    coefs = _w14e_weights_ls(rows, targets, weights, ridge=1e-8)
+    intercept = _w14e_score(net, [0.0] * m, cls)
+    return {
+        "intercept": intercept,
+        "coefs": coefs,
+        "names": names,
+        "score": _w14e_score(net, xr, cls),
+    }
+
+
+def _w14e_argmax(net, row):
+    out = _w14e_forward(net, row)
+    best = 0
+    for i in range(1, len(out)):
+        if out[i] > out[best]:
+            best = i
+    return best
+
+
+def anchor_rule(model, x, pool, class_index=None, threshold=0.9,
+                max_features=None, seed=None):
+    """Anchors（简化版）：贪心找最小的「特征=取值」组合。
+
+    精度定义：在 pool 里与 x 在该组合上完全一致的样本中，预测类别与 x 相同的
+    比例。返回 ``{"features", "values", "precision", "coverage"}``；找不到达到
+    ``threshold`` 的组合时抛 ValueError（不返回一个假装达标的规则）。
+    """
+    net = _w14e_net(model)
+    xr = _w14e_row(x, "anchor_rule")
+    m = len(xr)
+    rows = _w14e_pool(pool, m, "anchor_rule: pool")
+    if not isinstance(threshold, (int, float)) or not (0.0 < threshold <= 1.0):
+        raise ValueError(
+            f"anchor_rule: threshold 必须在 (0, 1] 内，收到 {threshold!r}"
+        )
+    target = _w14e_argmax(net, xr)
+    if max_features is None:
+        max_features = m
+    if not isinstance(max_features, int) or isinstance(max_features, bool):
+        raise ValueError(
+            f"anchor_rule: max_features 必须是整数，收到 {max_features!r}"
+        )
+    if not (1 <= max_features <= m):
+        raise ValueError(
+            f"anchor_rule: max_features 必须在 [1, {m}] 内，收到 {max_features}"
+        )
+
+    def stats(chosen):
+        matched = 0
+        agree = 0
+        for row in rows:
+            if all(row[j] == xr[j] for j in chosen):
+                matched += 1
+                if _w14e_argmax(net, row) == target:
+                    agree += 1
+        if matched == 0:
+            return 0.0, 0.0
+        return agree / float(matched), matched / float(len(rows))
+
+    chosen = []
+    best_prec, best_cov = stats(chosen)
+    while len(chosen) < max_features:
+        pick = None
+        pick_prec = best_prec
+        for j in range(m):
+            if j in chosen:
+                continue
+            prec, _cov = stats(chosen + [j])
+            if prec > pick_prec:
+                pick = j
+                pick_prec = prec
+        if pick is None:
+            break
+        chosen.append(pick)
+        best_prec, best_cov = stats(chosen)
+        if best_prec >= threshold:
+            break
+    if best_prec < threshold:
+        raise ValueError(
+            f"anchor_rule: 最多 {max_features} 个特征也只能到精度 {best_prec:.4f}，"
+            f"低于 threshold={threshold}；调小 threshold 或扩大 pool"
+        )
+    return {
+        "features": chosen,
+        "values": [xr[j] for j in chosen],
+        "precision": best_prec,
+        "coverage": best_cov,
+    }
+
+
+def scatter_ascii(points, labels=None, width=48, height=20):
+    """把二维点云画成 ASCII 散点；``labels`` 给定时用其首字符区分不同类。"""
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError("scatter_ascii: points 必须是非空二维列表")
+    xs = []
+    ys = []
+    for i, p in enumerate(points):
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            raise ValueError(f"scatter_ascii: 第 {i} 个点必须是 (x, y)")
+        for v in p:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"scatter_ascii: 第 {i} 个点含非数字 {v!r}")
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
+    if labels is not None:
+        if len(labels) != len(points):
+            raise ValueError(
+                f"scatter_ascii: labels 长度 {len(labels)} 与点数 {len(points)} 不一致"
+            )
+    if not isinstance(width, int) or isinstance(width, bool) or width < 4:
+        raise ValueError(f"scatter_ascii: width 必须是 >=4 的整数，收到 {width!r}")
+    if not isinstance(height, int) or isinstance(height, bool) or height < 3:
+        raise ValueError(f"scatter_ascii: height 必须是 >=3 的整数，收到 {height!r}")
+
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    span_x = (xmax - xmin) or 1.0
+    span_y = (ymax - ymin) or 1.0
+    grid = [[" "] * width for _ in range(height)]
+    for i, (xv, yv) in enumerate(zip(xs, ys)):
+        col = int((xv - xmin) / span_x * (width - 1))
+        row = height - 1 - int((yv - ymin) / span_y * (height - 1))
+        ch = "*"
+        if labels is not None:
+            text = str(labels[i])
+            ch = text[0] if text else "*"
+        grid[row][col] = ch
+    return "\n".join("".join(r) for r in grid)
+
+
+def embedding_visualize(data, labels=None, method="tsne", seed=42,
+                        width=48, height=20):
+    """把高维数据降到二维并画出 ASCII 散点图。
+
+    返回 ``{"coords": [[x, y], ...], "labels": labels, "ascii": 文本}``；
+    ``method='tsne'`` 复用 t-SNE，``method='pca'`` 复用 PCA。
+    """
+    if not isinstance(data, (list, tuple)) or not data:
+        raise ValueError("embedding_visualize: data 必须是非空二维列表")
+    width_dim = None
+    for i, row in enumerate(data):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"embedding_visualize: 第 {i} 行必须是非空列表")
+        if width_dim is None:
+            width_dim = len(row)
+        elif len(row) != width_dim:
+            raise ValueError(
+                f"embedding_visualize: 第 {i} 行宽度 {len(row)} 与 {width_dim} 不一致"
+            )
+    if labels is not None and len(labels) != len(data):
+        raise ValueError(
+            f"embedding_visualize: labels 长度 {len(labels)} 与样本数 {len(data)} 不一致"
+        )
+    if method == "tsne":
+        coords = TSNE(n_components=2, seed=seed).fit_transform(data)
+    elif method == "pca":
+        coords = PCA(n_components=2).fit_transform(data)
+    else:
+        raise ValueError(
+            f"embedding_visualize: method 必须是 'tsne' 或 'pca'，收到 {method!r}"
+        )
+    pts = [[float(row[0]), float(row[1])] for row in coords]
+    return {
+        "coords": pts,
+        "labels": labels,
+        "ascii": scatter_ascii(pts, labels=labels, width=width, height=height),
+    }
+
 #  可解释性：CAM 系列（W14-D：GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
 # ============================================================================
 

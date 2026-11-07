@@ -468,7 +468,10 @@
   - `cam_heatmap`（GradCAM / GradCAM++ / LayerCAM）+ `scorecam_heatmap` + `gradcam_weights` + `cam_ascii`
   - 复用 `Sequential` 的反向协议（`delta_index` 取 delta），定位到非卷积层会明确报错
   - 探针 54 项；首跑 2 条失败是我自己的期望值错（全负热图归一化后必为 0、`cam_ascii` 的表头带通道名）
-- [ ] 嵌入可视化（复用 t-SNE）；SHAP（KernelSHAP 简化）/ LIME（简化）/ Anchors
+- [x] 嵌入可视化（复用 t-SNE）；SHAP（KernelSHAP 简化）/ LIME（简化）/ Anchors
+  - 已实现：`kernel_shap` / `lime_explain` / `anchor_rule` / `scatter_ascii` / `embedding_visualize`（复用 `TSNE` / `PCA`）
+  - 真 bug：二值掩码只有 `2^m` 种，`n_samples` 未截断时「随机抽 + 去重」循环永不结束（探针直接挂死）；已截断并加回归测试
+  - 探针 49 项；三者都标注为简化实现（非 TreeSHAP、不建模特征相关性、Anchors 无 beam search）
 - [ ] TCAV；Activation Maximization / Network Dissection；Counterfactual / CEM；Prototypes / Influence（简化）
 
 ### W15 推理与部署（§11）

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1411 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1421 项）
 
 ## 特性
 
@@ -1528,6 +1528,30 @@ print(cam_ascii(heat, max_width=16))
 - ScoreCAM 需要 `C` 次额外前向（`n_masks` 可以只取前几个通道），纯 Python 下比 GradCAM 慢一个量级。
 - `relu=False` 保留负贡献；由于最后按最大值归一到 `[0,1]`，**全负的热图会被压成全零**——这是归一化的定义，不是丢数据。
 
+### 特征归因与嵌入可视化（W14-E）
+
+| API | 说明 |
+| --- | --- |
+| `kernel_shap(model, x, background=None, class_index=None, n_samples=100, seed=None, feature_names=None)` | 简化 KernelSHAP：掩码取特征子集、其余换成背景值，Shapley kernel 权重做加权最小二乘，最后按效率公理平移使 `sum(values) == output_value - base_value` |
+| `lime_explain(model, x, class_index=None, n_samples=200, kernel_width=0.75, seed=None, feature_names=None)` | 简化 LIME：「该维是否保留原值」的二值表示 + 汉明距离指数权重 + 加权最小二乘 |
+| `anchor_rule(model, x, pool, class_index=None, threshold=0.9, max_features=None, seed=None)` | 贪心找最小的「特征=取值」组合，精度 = pool 中与 x 在该组合上一致的样本里预测类别相同的比例；达不到 `threshold` 直接报错 |
+| `scatter_ascii(points, labels=None, width=48, height=20)` | 二维点云 ASCII 散点；`labels` 用首字符区分 |
+| `embedding_visualize(data, labels=None, method='tsne', seed=42, width=48, height=20)` | 高维数据降二维（复用 `TSNE` / `PCA`）并画 ASCII 散点 |
+
+```python
+shap = kernel_shap(model, x, background=X_train[:50], n_samples=200, seed=0)
+for name, value in zip(shap["names"], shap["values"]):
+    print(f"{name}: {value:+.4f}")
+
+lime = lime_explain(model, x, n_samples=500, seed=0)
+rule = anchor_rule(model, x, X_train, threshold=0.95)
+print(embedding_visualize(X, labels=y, method="tsne")["ascii"])
+```
+
+- 三者都是**简化实现**：KernelSHAP 用随机采样掩码 + 线性代理（不是 TreeSHAP，也不做精确 Shapley 枚举）；LIME 的扰动是伯努利保留/置零，不建模特征相关性；Anchors 只搜单特征逐一相加的组合，不做 beam search。
+- 二值掩码只有 `2^m` 种，`n_samples` 会被它截断（否则去重采样会死循环）——这是实现里的一处真 bug，已修并加了回归测试。
+- 模型输出多于 1 维时按 softmax 的类别概率当分数，`class_index=None` 锁到 argmax；单输出（回归）模型直接用输出值，且不接受 `class_index`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1944,7 +1968,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1411 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1421 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2130,6 +2154,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAttentionAttribution` | 单位/均匀注意力的闭式结果、行和归一、flow 的列守恒、三种头部融合、discard_ratio 丢最小项、`attention_maps` 与多层 CausalLM 输入、八条非法输入 |
 | `TestPermutationFeatureMaps` | 置换重要性的基准/常数特征/重要特征/单次重复 std=0/种子复现/自定义 metric/参数校验；特征图 ASCII 的表头、峰值字符、通道选择、下采样宽度、常量与负值、六处非法输入 |
 | `TestCAM` | GradCAM 通道权重闭式解、热图 = 归一化激活、换类别翻转权重、默认类 = argmax、GradCAM++ 与 LayerCAM 对照、relu=False 的混合符号、ScoreCAM 权重和为 1 与 `n_masks`、8 处非法输入 |
+| `TestShapLimeAnchors` | KernelSHAP 线性可加闭式解与效率公理、背景均值与特征名、`n_samples > 2^m` 不死循环；LIME 的排序与符号；Anchors 单特征精度/覆盖率与不可达阈值报错；ASCII 散点与 t-SNE/PCA 嵌入；10 处非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2183,7 +2208,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1411 个单元测试
+├── test_ai.py       # 1421 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
