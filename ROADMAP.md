@@ -345,7 +345,18 @@
   - 探针 50 项：三种策略闭式值、k=1/k=2 与 distance 权重 0.5、`y=2x` 与多列缺失恢复、
     观测值不改写、`n_iter_` 夹紧、列主元消元精确解与奇异返回 None、22 条非法输入。
 
-- [ ] 降维：`PCA` / `t-SNE`（简化）；`SMOTE` / `ADASYN`；特征选择（VarianceThreshold / SelectKBest / RFE / L1）
+- [x] 降维：`PCA` / `t-SNE`（简化）；`SMOTE` / `ADASYN`；特征选择（VarianceThreshold / SelectKBest / RFE / L1）
+  - `PCA`：协方差 + 幂迭代取前 k 个特征向量（符号归一），`explained_variance_ratio_`、白化、`inverse_transform` 齐备。
+  - `TSNE`：精确 O(n²) 版；按行二分 sigma 使熵 = `log(perplexity)`，对称化后 Student-t 核梯度下降，
+    前 50 轮 `early_exaggeration=12`、动量 0.5→0.8。**真 bug**：二分搜索方向写反（熵偏大时该缩上界却放了下界），
+    导致 P 近似均匀、三簇完全不分离（intra 116 > inter 111）→ 修后 5.8 vs 92.8。
+  - `SMOTE` / `ADASYN`：`_w11g_neighbors(x, i, candidates, k)` 原先把 k 当候选集合（`for other in idx` 报 `int not iterable`），
+    改成显式候选列表；ADASYN 的难度比在全样本上算、合成只在少数类内部取邻居。
+  - `VarianceThreshold` / `SelectKBest`（`f_classif` 与 `pearson`）/ `RFE`（岭回归系数递归消除）/ `L1Selector`（坐标下降 Lasso）。
+    **真 bug**：`f_classif` 里误用标签均值当特征总均值（F 从 8 变 40），修正后常量列得 0 而不是 inf。
+  - 探针 74 项：PCA 秩一/往返/白化、t-SNE 簇内<簇间且同种子可复现、SMOTE 4:4 与线段约束、
+    ADASYN 加权、四个选择器的支持集与分数、28 条非法输入。
+
 - [ ] 文本增强（同义词替换 / EDA / Token Dropout）；音频增强（概念）
 
 ### W12 分词与批处理（§8）

@@ -19788,3 +19788,209 @@ class TestImputers:
         assert abs(std[0] - 0.816496580927726) < 1e-12
         assert abs(coef[0] - 2.0 * std[0]) < 1e-6
         assert abs(yb - 5.0) < 1e-12
+class TestDimReductionSelection:
+    """W11-G：PCA / t-SNE / SMOTE·ADASYN / 特征选择"""
+
+    def test_pca_rank_one(self):
+        line = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]]
+        p = AI.PCA(n_components=1).fit(line)
+        assert abs(p.explained_variance_ratio_[0] - 1.0) < 1e-9
+        assert abs(abs(p.components_[0][0]) - 1.0 / math.sqrt(5.0)) < 1e-8
+        assert abs(abs(p.components_[0][1]) - 2.0 / math.sqrt(5.0)) < 1e-8
+        z = p.transform([[2.5, 5.0]])
+        assert abs(z[0][0]) < 1e-9
+        back = p.inverse_transform(p.transform(line))
+        for i in range(4):
+            for j in range(2):
+                assert abs(back[i][j] - line[i][j]) < 1e-9
+
+    def test_pca_full_rank_and_whiten(self):
+        full = [[1.0, 1.0], [2.0, 3.0], [3.0, 2.0], [4.0, 4.0]]
+        p = AI.PCA(n_components=2).fit(full)
+        assert len(p.components_) == 2
+        assert abs(sum(p.explained_variance_ratio_) - 1.0) < 1e-9
+        rt = p.inverse_transform(p.transform(full))
+        for i in range(4):
+            for j in range(2):
+                assert abs(rt[i][j] - full[i][j]) < 1e-9
+        line = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]]
+        pw = AI.PCA(n_components=1, whiten=True).fit(line)
+        zw = pw.transform(line)
+        mean_z = sum(r[0] for r in zw) / len(zw)
+        var_z = sum((r[0] - mean_z) ** 2 for r in zw) / (len(zw) - 1)
+        assert abs(var_z - 1.0) < 1e-9
+        back = pw.inverse_transform(zw)
+        for i in range(4):
+            for j in range(2):
+                assert abs(back[i][j] - line[i][j]) < 1e-9
+
+    def test_pca_errors(self):
+        with pytest.raises(ValueError):
+            AI.PCA(0)
+        with pytest.raises(TypeError):
+            AI.PCA(True)
+        with pytest.raises(ValueError):
+            AI.PCA().transform([[1.0]])
+        with pytest.raises(ValueError):
+            AI.PCA().fit([[1.0]])
+        with pytest.raises(ValueError):
+            AI.PCA().fit([[1.0, 2.0]]).transform([[1.0]])
+        with pytest.raises(ValueError):
+            AI.PCA().fit([[1.0, 1.0], [2.0, 3.0]]).inverse_transform([[1.0]])
+
+    def test_tsne_separates_clusters(self):
+        clusters = []
+        for cx, cy in ((0.0, 0.0), (10.0, 0.0), (0.0, 10.0)):
+            for k in range(4):
+                clusters.append([cx + 0.1 * k, cy + 0.05 * k])
+        t = AI.TSNE(n_components=2, perplexity=3.0, n_iter=150, seed=7)
+        emb = t.fit_transform(clusters)
+        assert len(emb) == 12 and len(emb[0]) == 2
+        intra = []
+        inter = []
+        for i in range(12):
+            for j in range(i + 1, 12):
+                d = math.sqrt(sum((emb[i][c] - emb[j][c]) ** 2 for c in range(2)))
+                (intra if i // 4 == j // 4 else inter).append(d)
+        assert sum(intra) / len(intra) < sum(inter) / len(inter)
+        assert t.kl_divergence_ == t.kl_divergence_
+        assert t.embedding_ == emb
+        again = AI.TSNE(n_components=2, perplexity=3.0, n_iter=150,
+                        seed=7).fit_transform(clusters)
+        assert again == emb
+
+    def test_tsne_errors(self):
+        clusters = [[float(i), float(i % 3)] for i in range(6)]
+        with pytest.raises(ValueError):
+            AI.TSNE(perplexity=20.0).fit_transform(clusters)
+        with pytest.raises(ValueError):
+            AI.TSNE(n_components=0)
+        with pytest.raises(ValueError):
+            AI.TSNE(n_iter=0)
+        with pytest.raises(ValueError):
+            AI.TSNE(perplexity=0.0)
+        with pytest.raises(ValueError):
+            AI.TSNE().fit_transform([[1.0], [2.0]])
+
+    def test_smote(self):
+        xm = [[0.0, 0.0], [0.1, 0.1], [0.2, 0.0], [0.1, -0.1],
+              [5.0, 5.0], [5.2, 5.1]]
+        ym = [0, 0, 0, 0, 1, 1]
+        sx, sy = AI.SMOTE(k_neighbors=1, random_state=1).fit_resample(xm, ym)
+        assert sum(1 for v in sy if v == 0) == 4
+        assert sum(1 for v in sy if v == 1) == 4
+        assert sx[:6] == [list(r) for r in xm]
+        assert sy[:6] == ym
+        for row in sx[6:]:
+            assert 4.9 <= row[0] <= 5.3 and 4.9 <= row[1] <= 5.3
+        sx2, sy2 = AI.SMOTE(k_neighbors=1, random_state=1).fit_resample(xm, ym)
+        assert sx == sx2 and sy == sy2
+        sx3, _sy3 = AI.SMOTE(k_neighbors=1, random_state=2).fit_resample(xm, ym)
+        assert sx3 != sx
+
+    def test_smote_errors(self):
+        with pytest.raises(ValueError):
+            AI.SMOTE(k_neighbors=0)
+        with pytest.raises(TypeError):
+            AI.SMOTE(True)
+        with pytest.raises(ValueError):
+            AI.SMOTE().fit_resample([[1.0], [2.0]], [0, 0])
+        with pytest.raises(ValueError):
+            AI.SMOTE().fit_resample([[1.0], [2.0]], [0])
+        with pytest.raises(ValueError):
+            AI.ADASYN(k_neighbors=0)
+
+    def test_adasyn(self):
+        xm = [[0.0, 0.0], [0.1, 0.1], [0.2, 0.0], [0.1, -0.1],
+              [5.0, 5.0], [5.2, 5.1]]
+        ym = [0, 0, 0, 0, 1, 1]
+        ada = AI.ADASYN(k_neighbors=2, random_state=3)
+        ax, ay = ada.fit_resample(xm, ym)
+        assert sum(1 for v in ay if v == 0) == 4
+        assert sum(1 for v in ay if v == 1) == 4
+        assert ax[:6] == [list(r) for r in xm]
+        assert 1 in ada.weights_ and len(ada.weights_[1]) == 2
+
+    def test_variance_threshold(self):
+        xv = [[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]]
+        vt = AI.VarianceThreshold(threshold=0.5).fit(xv)
+        assert abs(vt.variances_[0]) < 1e-12
+        assert abs(vt.variances_[1] - 2.0 / 3.0) < 1e-12
+        assert vt.support_ == [False, True]
+        assert vt.transform(xv) == [[1.0], [2.0], [3.0]]
+        assert vt.get_support() == [False, True]
+        with pytest.raises(ValueError):
+            AI.VarianceThreshold(2.0).fit(xv)
+        with pytest.raises(ValueError):
+            AI.VarianceThreshold(-1.0)
+        with pytest.raises(TypeError):
+            AI.VarianceThreshold(True)
+
+    def test_select_k_best(self):
+        xs = [[1.0, 1.0, 7.0], [2.0, 0.0, 7.0],
+              [3.0, 1.0, 7.0], [4.0, 0.0, 7.0]]
+        ys = [0, 0, 1, 1]
+        sk = AI.SelectKBest(k=1).fit(xs, ys)
+        assert sk.support_ == [True, False, False]
+        assert abs(sk.scores_[0] - 8.0) < 1e-12
+        assert abs(sk.scores_[2]) < 1e-12
+        assert sk.transform(xs) == [[1.0], [2.0], [3.0], [4.0]]
+        sp = AI.SelectKBest(k=1, score_func="pearson").fit(xs, ys)
+        assert sp.support_ == [True, False, False]
+        assert abs(sp.scores_[0] - 2.0 / math.sqrt(5.0)) < 1e-12
+        assert abs(sp.scores_[2]) < 1e-12
+        assert AI.SelectKBest(k=99).fit(xs, ys).k_ == 3
+
+    def test_select_k_best_errors(self):
+        xs = [[1.0, 2.0], [2.0, 3.0]]
+        with pytest.raises(ValueError):
+            AI.SelectKBest(0)
+        with pytest.raises(ValueError):
+            AI.SelectKBest(k=1, score_func="bad")
+        with pytest.raises(TypeError):
+            AI.SelectKBest(k=1, score_func="pearson").fit(xs, ["a", "b"])
+        with pytest.raises(ValueError):
+            AI.SelectKBest().transform([[1.0]])
+        with pytest.raises(ValueError):
+            AI.SelectKBest().fit(xs, [0, 1]).transform([[1.0]])
+        with pytest.raises(ValueError):
+            AI.SelectKBest().fit(xs, [0])
+
+    def test_rfe(self):
+        xr = []
+        yr = []
+        for i in range(10):
+            xr.append([float(i), float((i * 7) % 5), float((i * 3) % 4),
+                       1.0, float((i * 11) % 6)])
+            yr.append(2.0 * float(i) + 1.0)
+        rfe = AI.RFE(n_features_to_select=1, step=1).fit(xr, yr)
+        assert rfe.support_ == [True, False, False, False, False]
+        assert len(rfe.ranking_) == 5
+        assert rfe.ranking_[0] == 1
+        assert len(rfe.transform(xr)[0]) == 1
+        with pytest.raises(ValueError):
+            AI.RFE(n_features_to_select=9).fit(xr, yr)
+        with pytest.raises(ValueError):
+            AI.RFE(0)
+        with pytest.raises(ValueError):
+            AI.RFE(step=0)
+
+    def test_l1_selector(self):
+        xl = []
+        yl = []
+        for i in range(20):
+            xl.append([float(i), 1.0 if i % 2 == 0 else -1.0, 0.0])
+            yl.append(3.0 * i)
+        l1 = AI.L1Selector(alpha=0.1).fit(xl, yl)
+        assert l1.support_[0] is True
+        assert l1.support_[1] is False
+        assert l1.support_[2] is False
+        assert len(l1.transform(xl)[0]) == 1
+        with pytest.raises(ValueError):
+            AI.L1Selector(0.0)
+        with pytest.raises(TypeError):
+            AI.L1Selector(True)
+        with pytest.raises(ValueError):
+            AI.L1Selector(alpha=1e9).fit(xl, yl)
+        with pytest.raises(ValueError):
+            AI.L1Selector().transform([[1.0]])

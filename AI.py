@@ -25178,6 +25178,719 @@ class MinMaxScaler:
 
 
 #  ======================================================================
+#  W11-G：降维 / 不平衡采样 / 特征选择
+#  ======================================================================
+
+def _w11g_matrix(x, who):
+    """校验纯数值二维矩阵（不允许 None），返回 (行数, 列数)。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    if not isinstance(x[0], (list, tuple)) or not x[0]:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    width = len(x[0])
+    for row in x:
+        if not isinstance(row, (list, tuple)) or len(row) != width:
+            raise ValueError("%s: 各样本维度不一致" % who)
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 特征值必须是数字（不允许 None/NaN）" % who)
+    return len(x), width
+
+
+def _w11g_check_y(y, n, who):
+    if not isinstance(y, (list, tuple)):
+        raise TypeError("%s: 标签必须是列表" % who)
+    if len(y) != n:
+        raise ValueError("%s: 标签数 %d 与样本数 %d 不一致" % (who, len(y), n))
+    for v in y:
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise TypeError("%s: 标签必须是数字或字符串" % who)
+    return list(y)
+
+
+def _w11g_pow_iter(cov, k, seed=12345):
+    """对称矩阵前 k 个特征向量（幂迭代 + 收缩），比全量 Jacobi 快很多。"""
+    d = len(cov)
+    k = min(k, d)
+    vecs = []
+    vals = []
+    rng = random.Random(seed)
+    for _ in range(k):
+        v = [rng.uniform(-1.0, 1.0) for _ in range(d)]
+        for _it in range(200):
+            w = [sum(cov[i][j] * v[j] for j in range(d)) for i in range(d)]
+            for u in vecs:
+                dot = sum(w[i] * u[i] for i in range(d))
+                w = [w[i] - dot * u[i] for i in range(d)]
+            nrm = math.sqrt(sum(w[i] * w[i] for i in range(d)))
+            if nrm < 1e-14:
+                break
+            v = [w[i] / nrm for i in range(d)]
+        lam = sum(v[i] * sum(cov[i][j] * v[j] for j in range(d)) for i in range(d))
+        if lam < 0.0:
+            break
+        # 符号归一：绝对值最大的分量为正
+        big = 0
+        for i in range(d):
+            if abs(v[i]) > abs(v[big]):
+                big = i
+        if v[big] < 0:
+            v = [-u for u in v]
+        vecs.append(v)
+        vals.append(lam)
+    return vals, vecs
+
+
+class PCA:
+    """主成分分析（协方差 + 幂迭代），支持白化与逆变换。
+
+    `n_components` 超过特征数时自动夹到特征数；特征向量做符号归一（绝对值最大的
+    分量为正）保证结果可复现。
+    """
+
+    def __init__(self, n_components=2, whiten=False):
+        if isinstance(n_components, bool) or not isinstance(n_components, int):
+            raise TypeError("PCA: n_components 必须是整数")
+        if n_components < 1:
+            raise ValueError("PCA: n_components 必须 >= 1")
+        if not isinstance(whiten, bool):
+            raise TypeError("PCA: whiten 必须是 bool")
+        self.n_components = n_components
+        self.whiten = whiten
+        self.mean_ = None
+        self.components_ = None
+        self.explained_variance_ = None
+        self.explained_variance_ratio_ = None
+
+    def fit(self, x):
+        n, d = _w11g_matrix(x, "PCA")
+        if n < 2:
+            raise ValueError("PCA: 至少需要 2 个样本")
+        self.mean_ = [sum(row[j] for row in x) / n for j in range(d)]
+        z = [[row[j] - self.mean_[j] for j in range(d)] for row in x]
+        cov = [[sum(z[i][p] * z[i][q] for i in range(n)) / (n - 1)
+                for q in range(d)] for p in range(d)]
+        k = min(self.n_components, d)
+        vals, vecs = _w11g_pow_iter(cov, k)
+        if not vals:
+            raise ValueError("PCA: 无法提取主成分（数据可能是常数）")
+        total = sum(cov[i][i] for i in range(d))
+        self.components_ = vecs
+        self.explained_variance_ = vals
+        self.explained_variance_ratio_ = [(v / total if total > 0 else 0.0)
+                                          for v in vals]
+        self.n_components_ = len(vals)
+        self._scale = [math.sqrt(v) if v > 1e-12 else 1.0 for v in vals]
+        return self
+
+    def transform(self, x):
+        if self.components_ is None:
+            raise ValueError("PCA: 请先 fit")
+        _n, d = _w11g_matrix(x, "PCA")
+        if d != len(self.mean_):
+            raise ValueError("PCA: 输入列数 %d 与 fit 时的 %d 不一致"
+                             % (d, len(self.mean_)))
+        out = []
+        for row in x:
+            z = [row[j] - self.mean_[j] for j in range(d)]
+            proj = [sum(z[j] * comp[j] for j in range(d))
+                    for comp in self.components_]
+            if self.whiten:
+                proj = [proj[i] / self._scale[i] for i in range(len(proj))]
+            out.append(proj)
+        return out
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def inverse_transform(self, z):
+        if self.components_ is None:
+            raise ValueError("PCA: 请先 fit")
+        if not isinstance(z, (list, tuple)) or not z:
+            raise ValueError("PCA: 输入必须是非空的二维列表")
+        k = len(self.components_)
+        d = len(self.mean_)
+        out = []
+        for row in z:
+            if len(row) != k:
+                raise ValueError("PCA: 每行必须是 %d 维（fit 出的成分数）" % k)
+            vals = list(row)
+            if self.whiten:
+                vals = [vals[i] * self._scale[i] for i in range(k)]
+            out.append([self.mean_[j] + sum(vals[i] * self.components_[i][j]
+                                            for i in range(k))
+                        for j in range(d)])
+        return out
+
+
+def _w11g_pairwise_sq(x):
+    n = len(x)
+    d2 = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = 0.0
+            for p in range(len(x[i])):
+                t = x[i][p] - x[j][p]
+                s += t * t
+            d2[i][j] = s
+            d2[j][i] = s
+    return d2
+
+
+def _w11g_affinities(d2, perplexity):
+    """按行二分搜 sigma，使每行熵等于 log(perplexity)，再对称化。"""
+    n = len(d2)
+    target = math.log(perplexity)
+    p = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        lo, hi = 1e-8, 1e8
+        beta = 1.0
+        for _ in range(60):
+            beta = 1.0 / ((lo + hi) / 2.0)
+            row = [0.0] * n
+            s = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                row[j] = math.exp(-d2[i][j] * beta)
+                s += row[j]
+            if s <= 0.0:
+                lo = (lo + hi) / 2.0
+                continue
+            ent = 0.0
+            for j in range(n):
+                if row[j] > 0.0:
+                    q = row[j] / s
+                    ent -= q * math.log(q)
+            if ent > target:
+                # 熵偏大 ⇒ 需要更大 beta ⇒ 更小 sigma ⇒ 收缩上界
+                hi = (lo + hi) / 2.0
+            else:
+                lo = (lo + hi) / 2.0
+        s = sum(math.exp(-d2[i][j] * beta) for j in range(n) if j != i)
+        for j in range(n):
+            if j != i and s > 0.0:
+                p[i][j] = math.exp(-d2[i][j] * beta) / s
+    out = [[(p[i][j] + p[j][i]) / (2.0 * n) for j in range(n)] for i in range(n)]
+    return out
+
+
+class TSNE:
+    """简化 t-SNE：精确定点对（O(n²)），无 Barnes-Hut、无随机森林初始化。
+
+    `perplexity` 必须小于样本数；前 `early_exaggeration_iter` 轮乘以
+    `early_exaggeration`，之后动量从 0.5 切到 0.8。
+    """
+
+    def __init__(self, n_components=2, perplexity=5.0, learning_rate=None,
+                 n_iter=250, early_exaggeration=12.0,
+                 early_exaggeration_iter=50, seed=42):
+        if isinstance(n_components, bool) or not isinstance(n_components, int):
+            raise TypeError("TSNE: n_components 必须是整数")
+        if n_components < 1:
+            raise ValueError("TSNE: n_components 必须 >= 1")
+        for name, v in (("perplexity", perplexity),
+                        ("learning_rate", learning_rate),
+                        ("early_exaggeration", early_exaggeration)):
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("TSNE: %s 必须是数字" % name)
+            if v <= 0:
+                raise ValueError("TSNE: %s 必须为正" % name)
+        if isinstance(n_iter, bool) or not isinstance(n_iter, int):
+            raise TypeError("TSNE: n_iter 必须是整数")
+        if n_iter < 1:
+            raise ValueError("TSNE: n_iter 必须 >= 1")
+        if isinstance(early_exaggeration_iter, bool) or \
+                not isinstance(early_exaggeration_iter, int):
+            raise TypeError("TSNE: early_exaggeration_iter 必须是整数")
+        if early_exaggeration_iter < 0:
+            raise ValueError("TSNE: early_exaggeration_iter 不能为负")
+        self.n_components = n_components
+        self.perplexity = float(perplexity)
+        self.learning_rate = learning_rate
+        self.n_iter = n_iter
+        self.early_exaggeration = float(early_exaggeration)
+        self.early_exaggeration_iter = early_exaggeration_iter
+        self.seed = seed
+        self.embedding_ = None
+        self.kl_divergence_ = None
+
+    def fit_transform(self, x):
+        n, d = _w11g_matrix(x, "TSNE")
+        if n < 3:
+            raise ValueError("TSNE: 至少需要 3 个样本")
+        if self.perplexity >= n:
+            raise ValueError("TSNE: perplexity (%g) 必须小于样本数 (%d)"
+                             % (self.perplexity, n))
+        d2 = _w11g_pairwise_sq(x)
+        pmat = _w11g_affinities(d2, self.perplexity)
+        rng = random.Random(self.seed)
+        y = [[rng.gauss(0.0, 1e-4) for _ in range(self.n_components)]
+             for _ in range(n)]
+        lr = self.learning_rate
+        if lr is None:
+            lr = max(n / 12.0, 50.0)
+        vel = [[0.0] * self.n_components for _ in range(n)]
+        kl = 0.0
+        for it in range(self.n_iter):
+            exag = self.early_exaggeration if it < self.early_exaggeration_iter else 1.0
+            num = [[0.0] * n for _ in range(n)]
+            total = 0.0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    s = 0.0
+                    for c in range(self.n_components):
+                        t = y[i][c] - y[j][c]
+                        s += t * t
+                    q = 1.0 / (1.0 + s)
+                    num[i][j] = q
+                    num[j][i] = q
+                    total += 2.0 * q
+            if total <= 0.0:
+                total = 1.0
+            kl = 0.0
+            for i in range(n):
+                for j in range(n):
+                    if i == j or pmat[i][j] <= 0.0:
+                        continue
+                    q = num[i][j] / total
+                    kl += pmat[i][j] * math.log(pmat[i][j] / max(q, 1e-300))
+            grad = [[0.0] * self.n_components for _ in range(n)]
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    w = (exag * pmat[i][j] - num[i][j] / total) * num[i][j]
+                    for c in range(self.n_components):
+                        grad[i][c] += 4.0 * w * (y[i][c] - y[j][c])
+            mom = 0.5 if it < self.early_exaggeration_iter else 0.8
+            for i in range(n):
+                for c in range(self.n_components):
+                    vel[i][c] = mom * vel[i][c] - lr * grad[i][c]
+                    y[i][c] += vel[i][c]
+            if it >= 100:
+                mean = [sum(y[i][c] for i in range(n)) / n
+                        for c in range(self.n_components)]
+                for i in range(n):
+                    for c in range(self.n_components):
+                        y[i][c] -= mean[c]
+        self.embedding_ = [list(row) for row in y]
+        self.kl_divergence_ = kl
+        return [list(row) for row in y]
+
+
+def _w11g_neighbors(x, i, candidates, k):
+    """在 `candidates` 里找第 `i` 个样本的 k 个最近邻（平方距离升序，排除自身）。"""
+    d = len(x[0])
+    scored = []
+    for other in candidates:
+        if other == i:
+            continue
+        s = 0.0
+        for p in range(d):
+            t = x[i][p] - x[other][p]
+            s += t * t
+        scored.append((s, other))
+    scored.sort()
+    return [j for _s, j in scored[:k]]
+
+
+def _w11g_classes(y):
+    seen = []
+    for v in y:
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+class SMOTE:
+    """SMOTE 过采样：对每个少数类，在同类 k 近邻之间线性插值到与多数类等量。"""
+
+    def __init__(self, k_neighbors=5, random_state=42):
+        if isinstance(k_neighbors, bool) or not isinstance(k_neighbors, int):
+            raise TypeError("SMOTE: k_neighbors 必须是整数")
+        if k_neighbors < 1:
+            raise ValueError("SMOTE: k_neighbors 必须 >= 1")
+        self.k_neighbors = k_neighbors
+        self.random_state = random_state
+        self.n_majority_ = None
+
+    def fit_resample(self, x, y):
+        n, _d = _w11g_matrix(x, "SMOTE")
+        labels = _w11g_check_y(y, n, "SMOTE")
+        classes = _w11g_classes(labels)
+        if len(classes) < 2:
+            raise ValueError("SMOTE: 至少需要 2 个类别")
+        counts = {c: sum(1 for v in labels if v == c) for c in classes}
+        majority = max(counts.values())
+        self.n_majority_ = majority
+        rng = random.Random(self.random_state)
+        out_x = [list(row) for row in x]
+        out_y = list(labels)
+        for c in classes:
+            need = majority - counts[c]
+            if need <= 0:
+                continue
+            idx = [i for i, v in enumerate(labels) if v == c]
+            if len(idx) < 2:
+                continue
+            kk = min(self.k_neighbors, len(idx) - 1)
+            for _ in range(need):
+                src = idx[rng.randrange(len(idx))]
+                nb = _w11g_neighbors(x, src, idx, kk)
+                if not nb:
+                    continue
+                dst = nb[rng.randrange(len(nb))]
+                gap = rng.random()
+                out_x.append([x[src][p] + gap * (x[dst][p] - x[src][p])
+                              for p in range(len(x[0]))])
+                out_y.append(c)
+        return out_x, out_y
+
+
+class ADASYN:
+    """ADASYN：按「k 邻域里多数类占比」给少数类样本加权，越难分越多合成。"""
+
+    def __init__(self, k_neighbors=5, random_state=42):
+        if isinstance(k_neighbors, bool) or not isinstance(k_neighbors, int):
+            raise TypeError("ADASYN: k_neighbors 必须是整数")
+        if k_neighbors < 1:
+            raise ValueError("ADASYN: k_neighbors 必须 >= 1")
+        self.k_neighbors = k_neighbors
+        self.random_state = random_state
+        self.weights_ = None
+
+    def fit_resample(self, x, y):
+        n, _d = _w11g_matrix(x, "ADASYN")
+        labels = _w11g_check_y(y, n, "ADASYN")
+        classes = _w11g_classes(labels)
+        if len(classes) < 2:
+            raise ValueError("ADASYN: 至少需要 2 个类别")
+        counts = {c: sum(1 for v in labels if v == c) for c in classes}
+        majority_label = max(classes, key=lambda c: counts[c])
+        majority = counts[majority_label]
+        rng = random.Random(self.random_state)
+        out_x = [list(row) for row in x]
+        out_y = list(labels)
+        self.weights_ = {}
+        for c in classes:
+            if c == majority_label:
+                continue
+            need = majority - counts[c]
+            if need <= 0:
+                continue
+            idx = [i for i, v in enumerate(labels) if v == c]
+            if len(idx) < 2:
+                continue
+            kk = min(self.k_neighbors, n - 1)
+            # 每个少数样本的「多数类邻居占比」
+            ratio = []
+            for i in idx:
+                nb = _w11g_neighbors(x, i, list(range(n)), kk)
+                if not nb:
+                    ratio.append(0.0)
+                    continue
+                ratio.append(sum(1 for j in nb if labels[j] == majority_label)
+                             / float(len(nb)))
+            self.weights_[c] = ratio
+            tot = sum(ratio)
+            if tot <= 0.0:
+                probs = [1.0 / len(idx)] * len(idx)
+            else:
+                probs = [r / tot for r in ratio]
+            # 按概率分配 need 个合成样本（确定性：先按期望取整再补余数）
+            quota = [int(need * pr) for pr in probs]
+            rest = need - sum(quota)
+            order = sorted(range(len(idx)), key=lambda t: (-probs[t], t))
+            for t in range(rest):
+                quota[order[t % len(order)]] += 1
+            for pos, i in enumerate(idx):
+                for _ in range(quota[pos]):
+                    nb = _w11g_neighbors(x, i, idx, kk)
+                    if not nb:
+                        break
+                    dst = nb[rng.randrange(len(nb))]
+                    gap = rng.random()
+                    out_x.append([x[i][p] + gap * (x[dst][p] - x[i][p])
+                                  for p in range(len(x[0]))])
+                    out_y.append(c)
+        return out_x, out_y
+
+
+class VarianceThreshold:
+    """按列方差筛特征（population variance，与 sklearn 一致）。"""
+
+    def __init__(self, threshold=0.0):
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise TypeError("VarianceThreshold: threshold 必须是数字")
+        if threshold < 0:
+            raise ValueError("VarianceThreshold: threshold 不能为负")
+        self.threshold = float(threshold)
+        self.variances_ = None
+        self.support_ = None
+
+    def fit(self, x):
+        n, d = _w11g_matrix(x, "VarianceThreshold")
+        self.variances_ = []
+        for j in range(d):
+            m = sum(row[j] for row in x) / n
+            v = sum((row[j] - m) ** 2 for row in x) / n
+            self.variances_.append(v)
+        self.support_ = [v > self.threshold for v in self.variances_]
+        if not any(self.support_):
+            raise ValueError("VarianceThreshold: 没有特征满足方差阈值")
+        return self
+
+    def transform(self, x):
+        if self.support_ is None:
+            raise ValueError("VarianceThreshold: 请先 fit")
+        _n, d = _w11g_matrix(x, "VarianceThreshold")
+        if d != len(self.support_):
+            raise ValueError("VarianceThreshold: 输入列数 %d 与 fit 时的 %d 不一致"
+                             % (d, len(self.support_)))
+        keep = [j for j in range(d) if self.support_[j]]
+        return [[row[j] for j in keep] for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+    def get_support(self):
+        if self.support_ is None:
+            raise ValueError("VarianceThreshold: 请先 fit")
+        return list(self.support_)
+
+
+def _w11g_score(col, y, kind):
+    n = len(col)
+    if kind == "pearson":
+        mx = sum(col) / n
+        my = sum(y) / n
+        num = sum((col[i] - mx) * (y[i] - my) for i in range(n))
+        dx = math.sqrt(sum((col[i] - mx) ** 2 for i in range(n)))
+        dy = math.sqrt(sum((y[i] - my) ** 2 for i in range(n)))
+        if dx <= 0.0 or dy <= 0.0:
+            return 0.0
+        return abs(num / (dx * dy))
+    if kind == "f_classif":
+        classes = _w11g_classes(y)
+        if len(classes) < 2:
+            return 0.0
+        # 注意：这里的均值必须是**特征**的总均值，不是标签均值
+        m_all = sum(col) / n
+        between = 0.0
+        within = 0.0
+        for c in classes:
+            vals = [col[i] for i in range(n) if y[i] == c]
+            if not vals:
+                continue
+            mc = sum(vals) / len(vals)
+            between += len(vals) * (mc - m_all) ** 2
+            within += sum((v - mc) ** 2 for v in vals)
+        between /= (len(classes) - 1)
+        within /= max(n - len(classes), 1)
+        if within <= 0.0:
+            return float("inf") if between > 0.0 else 0.0
+        return between / within
+    raise ValueError("SelectKBest: score_func 必须是 'f_classif' 或 'pearson'")
+
+
+class SelectKBest:
+    """按单变量分数取前 `k` 列；`score_func='f_classif'`（离散标签）或 `'pearson'`。"""
+
+    def __init__(self, k=10, score_func="f_classif"):
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError("SelectKBest: k 必须是整数")
+        if k < 1:
+            raise ValueError("SelectKBest: k 必须 >= 1")
+        if score_func not in ("f_classif", "pearson"):
+            raise ValueError("SelectKBest: score_func 必须是 'f_classif' 或 'pearson'")
+        self.k = k
+        self.score_func = score_func
+        self.scores_ = None
+        self.support_ = None
+
+    def fit(self, x, y):
+        n, d = _w11g_matrix(x, "SelectKBest")
+        labels = _w11g_check_y(y, n, "SelectKBest")
+        if self.score_func == "pearson":
+            for v in labels:
+                if not isinstance(v, (int, float)):
+                    raise TypeError("SelectKBest: pearson 模式要求数值标签")
+        k = min(self.k, d)
+        self.scores_ = [_w11g_score([row[j] for row in x], labels, self.score_func)
+                        for j in range(d)]
+        order = sorted(range(d), key=lambda j: (-self.scores_[j], j))
+        keep = set(order[:k])
+        self.support_ = [j in keep for j in range(d)]
+        self.k_ = k
+        return self
+
+    def transform(self, x):
+        if self.support_ is None:
+            raise ValueError("SelectKBest: 请先 fit")
+        _n, d = _w11g_matrix(x, "SelectKBest")
+        if d != len(self.support_):
+            raise ValueError("SelectKBest: 输入列数 %d 与 fit 时的 %d 不一致"
+                             % (d, len(self.support_)))
+        keep = [j for j in range(d) if self.support_[j]]
+        return [[row[j] for j in keep] for row in x]
+
+    def fit_transform(self, x, y):
+        return self.fit(x, y).transform(x)
+
+    def get_support(self):
+        if self.support_ is None:
+            raise ValueError("SelectKBest: 请先 fit")
+        return list(self.support_)
+
+
+class RFE:
+    """递归特征消除：用岭回归系数的绝对值排序，每轮丢掉 `step` 个最小的。
+
+    `ranking_[j] == 1` 表示保留；被消除的特征按消除顺序给更大的序号（先被消除的最大）。
+    """
+
+    def __init__(self, n_features_to_select=1, step=1):
+        for name, v in (("n_features_to_select", n_features_to_select), ("step", step)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TypeError("RFE: %s 必须是整数" % name)
+            if v < 1:
+                raise ValueError("RFE: %s 必须 >= 1" % name)
+        self.n_features_to_select = n_features_to_select
+        self.step = step
+        self.support_ = None
+        self.ranking_ = None
+
+    def fit(self, x, y):
+        n, d = _w11g_matrix(x, "RFE")
+        labels = _w11g_check_y(y, n, "RFE")
+        for v in labels:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("RFE: 需要数值标签")
+        target = int(self.n_features_to_select)
+        if target > d:
+            raise ValueError("RFE: n_features_to_select (%d) 大于特征数 (%d)"
+                             % (target, d))
+        remaining = list(range(d))
+        ranking = [1] * d
+        round_no = 0
+        while len(remaining) > target:
+            feats = [[row[j] for j in remaining] for row in x]
+            _m, _s, coef, _b = _w11f_ridge(feats, labels, 1e-8)
+            order = sorted(range(len(remaining)), key=lambda t: (abs(coef[t]), t))
+            drop = min(self.step, len(remaining) - target)
+            eliminated = order[:drop]
+            round_no += 1
+            for t in eliminated:
+                ranking[remaining[t]] = round_no
+            gone = set(eliminated)
+            remaining = [remaining[t] for t in range(len(remaining)) if t not in gone]
+        self.support_ = [j in set(remaining) for j in range(d)]
+        self.ranking_ = ranking
+        self.n_features_ = len(remaining)
+        return self
+
+    def transform(self, x):
+        if self.support_ is None:
+            raise ValueError("RFE: 请先 fit")
+        _n, d = _w11g_matrix(x, "RFE")
+        if d != len(self.support_):
+            raise ValueError("RFE: 输入列数 %d 与 fit 时的 %d 不一致"
+                             % (d, len(self.support_)))
+        keep = [j for j in range(d) if self.support_[j]]
+        return [[row[j] for j in keep] for row in x]
+
+    def fit_transform(self, x, y):
+        return self.fit(x, y).transform(x)
+
+    def get_support(self):
+        if self.support_ is None:
+            raise ValueError("RFE: 请先 fit")
+        return list(self.support_)
+
+
+class L1Selector:
+    """L1（Lasso）特征选择：坐标下降求稀疏解，系数非零的列被保留。
+
+    目标：`1/(2n)·||y - Xw||² + alpha·||w||₁`（特征先标准化、截距不惩罚）。
+    """
+
+    def __init__(self, alpha=0.1, max_iter=1000, tol=1e-6):
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+            raise TypeError("L1Selector: alpha 必须是数字")
+        if alpha <= 0:
+            raise ValueError("L1Selector: alpha 必须为正")
+        if isinstance(max_iter, bool) or not isinstance(max_iter, int):
+            raise TypeError("L1Selector: max_iter 必须是整数")
+        if max_iter < 1:
+            raise ValueError("L1Selector: max_iter 必须 >= 1")
+        self.alpha = float(alpha)
+        self.max_iter = max_iter
+        self.tol = float(tol)
+        self.coef_ = None
+        self.support_ = None
+
+    def fit(self, x, y):
+        n, d = _w11g_matrix(x, "L1Selector")
+        labels = _w11g_check_y(y, n, "L1Selector")
+        for v in labels:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("L1Selector: 需要数值标签")
+        mean = [sum(row[j] for row in x) / n for j in range(d)]
+        std = []
+        for j in range(d):
+            v = sum((row[j] - mean[j]) ** 2 for row in x) / n
+            s = math.sqrt(v)
+            std.append(s if s > 0.0 else 1.0)
+        z = [[(row[j] - mean[j]) / std[j] for j in range(d)] for row in x]
+        y_bar = sum(labels) / n
+        yc = [v - y_bar for v in labels]
+        sq = [sum(z[i][j] ** 2 for i in range(n)) / n for j in range(d)]
+        w = [0.0] * d
+        for _it in range(self.max_iter):
+            delta = 0.0
+            for j in range(d):
+                if sq[j] <= 0.0:
+                    continue
+                rho = sum(z[i][j] * (yc[i] - sum(z[i][p] * w[p] for p in range(d)
+                                                  if p != j))
+                          for i in range(n)) / n
+                new = 0.0
+                if rho > self.alpha:
+                    new = (rho - self.alpha) / sq[j]
+                elif rho < -self.alpha:
+                    new = (rho + self.alpha) / sq[j]
+                delta = max(delta, abs(new - w[j]))
+                w[j] = new
+            if delta <= self.tol:
+                break
+        self.coef_ = [w[j] / std[j] for j in range(d)]
+        self.support_ = [abs(w[j]) > 1e-12 for j in range(d)]
+        if not any(self.support_):
+            raise ValueError("L1Selector: alpha=%g 太大，所有系数都被压成 0" % self.alpha)
+        return self
+
+    def transform(self, x):
+        if self.support_ is None:
+            raise ValueError("L1Selector: 请先 fit")
+        _n, d = _w11g_matrix(x, "L1Selector")
+        if d != len(self.support_):
+            raise ValueError("L1Selector: 输入列数 %d 与 fit 时的 %d 不一致"
+                             % (d, len(self.support_)))
+        keep = [j for j in range(d) if self.support_[j]]
+        return [[row[j] for j in keep] for row in x]
+
+    def fit_transform(self, x, y):
+        return self.fit(x, y).transform(x)
+
+    def get_support(self):
+        if self.support_ is None:
+            raise ValueError("L1Selector: 请先 fit")
+        return list(self.support_)
+
+#  ======================================================================
 #  W11-F：缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
 #  ======================================================================
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1228 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1241 项）
 
 ## 特性
 
@@ -902,6 +902,50 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
+### 降维 · 不平衡采样 · 特征选择（W11-G）
+
+**降维**
+
+| 类 | 作用 | 实现要点 |
+|---|---|---|
+| `PCA(n_components=2, whiten=False)` | 线性降维 | 协方差矩阵 + 幂迭代取前 k 个特征向量（符号归一，绝对值最大分量为正）；`explained_variance_ratio_` 与 `inverse_transform` 齐备 |
+| `TSNE(n_components=2, perplexity=5.0, n_iter=250, seed=42)` | 非线性降维可视化 | 精确 O(n²) 版：按行二分搜 sigma 使熵等于 `log(perplexity)`，对称化后用 Student-t 核梯度下降（前 50 轮 `early_exaggeration=12`，动量 0.5→0.8） |
+
+**不平衡采样**（`fit_resample(x, y) -> (x_res, y_res)`，只对少数类合成）
+
+| 类 | 合成策略 |
+|---|---|
+| `SMOTE(k_neighbors=5, random_state=42)` | 在少数类 k 近邻之间线性插值，补到与多数类等量 |
+| `ADASYN(k_neighbors=5, random_state=42)` | 按「k 邻域里多数类占比」加权，越靠近边界合成越多；`weights_` 记录每个少数样本的难度 |
+
+**特征选择**（都有 `fit/transform/fit_transform/get_support`）
+
+| 类 | 依据 |
+|---|---|
+| `VarianceThreshold(threshold=0.0)` | 列方差（population）大于阈值 |
+| `SelectKBest(k=10, score_func='f_classif')` | 单变量分数：`f_classif`（离散标签的 ANOVA F）或 `pearson`（数值标签的 \|相关系数\|） |
+| `RFE(n_features_to_select=1, step=1)` | 递归消除：每轮用岭回归系数绝对值排序丢最小的 `step` 个；`ranking_[j]=1` 表示保留 |
+| `L1Selector(alpha=0.1)` | 坐标下降解 Lasso（特征标准化、截距不惩罚），保留非零系数的列 |
+
+```python
+p = AI.PCA(n_components=2).fit(x_train)
+x_2d = p.transform(x_train)
+
+sx, sy = AI.SMOTE(random_state=0).fit_resample(x_train, y_train)
+sel = AI.SelectKBest(k=20).fit(x_train, y_train)
+x_sel = sel.transform(x_train)
+```
+
+诚实边界：
+
+- `TSNE` 是**简化版**：没有 Barnes-Hut 近似、没有随机森林初始化、固定 `n_iter` 不做早停，
+  12 个样本量级够用，上千样本会明显变慢（O(n²) 的亲和力矩阵与梯度）。
+- `PCA` 用幂迭代而非完整特征分解，`n_components` 超过有效秩时成分数会自动变少（`n_components_`）；
+  不会抛错但也不会有零方差成分。
+- `SMOTE` / `ADASYN` 只做**数值插值**，不做类别约束检查：类别特征（离散列）会插出中间值，
+  需要自己先编码成有意义的一维欧氏空间。
+- `RFE` 内部用的是岭回归系数而不是任意 sklearn 估计器；`SelectKBest` 只这两种打分函数。
+
 ### 缺失值填补（W11-F）
 
 三个填补器，输入是允许 `None` 的二维 list（`None` 表示缺失），输出新的二维 list：
@@ -1428,7 +1472,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1228 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1241 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1595,6 +1639,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSplitExtensions` | `GroupKFold` 的「同组不跨折」与折间均衡、时序切分的测试块位置/扩张与滚动窗口/`gap` 留空档、Purged K-Fold 的 `purge`+`embargo` 剔除区间、三类切分的参数校验、既有 `k_fold_indices` 不受影响 |
 | `TestScalerFamily` | `RobustScaler` 的中位数/IQR 闭式值与「不中心化/不缩放」开关、`MaxAbsScaler` 列最大绝对值、`QuantileTransformer` 的参考分位数与插值（整数点 k/9、中点 0.5、越界夹取）与正态模式往返、Yeo-Johnson 的 8×5 个 (λ, x) 格点往返、`PowerTransformer` 的标准化后均值/方差与两种 method 的往返、四类未 fit/坏形状/非数字报错 |
 | `TestImputers` | 三种填补器的闭式值：`SimpleImputer` 的 mean/median/most_frequent/constant 与全缺失列填 0、`KNNImputer` 的 k=1/k=2 与 distance 权重（0.5）与无共享列回退、`IterativeImputer` 对 `y=2x` 与多列缺失的恢复、观测值不被改写、`n_iter_` 与提前停止、列主元消元的 2×2 精确解与奇异返回 None，以及三类坏形状/非法超参报错 |
+| `TestDimReductionSelection` | `PCA` 的秩一数据（`explained_variance_ratio_`=1、成分方向、均值点投到原点、k=1/k=2 往返）与白化后方差为 1、`TSNE` 让三类点的簇内平均距离小于簇间（1.2K 量级 vs 12 量级）且同种子可复现、`SMOTE` 补到4:4 且合成点落在少数类线段上、`ADASYN` 的加权与 `weights_`、`VarianceThreshold` 的方差值与去常量列、`SelectKBest` 的 F=8 与 pearson=2/√5、`RFE` 保留唯一有效列、`L1Selector` 保信号列压正交列，以及各类坏形状/非法超参 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1648,7 +1693,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1228 个单元测试
+├── test_ai.py       # 1241 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
