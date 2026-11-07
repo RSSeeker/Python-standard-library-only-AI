@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1580 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1589 项）
 
 ## 特性
 
@@ -2022,6 +2022,34 @@ grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
   只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
 - 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
 
+### 神经风格迁移（W17-C-1）
+
+| 接口 | 说明 |
+|------|------|
+| `gram_matrix(features)` | `(C,H,W)` -> `(C,C)`，按 `H*W` 归一化的 Gram 矩阵 |
+| `FeatureExtractor(channels=(3,8,8), kernel_size=3, padding=1, seed=None)` | 固定的 `Conv2d + ReLU` 特征栈；`forward` 返回逐层激活，`backward(layer_grads)` 反传到**输入图像** |
+| `style_transfer(content, style, extractor=None, steps=50, lr=0.02, style_weight=100.0, content_weight=1.0, style_layers=None, content_layer=None, seed=None, clamp=True)` | 只优化图像本身：内容 MSE + 风格 Gram MSE，返回 `{"image","losses","content_losses","style_losses","extractor"}` |
+
+```python
+import AI
+
+content = [[[0.5, 0.2, 0.1], [0.3, 0.7, 0.4], [0.9, 0.6, 0.8]]]
+style = [[[0.1, 0.9, 0.3], [0.7, 0.2, 0.6], [0.4, 0.8, 0.5]]]
+ext = AI.FeatureExtractor(channels=(1, 2, 2), padding=1, seed=3)
+out = AI.style_transfer(content, style, extractor=ext, steps=20, lr=0.05,
+                        style_weight=10.0)
+print(out["losses"][0], "->", out["losses"][-1])
+```
+
+诚实边界：
+
+- 特征提取器是**随机初始化后固定**的小卷积栈，不是 VGG 预训练权重，所以风格迁移的观感远不如论文里的 NST；
+  这个实现的重点是「Gram 梯度 -> 逐层反传到像素」这条链路可以被中心差分逐点验证。
+- 内容层的目标特征直接取自输入 `content` 图像，因此初始内容损失恒为 0，只有风格项会推动图像变化；
+  这也是为什么默认取 `content_layer=n_layers-1`、`style_layers=所有层`。
+- 梯度量级较大（`lr=1.0` 就会发散），默认 `lr=0.02`；`clamp=True` 时像素被裁到 `[0,1]`。
+- `FeatureExtractor.backward` 的 `layer_grads` 的键是**层号**（0 基），值是 `dL/d(该层 ReLU 后激活)`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2438,7 +2466,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1580 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1589 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2643,6 +2671,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTimeSeriesModels` | 因果卷积闭式与反向、TCN 梯度与因果性、Informer 稀疏注意力、Autoformer 分解、PatchTST 嵌入 |
 | `TestRecommenders` | 矩阵分解收敛与可复现、NCF 的 logit 重算与逐权重梯度、Wide&Deep 训练与宽侧梯度、三者的参数校验 |
 | `TestDeepFMAndDIN` | DeepFM 的 logit 重算与二阶项闭式、六处中心差分、DIN 的注意力归一与 mask、参数/输入梯度、训练与校验 |
+| `TestStyleTransfer` | Gram 闭式与二次齐次、提取器形状与参数量、`dL/dx` 对中心差分、风格迁移损失下降与 clamp、单步更新等于 `-lr*dL/dx`、9 处参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2696,7 +2725,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1580 个单元测试
+├── test_ai.py       # 1589 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

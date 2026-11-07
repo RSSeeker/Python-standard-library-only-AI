@@ -30527,6 +30527,281 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ======================================================================
+#  领域应用 W17-C-1：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+# ======================================================================
+
+
+def _w17c_image(x, who, min_side=2):
+    """校验 (C, H, W) 的三层嵌套数值列表。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 图像需要非空的 (C, H, W) 列表")
+    channels = []
+    for c, plane in enumerate(x):
+        if not isinstance(plane, (list, tuple)) or not plane:
+            raise ValueError(f"{who}: 第 {c} 个通道不是非空列表")
+        rows = []
+        width = None
+        for r, row in enumerate(plane):
+            if not isinstance(row, (list, tuple)):
+                raise TypeError(f"{who}: 第 {c} 个通道第 {r} 行不是列表")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError(f"{who}: 第 {c} 个通道的行宽不一致（{len(row)} vs {width}）")
+            rows.append([_w17b_float(v, who, f"ch{c} 第 {r} 行") for v in row])
+        channels.append(rows)
+    h = len(channels[0])
+    w = len(channels[0][0])
+    if h < min_side or w < min_side:
+        raise ValueError(f"{who}: 图像太小（{h}x{w}），至少需要 {min_side}x{min_side}")
+    for c, plane in enumerate(channels):
+        if len(plane) != h or len(plane[0]) != w:
+            raise ValueError(f"{who}: 第 {c} 个通道的形状与其他通道不一致")
+    return channels
+
+
+def _w17c_relu(x):
+    return [[[v if v > 0.0 else 0.0 for v in row] for row in plane] for plane in x]
+
+
+def _w17c_shape(x):
+    return (len(x), len(x[0]), len(x[0][0]))
+
+
+def _w17c_zeros(shape):
+    c, h, w = shape
+    return [[[0.0] * w for _ in range(h)] for _ in range(c)]
+
+
+def gram_matrix(features):
+    """(C, H, W) 特征图的 Gram 矩阵（按 `H*W` 归一化）。
+
+    返回 `(C, C)`，`G[i][j] = Σ_{h,w} F[i][h][w] * F[j][h][w] / (H*W)`。
+    """
+    f = _w17c_image(features, "gram_matrix", min_side=1)
+    c, h, w = _w17c_shape(f)
+    n = float(h * w)
+    out = [[0.0] * c for _ in range(c)]
+    for i in range(c):
+        for j in range(c):
+            s = 0.0
+            for y in range(h):
+                row_i = f[i][y]
+                row_j = f[j][y]
+                for x in range(w):
+                    s += row_i[x] * row_j[x]
+            out[i][j] = s / n
+    return out
+
+
+class FeatureExtractor:
+    """若干 `Conv2d + ReLU` 组成的特征提取器（权重固定，只用来算 Gram）。"""
+
+    def __init__(self, channels=(3, 8, 8), kernel_size=3, padding=1, seed=None):
+        if not isinstance(channels, (list, tuple)) or len(channels) < 2:
+            raise ValueError("FeatureExtractor: channels 至少要有两层（含输入通道）")
+        self.channels = [_w17b_int(ch, "FeatureExtractor", "channels", 1)
+                         for ch in channels]
+        if seed is not None:
+            _w17b_int(seed, "FeatureExtractor", "seed", 0)
+        self.seed = seed
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            self.convs = [Conv2d(self.channels[i], self.channels[i + 1],
+                                 kernel_size, padding=padding)
+                          for i in range(len(self.channels) - 1)]
+        finally:
+            random.setstate(state)
+        self.acts = None
+        self.zs = None
+
+    def forward(self, image):
+        """返回逐层的 ReLU 后激活（最后一项就是最深层输出）。"""
+        x = _w17c_image(image, "FeatureExtractor.forward")
+        acts, zs = [], []
+        h = x
+        for conv in self.convs:
+            z = conv.forward(h)
+            a = _w17c_relu(z)
+            zs.append(z)
+            acts.append(a)
+            h = a
+        self.acts, self.zs = acts, zs
+        return acts
+
+    def backward(self, layer_grads):
+        """`layer_grads`: `{层号: dL/d(该层 ReLU 后激活)}`，返回 `dL/d输入图像`。"""
+        if self.acts is None:
+            raise RuntimeError("FeatureExtractor.backward: 必须先调用 forward()")
+        cur = {i: g for i, g in layer_grads.items()}
+        for idx in range(len(self.convs) - 1, -1, -1):
+            g = cur.get(idx)
+            if g is None:
+                g = _w17c_zeros(_w17c_shape(self.acts[idx]))
+            z = self.zs[idx]
+            c, h, w = _w17c_shape(z)
+            dz = [[[g[c_i][y][x] if z[c_i][y][x] > 0.0 else 0.0
+                    for x in range(w)] for y in range(h)] for c_i in range(c)]
+            dx = self.convs[idx].backward(dz)
+            if idx > 0:
+                prev = cur.get(idx - 1)
+                if prev is None:
+                    cur[idx - 1] = dx
+                else:
+                    for c_i in range(len(prev)):
+                        for y in range(len(prev[0])):
+                            row_p = prev[c_i][y]
+                            row_d = dx[c_i][y]
+                            for x in range(len(row_p)):
+                                row_p[x] += row_d[x]
+        # 反传到第 0 层后，dx 已经是 dL/d输入图像（cur[0] 只是 dL/d(第 0 层激活)）
+        return dx
+
+    def param_count(self):
+        """(固定) 卷积权重与偏置总数。"""
+        total = 0
+        for conv in self.convs:
+            total += conv.out_channels * conv.cg * conv.kh * conv.kw + conv.out_channels
+        return total
+
+
+def style_transfer(content, style, extractor=None, steps=50, lr=0.02,
+                   style_weight=100.0, content_weight=1.0,
+                   style_layers=None, content_layer=None, seed=None,
+                   clamp=True):
+    """简化版神经风格迁移：只优化**图像本身**，特征提取器固定。
+
+    损失 = `content_weight * MSE(第 content_layer 层激活)` +
+           `style_weight * Σ_l MSE(Gram(第 l 层))`。
+    梯度沿「Gram -> 特征图 -> 逐层反传到输入」手写回传，每步对图像做
+    `img -= lr * dL/dimg`（`clamp=True` 时裁到 `[0, 1]`）。
+    """
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError("style_transfer: steps 必须是 >=1 的整数")
+    lr = _w17b_float(lr, "style_transfer", "lr")
+    if lr <= 0.0:
+        raise ValueError("style_transfer: lr 必须 > 0")
+    style_weight = _w17b_float(style_weight, "style_transfer", "style_weight")
+    content_weight = _w17b_float(content_weight, "style_transfer", "content_weight")
+    if style_weight < 0.0 or content_weight < 0.0:
+        raise ValueError("style_transfer: 两个权重都必须 >= 0")
+    if style_weight == 0.0 and content_weight == 0.0:
+        raise ValueError("style_transfer: 两个权重不能同时为 0")
+
+    content = _w17c_image(content, "style_transfer.content")
+    style = _w17c_image(style, "style_transfer.style")
+    if _w17c_shape(content) != _w17c_shape(style):
+        raise ValueError(
+            "style_transfer: content 与 style 形状必须一致"
+            f"（{_w17c_shape(content)} vs {_w17c_shape(style)}）"
+        )
+    if extractor is None:
+        extractor = FeatureExtractor(channels=(3, 8, 8), padding=1, seed=seed)
+    if not isinstance(extractor, FeatureExtractor):
+        raise TypeError("style_transfer: extractor 必须是 FeatureExtractor")
+
+    n_layers = len(extractor.convs)
+    if style_layers is None:
+        style_layers = list(range(n_layers))
+    else:
+        if not isinstance(style_layers, (list, tuple)):
+            raise TypeError("style_transfer: style_layers 必须是列表")
+        style_layers = [_w17b_int(i, "style_transfer", "style_layers", 0)
+                        for i in style_layers]
+        for i in style_layers:
+            if i >= n_layers:
+                raise ValueError(f"style_transfer: style_layers 里的 {i} 越界（共 {n_layers} 层）")
+        if not style_layers:
+            raise ValueError("style_transfer: style_layers 不能为空")
+    if content_layer is None:
+        content_layer = n_layers - 1
+    else:
+        content_layer = _w17b_int(content_layer, "style_transfer", "content_layer", 0)
+        if content_layer >= n_layers:
+            raise ValueError(f"style_transfer: content_layer {content_layer} 越界（共 {n_layers} 层）")
+
+    content_acts = extractor.forward(content)
+    target_content = [[list(row) for row in plane] for plane in content_acts[content_layer]]
+    style_acts = extractor.forward(style)
+    target_grams = {i: gram_matrix(style_acts[i]) for i in style_layers}
+
+    image = [[list(row) for row in plane] for plane in content]
+    losses, content_losses, style_losses = [], [], []
+    for _step in range(steps):
+        acts = extractor.forward(image)
+        c_act = acts[content_layer]
+        c_n = float(len(c_act) * len(c_act[0]) * len(c_act[0][0]))
+        c_loss = 0.0
+        d_c = _w17c_zeros(_w17c_shape(c_act))
+        for c_i in range(len(c_act)):
+            for y in range(len(c_act[0])):
+                for x in range(len(c_act[0][0])):
+                    diff = c_act[c_i][y][x] - target_content[c_i][y][x]
+                    c_loss += diff * diff
+                    d_c[c_i][y][x] = 2.0 * diff / c_n
+        c_loss /= c_n
+
+        s_loss = 0.0
+        layer_grads = {content_layer: [[[content_weight * v for v in row] for row in plane]
+                                       for plane in d_c]}
+        for i in style_layers:
+            g = gram_matrix(acts[i])
+            tg = target_grams[i]
+            ch = len(g)
+            g_n = float(ch * ch)
+            d_g = [[0.0] * ch for _ in range(ch)]
+            for a in range(ch):
+                for b in range(ch):
+                    diff = g[a][b] - tg[a][b]
+                    s_loss += diff * diff
+                    d_g[a][b] = 2.0 * diff / g_n
+            s_loss /= g_n
+            # Gram 的梯度：dF = (dG + dG^T) F / (H*W)
+            a_i = acts[i]
+            _, h_i, w_i = _w17c_shape(a_i)
+            n_pix = float(h_i * w_i)
+            d_act = _w17c_zeros(_w17c_shape(a_i))
+            for c_i in range(ch):
+                for y in range(h_i):
+                    for x in range(w_i):
+                        total = 0.0
+                        for j in range(ch):
+                            total += (d_g[c_i][j] + d_g[j][c_i]) * a_i[j][y][x]
+                        d_act[c_i][y][x] = style_weight * total / n_pix
+            if i in layer_grads:
+                acc = layer_grads[i]
+                for c_i in range(len(acc)):
+                    for y in range(len(acc[0])):
+                        row_a = acc[c_i][y]
+                        row_b = d_act[c_i][y]
+                        for x in range(len(row_a)):
+                            row_a[x] += row_b[x]
+            else:
+                layer_grads[i] = d_act
+
+        dx = extractor.backward(layer_grads)
+        for c_i in range(len(image)):
+            for y in range(len(image[0])):
+                for x in range(len(image[0][0])):
+                    v = image[c_i][y][x] - lr * dx[c_i][y][x]
+                    if clamp:
+                        v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+                    image[c_i][y][x] = v
+        losses.append(content_weight * c_loss + style_weight * s_loss)
+        content_losses.append(c_loss)
+        style_losses.append(s_loss)
+
+    return {
+        "image": image,
+        "losses": losses,
+        "content_losses": content_losses,
+        "style_losses": style_losses,
+        "extractor": extractor,
+    }
+
+# ======================================================================
 #  领域应用 W17-B-2：DeepFM / DIN
 # ======================================================================
 

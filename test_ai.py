@@ -24205,3 +24205,167 @@ class TestDeepFMAndDIN:
         _l, grads = din.loss_and_grads([cand], [hist], [1.0])
         with pytest.raises(ValueError):
             din.apply_grads(grads, lr=-1.0)
+
+class TestStyleTransfer:
+    """W17-C-1：Gram 矩阵 / 特征提取器反传 / 神经风格迁移。"""
+
+    def _img(self):
+        return [[[0.5, 0.2, 0.1], [0.3, 0.7, 0.4], [0.9, 0.6, 0.8]]]
+
+    def _style(self):
+        return [[[0.1, 0.9, 0.3], [0.7, 0.2, 0.6], [0.4, 0.8, 0.5]]]
+
+    def test_gram_matrix_closed_form(self):
+        feats = [[[1.0, 2.0], [3.0, 4.0]], [[0.0, 1.0], [0.0, 1.0]]]
+        g = AI.gram_matrix(feats)
+        assert len(g) == 2 and len(g[0]) == 2
+        assert abs(g[0][0] - (1.0 + 4.0 + 9.0 + 16.0) / 4.0) < 1e-12
+        assert abs(g[1][1] - (0.0 + 1.0 + 0.0 + 1.0) / 4.0) < 1e-12
+        assert abs(g[0][1] - (0.0 + 2.0 + 0.0 + 4.0) / 4.0) < 1e-12
+        assert abs(g[0][1] - g[1][0]) < 1e-12
+
+    def test_gram_matrix_is_quadratic(self):
+        feats = [[[1.0, -2.0], [0.5, 3.0]]]
+        doubled = [[[2.0 * v for v in row] for row in plane] for plane in feats]
+        g1 = AI.gram_matrix(feats)
+        g2 = AI.gram_matrix(doubled)
+        assert abs(g2[0][0] - 4.0 * g1[0][0]) < 1e-12
+
+    def test_feature_extractor_shapes(self):
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=7)
+        acts = ext.forward(self._img())
+        assert len(acts) == 2
+        assert AI._w17c_shape(acts[0]) == (2, 3, 3)
+        assert AI._w17c_shape(acts[1]) == (2, 3, 3)
+        assert all(v >= 0.0 for plane in acts[1] for row in plane for v in row)
+        assert ext.param_count() == (1 * 2 * 9 + 2) + (2 * 2 * 9 + 2)
+
+    def test_feature_extractor_backward_matches_finite_difference(self):
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=7)
+        img = self._img()
+        target = [[[0.4, 0.1, 0.2], [0.8, 0.3, 0.5], [0.2, 0.9, 0.1]],
+                  [[0.3, 0.6, 0.2], [0.5, 0.1, 0.7], [0.4, 0.2, 0.6]]]
+
+        def loss_of(image):
+            a = ext.forward(image)[1]
+            n = float(len(a) * len(a[0]) * len(a[0][0]))
+            total = 0.0
+            for c in range(len(a)):
+                for y in range(len(a[0])):
+                    for x in range(len(a[0][0])):
+                        d = a[c][y][x] - target[c][y][x]
+                        total += d * d
+            return total / n
+
+        acts = ext.forward(img)
+        last = acts[1]
+        n_last = float(len(last) * len(last[0]) * len(last[0][0]))
+        d_act = [[[2.0 * (last[c][y][x] - target[c][y][x]) / n_last
+                   for x in range(len(last[0][0]))]
+                  for y in range(len(last[0]))] for c in range(len(last))]
+        dx = ext.backward({1: d_act})
+        eps = 1e-5
+        for y in range(3):
+            for x in range(3):
+                orig = img[0][y][x]
+                img[0][y][x] = orig + eps
+                lp = loss_of(img)
+                img[0][y][x] = orig - eps
+                lm = loss_of(img)
+                img[0][y][x] = orig
+                num = (lp - lm) / (2.0 * eps)
+                assert abs(num - dx[0][y][x]) <= 1e-5 * max(1.0, abs(num))
+
+    def test_style_transfer_reduces_loss(self):
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=3)
+        res = AI.style_transfer(self._img(), self._style(), extractor=ext, steps=6,
+                                lr=0.05, style_weight=10.0, content_weight=1.0)
+        assert set(res) == {"image", "losses", "content_losses", "style_losses", "extractor"}
+        assert len(res["losses"]) == 6
+        assert res["losses"][-1] < res["losses"][0]
+
+    def test_style_transfer_clamps_pixels(self):
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=5)
+        res = AI.style_transfer(self._img(), self._style(), extractor=ext, steps=4,
+                                lr=0.3, style_weight=20.0, content_weight=1.0)
+        assert all(0.0 <= v <= 1.0 for plane in res["image"] for row in plane for v in row)
+
+    def test_style_transfer_single_step_matches_gradient(self):
+        style = self._style()
+
+        def total_loss(ext, image, cw, sw):
+            acts = ext.forward(image)
+            c_act = acts[1]
+            n_c = float(len(c_act) * len(c_act[0]) * len(c_act[0][0]))
+            img_c = ext.forward(self._img())[1]
+            c_loss = 0.0
+            for c in range(len(c_act)):
+                for y in range(len(c_act[0])):
+                    for x in range(len(c_act[0][0])):
+                        d = c_act[c][y][x] - img_c[c][y][x]
+                        c_loss += d * d
+            c_loss /= n_c
+            s_loss = 0.0
+            for layer in (0, 1):
+                gx = AI.gram_matrix(ext.forward(image)[layer])
+                gs = AI.gram_matrix(ext.forward(style)[layer])
+                ch = len(gx)
+                s = 0.0
+                for a in range(ch):
+                    for b in range(ch):
+                        d = gx[a][b] - gs[a][b]
+                        s += d * d
+                s_loss += s / float(ch * ch)
+            return cw * c_loss + sw * s_loss
+
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=13)
+        base = self._img()
+        lr = 0.02
+        moved = AI.style_transfer(base, style, extractor=ext, steps=1, lr=lr,
+                                  style_weight=5.0, content_weight=2.0,
+                                  clamp=False)["image"]
+        eps = 1e-5
+        for y in range(3):
+            for x in range(3):
+                orig = base[0][y][x]
+                base[0][y][x] = orig + eps
+                lp = total_loss(ext, base, 2.0, 5.0)
+                base[0][y][x] = orig - eps
+                lm = total_loss(ext, base, 2.0, 5.0)
+                base[0][y][x] = orig
+                num = (lp - lm) / (2.0 * eps)
+                ana = (orig - moved[0][y][x]) / lr
+                assert abs(num - ana) <= 1e-3 * max(1.0, abs(num))
+
+    def test_style_transfer_content_target_is_initial_image(self):
+        ext = AI.FeatureExtractor(channels=(1, 2, 2), kernel_size=3, padding=1, seed=5)
+        res = AI.style_transfer(self._img(), self._style(), extractor=ext, steps=3,
+                                lr=0.05, style_weight=0.0, content_weight=1.0,
+                                content_layer=1)
+        assert max(res["content_losses"]) < 1e-12
+
+    def test_style_transfer_validation(self):
+        img = self._img()
+        style = self._style()
+        with pytest.raises(ValueError):
+            AI.gram_matrix([])
+        with pytest.raises(ValueError):
+            AI.gram_matrix([[[1.0, 2.0], [3.0]]])
+        with pytest.raises(RuntimeError):
+            AI.FeatureExtractor(channels=(1, 2)).backward({})
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, steps=0)
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, lr=0.0)
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, style_weight=-1.0)
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, style_weight=0.0, content_weight=0.0)
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, [[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]])
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, style_layers=[5])
+        with pytest.raises(ValueError):
+            AI.style_transfer(img, style, style_layers=[])
+        with pytest.raises(TypeError):
+            AI.style_transfer(img, style, extractor="nope")

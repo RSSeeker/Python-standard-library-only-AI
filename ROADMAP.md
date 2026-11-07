@@ -564,6 +564,7 @@
   - 探针 42 项（含 8 组参数的中心差分 < 1e-7）
   - 待做：`DeepFM`（FM 二阶交叉 + 深侧）、`DIN`（序列注意力池化）
 - [ ] 图像：风格迁移（NST）/ 超分（SRCNN / SRGAN）/ 去噪（DnCNN）
+  - `gram_matrix` / `FeatureExtractor` / `style_transfer`：Gram 梯度沿「特征图 -> 逐层反传」回到像素，单步更新与 `-lr*dL/dx` 对齐；特征栈是随机初始化后固定的小卷积，不是 VGG 预训练权重
 - [ ] 检索：Faiss 式暴力 + HNSW（简化）/ IVF（概念）
 - [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
 
