@@ -30528,6 +30528,298 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ======================================================================
+#  领域应用 W17-E-2b：视频（3D-CNN / Two-Stream 融合）
+# ======================================================================
+
+
+def _w17e2b_clip(clip, who, in_channels=None):
+    """校验视频片段 `(C, T, H, W)`：非空、三维、全为有限数字。"""
+    if not isinstance(clip, (list, tuple)) or not clip:
+        raise ValueError(f"{who}: 片段必须是非空列表，收到 {clip!r}")
+    channels = []
+    for c, plane in enumerate(clip):
+        if not isinstance(plane, (list, tuple)) or not plane:
+            raise ValueError(f"{who}: 第 {c} 个通道必须是 `(T, H, W)`，收到 {plane!r}")
+        rows = []
+        for t, frame in enumerate(plane):
+            if not isinstance(frame, (list, tuple)) or not frame:
+                raise ValueError(f"{who}: 第 {c} 通道第 {t} 帧必须是 `(H, W)`")
+            h_rows = []
+            for h, row in enumerate(frame):
+                if not isinstance(row, (list, tuple)) or not row:
+                    raise ValueError(f"{who}: 第 {c} 通道第 {t} 帧第 {h} 行必须是列表")
+                vals = []
+                for w, v in enumerate(row):
+                    if isinstance(v, bool) or not isinstance(v, (int, float)):
+                        raise ValueError(f"{who}: 元素不是数字：{v!r}")
+                    fv = float(v)
+                    if fv != fv or fv in (float("inf"), float("-inf")):
+                        raise ValueError(f"{who}: 元素不是有限数")
+                    vals.append(fv)
+                if h_rows and len(vals) != len(h_rows[0]):
+                    raise ValueError(f"{who}: 行宽不一致")
+                h_rows.append(vals)
+            if rows and (len(h_rows) != len(rows[0]) or len(h_rows[0]) != len(rows[0][0])):
+                raise ValueError(f"{who}: 帧尺寸不一致")
+            rows.append(h_rows)
+        channels.append(rows)
+    if in_channels is not None and len(channels) != in_channels:
+        raise ValueError(
+            f"{who}: 期望 {in_channels} 个通道，收到 {len(channels)}")
+    first = channels[0]
+    for c in range(1, len(channels)):
+        if len(channels[c]) != len(first) or len(channels[c][0]) != len(first[0]) \
+                or len(channels[c][0][0]) != len(first[0][0]):
+            raise ValueError(f"{who}: 各通道形状不一致")
+    return channels
+
+
+class _w17e2b_relu3d:
+    """作用于 `(C, T, H, W)` 的 ReLU，保存掩码供反向使用。"""
+
+    def __init__(self):
+        self._mask = None
+
+    def forward(self, x):
+        out = [[[[v if v > 0.0 else 0.0 for v in row] for row in frame]
+                for frame in plane] for plane in x]
+        self._mask = [[[[1.0 if v > 0.0 else 0.0 for v in row] for row in frame]
+                       for frame in plane] for plane in x]
+        return out
+
+    def backward(self, dout):
+        if self._mask is None:
+            raise RuntimeError("_w17e2b_relu3d.backward: 必须先调用 forward")
+        return [[[[dout[c][t][h][w] * self._mask[c][t][h][w]
+                   for w in range(len(dout[c][t][h]))]
+                  for h in range(len(dout[c][t]))]
+                 for t in range(len(dout[c]))]
+                for c in range(len(dout))]
+
+
+class Video3DCNN:
+    """简化 3D-CNN：`(Conv3d -> ReLU -> MaxPool3d) x 层数 -> 全局平均池化 -> Layer`。
+
+    没有 BatchNorm、没有 Dropout、没有残差；池化后做全局平均得到定长向量，
+    再经一层 `Layer` 输出 logits（分类）。
+    """
+
+    def __init__(self, in_channels=1, channels=(4, 8), kernel_size=3,
+                 pool=2, num_classes=2, seed=None):
+        for name, v in (("in_channels", in_channels), ("kernel_size", kernel_size),
+                        ("pool", pool), ("num_classes", num_classes)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(
+                    f"Video3DCNN: {name} 必须是 >= 1 的整数，收到 {v!r}")
+        if isinstance(channels, bool) or not isinstance(channels, (list, tuple)) or not channels:
+            raise ValueError(
+                f"Video3DCNN: channels 必须是非空列表，收到 {channels!r}")
+        for v in channels:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"Video3DCNN: channels 里的元素必须是正整数，收到 {v!r}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"Video3DCNN: seed 必须是整数或 None，收到 {seed!r}")
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.convs = []
+            self.relus = []
+            self.pools = []
+            prev = in_channels
+            for out in channels:
+                conv = Conv3d(prev, out, kernel_size, stride=1,
+                              padding=kernel_size // 2)
+                self.convs.append(conv)
+                self.relus.append(_w17e2b_relu3d())
+                self.pools.append(MaxPool3d(pool))
+                prev = out
+            self.head = Layer(prev, num_classes, activation="linear")
+        finally:
+            random.setstate(saved)
+        self.in_channels = in_channels
+        self.channels = tuple(int(v) for v in channels)
+        self.kernel_size = kernel_size
+        self.pool = pool
+        self.num_classes = num_classes
+        self._cache = None
+        # Layer 只返回 (grad_w, grad_b, next_delta)，没有 grad_w 属性；
+        # 这里自己累积 head 的梯度。
+        self._head_grads = None
+
+    def forward(self, clip):
+        x = _w17e2b_clip(clip, "Video3DCNN.forward", self.in_channels)
+        for conv, relu, pool in zip(self.convs, self.relus, self.pools):
+            x = pool.forward(relu.forward(conv.forward(x)))
+        c, d, h, w = len(x), len(x[0]), len(x[0][0]), len(x[0][0][0])
+        flat = []
+        for i in range(c):
+            total = 0.0
+            for a in range(d):
+                for b in range(h):
+                    for e in range(w):
+                        total += x[i][a][b][e]
+            flat.append(total / float(d * h * w))
+        logits = self.head.forward(flat)
+        self._cache = (c, d, h, w)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("Video3DCNN.backward: 必须先调用 forward")
+        if not isinstance(dlogits, (list, tuple)) or len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"Video3DCNN.backward: dlogits 长度必须是 {self.num_classes}")
+        c, d, h, w = self._cache
+        gw, gb, dflat = self.head.backward(list(dlogits))
+        if self._head_grads is None:
+            self._head_grads = ([[0.0] * self.head.fan_in
+                                 for _ in range(self.head.fan_out)],
+                                [0.0] * self.head.fan_out)
+        acc_w, acc_b = self._head_grads
+        for r in range(len(gw)):
+            arow = acc_w[r]
+            for col in range(len(gw[r])):
+                arow[col] += gw[r][col]
+        for r in range(len(gb)):
+            acc_b[r] += gb[r]
+        scale = 1.0 / float(d * h * w)
+        delta = [[[[dflat[i] * scale for _ in range(w)] for _ in range(h)]
+                  for _ in range(d)] for i in range(c)]
+        for conv, relu, pool in zip(reversed(self.convs), reversed(self.relus),
+                                    reversed(self.pools)):
+            delta = conv.backward(relu.backward(pool.backward(delta)))
+        return delta
+
+    def predict(self, clip):
+        logits = self.forward(clip)
+        best = 0
+        for i in range(1, len(logits)):
+            if logits[i] > logits[best]:
+                best = i
+        return best
+
+    def param_count(self):
+        total = sum(conv.param_count() for conv in self.convs)
+        return total + self.head.fan_in * self.head.fan_out + self.head.fan_out
+
+    def zero_grad(self):
+        for conv in self.convs:
+            conv.zero_grad()
+        self._head_grads = None
+
+    def grads(self):
+        """返回 `(每层卷积的 (grad_w, grad_b), head 的 (grad_w, grad_b))`。
+
+        未反传过时 head 一侧为 `None`（卷积模块自带 grad_w/grad_b，恒为数组）。
+        """
+        conv_grads = [(conv.grad_w, conv.grad_b) for conv in self.convs]
+        return conv_grads, self._head_grads
+
+
+class TwoStreamFusion:
+    """双流融合：空间流与时间流各投影到 `hidden` 维，拼接后线性分类。
+
+    `spatial` 与 `temporal` 是已经抽好的特征向量（本库不实现光流，
+    时间流在这里就是「预先算好的运动特征」）。
+    """
+
+    def __init__(self, spatial_dim, temporal_dim, hidden=8, num_classes=2, seed=None):
+        for name, v in (("spatial_dim", spatial_dim), ("temporal_dim", temporal_dim),
+                        ("hidden", hidden), ("num_classes", num_classes)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(
+                    f"TwoStreamFusion: {name} 必须是 >= 1 的整数，收到 {v!r}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"TwoStreamFusion: seed 必须是整数或 None，收到 {seed!r}")
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.spatial_proj = Layer(spatial_dim, hidden, activation="leaky_relu")
+            self.temporal_proj = Layer(temporal_dim, hidden, activation="leaky_relu")
+            self.head = Layer(2 * hidden, num_classes, activation="linear")
+        finally:
+            random.setstate(saved)
+        self.spatial_dim = spatial_dim
+        self.temporal_dim = temporal_dim
+        self.hidden = hidden
+        self.num_classes = num_classes
+        self._cache = None
+        self._grads = None
+
+    def _check(self, vec, dim, who):
+        if not isinstance(vec, (list, tuple)) or len(vec) != dim:
+            raise ValueError(f"{who}: 期望长度 {dim} 的向量，收到 {vec!r}")
+        out = []
+        for v in vec:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 元素不是数字：{v!r}")
+            fv = float(v)
+            if fv != fv or fv in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 元素不是有限数")
+            out.append(fv)
+        return out
+
+    def forward(self, spatial, temporal):
+        sp = self._check(spatial, self.spatial_dim, "TwoStreamFusion.forward(spatial)")
+        tp = self._check(temporal, self.temporal_dim, "TwoStreamFusion.forward(temporal)")
+        hs = self.spatial_proj.forward(sp)
+        ht = self.temporal_proj.forward(tp)
+        logits = self.head.forward(list(hs) + list(ht))
+        self._cache = (hs, ht)
+        return logits
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("TwoStreamFusion.backward: 必须先调用 forward")
+        if not isinstance(dlogits, (list, tuple)) or len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"TwoStreamFusion.backward: dlogits 长度必须是 {self.num_classes}")
+        gw, gb, dhidden = self.head.backward(list(dlogits))
+        sgw, sgb, dsp = self.spatial_proj.backward(list(dhidden[:self.hidden]))
+        tgw, tgb, dtp = self.temporal_proj.backward(list(dhidden[self.hidden:]))
+        if self._grads is None:
+            self._grads = {}
+            for key, layer in (("spatial", self.spatial_proj),
+                               ("temporal", self.temporal_proj),
+                               ("head", self.head)):
+                self._grads[key] = ([[0.0] * layer.fan_in
+                                     for _ in range(layer.fan_out)],
+                                    [0.0] * layer.fan_out)
+        for key, (lw, lb) in (("spatial", (sgw, sgb)),
+                              ("temporal", (tgw, tgb)),
+                              ("head", (gw, gb))):
+            acc_w, acc_b = self._grads[key]
+            for r in range(len(lw)):
+                arow = acc_w[r]
+                for col in range(len(lw[r])):
+                    arow[col] += lw[r][col]
+            for r in range(len(lb)):
+                acc_b[r] += lb[r]
+        return dsp, dtp
+
+    def predict(self, spatial, temporal):
+        logits = self.forward(spatial, temporal)
+        best = 0
+        for i in range(1, len(logits)):
+            if logits[i] > logits[best]:
+                best = i
+        return best
+
+    def param_count(self):
+        return sum(layer.fan_in * layer.fan_out + layer.fan_out
+                   for layer in (self.spatial_proj, self.temporal_proj, self.head))
+
+    def zero_grad(self):
+        self._grads = None
+
+    def grads(self):
+        """返回 `{"spatial"/"temporal"/"head": (grad_w, grad_b)}`。"""
+        return self._grads
+
+
+# ======================================================================
 #  领域应用 W17-E-2a：点云（FPS / Chamfer / 体素化 / PointNet 简化）
 # ======================================================================
 

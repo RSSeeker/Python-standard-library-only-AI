@@ -576,6 +576,7 @@
 - [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
   - 语音前端已完成：`mel_filterbank` / `frame_signal` / `dft_power`（朴素 DFT）/ `log_mel_spectrogram` / `dct_matrix` / `mfcc`；`ConformerBlock` 只做前向，无 GLU / 相对位置 / 手写反向；探针 34 项
   - 点云已完成：`farthest_point_indices` / `chamfer_distance` / `voxelize_points` / `PointNetEncoder`（逐点 MLP + 最大池化，只做编码，无 T-Net、无分类头）；探针 24 项
+  - 视频已完成：`Video3DCNN`（Conv3d/ReLU/MaxPool3d 串成可反传整网 + 全局平均池化 + Layer 分类）、`TwoStreamFusion`（两路特征各投影后拼接分类，**不含光流**）；探针 17 项
 
 ### W18 测试与数值稳定性（§15，贯穿各波）
 - [ ] `grad_check_all(model, ...)`：自动遍历所有带参数的子模块

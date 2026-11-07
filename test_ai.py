@@ -24949,3 +24949,196 @@ class TestPointCloud:
             enc.backward([1.0])
         with pytest.raises(ValueError):
             enc.backward([1.0] * 5, dfeats=[])
+
+
+class TestVideoModels:
+    """W17-E-2b：简化 3D-CNN 与双流融合。"""
+
+    def _clip(self, fill=0.1, c=1, t=4, h=4, w=4):
+        return [[[[fill + 0.01 * (tt + hh + ww) for ww in range(w)]
+                  for hh in range(h)] for tt in range(t)] for _ in range(c)]
+
+    def test_video3dcnn_forward_and_param_count(self):
+        net = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3, pool=2,
+                            num_classes=2, seed=11)
+        logits = net.forward(self._clip())
+        assert len(logits) == 2
+        # Conv3d(1->2, k=3): 2*1*27 + 2 = 56；head Layer(2->2): 2*2 + 2 = 6
+        assert net.param_count() == 56 + 6
+        assert all(0.0 == v for v in self._deep(net.convs[0].grad_w))
+
+    def _deep(self, x):
+        if isinstance(x, (list, tuple)):
+            for item in x:
+                for v in self._deep(item):
+                    yield v
+        else:
+            yield x
+
+    def test_video3dcnn_input_gradient(self):
+        net = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3, pool=2,
+                            num_classes=2, seed=11)
+        clip = self._clip()
+        net.forward(clip)
+        dlogits = [0.5, -0.3]
+        dx = net.backward(dlogits)
+        assert len(dx) == 1 and len(dx[0]) == 4 and len(dx[0][0]) == 4
+        ref = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3, pool=2,
+                            num_classes=2, seed=11)
+        eps = 1e-6
+        worst = 0.0
+        for t in range(4):
+            for h in range(4):
+                for w in range(4):
+                    plus = self._clip()
+                    minus = self._clip()
+                    plus[0][t][h][w] += eps
+                    minus[0][t][h][w] -= eps
+                    fp = sum(dlogits[k] * v for k, v in enumerate(ref.forward(plus)))
+                    fm = sum(dlogits[k] * v for k, v in enumerate(ref.forward(minus)))
+                    worst = max(worst, abs((fp - fm) / (2 * eps) - dx[0][t][h][w]))
+        assert worst < 1e-6, worst
+
+    def test_video3dcnn_weight_gradient(self):
+        net = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3, pool=2,
+                            num_classes=2, seed=11)
+        clip = self._clip()
+        net.forward(clip)
+        dlogits = [0.5, -0.3]
+        net.backward(dlogits)
+        conv_grads, head_grads = net.grads()
+        assert head_grads is not None
+        eps = 1e-6
+        worst = 0.0
+        for oc in range(2):
+            for kd in range(3):
+                for kh in range(3):
+                    for kw in range(3):
+                        plus = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3,
+                                             pool=2, num_classes=2, seed=11)
+                        minus = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3,
+                                              pool=2, num_classes=2, seed=11)
+                        plus.convs[0].weights[oc][0][kd][kh][kw] += eps
+                        minus.convs[0].weights[oc][0][kd][kh][kw] -= eps
+                        fp = sum(dlogits[k] * v for k, v in enumerate(plus.forward(clip)))
+                        fm = sum(dlogits[k] * v for k, v in enumerate(minus.forward(clip)))
+                        worst = max(worst,
+                                    abs((fp - fm) / (2 * eps)
+                                        - conv_grads[0][0][oc][0][kd][kh][kw]))
+        assert worst < 1e-5, worst
+        worst_h = 0.0
+        for i in range(2):
+            for j in range(2):
+                plus = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3,
+                                     pool=2, num_classes=2, seed=11)
+                minus = AI.Video3DCNN(in_channels=1, channels=(2,), kernel_size=3,
+                                      pool=2, num_classes=2, seed=11)
+                plus.head.weights[i][j] += eps
+                minus.head.weights[i][j] -= eps
+                fp = sum(dlogits[k] * v for k, v in enumerate(plus.forward(clip)))
+                fm = sum(dlogits[k] * v for k, v in enumerate(minus.forward(clip)))
+                worst_h = max(worst_h, abs((fp - fm) / (2 * eps) - head_grads[0][i][j]))
+        assert worst_h < 1e-5, worst_h
+        net.zero_grad()
+        assert net.grads()[1] is None
+
+    def test_video3dcnn_predict_and_validation(self):
+        net = AI.Video3DCNN(in_channels=1, channels=(2,), pool=2, num_classes=3, seed=2)
+        assert net.predict(self._clip()) in (0, 1, 2)
+        with pytest.raises(ValueError):
+            AI.Video3DCNN(in_channels=0)
+        with pytest.raises(ValueError):
+            AI.Video3DCNN(channels=[])
+        with pytest.raises(ValueError):
+            AI.Video3DCNN(channels=(0,))
+        with pytest.raises(ValueError):
+            AI.Video3DCNN(pool=0)
+        with pytest.raises(ValueError):
+            AI.Video3DCNN(seed="x")
+        with pytest.raises(RuntimeError):
+            AI.Video3DCNN(num_classes=2).backward([1.0, 0.0])
+        with pytest.raises(ValueError):
+            net.forward([[0.0]])
+        net.forward(self._clip())
+        with pytest.raises(ValueError):
+            net.backward([1.0])
+
+    def test_twostream_forward_and_param_count(self):
+        fuse = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                  num_classes=2, seed=13)
+        out = fuse.forward([0.3, -0.2, 0.7], [0.5, -0.4])
+        assert len(out) == 2
+        assert fuse.param_count() == (3 * 4 + 4) + (2 * 4 + 4) + (8 * 2 + 2)
+
+    def test_twostream_stream_gradients(self):
+        fuse = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                  num_classes=2, seed=13)
+        sp = [0.3, -0.2, 0.7]
+        tp = [0.5, -0.4]
+        fuse.forward(sp, tp)
+        dlogits = [0.4, -0.6]
+        dsp, dtp = fuse.backward(dlogits)
+        assert len(dsp) == 3 and len(dtp) == 2
+        ref = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                 num_classes=2, seed=13)
+        eps = 1e-6
+        worst = 0.0
+        for i in range(3):
+            plus, minus = list(sp), list(sp)
+            plus[i] += eps
+            minus[i] -= eps
+            fp = sum(dlogits[k] * v for k, v in enumerate(ref.forward(plus, tp)))
+            fm = sum(dlogits[k] * v for k, v in enumerate(ref.forward(minus, tp)))
+            worst = max(worst, abs((fp - fm) / (2 * eps) - dsp[i]))
+        for i in range(2):
+            plus, minus = list(tp), list(tp)
+            plus[i] += eps
+            minus[i] -= eps
+            fp = sum(dlogits[k] * v for k, v in enumerate(ref.forward(sp, plus)))
+            fm = sum(dlogits[k] * v for k, v in enumerate(ref.forward(sp, minus)))
+            worst = max(worst, abs((fp - fm) / (2 * eps) - dtp[i]))
+        assert worst < 1e-6, worst
+
+    def test_twostream_head_gradient(self):
+        fuse = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                  num_classes=2, seed=13)
+        sp, tp = [0.3, -0.2, 0.7], [0.5, -0.4]
+        fuse.forward(sp, tp)
+        dlogits = [0.4, -0.6]
+        fuse.backward(dlogits)
+        grads = fuse.grads()
+        assert set(grads) == {"spatial", "temporal", "head"}
+        eps = 1e-6
+        worst = 0.0
+        for i in range(2):
+            for j in range(8):
+                plus = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                          num_classes=2, seed=13)
+                minus = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4,
+                                           num_classes=2, seed=13)
+                plus.head.weights[i][j] += eps
+                minus.head.weights[i][j] -= eps
+                fp = sum(dlogits[k] * v for k, v in enumerate(plus.forward(sp, tp)))
+                fm = sum(dlogits[k] * v for k, v in enumerate(minus.forward(sp, tp)))
+                worst = max(worst, abs((fp - fm) / (2 * eps) - grads["head"][0][i][j]))
+        assert worst < 1e-5, worst
+        fuse.zero_grad()
+        assert fuse.grads() is None
+
+    def test_twostream_validation(self):
+        fuse = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, num_classes=2, seed=1)
+        with pytest.raises(ValueError):
+            AI.TwoStreamFusion(0, 2)
+        with pytest.raises(ValueError):
+            AI.TwoStreamFusion(3, 2, hidden=0)
+        with pytest.raises(ValueError):
+            AI.TwoStreamFusion(3, 2, seed="x")
+        with pytest.raises(RuntimeError):
+            AI.TwoStreamFusion(3, 2).backward([1.0, 0.0])
+        with pytest.raises(ValueError):
+            fuse.forward([0.1], [0.5, 0.5])
+        with pytest.raises(ValueError):
+            fuse.forward([0.1, 0.2, 0.3], [0.1])
+        fuse.forward([0.1, 0.2, 0.3], [0.1, 0.2])
+        with pytest.raises(ValueError):
+            fuse.backward([1.0])

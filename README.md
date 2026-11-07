@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1627 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1635 项）
 
 ## 特性
 
@@ -2195,6 +2195,36 @@ dpoints = enc.backward([0.3, -0.2, 0.5, 0.1, -0.4])   # 逐点梯度
 - `voxelize_points` 在某一维跨度为 0（例如只有一个点）时按该维两侧各 0.5 撑开，
   否则格子索引会退化；越界的点被夹到边缘格子而不是丢弃。
 
+### 视频模型（W17-E-2b）
+
+| 接口 | 说明 |
+|------|------|
+| `Video3DCNN(in_channels=1, channels=(4, 8), kernel_size=3, pool=2, num_classes=2, seed=None)` | `(Conv3d -> ReLU -> MaxPool3d) x N -> 全局平均池化 -> Layer`，`forward`/`backward`/`param_count`/`zero_grad`/`grads` |
+| `TwoStreamFusion(spatial_dim, temporal_dim, hidden=8, num_classes=2, seed=None)` | 空间流与时间流各投影到 `hidden` 维、拼接后线性分类 |
+
+```python
+import AI
+
+clip = [[[[0.1 + 0.01 * (t + h + w) for w in range(4)]
+          for h in range(4)] for t in range(4)]]
+net = AI.Video3DCNN(in_channels=1, channels=(2,), pool=2, num_classes=2, seed=11)
+logits = net.forward(clip)
+dx = net.backward([0.5, -0.3])          # 对输入片段的梯度
+
+fuse = AI.TwoStreamFusion(spatial_dim=3, temporal_dim=2, hidden=4, seed=13)
+out = fuse.forward([0.3, -0.2, 0.7], [0.5, -0.4])
+dsp, dtp = fuse.backward([0.4, -0.6])
+```
+
+诚实边界：
+
+- 时间流**不计算光流**：`TwoStreamFusion` 接收的是「已经抽好的运动特征向量」，
+  本库没有光流估计、没有 twin-stream 端到端训练。
+- `Video3DCNN` 没有 BatchNorm / Dropout / 残差，也没有 3D 数据增广；
+  它的意义是把 `Conv3d` / `MaxPool3d` 串成能反传的整网，并在小分辨率片段上可验证。
+- 两个类的权重梯度都由自己累积（`Layer` 只返回梯度、不保存），
+  `grads()` 在未反传过时返回 `None`，`zero_grad()` 把它清回 `None`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2611,7 +2641,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1627 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1635 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2821,6 +2851,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVectorRetrieval` | 暴力与手工扫描逐位一致、`ip` 度量与显式 id、k-means 三簇划分纯度、IVF 全探测等于暴力/单探测仍命中本簇、NSW recall@5 ≥ 0.8、`retrieval_recall` 取值、9 处参数校验 |
 | `TestSpeechFrontendConformer` | 梅尔刻度往返与单调、滤波器组形状/峰值/频点递增、切帧数量与偏移、DFT 常量与余弦闭式、log-mel 静音等于 `log(eps)`、DCT 正交性与 MFCC 形状、Conformer 形状/逐位置零均值/同种子复现、9 处参数校验 |
 | `TestPointCloud` | 最远点采样与手工复算一致、Chamfer 闭式与对称、体素化形状/单点自动边界/越界夹紧、PointNet 形状与置换不变、逐点梯度对中心差分、逐权重梯度对中心差分、参数校验 |
+| `TestVideoModels` | 3D-CNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度对中心差分、`zero_grad` 清空、双流拼接形状与参数量、两路输入梯度与 head 权重梯度、9 处参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2874,7 +2905,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1627 个单元测试
+├── test_ai.py       # 1635 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
