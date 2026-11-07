@@ -200,7 +200,10 @@
 - [x] 参数高效：`DoRALinear`（幅度+方向分解，`B=0` 与原层逐位一致，`g_V/g_m/g_A/g_B` 中心差分 ≤9.4e-7）/ `AdaLoRALinear`（每秩重要性 EMA + `prune(keep)` 剪秩，剪后前向等于存活秩之和）
 - [x] `QLoRA` 说明：本库只有 float32 张量、没有 4-bit 量化基座，因此**不做**量化路径；`DoRALinear`/`AdaLoRALinear` 的 `params()`/`merge()`/`denormalized()` 就是 QLoRA 训练侧的同一套约定
 - [x] 采样扩展：`typical_filter` / `mirostat_filter` + `mirostat_update` / `eta_filter` / `top_a_filter` / `tail_free_filter`（`tft` 0.1/0.3/0.5/0.7/0.9 实测保留 5/4/4/4/3 个 token，单调不增）
-- [ ] 采样扩展剩余：contrastive search / diverse beam（需要模型前向，留作生成器集成）
+- [x] 采样扩展剩余：contrastive search / diverse beam（需要模型前向，留作生成器集成）
+  - 对比搜索：`contrastive_select` 按**候选自己的隐状态**算退化惩罚（共用一个隐状态会退化成 argmax，探针抓到过）
+  - 多样束：`diverse_beam_select` 的组间扣分 + `diverse_beam_search`（模型解耦）+ `diverse_beam_generate`
+  - 起手 beam 全为同一前缀、命中 `eos_id` 立即进 finished；`num_return > num_beams` 报错
 - [x] 约束解码：`token_id_mask`（任意 id 白名单）+ `token_prefix_mask`（合法序列前缀约束，含 `eos_id` 收尾）；JSON Schema / 正则 / CFG 的完整语法器留作后续
 - [ ] 约束解码剩余：JSON Schema / 正则 / CFG 的语法器（本项已有可叠加的 mask 原语）
 - [x] 解码加速：投机解码的接受判定 `speculative_accept`（`min(1, p_t/p_d)` 拒绝采样 + `max(0, p_t-p_d)` 残差重采样，实测接受率 0.7885 ≈ Σmin(p,q)=0.8）

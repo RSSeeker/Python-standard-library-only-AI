@@ -27256,3 +27256,144 @@ class TestDiffPool:
             pool.forward([], [])
         with pytest.raises(ValueError):
             pool.forward(X, [[0.0] * (len(X) - 1) for _ in range(len(X))])
+
+
+class TestSamplingSearch:
+    """对比搜索 / 多样束搜索（W7-D）"""
+
+    def _lm(self):
+        AI.set_seed(3)
+        return AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                           num_layers=1)
+
+    def test_contrastive_select_penalises_similar_candidate(self):
+        res = AI.contrastive_select([1.0, 1.0], {0: [1.0, 0.0], 1: [0.0, 1.0]},
+                                    [[1.0, 0.0]], alpha=0.6, top_k=2)
+        assert res["token"] == 1
+        assert res["reward"] == 0.0
+        assert [c["reward"] for c in res["candidates"]] == [1.0, 0.0]
+        assert abs(res["score"] - 0.2) < 1e-12
+
+    def test_contrastive_select_alpha_extremes(self):
+        hid = {0: [1.0, 0.0], 1: [0.0, 1.0]}
+        greedy = AI.contrastive_select([3.0, 2.0], hid, [], alpha=0.0, top_k=2)
+        assert greedy["token"] == 0
+        avoid = AI.contrastive_select([3.0, 2.0], hid, [[1.0, 0.0]],
+                                      alpha=1.0, top_k=2)
+        assert avoid["token"] == 1
+        assert abs(avoid["score"] - 0.0) < 1e-12
+
+    def test_contrastive_select_top_k_and_ties(self):
+        one = AI.contrastive_select([3.0, 2.0, 1.0], {0: [1.0], 1: [1.0]},
+                                    [], alpha=0.0, top_k=1)
+        assert len(one["candidates"]) == 1
+        tie = AI.contrastive_select([0.0, 0.0, 0.0],
+                                    {0: [1.0], 1: [1.0], 2: [1.0]},
+                                    [], alpha=0.0, top_k=3)
+        assert tie["token"] == 0
+
+    def test_contrastive_select_zero_hidden(self):
+        res = AI.contrastive_select([1.0, 0.0], {0: [0.0, 0.0]}, [[1.0, 0.0]],
+                                    alpha=0.8, top_k=1)
+        assert res["reward"] == 0.0
+
+    def test_contrastive_search_top_k_one_is_greedy(self):
+        lm = self._lm()
+        prompt = [1, 2]
+        greedy = list(prompt)
+        for _ in range(3):
+            row = lm.forward(greedy)[-1]
+            greedy.append(max(range(len(row)), key=lambda i: row[i]))
+        got = AI.contrastive_search(lm, prompt, max_new_tokens=3, top_k=1,
+                                    alpha=0.6)
+        assert got["ids"] == greedy
+        assert len(got["picks"]) == 3
+        assert all(0 <= p["token"] < 5 for p in got["picks"])
+
+    def test_contrastive_search_candidates_come_from_top_k(self):
+        lm = self._lm()
+        prompt = [1, 2]
+        got = AI.contrastive_search(lm, prompt, max_new_tokens=2, top_k=3,
+                                    alpha=0.5)
+        assert len(got["ids"]) == len(prompt) + 2
+        cur = list(prompt)
+        for pick in got["picks"]:
+            row = lm.forward(cur)[-1]
+            probs = AI._softmax_row(list(row))
+            order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))[:3]
+            assert pick["token"] in order
+            cur.append(pick["token"])
+
+    def test_diverse_beam_select_penalty(self):
+        entries = [{"token": 0, "score": 1.0}, {"token": 0, "score": 0.9},
+                   {"token": 1, "score": 0.8}]
+        assert AI.diverse_beam_select(entries, 2, diversity_penalty=0.5) == [0, 2]
+        assert AI.diverse_beam_select(entries, 2, diversity_penalty=0.0) == [0, 1]
+        assert len(AI.diverse_beam_select(entries, 9, diversity_penalty=0.1)) == 3
+
+    def test_diverse_beam_search_diverges(self):
+        def step_const(ids):
+            return [-0.1, -0.12, -5.0]
+
+        plain = AI.diverse_beam_search(step_const, [0], num_beams=2, num_return=2,
+                                       max_new_tokens=2, diversity_penalty=0.0)
+        div = AI.diverse_beam_search(step_const, [0], num_beams=2, num_return=2,
+                                     max_new_tokens=2, diversity_penalty=1.0)
+        assert plain["sequences"][0] == plain["sequences"][1]
+        assert div["sequences"][0] != div["sequences"][1]
+        assert div["sequences"][0][-1] != div["sequences"][1][-1]
+        assert plain["scores"][0] >= plain["scores"][1]
+
+    def test_diverse_beam_search_eos(self):
+        def step_eos(ids):
+            if len(ids) >= 2:
+                return [-5.0, -5.0, 0.0]
+            return [0.0, -5.0, -5.0]
+
+        res = AI.diverse_beam_search(step_eos, [0], num_beams=1, num_return=1,
+                                     max_new_tokens=4, diversity_penalty=0.0,
+                                     eos_id=2)
+        assert res["sequences"][0] == [0, 0, 2]
+
+    def test_diverse_beam_generate_uses_model(self):
+        lm = self._lm()
+        res = AI.diverse_beam_generate(lm, [1], num_beams=3, num_return=2,
+                                       max_new_tokens=2)
+        assert len(res["sequences"]) == 2
+        assert all(s[0] == 1 for s in res["sequences"])
+        assert all(len(s) == 3 for s in res["sequences"])
+
+    def test_search_validation(self):
+        lm = self._lm()
+
+        def step_const(ids):
+            return [-0.1, -0.12, -5.0]
+
+        with pytest.raises(ValueError):
+            AI.contrastive_select([], {0: [1.0]}, [])
+        with pytest.raises(ValueError):
+            AI.contrastive_select([1.0], {}, [])
+        with pytest.raises(ValueError):
+            AI.contrastive_select([1.0, 1.0], {0: [1.0]}, [], top_k=2)
+        with pytest.raises(ValueError):
+            AI.contrastive_select([1.0], {0: [1.0]}, [], alpha=1.5)
+        with pytest.raises(ValueError):
+            AI.contrastive_select([1.0], {0: [1.0]}, [], top_k=0)
+        with pytest.raises(ValueError):
+            AI.contrastive_select([1.0], {0: [1.0, 0.0]}, [[1.0]])
+        with pytest.raises(ValueError):
+            AI.contrastive_search(lm, [])
+        with pytest.raises(ValueError):
+            AI.contrastive_search(lm, [1.5])
+        with pytest.raises(ValueError):
+            AI.contrastive_search(object(), [1])
+        with pytest.raises(ValueError):
+            AI.diverse_beam_select([], 1)
+        with pytest.raises(ValueError):
+            AI.diverse_beam_select([{"token": 0, "score": 1.0}], 1, -0.1)
+        with pytest.raises(ValueError):
+            AI.diverse_beam_select([{"token": 0}], 1)
+        with pytest.raises(ValueError):
+            AI.diverse_beam_search(step_const, [0], num_beams=2, num_return=3)
+        with pytest.raises(ValueError):
+            AI.diverse_beam_search(123, [0], num_beams=1, num_return=1)

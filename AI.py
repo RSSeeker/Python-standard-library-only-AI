@@ -8896,6 +8896,234 @@ class DiffPool:
         return self
 
 
+def _w7c_ids(ids, who):
+    """校验一维 token 序列（非空、非负整数、不接受 bool）"""
+    if not isinstance(ids, list) or not ids:
+        raise ValueError('%s: ids 必须是非空列表' % who)
+    for v in ids:
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError('%s: token 必须是非负整数，收到 %r' % (who, v))
+    return list(ids)
+
+
+def _w7c_vec(vec, who):
+    """校验一维数值向量（拒绝 NaN / inf）"""
+    if not isinstance(vec, list) or not vec:
+        raise ValueError('%s: 向量必须是非空列表' % who)
+    out = []
+    for v in vec:
+        if not _is_num(v):
+            raise ValueError('%s: 向量分量必须是数字，收到 %r' % (who, v))
+        out.append(float(v))
+    return out
+
+
+def _w7c_cos(a, b):
+    """余弦相似度；任一侧为零向量时返回 0.0（避免除零）"""
+    na = math.sqrt(sum(v * v for v in a))
+    nb = math.sqrt(sum(v * v for v in b))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+def contrastive_select(logits, hiddens, history, alpha: float = 0.6, top_k: int = 5):
+    """对比搜索的单步选择（Su et al. 2022）：``score = (1-α)·p − α·reward``
+
+    `hiddens` 是 `{候选 token: 该候选的隐状态}`（只需覆盖概率前 `top_k` 的 token），
+    每个候选的退化惩罚是它与 `history` 中任一隐状态余弦相似度的**最大值**——
+    惩罚必须按候选各自的隐状态算，否则所有候选同罚、选择就退化成 argmax。
+    返回 `{'token', 'score', 'prob', 'reward', 'candidates'}`。
+    """
+    lg = _w7c_vec(logits, 'contrastive_select(logits)')
+    if not isinstance(hiddens, dict) or not hiddens:
+        raise ValueError('contrastive_select(hiddens) 必须是非空 dict')
+    if not _is_num(alpha) or not (0.0 <= float(alpha) <= 1.0):
+        raise ValueError('contrastive_select(alpha) 必须在 [0, 1] 内')
+    _ck_int(top_k, 'contrastive_select(top_k)', 1)
+    if history is None:
+        history = []
+    if not isinstance(history, list):
+        raise ValueError('contrastive_select(history) 必须是列表')
+    hist = [_w7c_vec(h, 'contrastive_select(history[])') for h in history]
+    probs = _softmax_row(lg)
+    order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))[:top_k]
+    cands = []
+    for tok in order:
+        if tok not in hiddens:
+            raise ValueError('contrastive_select: hiddens 缺少候选 token %d 的隐状态'
+                             % tok)
+        hv = _w7c_vec(hiddens[tok], 'contrastive_select(hiddens[])')
+        if hist and len(hv) != len(hist[0]):
+            raise ValueError('contrastive_select: 候选隐状态宽度必须与 history 一致')
+        reward = max([_w7c_cos(hv, h) for h in hist]) if hist else 0.0
+        score = (1.0 - alpha) * probs[tok] - alpha * reward
+        cands.append({'token': tok, 'score': score, 'prob': probs[tok],
+                      'reward': reward})
+    best = cands[0]
+    for c in cands[1:]:
+        if c['score'] > best['score']:
+            best = c
+    return {'token': best['token'], 'score': best['score'], 'prob': best['prob'],
+            'reward': best['reward'], 'candidates': cands}
+
+
+def contrastive_search(model, prompt_ids, max_new_tokens: int = 8, top_k: int = 5,
+                       alpha: float = 0.6):
+    """对比搜索生成（要求模型有 ``forward(ids) -> (T, V) logits`` 与 ``h``（T×d 隐状态））
+
+    每一步：取当前分布的 top-k 候选，**对每个候选各前向一次**拿到它自己的隐状态，
+    再用 `contrastive_select` 打分挑一个。因此每生成一个 token 要 k+1 次前向
+    （教学实现，不复用 KV cache），docstring 明写这个代价。
+    """
+    ids = _w7c_ids(prompt_ids, 'contrastive_search(prompt_ids)')
+    _ck_int(max_new_tokens, 'contrastive_search(max_new_tokens)', 1)
+    _ck_int(top_k, 'contrastive_search(top_k)', 1)
+    if not _is_num(alpha) or not (0.0 <= float(alpha) <= 1.0):
+        raise ValueError('contrastive_search(alpha) 必须在 [0, 1] 内')
+    if not hasattr(model, 'forward') or not hasattr(model, 'h'):
+        raise ValueError('contrastive_search(model): 模型需要有 forward(ids) 与 h 属性')
+    model.eval()
+    cur = list(ids)
+    logits = model.forward(cur)
+    hidden = _w7c_vec(list(model.h[-1]), 'contrastive_search(model.h)')
+    history = [_w7c_vec(list(row), 'contrastive_search(model.h)')
+               for row in model.h[:-1]]
+    picks = []
+    for _ in range(max_new_tokens):
+        last = _w7c_vec(list(logits[-1]), 'contrastive_search(logits)')
+        probs = _softmax_row(last)
+        order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))[:top_k]
+        hiddens = {}
+        cache = {}
+        for tok in order:
+            logits_tok = model.forward(cur + [tok])
+            h_tok = _w7c_vec(list(model.h[-1]), 'contrastive_search(model.h)')
+            hiddens[tok] = h_tok
+            cache[tok] = (logits_tok, h_tok)
+        pick = contrastive_select(last, hiddens, history, alpha=alpha, top_k=top_k)
+        tok = pick['token']
+        history.append(hidden)
+        cur.append(tok)
+        logits, hidden = cache[tok]
+        picks.append({'token': tok, 'score': pick['score'],
+                      'prob': pick['prob'], 'reward': pick['reward']})
+    return {'ids': cur, 'picks': picks}
+
+
+def diverse_beam_select(entries, num_select: int, diversity_penalty: float = 0.5):
+    """多样束搜索的**单步**选择：先取最高分，之后对「与已选下一步 token 相同」的候选扣分
+
+    `entries` 是 `[{'token': int, 'score': float}, ...]`（同一批扩展候选）；
+    返回被选中条目的下标列表。扣分是 `penalty × 该 token 在已选集合里的出现次数`。
+    """
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('diverse_beam_select(entries) 必须是非空列表')
+    _ck_int(num_select, 'diverse_beam_select(num_select)', 1)
+    if not _is_num(diversity_penalty) or float(diversity_penalty) < 0.0:
+        raise ValueError('diverse_beam_select(diversity_penalty) 必须是非负数')
+    num_select = min(num_select, len(entries))
+    cleaned = []
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict) or 'token' not in e or 'score' not in e:
+            raise ValueError('diverse_beam_select: 每条要含 token 与 score')
+        tok = e['token']
+        if not isinstance(tok, int) or isinstance(tok, bool) or tok < 0:
+            raise ValueError('diverse_beam_select: token 必须是非负整数')
+        if not _is_num(e['score']):
+            raise ValueError('diverse_beam_select: score 必须是数字')
+        cleaned.append({'index': i, 'token': tok, 'score': float(e['score'])})
+    remaining = list(cleaned)
+    selected = []
+    used = {}
+    while len(selected) < num_select and remaining:
+        best = None
+        best_adj = None
+        for c in remaining:
+            adj = c['score'] - float(diversity_penalty) * used.get(c['token'], 0)
+            if best is None or adj > best_adj or (adj == best_adj
+                                                 and c['index'] < best['index']):
+                best = c
+                best_adj = adj
+        remaining.remove(best)
+        selected.append(best['index'])
+        used[best['token']] = used.get(best['token'], 0) + 1
+    return selected
+
+
+def diverse_beam_search(step_logprobs, prompt_ids, num_beams: int = 4,
+                        num_return: int = 2, max_new_tokens: int = 8,
+                        diversity_penalty: float = 0.5, eos_id=None):
+    """多样束搜索（不依赖具体模型）：``step_logprobs(ids) -> 逐步 log 概率``
+
+    所有 beam 从同一个前缀出发；每步对每个 beam 取 `2*num_beams` 个候选，
+    第一条 beam 直接取最高分，其余用 `diverse_beam_select` 的扣分规则挑不同 token
+    （Diverse Beam Search 的组间惩罚项，这里简化为单组）。命中 `eos_id` 的序列
+    立刻进 `finished`，不再扩展。
+    """
+    prompt = _w7c_ids(prompt_ids, 'diverse_beam_search(prompt_ids)')
+    _ck_int(num_beams, 'diverse_beam_search(num_beams)', 1)
+    _ck_int(num_return, 'diverse_beam_search(num_return)', 1)
+    _ck_int(max_new_tokens, 'diverse_beam_search(max_new_tokens)', 1)
+    if not callable(step_logprobs):
+        raise ValueError('diverse_beam_search(step_logprobs) 必须是可调用对象')
+    if num_return > num_beams:
+        raise ValueError('diverse_beam_search: num_return 不能大于 num_beams')
+    beams = [list(prompt) for _ in range(num_beams)]
+    scores = [0.0 for _ in range(num_beams)]
+    finished = []
+    for _ in range(max_new_tokens):
+        entries = []
+        for bi, seq in enumerate(beams):
+            lps = _w7c_vec(list(step_logprobs(seq)),
+                           'diverse_beam_search(step_logprobs)')
+            order = sorted(range(len(lps)), key=lambda i: (-lps[i], i))
+            for tok in order[:2 * num_beams]:
+                entries.append({'token': tok, 'score': scores[bi] + lps[tok],
+                                'beam': bi})
+        order = sorted(range(len(entries)),
+                       key=lambda i: (-entries[i]['score'], i))
+        ranked = [entries[i] for i in order]
+        keep = diverse_beam_select(ranked, num_beams,
+                                   diversity_penalty=diversity_penalty)
+        new_beams = []
+        new_scores = []
+        for pos in keep:
+            item = ranked[pos]
+            seq = list(beams[item['beam']]) + [item['token']]
+            if eos_id is not None and item['token'] == eos_id:
+                finished.append((seq, item['score']))
+                continue
+            new_beams.append(seq)
+            new_scores.append(item['score'])
+        if not new_beams:
+            beams, scores = [], []
+            break
+        beams, scores = new_beams, new_scores
+    finished.extend(list(zip(beams, scores)))
+    finished.sort(key=lambda pair: (-pair[1], pair[0]))
+    return {'sequences': [s for s, _ in finished[:num_return]],
+            'scores': [sc for _, sc in finished[:num_return]]}
+
+
+def diverse_beam_generate(model, prompt_ids, num_beams: int = 4, num_return: int = 2,
+                          max_new_tokens: int = 8, diversity_penalty: float = 0.5,
+                          eos_id=None):
+    """`CausalLM` 上的多样束搜索封装：把模型前向包装成 `step_logprobs`"""
+    if not hasattr(model, 'forward'):
+        raise ValueError('diverse_beam_generate(model): 模型需要有 forward(ids)')
+
+    def step_logprobs(ids):
+        logits = model.forward(list(ids))
+        return _log_softmax_row(list(logits[-1]))
+
+    return diverse_beam_search(step_logprobs, prompt_ids, num_beams=num_beams,
+                               num_return=num_return,
+                               max_new_tokens=max_new_tokens,
+                               diversity_penalty=diversity_penalty,
+                               eos_id=eos_id)
+
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 

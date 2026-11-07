@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1786 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1797 项）
 
 ## 特性
 
@@ -2646,6 +2646,33 @@ dX = pool.backward(dxp, dap)          # 所有节点都拿到梯度
 - 软分配是**逐节点** softmax，`n_clusters` 不宜大于节点数（大于时部分簇拿不到质量，
   `X'` 会出现全零行，但不报错——这是定义决定的，不是 bug）。
 
+### 对比搜索与多样束搜索（W7-D）
+
+| API | 作用 |
+| --- | --- |
+| `contrastive_select(logits, hiddens, history, alpha=0.6, top_k=5)` | 单步打分 `(1-α)·p − α·reward`，`reward` 取候选隐状态与历史隐状态余弦相似度的最大值 |
+| `contrastive_search(model, prompt_ids, max_new_tokens=8, top_k=5, alpha=0.6)` | 对比搜索生成：每步对 top-k 候选**各前向一次**拿它自己的隐状态 |
+| `diverse_beam_select(entries, num_select, diversity_penalty=0.5)` | 单步选束：先取最高分，再对「和已选组同 token」的候选扣分 |
+| `diverse_beam_search(step_logprobs, prompt_ids, num_beams=4, ...)` | 与模型解耦的多样束搜索（`step_logprobs(ids) -> log 概率`） |
+| `diverse_beam_generate(model, prompt_ids, ...)` | 把 `CausalLM` 前向包装成 `step_logprobs` 的便捷入口 |
+
+```python
+model = CausalLM(vocab_size=32, d_model=16, num_heads=2, d_ff=32, num_layers=1)
+out = contrastive_search(model, [1, 2], max_new_tokens=8, top_k=5, alpha=0.6)
+print(out["ids"], [p["token"] for p in out["picks"]])
+
+res = diverse_beam_generate(model, [1], num_beams=4, num_return=2, max_new_tokens=8,
+                            diversity_penalty=0.6)
+print(res["sequences"])
+```
+
+四点边界：
+
+1. **惩罚必须按候选自己的隐状态算**。`contrastive_select` 的 `hiddens` 是 `{候选 token: 该候选的隐状态}`；如果所有候选共用一个隐状态，惩罚对它们全都一样，选择就退化成 argmax（第一版就是这么写的，探针一眼看穿）。
+2. **代价是每 token `k+1` 次前向**。对比搜索的教学实现没有复用 KV cache，`top_k=5` 就是 6 次前向；真实系统会在候选分支上做批处理。
+3. **多样束的惩罚是「同一步里重复 token」**，不是「整条序列相似」。因此它只保证同一父节点下的扩展不会塌到同一个 token，不保证两条 beam 全程不同；想要更强的多样性要配合长度惩罚或分组（DBS 原文的多组版本）。
+4. **`eos_id` 命中即收尾**，该序列进入 `finished` 后不再扩展；所有 beam 都收尾时搜索提前结束。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3062,7 +3089,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1786 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1797 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3283,6 +3310,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
+| `TestSamplingSearch` | 对比搜索单步打分与 α 两端退化、top-k 截断、`top_k=1` 与贪心逐位一致、多样束的扣分让位与无惩罚等价、`eos` 收尾、14 处参数校验 |
 | `TestNeuroSymbolic` | 规则集合与掩码、整条序列体检、约束贪心解码、全屏蔽报错 |
 | `TestMixtureOfDepths` | MoD 容量/排序/权重归一、块输出透传、早退三分支、savings、参数校验 |
 | `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
@@ -3340,7 +3368,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1786 个单元测试
+├── test_ai.py       # 1797 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
