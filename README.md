@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1618 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1627 项）
 
 ## 特性
 
@@ -2161,6 +2161,40 @@ out = block.forward([[0.1 * t] * 4 for t in range(5)])
   卷积模块只有 depthwise 3×3 + SiLU；它的价值是「结构跑得通、形状与归一化可断言」，
   不是可训练的高性能 Conformer。
 
+### 点云（W17-E-2a）
+
+| 接口 | 说明 |
+|------|------|
+| `farthest_point_indices(points, num_samples, seed=None)` | 最远点采样，返回 `num_samples` 个互不相同的下标 |
+| `chamfer_distance(a, b)` | 对称 Chamfer 距离（两个方向最近点平方距离之和的平均） |
+| `voxelize_points(points, resolution=8, bounds=None)` | 2D/3D 点云 → 占据网格 `(1, D, H, W)`（0/1） |
+| `PointNetEncoder(in_channels=3, hidden=(16, 32), seed=None)` | 逐点 MLP + 全局最大池化，`forward` 返回 `(global_feature, point_features)` |
+
+```python
+import AI
+
+pts = [[0.3, -0.2, 0.5], [1.0, 0.1, 0.4], [0.2, 1.0, 0.3]]
+idx = AI.farthest_point_indices(pts, 2, seed=1)
+d = AI.chamfer_distance(pts, pts)          # 0.0
+grid = AI.voxelize_points(pts, resolution=4)
+
+enc = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+global_feature, per_point = enc.forward(pts)
+dpoints = enc.backward([0.3, -0.2, 0.5, 0.1, -0.4])   # 逐点梯度
+```
+
+诚实边界：
+
+- `PointNetEncoder` 只做**编码**：没有分类头、没有 T-Net 变换、没有 `gamma` 特征变换，
+  也没有点的法向/颜色等额外通道（`in_channels` 可以是任意维，但语义上就是逐点特征）。
+- `backward` 的梯度与**最近一次** `forward` 的点序对齐（池化路由按那次 forward 记录的最大值
+  位置派发）。中途换过点序请重新 `forward` 再反传。
+- 全零输入点（`[0,0,0]`）且偏置为 0 时，`leaky_relu` 恰好落在拐点上，解析梯度取得是
+  左导数（0.01 倍）而中心差分会跨过拐点——这不是实现错，但拿它做梯度对拍会得到假失败；
+  探针与测试都使用偏离原点的点。
+- `voxelize_points` 在某一维跨度为 0（例如只有一个点）时按该维两侧各 0.5 撑开，
+  否则格子索引会退化；越界的点被夹到边缘格子而不是丢弃。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2577,7 +2611,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1618 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1627 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2786,6 +2820,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSuperResolutionDenoising` | 双线性形状与常量保持、噪声可复现与 `sigma=0`、SRCNN 参数量与两层权重中心差分、`fit` 降损、DnCNN 的 `denoise = 输入 − 噪声`、卷积权重中心差分、600 轮后重建误差小于带噪误差、13 处参数校验 |
 | `TestVectorRetrieval` | 暴力与手工扫描逐位一致、`ip` 度量与显式 id、k-means 三簇划分纯度、IVF 全探测等于暴力/单探测仍命中本簇、NSW recall@5 ≥ 0.8、`retrieval_recall` 取值、9 处参数校验 |
 | `TestSpeechFrontendConformer` | 梅尔刻度往返与单调、滤波器组形状/峰值/频点递增、切帧数量与偏移、DFT 常量与余弦闭式、log-mel 静音等于 `log(eps)`、DCT 正交性与 MFCC 形状、Conformer 形状/逐位置零均值/同种子复现、9 处参数校验 |
+| `TestPointCloud` | 最远点采样与手工复算一致、Chamfer 闭式与对称、体素化形状/单点自动边界/越界夹紧、PointNet 形状与置换不变、逐点梯度对中心差分、逐权重梯度对中心差分、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2839,7 +2874,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1618 个单元测试
+├── test_ai.py       # 1627 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

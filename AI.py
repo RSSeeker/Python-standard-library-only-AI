@@ -30527,6 +30527,268 @@ class PatchTSTEmbedding:
     def param_count(self):
         return self.d_model * self.patch_len + self.d_model
 
+# ======================================================================
+#  领域应用 W17-E-2a：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+# ======================================================================
+
+
+def _w17e2_points(points, who, dim=None):
+    """校验点云 `[[x, y, z], ...]`：非空、等长、全为有限数字。"""
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError(f"{who}: 点云必须是非空列表，收到 {points!r}")
+    rows = []
+    width = None
+    for i, p in enumerate(points):
+        if not isinstance(p, (list, tuple)) or not p:
+            raise ValueError(f"{who}: 第 {i} 个点必须是坐标列表，收到 {p!r}")
+        row = []
+        for j, v in enumerate(p):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 第 {i} 个点的第 {j} 维不是数字：{v!r}")
+            fv = float(v)
+            if fv != fv or fv in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 第 {i} 个点的第 {j} 维不是有限数")
+            row.append(fv)
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 第 {i} 个点维度 {len(row)} 与首点 {width} 不一致")
+        rows.append(row)
+    if dim is not None and width != dim:
+        raise ValueError(f"{who}: 期望 {dim} 维坐标，收到 {width} 维")
+    return rows
+
+
+def _w17e2_pos_int(value, who, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{who}: {name} 必须是 >= 1 的整数，收到 {value!r}")
+    return value
+
+
+def _w17e2_sqdist(a, b):
+    total = 0.0
+    for x, y in zip(a, b):
+        d = x - y
+        total += d * d
+    return total
+
+
+def farthest_point_indices(points, num_samples, seed=None):
+    """最远点采样：返回 `num_samples` 个下标（互不相同），覆盖整片点云。"""
+    pts = _w17e2_points(points, "farthest_point_indices")
+    n = len(pts)
+    k = _w17e2_pos_int(num_samples, "farthest_point_indices", "num_samples")
+    if k > n:
+        raise ValueError(
+            f"farthest_point_indices: num_samples {k} 超过点数 {n}")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError(
+            f"farthest_point_indices: seed 必须是整数或 None，收到 {seed!r}")
+    rng = random.Random(0 if seed is None else seed)
+    first = rng.randrange(n)
+    chosen = [first]
+    taken = [False] * n
+    taken[first] = True
+    best = [_w17e2_sqdist(p, pts[first]) for p in pts]
+    while len(chosen) < k:
+        pick = -1
+        best_val = -1.0
+        for i in range(n):
+            if taken[i]:
+                continue
+            if best[i] > best_val:
+                best_val, pick = best[i], i
+        chosen.append(pick)
+        taken[pick] = True
+        for i in range(n):
+            d = _w17e2_sqdist(pts[i], pts[pick])
+            if d < best[i]:
+                best[i] = d
+    return chosen
+
+
+def chamfer_distance(a, b):
+    """对称 Chamfer 距离：两个方向的「最近点平方距离之和」的平均。"""
+    pa = _w17e2_points(a, "chamfer_distance")
+    pb = _w17e2_points(b, "chamfer_distance")
+    if len(pa[0]) != len(pb[0]):
+        raise ValueError(
+            f"chamfer_distance: 两组点维度不一致（{len(pa[0])} vs {len(pb[0])}）")
+    total = 0.0
+    for p in pa:
+        total += min(_w17e2_sqdist(p, q) for q in pb)
+    for q in pb:
+        total += min(_w17e2_sqdist(q, p) for p in pa)
+    return total / float(len(pa) + len(pb))
+
+
+def voxelize_points(points, resolution=8, bounds=None):
+    """把点云栅格化成占据网格 `(1, D, H, W)`（0/1）。
+
+    `bounds` 为 `(lo, hi)` 两个坐标（含三维边界）；省略时按每维 `min`/`max`
+    取界。落界外的点被夹到边缘格子（不丢点）。
+    """
+    pts = _w17e2_points(points, "voxelize_points")
+    res = _w17e2_pos_int(resolution, "voxelize_points", "resolution")
+    dim = len(pts[0])
+    if bounds is None:
+        lo = [min(p[j] for p in pts) for j in range(dim)]
+        hi = [max(p[j] for p in pts) for j in range(dim)]
+        # 单一取值（例如只有一个点、或某个维度全相同）时跨度为 0，
+        # 直接除会退化；按该维两侧各 0.5 撑开，保证点落在网格中心。
+        for j in range(dim):
+            if hi[j] - lo[j] <= 0.0:
+                lo[j] = lo[j] - 0.5
+                hi[j] = hi[j] + 0.5
+    else:
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            raise ValueError(
+                f"voxelize_points: bounds 必须是 (lo, hi) 两个坐标，收到 {bounds!r}")
+        lo = [float(v) for v in bounds[0]]
+        hi = [float(v) for v in bounds[1]]
+        if len(lo) != dim or len(hi) != dim:
+            raise ValueError(
+                f"voxelize_points: bounds 维度 {len(lo)}/{len(hi)} 与点维度 {dim} 不一致")
+        if any(hi[j] <= lo[j] for j in range(dim)):
+            raise ValueError("voxelize_points: bounds 的 hi 必须严格大于 lo")
+    grid = [[[[0.0] * res for _ in range(res)] for _ in range(res)]]
+    for p in pts:
+        cell = []
+        for j in range(dim):
+            span = hi[j] - lo[j]
+            if span <= 0.0:
+                cell.append(0)
+                continue
+            idx = int((p[j] - lo[j]) / span * res)
+            if idx < 0:
+                idx = 0
+            elif idx >= res:
+                idx = res - 1
+            cell.append(idx)
+        if dim == 3:
+            grid[0][cell[0]][cell[1]][cell[2]] = 1.0
+        elif dim == 2:
+            grid[0][cell[0]][cell[1]][0] = 1.0
+        else:
+            raise ValueError(
+                f"voxelize_points: 只支持 2D/3D 点云，收到 {dim} 维")
+    return grid
+
+
+class PointNetEncoder:
+    """简化 PointNet 编码器：逐点 MLP + 全局最大池化（对点序置换不变）。
+
+    结构：`(N, in_channels) -> Layer(hidden[0]) -> Layer(hidden[1]) -> max over N`
+    只做「编码」，没有分类头、没有 T-Net、没有 `gamma`/`log` 变换。
+    """
+
+    def __init__(self, in_channels=3, hidden=(16, 32), seed=None):
+        _w17e2_pos_int(in_channels, "PointNetEncoder", "in_channels")
+        if isinstance(hidden, bool) or not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError(
+                f"PointNetEncoder: hidden 必须是非空列表，收到 {hidden!r}")
+        sizes = [in_channels]
+        for v in hidden:
+            _w17e2_pos_int(v, "PointNetEncoder", "hidden 里的元素")
+            sizes.append(int(v))
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"PointNetEncoder: seed 必须是整数或 None，收到 {seed!r}")
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.layers = [Layer(sizes[i], sizes[i + 1],
+                                 activation=("linear" if i == len(sizes) - 2 else "leaky_relu"))
+                           for i in range(len(sizes) - 1)]
+        finally:
+            random.setstate(saved)
+        self.in_channels = in_channels
+        self.hidden = tuple(int(v) for v in hidden)
+        self._cache = None
+        # Layer 自身只返回 (grad_w, grad_b, next_delta)，不保存梯度；
+        # 这里按层累积，等价于 Model 的 acc_w / acc_b。
+        self._grads = None
+
+    def _forward_one(self, point):
+        acts = [list(point)]
+        for layer in self.layers:
+            acts.append(list(layer.forward(acts[-1])))
+        return acts
+
+    def forward(self, points):
+        pts = _w17e2_points(points, "PointNetEncoder.forward", self.in_channels)
+        feats = [self._forward_one(p)[-1] for p in pts]
+        width = len(feats[0])
+        argmax = []
+        global_feature = []
+        for k in range(width):
+            best_i = 0
+            best_v = feats[0][k]
+            for i in range(1, len(feats)):
+                if feats[i][k] > best_v:
+                    best_v, best_i = feats[i][k], i
+            argmax.append(best_i)
+            global_feature.append(best_v)
+        self._cache = (pts, argmax, width)
+        return global_feature, feats
+
+    def backward(self, dglobal, dfeats=None):
+        """返回逐点梯度 `dpoints`（`(N, in_channels)`）。
+
+        契约：梯度与**最近一次** `forward` 的点序对齐（池化路由按那次 forward
+        记录的最大值位置派发）。若中途换过点序，请重新 `forward` 再反传。
+        """
+        if self._cache is None:
+            raise RuntimeError("PointNetEncoder.backward: 必须先调用 forward")
+        pts, argmax, width = self._cache
+        if not isinstance(dglobal, (list, tuple)) or len(dglobal) != width:
+            raise ValueError(
+                f"PointNetEncoder.backward: dglobal 长度必须是 {width}")
+        if dfeats is None:
+            dfeats = [[0.0] * width for _ in pts]
+        else:
+            if len(dfeats) != len(pts):
+                raise ValueError(
+                    f"PointNetEncoder.backward: dfeats 行数 {len(dfeats)} 与点数 {len(pts)} 不一致")
+            dfeats = [list(row) for row in dfeats]
+        for k in range(width):
+            g = float(dglobal[k])
+            if g:
+                dfeats[argmax[k]][k] += g
+        if self._grads is None:
+            self._grads = [
+                ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                 [0.0] * layer.fan_out)
+                for layer in self.layers
+            ]
+        dpoints = []
+        for i, point in enumerate(pts):
+            self._forward_one(point)
+            delta = dfeats[i]
+            for j in range(len(self.layers) - 1, -1, -1):
+                gw, gb, delta = self.layers[j].backward(delta)
+                acc_w, acc_b = self._grads[j]
+                for r in range(len(gw)):
+                    row, arow = gw[r], acc_w[r]
+                    for c in range(len(row)):
+                        arow[c] += row[c]
+                for r in range(len(gb)):
+                    acc_b[r] += gb[r]
+            dpoints.append(list(delta))
+        return dpoints
+
+    def param_count(self):
+        return sum(layer.fan_in * layer.fan_out + layer.fan_out for layer in self.layers)
+
+    def grads(self):
+        """返回每层 `(grad_w, grad_b)`；未反传过时返回 `None`。"""
+        return self._grads
+
+    def zero_grad(self):
+        """清空累积的梯度（下一次 backward 会重新初始化）。"""
+        self._grads = None
+
+
 # ========================================================================
 #  领域应用 W17-E-1：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
 # ========================================================================

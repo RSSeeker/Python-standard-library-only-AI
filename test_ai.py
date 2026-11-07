@@ -24783,3 +24783,169 @@ class TestSpeechFrontendConformer:
             block.forward([])
         with pytest.raises(ValueError):
             block.forward([[1.0, 2.0]])
+
+
+class TestPointCloud:
+    """W17-E-2a：最远点采样 / Chamfer 距离 / 体素化 / 简化 PointNet。"""
+
+    def _pts(self):
+        return [[0.3, -0.2, 0.5], [1.0, 0.1, 0.4], [0.2, 1.0, 0.3],
+                [0.1, 0.2, 1.0], [1.1, 1.0, 0.9], [2.0, 2.0, 2.0]]
+
+    def test_farthest_point_sampling(self):
+        pts = self._pts()
+        idx = AI.farthest_point_indices(pts, 3, seed=1)
+        assert len(idx) == 3 and len(set(idx)) == 3
+        assert all(0 <= i < len(pts) for i in idx)
+        assert idx == AI.farthest_point_indices(pts, 3, seed=1)
+        # 手工复算：首点由种子决定，之后每步取「离已选集合最近距离最大」的点
+        import random
+        rng = random.Random(1)
+        first = rng.randrange(len(pts))
+        sel = [first]
+        best = [sum((pts[i][j] - pts[first][j]) ** 2 for j in range(3))
+                for i in range(len(pts))]
+        while len(sel) < 3:
+            pick = max((i for i in range(len(pts)) if i not in sel),
+                       key=lambda i: best[i])
+            sel.append(pick)
+            for i in range(len(pts)):
+                d = sum((pts[i][j] - pts[pick][j]) ** 2 for j in range(3))
+                best[i] = min(best[i], d)
+        assert idx == sel
+
+    def test_farthest_point_validation(self):
+        pts = self._pts()
+        with pytest.raises(ValueError):
+            AI.farthest_point_indices([], 1)
+        with pytest.raises(ValueError):
+            AI.farthest_point_indices(pts, 0)
+        with pytest.raises(ValueError):
+            AI.farthest_point_indices(pts, len(pts) + 1)
+        with pytest.raises(ValueError):
+            AI.farthest_point_indices(pts, 2, seed=1.5)
+        with pytest.raises(ValueError):
+            AI.farthest_point_indices([[0.0, 1.0], [0.0]], 1)
+
+    def test_chamfer_distance(self):
+        a = [[0.0, 0.0]]
+        b = [[3.0, 0.0], [0.0, 4.0]]
+        assert abs(AI.chamfer_distance(a, b) - 34.0 / 3.0) < 1e-12
+        assert abs(AI.chamfer_distance(a, b) - AI.chamfer_distance(b, a)) < 1e-12
+        pts = self._pts()
+        assert abs(AI.chamfer_distance(pts, pts)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.chamfer_distance([], b)
+        with pytest.raises(ValueError):
+            AI.chamfer_distance(a, [[0.0, 0.0, 0.0]])
+
+    def test_voxelize_points(self):
+        grid = AI.voxelize_points([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], resolution=2)
+        assert len(grid) == 1 and len(grid[0]) == 2
+        assert len(grid[0][0]) == 2 and len(grid[0][0][0]) == 2
+        assert grid[0][0][0][0] == 1.0 and grid[0][1][1][1] == 1.0
+        mid = AI.voxelize_points([[0.5, 0.5, 0.5]], resolution=2,
+                                 bounds=([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]))
+        assert mid[0][1][1][1] == 1.0
+        # 单点时自动边界跨度为 0，会被撑成 +/-0.5 落在中心格子
+        one = AI.voxelize_points([[0.5, 0.5, 0.5]], resolution=2)
+        assert one[0][1][1][1] == 1.0
+        clamped = AI.voxelize_points([[9.0, 9.0, 9.0]], resolution=2,
+                                     bounds=([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]))
+        assert clamped[0][1][1][1] == 1.0
+
+    def test_voxelize_validation(self):
+        pts = self._pts()
+        with pytest.raises(ValueError):
+            AI.voxelize_points([], 2)
+        with pytest.raises(ValueError):
+            AI.voxelize_points(pts, 0)
+        with pytest.raises(ValueError):
+            AI.voxelize_points(pts, 2, bounds=([0.0], [1.0]))
+        with pytest.raises(ValueError):
+            AI.voxelize_points(pts, 2, bounds=([1.0, 1.0, 1.0], [0.0, 0.0, 0.0]))
+        with pytest.raises(ValueError):
+            AI.voxelize_points([[0.5, 0.5, 0.5, 0.5]], 2)
+
+    def test_pointnet_shapes_and_permutation(self):
+        pts = self._pts()
+        enc = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+        g, feats = enc.forward(pts)
+        assert len(g) == 5 and len(feats) == len(pts) and len(feats[0]) == 5
+        for k in range(5):
+            assert abs(g[k] - max(f[k] for f in feats)) < 1e-12
+        assert enc.param_count() == (3 * 4 + 4) + (4 * 5 + 5)
+        shuffled = [pts[i] for i in (3, 0, 5, 1, 4, 2)]
+        g2, _ = enc.forward(shuffled)
+        for k in range(5):
+            assert abs(g[k] - g2[k]) < 1e-12
+
+    def test_pointnet_input_gradient(self):
+        import random
+        pts = self._pts()
+        enc = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+        enc.forward(pts)
+        random.seed(3)
+        dglobal = [random.uniform(-1.0, 1.0) for _ in range(5)]
+        enc.zero_grad()
+        dpts = enc.backward(dglobal)
+        assert len(dpts) == len(pts) and len(dpts[0]) == 3
+        ref = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+        eps = 1e-6
+        worst = 0.0
+        for i in range(len(pts)):
+            for j in range(3):
+                plus = [list(p) for p in pts]
+                minus = [list(p) for p in pts]
+                plus[i][j] += eps
+                minus[i][j] -= eps
+                fp = sum(dglobal[k] * v for k, v in enumerate(ref.forward(plus)[0]))
+                fm = sum(dglobal[k] * v for k, v in enumerate(ref.forward(minus)[0]))
+                worst = max(worst, abs((fp - fm) / (2.0 * eps) - dpts[i][j]))
+        assert worst < 1e-6, worst
+
+    def test_pointnet_weight_gradient(self):
+        import random
+        pts = self._pts()
+        enc = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+        enc.forward(pts)
+        random.seed(5)
+        dglobal = [random.uniform(-1.0, 1.0) for _ in range(5)]
+        enc.zero_grad()
+        enc.backward(dglobal)
+        grads = enc.grads()
+        assert grads is not None
+        eps = 1e-6
+        worst = 0.0
+        for i in range(4):
+            for j in range(3):
+                plus = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+                minus = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+                plus.layers[0].weights[i][j] += eps
+                minus.layers[0].weights[i][j] -= eps
+                fp = sum(dglobal[k] * v for k, v in enumerate(plus.forward(pts)[0]))
+                fm = sum(dglobal[k] * v for k, v in enumerate(minus.forward(pts)[0]))
+                worst = max(worst, abs((fp - fm) / (2.0 * eps) - grads[0][0][i][j]))
+        assert worst < 1e-5, worst
+        enc.zero_grad()
+        assert enc.grads() is None
+
+    def test_pointnet_validation(self):
+        enc = AI.PointNetEncoder(in_channels=3, hidden=(4, 5), seed=7)
+        with pytest.raises(ValueError):
+            AI.PointNetEncoder(in_channels=0)
+        with pytest.raises(ValueError):
+            AI.PointNetEncoder(hidden=[])
+        with pytest.raises(ValueError):
+            AI.PointNetEncoder(hidden=(0,))
+        with pytest.raises(ValueError):
+            AI.PointNetEncoder(seed="x")
+        with pytest.raises(RuntimeError):
+            AI.PointNetEncoder(in_channels=3).backward([1.0])
+        with pytest.raises(ValueError):
+            enc.forward([[0.0, 0.0]])
+        enc.forward([[0.0, 0.0, 0.0]])
+        with pytest.raises(ValueError):
+            enc.backward([1.0])
+        with pytest.raises(ValueError):
+            enc.backward([1.0] * 5, dfeats=[])
