@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1382 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1391 项）
 
 ## 特性
 
@@ -1374,6 +1374,30 @@ print(average_recall(gt, pred))                  # 1.0
 - **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
   10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
 
+### 注意力 Rollout / Flow（W14-B）
+
+| 函数 | 说明 |
+|---|---|
+| `attention_rollout(attentions, head_fusion='mean', discard_ratio=0.0)` | 各层 `Ã = 0.5A + 0.5I` 连乘，平均所有路径 |
+| `attention_flow(attentions, head_fusion='mean', discard_ratio=0.0)` | 每层按**列**归一后连乘，影响力守恒（简化版，不含梯度项） |
+
+```python
+maps = attention_maps(transformer, x)        # 各层各头注意力
+print(attention_rollout(maps))               # T×T，第 t 行是 t 对各源的贡献
+print(attention_flow(maps))                  # 同一批图，按列归一
+```
+
+口径说明：
+
+- `attentions` 接受三种形态：每层一张 `T×T`、每层 `heads×T×T`、或
+  `attention_maps` 的返回值（含 `layers` / `maps` 键），头部融合可选
+  `mean` / `max` / `min`。
+- **Rollout 与 Flow 的差别是真实的**：Rollout 每层加 `0.5I`（给残差留通路）并按行
+  归一，得到「平均路径」；Flow 不加单位项、按列归一，保证每个源位置收到的总影响力
+  守恒。两者在均匀注意力上给出的数不同，不是实现不一致。
+- `discard_ratio` 按行丢掉最小的那一部分权重再重新归一化（Rollout 论文里的做法），
+  用来观察「只看最强的几条连接」时的图。
+
 ### 输入归因（W14-A）
 
 | 函数 | 说明 |
@@ -1879,7 +1903,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1382 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1391 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2062,6 +2086,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestImageQualityMetrics` | PSNR 的 inf/0dB/`data_range`、SSIM 与独立参考实现对照、MS-SSIM 两个尺度、FID 三种方差组合、KID 单调性、IS 的 1 与 2、十条非法输入 |
 | `TestConsistencyFairness` | Fleiss 完美 1.0 与 Fleiss(1971) 经典例 0.2199、两两相反 0、Krippendorff 单单位手算 0、三种 level 的参考值、缺失值、三项公平性手算与 0.8 边界、十条非法输入 |
 | `TestAttribution` | 线性网络闭式梯度、Grad×Input 与梯度的关系、IG 完备性（线性精确 / ReLU 收敛）、DeepLIFT 完备性、SmoothGrad 退化与可复现、多分类 class_index、九条非法输入、softmax 拒绝 |
+| `TestAttentionAttribution` | 单位/均匀注意力的闭式结果、行和归一、flow 的列守恒、三种头部融合、discard_ratio 丢最小项、`attention_maps` 与多层 CausalLM 输入、八条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2115,7 +2140,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1382 个单元测试
+├── test_ai.py       # 1391 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

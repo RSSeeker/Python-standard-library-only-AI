@@ -452,7 +452,14 @@
     线性网络与 ReLU 网络上完备性 `Σ attr = f(x) − f(baseline)` 精确到 1e-12。
   - 探针 41 项；两处首跑失败都是我的期望值错（`smooth_grad` 在小 sigma 下采到同一
     ReLU 分片、`Model` 包装器的 saliency 期望写成两类都有梯度）。
-- [ ] 注意力：Attention Rollout / Attention Flow（在 `attention_maps` 上做矩阵连乘）
+- [x] 注意力：Attention Rollout / Attention Flow（在 `attention_maps` 上做矩阵连乘）
+
+  - 已实现：`attention_rollout`（`Ã = 0.5A + 0.5I` 连乘）、`attention_flow`
+    （按列归一后连乘，简化版不含梯度项）；输入支持每层 `T×T`、`heads×T×T`
+    或 `attention_maps` 返回值，头部融合 `mean/max/min`。
+  - Rollout 与 Flow 在均匀注意力上本来就不同（前者含单位项），README 写明。
+  - 探针 37 项；首跑 4 条失败全是我的期望值错：以为 flow 也加单位项、
+    把 `discard_ratio` 的期望方向写反、`max`/`min` 融合的两处算术错。
 - [ ] `permutation_importance`；`feature_maps_ascii`（`attention_ascii` 扩展）
 - [ ] CNN：GradCAM / GradCAM++ / ScoreCAM / LayerCAM
 - [ ] 嵌入可视化（复用 t-SNE）；SHAP（KernelSHAP 简化）/ LIME（简化）/ Anchors

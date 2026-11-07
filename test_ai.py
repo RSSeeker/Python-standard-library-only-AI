@@ -21364,3 +21364,88 @@ class TestAttribution:
         wrapper.model.layers[0].weights = [[1.0, 0.0], [0.0, 1.0]]
         wrapper.model.layers[0].biases = [0.0, 0.0]
         assert AI.saliency_map(wrapper, [2.0, 5.0]) == [0.0, 1.0]
+
+class TestAttentionAttribution:
+    """W14-B：注意力 Rollout / Flow。"""
+
+    IDENT = [[1.0, 0.0], [0.0, 1.0]]
+    UNIFORM = [[0.5, 0.5], [0.5, 0.5]]
+
+    def test_rollout_identity(self):
+        got = AI.attention_rollout([self.IDENT, self.IDENT])
+        assert got == self.IDENT
+
+    def test_rollout_uniform(self):
+        one = AI.attention_rollout([self.UNIFORM])
+        assert abs(one[0][0] - 0.75) < 1e-12 and abs(one[0][1] - 0.25) < 1e-12
+        two = AI.attention_rollout([self.UNIFORM, self.UNIFORM])
+        assert abs(two[0][0] - 0.625) < 1e-12
+        assert abs(two[0][1] - 0.375) < 1e-12
+
+    def test_rollout_rows_normalized(self):
+        a = [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.3, 0.3, 0.4]]
+        b = [[0.6, 0.4, 0.0], [0.0, 0.5, 0.5], [0.2, 0.2, 0.6]]
+        got = AI.attention_rollout([a, b])
+        for i in range(3):
+            assert abs(sum(got[i]) - 1.0) < 1e-12
+
+    def test_flow_column_conservation(self):
+        a = [[0.5, 0.5], [1.5, 0.5]]
+        got = AI.attention_flow([a])
+        assert abs(got[0][0] + got[1][0] - 1.0) < 1e-12
+        assert abs(got[0][1] + got[1][1] - 1.0) < 1e-12
+        # 列为单位和的注意力：flow 就是矩阵连乘
+        col_norm = [[0.25, 0.5], [0.75, 0.5]]
+        two = AI.attention_flow([col_norm, col_norm])
+        want = AI._w14b_mul(col_norm, col_norm)
+        assert all(abs(two[i][j] - want[i][j]) < 1e-12
+                   for i in range(2) for j in range(2))
+
+    def test_flow_no_identity_term(self):
+        # flow 不加单位项，单层均匀注意力原样返回
+        assert AI.attention_flow([self.UNIFORM]) == self.UNIFORM
+
+    def test_head_fusion(self):
+        heads = [
+            [[0.9, 0.1], [0.1, 0.9]],
+            [[0.1, 0.9], [0.9, 0.1]],
+            [[0.5, 0.5], [0.5, 0.5]],
+        ]
+        mean = AI.attention_rollout([heads])
+        assert abs(mean[0][0] - 0.75) < 1e-12 and abs(mean[0][1] - 0.25) < 1e-12
+        mx = AI.attention_rollout([heads], head_fusion="max")
+        assert abs(mx[0][1] - 0.45) < 1e-12
+        mn = AI.attention_rollout([heads], head_fusion="min")
+        assert abs(mn[0][1] - 0.05) < 1e-12
+
+    def test_discard_ratio(self):
+        a = [[0.7, 0.2, 0.1], [0.1, 0.7, 0.2], [0.4, 0.4, 0.2]]
+        got = AI.attention_rollout([a], discard_ratio=1.0 / 3.0)
+        assert abs(got[0][2]) < 1e-12      # 最小项被丢掉
+        assert abs(sum(got[0]) - 1.0) < 1e-12
+
+    def test_attention_maps_input(self):
+        mha = AI.MultiHeadAttention(d_model=4, num_heads=2)
+        mha.eval()
+        maps = AI.attention_maps(mha, [[1.0, 0.0, 0.0, 0.0],
+                                       [0.0, 1.0, 0.0, 0.0]])
+        got = AI.attention_rollout(maps)
+        assert len(got) == 2 and len(got[0]) == 2
+        for i in range(2):
+            assert abs(sum(got[i]) - 1.0) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.attention_rollout([])
+        with pytest.raises(ValueError):
+            AI.attention_rollout([[[1.0, 0.0]]])
+        with pytest.raises(ValueError):
+            AI.attention_rollout([[[1.0, -0.5], [0.0, 1.0]]])
+        with pytest.raises(ValueError):
+            AI.attention_rollout([self.IDENT], discard_ratio=1.0)
+        with pytest.raises(ValueError):
+            AI.attention_rollout([self.IDENT], head_fusion="sum")
+        with pytest.raises(TypeError):
+            AI.attention_rollout(42)
+        with pytest.raises(ValueError):
+            AI.attention_flow([])

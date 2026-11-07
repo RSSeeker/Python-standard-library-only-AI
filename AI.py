@@ -28714,6 +28714,161 @@ def _cf_matrix(ratings, who, allow_none):
 
 
 # ============================================================================
+#  可解释性：注意力 Rollout / Flow（W14-B）
+# ============================================================================
+
+def _w14b_mul(a, b):
+    """方阵乘法（T×T）。"""
+    n = len(a)
+    return [[sum(a[i][k] * b[k][j] for k in range(n)) for j in range(n)]
+            for i in range(n)]
+
+
+def _w14b_fuse(maps, fusion, who):
+    """把 `heads × T × T` 融成一张 `T × T`。"""
+    if not maps:
+        raise ValueError(f"{who}: 注意力图为空")
+    heads = len(maps)
+    n = len(maps[0])
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            col = [maps[h][i][j] for h in range(heads)]
+            if fusion == "mean":
+                out[i][j] = sum(col) / float(heads)
+            elif fusion == "max":
+                out[i][j] = max(col)
+            else:
+                out[i][j] = min(col)
+    return out
+
+
+def _w14b_matrix(m, who, tag):
+    if not isinstance(m, (list, tuple)) or not m:
+        raise ValueError(f"{who}: {tag} 必须是非空方阵")
+    n = len(m)
+    rows = []
+    for i, row in enumerate(m):
+        if not isinstance(row, (list, tuple)) or len(row) != n:
+            raise ValueError(f"{who}: {tag} 第 {i} 行长度应为 {n}")
+        rows.append([_metric_number(v, who, i) for v in row])
+        if any(v < 0.0 for v in rows[i]):
+            raise ValueError(f"{who}: {tag} 第 {i} 行含负权重")
+    return rows
+
+
+def _w14b_discard(m, ratio, who):
+    """按行丢掉最小的 `ratio` 比例的权重，再按行重新归一化。"""
+    if ratio <= 0.0:
+        return [list(row) for row in m]
+    n = len(m)
+    drop = int(n * ratio)
+    if drop <= 0:
+        return [list(row) for row in m]
+    out = []
+    for i, row in enumerate(m):
+        order = sorted(range(n), key=lambda j: (row[j], j))
+        kept = [0.0] * n
+        for j in order[drop:]:
+            kept[j] = row[j]
+        total = sum(kept)
+        if total <= 0.0:
+            raise ValueError(
+                f"{who}: 第 {i} 行在 discard_ratio={ratio} 下被清空")
+        out.append([v / total for v in kept])
+    return out
+
+
+def _w14b_layers(attentions, who, head_fusion):
+    """把多种输入形态统一成「每层一张 T×T」。"""
+    if head_fusion not in ("mean", "max", "min"):
+        raise ValueError(
+            f"{who}: head_fusion 必须是 mean/max/min，收到 {head_fusion!r}")
+    if isinstance(attentions, dict):
+        if "layers" in attentions:
+            items = [entry["maps"] for entry in attentions["layers"]]
+        elif "maps" in attentions:
+            items = [attentions["maps"]]
+        else:
+            raise ValueError(f"{who}: 字典输入需要 'maps' 或 'layers' 键")
+    elif isinstance(attentions, (list, tuple)):
+        items = list(attentions)
+    else:
+        raise TypeError(f"{who}: attentions 必须是列表或 attention_maps 的返回值")
+    if not items:
+        raise ValueError(f"{who}: 至少需要一层的注意力")
+    layers = []
+    seq = None
+    for k, item in enumerate(items):
+        if isinstance(item, dict) and "maps" in item:
+            item = item["maps"]
+        if not isinstance(item, (list, tuple)) or not item:
+            raise ValueError(f"{who}: 第 {k} 层注意力为空")
+        first = item[0]
+        if isinstance(first, (list, tuple)) and first \
+                and isinstance(first[0], (list, tuple)):
+            mat = _w14b_fuse(item, head_fusion, who)
+        else:
+            mat = _w14b_matrix(item, who, f"第 {k} 层")
+        if seq is None:
+            seq = len(mat)
+        elif len(mat) != seq:
+            raise ValueError(
+                f"{who}: 第 {k} 层的序列长度 {len(mat)} 与首层 {seq} 不一致")
+        layers.append(mat)
+    return layers
+
+
+def _w14b_check_ratio(discard_ratio, who):
+    ratio = _metric_number(discard_ratio, who, 0)
+    if ratio < 0.0 or ratio >= 1.0:
+        raise ValueError(
+            f"{who}: discard_ratio 必须在 [0, 1) 内，收到 {ratio}")
+    return ratio
+
+
+def attention_rollout(attentions, head_fusion="mean", discard_ratio=0.0):
+    """Attention Rollout：把各层注意力连乘，近似「每条路径被平均后的贡献」。
+
+    `attentions` 可以是「每层一张 `T×T`」的列表、每层「`heads×T×T`」的列表，
+    或 `attention_maps` 的返回值。每层做 `Ã = 0.5·A + 0.5·I`（给残差留通路），
+    然后 `R = Ã_L · … · Ã_1`。返回 `T×T`，第 `t` 行是位置 `t` 对各源位置的
+    归一化贡献（行和为 1）。
+    """
+    who = "attention_rollout"
+    ratio = _w14b_check_ratio(discard_ratio, who)
+    layers = _w14b_layers(attentions, who, head_fusion)
+    n = len(layers[0])
+    result = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for k, mat in enumerate(layers):
+        m = _w14b_discard(mat, ratio, who)
+        mixed = [[0.5 * m[i][j] + (0.5 if i == j else 0.0) for j in range(n)]
+                 for i in range(n)]
+        result = _w14b_mul(mixed, result)
+    return result
+
+
+def attention_flow(attentions, head_fusion="mean", discard_ratio=0.0):
+    """Attention Flow（简化版）：按**列**归一化后连乘，保持「影响力守恒」。
+
+    与 Rollout 的区别：Rollout 每层按行归一（平均路径），Flow 把每层的
+    `A` 除以列和再作用到上一层的流上，使每个源位置收到的总影响力守恒。
+    这里不含论文里的梯度项，docstring 明确这是简化版。
+    """
+    who = "attention_flow"
+    ratio = _w14b_check_ratio(discard_ratio, who)
+    layers = _w14b_layers(attentions, who, head_fusion)
+    n = len(layers[0])
+    flow = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for k, mat in enumerate(layers):
+        m = _w14b_discard(mat, ratio, who)
+        col = [sum(m[i][j] for i in range(n)) for j in range(n)]
+        norm = [[(m[i][j] / col[j]) if col[j] > 0.0 else 1.0 / n
+                 for j in range(n)] for i in range(n)]
+        flow = _w14b_mul(norm, flow)
+    return flow
+
+# ============================================================================
 #  可解释性：输入归因（W14-A）
 # ============================================================================
 
