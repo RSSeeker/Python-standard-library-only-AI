@@ -21972,3 +21972,206 @@ class TestExplanationExtras:
         seq = AI.Sequential([AI.Layer(2, 1, activation="linear")])
         with pytest.raises(ValueError):
             AI.influence_scores(seq, [1.0, 0.0], 1.0, [[1.0, 0.0]], [1.0])
+
+
+class TestStructuredPruning:
+    """W15-A：通道 / 头 / 层的结构化剪枝与稀疏度统计。"""
+
+    @staticmethod
+    def _net():
+        net = AI.MLP([3, 4, 2], activations=["linear", "linear"])
+        net.layers[0].weights = [
+            [1.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [2.0, 2.0, 0.0],
+        ]
+        net.layers[0].biases = [0.5, 0.5, 0.5, 0.5]
+        return net
+
+    def test_channel_scores(self):
+        net = self._net()
+        assert AI.channel_scores(net.layers[0]) == [1.0, 3.0, 0.0, 4.0]
+
+    def test_prune_channels_zeroes_weakest(self):
+        net = self._net()
+        res = AI.prune_channels(net, 0, ratio=0.5)
+        assert res["pruned"] == [0, 2]
+        assert res["kept"] == [1, 3]
+        assert net.layers[0].weights[2] == [0.0, 0.0, 0.0]
+        assert net.layers[0].weights[0] == [0.0, 0.0, 0.0]
+        assert net.layers[0].biases[2] == 0.0
+        assert net.layers[0].weights[3] == [2.0, 2.0, 0.0]
+        assert len(net.layers[0].weights) == 4  # 形状不变
+
+    def test_prune_channels_validation(self):
+        net = self._net()
+        assert AI.prune_channels(net, 0, ratio=0.0)["pruned"] == []
+        with pytest.raises(ValueError):
+            AI.prune_channels(net, 0, ratio=-0.1)
+        with pytest.raises(ValueError):
+            AI.prune_channels(net, 0, ratio=1.5)
+        with pytest.raises(ValueError):
+            AI.prune_channels(net, 9, ratio=0.5)
+        with pytest.raises(ValueError):
+            AI.prune_channels(net, 0, ratio=0.99, keep_at_least=4)
+
+    def test_head_scores_and_prune(self):
+        attn = AI.MultiHeadAttention(4, 2)
+        attn.W_q = [[1.0, 0.0, 0.0, 0.0],
+                    [0.0, 2.0, 0.0, 0.0],
+                    [0.0, 0.0, 5.0, 0.0],
+                    [0.0, 0.0, 0.0, 5.0]]
+        attn.W_o = [[1.0] * 4 for _ in range(4)]
+        assert AI.head_scores(attn, "q") == [3.0, 10.0]
+        res = AI.prune_heads(attn, ratio=0.5)
+        assert res["pruned"] == [0]
+        # 头 0 占 W_q 的第 0、1 列，剪掉后这两列全零
+        assert [row[0] for row in attn.W_q] == [0.0, 0.0, 0.0, 0.0]
+        assert [row[1] for row in attn.W_q] == [0.0, 0.0, 0.0, 0.0]
+        assert attn.W_q[2][2] == 5.0
+        # W_o 中头 0 对应的行被清零，其余行保持原值
+        assert attn.W_o[0] == [0.0] * 4
+        assert attn.W_o[1] == [0.0] * 4
+        assert attn.W_o[2] == [1.0] * 4
+        assert attn.W_o[3] == [1.0] * 4
+
+    def test_head_validation(self):
+        attn = AI.MultiHeadAttention(4, 2)
+        with pytest.raises(ValueError):
+            AI.head_scores(attn, "z")
+        with pytest.raises(ValueError):
+            AI.prune_heads(AI.MultiHeadAttention(4, 1), 0.5)
+
+    def test_prune_layers_rebuilds_mlp(self):
+        net = AI.MLP([2, 4, 4, 4, 2], activations=["linear"] * 4)
+        res = AI.prune_layers(net, ratio=0.25)
+        assert len(res.layers) == 3
+        assert len(net.layers) == 4
+        assert res.layer_sizes == [2, 4, 4, 2]
+        assert len(res.forward([1.0, 2.0])) == 2
+
+    def test_prune_layers_validation(self):
+        small = AI.MLP([2, 3, 2], activations=["linear", "linear"])
+        with pytest.raises(ValueError):
+            AI.prune_layers(small, ratio=0.5)
+        mixed = AI.MLP([2, 3, 5, 2], activations=["linear"] * 3)
+        with pytest.raises(ValueError):
+            AI.prune_layers(mixed, ratio=1.0)
+        with pytest.raises(ValueError):
+            AI.prune_layers(small, ratio=0.0)
+
+    def test_sparsity_report(self):
+        net = self._net()
+        rep = AI.sparsity_report(net)
+        assert len(rep) == 2
+        # 权重 [[1,0,0],[0,3,0],[0,0,0],[2,2,0]] 共 12 个元素、8 个 0
+        assert rep[0]["zeros"] == 8
+        assert abs(rep[0]["ratio"] - 8.0 / 12.0) < 1e-12
+        assert rep[0]["kind"] == "Layer"
+
+
+class TestQuantization:
+    """W15-B：PTQ / QAT 伪量化 / SmoothQuant 缩放。"""
+
+    def test_fake_quantize_grid_and_peak(self):
+        out = AI.fake_quantize([0.0, 1.0], bits=8)
+        assert out[0] == 0.0
+        assert abs(out[1] - 1.0) < 1e-12
+        scale = 1.0 / 127.0
+        mid = AI.fake_quantize([0.5, 1.0], bits=8)[0]
+        assert abs(mid / scale - round(mid / scale)) < 1e-9
+
+    def test_fake_quantize_clips(self):
+        clipped = AI.fake_quantize([2.0, -2.0], bits=8, scale=0.01)
+        assert abs(clipped[0] - 1.27) < 1e-12
+        assert abs(clipped[1] + 1.27) < 1e-12
+
+    def test_fake_quantize_validation(self):
+        for bits in (1, 17, 8.0, True):
+            with pytest.raises(ValueError):
+                AI.fake_quantize([1.0], bits=bits)
+        for scale in (0.0, -1.0, "x"):
+            with pytest.raises(ValueError):
+                AI.fake_quantize([1.0], scale=scale)
+
+    def test_quantize_weights_stores_ints(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        before = [row[:] for row in net.layers[0].weights]
+        res = AI.quantize_weights(net, bits=8)
+        assert res["bits"] == 8
+        assert len(res["scales"]) == 2
+        code = res["codes"][0][0][0]
+        assert isinstance(code, int) and not isinstance(code, bool)
+        assert all(-127 <= c <= 127 for row in res["codes"][0] for c in row)
+        assert abs(net.layers[0].weights[0][0]
+                   - res["codes"][0][0][0] * res["scales"][0]) < 1e-15
+        assert net.layers[0].weights != before
+        assert len(net.forward([1.0, -1.0])) == 1
+
+    def test_quantize_weights_idempotent(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        first = AI.quantize_weights(net, bits=8)["scales"][0]
+        second = AI.quantize_weights(net, bits=8)["scales"][0]
+        assert abs(first - second) <= first * 1e-9
+
+    def test_quantization_error_bounds(self):
+        net = AI.MLP([4, 5, 2], activations=["linear", "linear"])
+        before = [row[:] for row in net.layers[0].weights]
+        rep = AI.quantization_error(net, bits=8)
+        assert len(rep) == 2
+        for item in rep:
+            scale, _ = AI._w15_scale_of(net.layers[item["index"]].weights, 8, "t")
+            assert item["max"] <= scale / 2.0 + 1e-12
+            assert item["mean"] <= item["max"] + 1e-15
+        assert net.layers[0].weights == before
+
+    def test_qat_grads_match_plain_grads(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        AI.quantize_weights(net, bits=8)
+        xs = [[0.0, 0.0], [1.0, 1.0]]
+        ys = [0.0, 1.0]
+        grads = AI.qat_grads(net, xs, ys, bits=8)
+        assert len(grads) == 2
+        acc_w = [[0.0] * 2 for _ in range(3)]
+        for x, y in zip(xs, ys):
+            pred = net.forward(list(x))
+            for li, (gw, _gb) in enumerate(AI._mlp_backward(net, [2.0 * (pred[0] - y)])):
+                if li != 0:
+                    continue
+                for j in range(len(gw)):
+                    for i in range(len(gw[j])):
+                        acc_w[j][i] += gw[j][i]
+        n = float(len(xs))
+        diff = max(abs(grads[0][0][j][i] - acc_w[j][i] / n)
+                   for j in range(3) for i in range(2))
+        assert diff < 1e-12
+
+    def test_qat_grads_validation(self):
+        net = AI.MLP([2, 3, 1], activations=["linear", "linear"])
+        with pytest.raises(ValueError):
+            AI.qat_grads(net, [], [])
+        with pytest.raises(ValueError):
+            AI.qat_grads(net, [[1.0, 1.0]], [1.0, 2.0])
+        seq = AI.Sequential([AI.Layer(2, 1, activation="linear")])
+        with pytest.raises(ValueError):
+            AI.qat_grads(seq, [[1.0, 1.0]], [1.0])
+
+    def test_smooth_quant_scale_and_apply(self):
+        assert abs(AI.smooth_quant_scale(4.0, 1.0, 0.5) - 2.0) < 1e-12
+        assert abs(AI.smooth_quant_scale(4.0, 1.0, 0.0) - 1.0) < 1e-12
+        assert abs(AI.smooth_quant_scale(4.0, 1.0, 1.0) - 4.0) < 1e-12
+        layer = AI.Layer(2, 2, activation="linear")
+        layer.weights = [[1.0, 1.0], [1.0, 1.0]]
+        layer.biases = [0.5, 0.5]
+        AI.smooth_quant_apply(layer, [2.0, 3.0])
+        assert layer.weights == [[2.0, 3.0], [2.0, 3.0]]
+        assert layer.biases == [0.5, 0.5]
+
+    def test_smooth_quant_validation(self):
+        for args in ((0.0, 1.0), (1.0, 0.0), (1.0, 1.0, 1.5), (1.0, 1.0, -0.1)):
+            with pytest.raises(ValueError):
+                AI.smooth_quant_scale(*args)
+        layer = AI.Layer(2, 2, activation="linear")
+        with pytest.raises(ValueError):
+            AI.smooth_quant_apply(layer, [1.0])

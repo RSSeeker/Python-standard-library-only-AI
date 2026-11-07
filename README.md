@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1431 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1449 项）
 
 ## 特性
 
@@ -1581,6 +1581,57 @@ print(cf['target'], cf['distance'])
 - `counterfactual_example` 用「目标类 one-hot 减原类 one-hot」的单次回传做梯度下降，不是 CEM 的对比解释，也没有 line search；距离由 `l2` 约束，不保证最小。
 - `influence_scores` 是一阶梯度余弦，不是「留一重训」的精确影响；只在 MSE、单输出、MLP 上有定义。
 
+### 结构化剪枝（W15-A）
+
+| 函数 | 说明 |
+|---|---|
+| `channel_scores(layer)` | 每个输出通道的权重绝对值之和（重要性分数） |
+| `prune_channels(model, layer_index, ratio=0.5, keep_at_least=1)` | 按分数置零最弱的输出通道（连偏置一起置零），返回 `{"pruned","kept","scores"}` |
+| `head_scores(attention, projection='q')` | 多头注意力每个头的权重绝对值之和（`q`/`k`/`v`/`o`） |
+| `prune_heads(attention, ratio=0.5, keep_at_least=1)` | 置零最弱的头（`W_q/W_k/W_v` 对应列与 `W_o` 对应行） |
+| `prune_layers(model, ratio=0.5, keep_at_least=2)` | 按层 L1 真正删除中间层，返回新的 `MLP`（原模型不动） |
+| `sparsity_report(model)` | 逐层统计权重零元素个数与比例 |
+
+```python
+from AI import MLP, channel_scores, prune_channels, prune_layers, sparsity_report
+
+net = MLP([64, 128, 10])
+print(channel_scores(net.layers[0])[:4])
+prune_channels(net, 0, ratio=0.3)      # 掩码式：形状不变
+small = prune_layers(net, ratio=0.0)   # 维度兼容时才真的删层
+print(sparsity_report(net))
+```
+
+- `prune_channels` / `prune_heads` 是**掩码式**置零（形状不变、下游不用改），不是删行重建；要真删通道得手工重建下游层的 `fan_in`。
+- `prune_layers` 会新建 `MLP`，只删中间层；删完前后维度对不上就抛 `ValueError`，不会悄悄改形状。
+
+### 量化与 SmoothQuant（W15-B）
+
+| 函数 | 说明 |
+|---|---|
+| `fake_quantize(value, bits=8, scale=None)` | 对称均匀量化的伪量化（量化再反量化），结构不变，可直接前向 |
+| `quantize_weights(model, bits=8)` | 训练后量化（PTQ）：每层一个 scale，写入反量化值并返回 `{"bits","scales","codes"}`（`codes` 是真 int 编码） |
+| `quantization_error(model, bits=8)` | 逐层量化前后的最大 / 平均绝对误差（不改模型） |
+| `qat_grads(model, xs, ys, bits=8)` | QAT 的直通估计梯度：在伪量化权重上前向反传，返回各层平均梯度 |
+| `smooth_quant_scale(activation_peak, weight_peak, alpha=0.5)` | SmoothQuant 缩放因子 `s = max|x|^α / max|w|^(1-α)` |
+| `smooth_quant_apply(layer, scales)` | 把缩放折进权重列（`W[:, j] *= s_j`），激活端需自行除以 `s_j` |
+
+```python
+from AI import MLP, quantize_weights, quantization_error, qat_grads
+
+net = MLP([64, 128, 10])
+for row in quantization_error(net, bits=8):
+    print(row['index'], row['max'], row['mean'])
+
+state = quantize_weights(net, bits=8)   # 写回的是反量化值，前向照常
+grads = qat_grads(net, xs, ys, bits=8)  # 直通估计梯度
+```
+
+- PTQ 是**对称 per-tensor**（每层一个 scale），不是 per-channel；`bits` 支持 2–16，8 位最常用。
+- QAT 只提供直通估计（STE）的**梯度**，反向不衰减，前向仍然走量化格点；完整的量化感知训练循环需要自己套 `optimizer.step`。
+- GPTQ / AWQ 未实现；SmoothQuant 只提供缩放因子与权重列迁移，激活端除以 `s` 由调用方完成。
+- 特征蒸馏（hint layer）复用 W1-C 的 `hint_loss`，这里不重复实现。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1997,7 +2048,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1431 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1449 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2185,6 +2236,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCAM` | GradCAM 通道权重闭式解、热图 = 归一化激活、换类别翻转权重、默认类 = argmax、GradCAM++ 与 LayerCAM 对照、relu=False 的混合符号、ScoreCAM 权重和为 1 与 `n_masks`、8 处非法输入 |
 | `TestShapLimeAnchors` | KernelSHAP 线性可加闭式解与效率公理、背景均值与特征名、`n_samples > 2^m` 不死循环；LIME 的排序与符号；Anchors 单特征精度/覆盖率与不可达阈值报错；ASCII 散点与 t-SNE/PCA 嵌入；10 处非法输入 |
 | `TestExplanationExtras` | TCAV、激活最大化、网络解剖、原型、反事实、影响分数的行为与参数校验（10 例） |
+| `TestStructuredPruning` | 通道分数、掩码式通道剪枝、头分数与剪枝、删层重建、稀疏度统计（8 例） |
+| `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2238,7 +2291,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1431 个单元测试
+├── test_ai.py       # 1449 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

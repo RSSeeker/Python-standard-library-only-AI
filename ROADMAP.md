@@ -479,8 +479,13 @@
   - 回传到输入的三件只支持 `Layer` 组成的 MLP，卷积请用 `cam_heatmap`（已在 README 写明）。
 
 ### W15 推理与部署（§11）
-- [ ] 结构化剪枝：通道 / 头 / 层（现有 `prune_magnitude` 是非结构化）
-- [ ] 特征蒸馏（hint layer）；QAT（量化感知训练）；PTQ / GPTQ / AWQ / SmoothQuant（教学，标注 int8 未真存）
+- [x] 结构化剪枝：通道 / 头 / 层（现有 `prune_magnitude` 是非结构化）
+  - `channel_scores` / `prune_channels`（掩码式置零，形状不变）/ `head_scores` / `prune_heads` / `prune_layers`（真删中间层）/ `sparsity_report`；
+  - 删层要求相邻维度兼容，否则直接 `ValueError`，不会悄悄改形状。
+- [x] 特征蒸馏（hint layer）；QAT（量化感知训练）；PTQ / GPTQ / AWQ / SmoothQuant（教学，标注 int8 未真存）
+  - 特征蒸馏复用 W1-C 的 `hint_loss`；QAT 提供 `qat_grads`（直通估计，只给梯度）；
+  - PTQ 用 `quantize_weights` 真存 int 编码 + 每层一个 scale，`quantization_error` 给误差上界；
+  - SmoothQuant 只提供 `smooth_quant_scale` 与 `smooth_quant_apply`（激活端除 `s` 由调用方做）；GPTQ / AWQ 未实现，README 已写明。
 - [ ] 集成：Voting / Stacking / Bagging / Boosting
 - [ ] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理（W7 已实现 `ContinuousBatcher`）、并行概念（文档）
 

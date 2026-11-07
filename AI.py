@@ -28716,6 +28716,443 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  推理与部署：量化（W15-B：PTQ / QAT / SmoothQuant）
+# ============================================================================
+
+def _w15_flat_numbers(value, who="_w15_flat_numbers"):
+    """把嵌套结构摊平成一维（只读，返回浮点列表）。"""
+    out = []
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, (list, tuple)):
+            for v in reversed(item):
+                stack.append(v)
+        else:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError(f"{who}: 需要数字，收到 {item!r}")
+            out.append(float(item))
+    return out
+
+
+def _w15_map(value, fn):
+    """对嵌套结构逐元素套用 fn，保持结构。"""
+    if isinstance(value, (list, tuple)):
+        return [_w15_map(v, fn) for v in value]
+    return fn(float(value))
+
+
+def _w15_check_bits(bits, who):
+    if not isinstance(bits, int) or isinstance(bits, bool) or not (2 <= bits <= 16):
+        raise ValueError(f"{who}: bits 必须是 2..16 的整数，收到 {bits!r}")
+    return bits
+
+
+def _w15_scale_of(value, bits, who):
+    flat = _w15_flat_numbers(value, who)
+    if not flat:
+        raise ValueError(f"{who}: 空结构没有可量化的元素")
+    qmax = float((1 << (bits - 1)) - 1)
+    peak = max(abs(v) for v in flat)
+    if peak <= 0.0:
+        return 1.0, qmax
+    return peak / qmax, qmax
+
+
+def fake_quantize(value, bits=8, scale=None):
+    """对称均匀量化的「伪量化」：量化后再反量化，返回同结构浮点。
+
+    这是 QAT / PTQ 误差分析的通用工具：数值落在 ``scale * [-qmax, qmax]``
+    的整数格点上，形状不变，可直接继续前向。
+    """
+    _w15_check_bits(bits, "fake_quantize")
+    if scale is None:
+        scale, qmax = _w15_scale_of(value, bits, "fake_quantize")
+    else:
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise ValueError(f"fake_quantize: scale 必须是数字，收到 {scale!r}")
+        if scale <= 0.0:
+            raise ValueError(f"fake_quantize: scale 必须 > 0，收到 {scale!r}")
+        qmax = float((1 << (bits - 1)) - 1)
+
+    def _one(v):
+        q = int(round(v / scale))
+        if q > qmax:
+            q = int(qmax)
+        elif q < -qmax:
+            q = -int(qmax)
+        return q * scale
+
+    return _w15_map(value, _one)
+
+
+def quantize_weights(model, bits=8):
+    """训练后量化（PTQ）：把每层权重对称量化，写回反量化值并返回编码。
+
+    返回 ``{"bits", "scales", "codes"}``：``codes`` 是每层权重的整型编码
+    （真正的 int8 存储），``scales`` 是每层一个缩放因子。注意写回模型的是
+    反量化后的浮点，前向不需要额外解包。
+    """
+    _w15_check_bits(bits, "quantize_weights")
+    net = getattr(model, "model", model)
+    mods = getattr(net, "layers", None) or getattr(net, "modules", None)
+    if mods is None:
+        raise ValueError("quantize_weights: 模型既没有 layers 也没有 modules")
+    scales = []
+    codes = []
+    for i, layer in enumerate(mods):
+        weight = getattr(layer, "weights", None)
+        if weight is None:
+            scales.append(None)
+            codes.append(None)
+            continue
+        scale, qmax = _w15_scale_of(weight, bits, "quantize_weights")
+        layer_codes = _w15_map(weight, lambda v: max(-int(qmax), min(int(qmax),
+                                                                    int(round(v / scale)))))
+        layer.weights = _w15_map(layer_codes, lambda q: q * scale)
+        scales.append(scale)
+        codes.append(layer_codes)
+    return {"bits": bits, "scales": scales, "codes": codes}
+
+
+def quantization_error(model, bits=8):
+    """量化前后逐层最大 / 平均绝对误差（不改动模型）。"""
+    _w15_check_bits(bits, "quantization_error")
+    net = getattr(model, "model", model)
+    mods = getattr(net, "layers", None) or getattr(net, "modules", None)
+    if mods is None:
+        raise ValueError("quantization_error: 模型既没有 layers 也没有 modules")
+    out = []
+    for i, layer in enumerate(mods):
+        weight = getattr(layer, "weights", None)
+        if weight is None:
+            out.append({"index": i, "max": None, "mean": None})
+            continue
+        quant = fake_quantize(weight, bits=bits)
+        flat_a = _w15_flat_numbers(weight, "quantization_error")
+        flat_b = _w15_flat_numbers(quant, "quantization_error")
+        diffs = [abs(a - b) for a, b in zip(flat_a, flat_b)]
+        out.append({
+            "index": i,
+            "max": max(diffs),
+            "mean": sum(diffs) / float(len(diffs)),
+        })
+    return out
+
+
+def qat_grads(model, xs, ys, bits=8):
+    """QAT 的「直通估计」梯度：在伪量化权重上前向反传，返回各层平均梯度。
+
+    反向按 STE 处理——梯度穿过量化器不衰减，直接是量化点处的梯度。返回结构
+    与 ``_mlp_backward`` 相同（每层 ``(grad_w, grad_b)``）。
+    """
+    _w15_check_bits(bits, "qat_grads")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("qat_grads: xs 不能为空")
+    if len(xs) != len(ys):
+        raise ValueError(
+            f"qat_grads: xs 有 {len(xs)} 行，ys 有 {len(ys)} 个"
+        )
+    net = getattr(model, "model", model)
+    if not hasattr(net, "layers"):
+        raise ValueError("qat_grads: 只支持 MLP（需要 _mlp_backward 取参数梯度）")
+    saved = []
+    for layer in net.layers:
+        if hasattr(layer, "weights"):
+            saved.append((layer, layer.weights,
+                          _w15_map(layer.weights, lambda v: v)))
+            layer.weights = fake_quantize(layer.weights, bits=bits)
+    try:
+        acc = None
+        for x, y in zip(xs, ys):
+            pred = _w15_flat_numbers(net.forward(list(x)), "qat_grads")
+            target = _w15_flat_numbers([y], "qat_grads") if not isinstance(
+                y, (list, tuple)) else _w15_flat_numbers(y, "qat_grads")
+            if len(pred) != len(target):
+                raise ValueError(
+                    f"qat_grads: 预测维度 {len(pred)} 与目标 {len(target)} 不一致"
+                )
+            dloss = [2.0 * (pred[i] - target[i]) for i in range(len(pred))]
+            grads = _mlp_backward(net, dloss)
+            if acc is None:
+                acc = [[(None if gw is None else _w15_map(gw, lambda v: v),
+                         _w15_map(gb, lambda v: v)) for gw, gb in grads]]
+            else:
+                for li, (gw, gb) in enumerate(grads):
+                    acc_gw, acc_gb = acc[0][li]
+                    if gw is not None and acc_gw is not None:
+                        for j in range(len(gw)):
+                            for i in range(len(gw[j])):
+                                acc_gw[j][i] += gw[j][i]
+                    if acc_gb is not None:
+                        for j in range(len(gb)):
+                            acc_gb[j] += gb[j]
+        n = float(len(xs))
+        return [(None if gw is None else _w15_map(gw, lambda v: v / n),
+                 _w15_map(gb, lambda v: v / n)) for gw, gb in acc[0]]
+    finally:
+        for layer, original, _copy in saved:
+            layer.weights = original
+
+
+def smooth_quant_scale(activation_peak, weight_peak, alpha=0.5):
+    """SmoothQuant 的逐通道缩放因子：``s = max|x|^alpha / max|w|^(1-alpha)``。"""
+    for name, v in (("activation_peak", activation_peak), ("weight_peak", weight_peak)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0.0:
+            raise ValueError(f"smooth_quant_scale: {name} 必须 > 0，收到 {v!r}")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
+            or not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"smooth_quant_scale: alpha 必须在 [0, 1] 内，收到 {alpha!r}")
+    return (float(activation_peak) ** float(alpha)) / (
+        float(weight_peak) ** (1.0 - float(alpha))
+    )
+
+
+def smooth_quant_apply(layer, scales):
+    """按输入通道做 SmoothQuant 迁移：``W[:, j] *= s_j``（激活端要除以 ``s_j``）。
+
+    数学上 ``(X / s) · (W * s) = X · W``，迁移后激活的动态范围变小，权重变大，
+    更不容易被量化截断。调用方负责把对应的输入特征除以 ``s_j``。
+    """
+    if not hasattr(layer, "weights"):
+        raise ValueError("smooth_quant_apply: 该层没有权重")
+    rows = _w15_rows(layer.weights)
+    scale_list = _w15_flat_numbers(scales, "smooth_quant_apply")
+    width = len(rows[0])
+    if len(scale_list) != width:
+        raise ValueError(
+            f"smooth_quant_apply: scales 长度 {len(scale_list)} 与输入维度 {width} 不一致"
+        )
+    for row in rows:
+        for j in range(width):
+            row[j] = row[j] * scale_list[j]
+    return layer
+
+
+# ============================================================================
+#  推理与部署：结构化剪枝（W15-A：通道 / 头 / 层）
+# ============================================================================
+
+def _w15_rows(value):
+    """把嵌套结构按第一维切成「行」。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("_w15_rows: 需要非空的行列表")
+    return list(value)
+
+
+def _w15_abs_sum(value):
+    """嵌套结构的绝对值之和。"""
+    total = 0.0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, (list, tuple)):
+            for v in reversed(item):
+                stack.append(v)
+        else:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValueError(f"_w15_abs_sum: 需要数字，收到 {item!r}")
+            total += abs(float(item))
+    return total
+
+
+def _w15_ratio(ratio, who, allow_zero=True):
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        raise ValueError(f"{who}: ratio 必须是数字，收到 {ratio!r}")
+    lo_ok = ratio >= 0.0 if allow_zero else ratio > 0.0
+    if not lo_ok or ratio > 1.0:
+        raise ValueError(f"{who}: ratio 必须在 {'[0, 1]' if allow_zero else '(0, 1]'} 内，收到 {ratio!r}")
+    return float(ratio)
+
+
+def _w15_pick(scores, ratio, who, keep_at_least=1):
+    """按分数从小到大挑出要剪掉的下标，至少保留 keep_at_least 个。"""
+    n = len(scores)
+    if n <= 0:
+        raise ValueError(f"{who}: 没有可剪的单元")
+    if not isinstance(keep_at_least, int) or isinstance(keep_at_least, bool) \
+            or keep_at_least < 1:
+        raise ValueError(f"{who}: keep_at_least 必须是 >=1 的整数，收到 {keep_at_least!r}")
+    if keep_at_least >= n:
+        raise ValueError(f"{who}: keep_at_least={keep_at_least} 不小于单元数 {n}，没有可剪的")
+    order = sorted(range(n), key=lambda i: (scores[i], i))
+    limit = min(n - keep_at_least, int(round(ratio * n)))
+    return sorted(order[:limit])
+
+
+def channel_scores(layer):
+    """每个输出通道（``weights`` 的第一维）的绝对值之和。"""
+    rows = _w15_rows(getattr(layer, "weights", None))
+    return [_w15_abs_sum(row) for row in rows]
+
+
+def prune_channels(model, layer_index, ratio=0.5, keep_at_least=1):
+    """按通道重要性置零最弱的输出通道（**不改变形状**，下游无需改动）。
+
+    返回 ``{"pruned", "kept", "scores"}``。真正的删行需要重建下游层，
+    本函数只做掩码式剪枝，README 已写明。
+    """
+    _w15_ratio(ratio, "prune_channels")
+    mods = getattr(model, "modules", None)
+    if mods is None:
+        mods = getattr(model, "layers", None)
+    if mods is None:
+        raise ValueError("prune_channels: 模型既没有 modules 也没有 layers")
+    mods = list(mods)
+    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
+        raise ValueError(f"prune_channels: layer_index 必须是整数，收到 {layer_index!r}")
+    if not (0 <= layer_index < len(mods)):
+        raise ValueError(f"prune_channels: layer_index={layer_index} 超出范围 [0, {len(mods)})")
+    layer = mods[layer_index]
+    if not hasattr(layer, "weights"):
+        raise ValueError(
+            f"prune_channels: 第 {layer_index} 层是 {type(layer).__name__}，没有权重"
+        )
+    scores = channel_scores(layer)
+    pruned = _w15_pick(scores, ratio, "prune_channels", keep_at_least)
+    for j in pruned:
+        for i in range(len(layer.weights[j])):
+            layer.weights[j][i] = 0.0
+        if hasattr(layer, "biases") and j < len(layer.biases):
+            layer.biases[j] = 0.0
+    kept = [j for j in range(len(scores)) if j not in pruned]
+    return {"pruned": pruned, "kept": kept, "scores": scores}
+
+
+def head_scores(attention, projection="q"):
+    """多头注意力每个头的权重绝对值之和（``projection`` 取 ``q`` / ``k`` / ``v`` / ``o``）。"""
+    if projection not in ("q", "k", "v", "o"):
+        raise ValueError(f"head_scores: projection 只能是 q/k/v/o，收到 {projection!r}")
+    weight = getattr(attention, "W_" + projection, None)
+    if weight is None:
+        raise ValueError(
+            f"head_scores: {type(attention).__name__} 没有 W_{projection} 投影权重"
+        )
+    heads = getattr(attention, "num_heads", None)
+    d_model = getattr(attention, "d_model", None)
+    d_k = getattr(attention, "d_k", None)
+    if not isinstance(heads, int) or isinstance(heads, bool) or heads < 1:
+        raise ValueError("head_scores: attention.num_heads 必须是 >=1 的整数")
+    if not isinstance(d_model, int) or d_model < 1 or not isinstance(d_k, int) or d_k < 1:
+        raise ValueError("head_scores: attention.d_model / d_k 必须是正整数")
+    if heads * d_k != d_model:
+        raise ValueError(
+            f"head_scores: num_heads*d_k={heads * d_k} 不等于 d_model={d_model}"
+        )
+    rows = _w15_rows(weight)
+    out = []
+    for h in range(heads):
+        lo, hi = h * d_k, (h + 1) * d_k
+        total = 0.0
+        if projection == "o":
+            for r in range(lo, hi):
+                total += _w15_abs_sum(rows[r])
+        else:
+            for row in rows:
+                total += _w15_abs_sum(row[lo:hi])
+        out.append(total)
+    return out
+
+
+def prune_heads(attention, ratio=0.5, keep_at_least=1):
+    """按头重要性置零最弱的注意力头（同时置零 ``W_o`` 中对应的行）。"""
+    _w15_ratio(ratio, "prune_heads")
+    heads = getattr(attention, "num_heads", None)
+    d_k = getattr(attention, "d_k", None)
+    if not isinstance(heads, int) or isinstance(heads, bool) or heads < 2:
+        raise ValueError("prune_heads: 头数必须 >=2 才能剪")
+    if not isinstance(d_k, int) or d_k < 1:
+        raise ValueError("prune_heads: attention.d_k 必须是正整数")
+    scores = head_scores(attention, "q")
+    pruned = _w15_pick(scores, ratio, "prune_heads", keep_at_least)
+    for h in pruned:
+        lo, hi = h * d_k, (h + 1) * d_k
+        for name in ("W_q", "W_k", "W_v"):
+            weight = getattr(attention, name, None)
+            if weight is None:
+                continue
+            for row in weight:
+                for c in range(lo, hi):
+                    row[c] = 0.0
+        out_w = getattr(attention, "W_o", None)
+        if out_w is not None:
+            for r in range(lo, hi):
+                for c in range(len(out_w[r])):
+                    out_w[r][c] = 0.0
+    kept = [h for h in range(heads) if h not in pruned]
+    return {"pruned": pruned, "kept": kept, "scores": scores}
+
+
+def prune_layers(model, ratio=0.5, keep_at_least=2):
+    """按层重要性**真正删除**中间层，返回新的 ``MLP``（原模型不改）。
+
+    只能用于相邻维度互相兼容的 MLP；一旦删层后前后维度对不上就报错，
+    不会悄悄改形状。
+    """
+    _w15_ratio(ratio, "prune_layers")
+    net = getattr(model, "model", model)
+    if not hasattr(net, "layers") or not hasattr(net, "layer_sizes"):
+        raise ValueError("prune_layers: 只支持 MLP（需要 layers 与 layer_sizes）")
+    layers = list(net.layers)
+    if len(layers) <= keep_at_least:
+        raise ValueError(
+            f"prune_layers: 只有 {len(layers)} 层，keep_at_least={keep_at_least} 时无可剪"
+        )
+    if ratio <= 0.0:
+        raise ValueError("prune_layers: ratio 必须 > 0（否则什么都不会删）")
+    scores = [_w15_abs_sum(layer.weights) for layer in layers]
+    candidates = list(range(1, len(layers) - 1))
+    if not candidates:
+        raise ValueError("prune_layers: 没有可删的中间层")
+    order = sorted(candidates, key=lambda i: (scores[i], i))
+    limit = min(len(layers) - keep_at_least, int(round(ratio * len(layers))))
+    drop = set(order[:max(0, limit)])
+    keep = [layer for i, layer in enumerate(layers) if i not in drop]
+    for a, b in zip(keep, keep[1:]):
+        if getattr(a, "fan_out", None) != getattr(b, "fan_in", None):
+            raise ValueError(
+                f"prune_layers: 删掉第 {sorted(drop)} 层后维度不兼容"
+                f"（{a.fan_out} -> {b.fan_in}）"
+            )
+    new = MLP.__new__(MLP)
+    new.layers = keep
+    new.layer_sizes = [keep[0].fan_in] + [layer.fan_out for layer in keep]
+    new._fhooks = {}
+    new._bhooks = {}
+    return new
+
+
+def sparsity_report(model):
+    """逐层统计权重为 0 的比例。"""
+    net = getattr(model, "model", model)
+    mods = getattr(net, "layers", None) or getattr(net, "modules", None)
+    if mods is None:
+        raise ValueError("sparsity_report: 模型既没有 layers 也没有 modules")
+    out = []
+    for i, layer in enumerate(mods):
+        weight = getattr(layer, "weights", None)
+        if weight is None:
+            out.append({"index": i, "kind": type(layer).__name__, "zeros": None,
+                        "total": None, "ratio": None})
+            continue
+        total = 0
+        zeros = 0
+        stack = [weight]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                for v in reversed(item):
+                    stack.append(v)
+            else:
+                total += 1
+                if float(item) == 0.0:
+                    zeros += 1
+        out.append({"index": i, "kind": type(layer).__name__, "zeros": zeros,
+                    "total": total, "ratio": zeros / float(total) if total else 0.0})
+    return out
+
+
+# ============================================================================
 #  可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响（W14-F）
 # ============================================================================
 
