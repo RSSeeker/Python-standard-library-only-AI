@@ -24071,6 +24071,408 @@ class PreprocessCache:
 
 
 # ============================================================================
+#  ======================================================================
+#  W11-C：图像增强管道（Compose / RandomCrop / RandomResizedCrop /
+#          RandomRotation / ColorJitter / GaussianBlur / Normalize）
+#  ======================================================================
+
+def _aug3_check(x, who):
+    """校验 (C, H, W) 浮点图像。"""
+    if not isinstance(x, list) or not x:
+        raise ValueError("%s: 输入必须是 (C, H, W) 非空 list" % who)
+    if not isinstance(x[0], list) or not x[0]:
+        raise ValueError("%s: 输入必须是 (C, H, W) 非空 list" % who)
+    h = len(x[0])
+    for ch in x:
+        if not isinstance(ch, list) or len(ch) != h:
+            raise ValueError("%s: 各通道高度必须一致" % who)
+        for row in ch:
+            if not isinstance(row, list) or not row:
+                raise ValueError("%s: 每一行必须是非空 list" % who)
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise TypeError("%s: 像素必须是数字" % who)
+    w = len(x[0][0])
+    for ch in x:
+        for row in ch:
+            if len(row) != w:
+                raise ValueError("%s: 各通道宽度必须一致" % who)
+    return len(x), h, w
+
+
+def _aug3_pair(size, who, name="size"):
+    """把 int / (h, w) 统一成 (h, w)。"""
+    if isinstance(size, bool):
+        raise TypeError("%s: %s 不能是 bool" % (who, name))
+    if isinstance(size, int):
+        if size <= 0:
+            raise ValueError("%s: %s 必须为正整数" % (who, name))
+        return size, size
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        h, w = size
+        for v in (h, w):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TypeError("%s: %s 的元素必须是整数" % (who, name))
+            if v <= 0:
+                raise ValueError("%s: %s 的元素必须为正整数" % (who, name))
+        return int(h), int(w)
+    raise TypeError("%s: %s 必须是 int 或 (h, w)" % (who, name))
+
+
+def _aug3_rng(obj, seed):
+    """有 seed 就用私有 RNG（多次调用仍有随机性，但序列可复现）。"""
+    if seed is None:
+        return random
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("%s: seed 必须是整数或 None" % type(obj).__name__)
+    return random.Random(seed)
+
+
+def _resize_bilinear(x, out_h, out_w):
+    """把 (C, H, W) 双线性缩放到 (C, out_h, out_w)，align_corners=False 语义。"""
+    c, h, w = _aug3_check(x, "_resize_bilinear")
+    if h == out_h and w == out_w:
+        return [[list(row) for row in ch] for ch in x]
+    sy = (h - 1.0) / (out_h - 1.0) if out_h > 1 else 0.0
+    sx = (w - 1.0) / (out_w - 1.0) if out_w > 1 else 0.0
+    ys = [i * sy for i in range(out_h)]
+    xs = [j * sx for j in range(out_w)]
+    out = []
+    for ch in x:
+        new_ch = []
+        for yy in ys:
+            y0 = int(math.floor(yy))
+            y1 = min(y0 + 1, h - 1)
+            fy = yy - y0
+            row = []
+            for xx in xs:
+                x0 = int(math.floor(xx))
+                x1 = min(x0 + 1, w - 1)
+                fx = xx - x0
+                top = ch[y0][x0] * (1.0 - fx) + ch[y0][x1] * fx
+                bot = ch[y1][x0] * (1.0 - fx) + ch[y1][x1] * fx
+                row.append(top * (1.0 - fy) + bot * fy)
+            new_ch.append(row)
+        out.append(new_ch)
+    return out
+
+
+class Compose:
+    """按顺序调用一串变换；每个变换都吃并返回 (C, H, W) 浮点图像。"""
+
+    def __init__(self, transforms):
+        if not isinstance(transforms, (list, tuple)) or not transforms:
+            raise ValueError("Compose: transforms 必须是非空 list")
+        for t in transforms:
+            if not callable(t):
+                raise TypeError("Compose: 每个变换都必须可调用")
+        self.transforms = list(transforms)
+
+    def __call__(self, x):
+        _aug3_check(x, "Compose")
+        for t in self.transforms:
+            x = t(x)
+        return x
+
+    def __repr__(self):
+        return "Compose([%s])" % ", ".join(type(t).__name__ for t in self.transforms)
+
+
+class RandomCrop:
+    """随机裁到 size；padding>0 时先补边（补 fill）。"""
+
+    def __init__(self, size, padding=0, fill=0.0, seed=None):
+        self.size = _aug3_pair(size, "RandomCrop")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("RandomCrop: padding 必须是整数")
+        if padding < 0:
+            raise ValueError("RandomCrop: padding 不能为负")
+        self.padding = padding
+        if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+            raise TypeError("RandomCrop: fill 必须是数字")
+        self.fill = float(fill)
+        self._rng = _aug3_rng(self, seed)
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "RandomCrop")
+        pad = self.padding
+        if pad:
+            base = [[[self.fill] * (w + 2 * pad) for _ in range(h + 2 * pad)] for _ in range(c)]
+            for ch in range(c):
+                for i in range(h):
+                    for j in range(w):
+                        base[ch][i + pad][j + pad] = x[ch][i][j]
+            x = base
+            h += 2 * pad
+            w += 2 * pad
+        out_h, out_w = self.size
+        if out_h > h or out_w > w:
+            raise ValueError(
+                "RandomCrop: 裁剪尺寸 %dx%d 大于（补边后的）图像 %dx%d"
+                % (out_h, out_w, h, w))
+        top = self._rng.randrange(0, h - out_h + 1)
+        left = self._rng.randrange(0, w - out_w + 1)
+        return [[row[left:left + out_w] for row in ch[top:top + out_h]] for ch in x]
+
+
+class RandomResizedCrop:
+    """随机取一块（面积比例 scale、长宽比 ratio）再双线性缩放到 size。"""
+
+    def __init__(self, size, scale=(0.08, 1.0), ratio=(3.0 / 4.0, 4.0 / 3.0), seed=None):
+        self.size = _aug3_pair(size, "RandomResizedCrop")
+        self.scale = self._check_pair(scale, "scale", 0.0, 1.0)
+        self.ratio = self._check_pair(ratio, "ratio", 0.0, float("inf"))
+        self._rng = _aug3_rng(self, seed)
+
+    @staticmethod
+    def _check_pair(pair, name, lo, hi):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise TypeError("RandomResizedCrop: %s 必须是 (low, high)" % name)
+        a, b = pair
+        for v in (a, b):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("RandomResizedCrop: %s 的元素必须是数字" % name)
+        a, b = float(a), float(b)
+        if a <= lo or b <= lo or a > b:
+            raise ValueError("RandomResizedCrop: 需要 %s 两端为正且 low<=high" % name)
+        return a, b
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "RandomResizedCrop")
+        area = h * w
+        for _ in range(10):
+            target = self._rng.uniform(area * self.scale[0], area * self.scale[1])
+            log_r = self._rng.uniform(math.log(self.ratio[0]), math.log(self.ratio[1]))
+            ar = math.exp(log_r)
+            ch_ = int(round(math.sqrt(target * ar)))
+            cw_ = int(round(math.sqrt(target / ar)))
+            if 1 <= ch_ <= h and 1 <= cw_ <= w:
+                top = self._rng.randrange(0, h - ch_ + 1)
+                left = self._rng.randrange(0, w - cw_ + 1)
+                crop = [[row[left:left + cw_] for row in chx[top:top + ch_]] for chx in x]
+                return _resize_bilinear(crop, self.size[0], self.size[1])
+        # 10 次都不合适就退化成中心裁剪
+        ch_ = min(h, max(1, int(round(math.sqrt(area * 0.5)))))
+        cw_ = min(w, max(1, int(round(math.sqrt(area * 0.5)))))
+        top = (h - ch_) // 2
+        left = (w - cw_) // 2
+        crop = [[row[left:left + cw_] for row in chx[top:top + ch_]] for chx in x]
+        return _resize_bilinear(crop, self.size[0], self.size[1])
+
+
+class RandomRotation:
+    """在 [-degrees, degrees] 里取角度做双线性旋转，边界外填 fill。"""
+
+    def __init__(self, degrees, fill=0.0, seed=None):
+        if isinstance(degrees, bool) or not isinstance(degrees, (int, float)):
+            raise TypeError("RandomRotation: degrees 必须是数字")
+        if degrees < 0:
+            raise ValueError("RandomRotation: degrees 不能为负")
+        self.degrees = float(degrees)
+        if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+            raise TypeError("RandomRotation: fill 必须是数字")
+        self.fill = float(fill)
+        self._rng = _aug3_rng(self, seed)
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "RandomRotation")
+        if self.degrees == 0:
+            return [[list(row) for row in ch] for ch in x]
+        theta = self._rng.uniform(-self.degrees, self.degrees) * math.pi / 180.0
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        cy, cx = (h - 1) * 0.5, (w - 1) * 0.5
+        out = []
+        for ch in x:
+            new_ch = []
+            for i in range(h):
+                dy = i - cy
+                row = []
+                for j in range(w):
+                    dx = j - cx
+                    sy = cos_t * dy + sin_t * dx + cy
+                    sx = -sin_t * dy + cos_t * dx + cx
+                    if sy < 0.0 or sy > h - 1 or sx < 0.0 or sx > w - 1:
+                        row.append(self.fill)
+                        continue
+                    y0 = int(math.floor(sy))
+                    x0 = int(math.floor(sx))
+                    y1 = min(y0 + 1, h - 1)
+                    x1 = min(x0 + 1, w - 1)
+                    fy, fx = sy - y0, sx - x0
+                    top = ch[y0][x0] * (1.0 - fx) + ch[y0][x1] * fx
+                    bot = ch[y1][x0] * (1.0 - fx) + ch[y1][x1] * fx
+                    row.append(top * (1.0 - fy) + bot * fy)
+                new_ch.append(row)
+            out.append(new_ch)
+        return out
+
+
+class ColorJitter:
+    """亮度 / 对比度 / 饱和度 / 色相抖动；前三项选 (C,H,W)，色相需要在 0..1 区间。"""
+
+    def __init__(self, brightness=0.0, contrast=0.0, saturation=0.0, hue=0.0, seed=None):
+        for name, v in (("brightness", brightness), ("contrast", contrast),
+                        ("saturation", saturation), ("hue", hue)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("ColorJitter: %s 必须是数字" % name)
+            if v < 0:
+                raise ValueError("ColorJitter: %s 不能为负" % name)
+        if hue > 0.5:
+            raise ValueError("ColorJitter: hue 不能超过 0.5")
+        self.brightness = float(brightness)
+        self.contrast = float(contrast)
+        self.saturation = float(saturation)
+        self.hue = float(hue)
+        self._rng = _aug3_rng(self, seed)
+
+    def _factor(self, amount):
+        if amount == 0.0:
+            return 1.0
+        return self._rng.uniform(1.0 - amount, 1.0 + amount)
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "ColorJitter")
+        if self.hue > 0.0 and c < 3:
+            raise ValueError("ColorJitter: hue 抖动需要至少 3 个通道")
+        out = [[list(row) for row in ch] for ch in x]
+        if self.brightness:
+            f = self._factor(self.brightness)
+            out = [[[v * f for v in row] for row in ch] for ch in out]
+        if self.contrast:
+            f = self._factor(self.contrast)
+            n = c * h * w
+            gray = sum(sum(row) for ch in out for row in ch) / n
+            out = [[[gray + (v - gray) * f for v in row] for row in ch] for ch in out]
+        if self.saturation:
+            f = self._factor(self.saturation)
+            if c < 3:
+                raise ValueError("ColorJitter: saturation 需要至少 3 个通道")
+            new = [[list(row) for row in ch] for ch in out]
+            for i in range(h):
+                for j in range(w):
+                    lum = 0.299 * out[0][i][j] + 0.587 * out[1][i][j] + 0.114 * out[2][i][j]
+                    for ch in range(3):
+                        new[ch][i][j] = lum + (out[ch][i][j] - lum) * f
+            out = new
+        if self.hue:
+            if c < 3:
+                raise ValueError("ColorJitter: hue 需要至少 3 个通道")
+            d = self._rng.uniform(-self.hue, self.hue)
+            cos_d, sin_d = math.cos(2.0 * math.pi * d), math.sin(2.0 * math.pi * d)
+            #  行和恒为 1（cos/sin 系数各行为 0）：灰度图抖动色相后仍是同一灰度。
+            #  与 PyTorch 的常数有 1e-3 量级差异，换来严格保持亮度这一可验证性质。
+            m = [
+                [0.299 + 0.701 * cos_d + 0.168 * sin_d,
+                 0.587 - 0.587 * cos_d + 0.329 * sin_d,
+                 0.114 - 0.114 * cos_d - 0.497 * sin_d],
+                [0.299 - 0.299 * cos_d - 0.328 * sin_d,
+                 0.587 + 0.413 * cos_d + 0.035 * sin_d,
+                 0.114 - 0.114 * cos_d + 0.293 * sin_d],
+                [0.299 - 0.300 * cos_d + 1.250 * sin_d,
+                 0.587 - 0.588 * cos_d - 1.050 * sin_d,
+                 0.114 + 0.888 * cos_d - 0.200 * sin_d],
+            ]
+            new = [[[0.0] * w for _ in range(h)] for _ in range(c)]
+            for i in range(h):
+                for j in range(w):
+                    rgb = [out[k][i][j] for k in range(3)]
+                    for ch in range(3):
+                        new[ch][i][j] = sum(m[ch][k] * rgb[k] for k in range(3))
+            out = new
+        return out
+
+
+class GaussianBlur:
+    """可分离高斯模糊，核按 sigma=uniform(sigma_lo, sigma_hi) 现算。"""
+
+    def __init__(self, kernel_size=3, sigma=(0.1, 2.0), seed=None):
+        self.kernel_size = _aug3_pair(kernel_size, "GaussianBlur", "kernel_size")[0]
+        if self.kernel_size % 2 == 0:
+            raise ValueError("GaussianBlur: kernel_size 必须是奇数")
+        if isinstance(sigma, (int, float)) and not isinstance(sigma, bool):
+            sigma = (float(sigma), float(sigma))
+        if not isinstance(sigma, (list, tuple)) or len(sigma) != 2:
+            raise TypeError("GaussianBlur: sigma 必须是数字或 (low, high)")
+        lo, hi = sigma
+        for v in (lo, hi):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("GaussianBlur: sigma 的元素必须是数字")
+        if lo <= 0.0 or hi <= 0.0 or lo > hi:
+            raise ValueError("GaussianBlur: sigma 需要两端为正且 low<=high")
+        self.sigma = (float(lo), float(hi))
+        self._rng = _aug3_rng(self, seed)
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "GaussianBlur")
+        sigma = self._rng.uniform(self.sigma[0], self.sigma[1])
+        radius = self.kernel_size // 2
+        kernel = [math.exp(-0.5 * (k * k) / (sigma * sigma)) for k in range(-radius, radius + 1)]
+        total = sum(kernel)
+        kernel = [v / total for v in kernel]
+        out = []
+        for ch in x:
+            tmp = []
+            for i in range(h):
+                row = []
+                for j in range(w):
+                    acc = 0.0
+                    wsum = 0.0
+                    for k in range(-radius, radius + 1):
+                        jj = j + k
+                        if jj < 0 or jj >= w:
+                            continue
+                        acc += ch[i][jj] * kernel[k + radius]
+                        wsum += kernel[k + radius]
+                    row.append(acc / wsum)
+                tmp.append(row)
+            blurred = []
+            for i in range(h):
+                row = []
+                for j in range(w):
+                    acc = 0.0
+                    wsum = 0.0
+                    for k in range(-radius, radius + 1):
+                        ii = i + k
+                        if ii < 0 or ii >= h:
+                            continue
+                        acc += tmp[ii][j] * kernel[k + radius]
+                        wsum += kernel[k + radius]
+                    row.append(acc / wsum)
+                blurred.append(row)
+            out.append(blurred)
+        return out
+
+
+class Normalize:
+    """逐通道 (x - mean) / std；确定性变换，没有随机性也没有 seed。"""
+
+    def __init__(self, mean, std):
+        for name, v in (("mean", mean), ("std", std)):
+            if not isinstance(v, (list, tuple)) or not v:
+                raise ValueError("Normalize: %s 必须是非空 list" % name)
+            for e in v:
+                if isinstance(e, bool) or not isinstance(e, (int, float)):
+                    raise TypeError("Normalize: %s 的元素必须是数字" % name)
+        if len(mean) != len(std):
+            raise ValueError("Normalize: mean 与 std 长度必须一致")
+        for e in std:
+            if e <= 0:
+                raise ValueError("Normalize: std 必须为正")
+        self.mean = [float(v) for v in mean]
+        self.std = [float(v) for v in std]
+
+    def __call__(self, x):
+        c, h, w = _aug3_check(x, "Normalize")
+        if c != len(self.mean):
+            raise ValueError(
+                "Normalize: 输入通道数 %d 与 mean/std 长度 %d 不一致"
+                % (c, len(self.mean)))
+        return [
+            [[(v - self.mean[ch]) / self.std[ch] for v in row] for row in x[ch]]
+            for ch in range(c)
+        ]
+
+
 #  W11-B：编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
 # ============================================================================
 

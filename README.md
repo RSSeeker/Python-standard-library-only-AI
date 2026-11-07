@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1194 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1202 项）
 
 ## 特性
 
@@ -902,6 +902,35 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
+### 图像增强（W11-C）
+
+全部作用于 `(C, H, W)` 的嵌套 list（与卷积层的输入约定一致），返回新图、不改入参；
+每个类的构造参数里都可以给 `seed`，同一个实例连续调用会**继续抽随机**（每张图增强不同），
+想要逐图复现就按 seed 新建实例。
+
+| 类 | 说明 |
+|---|---|
+| `Compose(transforms)` | 顺序调用；空列表/不可调用元素报错 |
+| `RandomCrop(size, padding=0, fill=0.0)` | 随机裁剪；`padding>0` 先补边再裁 |
+| `RandomResizedCrop(size, scale=(0.08,1.0), ratio=(3/4,4/3))` | 随机取面积/长宽比不同的块，再双线性缩放到 `size`；10 次采样都不合适就退化为中心裁剪 |
+| `RandomRotation(degrees, fill=0.0)` | 在 `[-degrees, degrees]` 取角度，逆映射双线性采样，越界填 `fill` |
+| `ColorJitter(brightness, contrast, saturation, hue)` | 抖动幅度都是「最多偏离多少」；`hue` 用亮度保持矩阵（行和恰为 1，灰度图不变灰） |
+| `GaussianBlur(kernel_size, sigma=(0.1,2.0))` | 可分离高斯；边界按**实际用到的权重重新归一化**，常量图模糊后仍是常量 |
+| `Normalize(mean, std)` | 逐通道 `(x-mean)/std`，确定性变换，没有 seed |
+
+```python
+train_aug = AI.Compose([
+    AI.RandomResizedCrop((32, 32), seed=0),
+    AI.ColorJitter(brightness=0.2, contrast=0.2, seed=0),
+    AI.RandomRotation(15.0, seed=0),
+    AI.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+])
+x = train_aug(image)          # (3, 32, 32)
+```
+
+`GaussianBlur` 的 `sigma` 可以给数字（固定）或 `(low, high)`（每次抽样）。所有类都对
+空输入、行宽不一致、非数字像素、非法超参报 `ValueError` / `TypeError`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1318,7 +1347,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1194 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1202 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1481,6 +1510,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
+| `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1534,7 +1564,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1194 个单元测试
+├── test_ai.py       # 1202 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

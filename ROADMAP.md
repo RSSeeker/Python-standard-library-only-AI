@@ -319,7 +319,11 @@
     `get_feature_names`）。
   - `TargetEncoder`（平滑到全局均值，docstring 警告只能 fit 训练集）、
     `FrequencyEncoder`、`WOEEncoder`（`log(bad/good)` + 平滑，未见类别 0）。
-- [ ] 图像增强管道：`Compose` / `RandomCrop` / `RandomResizedCrop` / `RandomRotation` / `ColorJitter` / `GaussianBlur` / `Normalize`
+- [x] 图像增强管道：`Compose` / `RandomCrop` / `RandomResizedCrop` / `RandomRotation` / `ColorJitter` / `GaussianBlur` / `Normalize`
+  - 统一吃 `(C, H, W)` 嵌套 list，`seed` 决定一条可复现的随机流（同实例连续调用继续抽）。
+  - `RandomResizedCrop` 10 次采样失败退化为中心裁剪；`RandomRotation` 逆映射双线性 + `fill`。
+  - `ColorJitter` 的 hue 用行和恒为 1 的亮度保持矩阵（灰度图抖动后仍是同一灰度）。
+  - `GaussianBlur` 边界按实际权重重新归一化 ⇒ 常量图模糊不变；核/`sigma` 非法报错。
 - [ ] 切分扩展：`GroupKFold` / 时间序列切分
 - [ ] Scaler 族：Robust / MaxAbs / QuantileTransformer / PowerTransformer
 - [ ] 缺失值：`SimpleImputer` / `KNNImputer` / `IterativeImputer`

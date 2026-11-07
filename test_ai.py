@@ -19345,3 +19345,131 @@ class TestEncoders:
                     maker().fit(bad)
         with pytest.raises(ValueError):
             AI.TargetEncoder().fit([["a"]], [1.0, 2.0])
+
+
+class TestImageAugmentation:
+    """W11-C：图像增强管道"""
+
+    def test_resize_bilinear(self):
+        up = AI._resize_bilinear([[[0.0, 10.0], [20.0, 30.0]]], 3, 3)
+        assert len(up[0]) == 3 and len(up[0][0]) == 3
+        assert up[0][0][0] == 0.0 and up[0][2][2] == 30.0
+        assert abs(up[0][1][1] - 15.0) < 1e-12
+        same = AI._resize_bilinear([[[1.0]]], 1, 1)
+        assert same == [[[1.0]]]
+
+    def test_compose(self):
+        ident = AI.Compose([AI.Normalize([0.0], [1.0])])
+        x = [[[1.0, 2.0]]]
+        assert ident(x) == x
+        assert repr(ident) == "Compose([Normalize])"
+        with pytest.raises(ValueError):
+            AI.Compose([])
+        with pytest.raises(TypeError):
+            AI.Compose([1])
+
+    def test_random_crop(self):
+        g = [[[float(i * 10 + j) for j in range(5)] for i in range(5)]]
+        rc = AI.RandomCrop((2, 3), seed=7)
+        out = rc(g)
+        want = [[row[0:3] for row in g[0][2:4]]]
+        assert out == want
+        assert AI.RandomCrop((2, 3), seed=7)(g) == out
+        padded = AI.RandomCrop((4, 4), padding=1, fill=9.0, seed=1)(
+            [[[1.0, 2.0], [3.0, 4.0]]])
+        assert padded[0][0][3] == 9.0 and padded[0][3][0] == 9.0
+        assert sorted(v for ch in padded for row in ch for v in row) ==             sorted([9.0] * 12 + [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(ValueError):
+            AI.RandomCrop((6, 6))(g)
+
+    def test_random_resized_crop(self):
+        g = [[[float(i + j) / 14.0 for j in range(8)] for i in range(8)] for _ in range(2)]
+        rrc = AI.RandomResizedCrop((4, 4), seed=3)
+        out = rrc(g)
+        assert len(out) == 2 and len(out[0]) == 4 and len(out[0][0]) == 4
+        vals = [v for ch in out for row in ch for v in row]
+        assert min(vals) >= -1e-12 and max(vals) <= 1.0 + 1e-12
+        assert AI.RandomResizedCrop((4, 4), seed=3)(g) == out
+        with pytest.raises(ValueError):
+            AI.RandomResizedCrop((4, 4), scale=(0.5, 0.1))
+
+    def test_random_rotation(self):
+        g = [[[float(i + j) for j in range(5)] for i in range(5)]]
+        assert AI.RandomRotation(0.0, seed=1)(g) == g
+        const = [[[2.5] * 7 for _ in range(7)]]
+        out = AI.RandomRotation(180.0, fill=2.5, seed=11)(const)
+        assert all(abs(v - 2.5) < 1e-12 for ch in out for row in ch for v in row)
+        delta = [[[0.0] * 9 for _ in range(9)]]
+        delta[0][4][4] = 1.0
+        dr = AI.RandomRotation(180.0, seed=5)(delta)
+        assert dr[0][4][4] > 0.3
+        total = sum(v for ch in dr for row in ch for v in row)
+        cy = sum(i * dr[0][i][j] for i in range(9) for j in range(9)) / total
+        assert abs(cy - 4.0) < 0.35
+        with pytest.raises(ValueError):
+            AI.RandomRotation(-1.0)
+
+    def test_color_jitter(self):
+        one = [[[0.4 + 0.1 * c for _ in range(3)] for _ in range(3)] for c in range(3)]
+        assert AI.ColorJitter(seed=1)(one) == one
+        bo = AI.ColorJitter(brightness=0.5, seed=5)(one)
+        f = random.Random(5).uniform(0.5, 1.5)
+        assert all(abs(bo[c][i][j] - one[c][i][j] * f) < 1e-12
+                   for c in range(3) for i in range(3) for j in range(3))
+        gray = [[[0.5] * 3 for _ in range(3)] for _ in range(3)]
+        hue = AI.ColorJitter(hue=0.4, seed=2)(gray)
+        assert all(abs(hue[0][i][j] - hue[1][i][j]) < 1e-12
+                   and abs(hue[1][i][j] - hue[2][i][j]) < 1e-12
+                   for i in range(3) for j in range(3))
+        assert AI.ColorJitter(saturation=0.5, seed=2)(gray) == gray
+        with pytest.raises(ValueError):
+            AI.ColorJitter(hue=0.6)
+        with pytest.raises(ValueError):
+            AI.ColorJitter(hue=0.2)([[[0.5] * 2 for _ in range(2)]])
+
+    def test_gaussian_blur_and_normalize(self):
+        blur = AI.GaussianBlur(3, sigma=(1.0, 1.0), seed=1)
+        const = [[[1.5] * 5 for _ in range(5)] for _ in range(2)]
+        assert all(abs(v - 1.5) < 1e-12 for ch in blur(const) for row in ch for v in row)
+        d = [[[0.0] * 7 for _ in range(7)]]
+        d[0][3][3] = 1.0
+        bd = blur(d)
+        assert abs(sum(v for ch in bd for row in ch for v in row) - 1.0) < 1e-9
+        assert abs(bd[0][2][3] - bd[0][4][3]) < 1e-12
+        with pytest.raises(ValueError):
+            AI.GaussianBlur(4)
+        with pytest.raises(ValueError):
+            AI.GaussianBlur(3, sigma=(0.0, 1.0))
+        n = AI.Normalize([0.5, 1.0], [0.5, 2.0])
+        assert n([[[0.5, 1.0]], [[1.0, 3.0]]]) == [[[0.0, 1.0]], [[0.0, 1.0]]]
+        with pytest.raises(ValueError):
+            n([[[0.0, 1.0]]])
+        with pytest.raises(ValueError):
+            AI.Normalize([0.0, 1.0], [1.0])
+        with pytest.raises(ValueError):
+            AI.Normalize([0.0], [0.0])
+
+    def test_aug_input_validation_and_pipeline(self):
+        for bad in ([], [[]], [[[1.0], [2.0, 3.0]]]):
+            with pytest.raises(ValueError):
+                AI._aug3_check(bad, "t")
+        with pytest.raises(TypeError):
+            AI._aug3_check([[[True]]], "t")
+
+        def build():
+            return AI.Compose([
+                AI.ColorJitter(brightness=0.2, contrast=0.2, seed=4),
+                AI.RandomCrop((8, 8), seed=4),
+                AI.RandomRotation(15.0, seed=4),
+                AI.GaussianBlur(3, sigma=(0.3, 0.8), seed=4),
+                AI.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ])
+
+        src = [[[0.5 + 0.01 * (i - j) for j in range(10)] for i in range(10)]
+               for _ in range(3)]
+        pipe = build()
+        out = pipe(src)
+        assert len(out) == 3 and len(out[0]) == 8 and len(out[0][0]) == 8
+        assert build()(src) == out
+        assert pipe(src) != out
+        assert src[0][0][0] == 0.5 and len(src[0]) == 10
