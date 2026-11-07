@@ -574,6 +574,7 @@
   - `IVFIndex`（k-means++ 初始化 + 只在最近 `n_probe` 个簇内扫描，全探测时与暴力完全一致）
   - `NSWIndex`：**单层**近邻图 + 贪心束搜索，不是分层 HNSW（没有层级/启发式剪枝），构造数据上 recall@5 到 1.0；探针 32 项
 - [ ] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
+  - 语音前端已完成：`mel_filterbank` / `frame_signal` / `dft_power`（朴素 DFT）/ `log_mel_spectrogram` / `dct_matrix` / `mfcc`；`ConformerBlock` 只做前向，无 GLU / 相对位置 / 手写反向；探针 34 项
 
 ### W18 测试与数值稳定性（§15，贯穿各波）
 - [ ] `grad_check_all(model, ...)`：自动遍历所有带参数的子模块

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1609 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1618 项）
 
 ## 特性
 
@@ -2126,6 +2126,41 @@ print(AI.retrieval_recall(truth, [i for i, _ in nsw.search(q, k=5)]))
   在 18 个点/3 簇的构造数据上 recall@5 能到 1.0，但不要把它当生产级 ANN。
 - 三个索引都只支持「先批量 `add` 再查」，没有删除、没有持久化、没有多线程。
 
+### 语音前端与 Conformer（W17-E-1）
+
+| 接口 | 说明 |
+|------|------|
+| `hz_to_mel(f)` / `mel_to_hz(m)` | HTK 梅尔刻度（`2595·log10(1+f/700)` 及其反变换） |
+| `mel_filterbank(sample_rate=16000, n_fft=256, n_mels=8, fmin=0.0, fmax=None)` | `(n_mels, n_fft//2+1)` 三角滤波器组 |
+| `frame_signal(samples, frame_length=32, hop_length=8, pad=True)` | 一维采样切帧 |
+| `dft_power(frame)` | **朴素 DFT** 的幅度谱（`n//2+1` 个频点，O(n²)） |
+| `log_mel_spectrogram(...)` | `log(梅尔能量 + eps)`，返回 `(帧数, n_mels)` |
+| `dct_matrix(n_mels=8, n_mfcc=4)` / `mfcc(...)` | 正交 DCT-II 与 MFCC |
+| `ConformerBlock(d_model=8, num_heads=2, kernel_size=3, expansion=2, seed=None)` | macaron FFN + 自注意力 + 卷积模块 + 后置 LayerNorm，**只有前向** |
+
+```python
+import AI, math
+
+sig = [math.sin(2 * math.pi * 4 * t / 32) for t in range(64)]
+spec = AI.log_mel_spectrogram(sig, sample_rate=8000, frame_length=32,
+                              hop_length=16, n_mels=4)
+feats = AI.mfcc(sig, sample_rate=8000, frame_length=32, hop_length=16,
+                n_mels=4, n_mfcc=3)
+
+block = AI.ConformerBlock(d_model=4, num_heads=2, seed=5)
+out = block.forward([[0.1 * t] * 4 for t in range(5)])
+```
+
+诚实边界：
+
+- `dft_power` 是**朴素 DFT**，不是 FFT：本库不引入数值库，语音前端只在小 `n_fft` 上跑，
+  O(n²) 的代价换来零依赖与可逐点核对。
+- 三角滤波按 FFT 频点**采样**，所以每个滤波器的峰值一般略小于 1（中心频率常落在两个
+  频点之间，实测 4 个滤波器峰值 0.77 / 0.90 / 0.99 / 0.99），这里不做归一化以免改变能量口径。
+- `ConformerBlock` 是**推理用**的简化实现：没有手写反向、没有 GLU、没有相对位置编码、
+  卷积模块只有 depthwise 3×3 + SiLU；它的价值是「结构跑得通、形状与归一化可断言」，
+  不是可训练的高性能 Conformer。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2542,7 +2577,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1609 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1618 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2750,6 +2785,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStyleTransfer` | Gram 闭式与二次齐次、提取器形状与参数量、`dL/dx` 对中心差分、风格迁移损失下降与 clamp、单步更新等于 `-lr*dL/dx`、9 处参数校验 |
 | `TestSuperResolutionDenoising` | 双线性形状与常量保持、噪声可复现与 `sigma=0`、SRCNN 参数量与两层权重中心差分、`fit` 降损、DnCNN 的 `denoise = 输入 − 噪声`、卷积权重中心差分、600 轮后重建误差小于带噪误差、13 处参数校验 |
 | `TestVectorRetrieval` | 暴力与手工扫描逐位一致、`ip` 度量与显式 id、k-means 三簇划分纯度、IVF 全探测等于暴力/单探测仍命中本簇、NSW recall@5 ≥ 0.8、`retrieval_recall` 取值、9 处参数校验 |
+| `TestSpeechFrontendConformer` | 梅尔刻度往返与单调、滤波器组形状/峰值/频点递增、切帧数量与偏移、DFT 常量与余弦闭式、log-mel 静音等于 `log(eps)`、DCT 正交性与 MFCC 形状、Conformer 形状/逐位置零均值/同种子复现、9 处参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2803,7 +2839,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1609 个单元测试
+├── test_ai.py       # 1618 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

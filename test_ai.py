@@ -24663,3 +24663,123 @@ class TestVectorRetrieval:
             AI.NSWIndex().search([0.0, 0.0])
         with pytest.raises(ValueError):
             AI.IVFIndex().search([0.0, 0.0])
+
+
+class TestSpeechFrontendConformer:
+    """W17-E-1：Mel 滤波器 / MFCC / 简化 Conformer 块。"""
+
+    def test_mel_scale_round_trip(self):
+        import math
+        for f in (0.0, 100.0, 1000.0, 8000.0):
+            assert abs(AI.mel_to_hz(AI.hz_to_mel(f)) - f) < 1e-6
+        assert AI.hz_to_mel(1000.0) > AI.hz_to_mel(500.0) > AI.hz_to_mel(0.0)
+        with pytest.raises(ValueError):
+            AI.hz_to_mel(-1.0)
+        with pytest.raises(ValueError):
+            AI.mel_to_hz(None)
+
+    def test_mel_filterbank_shape_and_monotone_peaks(self):
+        fb = AI.mel_filterbank(sample_rate=8000, n_fft=32, n_mels=4)
+        assert len(fb) == 4 and all(len(row) == 17 for row in fb)
+        assert all(v >= 0.0 for row in fb for v in row)
+        for row in fb:
+            assert 0.5 <= max(row) <= 1.0 + 1e-12
+            assert sum(row) > 0.0
+        peaks = [max(range(len(row)), key=lambda i: row[i]) for row in fb]
+        assert peaks == sorted(peaks)
+
+    def test_mel_filterbank_validation(self):
+        with pytest.raises(ValueError):
+            AI.mel_filterbank(n_mels=0)
+        with pytest.raises(ValueError):
+            AI.mel_filterbank(fmin=5000.0, fmax=100.0)
+        with pytest.raises(ValueError):
+            AI.mel_filterbank(fmax=9000.0)
+        with pytest.raises(ValueError):
+            AI.mel_filterbank(n_mels=64, n_fft=8)
+
+    def test_frame_signal_counts_and_offsets(self):
+        samples = [float(i) for i in range(10)]
+        frames = AI.frame_signal(samples, frame_length=4, hop_length=3)
+        assert len(frames) == 3
+        assert frames[0] == [0.0, 1.0, 2.0, 3.0]
+        assert frames[1] == [3.0, 4.0, 5.0, 6.0]
+        with pytest.raises(ValueError):
+            AI.frame_signal([], 4, 2)
+        with pytest.raises(ValueError):
+            AI.frame_signal(samples, 0, 2)
+        with pytest.raises(ValueError):
+            AI.frame_signal([1.0, 2.0], 4, 2)
+        with pytest.raises(ValueError):
+            AI.frame_signal(samples, 4, 2, pad="yes")
+
+    def test_dft_power_closed_form(self):
+        import math
+        mag = AI.dft_power([1.0] * 8)
+        assert abs(mag[0] - 8.0) < 1e-9
+        assert all(v < 1e-9 for v in mag[1:])
+        cos1 = [math.cos(2.0 * math.pi * t / 8.0) for t in range(8)]
+        mag1 = AI.dft_power(cos1)
+        assert max(range(len(mag1)), key=lambda i: mag1[i]) == 1
+        assert abs(mag1[1] - 4.0) < 1e-9
+        with pytest.raises(ValueError):
+            AI.dft_power([])
+
+    def test_log_mel_spectrogram_and_silence(self):
+        import math
+        sig = [math.sin(2.0 * math.pi * 4.0 * t / 32.0) for t in range(64)]
+        spec = AI.log_mel_spectrogram(sig, sample_rate=8000, frame_length=32,
+                                      hop_length=16, n_mels=4)
+        assert len(spec) >= 1 and len(spec[0]) == 4
+        assert all(v == v and abs(v) < 1e6 for row in spec for v in row)
+        sil = AI.log_mel_spectrogram([0.0] * 64, sample_rate=8000,
+                                     frame_length=32, hop_length=16, n_mels=4,
+                                     eps=1e-10)
+        assert all(abs(v - math.log(1e-10)) < 1e-9 for row in sil for v in row)
+        with pytest.raises(ValueError):
+            AI.log_mel_spectrogram(sig, eps=0.0)
+
+    def test_dct_matrix_and_mfcc(self):
+        mat = AI.dct_matrix(4, 3)
+        assert len(mat) == 3 and all(len(row) == 4 for row in mat)
+        for i in range(3):
+            for j in range(3):
+                dot = sum(mat[i][k] * mat[j][k] for k in range(4))
+                assert abs(dot - (1.0 if i == j else 0.0)) < 1e-12
+        import math
+        sig = [math.sin(2.0 * math.pi * 4.0 * t / 32.0) for t in range(64)]
+        spec = AI.log_mel_spectrogram(sig, sample_rate=8000, frame_length=32,
+                                      hop_length=16, n_mels=4)
+        feats = AI.mfcc(sig, sample_rate=8000, frame_length=32, hop_length=16,
+                        n_mels=4, n_mfcc=3)
+        assert len(feats) == len(spec) and len(feats[0]) == 3
+        with pytest.raises(ValueError):
+            AI.dct_matrix(4, 5)
+
+    def test_conformer_forward_shape_and_layernorm(self):
+        block = AI.ConformerBlock(d_model=4, num_heads=2, kernel_size=3, seed=5)
+        x = [[0.1 * (t + 1) + 0.01 * c for c in range(4)] for t in range(5)]
+        out = block.forward(x)
+        assert len(out) == 5 and all(len(row) == 4 for row in out)
+        assert all(v == v and abs(v) < 1e6 for row in out for v in row)
+        for row in out:
+            assert abs(sum(row) / 4.0) < 1e-9
+        assert block.param_count() > 0
+        again = AI.ConformerBlock(d_model=4, num_heads=2, kernel_size=3, seed=5)
+        out2 = again.forward(x)
+        for t in range(5):
+            for c in range(4):
+                assert abs(out[t][c] - out2[t][c]) < 1e-12
+
+    def test_conformer_validation(self):
+        block = AI.ConformerBlock(d_model=4, num_heads=2, seed=1)
+        with pytest.raises(ValueError):
+            AI.ConformerBlock(d_model=5, num_heads=2)
+        with pytest.raises(ValueError):
+            AI.ConformerBlock(kernel_size=4)
+        with pytest.raises(ValueError):
+            AI.ConformerBlock(d_model=0)
+        with pytest.raises(ValueError):
+            block.forward([])
+        with pytest.raises(ValueError):
+            block.forward([[1.0, 2.0]])

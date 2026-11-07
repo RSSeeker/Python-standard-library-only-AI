@@ -30528,6 +30528,279 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ========================================================================
+#  领域应用 W17-E-1：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+# ========================================================================
+
+
+def _w17e_samples(samples, who):
+    if not isinstance(samples, (list, tuple)) or not samples:
+        raise ValueError("%s: 采样点必须是非空数值列表" % who)
+    out = []
+    for v in samples:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("%s: 采样点必须是数字，收到 %r" % (who, v))
+        f = float(v)
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError("%s: 采样点必须是有限数" % who)
+        out.append(f)
+    return out
+
+
+def _w17e_pos_int(value, who, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("%s: %s 必须是整数" % (who, name))
+    if value < minimum:
+        raise ValueError("%s: %s 必须 >= %d" % (who, name, minimum))
+    return value
+
+
+def hz_to_mel(f):
+    """HTK 刻度：2595 * log10(1 + f/700)。"""
+    if isinstance(f, bool) or not isinstance(f, (int, float)):
+        raise ValueError("hz_to_mel: 频率必须是数字")
+    if f < 0:
+        raise ValueError("hz_to_mel: 频率不能为负")
+    return 2595.0 * math.log10(1.0 + float(f) / 700.0)
+
+
+def mel_to_hz(m):
+    """HTK 反变换：700 * (10^(m/2595) - 1)。"""
+    if isinstance(m, bool) or not isinstance(m, (int, float)):
+        raise ValueError("mel_to_hz: mel 值必须是数字")
+    return 700.0 * (10.0 ** (float(m) / 2595.0) - 1.0)
+
+
+def mel_filterbank(sample_rate=16000, n_fft=256, n_mels=8, fmin=0.0, fmax=None):
+    """返回 (n_mels, n_fft//2+1) 的三角滤波器组。
+
+    中心频率在 mel 刻度上等距；每个滤波器在本带上三角加权、带宽外为 0。
+    """
+    _w17e_pos_int(sample_rate, "mel_filterbank", "sample_rate")
+    _w17e_pos_int(n_fft, "mel_filterbank", "n_fft")
+    _w17e_pos_int(n_mels, "mel_filterbank", "n_mels")
+    if isinstance(fmin, bool) or not isinstance(fmin, (int, float)) or fmin < 0:
+        raise ValueError("mel_filterbank: fmin 必须是非负数字")
+    if fmax is None:
+        fmax = sample_rate / 2.0
+    if isinstance(fmax, bool) or not isinstance(fmax, (int, float)):
+        raise ValueError("mel_filterbank: fmax 必须是数字")
+    if not (fmax > fmin) or fmax > sample_rate / 2.0:
+        raise ValueError("mel_filterbank: 需要 fmin < fmax <= sample_rate/2")
+    m_lo = hz_to_mel(fmin)
+    m_hi = hz_to_mel(fmax)
+    mels = [m_lo + (m_hi - m_lo) * i / (n_mels + 1) for i in range(n_mels + 2)]
+    hz = [mel_to_hz(m) for m in mels]
+    n_bins = n_fft // 2 + 1
+    freqs = [i * float(sample_rate) / n_fft for i in range(n_bins)]
+    filters = []
+    for m in range(n_mels):
+        left, center, right = hz[m], hz[m + 1], hz[m + 2]
+        row = []
+        for f in freqs:
+            if f <= left or f >= right:
+                row.append(0.0)
+            elif f <= center:
+                row.append((f - left) / (center - left))
+            else:
+                row.append((right - f) / (right - center))
+        if max(row) <= 0.0:
+            raise ValueError(
+                "mel_filterbank: 第 %d 个滤波器没有可用频点（n_mels 相对 n_fft 太大）" % m)
+        filters.append(row)
+    return filters
+
+
+def frame_signal(samples, frame_length=32, hop_length=8, pad=True):
+    """把 1-D 采样切帧，返回 [(frame_length 个采样), ...]。"""
+    xs = _w17e_samples(samples, "frame_signal")
+    _w17e_pos_int(frame_length, "frame_signal", "frame_length")
+    _w17e_pos_int(hop_length, "frame_signal", "hop_length")
+    if not isinstance(pad, bool):
+        raise ValueError("frame_signal: pad 必须是 bool")
+    if len(xs) < frame_length:
+        raise ValueError("frame_signal: 采样数 %d 少于帧长 %d" % (len(xs), frame_length))
+    data = list(xs)
+    if pad:
+        need = frame_length + max(0, (len(xs) - frame_length) // hop_length) * hop_length
+        while len(data) < need:
+            data.append(0.0)
+    frames = []
+    pos = 0
+    while pos + frame_length <= len(data):
+        frames.append(data[pos:pos + frame_length])
+        pos += hop_length
+    return frames
+
+
+def dft_power(frame):
+    """朴素 DFT 的幅度谱（n//2+1 个频点）。
+
+    这是 O(n^2) 的直接求和，不是 FFT——本库不引入数值库，语音前端只在小 n_fft 上跑。
+    """
+    xs, n = _w17e_samples(frame, "dft_power"), None
+    n = len(xs)
+    n_bins = n // 2 + 1
+    out = []
+    for k in range(n_bins):
+        re = 0.0
+        im = 0.0
+        for t in range(n):
+            ang = -2.0 * math.pi * k * t / n
+            re += xs[t] * math.cos(ang)
+            im += xs[t] * math.sin(ang)
+        out.append(math.sqrt(re * re + im * im))
+    return out
+
+
+def log_mel_spectrogram(samples, sample_rate=16000, frame_length=32,
+                        hop_length=8, n_mels=8, fmin=0.0, fmax=None,
+                        eps=1e-10):
+    """log(梅尔滤波器组能量 + eps)，返回 (帧数, n_mels)。"""
+    frames = frame_signal(samples, frame_length, hop_length)
+    filters = mel_filterbank(sample_rate, frame_length, n_mels, fmin, fmax)
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+        raise ValueError("log_mel_spectrogram: eps 必须是正数")
+    out = []
+    for fr in frames:
+        power = dft_power(fr)
+        row = []
+        for m in range(n_mels):
+            acc = 0.0
+            for i in range(len(power)):
+                acc += filters[m][i] * power[i] * power[i]
+            row.append(math.log(acc + eps))
+        out.append(row)
+    return out
+
+
+def dct_matrix(n_mels=8, n_mfcc=4):
+    """正交 DCT-II 矩阵 (n_mfcc, n_mels)。"""
+    _w17e_pos_int(n_mels, "dct_matrix", "n_mels")
+    _w17e_pos_int(n_mfcc, "dct_matrix", "n_mfcc")
+    if n_mfcc > n_mels:
+        raise ValueError("dct_matrix: n_mfcc 不能大于 n_mels")
+    rows = []
+    for k in range(n_mfcc):
+        alpha = math.sqrt(1.0 / n_mels) if k == 0 else math.sqrt(2.0 / n_mels)
+        rows.append([alpha * math.cos(math.pi * k * (i + 0.5) / n_mels)
+                     for i in range(n_mels)])
+    return rows
+
+
+def mfcc(samples, sample_rate=16000, frame_length=32, hop_length=8,
+         n_mels=8, n_mfcc=4, fmin=0.0, fmax=None):
+    """MFCC：log-mel 谱再乘 DCT-II，返回 (帧数, n_mfcc)。"""
+    spec = log_mel_spectrogram(samples, sample_rate, frame_length, hop_length,
+                               n_mels, fmin, fmax)
+    mat = dct_matrix(n_mels, n_mfcc)
+    return [[sum(mat[k][i] * row[i] for i in range(n_mels)) for k in range(n_mfcc)]
+            for row in spec]
+
+
+class ConformerBlock:
+    """单层 Conformer 块（简化）：macaron FFN + 自注意力 + 卷积模块 + 后置 LayerNorm。
+
+    结构（每个子层都是 pre-norm + 残差）：
+        x += 0.5 * FFN1(LN(x));  x += MHA(LN(x));  x += Conv(LN(x));  x += 0.5 * FFN2(LN(x));
+        out = LN(x)
+
+    诚实说明：**只提供前向**（不做手写反向训练），卷积模块只用一个 same padding 的
+    depthwise 卷积 + SiLU，没有 GLU、没有相对位置编码、没有 batch norm。
+    """
+
+    def __init__(self, d_model=8, num_heads=2, kernel_size=3, expansion=2, seed=None):
+        _w17e_pos_int(d_model, "ConformerBlock", "d_model")
+        _w17e_pos_int(num_heads, "ConformerBlock", "num_heads")
+        _w17e_pos_int(kernel_size, "ConformerBlock", "kernel_size")
+        _w17e_pos_int(expansion, "ConformerBlock", "expansion")
+        if d_model % num_heads != 0:
+            raise ValueError("ConformerBlock: d_model 必须能被 num_heads 整除")
+        if kernel_size % 2 == 0:
+            raise ValueError("ConformerBlock: kernel_size 必须是正奇数（same padding）")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.kernel_size = kernel_size
+        self.expansion = expansion
+        hidden = d_model * expansion
+        if seed is not None:
+            state = random.getstate()
+            random.seed(seed)
+            try:
+                self._build(hidden)
+            finally:
+                random.setstate(state)
+        else:
+            self._build(hidden)
+
+    def _build(self, hidden):
+        d = self.d_model
+        self.norm_ff1 = LayerNorm(d)
+        self.norm_attn = LayerNorm(d)
+        self.norm_conv = LayerNorm(d)
+        self.norm_ff2 = LayerNorm(d)
+        self.norm_out = LayerNorm(d)
+        self.ff1_in = Layer(d, hidden, activation="silu")
+        self.ff1_out = Layer(hidden, d, activation="linear", is_output=True)
+        self.ff2_in = Layer(d, hidden, activation="silu")
+        self.ff2_out = Layer(hidden, d, activation="linear", is_output=True)
+        self.attn = MultiHeadAttention(d, self.num_heads)
+        self.conv = Conv1d(d, d, self.kernel_size, padding=self.kernel_size // 2)
+
+    def _ffn(self, x, first, second):
+        h = [first.forward(row) for row in x]
+        return [second.forward(row) for row in h]
+
+    def _conv_block(self, x):
+        """(T, d) -> (T, d)：转成 (d, T) 过 1D 卷积，逐元素 SiLU 后再转回来。"""
+        transposed = [[x[t][c] for t in range(len(x))] for c in range(self.d_model)]
+        mixed = self.conv.forward(transposed)
+        out = []
+        for t in range(len(x)):
+            row = []
+            for c in range(self.d_model):
+                v = mixed[c][t]
+                row.append(v * (1.0 / (1.0 + math.exp(-v))) if v > -30 else 0.0)
+            out.append(row)
+        return out
+
+    def param_count(self):
+        n = 0
+        for mod in (self.ff1_in, self.ff1_out, self.ff2_in, self.ff2_out):
+            n += mod.fan_in * mod.fan_out + mod.fan_out
+        n += 4 * self.attn.d_model * self.attn.d_model + 4 * self.attn.d_model
+        for plane in self.conv.weights:
+            for rows in plane:
+                n += len(rows)
+        n += len(self.conv.biases)
+        n += 5 * (2 * self.d_model)
+        return n
+
+    def forward(self, x_seq):
+        if not isinstance(x_seq, (list, tuple)) or not x_seq:
+            raise ValueError("ConformerBlock.forward: 输入必须是 (T, d_model) 的非空序列")
+        T = len(x_seq)
+        x = []
+        for row in x_seq:
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError("ConformerBlock.forward: 每个位置必须是长度 %d 的向量"
+                                 % self.d_model)
+            x.append([float(v) for v in row])
+        half = 0.5
+        f1 = self._ffn([self.norm_ff1.forward(row) for row in x],
+                       self.ff1_in, self.ff1_out)
+        x = [[x[t][c] + half * f1[t][c] for c in range(self.d_model)] for t in range(T)]
+        attn_in = [self.norm_attn.forward(row) for row in x]
+        attn_out = self.attn.forward(attn_in)
+        x = [[x[t][c] + attn_out[t][c] for c in range(self.d_model)] for t in range(T)]
+        conv_in = [self.norm_conv.forward(row) for row in x]
+        conv_out = self._conv_block(conv_in)
+        x = [[x[t][c] + conv_out[t][c] for c in range(self.d_model)] for t in range(T)]
+        f2 = self._ffn([self.norm_ff2.forward(row) for row in x],
+                       self.ff2_in, self.ff2_out)
+        x = [[x[t][c] + half * f2[t][c] for c in range(self.d_model)] for t in range(T)]
+        return [self.norm_out.forward(row) for row in x]
+
+# ========================================================================
 #  领域应用 W17-D：向量检索（暴力 / IVF / 单层 NSW 图）
 # ========================================================================
 
