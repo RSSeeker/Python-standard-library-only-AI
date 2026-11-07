@@ -28683,6 +28683,240 @@ def _img_range(data_range, who):
     return float(data_range)
 
 
+# ============================================================================
+#  一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+# ============================================================================
+
+def _cf_matrix(ratings, who, allow_none):
+    """校验评分矩阵（行=评分对象，列=评分者）。"""
+    if not isinstance(ratings, (list, tuple)) or not ratings:
+        raise ValueError(f"{who}: ratings 不能为空")
+    rows = []
+    width = None
+    for i, row in enumerate(ratings):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 行有 {len(row)} 个评分，与首行 {width} 个不一致")
+        vals = []
+        for j, v in enumerate(row):
+            if v is None:
+                if not allow_none:
+                    raise ValueError(f"{who}: ratings[{i}][{j}] 不能为 None")
+                vals.append(None)
+            else:
+                vals.append(_metric_label(v, f"{who}.ratings[{i}]", j))
+        rows.append(vals)
+    return rows, width
+
+
+def fleiss_kappa(ratings, categories=None) -> float:
+    """Fleiss' Kappa：多名评分者对同一批对象做**固定类别**标注的一致性。
+
+    `ratings` 行=对象、列=评分者，每行评分者数必须相同且不能有缺失；
+    `(P_bar - P_e) / (1 - P_e)`，1 为完全一致。
+    """
+    who = "fleiss_kappa"
+    rows, width = _cf_matrix(ratings, who, allow_none=False)
+    if width < 2:
+        raise ValueError(f"{who}: 至少需要 2 名评分者，收到 {width}")
+    if len(rows) < 1:
+        raise ValueError(f"{who}: 至少要有一个评分对象")
+    if categories is None:
+        seen = set()
+        for row in rows:
+            seen.update(row)
+        categories = sorted(seen)
+    else:
+        if not isinstance(categories, (list, tuple)) or not categories:
+            raise ValueError(f"{who}: categories 必须是非空列表")
+        categories = [_metric_label(v, who, i) for i, v in enumerate(categories)]
+        if len(set(categories)) != len(categories):
+            raise ValueError(f"{who}: categories 有重复值")
+    index = {}
+    for k, cat in enumerate(categories):
+        index[cat] = k
+    n_cat = len(categories)
+    totals = [0] * n_cat
+    p_items = []
+    n = float(width)
+    for i, row in enumerate(rows):
+        counts = [0] * n_cat
+        for v in row:
+            if v not in index:
+                raise ValueError(
+                    f"{who}: 第 {i} 行出现未声明的类别 {v!r}")
+            counts[index[v]] += 1
+        for k in range(n_cat):
+            totals[k] += counts[k]
+        sq = sum(c * c for c in counts)
+        p_items.append((sq - n) / (n * (n - 1.0)))
+    p_bar = sum(p_items) / float(len(p_items))
+    total = sum(totals)
+    p_e = sum((t / float(total)) ** 2 for t in totals)
+    if abs(1.0 - p_e) <= 1e-15:
+        raise ValueError(f"{who}: 所有评分都落在同一类别，kappa 无定义")
+    return (p_bar - p_e) / (1.0 - p_e)
+
+
+def _kr_delta(level, c, k, counts):
+    """Krippendorff 的距离函数 δ²(c, k)。"""
+    if c == k:
+        return 0.0
+    if level == "nominal":
+        return 1.0
+    if level == "interval":
+        return float((c - k) ** 2)
+    lo, hi = (c, k) if c < k else (k, c)
+    s = 0.0
+    for g in range(lo, hi + 1):
+        s += counts[g]
+    s -= (counts[lo] + counts[hi]) / 2.0
+    return s * s
+
+
+def krippendorff_alpha(ratings, level: str = "nominal") -> float:
+    """Krippendorff's Alpha：允许**缺失值**与不同对象评分者数不同的一致性。
+
+    `ratings` 行=对象、列=评分者，缺失写 `None`；`level` 支持
+    `'nominal'` / `'ordinal'` / `'interval'`。`1 - D_o/D_e`，1 为完全一致。
+    """
+    who = "krippendorff_alpha"
+    if level not in ("nominal", "ordinal", "interval"):
+        raise ValueError(
+            f"{who}: level 必须是 nominal/ordinal/interval，收到 {level!r}")
+    rows, width = _cf_matrix(ratings, who, allow_none=True)
+    values = set()
+    pairable = 0
+    for row in rows:
+        present = [v for v in row if v is not None]
+        if len(present) >= 2:
+            pairable += len(present)
+        values.update(present)
+    if len(values) < 2:
+        raise ValueError(f"{who}: 至少需要 2 个不同类别才能算 Alpha")
+    codes = sorted(values)
+    index = {}
+    for k, code in enumerate(codes):
+        index[code] = k
+    n_cat = len(codes)
+    coincidence = [[0.0] * n_cat for _ in range(n_cat)]
+    n_total = 0.0
+    for i, row in enumerate(rows):
+        present = [v for v in row if v is not None]
+        m = len(present)
+        if m < 2:
+            continue
+        share = 1.0 / (m - 1.0)
+        for a in range(m):
+            for b in range(m):
+                if a == b:
+                    continue
+                coincidence[index[present[a]]][index[present[b]]] += share
+        n_total += m
+    if n_total <= 0.0:
+        raise ValueError(f"{who}: 没有任何对象被至少两名评分者标注")
+    counts = [sum(coincidence[k]) for k in range(n_cat)]
+    sum_o = 0.0
+    for c in range(n_cat):
+        for k in range(n_cat):
+            d = _kr_delta(level, c, k, counts)
+            if d != 0.0:
+                sum_o += coincidence[c][k] * d
+    d_o = sum_o / n_total
+    sum_e = 0.0
+    denom = n_total * (n_total - 1.0)
+    for c in range(n_cat):
+        for k in range(n_cat):
+            d = _kr_delta(level, c, k, counts)
+            if d != 0.0:
+                sum_e += counts[c] * counts[k] * d
+    d_e = sum_e / denom
+    if d_e <= 0.0:
+        raise ValueError(f"{who}: 期望分歧为 0（所有值同类），Alpha 无定义")
+    return 1.0 - d_o / d_e
+
+
+def _fair_check(y, sensitive, who, tag):
+    if not isinstance(y, (list, tuple)) or not y:
+        raise ValueError(f"{who}: {tag} 不能为空")
+    if not isinstance(sensitive, (list, tuple)):
+        raise ValueError(f"{who}: sensitive 必须是列表")
+    if len(y) != len(sensitive):
+        raise ValueError(
+            f"{who}: {tag} 有 {len(y)} 个样本，sensitive 有 {len(sensitive)} 个")
+    return list(y), list(sensitive)
+
+
+def _fair_groups(sensitive, who):
+    groups = {}
+    for i, g in enumerate(sensitive):
+        if isinstance(g, (list, tuple, dict)):
+            raise ValueError(f"{who}: sensitive[{i}] 必须是可哈希的标量")
+        groups.setdefault(g, []).append(i)
+    if len(groups) < 2:
+        raise ValueError(f"{who}: 至少需要 2 个分组，收到 {len(groups)}")
+    return groups
+
+
+def _fair_rate(y, idx, positive, who):
+    hits = 0
+    for i in idx:
+        v = _metric_label(y[i], who, i)
+        if v == positive:
+            hits += 1
+    return hits / float(len(idx))
+
+
+def demographic_parity_difference(y_pred, sensitive, positive_label: int = 1) -> float:
+    """人口统计均等差：各分组正预测率的 `max − min`（0 为完全均等）。"""
+    who = "demographic_parity_difference"
+    y, s = _fair_check(y_pred, sensitive, who, "y_pred")
+    groups = _fair_groups(s, who)
+    pos = _metric_label(positive_label, who, 0)
+    rates = [_fair_rate(y, idx, pos, who) for idx in groups.values()]
+    return max(rates) - min(rates)
+
+
+def equal_opportunity_difference(y_true, y_pred, sensitive,
+                                 positive_label: int = 1) -> float:
+    """机会均等差：各分组**真阳率**的 `max − min`；无正样本的分组被跳过。"""
+    who = "equal_opportunity_difference"
+    yt, s1 = _fair_check(y_true, sensitive, who, "y_true")
+    yp, s2 = _fair_check(y_pred, sensitive, who, "y_pred")
+    groups = _fair_groups(s1, who)
+    pos = _metric_label(positive_label, who, 0)
+    tprs = []
+    for idx in groups.values():
+        positives = [i for i in idx
+                     if _metric_label(yt[i], who, i) == pos]
+        if not positives:
+            continue
+        hit = sum(1 for i in positives
+                  if _metric_label(yp[i], who, i) == pos)
+        tprs.append(hit / float(len(positives)))
+    if len(tprs) < 2:
+        raise ValueError(
+            f"{who}: 只有 {len(tprs)} 个分组含正样本，无法比较机会均等")
+    return max(tprs) - min(tprs)
+
+
+def disparate_impact_ratio(y_pred, sensitive, positive_label: int = 1) -> float:
+    """差别影响比：各分组正预测率的 `min / max`（0.8 以下常被视为有问题）。"""
+    who = "disparate_impact_ratio"
+    y, s = _fair_check(y_pred, sensitive, who, "y_pred")
+    groups = _fair_groups(s, who)
+    pos = _metric_label(positive_label, who, 0)
+    rates = [_fair_rate(y, idx, pos, who) for idx in groups.values()]
+    hi = max(rates)
+    if hi <= 0.0:
+        raise ValueError(f"{who}: 所有分组的正预测率都是 0，比值无定义")
+    return min(rates) / hi
+
+
 def psnr_score(a, b, data_range: float = 1.0) -> float:
     """PSNR = `10*log10(range²/MSE)`；完全相同时返回 `inf`。"""
     who = "psnr_score"

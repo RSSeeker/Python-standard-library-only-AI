@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1360 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1372 项）
 
 ## 特性
 
@@ -1374,6 +1374,36 @@ print(average_recall(gt, pred))                  # 1.0
 - **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
   10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
 
+### 一致性与公平性（W13-K）
+
+| 函数 | 说明 |
+|---|---|
+| `fleiss_kappa(ratings, categories=None)` | 多评分者固定类别一致性；行=对象列=评分者，不允许缺失 |
+| `krippendorff_alpha(ratings, level='nominal')` | 允许缺失（写 `None`）与评分者数不等；支持 nominal/ordinal/interval |
+| `demographic_parity_difference(y_pred, sensitive)` | 各组正预测率的 `max − min` |
+| `equal_opportunity_difference(y_true, y_pred, sensitive)` | 各组真阳率的 `max − min`，无正样本的分组被跳过 |
+| `disparate_impact_ratio(y_pred, sensitive)` | 各组正预测率的 `min / max`（0.8 以下常视为有问题） |
+
+```python
+print(fleiss_kappa([[0, 0, 0], [1, 1, 1], [0, 0, 1]]))        # 0.55
+print(krippendorff_alpha([[1, 1, 1], [2, 2, 2], [3, 3, 3]]))  # 1.0
+y_pred = [1, 1, 0, 0]
+print(demographic_parity_difference(y_pred, ["a", "a", "b", "b"]))    # 1.0
+print(equal_opportunity_difference([1, 0, 1, 0], y_pred,
+                                   ["a", "a", "b", "b"]))            # 1.0
+```
+
+口径说明：
+
+- 评分数据（`ratings`）的类别是**非负整数**索引，与库内其它指标的标签约定一致；
+  `fleiss_kappa` 要求每行评分者数相同且无缺失，`krippendorff_alpha` 用 `None` 表示
+  缺失、并跳过只被一名评分者标注的对象。
+- `krippendorff_alpha` 的重合矩阵按 `1/(mₐ−1)` 摊分，`ordinal` 距离用累积频次的中点差，
+  与 Krippendorff 原文一致（不是简化的「差多少级」）。
+- 三项公平性指标都是**描述性**的：只比较分组的率，不做显著性检验，也不推断因果。
+  `sensitive` 接受任意可哈希标量（`"male"`/0 都可以）；`equal_opportunity_difference`
+  要求至少两个分组含正样本，否则抛 `ValueError` 而不是返回 0 假装均等。
+
 ### 图像质量指标（W13-J）
 
 | 函数 | 说明 |
@@ -1819,7 +1849,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1360 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1372 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2000,6 +2030,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCalibrationMetrics` | ECE/MCE 手算、单列与两列等价、多分类、可靠性图结构与 quantile 分箱、十条非法输入 |
 | `TestDetectionMetrics` | IoU 手算、完美 AP、FP 在前的 2/3、阈值改变结果、mAP 与 mAP@[.5:.95]、AR 的 max_dets、八条非法输入 |
 | `TestImageQualityMetrics` | PSNR 的 inf/0dB/`data_range`、SSIM 与独立参考实现对照、MS-SSIM 两个尺度、FID 三种方差组合、KID 单调性、IS 的 1 与 2、十条非法输入 |
+| `TestConsistencyFairness` | Fleiss 完美 1.0 与 Fleiss(1971) 经典例 0.2199、两两相反 0、Krippendorff 单单位手算 0、三种 level 的参考值、缺失值、三项公平性手算与 0.8 边界、十条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2053,7 +2084,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1360 个单元测试
+├── test_ai.py       # 1372 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

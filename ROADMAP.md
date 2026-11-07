@@ -432,7 +432,16 @@
   - FID/KID 直接吃特征向量（无预训练 Inception）；FID 不做样本量校正，协方差维数 > `max_dim` 报错并提示先 PCA
   - KID 是无偏 MMD²，小样本可为负值（docstring 与 README 都写明）
   - 探针 35 项（SSIM 与独立参考实现逐窗口对照、FID 三种方差组合、KID 与参考 MMD 一致）
-- [ ] 一致性：Fleiss Kappa / Krippendorff Alpha；公平性：Demographic Parity / Equal Opportunity / Disparate Impact
+- [x] 一致性：Fleiss Kappa / Krippendorff Alpha；公平性：Demographic Parity / Equal Opportunity / Disparate Impact
+
+  - 已实现：`fleiss_kappa`（固定类别、不允许缺失）、`krippendorff_alpha`（`None` 缺失 +
+    nominal/ordinal/interval 三种距离，重合矩阵 `1/(mₐ−1)` 摊分）、
+    `demographic_parity_difference` / `equal_opportunity_difference` / `disparate_impact_ratio`。
+  - 三项公平性只是描述性比较，无显著性检验；`equal_opportunity_difference` 在
+    「含正样本的分组少于 2 个」时抛错而不是返回 0。
+  - 探针 52 项；`fleiss_kappa` 的 Fleiss(1971) 经典例手算核对为 **0.2199**（不是常被
+    引用的 0.210，那是另一张表），`krippendorff_alpha` 另写一份按定义直接枚举的方案做
+    独立参考对照。
 
 ### W14 可解释性（§10）
 - [ ] 归因：Saliency / Gradient×Input / SmoothGrad / IntegratedGradients / DeepLIFT（简化）

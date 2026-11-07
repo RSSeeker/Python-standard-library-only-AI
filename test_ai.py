@@ -21134,3 +21134,125 @@ class TestImageQualityMetrics:
             AI.inception_score([[1.5, -0.5]])
         with pytest.raises(ValueError):
             AI.inception_score([[0.0, 0.0]])
+
+class TestConsistencyFairness:
+    """W13-K：一致性与公平性指标。"""
+
+    @staticmethod
+    def _fleiss_classic():
+        counts = [
+            (0, 0, 0, 0, 14),
+            (0, 2, 6, 4, 2),
+            (0, 0, 3, 5, 6),
+            (0, 3, 9, 2, 0),
+            (2, 2, 8, 1, 1),
+            (7, 7, 0, 0, 0),
+            (3, 2, 6, 3, 0),
+            (2, 5, 6, 1, 0),
+            (6, 5, 2, 1, 0),
+            (0, 2, 2, 3, 7),
+        ]
+        out = []
+        for row in counts:
+            line = []
+            for cat, n in enumerate(row):
+                line.extend([cat] * n)
+            out.append(line)
+        return out
+
+    def test_fleiss_perfect(self):
+        data = [[0, 0, 0], [1, 1, 1], [0, 0, 0]]
+        assert abs(AI.fleiss_kappa(data) - 1.0) < 1e-12
+
+    def test_fleiss_classic_example(self):
+        # Fleiss (1971) 10 对象 / 14 评分者 / 5 类，手算 kappa = 0.2199
+        got = AI.fleiss_kappa(self._fleiss_classic())
+        assert abs(got - 0.21994628612658837) < 1e-12
+
+    def test_fleiss_two_category_zero(self):
+        # 每个对象 2 名评分者且完全相反 ⇒ P_bar = 0.5 = P_e ⇒ 0
+        data = [[0, 0], [0, 1], [1, 1], [0, 1]]
+        assert abs(AI.fleiss_kappa(data)) < 1e-12
+
+    def test_fleiss_validation(self):
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([[0, 1], [0, 1, 1]])
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([[0, None], [0, 1]])
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([[0], [1]])
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([])
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([[1, 1], [1, 1]])
+        with pytest.raises(ValueError):
+            AI.fleiss_kappa([[0, 2], [0, 2]], categories=[0, 1])
+
+    def test_krippendorff_perfect(self):
+        data = [[1, 1, 1], [2, 2, 2], [3, 3, 3]]
+        assert abs(AI.krippendorff_alpha(data) - 1.0) < 1e-12
+
+    def test_krippendorff_hand_case(self):
+        # 单个单位 {1,1,2,2}：D_o = D_e = 2/3 ⇒ 0
+        assert abs(AI.krippendorff_alpha([[1, 1, 2, 2]])) < 1e-12
+
+    def test_krippendorff_levels(self):
+        data = [[1, 2, 3], [1, 2, 4], [2, 2, 3]]
+        nominal = AI.krippendorff_alpha(data, level="nominal")
+        ordinal = AI.krippendorff_alpha(data, level="ordinal")
+        interval = AI.krippendorff_alpha(data, level="interval")
+        assert abs(nominal - (-0.1428571428571428)) < 1e-12
+        assert abs(ordinal - (-0.2962962962962963)) < 1e-12
+        assert abs(interval - (-0.2941176470588236)) < 1e-12
+
+    def test_krippendorff_missing(self):
+        data = [[1, 2, None, 3], [1, None, 3, 3], [2, 2, 3, None]]
+        assert abs(AI.krippendorff_alpha(data, level="nominal")
+                   - (-0.07692307692307687)) < 1e-12
+        assert abs(AI.krippendorff_alpha(data, level="interval")
+                   - (-0.28)) < 1e-12
+        # 只有一名评分者的单位被跳过
+        a1 = AI.krippendorff_alpha([[1, 2], [1, 2]])
+        a2 = AI.krippendorff_alpha([[1, 2], [1, 2], [3, None]])
+        assert abs(a1 - a2) < 1e-12
+
+    def test_krippendorff_validation(self):
+        with pytest.raises(ValueError):
+            AI.krippendorff_alpha([[1, 2], [1, 2]], level="ratio")
+        with pytest.raises(ValueError):
+            AI.krippendorff_alpha([[1, 1], [1, 1]])
+        with pytest.raises(ValueError):
+            AI.krippendorff_alpha([[None, None], [None, None]])
+        with pytest.raises(ValueError):
+            AI.krippendorff_alpha([])
+
+    def test_fairness_basic(self):
+        y_pred = [1, 1, 0, 0]
+        sensitive = ["a", "a", "b", "b"]
+        y_true = [1, 0, 1, 0]
+        assert abs(AI.demographic_parity_difference(y_pred, sensitive) - 1.0) < 1e-12
+        assert abs(AI.disparate_impact_ratio(y_pred, sensitive)) < 1e-12
+        assert abs(AI.equal_opportunity_difference(
+            y_true, y_pred, sensitive) - 1.0) < 1e-12
+
+    def test_fairness_eighty_percent_rule(self):
+        y_pred = [1, 1, 1, 1, 0, 1, 1, 1, 1, 1]
+        sensitive = ["a"] * 5 + ["b"] * 5
+        assert abs(AI.disparate_impact_ratio(y_pred, sensitive) - 0.8) < 1e-12
+        assert abs(AI.demographic_parity_difference(
+            y_pred, sensitive) - 0.2) < 1e-12
+
+    def test_fairness_validation(self):
+        with pytest.raises(ValueError):
+            AI.demographic_parity_difference([1, 0], ["a", "a"])
+        with pytest.raises(ValueError):
+            AI.demographic_parity_difference([1, 0, 1], ["a", "b"])
+        with pytest.raises(ValueError):
+            AI.demographic_parity_difference([], [])
+        with pytest.raises(ValueError):
+            AI.disparate_impact_ratio([0, 0, 0, 0], ["a", "a", "b", "b"])
+        with pytest.raises(ValueError):
+            AI.demographic_parity_difference([1, 0], [["a"], ["b"]])
+        with pytest.raises(ValueError):
+            AI.equal_opportunity_difference([1, 0, 0, 0], [1, 0, 0, 0],
+                                           ["a", "a", "b", "b"])
