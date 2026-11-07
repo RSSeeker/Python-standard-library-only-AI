@@ -514,7 +514,10 @@
   - `rotation_targets` / `rotate_image`（只有 90 度整数倍，非方图只能 0/180）/`rotation_classifier_head` / `rotation_loss`
   - `jigsaw_permutations`（保证非恒等、互不相同，凑不够时明确报错）/`jigsaw_shuffle` / `linear_probe_accuracy`
   - 只提供任务构造与评估，不内置训练循环；探针 42 项，测试 `TestPredictiveSelfSupervision` 7 例
-- [ ] RL 环境：`GridWorld` / `CartPole`（内置）
+- [x] RL 环境：`GridWorld` / `CartPole`（内置）
+  - `GridWorld`：撞墙原地不动但照扣 `step_reward`、到达 goal 给 `goal_reward`、超过 `max_steps` 标 `truncated`
+  - `CartPole`：显式欧拉 + Gym 原始常数，探针里用**独立重算**核对第一步的 `x`/`x_dot`（差 0.000e+00）
+  - 附带 `discounted_returns` 与 `rollout`；测试 `TestRLEnvironments` 8 例
 - [ ] RL 算法：DQN / Double / Dueling / Rainbow（简化）/ REINFORCE / A2C / PPO / SAC / TD3 / DDPG
 - [ ] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型
 - [ ] 元学习：MAML / Reptile / ProtoNet / Matching Networks

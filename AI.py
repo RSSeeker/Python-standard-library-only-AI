@@ -29206,6 +29206,256 @@ def linear_probe_accuracy(scores, labels):
     return hit / len(scores)
 
 # ============================================================================
+#  RL 环境（W16-E：GridWorld / CartPole）
+# ============================================================================
+
+class GridWorld:
+    """最小网格世界：连续动作 0=上 1=右 2=下 3=左。
+
+    state 是 ``(row, col)``；撞墙或越界原地不动（仍然扣一步的 ``step_reward``）；
+    到达 ``goal`` 得 ``goal_reward`` 并结束；超过 ``max_steps`` 视为截断
+    （``info["truncated"] = True``）。
+    """
+
+    def __init__(self, height=5, width=5, start=(0, 0), goal=None,
+                 obstacles=None, max_steps=50, step_reward=-0.01,
+                 goal_reward=1.0, seed=None):
+        for name, v in (("height", height), ("width", width), ("max_steps", max_steps)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(
+                    f"GridWorld: {name} 必须是 >=1 的整数，收到 {v!r}")
+        self.height = height
+        self.width = width
+        self.max_steps = max_steps
+        if not isinstance(step_reward, (int, float)) or isinstance(step_reward, bool):
+            raise ValueError("GridWorld: step_reward 必须是数字")
+        if not isinstance(goal_reward, (int, float)) or isinstance(goal_reward, bool):
+            raise ValueError("GridWorld: goal_reward 必须是数字")
+        self.step_reward = float(step_reward)
+        self.goal_reward = float(goal_reward)
+
+        def cell(name, v):
+            if not isinstance(v, (list, tuple)) or len(v) != 2:
+                raise ValueError(f"GridWorld: {name} 必须是 (row, col)，收到 {v!r}")
+            r, c = v
+            for x in (r, c):
+                if not isinstance(x, int) or isinstance(x, bool):
+                    raise ValueError(f"GridWorld: {name} 的坐标必须是整数，收到 {v!r}")
+            if not (0 <= r < height and 0 <= c < width):
+                raise ValueError(
+                    f"GridWorld: {name}={v!r} 越界（网格 {height}x{width}）")
+            return (r, c)
+
+        self.start = cell("start", start)
+        self.goal = cell("goal", goal if goal is not None else (height - 1, width - 1))
+        if self.start == self.goal:
+            raise ValueError("GridWorld: start 与 goal 不能是同一个格子")
+        blocked = []
+        if obstacles is not None:
+            if not isinstance(obstacles, (list, tuple)):
+                raise ValueError("GridWorld: obstacles 必须是 (row, col) 的列表")
+            for i, o in enumerate(obstacles):
+                blocked.append(cell(f"obstacles[{i}]", o))
+        if self.start in blocked or self.goal in blocked:
+            raise ValueError("GridWorld: start / goal 不能落在障碍物上")
+        self.obstacles = blocked
+        self.rng = random.Random(seed)
+        self.state = self.start
+        self.steps = 0
+        self.observation_shape = (2,)
+        self.num_actions = 4
+
+    def reset(self, seed=None):
+        """回到起点并清零步数；给了 ``seed`` 就重置本地 RNG。"""
+        if seed is not None:
+            self.rng = random.Random(seed)
+        self.state = self.start
+        self.steps = 0
+        return self.state
+
+    def _move(self, state, action):
+        r, c = state
+        if action == 0:
+            r -= 1
+        elif action == 1:
+            c += 1
+        elif action == 2:
+            r += 1
+        elif action == 3:
+            c -= 1
+        return (r, c)
+
+    def step(self, action):
+        """返回 ``(state, reward, done, info)``。"""
+        if isinstance(action, bool) or not isinstance(action, int) \
+                or not (0 <= action < self.num_actions):
+            raise ValueError(
+                f"GridWorld.step: action 必须是 0..3 的整数，收到 {action!r}")
+        self.steps += 1
+        nxt = self._move(self.state, action)
+        r, c = nxt
+        if not (0 <= r < self.height and 0 <= c < self.width) or nxt in self.obstacles:
+            nxt = self.state
+        self.state = nxt
+        if nxt == self.goal:
+            return nxt, self.goal_reward, True, {"truncated": False, "steps": self.steps}
+        if self.steps >= self.max_steps:
+            return nxt, self.step_reward, True, {"truncated": True, "steps": self.steps}
+        return nxt, self.step_reward, False, {"truncated": False, "steps": self.steps}
+
+    def render(self):
+        """返回字符画：``S`` 起点、``G`` 终点、``#`` 障碍、``A`` 当前智能体。"""
+        lines = []
+        for r in range(self.height):
+            row = []
+            for c in range(self.width):
+                cell = (r, c)
+                if cell == self.state:
+                    row.append("A")
+                elif cell == self.goal:
+                    row.append("G")
+                elif cell in self.obstacles:
+                    row.append("#")
+                elif cell == self.start:
+                    row.append("S")
+                else:
+                    row.append(".")
+            lines.append("".join(row))
+        return "\n".join(lines)
+
+
+class CartPole:
+    """简化版 CartPole（离散动作 0=左推 1=右推），物理常数照 Gym 的原始取值。
+
+    state 是 ``(x, x_dot, theta, theta_dot)``；``theta`` 用弧度。每步奖励 1.0；
+    ``|x| > 2.4`` 或 ``|theta| > 12 度`` 结束，超过 ``max_steps`` 视为截断。
+    """
+
+    gravity = 9.8
+    masscart = 1.0
+    masspole = 0.1
+    total_mass = masscart + masspole
+    length = 0.5            # 半杆长
+    polemass_length = masspole * length
+    force_mag = 10.0
+    tau = 0.02
+    theta_threshold = 12 * 2 * math.pi / 360
+    x_threshold = 2.4
+
+    def __init__(self, max_steps=200, seed=None):
+        if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
+            raise ValueError(
+                f"CartPole: max_steps 必须是 >=1 的整数，收到 {max_steps!r}")
+        self.max_steps = max_steps
+        self.rng = random.Random(seed)
+        self.state = [0.0, 0.0, 0.0, 0.0]
+        self.steps = 0
+        self.observation_shape = (4,)
+        self.num_actions = 2
+        self.reset(seed)
+
+    def reset(self, seed=None):
+        """随机初始化到 ±0.05 的小区间内，返回新 state。"""
+        if seed is not None:
+            self.rng = random.Random(seed)
+        self.state = [self.rng.uniform(-0.05, 0.05) for _ in range(4)]
+        self.steps = 0
+        return list(self.state)
+
+    def step(self, action):
+        """返回 ``(state, reward, done, info)``；物理更新照 Gym CartPole 的显式欧拉。"""
+        if isinstance(action, bool) or not isinstance(action, int) \
+                or not (0 <= action < self.num_actions):
+            raise ValueError(
+                f"CartPole.step: action 必须是 0 或 1，收到 {action!r}")
+        x, x_dot, theta, theta_dot = self.state
+        force = self.force_mag if action == 1 else -self.force_mag
+        costheta = math.cos(theta)
+        sintheta = math.sin(theta)
+        temp = (force + self.polemass_length * theta_dot ** 2 * sintheta) / self.total_mass
+        thetaacc = (self.gravity * sintheta - costheta * temp) / (
+            self.length * (4.0 / 3.0
+                           - self.masspole * costheta ** 2 / self.total_mass))
+        xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
+        x = x + self.tau * x_dot
+        x_dot = x_dot + self.tau * xacc
+        theta = theta + self.tau * theta_dot
+        theta_dot = theta_dot + self.tau * thetaacc
+        self.state = [x, x_dot, theta, theta_dot]
+        self.steps += 1
+        failed = (abs(x) > self.x_threshold
+                  or abs(theta) > self.theta_threshold)
+        if failed:
+            return list(self.state), 1.0, True, {"truncated": False, "steps": self.steps}
+        if self.steps >= self.max_steps:
+            return list(self.state), 1.0, True, {"truncated": True, "steps": self.steps}
+        return list(self.state), 1.0, False, {"truncated": False, "steps": self.steps}
+
+    def render(self):
+        """极简字符画：杆子倾斜用 ``/`` 或 ``\\`` 表示，小车用 ``[ ]``。"""
+        theta = self.state[2]
+        if abs(theta) < 0.05:
+            pole = "|"
+        elif theta > 0:
+            pole = "/"
+        else:
+            pole = "\\"
+        pos = int(round((self.state[0] + self.x_threshold) / (2 * self.x_threshold) * 10))
+        pos = max(0, min(10, pos))
+        line = [" "] * 11
+        line[pos] = pole
+        return "".join(line) + "\n[ ]".ljust(11)
+
+
+def discounted_returns(rewards, gamma=0.99):
+    """从回报序列算折现回报 ``G_t = r_t + gamma*r_{t+1} + ...``（就地反向累加）。"""
+    if not isinstance(rewards, (list, tuple)) or not rewards:
+        raise ValueError("discounted_returns: rewards 必须是非空列表")
+    if not isinstance(gamma, (int, float)) or isinstance(gamma, bool) \
+            or not (0.0 <= gamma <= 1.0):
+        raise ValueError(f"discounted_returns: gamma 必须在 [0,1] 内，收到 {gamma!r}")
+    out = [0.0] * len(rewards)
+    acc = 0.0
+    for t in range(len(rewards) - 1, -1, -1):
+        r = rewards[t]
+        if isinstance(r, bool) or not isinstance(r, (int, float)):
+            raise ValueError(f"discounted_returns: rewards[{t}] 不是数字：{r!r}")
+        acc = float(r) + gamma * acc
+        out[t] = acc
+    return out
+
+
+def rollout(env, policy, max_steps=None):
+    """跑一条轨迹，返回 ``{"states", "actions", "rewards", "dones"}``。
+
+    ``policy`` 是 ``state -> action`` 的可调用对象（随机策略就传 lambda）。
+    """
+    if not callable(policy):
+        raise ValueError("rollout: policy 必须可调用")
+    if max_steps is not None:
+        if not isinstance(max_steps, int) or isinstance(max_steps, bool) \
+                or max_steps < 1:
+            raise ValueError(
+                f"rollout: max_steps 必须是 >=1 的整数或 None，收到 {max_steps!r}")
+    state = env.reset()
+    states = [list(state) if isinstance(state, (list, tuple)) else state]
+    actions = []
+    rewards = []
+    dones = []
+    limit = max_steps if max_steps is not None else getattr(env, "max_steps", 1000)
+    for _ in range(limit):
+        action = policy(states[-1])
+        state, reward, done, _info = env.step(action)
+        actions.append(action)
+        rewards.append(reward)
+        dones.append(bool(done))
+        states.append(list(state) if isinstance(state, (list, tuple)) else state)
+        if done:
+            break
+    return {"states": states, "actions": actions,
+            "rewards": rewards, "dones": dones}
+
+# ============================================================================
 #  自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
 # ============================================================================
 

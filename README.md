@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1497 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1505 项）
 
 ## 特性
 
@@ -1767,6 +1767,24 @@ perms = AI.jigsaw_permutations(9, 8, seed=0) # 8 种固定排列当 8 分类
 
 三条边界：`rotate_image` 不做插值（只有 90 度的整数倍，像素严格搬移）；`jigsaw_permutations` 最多能给出 `n! - 1` 个不同排列，要不到那么多会明确报错而不是死循环；`linear_probe_accuracy` 只评估给定得分矩阵，不训练任何东西。
 
+### 内置强化学习环境（W16-E）
+
+| API | 说明 |
+| --- | --- |
+| `GridWorld(height=5, width=5, start=(0,0), goal=None, obstacles=None, max_steps=50, step_reward=-0.01, goal_reward=1.0, seed=None)` | 网格世界，动作 0/1/2/3 = 上/右/下/左；撞墙原地不动仍扣分 |
+| `CartPole(max_steps=200, seed=None)` | 离散推杆，物理常数照 Gym 原始取值 |
+| 两个环境的 `reset(seed=None)` / `step(action)` / `render()` | `step` 返回 `(state, reward, done, info)`，`info` 带 `steps` 与 `truncated` |
+| `discounted_returns(rewards, gamma=0.99)` | 折现回报 `G_t = r_t + γ r_{t+1} + ...` |
+| `rollout(env, policy, max_steps=None)` | 跑一条轨迹，返回 `states` / `actions` / `rewards` / `dones` |
+
+```python
+env = AI.GridWorld(5, 5, (0, 0), (4, 4), obstacles=[(2, 2)], max_steps=30)
+traj = AI.rollout(env, lambda s: 1 if s[1] < 4 else 2)
+print(env.render(), AI.discounted_returns(traj["rewards"], 0.9)[:3])
+```
+
+三条边界：`GridWorld` 是**确定性**环境（没有随机转移，随机性只在重置 RNG 上）；`CartPole` 用显式欧拉步进，常数与 Gym 一致，但**不带**它的 seed 兼容保证；`rollout` 只在 `done` 时提前停，不做 `max_steps` 之外的截断判断。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2183,7 +2201,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1497 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1505 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2379,6 +2397,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMaskedVisionModeling` | patchify/unpatchify 往返、掩码数量与可复现、`mask_ratio=0` 不遮、块状掩码一致性、三种损失的闭式值与梯度行和、参数校验 |
 | `TestMultimodal` | CLIP 相似度/损失手算、两侧梯度对中心差分（<1e-6）、检索准确率、投影头 30 步 SGD 降 loss、跨模态融合块两侧梯度对中心差分（<1e-5）、单 key 时 `W_q` 梯度为 0 |
 | `TestPredictiveSelfSupervision` | 旋转标签分布与复现、四次旋转的像素位置与 `k` 取模、非方图限制、Jigsaw 排列合法性、线性头与交叉熵、线性探针命中率 |
+| `TestRLEnvironments` | GridWorld 移动/撞墙/目标奖励/步数截断/障碍与坐标校验、渲染字符、CartPole 状态范围与物理独立重算（1e-12）、折现回报手算、rollout 长度与提前终止 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2432,7 +2451,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1497 个单元测试
+├── test_ai.py       # 1505 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

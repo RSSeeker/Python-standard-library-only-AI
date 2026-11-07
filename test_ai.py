@@ -22838,3 +22838,107 @@ class TestPredictiveSelfSupervision:
             AI.linear_probe_accuracy(scores, [0])
         with pytest.raises(ValueError):
             AI.linear_probe_accuracy([[1.0, None]], [0])
+class TestRLEnvironments:
+    """W16-E：内置环境（GridWorld / CartPole）+ 回报与 rollout 工具。"""
+
+    def test_gridworld_basics(self):
+        env = AI.GridWorld(height=3, width=3, start=(0, 0), goal=(2, 2), max_steps=10)
+        assert env.reset() == (0, 0)
+        state, reward, done, info = env.step(1)
+        assert state == (0, 1)
+        assert not done and abs(reward + 0.01) < 1e-12
+        assert info["steps"] == 1 and info["truncated"] is False
+        state, reward, done, _ = env.step(0)
+        assert state == (0, 1) and abs(reward + 0.01) < 1e-12
+        with pytest.raises(ValueError):
+            env.step(4)
+        with pytest.raises(ValueError):
+            env.step("up")
+
+    def test_gridworld_goal_and_truncation(self):
+        env = AI.GridWorld(height=3, width=3, start=(0, 0), goal=(0, 2), max_steps=10)
+        env.reset()
+        env.step(1)
+        state, reward, done, info = env.step(1)
+        assert state == (0, 2) and abs(reward - 1.0) < 1e-12
+        assert done and info["truncated"] is False
+        env2 = AI.GridWorld(height=3, width=3, start=(0, 0), goal=(2, 2), max_steps=3)
+        env2.reset()
+        for _ in range(3):
+            _, _, done, info = env2.step(0)
+        assert done and info["truncated"] is True and info["steps"] == 3
+
+    def test_gridworld_validation(self):
+        env = AI.GridWorld(3, 3, (0, 0), (2, 2), None, 5, -0.01, 1.0, None)
+        assert env.reset() == (0, 0)
+        env = AI.GridWorld(3, 3, (0, 0), (2, 2), [(0, 1)], 5)
+        env.reset()
+        assert env.step(1)[0] == (0, 0)
+        with pytest.raises(ValueError):
+            AI.GridWorld(3, 3, (0, 0), (2, 2), [(0, 0)])
+        with pytest.raises(ValueError):
+            AI.GridWorld(3, 3, (5, 0), (2, 2))
+        with pytest.raises(ValueError):
+            AI.GridWorld(3, 3, (1, 1), (1, 1))
+        with pytest.raises(ValueError):
+            AI.GridWorld(0, 3)
+        with pytest.raises(ValueError):
+            AI.GridWorld(3, 3, (0, 0), (2, 2), None, 5, "x", 1.0)
+
+    def test_gridworld_render(self):
+        env = AI.GridWorld(3, 3, (0, 0), (2, 2), [(1, 1)], 5)
+        lines = env.render().split("\n")
+        assert len(lines) == 3
+        assert lines[0][0] == "A" and lines[2][2] == "G" and lines[1][1] == "#"
+
+    def test_cartpole_reset_and_step(self):
+        cp = AI.CartPole(max_steps=200, seed=3)
+        state = cp.reset(seed=3)
+        assert len(state) == 4 and all(abs(v) <= 0.05 for v in state)
+        assert cp.reset(seed=3) == state
+        assert cp.reset(seed=4) != state
+        cp.reset(seed=3)
+        nxt, reward, done, _ = cp.step(1)
+        assert abs(reward - 1.0) < 1e-12 and not done
+        assert all(AI.math.isfinite(v) for v in nxt)
+        with pytest.raises(ValueError):
+            cp.step(2)
+        with pytest.raises(ValueError):
+            AI.CartPole(0)
+
+    def test_cartpole_physics_matches_reference(self):
+        cp = AI.CartPole(seed=1)
+        cp.reset(seed=1)
+        x0, xd0, th0, thd0 = cp.state
+        out, _, _, _ = cp.step(1)
+        force = 10.0
+        costheta = AI.math.cos(th0)
+        sintheta = AI.math.sin(th0)
+        temp = (force + cp.polemass_length * thd0 ** 2 * sintheta) / cp.total_mass
+        thetaacc = (cp.gravity * sintheta - costheta * temp) / (
+            cp.length * (4.0 / 3.0
+                         - cp.masspole * costheta ** 2 / cp.total_mass))
+        xacc = temp - cp.polemass_length * thetaacc * costheta / cp.total_mass
+        assert abs(out[0] - (x0 + cp.tau * xd0)) < 1e-12
+        assert abs(out[1] - (xd0 + cp.tau * xacc)) < 1e-12
+        assert out[1] > xd0
+
+    def test_discounted_returns(self):
+        G = AI.discounted_returns([1.0, 1.0, 1.0], gamma=0.5)
+        assert abs(G[0] - 1.75) < 1e-12 and abs(G[2] - 1.0) < 1e-12
+        assert abs(AI.discounted_returns([1.0, 2.0], 1.0)[0] - 3.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.discounted_returns([])
+        with pytest.raises(ValueError):
+            AI.discounted_returns([1.0], 1.5)
+
+    def test_rollout(self):
+        env = AI.GridWorld(2, 2, (0, 0), (0, 1), None, 5)
+        traj = AI.rollout(env, lambda s: 1)
+        assert len(traj["actions"]) == len(traj["rewards"]) == len(traj["dones"])
+        assert traj["dones"] == [True] and len(traj["actions"]) == 1
+        assert len(traj["states"]) == len(traj["actions"]) + 1
+        with pytest.raises(ValueError):
+            AI.rollout(env, 3)
+        with pytest.raises(ValueError):
+            AI.rollout(env, lambda s: 1, 0)
