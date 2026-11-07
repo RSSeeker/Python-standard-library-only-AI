@@ -26990,3 +26990,100 @@ class TestCaseStudies:
             AI.double_descent_curve(n_samples=1)
         with pytest.raises(ValueError):
             AI.double_descent_curve(noise=-0.1)
+
+
+class TestTrainAugment:
+    """W0 补完：`fit(train_augment=...)` 的批级增强回调。"""
+
+    def _data(self):
+        return [[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]], [0.0, 1.0, 0.5, 0.5]
+
+    def _model(self, seed=1, classes=1):
+        random.seed(seed)
+        if classes == 1:
+            return AI.Model(AI.MLP([2, 3, 1]), loss_fn="mse", optimizer="adam", lr=0.01)
+        return AI.Model(AI.MLP([2, 3, classes], activations=["relu", "softmax"]),
+                        loss_fn="cross_entropy", optimizer="adam", lr=0.01)
+
+    def test_default_is_bit_identical(self):
+        xs, ys = self._data()
+        a = self._model(5)
+        h1 = a.fit(x=xs, y=ys, epochs=3, batch_size=2, val_split=0.0, verbose=False, seed=9)
+        b = self._model(5)
+        h2 = b.fit(x=xs, y=ys, epochs=3, batch_size=2, val_split=0.0, verbose=False,
+                   seed=9, train_augment=None)
+        assert h1["train_loss"] == h2["train_loss"]
+        for i in range(len(a.model.layers)):
+            assert a.model.layers[i].weights == b.model.layers[i].weights
+            assert a.model.layers[i].biases == b.model.layers[i].biases
+
+    def test_callback_called_per_batch(self):
+        xs, ys = self._data()
+        seen = []
+
+        def hook(bxs, bys):
+            seen.append((len(bxs), list(bys)))
+            return bxs, bys
+
+        self._model(5).fit(x=xs, y=ys, epochs=2, batch_size=2, val_split=0.0,
+                           verbose=False, seed=9, train_augment=hook)
+        assert len(seen) == 4
+        assert [n for n, _ in seen] == [2, 2, 2, 2]
+        assert seen[0][1] == ys[0:2]
+
+    def test_matches_manual_preprocessing(self):
+        xs, ys = self._data()
+
+        def shift(bxs, bys):
+            return [[v + 1.0 for v in xb] for xb in bxs], list(bys)
+
+        aug = self._model(5)
+        h_aug = aug.fit(x=xs, y=ys, epochs=5, batch_size=4, val_split=0.0,
+                        verbose=False, seed=9, train_augment=shift)
+        manual = self._model(5)
+        h_ref = manual.fit(x=[[v + 1.0 for v in xb] for xb in xs], y=ys, epochs=5,
+                           batch_size=4, val_split=0.0, verbose=False, seed=9)
+        assert h_aug["train_loss"] == h_ref["train_loss"]
+
+    def test_composes_with_mixup(self):
+        xs, _ = self._data()
+        ys = [0, 1, 2, 2]
+
+        def shift(bxs, bys):
+            return [[v + 1.0 for v in xb] for xb in bxs], list(bys)
+
+        m1 = self._model(4, classes=3)
+        h1 = m1.fit(x=xs, y=ys, epochs=4, batch_size=2, val_split=0.0, verbose=False,
+                    seed=3, mixup_alpha=0.2, train_augment=shift)
+        m2 = self._model(4, classes=3)
+        h2 = m2.fit(x=[[v + 1.0 for v in xb] for xb in xs], y=ys, epochs=4, batch_size=2,
+                    val_split=0.0, verbose=False, seed=3, mixup_alpha=0.2)
+        assert h1["train_loss"] == h2["train_loss"]
+
+    def test_composes_with_adversarial(self):
+        xs, ys = self._data()
+
+        def shift(bxs, bys):
+            return [[v + 1.0 for v in xb] for xb in bxs], list(bys)
+
+        m1 = self._model(6)
+        h1 = m1.fit(x=xs, y=ys, epochs=3, batch_size=2, val_split=0.0, verbose=False,
+                    seed=2, adv_eps=0.05, adv_steps=2, train_augment=shift)
+        m2 = self._model(6)
+        h2 = m2.fit(x=[[v + 1.0 for v in xb] for xb in xs], y=ys, epochs=3, batch_size=2,
+                    val_split=0.0, verbose=False, seed=2, adv_eps=0.05, adv_steps=2)
+        assert h1["train_loss"] == h2["train_loss"]
+
+    def test_rejects_bad_callable_and_shapes(self):
+        xs, ys = self._data()
+        with pytest.raises(ValueError):
+            self._model(5).fit(x=xs, y=ys, epochs=1, train_augment=3)
+        with pytest.raises(ValueError):
+            self._model(5).fit(x=xs, y=ys, epochs=1, val_split=0.0,
+                               train_augment=lambda a, b: a)
+        with pytest.raises(ValueError):
+            self._model(5).fit(x=xs, y=ys, epochs=1, val_split=0.0,
+                               train_augment=lambda a, b: (a[:1], b[:1]))
+        with pytest.raises(ValueError):
+            self._model(5).fit(x=xs, y=ys, epochs=1, val_split=0.0,
+                               train_augment=lambda a, b: (a, b[:1]))

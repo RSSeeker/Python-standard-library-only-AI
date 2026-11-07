@@ -45644,7 +45644,7 @@ class Model:
             checkpoint_path=None, checkpoint_every=1, grad_accum: int = 1,
             seed=None, callbacks=None, resume_from=None, mixup_alpha: float = 0.0,
             record_layer_norms: bool = False, adv_eps: float = 0.0,
-            adv_steps: int = 5, adv_alpha: float = None):
+            adv_steps: int = 5, adv_alpha: float = None, train_augment=None):
         """
         训练模型。
 
@@ -45685,7 +45685,18 @@ class Model:
                 数值与旧版完全一致。与 mixup_alpha 互斥
             adv_steps:    对抗攻击的步数（越大越强、越慢）
             adv_alpha:    对抗攻击每步步长（None = 2.5*adv_eps/adv_steps）
+            train_augment: 可选的批级数据增强回调 `fn(xs, ys) -> (xs, ys)`，
+                每个 batch 在 mixup / 对抗攻击**之前**调用一次，输入输出都是
+                「批内样本列表 + 标签列表」，样本数必须保持不变。默认 None
+                （关闭），关闭时数值与旧版完全一致。
+                用途：W11-C 的 `Compose`/`RandomCrop`/`ColorJitter` 等图像增强、
+                `augment_cutout`、或自定义的「x 加噪」——它们都是逐样本变换，
+                先增强再混合才符合 CutMix/Cutout 的语义（早先只接 mixup 的顺序
+                问题在这里解决）。
         """
+        if train_augment is not None and not callable(train_augment):
+            raise ValueError(
+                f"fit: train_augment 必须可调用，收到 {train_augment!r}")
         # === 规范化数据 ===
         if data is not None:
             dataset = [(list(x_i), y_i) for x_i, y_i in data]
@@ -45826,6 +45837,26 @@ class Model:
             pending_n = 0
             for b in range(0, len(dataset), batch_size):
                 batch = dataset[b:b + batch_size]
+                if train_augment is not None:
+                    # 逐样本增强必须在 mixup / 对抗攻击**之前**：Cutout、随机裁剪
+                    # 这类变换作用在单个样本上，先混合再增强会把两份样本的语义搅在一起。
+                    aug_x = [xi for xi, _ in batch]
+                    aug_y = [yi for _, yi in batch]
+                    out = train_augment(aug_x, aug_y)
+                    if not isinstance(out, tuple) or len(out) != 2:
+                        raise ValueError(
+                            "fit(train_augment): 必须返回 (xs, ys) 二元组，"
+                            f"收到 {type(out).__name__}")
+                    new_x, new_y = out
+                    if len(new_x) != len(aug_x):
+                        raise ValueError(
+                            "fit(train_augment): 样本数从 %d 变成 %d（不允许多删少补）"
+                            % (len(aug_x), len(new_x)))
+                    if len(new_y) != len(aug_y):
+                        raise ValueError(
+                            "fit(train_augment): 标签数从 %d 变成 %d（不允许多删少补）"
+                            % (len(aug_y), len(new_y)))
+                    batch = [(list(new_x[i]), new_y[i]) for i in range(len(aug_x))]
                 if mixup_alpha > 0.0:
                     batch = self._mixup_batch(batch, mixup_alpha, rng)
                 if adv_eps > 0.0:

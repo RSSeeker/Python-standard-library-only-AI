@@ -105,8 +105,8 @@
 - [x] 逐层梯度范数进 `history['layer_grad_norm']`（`record_layer_norms=True`，只记录不改训练）
 - [x] `activation_stats(model, x)` / `dead_units(model, x)`：逐层 mean/std/min/max/zero_ratio
       与死单元下标、比例
-- [ ] `fit(train_augment=...)`：**只接了 Mixup**（`mixup_alpha=`，分类 + 索引型损失）；
-      CutMix/Cutout 需要「先卷积再混合」的图像语义，随 W10 的增强族一起接
+- [x] `fit(train_augment=fn(xs, ys) -> (xs, ys))`：批级回调，**在 Mixup / PGD 之前**执行；
+      样本数必须不变，默认 None 时数值与旧版逐位相同；探针证明「增强 + mixup」与「手工预处理 + mixup」逐位一致，Cutout/CutMix 由此可按正确顺序接入（CutMix 需自定义回调）
 
 ### W1 损失：回归与偏好对齐（P0）
 - [x] 回归族：`l1_loss`、`log_cosh_loss`、`quantile_loss`（= pinball）、`smooth_l1`（= `huber_loss` 别名，逐位等价）（`c37cdf5`；梯度差分 ≤2.6e-10，`quantile(0.5)` 逐位等于 `l1/2`）
@@ -117,7 +117,7 @@
 - [x] 蒸馏：`distill_loss(student_logits, teacher_logits, T=2.0)`（`T²·KL`，对学生 logits 的梯度 `T·(p_s−p_t)`）+ `hint_loss(student_feat, teacher_feat, weight)`（隐藏层均方误差）；`_LOSS_MAP` 增 `'distill'`、输出层要求 `linear`（梯度差分 ≤9.4e-10，`T=1` 时与手算 KL 逐位一致）
 - [x] 类别不平衡族：`ohem_loss`（批级，不进 `Model`）、`class_balanced_loss`、`ldam_loss`；`soft_ce` **不再单独实现**——`cross_entropy_loss` 已支持任意软标签与 `label_smoothing`，再写一个只是重复（W1-B 提交；CB/LDAM 梯度差分 ≤3.5e-9）
 - [x] 多任务权重：`uncertainty_weighting`（Kendall，`d_log_vars = 1 - exp(-s_i)·L_i`）、`gradnorm_weights`（`target_i = Ḡ·r_i`，权重归一化均值 1；只有 `r_i ≡ 1` 时才有不动点，一般情形用返回的 `gradients = sign(G-target)·G0/r`）、`pcgrad`（两两冲突投影，嵌套 list 支持）；W1-E 提交，双向差分 worst_rel 1.54e-10，11 类非法输入全报错
-- [ ] 已有项标注：`huber_loss`（SmoothL1）、`kl_divergence`、`dice_loss`、`ctc_loss`、`triplet_loss`、`info_nce_loss`
+- [x] 已有项标注：`huber_loss`（SmoothL1）、`kl_divergence`、`dice_loss`、`ctc_loss`、`triplet_loss`、`info_nce_loss` —— README 损失表（约 725–734 行）逐条给了公式与适用场景，`smooth_l1_loss` 是 huber 的逐位等价别名
 
 ### W2 卷积与视觉块（P0/P1）
 - [x] `DepthwiseSeparableConv2d`（W2-B：`Conv2d(groups=C)` + 1×1 点卷积，参数量 `C·k·k + C + C·out + out`；dx 中心差分 ≤1e-8，`sgd_step`/`adam_step` 真改权重）
@@ -172,7 +172,7 @@
 - [x] `AttentionPooling`（`q` 可学，`q=0` 退化为平均；`dx`/`grad_q` 中心差分 ≤1e-9）、`GeMPooling`（`p=1` 平均 / `p=2` 均方根 / `p=2000` 仍不溢出，log 空间实现）
 
 ### W5 注意力与位置编码（P1/P2）
-- [ ] `MLA`（低秩 KV 压缩）；`MQA` 标注为 `num_kv_heads=1` 特例
+- [x] `MLA`（低秩 KV 压缩）由 `MLAttention` 承载（`T·d_c` 的 KV cache，见 W5 第 178 行）；`MQA` 是 `num_kv_heads=1` 特例，README 第 553–557 行写明
 - [x] `LearnedPositionalEncoding`（可学习位置编码表，`out=x+table`，`sgd_step`/`adam_step`，超长自动扩表）
 - [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（未实现 YaRN 的 mscale 温度，docstring 注明）
 - [x] `MLAttention`（MLA 简化版：低秩 KV 潜在向量 `d_c`，KV cache 从 `T·2·H·d_k` 降到 `T·d_c`；
