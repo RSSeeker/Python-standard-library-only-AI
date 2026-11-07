@@ -592,7 +592,15 @@
   - CI 用摘要常量当金标准（`TestBaselineSnapshot.GOLDEN`），不额外增加仓库文件；
     探针 50 项 + `TestBaselineSnapshot` 10 例。
   - 已知边界：不覆盖 BN/Dropout 随机状态、不做层间接口校验（分别由 `grad_check_all` 和集成测试负责）。
-- [ ] 集成测试（toy 数据集训练到达标）；doctest；属性测试（随机输入验证不变量）
+- [x] 集成测试（toy 数据集训练到达标）；doctest；属性测试（随机输入验证不变量）
+  - 集成：XOR 收敛到 1e-34、三分类 ≥95%、4→2→4 自编码器重建 1e-6、CausalLM loss < 0.0004、
+    `grad_check_all` 全过；踩过的坑是默认 `val_split=0.1` 会把 4 个样本里的 1 个切走，
+    导致「训练损失极小但有一个样本永远没学会」。
+  - doctest：`run_doctests`（带 `require_examples`，空模块报错而不是静默返回 0）+ 5 条示例；
+    另有一条故意写错示例的反例测试，断言确实被抓到（依赖 `sys.modules` 注册）。
+  - 属性测试：12 条不变量，固定 seed 的 `random.Random`，不引入第三方库。
+
+
 
 ### W19 工程化收尾（§14 剩余）
 - [ ] 实验追踪（JSON：配置/指标/曲线/耗时）；模型元数据（created_at/git_hash/config/metrics）

@@ -54,6 +54,7 @@
 #  23. Main: 回归 + 分类 + CNN 完整示例
 
 
+import doctest
 import hashlib
 import io
 import itertools
@@ -31114,6 +31115,99 @@ def baseline_model(layer_sizes=(3, 4, 2), seed=12345,
     return MLP(list(layer_sizes), activations=list(activations))
 
 
+# ==== W18-D：集成测试 / doctest / 属性测试的运行时支撑 ====
+
+def run_doctests(module=None, verbose=False, optionflags=None, require_examples=True):
+    """运行 docstring 里的 `>>>` 示例，返回 `{"attempted", "failed", "failures"}`。
+
+    `module` 省略时跑本模块（`AI`）。`failures` 是 `[(测试名, 失败数), ...]`，
+    便于定位是哪个函数的 docstring 坏了。CI 里加一条
+    `assert AI.run_doctests()["failed"] == 0` 就能防止文档示例腐烂。
+    """
+    if optionflags is None:
+        optionflags = doctest.ELLIPSIS
+    if isinstance(optionflags, bool) or not isinstance(optionflags, int):
+        raise TypeError("run_doctests: optionflags 必须是整数")
+    target = module if module is not None else sys.modules[__name__]
+    runner = doctest.DocTestRunner(verbose=bool(verbose), optionflags=optionflags)
+    failures = []
+    for test in doctest.DocTestFinder().find(target):
+        result = runner.run(test)
+        if result.failed:
+            failures.append((test.name, result.failed))
+    if require_examples and runner.tries == 0:
+        raise ValueError("run_doctests: 没有找到任何 doctest 示例"
+                         "（模块没注册进 sys.modules 也会这样）")
+    return {"attempted": runner.tries, "failed": runner.failures, "failures": failures}
+
+
+def _w18d_check_matrix(rows, who, width=None):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError("%s: 需要非空的二维列表" % who)
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("%s: 第 %d 行必须是 非空 list/tuple" % (who, i))
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 第 %d 行含非数字元素 %r" % (who, i, v))
+            vals.append(float(v))
+        if width is not None and len(vals) != width:
+            raise ValueError("%s: 第 %d 行长度 %d != %d" % (who, i, len(vals), width))
+        out.append(vals)
+    return out
+
+
+def check_probability_rows(probs, tolerance=1e-9):
+    """属性检查：每行都是概率分布（非负、和为 1），返回最大偏差。"""
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("check_probability_rows: tolerance 必须是数字")
+    if tolerance < 0:
+        raise ValueError("check_probability_rows: tolerance 不能为负")
+    rows = _w18d_check_matrix(probs, "check_probability_rows")
+    worst = 0.0
+    for i, row in enumerate(rows):
+        for v in row:
+            if v < -tolerance:
+                raise ValueError("check_probability_rows: 第 %d 行有负概率 %r" % (i, v))
+            worst = max(worst, abs(v - min(max(v, 0.0), 1.0)))
+        dev = abs(sum(row) - 1.0)
+        if dev > tolerance:
+            raise ValueError("check_probability_rows: 第 %d 行概率和偏离 1 达 %.3e" % (i, dev))
+        worst = max(worst, dev)
+    return worst
+
+
+def check_shape_consistency(model, x):
+    """属性检查：逐层 forward 的维度与声明一致，返回 (out, info)。
+
+    本库的 Layer.forward 吃**单个样本**（一维列表），因此这里逐样本跑完全部层，
+    逐层核对 len(输入) == fan_in 与 len(输出) == fan_out；任何一层不匹配
+    就抛 ValueError，并把已走过的层记录在 info 里（(样本号, 层号, 入, 出)）。
+    """
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if not isinstance(layers, list) or not layers:
+        raise TypeError("check_shape_consistency: 需要 MLP 或带 .layers 的模型")
+    rows = _w18d_check_matrix(x, "check_shape_consistency")
+    info = []
+    out = []
+    for r, sample in enumerate(rows):
+        cur = sample
+        for idx, layer in enumerate(layers):
+            if len(cur) != layer.fan_in:
+                raise ValueError("check_shape_consistency: 样本 %d 第 %d 层输入长度 %d != fan_in %d"
+                                 % (r, idx, len(cur), layer.fan_in))
+            nxt = layer.forward(cur)
+            if len(nxt) != layer.fan_out:
+                raise ValueError("check_shape_consistency: 样本 %d 第 %d 层输出长度 %d != fan_out %d"
+                                 % (r, idx, len(nxt), layer.fan_out))
+            info.append((r, idx, len(cur), len(nxt)))
+            cur = nxt
+        out.append(list(cur))
+    return out, info
+
 # ======================================================================
 #  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
 # ======================================================================
@@ -31983,7 +32077,11 @@ def _w17e_pos_int(value, who, name, minimum=1):
 
 
 def hz_to_mel(f):
-    """HTK 刻度：2595 * log10(1 + f/700)。"""
+    """HTK 刻度：2595 * log10(1 + f/700)。
+
+    >>> round(hz_to_mel(1000), 6)
+    999.985537
+    """
     if isinstance(f, bool) or not isinstance(f, (int, float)):
         raise ValueError("hz_to_mel: 频率必须是数字")
     if f < 0:
@@ -31992,7 +32090,11 @@ def hz_to_mel(f):
 
 
 def mel_to_hz(m):
-    """HTK 反变换：700 * (10^(m/2595) - 1)。"""
+    """HTK 反变换：700 * (10^(m/2595) - 1)。
+
+    >>> round(mel_to_hz(hz_to_mel(1000)), 6)
+    1000.0
+    """
     if isinstance(m, bool) or not isinstance(m, (int, float)):
         raise ValueError("mel_to_hz: mel 值必须是数字")
     return 700.0 * (10.0 ** (float(m) / 2595.0) - 1.0)
@@ -34874,7 +34976,11 @@ class CartPole:
 
 
 def discounted_returns(rewards, gamma=0.99):
-    """从回报序列算折现回报 ``G_t = r_t + gamma*r_{t+1} + ...``（就地反向累加）。"""
+    """从回报序列算折现回报 ``G_t = r_t + gamma*r_{t+1} + ...``（就地反向累加）。
+
+    >>> discounted_returns([1.0, 1.0, 1.0], 0.5)
+    [1.75, 1.5, 1.0]
+    """
     if not isinstance(rewards, (list, tuple)) or not rewards:
         raise ValueError("discounted_returns: rewards 必须是非空列表")
     if not isinstance(gamma, (int, float)) or isinstance(gamma, bool) \
@@ -38766,7 +38872,13 @@ def inception_score(probs, eps: float = 1e-12) -> float:
 
 
 def box_area(box) -> float:
-    """矩形面积（宽或高为 0 时返回 0）。"""
+    """矩形面积（宽或高为 0 时返回 0）。
+
+    >>> box_area([0.0, 0.0, 2.0, 3.0])
+    6.0
+    >>> box_area([1.0, 1.0, 1.0, 5.0])
+    0.0
+    """
     b = _det_box(box, "box_area", "box")
     return (b[2] - b[0]) * (b[3] - b[1])
 

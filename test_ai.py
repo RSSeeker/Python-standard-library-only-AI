@@ -25686,3 +25686,255 @@ class TestBaselineSnapshot:
             AI.load_snapshot(None)
         with pytest.raises(ValueError):
             AI.snapshot_digest({"forward": [[float("nan")]]})
+
+def _w18d_rng(seed):
+    return random.Random(seed)
+
+
+class TestIntegrationTraining:
+    """W18-D：toy 数据集端到端训练，确认「能学会」而不只是「不报错」。"""
+
+    def test_xor_reaches_low_loss(self):
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [0.0, 1.0, 1.0, 0.0]
+        model = AI.Model(AI.MLP([2, 8, 1], activations=["relu", "linear"]),
+                         loss_fn="mse", optimizer="adam", lr=0.05)
+        hist = model.fit(xs, ys, epochs=1500, batch_size=4, patience=2000,
+                         val_split=0.0, verbose=False)
+        losses = [pair[1] for pair in hist["train_loss"]]
+        assert losses[0] > losses[-1]
+        assert losses[-1] < 0.05
+        preds = [model.forward(x)[0] for x in xs]
+        assert preds[0] < 0.25 and preds[3] < 0.25
+        assert preds[1] > 0.75 and preds[2] > 0.75
+
+    def test_quick_train_classification(self):
+        rng = _w18d_rng(7)
+        xs, ys = [], []
+        for i in range(60):
+            label = i % 3
+            center = [[2.0, 0.0], [-2.0, 0.0], [0.0, 2.0]][label]
+            xs.append([center[0] + rng.uniform(-0.3, 0.3), center[1] + rng.uniform(-0.3, 0.3)])
+            ys.append(label)
+        model = AI.quick_train(xs, ys, task="classification", hidden_layers=(16,),
+                               epochs=120, lr=0.05, val_split=0.0, verbose=False, seed=3)
+        hits = 0
+        for x, y in zip(xs, ys):
+            out = model.forward(x)
+            pred = max(range(len(out)), key=lambda k: out[k])
+            hits += 1 if pred == y else 0
+        assert hits / len(xs) >= 0.95
+
+    def test_autoencoder_reconstruction(self):
+        rng = _w18d_rng(11)
+        xs = [[rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0), 0.0, 0.0]
+              for _ in range(24)]
+        model = AI.Model(AI.MLP([4, 2, 4], activations=["relu", "linear"]),
+                         loss_fn="mse", optimizer="adam", lr=0.02)
+        hist = model.fit(xs, xs, epochs=1500, batch_size=8, patience=3000,
+                         val_split=0.0, verbose=False)
+        assert hist["train_loss"][-1][1] < 1e-6
+        err = 0.0
+        for x in xs:
+            out = model.forward(x)
+            err += sum((a - b) ** 2 for a, b in zip(out, x)) / len(x)
+        assert err / len(xs) < 1e-6
+
+    def test_causal_lm_overfits_tiny_corpus(self):
+        AI.set_seed(5)
+        lm = AI.CausalLM(vocab_size=3, d_model=16, num_heads=2, num_layers=1, dropout=0.0)
+        corpus = [[0, 1, 2, 0, 1, 2]]
+        before = lm.evaluate(corpus)
+        lm.fit(corpus, epochs=60, lr=0.02)
+        after = lm.evaluate(corpus)
+        assert after < before
+        assert after < 0.1
+        gen = lm.generate([0], max_new_tokens=6, temperature=0.5)
+        assert len(gen) == 7
+        assert all(0 <= t < 3 for t in gen)
+
+    def test_grad_check_all_on_baseline(self):
+        model = AI.baseline_model()
+        report = AI.grad_check_all(model, eps=1e-6, tol=1e-4, seed=1)
+        assert report["failed"] == [], report["failed"]
+        assert report["ok"] is True
+        assert report["checked"] >= 2
+
+
+class TestDoctests:
+    """W18-D：docstring 里的示例必须一直可运行。"""
+
+    def test_run_doctests_all_pass(self):
+        result = AI.run_doctests()
+        assert result["failed"] == 0, result["failures"]
+        assert result["attempted"] >= 5
+
+    def test_run_doctests_rejects_bad_flags(self):
+        with pytest.raises(TypeError):
+            AI.run_doctests(optionflags=True)
+
+    def test_doctests_detect_broken_example(self):
+        import types as _types
+        mod = _types.ModuleType("w18d_broken")
+
+        def broken(value):
+            """故意写错的示例。
+
+            >>> broken(1)
+            999
+            """
+            return value
+
+        broken.__module__ = "w18d_broken"
+        mod.broken = broken
+        import sys as _sys
+        _sys.modules["w18d_broken"] = mod
+        try:
+            result = AI.run_doctests(mod)
+        finally:
+            _sys.modules.pop("w18d_broken", None)
+        assert result["failed"] == 1
+        assert result["failures"]
+        # 找不到任何示例时要报错，而不是静默返回 0
+        import types as _types2
+        empty = _types2.ModuleType("w18d_empty")
+        with pytest.raises(ValueError):
+            AI.run_doctests(empty)
+
+
+class TestInvariants:
+    """W18-D：随机输入下的不变量（属性测试，固定种子可复现）。"""
+
+    def test_softmax_is_distribution(self):
+        for seed in range(10):
+            rng = _w18d_rng(seed)
+            rows = [[rng.uniform(-30.0, 30.0) for _ in range(5)] for _ in range(4)]
+            probs = AI.softmax_rows(rows)
+            assert AI.check_probability_rows(probs) <= 1e-12
+
+    def test_mse_loss_properties(self):
+        rng = _w18d_rng(21)
+        for _ in range(10):
+            a = [rng.uniform(-2.0, 2.0) for _ in range(4)]
+            b = [rng.uniform(-2.0, 2.0) for _ in range(4)]
+            ab = AI.mse_loss(a, b)[0]
+            ba = AI.mse_loss(b, a)[0]
+            assert ab >= 0.0
+            assert abs(ab - ba) < 1e-15
+            assert AI.mse_loss(a, a)[0] == 0.0
+
+    def test_layernorm_zero_mean_unit_var(self):
+        rng = _w18d_rng(31)
+        norm = AI.LayerNorm(6)
+        for _ in range(10):
+            row = [rng.uniform(-3.0, 3.0) for _ in range(6)]
+            out = norm.forward(row)
+            mean = sum(out) / len(out)
+            var = sum((v - mean) ** 2 for v in out) / len(out)
+            assert abs(mean) < 1e-9
+            assert abs(var - 1.0) < 2e-3
+
+    def test_dropout_eval_is_identity(self):
+        rng = _w18d_rng(41)
+        for p in (0.0, 0.3, 0.9):
+            drop = AI.Dropout(p)
+            drop.eval()
+            for _ in range(5):
+                row = [rng.uniform(-1.0, 1.0) for _ in range(6)]
+                assert drop.forward(row) == row
+
+    def test_attention_is_causal(self):
+        AI.set_seed(9)
+        att = AI.MultiHeadAttention(4, 2, causal=True)
+        base = [[0.5, -0.2, 0.1, 0.7], [0.3, 0.9, -0.4, 0.2], [0.1, 0.2, 0.3, 0.4]]
+        out_a = att.forward(base)
+        from copy import deepcopy
+        moved = deepcopy(base)
+        moved[2] = [9.0, -9.0, 9.0, -9.0]
+        out_b = att.forward(moved)
+        assert out_a[0] == out_b[0]
+        assert out_a[1] == out_b[1]
+        assert out_a[2] != out_b[2]
+
+    def test_conv2d_output_shape_formula(self):
+        rng = _w18d_rng(51)
+        for _ in range(8):
+            k, s, p, d = rng.randint(1, 3), rng.randint(1, 2), rng.randint(0, 2), rng.randint(1, 2)
+            h, w = rng.randint(3, 6), rng.randint(3, 6)
+            conv = AI.Conv2d(2, 3, k, stride=s, padding=p, dilation=d)
+            x = [[[rng.uniform(-1.0, 1.0) for _ in range(w)] for _ in range(h)] for _ in range(2)]
+            out = conv.forward(x)
+            want_h = (h + 2 * p - d * (k - 1) - 1) // s + 1
+            want_w = (w + 2 * p - d * (k - 1) - 1) // s + 1
+            assert len(out) == 3
+            assert len(out[0]) == want_h and len(out[0][0]) == want_w
+
+    def test_maxpool2d_matches_window_max(self):
+        rng = _w18d_rng(61)
+        pool = AI.MaxPool2d(2, 2)
+        for _ in range(8):
+            img = [[[rng.uniform(-1.0, 1.0) for _ in range(4)] for _ in range(4)]]
+            out = pool.forward(img)
+            for i in range(2):
+                for j in range(2):
+                    win = [img[0][2 * i + a][2 * j + b] for a in range(2) for b in range(2)]
+                    assert out[0][i][j] == max(win)
+
+    def test_box_iou_bounds_and_symmetry(self):
+        rng = _w18d_rng(71)
+        for _ in range(10):
+            a = sorted([rng.uniform(0.0, 4.0), rng.uniform(0.0, 4.0)])
+            b = sorted([rng.uniform(0.0, 4.0), rng.uniform(0.0, 4.0)])
+            box_a = [a[0], a[0], a[1], a[1] + 1.0]
+            box_b = [b[0], b[0], b[1], b[1] + 1.0]
+            iou = AI.box_iou(box_a, box_b)
+            assert 0.0 <= iou <= 1.0
+            assert abs(iou - AI.box_iou(box_b, box_a)) < 1e-15
+            assert AI.box_iou(box_a, box_a) == 1.0
+
+    def test_standard_scaler_zero_mean(self):
+        rng = _w18d_rng(81)
+        rows = [[rng.uniform(-5.0, 5.0) for _ in range(3)] for _ in range(30)]
+        scaler = AI.StandardScaler()
+        scaled = scaler.fit(rows).transform(rows)
+        for j in range(3):
+            col = [r[j] for r in scaled]
+            assert abs(sum(col) / len(col)) < 1e-9
+
+    def test_gaussian_noise_sigma_zero_and_determinism(self):
+        img = [[[0.1, -0.2], [0.3, 0.4]]]
+        assert AI.add_gaussian_noise(img, sigma=0.0) == img
+        a = AI.add_gaussian_noise(img, sigma=0.1, seed=5)
+        b = AI.add_gaussian_noise(img, sigma=0.1, seed=5)
+        assert a == b
+        assert a != img
+
+    def test_kfold_partitions_all_indices(self):
+        n, k = 23, 4
+        for seed in (0, 1, 2):
+            folds = AI.k_fold_indices(n, n_splits=k, shuffle=True, seed=seed)
+            assert len(folds) == k
+            seen = []
+            for _, test_idx in folds:
+                seen.extend(test_idx)
+            assert sorted(seen) == list(range(n))
+
+    def test_pinball_loss_non_negative(self):
+        rng = _w18d_rng(91)
+        for _ in range(6):
+            ys = [rng.uniform(-2.0, 2.0) for _ in range(5)]
+            ps = [rng.uniform(-2.0, 2.0) for _ in range(5)]
+            for q in (0.1, 0.5, 0.9):
+                assert AI.mean_pinball_loss(ys, ps, q) >= 0.0
+            assert AI.mean_pinball_loss(ys, ys, 0.5) == 0.0
+
+    def test_check_shape_consistency_helper(self):
+        model = AI.baseline_model()
+        xs = [[0.1, -0.2, 0.3], [0.4, 0.5, -0.6]]
+        out, info = AI.check_shape_consistency(model, xs)
+        assert len(out) == 2 and len(out[0]) == 2
+        assert len(info) == 4
+        with pytest.raises(ValueError):
+            AI.check_shape_consistency(model, [[0.1, -0.2]])
+        with pytest.raises(TypeError):
+            AI.check_shape_consistency(object(), xs)

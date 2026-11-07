@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1676 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1697 项）
 
 ## 特性
 
@@ -2365,6 +2365,31 @@ print(AI.snapshot_digest(snap))
 - 快照不覆盖 BN/Dropout 的随机状态，也不检查层间接口约定——那两条分别由 `grad_check_all`
   和集成测试负责。
 
+### 集成测试 / doctest / 属性测试（W18-D）
+
+| API | 说明 |
+| --- | --- |
+| `run_doctests(module=None, verbose=False, optionflags=None, require_examples=True)` | 跑 docstring 里的 `>>>` 示例，返回 `{"attempted","failed","failures"}`；找不到示例时报错而不是静默返回 0 |
+| `check_probability_rows(probs, tolerance=1e-9)` | 每行必须是非负且和为 1 的概率分布，返回最大偏差 |
+| `check_shape_consistency(model, x)` | 逐层核对 `len(输入)==fan_in` 与 `len(输出)==fan_out`，返回 `(out, info)` |
+
+三层校验各管一段，别指望一个工具全包：
+
+- **集成测试**（`TestIntegrationTraining`）跑 toy 任务到「达标」而不只是「不报错」：
+  XOR 收敛到 1e-34、三分类 60 个样本 ≥95% 准确率、4→2→4 自编码器在 2 维子空间上重建到 1e-6、
+  `CausalLM` 在 `[0,1,2,0,1,2]` 上把 loss 压到 0.0004 以下、`grad_check_all` 对基线模型全过。
+  这些测试里 `val_split=0.0` 是**故意**的：4 个样本按默认 0.1 会切走 1 个当验证集，
+  于是那个样本永远学不到（我第一次写就成了这个假失败）。
+- **doctest**（`TestDoctests`）保证文档示例不腐烂：`hz_to_mel`/`mel_to_hz`/`box_area`/`discounted_returns`
+  的 `>>>` 示例都在 `AI.run_doctests()` 里跑；另有一条反例测试故意写错示例并断言 `failed == 1`，
+  证明这套机制真的会抓错。注意 `run_doctests` 依赖 `sys.modules` 里的模块名，
+  临时模块要自己注册进去。
+- **属性测试**（`TestInvariants`）对随机输入验证不变量，全部用固定 seed 的 `random.Random`，
+  不引入第三方库：softmax 行和、MSE 对称且非负、LayerNorm 零均值单位方差（受 eps 影响放 2e-3）、
+  Dropout 在 `eval()` 下恒等、**因果注意力下扰动后位 token 不影响前面输出**、Conv2d 输出形状公式、
+  MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
+  K 折划分恰好覆盖全部下标一次、pinball loss 非负。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2781,7 +2806,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1676 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1697 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2996,6 +3021,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGradCheckAll` | 遍历三层 MLP、Model 包装解包、同种子可复现、`max_params` 上限、故意破坏 `backward` 被定位到具体层、非 Layer 持有者进 `skipped`、零梯度归类、容器递归、空模型报错、11 条参数校验，共 10 例 |
 | `TestNumericalStability` | `numeric_scan` 嵌套计数、`assert_all_finite` 报错带标签、六类 case、五种 probe 判定（finite/nan/inf/raised/allow_inf）、softmax 的 ±inf 与 NaN、空损失 ValueError、NaN 输入拒绝、inf 溢出仍为 inf、六个真实入口契约、模型边界如实上报、参数校验，共 12 例 |
 | `TestBaselineSnapshot` | 回归基线快照：决定性、金标准摘要、读写往返、容差与结构差异判定 |
+| `TestIntegrationTraining` | 端到端训练到指标：XOR / 三分类 / 自编码器 / CausalLM / grad_check_all |
+| `TestDoctests` | docstring 示例可运行 + 反例确实被抓到 |
+| `TestInvariants` | 随机输入下的不变量（概率分布、形状、因果性、池化、IoU 等） |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3049,7 +3077,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1676 个单元测试
+├── test_ai.py       # 1697 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
