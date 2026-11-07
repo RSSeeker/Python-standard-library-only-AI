@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1217 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1228 项）
 
 ## 特性
 
@@ -902,6 +902,36 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
+### 缺失值填补（W11-F）
+
+三个填补器，输入是允许 `None` 的二维 list（`None` 表示缺失），输出新的二维 list：
+
+| 类 | 填补方式 | 说明 |
+|---|---|---|
+| `SimpleImputer(strategy='mean', fill_value=None)` | 每列一个统计量 | `mean` / `median` / `most_frequent` / `constant`（`constant` 必须给 `fill_value`） |
+| `KNNImputer(n_neighbors=5, weights='uniform')` | 最近的 k 个训练样本 | 只在**共同观测到**的列上算距离；`weights='distance'` 按 `1/(d+eps)` 加权；没有邻居共享任何观测列时退回该列 fit 均值 |
+| `IterativeImputer(max_iter=10, tol=1e-3, alpha=1e-6)` | 轮转岭回归 | 初始值取列均值，每轮对每列拟合 `target ~ 其他列`（特征标准化 + 岭惩罚），只把预测值写回**原本缺失**的位置；最大变化小于 `tol` 提前停，`n_iter_` 记录实际轮数 |
+
+```python
+imp = AI.SimpleImputer(strategy="median").fit(train_x)
+x_train = imp.transform(train_x)
+
+knn = AI.KNNImputer(n_neighbors=3).fit(train_x)
+x_test = knn.transform(test_x)              # 用训练集的邻居填补测试集
+
+iter_imp = AI.IterativeImputer(max_iter=20).fit(train_x)
+x_filled = iter_imp.transform(train_x)
+```
+
+诚实边界：
+
+- **整列全缺失**时 `mean` / `median` 填 `0.0`（不静默丢列）；`IterativeImputer` 对该列无法建模，
+  同样停在 `0.0`。
+- `IterativeImputer` 是**单变量轮转**近似，不是真正的多重填补：没有 `sample_posterior`，
+  也不给方差估计；每列观测样本少于 2 个时跳过该列。
+- 三个类都只认 `None` 作缺失标记；`float('nan')` 会被当成普通数字参与计算（要处理 NaN
+  请先自己换成 `None`）。
+
 ### Scaler 族（W11-E）
 
 四个按列变换器，接口与既有 `StandardScaler` / `MinMaxScaler` 一致：
@@ -1398,7 +1428,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1217 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1228 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1564,6 +1594,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
 | `TestSplitExtensions` | `GroupKFold` 的「同组不跨折」与折间均衡、时序切分的测试块位置/扩张与滚动窗口/`gap` 留空档、Purged K-Fold 的 `purge`+`embargo` 剔除区间、三类切分的参数校验、既有 `k_fold_indices` 不受影响 |
 | `TestScalerFamily` | `RobustScaler` 的中位数/IQR 闭式值与「不中心化/不缩放」开关、`MaxAbsScaler` 列最大绝对值、`QuantileTransformer` 的参考分位数与插值（整数点 k/9、中点 0.5、越界夹取）与正态模式往返、Yeo-Johnson 的 8×5 个 (λ, x) 格点往返、`PowerTransformer` 的标准化后均值/方差与两种 method 的往返、四类未 fit/坏形状/非数字报错 |
+| `TestImputers` | 三种填补器的闭式值：`SimpleImputer` 的 mean/median/most_frequent/constant 与全缺失列填 0、`KNNImputer` 的 k=1/k=2 与 distance 权重（0.5）与无共享列回退、`IterativeImputer` 对 `y=2x` 与多列缺失的恢复、观测值不被改写、`n_iter_` 与提前停止、列主元消元的 2×2 精确解与奇异返回 None，以及三类坏形状/非法超参报错 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1617,7 +1648,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1217 个单元测试
+├── test_ai.py       # 1228 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

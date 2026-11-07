@@ -25178,6 +25178,318 @@ class MinMaxScaler:
 
 
 #  ======================================================================
+#  W11-F：缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#  ======================================================================
+
+def _w11f_matrix(x, who):
+    """校验二维矩阵，允许 `None` 表示缺失；返回 (行数, 列数, 缺失个数)。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    if not isinstance(x[0], (list, tuple)) or not x[0]:
+        raise ValueError("%s: 输入必须是非空的二维列表" % who)
+    width = len(x[0])
+    missing = 0
+    for row in x:
+        if not isinstance(row, (list, tuple)) or len(row) != width:
+            raise ValueError("%s: 各样本维度不一致" % who)
+        for v in row:
+            if v is None:
+                missing += 1
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 特征值必须是数字或 None（缺失）" % who)
+    return len(x), width, missing
+
+
+def _w11f_col(x, j):
+    return [row[j] for row in x]
+
+
+def _w11f_stats(col, strategy, fill_value=None):
+    """按策略算一个统计量；整列全缺失时 mean/median 退化为 0.0。"""
+    vals = [v for v in col if v is not None]
+    if strategy == "constant":
+        if fill_value is None:
+            raise ValueError(
+                "SimpleImputer: strategy='constant' 时必须给 fill_value")
+        return float(fill_value)
+    if not vals:
+        return 0.0
+    if strategy == "mean":
+        return float(sum(vals)) / len(vals)
+    if strategy == "median":
+        return _w11e_median(vals)
+    if strategy == "most_frequent":
+        counts = {}
+        for v in vals:
+            counts[v] = counts.get(v, 0) + 1
+        best = None
+        best_n = -1
+        for v in sorted(counts):
+            if counts[v] > best_n:
+                best, best_n = v, counts[v]
+        return float(best)
+    raise ValueError(
+        "SimpleImputer: strategy 必须是 'mean'/'median'/'most_frequent'/'constant'")
+
+
+class SimpleImputer:
+    """按列统计量填补 `None`：`mean` / `median` / `most_frequent` / `constant`。
+
+    整列全缺失时 `mean` / `median` 填 0.0（docstring 已写明，不做静默丢列）。
+    """
+
+    def __init__(self, strategy="mean", fill_value=None):
+        if strategy not in ("mean", "median", "most_frequent", "constant"):
+            raise ValueError(
+                "SimpleImputer: strategy 必须是 'mean'/'median'/'most_frequent'"
+                "/'constant'")
+        if strategy == "constant":
+            if fill_value is None:
+                raise ValueError(
+                    "SimpleImputer: strategy='constant' 时必须给 fill_value")
+            if isinstance(fill_value, bool) or not isinstance(fill_value, (int, float)):
+                raise TypeError("SimpleImputer: fill_value 必须是数字")
+        elif fill_value is not None:
+            raise ValueError(
+                "SimpleImputer: 只有 strategy='constant' 才接受 fill_value")
+        self.strategy = strategy
+        self.fill_value = fill_value
+        self.statistics_ = None
+
+    def fit(self, x):
+        _n, width, _m = _w11f_matrix(x, "SimpleImputer")
+        self.statistics_ = [
+            _w11f_stats(_w11f_col(x, j), self.strategy, self.fill_value)
+            for j in range(width)]
+        return self
+
+    def transform(self, x):
+        if self.statistics_ is None:
+            raise ValueError("SimpleImputer: 请先 fit")
+        _n, width, _m = _w11f_matrix(x, "SimpleImputer")
+        if width != len(self.statistics_):
+            raise ValueError(
+                "SimpleImputer: 输入列数 %d 与 fit 时的 %d 不一致"
+                % (width, len(self.statistics_)))
+        return [[self.statistics_[j] if v is None else float(v)
+                 for j, v in enumerate(row)] for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+
+def _w11f_distance(a, b):
+    """只在两边都观测到的列上算平方距离；返回 (距离², 共享列数)。"""
+    total = 0.0
+    shared = 0
+    for u, v in zip(a, b):
+        if u is None or v is None:
+            continue
+        d = u - v
+        total += d * d
+        shared += 1
+    return total, shared
+
+
+class KNNImputer:
+    """用最近的 k 个训练样本填补缺失值（只在共同观测到的列上算距离）。
+
+    weights='uniform' 时取平均，'distance' 时按 1/(d+eps) 加权；没有任何邻居与
+    目标行有共同观测列时退回该列的 fit 均值。
+    """
+
+    def __init__(self, n_neighbors=5, weights="uniform"):
+        if isinstance(n_neighbors, bool) or not isinstance(n_neighbors, int):
+            raise TypeError("KNNImputer: n_neighbors 必须是整数")
+        if n_neighbors < 1:
+            raise ValueError("KNNImputer: n_neighbors 必须 >= 1")
+        if weights not in ("uniform", "distance"):
+            raise ValueError("KNNImputer: weights 必须是 'uniform' 或 'distance'")
+        self.n_neighbors = n_neighbors
+        self.weights = weights
+        self._train = None
+        self.fill_ = None
+
+    def fit(self, x):
+        _n, width, _m = _w11f_matrix(x, "KNNImputer")
+        self._train = [[None if v is None else float(v) for v in row] for row in x]
+        self.fill_ = []
+        for j in range(width):
+            col = [row[j] for row in self._train if row[j] is not None]
+            self.fill_.append(sum(col) / len(col) if col else 0.0)
+        return self
+
+    def _impute_row(self, row):
+        out = list(row)
+        for j, v in enumerate(row):
+            if v is not None:
+                continue
+            cands = []
+            for tr in self._train:
+                d2, shared = _w11f_distance(row, tr)
+                if shared == 0 or tr[j] is None:
+                    continue
+                cands.append((d2, tr[j]))
+            if not cands:
+                out[j] = self.fill_[j]
+                continue
+            cands.sort(key=lambda p: p[0])
+            picked = cands[:self.n_neighbors]
+            if self.weights == "uniform":
+                out[j] = sum(v2 for _d2, v2 in picked) / len(picked)
+            else:
+                num = 0.0
+                den = 0.0
+                for d2, v2 in picked:
+                    wgt = 1.0 / (math.sqrt(d2) + 1e-12)
+                    num += wgt * v2
+                    den += wgt
+                out[j] = num / den
+        return out
+
+    def transform(self, x):
+        if self._train is None:
+            raise ValueError("KNNImputer: 请先 fit")
+        _n, width, _m = _w11f_matrix(x, "KNNImputer")
+        if width != len(self.fill_):
+            raise ValueError(
+                "KNNImputer: 输入列数 %d 与 fit 时的 %d 不一致"
+                % (width, len(self.fill_)))
+        return [self._impute_row([None if v is None else float(v) for v in row])
+                for row in x]
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+
+def _w11f_solve(a, b):
+    """高斯消元（列主元）解 a·x = b；a 是 n×n 的 list of list。"""
+    n = len(a)
+    m = [list(a[i]) + [b[i]] for i in range(n)]
+    for col in range(n):
+        pivot = col
+        for r in range(col + 1, n):
+            if abs(m[r][col]) > abs(m[pivot][col]):
+                pivot = r
+        if abs(m[pivot][col]) < 1e-12:
+            return None
+        if pivot != col:
+            m[col], m[pivot] = m[pivot], m[col]
+        inv = 1.0 / m[col][col]
+        for j in range(col, n + 1):
+            m[col][j] *= inv
+        for r in range(n):
+            if r == col:
+                continue
+            f = m[r][col]
+            if f == 0.0:
+                continue
+            for j in range(col, n + 1):
+                m[r][j] -= f * m[col][j]
+    return [m[i][n] for i in range(n)]
+
+
+def _w11f_ridge(feats, target, alpha):
+    """带截距的岭回归闭式解（先标准化特征），返回 (mean, std, coef, intercept)。"""
+    n = len(feats)
+    d = len(feats[0]) if feats else 0
+    mean = [sum(feats[i][j] for i in range(n)) / n for j in range(d)]
+    std = []
+    for j in range(d):
+        v = sum((feats[i][j] - mean[j]) ** 2 for i in range(n)) / n
+        s = math.sqrt(v)
+        std.append(s if s > 0.0 else 1.0)
+    z = [[(feats[i][j] - mean[j]) / std[j] for j in range(d)] for i in range(n)]
+    y_bar = sum(target) / n
+    yc = [t - y_bar for t in target]
+    if d == 0:
+        return mean, std, [], y_bar
+    a = [[sum(z[i][p] * z[i][q] for i in range(n)) + (alpha if p == q else 0.0)
+          for q in range(d)] for p in range(d)]
+    b = [sum(z[i][p] * yc[i] for i in range(n)) for p in range(d)]
+    coef = _w11f_solve(a, b)
+    if coef is None:
+        coef = [0.0] * d
+    return mean, std, coef, y_bar
+
+
+class IterativeImputer:
+    """轮转岭回归填补：每列用其余列（含已填补值）建模，循环 `max_iter` 次。
+
+    初始值取列均值；每轮对每列拟合 `target ~ 其他列`（特征标准化 + 岭惩罚 `alpha`），
+    只把预测值写回**原本缺失**的位置。最大相对变化小于 `tol` 时提前停止。
+
+    docstring 说明：这是**单变量轮转**的近似多重填补，不提供 `sample_posterior`。
+    """
+
+    def __init__(self, max_iter=10, tol=1e-3, alpha=1e-6):
+        if isinstance(max_iter, bool) or not isinstance(max_iter, int):
+            raise TypeError("IterativeImputer: max_iter 必须是整数")
+        if max_iter < 1:
+            raise ValueError("IterativeImputer: max_iter 必须 >= 1")
+        for name, v in (("tol", tol), ("alpha", alpha)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("IterativeImputer: %s 必须是数字" % name)
+            if v < 0:
+                raise ValueError("IterativeImputer: %s 不能为负" % name)
+        self.max_iter = max_iter
+        self.tol = float(tol)
+        self.alpha = float(alpha)
+        self.n_iter_ = 0
+        self.fill_ = None
+
+    def fit(self, x):
+        _n, width, _m = _w11f_matrix(x, "IterativeImputer")
+        self.fill_ = []
+        for j in range(width):
+            col = [row[j] for row in x if row[j] is not None]
+            self.fill_.append(sum(col) / len(col) if col else 0.0)
+        return self
+
+    def transform(self, x):
+        if self.fill_ is None:
+            raise ValueError("IterativeImputer: 请先 fit")
+        _n, width, _m = _w11f_matrix(x, "IterativeImputer")
+        if width != len(self.fill_):
+            raise ValueError(
+                "IterativeImputer: 输入列数 %d 与 fit 时的 %d 不一致"
+                % (width, len(self.fill_)))
+        missing = [[v is None for v in row] for row in x]
+        cur = [[self.fill_[j] if v is None else float(v) for j, v in enumerate(row)]
+               for row in x]
+        if not any(any(r) for r in missing):
+            self.n_iter_ = 0
+            return cur
+        n = len(cur)
+        for it in range(1, self.max_iter + 1):
+            delta = 0.0
+            for j in range(width):
+                if not any(missing[i][j] for i in range(n)):
+                    continue
+                others = [k for k in range(width) if k != j]
+                feats = [[cur[i][k] for k in others] for i in range(n)]
+                obs = [i for i in range(n) if not missing[i][j]]
+                if len(obs) < 2 or not others:
+                    continue
+                mean, std, coef, y_bar = _w11f_ridge(
+                    [feats[i] for i in obs], [cur[i][j] for i in obs], self.alpha)
+                for i in range(n):
+                    if not missing[i][j]:
+                        continue
+                    pred = y_bar + sum(coef[p] * ((feats[i][p] - mean[p]) / std[p])
+                                       for p in range(len(others)))
+                    delta = max(delta, abs(pred - cur[i][j]))
+                    cur[i][j] = pred
+            self.n_iter_ = it
+            if delta <= self.tol:
+                break
+        return cur
+
+    def fit_transform(self, x):
+        return self.fit(x).transform(x)
+
+#  ======================================================================
 #  W11-E：Scaler 族（RobustScaler / MaxAbsScaler /
 #          QuantileTransformer / PowerTransformer）
 #  ======================================================================

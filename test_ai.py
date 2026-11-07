@@ -19669,3 +19669,122 @@ class TestScalerFamily:
                     obj.fit(bad)
             with pytest.raises(TypeError):
                 obj.fit([["a"]])
+
+class TestImputers:
+    """W11-F：Simple / KNN / Iterative 缺失值填补"""
+
+    def test_simple_mean_transform(self):
+        x = [[1.0, 10.0], [3.0, None], [None, 30.0]]
+        imp = AI.SimpleImputer(strategy="mean").fit(x)
+        assert imp.statistics_ == [2.0, 20.0]
+        assert imp.transform(x) == [[1.0, 10.0], [3.0, 20.0], [2.0, 30.0]]
+
+    def test_simple_median_and_all_missing(self):
+        imp = AI.SimpleImputer(strategy="median").fit(
+            [[1.0, None], [2.0, None], [100.0, None]])
+        assert imp.statistics_[0] == 2.0
+        assert imp.statistics_[1] == 0.0
+
+    def test_simple_most_frequent_and_constant(self):
+        mf = AI.SimpleImputer("most_frequent").fit([[1.0], [1.0], [2.0], [None]])
+        assert mf.statistics_ == [1.0]
+        imp = AI.SimpleImputer("constant", fill_value=7.5).fit([[None], [1.0]])
+        assert imp.transform([[None], [2.0]]) == [[7.5], [2.0]]
+
+    def test_simple_imputer_errors(self):
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("bad")
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("constant")
+        with pytest.raises(TypeError):
+            AI.SimpleImputer("constant", fill_value=True)
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("mean").transform([[1.0]])
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("mean").fit([[1.0]]).transform([[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("mean").fit([[1.0], [2.0, 3.0]])
+        with pytest.raises(ValueError):
+            AI.SimpleImputer("mean").fit([])
+        with pytest.raises(TypeError):
+            AI.SimpleImputer("mean").fit([[True], [1.0]])
+
+    def test_knn_uniform_and_distance(self):
+        train = [[0.0, 0.0], [0.0, 10.0], [10.0, 0.0]]
+        out = AI.KNNImputer(n_neighbors=2, weights="uniform").fit(
+            train).transform([[None, 1.0]])
+        assert abs(out[0][0] - 5.0) < 1e-12
+        out2 = AI.KNNImputer(n_neighbors=2, weights="distance").fit(
+            [[0.0, 0.0], [2.0, 4.0]]).transform([[None, 1.0]])
+        assert abs(out2[0][0] - 0.5) < 1e-12
+
+    def test_knn_fallback_and_nearest(self):
+        out = AI.KNNImputer().fit([[1.0], [3.0]]).transform([[None]])
+        assert abs(out[0][0] - 2.0) < 1e-12
+        out2 = AI.KNNImputer(n_neighbors=1).fit(
+            [[0.0, 0.0], [4.0, 4.0]]).transform([[None, 0.5]])
+        assert abs(out2[0][0] - 0.0) < 1e-12
+        got = AI.KNNImputer().fit([[0.0, 0.0], [0.0, 1.0]]).transform([[7.0, 8.0]])
+        assert got == [[7.0, 8.0]]
+
+    def test_knn_errors(self):
+        with pytest.raises(ValueError):
+            AI.KNNImputer(0)
+        with pytest.raises(TypeError):
+            AI.KNNImputer(True)
+        with pytest.raises(ValueError):
+            AI.KNNImputer(3, "bad")
+        with pytest.raises(ValueError):
+            AI.KNNImputer().transform([[None]])
+        with pytest.raises(ValueError):
+            AI.KNNImputer().fit([[1.0, 2.0]]).transform([[None]])
+
+    def test_iterative_recovers_linear(self):
+        x = [[1.0, 3.0], [2.0, 5.0], [3.0, None], [4.0, 9.0]]
+        imp = AI.IterativeImputer(max_iter=50, tol=1e-9)
+        out = imp.fit_transform(x)
+        assert abs(out[2][1] - 7.0) < 1e-6
+        assert 1 <= imp.n_iter_ <= 50
+        for i in range(len(x)):
+            for j in range(2):
+                if x[i][j] is not None:
+                    assert out[i][j] == x[i][j]
+
+    def test_iterative_two_missing_and_no_missing(self):
+        x = [[1.0, 2.0, 2.0], [2.0, 4.0, None],
+             [3.0, 6.0, 4.0], [4.0, None, 5.0]]
+        out = AI.IterativeImputer(max_iter=60, tol=1e-10).fit_transform(x)
+        assert abs(out[1][2] - 3.0) < 1e-4
+        assert abs(out[3][1] - 8.0) < 1e-4
+        imp = AI.IterativeImputer()
+        assert imp.fit_transform([[1.0, 2.0], [3.0, 4.0]]) == [[1.0, 2.0], [3.0, 4.0]]
+        assert imp.n_iter_ == 0
+
+    def test_iterative_all_missing_column_and_errors(self):
+        out = AI.IterativeImputer(max_iter=3).fit_transform(
+            [[None, 1.0], [None, 2.0], [None, 3.0]])
+        assert all(row[0] == 0.0 for row in out)
+        with pytest.raises(ValueError):
+            AI.IterativeImputer(0)
+        with pytest.raises(TypeError):
+            AI.IterativeImputer(True)
+        with pytest.raises(ValueError):
+            AI.IterativeImputer(tol=-1.0)
+        with pytest.raises(ValueError):
+            AI.IterativeImputer(alpha=-0.5)
+        with pytest.raises(TypeError):
+            AI.IterativeImputer(tol="x")
+        with pytest.raises(ValueError):
+            AI.IterativeImputer().transform([[None]])
+
+    def test_solve_and_ridge_helpers(self):
+        sol = AI._w11f_solve([[2.0, 1.0], [1.0, 3.0]], [3.0, 5.0])
+        assert abs(sol[0] - 0.8) < 1e-12
+        assert abs(sol[1] - 1.4) < 1e-12
+        assert AI._w11f_solve([[1.0, 2.0], [2.0, 4.0]], [1.0, 2.0]) is None
+        mean, std, coef, yb = AI._w11f_ridge(
+            [[1.0], [2.0], [3.0]], [3.0, 5.0, 7.0], 1e-9)
+        assert abs(mean[0] - 2.0) < 1e-12
+        assert abs(std[0] - 0.816496580927726) < 1e-12
+        assert abs(coef[0] - 2.0 * std[0]) < 1e-6
+        assert abs(yb - 5.0) < 1e-12

@@ -335,7 +335,16 @@
   - `QuantileTransformer`：分段线性分位数映射，`uniform` / `normal` 两种输出；
     两端点在 normal 模式有 1e-8 量级逆变换残差（已写进 docstring）。
   - `PowerTransformer`：Yeo-Johnson / Box-Cox，lambda 用黄金分割搜索近似 MLE。
-- [ ] 缺失值：`SimpleImputer` / `KNNImputer` / `IterativeImputer`
+- [x] 缺失值：`SimpleImputer` / `KNNImputer` / `IterativeImputer`
+  - `SimpleImputer`：`mean` / `median` / `most_frequent` / `constant`（`constant` 必须给 `fill_value`）；
+    整列全缺失填 `0.0`，不静默丢列。
+  - `KNNImputer`：只在**共同观测到**的列上算距离；`weights='distance'` 按 `1/(d+eps)` 加权；
+    没有任何邻居共享观测列时退回该列 fit 均值。
+  - `IterativeImputer`：初始值取列均值，轮转岭回归（特征标准化 + `alpha` 惩罚），只回填原本缺失的位置；
+    最大变化 < `tol` 提前停，`n_iter_` 记录实际轮数。docstring 写明是单变量轮转近似，无 `sample_posterior`。
+  - 探针 50 项：三种策略闭式值、k=1/k=2 与 distance 权重 0.5、`y=2x` 与多列缺失恢复、
+    观测值不改写、`n_iter_` 夹紧、列主元消元精确解与奇异返回 None、22 条非法输入。
+
 - [ ] 降维：`PCA` / `t-SNE`（简化）；`SMOTE` / `ADASYN`；特征选择（VarianceThreshold / SelectKBest / RFE / L1）
 - [ ] 文本增强（同义词替换 / EDA / Token Dropout）；音频增强（概念）
 
