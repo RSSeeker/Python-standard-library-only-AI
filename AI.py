@@ -30526,6 +30526,349 @@ class PatchTSTEmbedding:
     def param_count(self):
         return self.d_model * self.patch_len + self.d_model
 
+# ========================================================================
+#  领域应用 W17-C-2：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+# ========================================================================
+
+
+def _w17c2_image(x, who, min_side=1):
+    """校验 (C, H, W) 的嵌套 list，返回 (c, h, w)。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 图像必须是 (C,H,W) 的非空嵌套列表" % who)
+    c = len(x)
+    first = x[0]
+    if not isinstance(first, (list, tuple)) or not first:
+        raise ValueError("%s: 每个通道必须是非空的行列表" % who)
+    h = len(first)
+    if not isinstance(first[0], (list, tuple)) or not first[0]:
+        raise ValueError("%s: 每行必须是非空的数值列表" % who)
+    w = len(first[0])
+    if h < min_side or w < min_side:
+        raise ValueError("%s: 图像高宽都要 >= %d，收到 %dx%d" % (who, min_side, h, w))
+    out = []
+    for ch in x:
+        if not isinstance(ch, (list, tuple)) or len(ch) != h:
+            raise ValueError("%s: 所有通道的行数必须一致（期望 %d）" % (who, h))
+        rows = []
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or len(row) != w:
+                raise ValueError("%s: 每行的列数必须一致（期望 %d）" % (who, w))
+            vals = []
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError("%s: 像素必须是数字，收到 %r" % (who, v))
+                vals.append(float(v))
+            rows.append(vals)
+        out.append(rows)
+    return out, c, h, w
+
+
+def _w17c2_relu(x):
+    return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+
+def _w17c2_mask(dout, act):
+    return [[[dout[c][i][j] if act[c][i][j] > 0.0 else 0.0
+              for j in range(len(act[c][i]))]
+             for i in range(len(act[c]))]
+            for c in range(len(act))]
+
+
+def _w17c2_conv_count(conv):
+    n = len(conv.biases)
+    for plane in conv.weights:
+        for rows in plane:
+            for row in rows:
+                n += len(row)
+    return n
+
+
+def _w17c2_mse(pred, target):
+    """逐元素 MSE 与 dL/dpred。"""
+    c = len(pred)
+    h = len(pred[0])
+    w = len(pred[0][0])
+    total = c * h * w
+    acc = 0.0
+    grad = []
+    for ch in range(c):
+        grows = []
+        for i in range(h):
+            row = []
+            for j in range(w):
+                diff = pred[ch][i][j] - target[ch][i][j]
+                acc += diff * diff
+                row.append(2.0 * diff / total)
+            grows.append(row)
+        grad.append(grows)
+    return acc / total, grad
+
+
+def _w17c2_check_lr(lr, who):
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise ValueError("%s: lr 必须是数字" % who)
+    if not (lr > 0.0) or lr != lr or lr in (float("inf"), float("-inf")):
+        raise ValueError("%s: lr 必须是正的有限数" % who)
+    return float(lr)
+
+
+def add_gaussian_noise(image, sigma=0.1, seed=None):
+    """给 (C,H,W) 图像加逐像素高斯噪声，返回新图像（不改入参）。"""
+    img, c, h, w = _w17c2_image(image, "add_gaussian_noise")
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)):
+        raise ValueError("add_gaussian_noise: sigma 必须是数字")
+    if sigma < 0.0:
+        raise ValueError("add_gaussian_noise: sigma 不能为负")
+    rng = random.Random(seed) if seed is not None else random
+    return [[[img[ch][i][j] + rng.gauss(0.0, float(sigma)) for j in range(w)]
+             for i in range(h)] for ch in range(c)]
+
+
+def upscale_bilinear(image, scale=2):
+    """双线性放大 (C,H,W) -> (C, H*scale, W*scale)。"""
+    img, c, h, w = _w17c2_image(image, "upscale_bilinear")
+    if isinstance(scale, bool) or not isinstance(scale, int):
+        raise ValueError("upscale_bilinear: scale 必须是整数")
+    if scale < 1:
+        raise ValueError("upscale_bilinear: scale 必须 >= 1")
+    return _resize_bilinear(img, h * scale, w * scale)
+
+
+class SRCNN:
+    """SRCNN 式超分：双线性上采样后接三层卷积（9x9 提取 / 1x1 映射 / 5x5 重建）。
+
+    这不是论文里的 patch 采样训练，而是「一层卷积就作用在整幅上采样图」的等价写法，
+    padding 全用 same，所以输出与上采样图同尺寸。训练用 MSE，梯度手写回传。
+    """
+
+    def __init__(self, scale=2, channels=1, hidden=8, seed=None):
+        if isinstance(scale, bool) or not isinstance(scale, int):
+            raise ValueError("SRCNN: scale 必须是整数")
+        if scale < 1:
+            raise ValueError("SRCNN: scale 必须 >= 1")
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            raise ValueError("SRCNN: channels 必须是正整数")
+        if isinstance(hidden, bool) or not isinstance(hidden, int) or hidden < 1:
+            raise ValueError("SRCNN: hidden 必须是正整数")
+        self.scale = scale
+        self.channels = channels
+        self.hidden = hidden
+        if seed is not None:
+            state = random.getstate()
+            random.seed(seed)
+            try:
+                self.conv1 = Conv2d(channels, hidden, 9, padding=4)
+                self.conv2 = Conv2d(hidden, hidden, 1)
+                self.conv3 = Conv2d(hidden, channels, 5, padding=2)
+            finally:
+                random.setstate(state)
+        else:
+            self.conv1 = Conv2d(channels, hidden, 9, padding=4)
+            self.conv2 = Conv2d(hidden, hidden, 1)
+            self.conv3 = Conv2d(hidden, channels, 5, padding=2)
+        self.convs = [self.conv1, self.conv2, self.conv3]
+        self._a1 = None
+        self._a2 = None
+
+    def param_count(self):
+        return sum(_w17c2_conv_count(conv) for conv in self.convs)
+
+    def zero_grad(self):
+        for conv in self.convs:
+            conv.zero_grad()
+
+    def forward(self, upsampled):
+        """输入上采样图 (channels,H,W)，返回同尺寸预测。"""
+        x, c, h, w = _w17c2_image(upsampled, "SRCNN.forward")
+        if c != self.channels:
+            raise ValueError("SRCNN.forward: 通道数 %d 与 channels=%d 不一致"
+                             % (c, self.channels))
+        z1 = self.conv1.forward(x)
+        a1 = _w17c2_relu(z1)
+        z2 = self.conv2.forward(a1)
+        a2 = _w17c2_relu(z2)
+        out = self.conv3.forward(a2)
+        self._a1 = a1
+        self._a2 = a2
+        return out
+
+    def loss_and_grads(self, upsampled, target):
+        """返回 MSE 损失，并把 dL/dW 累加进三层卷积的 grad_w / grad_b。"""
+        pred = self.forward(upsampled)
+        tgt, c, h, w = _w17c2_image(target, "SRCNN.loss_and_grads")
+        if (c, h, w) != (self.channels, len(pred[0]), len(pred[0][0])):
+            raise ValueError(
+                "SRCNN.loss_and_grads: 目标尺寸 %dx%dx%d 与预测 %dx%dx%d 不一致"
+                % (c, h, w, len(pred), len(pred[0]), len(pred[0][0])))
+        loss, dpred = _w17c2_mse(pred, tgt)
+        d2 = self.conv3.backward(dpred)
+        d2 = _w17c2_mask(d2, self._a2)
+        d1 = self.conv2.backward(d2)
+        d1 = _w17c2_mask(d1, self._a1)
+        self.conv1.backward(d1)
+        return loss
+
+    def upscale(self, image):
+        """直接把低分辨率图放大并重建。"""
+        return self.forward(upscale_bilinear(image, self.scale))
+
+    def fit(self, pairs, epochs=50, lr=0.01):
+        """在 (低分辨率, 高分辨率) 对上学，返回每轮平均 MSE。"""
+        if not isinstance(pairs, (list, tuple)) or not pairs:
+            raise ValueError("SRCNN.fit: pairs 必须是非空列表")
+        lr = _w17c2_check_lr(lr, "SRCNN.fit")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("SRCNN.fit: epochs 必须是正整数")
+        prepared = []
+        for item in pairs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("SRCNN.fit: 每项必须是 (低分辨率, 高分辨率)")
+            low = upscale_bilinear(item[0], self.scale)
+            high, _, _, _ = _w17c2_image(item[1], "SRCNN.fit")
+            prepared.append((low, high))
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            total = 0.0
+            for low, high in prepared:
+                total += self.loss_and_grads(low, high)
+            n = len(prepared)
+            for conv in self.convs:
+                for oc in range(len(conv.weights)):
+                    for ic in range(len(conv.weights[oc])):
+                        for kh in range(len(conv.weights[oc][ic])):
+                            wrow = conv.weights[oc][ic][kh]
+                            grow = conv.grad_w[oc][ic][kh]
+                            for kw in range(len(wrow)):
+                                wrow[kw] -= lr * grow[kw] / n
+                    conv.biases[oc] -= lr * conv.grad_b[oc] / n
+            history.append(total / n)
+        return history
+
+
+class DnCNN:
+    """DnCNN 式去噪：网络预测噪声残差，`denoise = 输入 - 预测噪声`。
+
+    最后一层不带激活，depth 个 3x3 same 卷积中间夹 ReLU。训练目标是「噪声」(noisy - clean)。
+    """
+
+    def __init__(self, channels=1, depth=3, hidden=8, kernel_size=3, seed=None):
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            raise ValueError("DnCNN: channels 必须是正整数")
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+            raise ValueError("DnCNN: depth 必须是正整数")
+        if isinstance(hidden, bool) or not isinstance(hidden, int) or hidden < 1:
+            raise ValueError("DnCNN: hidden 必须是正整数")
+        if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
+            raise ValueError("DnCNN: kernel_size 必须是整数")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("DnCNN: kernel_size 必须是正奇数（同尺寸卷积需要奇数核）")
+        self.channels = channels
+        self.depth = depth
+        self.hidden = hidden
+        self.kernel_size = kernel_size
+        pad = (kernel_size - 1) // 2
+        convs = []
+        if seed is not None:
+            state = random.getstate()
+            random.seed(seed)
+            try:
+                for i in range(depth):
+                    cin = channels if i == 0 else hidden
+                    cout = channels if i == depth - 1 else hidden
+                    convs.append(Conv2d(cin, cout, kernel_size, padding=pad))
+            finally:
+                random.setstate(state)
+        else:
+            for i in range(depth):
+                cin = channels if i == 0 else hidden
+                cout = channels if i == depth - 1 else hidden
+                convs.append(Conv2d(cin, cout, kernel_size, padding=pad))
+        self.convs = convs
+        self._acts = []
+
+    def param_count(self):
+        return sum(_w17c2_conv_count(conv) for conv in self.convs)
+
+    def zero_grad(self):
+        for conv in self.convs:
+            conv.zero_grad()
+
+    def predict_noise(self, image):
+        x, c, h, w = _w17c2_image(image, "DnCNN.predict_noise")
+        if c != self.channels:
+            raise ValueError("DnCNN.predict_noise: 通道数 %d 与 channels=%d 不一致"
+                             % (c, self.channels))
+        acts = []
+        cur = x
+        for i, conv in enumerate(self.convs):
+            z = conv.forward(cur)
+            if i == len(self.convs) - 1:
+                cur = z
+            else:
+                cur = _w17c2_relu(z)
+                acts.append(cur)
+        self._acts = acts
+        return cur
+
+    def denoise(self, image):
+        img, c, h, w = _w17c2_image(image, "DnCNN.denoise")
+        noise = self.predict_noise(img)
+        return [[[img[ch][i][j] - noise[ch][i][j] for j in range(w)]
+                 for i in range(h)] for ch in range(c)]
+
+    def loss_and_grads(self, noisy, clean):
+        """MSE(预测噪声, noisy - clean)，梯度累加进各卷积。"""
+        pred = self.predict_noise(noisy)
+        tgt, c, h, w = _w17c2_image(clean, "DnCNN.loss_and_grads")
+        if (c, h, w) != (self.channels, len(pred[0]), len(pred[0][0])):
+            raise ValueError(
+                "DnCNN.loss_and_grads: clean 尺寸 %dx%dx%d 与 noisy 的 %dx%dx%d 不一致"
+                % (c, h, w, len(pred), len(pred[0]), len(pred[0][0])))
+        src, _, _, _ = _w17c2_image(noisy, "DnCNN.loss_and_grads")
+        target = [[[src[ch][i][j] - tgt[ch][i][j] for j in range(w)]
+                   for i in range(h)] for ch in range(c)]
+        loss, dpred = _w17c2_mse(pred, target)
+        delta = dpred
+        for i in range(len(self.convs) - 1, -1, -1):
+            delta = self.convs[i].backward(delta)
+            if i > 0:
+                delta = _w17c2_mask(delta, self._acts[i - 1])
+        return loss
+
+    def fit(self, pairs, epochs=50, lr=0.01):
+        """在 (带噪, 干净) 对上学，返回每轮平均 MSE。"""
+        if not isinstance(pairs, (list, tuple)) or not pairs:
+            raise ValueError("DnCNN.fit: pairs 必须是非空列表")
+        lr = _w17c2_check_lr(lr, "DnCNN.fit")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("DnCNN.fit: epochs 必须是正整数")
+        prepared = []
+        for item in pairs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("DnCNN.fit: 每项必须是 (带噪, 干净)")
+            noisy, _, _, _ = _w17c2_image(item[0], "DnCNN.fit")
+            clean, _, _, _ = _w17c2_image(item[1], "DnCNN.fit")
+            prepared.append((noisy, clean))
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            total = 0.0
+            for noisy, clean in prepared:
+                total += self.loss_and_grads(noisy, clean)
+            n = len(prepared)
+            for conv in self.convs:
+                for oc in range(len(conv.weights)):
+                    for ic in range(len(conv.weights[oc])):
+                        for kh in range(len(conv.weights[oc][ic])):
+                            wrow = conv.weights[oc][ic][kh]
+                            grow = conv.grad_w[oc][ic][kh]
+                            for kw in range(len(wrow)):
+                                wrow[kw] -= lr * grow[kw] / n
+                    conv.biases[oc] -= lr * conv.grad_b[oc] / n
+            history.append(total / n)
+        return history
+
 # ======================================================================
 #  领域应用 W17-C-1：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
 # ======================================================================

@@ -24369,3 +24369,180 @@ class TestStyleTransfer:
             AI.style_transfer(img, style, style_layers=[])
         with pytest.raises(TypeError):
             AI.style_transfer(img, style, extractor="nope")
+
+
+class TestSuperResolutionDenoising:
+    """W17-C-2：SRCNN 式超分与 DnCNN 式残差去噪。"""
+
+    @staticmethod
+    def _const(c, h, w, v):
+        return [[[float(v)] * w for _ in range(h)] for _ in range(c)]
+
+    @staticmethod
+    def _rand(c, h, w, seed, lo=0.0, hi=1.0):
+        import random
+        rng = random.Random(seed)
+        return [[[rng.uniform(lo, hi) for _ in range(w)] for _ in range(h)]
+                for _ in range(c)]
+
+    @staticmethod
+    def _flat(img):
+        out = []
+        for ch in img:
+            for row in ch:
+                out.extend(row)
+        return out
+
+    @staticmethod
+    def _deep(obj):
+        if isinstance(obj, (list, tuple)):
+            out = []
+            for item in obj:
+                out.extend(TestSuperResolutionDenoising._deep(item))
+            return out
+        return [obj]
+
+    def test_upscale_bilinear_shape_and_constant(self):
+        up = AI.upscale_bilinear(self._const(1, 2, 2, 0.4), 2)
+        assert (len(up), len(up[0]), len(up[0][0])) == (1, 4, 4)
+        for v in self._flat(up):
+            assert abs(v - 0.4) < 1e-12
+        assert AI._w17c2_image(self._const(1, 2, 2, 0.0), "t")[1:] == (1, 2, 2)
+
+    def test_upscale_bilinear_validation(self):
+        with pytest.raises(ValueError):
+            AI.upscale_bilinear(self._const(1, 2, 2, 0.1), 0)
+        with pytest.raises(ValueError):
+            AI.upscale_bilinear(self._const(1, 2, 2, 0.1), 1.5)
+        with pytest.raises(ValueError):
+            AI.upscale_bilinear([], 2)
+
+    def test_add_gaussian_noise(self):
+        clean = self._rand(1, 4, 4, 7)
+        assert self._flat(AI.add_gaussian_noise(clean, 0.0, seed=1)) == \
+            self._flat(clean)
+        n1 = AI.add_gaussian_noise(clean, 0.05, seed=11)
+        n2 = AI.add_gaussian_noise(clean, 0.05, seed=11)
+        n3 = AI.add_gaussian_noise(clean, 0.05, seed=12)
+        assert self._flat(n1) == self._flat(n2)
+        assert self._flat(n1) != self._flat(n3)
+        with pytest.raises(ValueError):
+            AI.add_gaussian_noise(clean, -0.1)
+        with pytest.raises(ValueError):
+            AI.add_gaussian_noise(clean, "0.1")
+
+    def test_srcnn_forward_and_param_count(self):
+        model = AI.SRCNN(scale=2, channels=1, hidden=4, seed=3)
+        low = self._rand(1, 3, 3, 5)
+        pred = model.forward(AI.upscale_bilinear(low, 2))
+        assert (len(pred), len(pred[0]), len(pred[0][0])) == (1, 6, 6)
+        expected = (1 * 4 * 9 * 9 + 4) + (4 * 4 + 4) + (4 * 1 * 5 * 5 + 1)
+        assert model.param_count() == expected
+        model.zero_grad()
+        assert all(v == 0.0 for v in self._deep(model.conv1.grad_w))
+
+    def test_srcnn_weight_gradients_match_finite_difference(self):
+        model = AI.SRCNN(scale=2, channels=1, hidden=4, seed=3)
+        low = self._rand(1, 3, 3, 5)
+        low_up = AI.upscale_bilinear(low, 2)
+        high = self._rand(1, 6, 6, 9)
+        eps = 1e-6
+
+        def loss():
+            return AI._w17c2_mse(model.forward(low_up), high)[0]
+
+        model.zero_grad()
+        model.loss_and_grads(low_up, high)
+        cases = ((model.conv1, 0, 0, 4, 4), (model.conv3, 0, 2, 2, 2))
+        for conv, oc, ic, kh, kw in cases:
+            analytic = conv.grad_w[oc][ic][kh][kw]
+            old = conv.weights[oc][ic][kh][kw]
+            conv.weights[oc][ic][kh][kw] = old + eps
+            lp = loss()
+            conv.weights[oc][ic][kh][kw] = old - eps
+            lm = loss()
+            conv.weights[oc][ic][kh][kw] = old
+            numeric = (lp - lm) / (2.0 * eps)
+            assert abs(analytic - numeric) < 1e-6, (analytic, numeric)
+
+    def test_srcnn_fit_reduces_loss(self):
+        model = AI.SRCNN(scale=2, channels=1, hidden=4, seed=8)
+        pairs = [(self._rand(1, 3, 3, 100 + s), self._const(1, 6, 6, 0.75))
+                 for s in range(3)]
+        history = model.fit(pairs, epochs=120, lr=0.05)
+        assert len(history) == 120
+        assert history[-1] < history[0] * 0.5, (history[0], history[-1])
+
+    def test_srcnn_validation(self):
+        low = self._rand(1, 3, 3, 5)
+        high = self._rand(1, 6, 6, 9)
+        with pytest.raises(ValueError):
+            AI.SRCNN(scale=0)
+        with pytest.raises(ValueError):
+            AI.SRCNN(scale=1.5)
+        with pytest.raises(ValueError):
+            AI.SRCNN(channels=2, seed=1).upscale(self._const(1, 3, 3, 0.1))
+        with pytest.raises(ValueError):
+            AI.SRCNN(seed=1).fit([])
+        with pytest.raises(ValueError):
+            AI.SRCNN(seed=1).fit([(low, high)], lr=0.0)
+        with pytest.raises(ValueError):
+            AI.SRCNN(scale=2, channels=1, seed=1).loss_and_grads(
+                AI.upscale_bilinear(low, 2), self._const(1, 5, 5, 0.0))
+
+    def test_dncnn_denoise_is_input_minus_noise(self):
+        clean = self._rand(1, 4, 4, 7)
+        noisy = AI.add_gaussian_noise(clean, 0.15, seed=21)
+        model = AI.DnCNN(channels=1, depth=3, hidden=4, seed=4)
+        noise = model.predict_noise(noisy)
+        restored = model.denoise(noisy)
+        manual = [[[noisy[ch][i][j] - noise[ch][i][j] for j in range(4)]
+                   for i in range(4)] for ch in range(1)]
+        assert self._flat(restored) == self._flat(manual)
+        expected = (1 * 4 * 9 + 4) + (4 * 4 * 9 + 4) + (4 * 1 * 9 + 1)
+        assert model.param_count() == expected
+
+    def test_dncnn_weight_gradient_matches_finite_difference(self):
+        clean = self._rand(1, 4, 4, 7)
+        noisy = AI.add_gaussian_noise(clean, 0.15, seed=21)
+        model = AI.DnCNN(channels=1, depth=3, hidden=4, seed=4)
+        target = [[[noisy[ch][i][j] - clean[ch][i][j] for j in range(4)]
+                   for i in range(4)] for ch in range(1)]
+        eps = 1e-6
+        model.zero_grad()
+        model.loss_and_grads(noisy, clean)
+        conv = model.convs[0]
+        analytic = conv.grad_w[0][0][1][1]
+        old = conv.weights[0][0][1][1]
+        conv.weights[0][0][1][1] = old + eps
+        lp = AI._w17c2_mse(model.predict_noise(noisy), target)[0]
+        conv.weights[0][0][1][1] = old - eps
+        lm = AI._w17c2_mse(model.predict_noise(noisy), target)[0]
+        conv.weights[0][0][1][1] = old
+        numeric = (lp - lm) / (2.0 * eps)
+        assert abs(analytic - numeric) < 1e-6, (analytic, numeric)
+
+    def test_dncnn_fit_recovers_clean_signal(self):
+        clean = self._rand(1, 4, 4, 7)
+        pairs = [(AI.add_gaussian_noise(clean, 0.2, seed=30 + s), clean)
+                 for s in range(3)]
+        model = AI.DnCNN(channels=1, depth=3, hidden=4, seed=6)
+        history = model.fit(pairs, epochs=600, lr=0.05)
+        assert history[-1] < history[0] * 0.1, (history[0], history[-1])
+        before = sum((a - b) ** 2 for a, b in
+                     zip(self._flat(pairs[0][0]), self._flat(clean)))
+        after_img = model.denoise(pairs[0][0])
+        after = sum((a - b) ** 2 for a, b in
+                    zip(self._flat(after_img), self._flat(clean)))
+        assert after < before, (before, after)
+
+    def test_dncnn_validation(self):
+        clean = self._rand(1, 4, 4, 7)
+        with pytest.raises(ValueError):
+            AI.DnCNN(kernel_size=2)
+        with pytest.raises(ValueError):
+            AI.DnCNN(depth=0)
+        with pytest.raises(ValueError):
+            AI.DnCNN(channels=1, seed=1).denoise(self._const(3, 4, 4, 0.0))
+        with pytest.raises(ValueError):
+            AI.DnCNN(seed=1).fit([(clean,)])

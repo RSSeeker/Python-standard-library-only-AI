@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1589 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1600 项）
 
 ## 特性
 
@@ -2050,6 +2050,40 @@ print(out["losses"][0], "->", out["losses"][-1])
 - 梯度量级较大（`lr=1.0` 就会发散），默认 `lr=0.02`；`clamp=True` 时像素被裁到 `[0,1]`。
 - `FeatureExtractor.backward` 的 `layer_grads` 的键是**层号**（0 基），值是 `dL/d(该层 ReLU 后激活)`。
 
+### 超分与去噪（W17-C-2）
+
+| 接口 | 说明 |
+|------|------|
+| `upscale_bilinear(image, scale=2)` | 双线性放大 `(C,H,W) -> (C, H*scale, W*scale)` |
+| `add_gaussian_noise(image, sigma=0.1, seed=None)` | 逐像素高斯噪声，不改入参；`sigma=0` 恒等 |
+| `SRCNN(scale=2, channels=1, hidden=8, seed=None)` | 三层卷积（9×9 / 1×1 / 5×5，same padding），`upscale` / `fit` / `param_count` |
+| `DnCNN(channels=1, depth=3, hidden=8, kernel_size=3, seed=None)` | 预测噪声残差，`denoise = 输入 − 预测噪声`；`fit` 的目标是 `noisy − clean` |
+
+```python
+import AI
+
+low = [[[0.1, 0.4, 0.2], [0.3, 0.9, 0.5], [0.0, 0.6, 0.7]]]
+high = AI.upscale_bilinear(low, 2)
+
+sr = AI.SRCNN(scale=2, channels=1, hidden=8, seed=1)
+sr.fit([(low, high)], epochs=50, lr=0.05)
+print(sr.upscale(low)[0][0])
+
+dn = AI.DnCNN(channels=1, depth=3, hidden=8, seed=2)
+noisy = AI.add_gaussian_noise(high, 0.1, seed=3)
+dn.fit([(noisy, high)], epochs=200, lr=0.02)
+print(dn.denoise(noisy)[0][0])
+```
+
+诚实边界：
+
+- 两者都是**小规模可验证实现**：SRCNN 直接在整幅上采样图上做卷积（不是论文的 patch 采样流水线），
+  DnCNN 是三层 3×3 same 卷积；没有批归一化、没有残差学习堆叠、没有 GPU。
+- 超分只到 SRCNN 式，**没有 SRGAN**（需要对抗训练与感知损失，本库没有 VGG 特征）。
+- 去噪训练目标是「预测噪声」，所以 `fit` 的每个样本是 `(带噪, 干净)`；`denoise` 只在
+  「噪声接近加性高斯」时语义清楚，其他退化（模糊、压缩伪影）没有承诺。
+- 训练量很小（几十到几百轮、几个 4×4 样本），收敛曲线是「损失下降」的证明，不是质量承诺。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2466,7 +2500,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1589 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1600 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2672,6 +2706,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRecommenders` | 矩阵分解收敛与可复现、NCF 的 logit 重算与逐权重梯度、Wide&Deep 训练与宽侧梯度、三者的参数校验 |
 | `TestDeepFMAndDIN` | DeepFM 的 logit 重算与二阶项闭式、六处中心差分、DIN 的注意力归一与 mask、参数/输入梯度、训练与校验 |
 | `TestStyleTransfer` | Gram 闭式与二次齐次、提取器形状与参数量、`dL/dx` 对中心差分、风格迁移损失下降与 clamp、单步更新等于 `-lr*dL/dx`、9 处参数校验 |
+| `TestSuperResolutionDenoising` | 双线性形状与常量保持、噪声可复现与 `sigma=0`、SRCNN 参数量与两层权重中心差分、`fit` 降损、DnCNN 的 `denoise = 输入 − 噪声`、卷积权重中心差分、600 轮后重建误差小于带噪误差、13 处参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2725,7 +2760,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1589 个单元测试
+├── test_ai.py       # 1600 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
