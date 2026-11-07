@@ -528,7 +528,14 @@
     `gae_advantages` / `ppo_loss`（裁剪目标）+ `PolicyNetwork` / `ValueNetwork` / `PPOAgent`，
     probe 51 项（策略梯度与 PPO 梯度都对中心差分、裁剪分支梯度为 0、GAE 手算）。
   - 仍未做：SAC / TD3 / DDPG（连续动作，需要高斯策略的 reparameterization）与 RLHF。
-- [ ] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型
+- [x] RL 基础设施：ReplayBuffer / ε-greedy / UCB / Thompson；RLHF（PPO-based）/ 奖励模型
+  - ReplayBuffer 在 W16-F 已做；W16-G 补 `epsilon_schedule`（linear/exp）、
+    `epsilon_greedy_action`、`ucb1_action`、`BetaBernoulliBandit`（Thompson）。
+  - RLHF 侧只到「奖励模型 + 奖励塑形」：`bradley_terry_loss`（成对偏好，带两侧梯度）、
+    `kl_penalty`、`rlhf_reward`（`r - β·(logp - ref_logp)`）。
+  - 完整的 PPO-RLHF 四模型训练循环**没有**封装（README 给了拼法），策略侧复用 W16-F2 的 `PPOAgent`。
+  - probe_w16g.py 48 项：ε 单调不增、UCB 稀疏臂优先、Thompson 200 轮后最优臂后验最高、
+    Bradley-Terry 在 ±50 的分数差下不溢出且梯度与中心差分一致。
 - [ ] 元学习：MAML / Reptile / ProtoNet / Matching Networks
 - [ ] 联邦学习：FedAvg / FedProx / FedBN
 

@@ -23237,3 +23237,96 @@ class TestPolicyGradient:
             AI.PPOAgent(2, 2, lr=0.0)
         with pytest.raises(ValueError):
             AI.PPOAgent(2, 2, epochs=0)
+
+class TestRLInfrastructure:
+    """W16-G：ε 衰减 / ε-greedy / UCB / Thompson / Bradley-Terry 奖励 / RLHF KL"""
+
+    def test_epsilon_schedule(self):
+        assert AI.epsilon_schedule(0, 1.0, 0.05, 100) == 1.0
+        assert abs(AI.epsilon_schedule(50, 1.0, 0.05, 100) - 0.525) < 1e-12
+        assert AI.epsilon_schedule(100, 1.0, 0.05, 100) == 0.05
+        assert AI.epsilon_schedule(500, 1.0, 0.05, 100) == 0.05
+        assert abs(AI.epsilon_schedule(50, 1.0, 0.01, 100, "exp") - math.sqrt(0.01)) < 1e-12
+        assert abs(AI.epsilon_schedule(100, 1.0, 0.01, 100, "exp") - 0.01) < 1e-12
+        seq = [AI.epsilon_schedule(s, 1.0, 0.05, 100) for s in range(101)]
+        assert all(seq[i] >= seq[i + 1] for i in range(100))
+        with pytest.raises(ValueError):
+            AI.epsilon_schedule(-1)
+        with pytest.raises(ValueError):
+            AI.epsilon_schedule(0, 0.1, 0.5)
+        with pytest.raises(ValueError):
+            AI.epsilon_schedule(0, 1.0, 0.1, 10, "cosine")
+
+    def test_epsilon_greedy_action(self):
+        q = [0.1, 3.0, 0.2]
+        assert all(AI.epsilon_greedy_action(q, 0.0) == 1 for _ in range(5))
+        explored = {AI.epsilon_greedy_action(q, 1.0, seed=s) for s in range(30)}
+        assert len(explored) > 1
+        assert (AI.epsilon_greedy_action(q, 1.0, seed=7)
+                == AI.epsilon_greedy_action(q, 1.0, seed=7))
+        assert AI.epsilon_greedy_action([1.0, 1.0], 0.0) == 0
+        with pytest.raises(ValueError):
+            AI.epsilon_greedy_action([], 0.0)
+        with pytest.raises(ValueError):
+            AI.epsilon_greedy_action(q, 1.5)
+
+    def test_ucb1_action(self):
+        assert AI.ucb1_action([0.0, 9.9, 9.9], [5, 0, 5]) == 1
+        assert AI.ucb1_action([0.0, 0.0, 0.0], [0, 0, 0]) == 0
+        assert AI.ucb1_action([0.5, 0.6], [100, 2], c=0.5) == 1
+        assert AI.ucb1_action([0.1, 0.9], [100, 100], c=0.1) == 1
+        with pytest.raises(ValueError):
+            AI.ucb1_action([1.0], [1, 2])
+        with pytest.raises(ValueError):
+            AI.ucb1_action([1.0], [-1])
+        with pytest.raises(ValueError):
+            AI.ucb1_action([1.0], [1], c=0.0)
+
+    def test_beta_bernoulli_bandit(self):
+        bandit = AI.BetaBernoulliBandit(3, seed=11)
+        for _ in range(200):
+            arm = bandit.select()
+            bandit.update(arm, 1.0 if arm == 2 else 0.0)
+        means = bandit.means()
+        assert max(range(3), key=lambda i: means[i]) == 2
+        assert all(0.0 < m < 1.0 for m in means)
+        fresh = AI.BetaBernoulliBandit(2, seed=3)
+        picks = [fresh.select() for _ in range(10)]
+        assert all(0 <= a < 2 for a in picks)
+        with pytest.raises(ValueError):
+            fresh.update(2, 1.0)
+        with pytest.raises(ValueError):
+            fresh.update(0, 1.5)
+        with pytest.raises(ValueError):
+            AI.BetaBernoulliBandit(0)
+
+    def test_bradley_terry_loss(self):
+        loss, d_chosen, d_rejected = AI.bradley_terry_loss([1.0], [0.0])
+        assert abs(loss - math.log(1.0 + math.exp(-1.0))) < 1e-12
+        assert abs(d_chosen[0] + d_rejected[0]) < 1e-12
+        assert d_chosen[0] < 0 < d_rejected[0]
+        flat_loss, flat_c, flat_r = AI.bradley_terry_loss([0.0], [0.0])
+        assert abs(flat_loss - math.log(2.0)) < 1e-12
+        assert abs(flat_c[0] + 0.5) < 1e-12 and abs(flat_r[0] - 0.5) < 1e-12
+        assert AI.bradley_terry_loss([50.0], [0.0])[0] < 1e-20
+        assert abs(AI.bradley_terry_loss([0.0], [50.0])[0] - 50.0) < 1e-9
+        eps = 1e-6
+        numeric_c = (AI.bradley_terry_loss([1.0 + eps], [0.0])[0]
+                     - AI.bradley_terry_loss([1.0 - eps], [0.0])[0]) / (2 * eps)
+        numeric_r = (AI.bradley_terry_loss([1.0], [eps])[0]
+                     - AI.bradley_terry_loss([1.0], [-eps])[0]) / (2 * eps)
+        assert abs(d_chosen[0] - numeric_c) < 1e-6
+        assert abs(d_rejected[0] - numeric_r) < 1e-6
+        with pytest.raises(ValueError):
+            AI.bradley_terry_loss([1.0], [0.0, 1.0])
+
+    def test_kl_penalty_and_rlhf_reward(self):
+        assert abs(AI.kl_penalty([-0.5, -0.7], [-0.5, -0.9]) - 0.2) < 1e-12
+        assert AI.kl_penalty([-1.0], [-1.0]) == 0.0
+        rewards = AI.rlhf_reward([1.0, 2.0], [-0.2, -0.4], [-0.2, -0.1], beta=0.5)
+        assert abs(rewards[0] - 1.0) < 1e-12
+        assert abs(rewards[1] - (2.0 - 0.5 * (-0.3))) < 1e-12
+        with pytest.raises(ValueError):
+            AI.kl_penalty([-1.0], [-1.0, -2.0])
+        with pytest.raises(ValueError):
+            AI.rlhf_reward([1.0], [0.0], [0.0], beta=-1.0)

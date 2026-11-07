@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1525 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1531 项）
 
 ## 特性
 
@@ -1842,6 +1842,33 @@ print(agent.policy.probs(env.reset(seed=0)))
 
 四条边界：只有离散动作（连续控制要另写高斯策略的 reparameterization，SAC/TD3/DDPG 尚未实现）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
 
+### RL 基础设施与 RLHF 奖励（W16-G）
+
+| API | 说明 |
+|-----|------|
+| `epsilon_schedule(step, start=1.0, end=0.05, decay_steps=1000, kind='linear'\|'exp')` | ε 衰减，到点后恒为 `end` |
+| `epsilon_greedy_action(q_values, epsilon, seed=None)` | ε-greedy 选动作（同分取小下标） |
+| `ucb1_action(means, counts, c=1.0)` | UCB1，未拉过的臂优先 |
+| `BetaBernoulliBandit(num_arms, seed=None)` | Thompson 采样（`select` / `update` / `means`） |
+| `bradley_terry_loss(chosen_scores, rejected_scores)` | 奖励模型的成对偏好损失，返回 `(loss, d_chosen, d_rejected)` |
+| `kl_penalty(logp, ref_logp)` | 逐 token KL 求和 |
+| `rlhf_reward(rewards, logps, ref_logps, beta=0.1)` | `r_t − β·(logp_t − ref_logp_t)` |
+
+```python
+import AI
+
+bandit = AI.BetaBernoulliBandit(3, seed=11)
+for step in range(200):
+    arm = bandit.select()
+    bandit.update(arm, 1.0 if arm == 2 else 0.0)
+print(bandit.means())
+
+loss, d_c, d_r = AI.bradley_terry_loss([1.0, 0.5], [0.0, 0.5])
+shaped = AI.rlhf_reward([1.0, 0.0], [-0.2, -1.0], [-0.2, -0.6], beta=0.5)
+```
+
+三条边界：`bradley_terry_loss` 只算**成对**比较（批量就是逐对求均值），不建模平局；`rlhf_reward` 只做奖励塑形，**没有**封装完整的 PPO-RLHF 训练循环（策略 / 参考 / 奖励 / 价值四模型联动要自己拼，README 这段就是拼法）；`ucb1_action` 的 `total` 由 `counts` 求和得到，调用方不需要另外传步数。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2258,7 +2285,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1525 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1531 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2457,6 +2484,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRLEnvironments` | GridWorld 移动/撞墙/目标奖励/步数截断/障碍与坐标校验、渲染字符、CartPole 状态范围与物理独立重算（1e-12）、折现回报手算、rollout 长度与提前终止 |
 | `TestDQNFamily` | W16-F：回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
 | `TestPolicyGradient` | W16-F2：策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
+| `TestRLInfrastructure` | W16-G：ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2510,7 +2538,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1525 个单元测试
+├── test_ai.py       # 1531 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

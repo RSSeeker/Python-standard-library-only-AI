@@ -29556,6 +29556,188 @@ class DQNAgent:
         return self.online.param_count() + self.target.param_count()
 
 # ============================================================================
+#  RL 基础设施（W16-G：探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+# ============================================================================
+
+def epsilon_schedule(step, start=1.0, end=0.05, decay_steps=1000, kind="linear"):
+    """ε 的衰减：``linear`` 线性到 ``end``，``exp`` 指数到 ``end``。
+
+    ``step >= decay_steps`` 之后恒为 ``end``（不做 clamp 之外的抖动）。
+    """
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"epsilon_schedule: step 必须是 >=0 的整数，收到 {step!r}")
+    for name, v in (("start", start), ("end", end)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 <= v <= 1.0):
+            raise ValueError(f"epsilon_schedule: {name} 必须在 [0,1] 内，收到 {v!r}")
+    if end > start:
+        raise ValueError(
+            f"epsilon_schedule: end({end}) 不能大于 start({start})")
+    if isinstance(decay_steps, bool) or not isinstance(decay_steps, int) or decay_steps < 1:
+        raise ValueError(
+            f"epsilon_schedule: decay_steps 必须是 >=1 的整数，收到 {decay_steps!r}")
+    if kind not in ("linear", "exp"):
+        raise ValueError(f"epsilon_schedule: kind 只支持 'linear'/'exp'，收到 {kind!r}")
+    if step >= decay_steps:
+        return float(end)
+    frac = float(step) / float(decay_steps)
+    if kind == "linear":
+        return float(start) + (float(end) - float(start)) * frac
+    if start <= 0.0 or end <= 0.0:
+        raise ValueError("epsilon_schedule: 指数衰减要求 start 与 end 都 > 0")
+    return float(start) * (float(end) / float(start)) ** frac
+
+
+def epsilon_greedy_action(q_values, epsilon, seed=None):
+    """ε-greedy 选动作：以 ε 概率均匀随机，否则取 Q 最大（同分取下标最小）。"""
+    if not isinstance(q_values, (list, tuple)) or not q_values:
+        raise ValueError("epsilon_greedy_action: q_values 必须是非空列表")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)) \
+            or not (0.0 <= epsilon <= 1.0):
+        raise ValueError(
+            f"epsilon_greedy_action: epsilon 必须在 [0,1] 内，收到 {epsilon!r}")
+    rng = random.Random(seed) if seed is not None else random
+    n = len(q_values)
+    if rng.random() < float(epsilon):
+        return rng.randrange(n)
+    best = 0
+    for j in range(1, n):
+        if float(q_values[j]) > float(q_values[best]):
+            best = j
+    return best
+
+
+def ucb1_action(means, counts, c=1.0):
+    """UCB1：没被拉过的臂优先（按下标顺序），否则 ``mean + c*sqrt(ln N / n)``。"""
+    if not isinstance(means, (list, tuple)) or not means:
+        raise ValueError("ucb1_action: means 必须是非空列表")
+    if not isinstance(counts, (list, tuple)) or len(counts) != len(means):
+        raise ValueError("ucb1_action: counts 长度必须与 means 相同")
+    if isinstance(c, bool) or not isinstance(c, (int, float)) or c <= 0.0:
+        raise ValueError(f"ucb1_action: c 必须 > 0，收到 {c!r}")
+    total = 0
+    for i, n in enumerate(counts):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError(f"ucb1_action: counts[{i}] 必须是非负整数，收到 {n!r}")
+        total += n
+    for i, n in enumerate(counts):
+        if n == 0:
+            return i
+    if total == 0:
+        raise ValueError("ucb1_action: 所有臂的计数都是 0")
+    best = 0
+    best_score = None
+    for i in range(len(means)):
+        score = float(means[i]) + c * _math_sqrt(_math_log(total) / counts[i])
+        if best_score is None or score > best_score:
+            best_score = score
+            best = i
+    return best
+
+
+def _math_sqrt(x):
+    return math.sqrt(x)
+
+
+def _math_log(x):
+    return math.log(x) if x > 0.0 else 0.0
+
+
+class BetaBernoulliBandit:
+    """Thompson 采样的 Beta-Bernoulli 老虎机：``alpha += r``、``beta += 1 - r``。"""
+
+    def __init__(self, num_arms, seed=None):
+        if isinstance(num_arms, bool) or not isinstance(num_arms, int) or num_arms < 1:
+            raise ValueError(
+                f"BetaBernoulliBandit: num_arms 必须是 >=1 的整数，收到 {num_arms!r}")
+        self.num_arms = num_arms
+        self.alpha = [1.0] * num_arms
+        self.beta = [1.0] * num_arms
+        self.rng = random.Random(seed)
+
+    def select(self):
+        """按 Thompson 采样挑一个臂（各臂独立采 Beta，取最大）。"""
+        best = 0
+        best_draw = -1.0
+        for i in range(self.num_arms):
+            draw = self.rng.betavariate(self.alpha[i], self.beta[i])
+            if draw > best_draw:
+                best_draw = draw
+                best = i
+        return best
+
+    def update(self, arm, reward):
+        """用一次 ``0/1`` 奖励更新该臂的后验。"""
+        if isinstance(arm, bool) or not isinstance(arm, int) \
+                or not (0 <= arm < self.num_arms):
+            raise ValueError(
+                f"BetaBernoulliBandit.update: arm 必须在 0..{self.num_arms - 1}，收到 {arm!r}")
+        if isinstance(reward, bool) or not isinstance(reward, (int, float)) \
+                or not (0.0 <= float(reward) <= 1.0):
+            raise ValueError(
+                f"BetaBernoulliBandit.update: reward 必须在 [0,1] 内，收到 {reward!r}")
+        self.alpha[arm] += float(reward)
+        self.beta[arm] += 1.0 - float(reward)
+
+    def means(self):
+        """各臂后验均值。"""
+        return [self.alpha[i] / (self.alpha[i] + self.beta[i])
+                for i in range(self.num_arms)]
+
+
+def bradley_terry_loss(chosen_scores, rejected_scores):
+    """Bradley-Terry 偏好损失：``-log sigmoid(r_c - r_r)``，返回 ``(loss, d_chosen, d_rejected)``。"""
+    if not isinstance(chosen_scores, (list, tuple)) or not chosen_scores:
+        raise ValueError("bradley_terry_loss: chosen_scores 必须是非空列表")
+    if not isinstance(rejected_scores, (list, tuple)) \
+            or len(rejected_scores) != len(chosen_scores):
+        raise ValueError("bradley_terry_loss: 两侧长度必须相同")
+    n = len(chosen_scores)
+    total = 0.0
+    d_chosen = []
+    d_rejected = []
+    for i in range(n):
+        diff = float(chosen_scores[i]) - float(rejected_scores[i])
+        # softplus(-diff) = log(1 + exp(-diff))，数值稳定写法
+        if diff >= 0.0:
+            loss = _math_log(1.0 + _math_exp(-diff))
+        else:
+            loss = -diff + _math_log(1.0 + _math_exp(diff))
+        total += loss
+        sig = 1.0 / (1.0 + _math_exp(diff))   # sigmoid(-diff)
+        d_chosen.append(-sig / n)
+        d_rejected.append(sig / n)
+    return total / n, d_chosen, d_rejected
+
+
+def kl_penalty(logp, ref_logp):
+    """逐 token 的 KL 惩罚（``logp - ref_logp`` 的求和），用于 RLHF 的奖励扣减。"""
+    if not isinstance(logp, (list, tuple)) or not logp:
+        raise ValueError("kl_penalty: logp 必须是非空列表")
+    if not isinstance(ref_logp, (list, tuple)) or len(ref_logp) != len(logp):
+        raise ValueError("kl_penalty: ref_logp 长度必须与 logp 相同")
+    total = 0.0
+    for i in range(len(logp)):
+        total += float(logp[i]) - float(ref_logp[i])
+    return total
+
+
+def rlhf_reward(rewards, logps, ref_logps, beta=0.1):
+    """RLHF 的逐步奖励：``r_t - beta * (logp_t - ref_logp_t)``（逐 token）。"""
+    if not isinstance(rewards, (list, tuple)) or not rewards:
+        raise ValueError("rlhf_reward: rewards 必须是非空列表")
+    n = len(rewards)
+    if not isinstance(logps, (list, tuple)) or len(logps) != n:
+        raise ValueError("rlhf_reward: logps 长度必须与 rewards 相同")
+    if not isinstance(ref_logps, (list, tuple)) or len(ref_logps) != n:
+        raise ValueError("rlhf_reward: ref_logps 长度必须与 rewards 相同")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta < 0.0:
+        raise ValueError(f"rlhf_reward: beta 必须 >= 0，收到 {beta!r}")
+    out = []
+    for i in range(n):
+        out.append(float(rewards[i]) - float(beta) * (float(logps[i]) - float(ref_logps[i])))
+    return out
+
+# ============================================================================
 #  RL 策略侧（W16-F2：REINFORCE / A2C(GAE) / PPO）
 # ============================================================================
 
