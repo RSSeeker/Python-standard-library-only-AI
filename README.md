@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1336 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1344 项）
 
 ## 特性
 
@@ -1320,6 +1320,32 @@ print(adjusted_rand_score(y, [7, 7, 3, 3]))  # 1.0（标签重命名不影响）
 - **AMI 在小样本上可以是负数**：`adjusted_mutual_info_score([0,0,1,1], [0,1,0,1])` 返回 `-0.5`，因为机会校正后的期望互信息高于 0，这比随机划分还差；NMI 同场景是 0。聚类数多于真实类数时（细分）AMI 会明显低于 NMI，这是 AMI 的预期行为。
 - **silhouette 需要 `2 <= k < n`**：全单点簇（k == n）没有簇内距离，直接报错而不是返回 1。
 
+### 校准指标（W13-H）
+
+| 函数 | 说明 |
+|---|---|
+| `expected_calibration_error(y_true, y_proba, n_bins=10, strategy=)` | ECE：`Σ (n_b/N)·|acc_b − conf_b|` |
+| `maximum_calibration_error(...)` | MCE：各非空箱 `|acc_b − conf_b|` 的最大值 |
+| `reliability_diagram(...)` | 非空箱列表：`{"lo","hi","count","confidence","accuracy"}` |
+
+```python
+y = [1, 1, 1, 0, 0]
+p = [0.9, 0.6, 0.3, 0.2, 0.1]
+print(expected_calibration_error(y, p, n_bins=5))   # 0.14
+print(maximum_calibration_error(y, p, n_bins=5))    # 0.15
+for row in reliability_diagram(y, p, n_bins=5):
+    print(row["lo"], row["count"], row["accuracy"], row["confidence"])
+```
+
+三点说明：
+
+- **置信度 = 最大类概率**，命中 = argmax 与标签一致。单列概率按二分类正类处理
+  （`pred = p > 0.5`，置信度取 `max(p, 1-p)`），也接受完整概率行。
+- **`strategy="uniform"`** 固定按 `[0,1]` 等宽分箱；`"quantile"` 按置信度分位点切，
+  置信度大量重复时边界会去重，实际箱数可能少于 `n_bins`。
+- ECE/MCE 只统计非空箱，所以输出恒为「有样本的箱」的加权或最大值；概率要求落在
+  `[0,1]`（不做归一化，softmax 输出可直接传）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1736,7 +1762,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1336 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1344 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1914,6 +1940,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTextGenerationMetrics` | corpus BLEU（手算四阶精度 / 多参考 / 简短惩罚）/ ROUGE-1·2 / METEOR 闭式（含片段惩罚）/ CIDEr 三个端点 / Self-BLEU 相同与互异 |
 | `TestSpeechMetrics` | WER 的五种编辑组合、`_edit_ops` 三元组、CER 的中英文、SER 的值错/缺失/多出与四种非法输入 |
 | `TestClusteringMetrics` | silhouette 含单点簇、CH 手算 400、DB 手算、ARI 的 1/-0.5、NMI 手算、AMI 的负数与细分 0.5333、九条非法输入 |
+| `TestCalibrationMetrics` | ECE/MCE 手算、单列与两列等价、多分类、可靠性图结构与 quantile 分箱、十条非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1967,7 +1994,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1336 个单元测试
+├── test_ai.py       # 1344 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -28608,6 +28608,148 @@ def jaccard_score(y_true, y_pred, average: str = "macro",
     return sum(used) / len(used)
 
 
+# ============================================================================
+#  校准指标（ECE / MCE / Reliability Diagram）
+# ============================================================================
+
+def _cal_check_bins(n_bins, strategy):
+    if isinstance(n_bins, bool) or not isinstance(n_bins, int):
+        raise ValueError(f"校准: n_bins 必须是整数，收到 {type(n_bins).__name__}")
+    if n_bins < 1:
+        raise ValueError(f"校准: n_bins 必须 >= 1，收到 {n_bins}")
+    if strategy not in ("uniform", "quantile"):
+        raise ValueError(
+            f"校准: strategy 必须是 'uniform' 或 'quantile'，收到 {strategy!r}")
+    return n_bins
+
+
+def _cal_prepare(y_true, y_proba, who):
+    """返回 (置信度列表, 命中列表, 标签列表, 概率行)。单列按二分类正类概率处理。"""
+    if not isinstance(y_true, (list, tuple)):
+        raise ValueError(f"{who}: y_true 必须是列表")
+    if not y_true:
+        raise ValueError(f"{who}: y_true 不能为空")
+    rows = _proba_matrix(y_proba, len(y_true), who)
+    width = len(rows[0])
+    labels = []
+    conf = []
+    hit = []
+    for i, row in enumerate(rows):
+        for c, v in enumerate(row):
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(
+                    f"{who}: y_proba[{i}][{c}] = {v} 不在 [0, 1] 内")
+        tv = _metric_label(y_true[i], f"{who}.y_true", i)
+        if width == 1:
+            if tv not in (0, 1):
+                raise ValueError(
+                    f"{who}: 单列概率要求标签是 0/1，y_true[{i}] = {tv}")
+            p = row[0]
+            pred = 1 if p > 0.5 else 0
+            confidence = p if pred == 1 else 1.0 - p
+        else:
+            if not 0 <= tv < width:
+                raise ValueError(
+                    f"{who}: y_true[{i}] = {tv} 超出概率列数 {width}")
+            best = 0
+            for c in range(1, width):
+                if row[c] > row[best]:
+                    best = c
+            pred = best
+            confidence = row[best]
+        labels.append(tv)
+        conf.append(confidence)
+        hit.append(1.0 if pred == tv else 0.0)
+    return conf, hit, labels, rows
+
+
+def _cal_edges(conf, n_bins, strategy):
+    """返回分箱边界；uniform 固定 0..1，quantile 用置信度分位点。
+
+    quantile 策略下若置信度大量重复，边界会去重，实际箱数可能少于 n_bins。
+    """
+    if strategy == "uniform":
+        return [i / float(n_bins) for i in range(n_bins + 1)]
+    ordered = sorted(conf)
+    n = len(ordered)
+    edges = [ordered[0]]
+    for b in range(1, n_bins):
+        pos = int(round(b * n / float(n_bins)))
+        if pos >= n:
+            pos = n - 1
+        if ordered[pos] > edges[-1]:
+            edges.append(ordered[pos])
+    if ordered[-1] > edges[-1]:
+        edges.append(ordered[-1])
+    if len(edges) < 2:
+        edges = [ordered[0], ordered[0] + 1e-12]
+    return edges
+
+
+def _cal_diagram(y_true, y_proba, n_bins, strategy, who):
+    n_bins = _cal_check_bins(n_bins, strategy)
+    conf, hit, labels, _ = _cal_prepare(y_true, y_proba, who)
+    edges = _cal_edges(conf, n_bins, strategy)
+    width = len(edges) - 1
+    counts = [0] * width
+    conf_sum = [0.0] * width
+    hit_sum = [0.0] * width
+    for c, h in zip(conf, hit):
+        idx = width - 1
+        for b in range(width):
+            lo, hi = edges[b], edges[b + 1]
+            if (c >= lo and c < hi) or (b == width - 1 and c <= hi):
+                idx = b
+                break
+        counts[idx] += 1
+        conf_sum[idx] += c
+        hit_sum[idx] += h
+    out = []
+    for b in range(width):
+        if counts[b] == 0:
+            continue
+        out.append({
+            "lo": edges[b],
+            "hi": edges[b + 1],
+            "count": counts[b],
+            "confidence": conf_sum[b] / counts[b],
+            "accuracy": hit_sum[b] / counts[b],
+        })
+    return out, len(conf)
+
+
+def expected_calibration_error(y_true, y_proba, n_bins: int = 10,
+                               strategy: str = "uniform") -> float:
+    """ECE：`Σ (n_b/N)·|acc_b − conf_b|`，按置信度分箱。"""
+    bins, total = _cal_diagram(y_true, y_proba, n_bins, strategy,
+                               "expected_calibration_error")
+    if total <= 0:
+        raise ValueError("expected_calibration_error: 没有样本")
+    ece = 0.0
+    for b in bins:
+        ece += (b["count"] / float(total)) * abs(b["accuracy"] - b["confidence"])
+    return ece
+
+
+def maximum_calibration_error(y_true, y_proba, n_bins: int = 10,
+                              strategy: str = "uniform") -> float:
+    """MCE：各箱 `|acc_b − conf_b|` 的最大值（只看非空箱）。"""
+    bins, total = _cal_diagram(y_true, y_proba, n_bins, strategy,
+                               "maximum_calibration_error")
+    if total <= 0:
+        raise ValueError("maximum_calibration_error: 没有样本")
+    return max(abs(b["accuracy"] - b["confidence"]) for b in bins)
+
+
+def reliability_diagram(y_true, y_proba, n_bins: int = 10,
+                        strategy: str = "uniform"):
+    """返回非空箱列表：`{"lo","hi","count","confidence","accuracy"}`。"""
+    bins, total = _cal_diagram(y_true, y_proba, n_bins, strategy,
+                              "reliability_diagram")
+    if total <= 0:
+        raise ValueError("reliability_diagram: 没有样本")
+    return bins
+
 def _proba_matrix(y_proba, n: int, who):
     rows = list(y_proba)
     if not rows:

@@ -416,7 +416,11 @@
   - ARI 用组合数做机会校正；AMI 用超几何期望（`lgamma` 实现），小样本可为负（`[0,0,1,1]` vs `[0,1,0,1]` = -0.5）
   - NMI/AMI 支持 arithmetic / geometric / min / max 四种归一化
   - 探针 33 项（含独立参考实现逐步对照 silhouette 与 DB）
-- [ ] 校准：ECE / MCE / ReliabilityDiagram
+- [x] 校准：ECE / MCE / ReliabilityDiagram
+  - 置信度取最大类概率，单列概率按二分类正类处理（`pred = p > 0.5`）
+  - `strategy='uniform'` 等宽分箱；`'quantile'` 按分位点切，重复值会去重
+  - 只统计非空箱；MCE 是各箱偏差绝对值的最大值
+  - 探针 30 项（手算 ECE 0.14 / MCE 0.15 + 单列与两列等价 + 十条非法输入）
 - [ ] 检测：mAP / mAP@0.5 / mAP@[.5:.95] / AR（简化）
 - [ ] 图像：PSNR / SSIM / MS-SSIM；FID / KID / IS（简化并标注口径）
 - [ ] 一致性：Fleiss Kappa / Krippendorff Alpha；公平性：Demographic Parity / Equal Opportunity / Disparate Impact

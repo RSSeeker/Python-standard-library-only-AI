@@ -20914,3 +20914,74 @@ class TestClusteringMetrics:
         near = AI.silhouette_score([[0.0], [1.0], [2.0], [3.0]], [0, 0, 1, 1])
         far = AI.silhouette_score([[0.0], [1.0], [100.0], [101.0]], [0, 0, 1, 1])
         assert far > near
+
+
+class TestCalibrationMetrics:
+    Y = [1, 1, 1, 0, 0]
+    P = [0.9, 0.6, 0.3, 0.2, 0.1]
+
+    def test_ece_hand_value(self):
+        want = 0.4 * 0.15 + 0.6 * (1.0 - (0.9 + 0.8 + 0.9) / 3.0)
+        got = AI.expected_calibration_error(self.Y, self.P, n_bins=5)
+        assert abs(got - want) < 1e-12
+
+    def test_mce_hand_value(self):
+        assert abs(AI.maximum_calibration_error(self.Y, self.P, n_bins=5) - 0.15) < 1e-12
+
+    def test_single_column_matches_two_column(self):
+        two = [[1.0 - p, p] for p in self.P]
+        assert abs(AI.expected_calibration_error(self.Y, self.P, n_bins=5)
+                   - AI.expected_calibration_error(self.Y, two, n_bins=5)) < 1e-12
+        assert abs(AI.maximum_calibration_error(self.Y, self.P, n_bins=5)
+                   - AI.maximum_calibration_error(self.Y, two, n_bins=5)) < 1e-12
+
+    def test_overconfident_and_perfect(self):
+        assert abs(AI.expected_calibration_error([1, 0], [0.9, 0.1], n_bins=5) - 0.1) < 1e-12
+        assert abs(AI.expected_calibration_error([1, 0], [1.0, 0.0], n_bins=5)) < 1e-12
+
+    def test_multiclass(self):
+        y = [0, 1, 2]
+        p = [[0.7, 0.2, 0.1], [0.1, 0.6, 0.3], [0.2, 0.3, 0.5]]
+        want = 1.0 - (0.7 + 0.6 + 0.5) / 3.0
+        assert abs(AI.expected_calibration_error(y, p, n_bins=2) - want) < 1e-12
+        assert abs(AI.maximum_calibration_error(y, p, n_bins=2) - want) < 1e-12
+
+    def test_reliability_diagram_structure(self):
+        bins = AI.reliability_diagram(self.Y, self.P, n_bins=5)
+        assert len(bins) == 2
+        assert bins[0]["count"] == 2
+        assert abs(bins[0]["accuracy"] - 0.5) < 1e-12
+        assert abs(bins[0]["confidence"] - 0.65) < 1e-12
+        assert bins[1]["count"] == 3
+        assert abs(bins[1]["accuracy"] - 1.0) < 1e-12
+        assert sum(b["count"] for b in bins) == len(self.Y)
+
+    def test_quantile_strategy(self):
+        bins = AI.reliability_diagram([1, 1, 1, 1], [0.5, 0.6, 0.7, 0.8],
+                                      n_bins=2, strategy="quantile")
+        assert sum(b["count"] for b in bins) == 4
+        same = AI.reliability_diagram([1, 1, 1], [0.7, 0.7, 0.7],
+                                      n_bins=4, strategy="quantile")
+        assert len(same) == 1 and abs(same[0]["accuracy"] - 1.0) < 1e-12
+
+    def test_rejects_bad_inputs(self):
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error([], [], n_bins=5)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error([1, 0], [1.5, 0.2], n_bins=5)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error([1, 0], [[0.2, 0.8]], n_bins=5)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error([2, 0], [0.7, 0.2], n_bins=5)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error(self.Y, self.P, n_bins=0)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error(self.Y, self.P, n_bins=True)
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error(self.Y, self.P, n_bins="5")
+        with pytest.raises(ValueError):
+            AI.expected_calibration_error(self.Y, self.P, n_bins=5, strategy="adaptive")
+        with pytest.raises(ValueError):
+            AI.maximum_calibration_error([0, 1, 5], [[0.7, 0.2, 0.1]] * 3, n_bins=2)
+        with pytest.raises(ValueError):
+            AI.reliability_diagram([1, 0], ["a", 0.2], n_bins=5)
