@@ -30909,6 +30909,186 @@ def _w18b_user_why():
 
 
 # ============================================================================
+#  研究前沿 W20-D：神经符号（规则约束的候选过滤）
+# ============================================================================
+
+def _w20d_sequence(values, what):
+    if not isinstance(values, list):
+        raise ValueError("%s 必须是列表" % what)
+    out = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s 里必须是整数 token" % what)
+        if value < 0:
+            raise ValueError("%s 里不能有负 token" % what)
+        out.append(value)
+    return out
+
+
+def _w20d_mask(mask, vocab_size):
+    if not isinstance(mask, list) or not mask:
+        raise ValueError("掩码必须是非空列表")
+    if len(mask) != vocab_size:
+        raise ValueError("掩码长度 %d 与词表 %d 不一致" % (len(mask), vocab_size))
+    for value in mask:
+        if not isinstance(value, bool):
+            raise ValueError("掩码必须是布尔值（isinstance 判断，1 不算 True）")
+    return mask
+
+
+def rule_no_repeat(prefix, token):
+    """规则：同一个 token 不重复出现。"""
+    return token not in prefix
+
+
+def rule_max_length(limit):
+    """规则工厂：序列长度不超过 `limit`。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("rule_max_length 的 limit 必须是 >= 1 的整数")
+
+    def _rule(prefix, token):
+        return len(prefix) < limit
+
+    return _rule
+
+
+def rule_allowed_set(allowed):
+    """规则工厂：token 必须属于给定白名单。"""
+    if not isinstance(allowed, (list, tuple, set)) or not allowed:
+        raise ValueError("rule_allowed_set 的 allowed 必须是非空集合")
+    values = set()
+    for value in allowed:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("rule_allowed_set 里必须是非负整数")
+        values.add(value)
+
+    def _rule(prefix, token):
+        return token in values
+
+    return _rule
+
+
+class RuleSet:
+    """一组「(名字, 谓词(prefix, token) -> bool)」规则，用来约束解码候选。"""
+
+    def __init__(self, rules=None):
+        if rules is None:
+            rules = []
+        if not isinstance(rules, (list, tuple)):
+            raise ValueError("RuleSet 的 rules 必须是列表")
+        self.rules = []
+        seen = set()
+        for item in rules:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("每条规则必须是 (名字, 谓词)")
+            name, predicate = item
+            if not isinstance(name, str) or not name:
+                raise ValueError("规则名字必须是非空字符串")
+            if name in seen:
+                raise ValueError("规则名字重复：%s" % name)
+            if not callable(predicate):
+                raise ValueError("规则 %s 的谓词必须可调用" % name)
+            seen.add(name)
+            self.rules.append((name, predicate))
+
+    def names(self):
+        return [name for name, _predicate in self.rules]
+
+    def allows(self, prefix, token):
+        prefix = _w20d_sequence(prefix, "RuleSet.allows.prefix")
+        if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+            raise ValueError("RuleSet.allows.token 必须是非负整数")
+        for _name, predicate in self.rules:
+            if not predicate(prefix, token):
+                return False
+        return True
+
+    def mask(self, prefix, vocab_size):
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 1:
+            raise ValueError("vocab_size 必须是 >= 1 的整数")
+        return [self.allows(prefix, token) for token in range(vocab_size)]
+
+    def filter(self, prefix, candidates):
+        candidates = _w20d_sequence(candidates, "RuleSet.filter.candidates")
+        return [token for token in candidates if self.allows(prefix, token)]
+
+    def check(self, sequence):
+        """检查整条序列：返回 `{ok, violations}`，逐位置列出被哪些规则拒绝。"""
+        sequence = _w20d_sequence(sequence, "RuleSet.check.sequence")
+        violations = []
+        for position, token in enumerate(sequence):
+            prefix = sequence[:position]
+            broken = [name for name, predicate in self.rules if not predicate(prefix, token)]
+            if broken:
+                violations.append({"position": position, "token": token, "rules": broken})
+        return {"ok": not violations, "violations": violations}
+
+
+def apply_rule_mask(logits, mask):
+    """把 `mask` 为 False 的位置设成 `-inf`（其余原样），返回新列表。
+
+    如果全部被屏蔽，说明规则和模型输出完全不兼容——这是配置错误，
+    直接抛 ValueError，而不是返回全 `-inf` 让下游 softmax 变成 NaN。
+    """
+    if not isinstance(logits, list) or not logits:
+        raise ValueError("apply_rule_mask.logits 必须是非空列表")
+    mask = _w20d_mask(mask, len(logits))
+    values = []
+    for value in logits:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("apply_rule_mask.logits 里必须是数字")
+        values.append(float(value))
+    if not any(mask):
+        raise ValueError("apply_rule_mask: 所有候选都被规则屏蔽了")
+    return [values[i] if mask[i] else float("-inf") for i in range(len(values))]
+
+
+def constrained_pick(logits, mask):
+    """在允许的候选里取 argmax（同分取小下标），返回 token。"""
+    masked = apply_rule_mask(logits, mask)
+    best = None
+    for index, value in enumerate(masked):
+        if value == float("-inf"):
+            continue
+        if best is None or value > masked[best]:
+            best = index
+    if best is None:
+        raise ValueError("constrained_pick: 没有可选的候选")
+    return best
+
+
+def constrained_generate(step_fn, rules, max_len=8, vocab_size=None, seed_token=None):
+    """规则约束的贪心解码。
+
+    `step_fn(prefix)` 返回下一个 token 的 logits；`rules` 是 `RuleSet`；
+    `vocab_size` 省略时按第一次 `len(logits)` 推断。返回 `{"tokens", "logits", "steps"}`，
+    其中 `logits` 是每步**被屏蔽后**的分布（被屏蔽位置为 `-inf`）。
+    """
+    if not callable(step_fn):
+        raise ValueError("constrained_generate: step_fn 必须可调用")
+    if not isinstance(rules, RuleSet):
+        raise ValueError("constrained_generate: rules 必须是 RuleSet")
+    if isinstance(max_len, bool) or not isinstance(max_len, int) or max_len < 1:
+        raise ValueError("constrained_generate: max_len 必须是 >= 1 的整数")
+    tokens = [] if seed_token is None else _w20d_sequence([seed_token], "seed_token")
+    trace = []
+    for _step in range(max_len):
+        logits = step_fn(list(tokens))
+        if not isinstance(logits, list) or not logits:
+            raise ValueError("constrained_generate: step_fn 必须返回非空 logits")
+        size = len(logits) if vocab_size is None else vocab_size
+        if size != len(logits):
+            raise ValueError("constrained_generate: 实际 logits 宽度 %d 与 vocab_size %d 不一致"
+                             % (len(logits), size))
+        mask = rules.mask(list(tokens), size)
+        if not any(mask):
+            raise ValueError("constrained_generate: 第 %d 步没有合法候选" % (_step + 1))
+        masked = apply_rule_mask(logits, mask)
+        tokens.append(constrained_pick(logits, mask))
+        trace.append(masked)
+    return {"tokens": tokens, "logits": trace, "steps": len(trace)}
+
+# ============================================================================
 #  研究前沿 W20-C：Mixture-of-Depths 路由与 Early Exit
 # ============================================================================
 

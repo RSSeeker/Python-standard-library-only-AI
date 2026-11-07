@@ -26769,3 +26769,129 @@ class TestMixtureOfDepths:
             AI.early_exit_savings([True], 4)
         with pytest.raises(ValueError):
             AI.early_exit_savings([], 4)
+
+
+class TestNeuroSymbolic:
+    """W20-D：规则约束的候选过滤（神经符号最小实现）"""
+
+    def _rules(self):
+        return AI.RuleSet([("no_repeat", AI.rule_no_repeat),
+                           ("short", AI.rule_max_length(3)),
+                           ("white", AI.rule_allowed_set([0, 1, 2]))])
+
+    def test_ruleset_allows_and_mask(self):
+        rules = self._rules()
+        assert rules.names() == ["no_repeat", "short", "white"]
+        assert rules.allows([], 0) is True
+        assert rules.allows([0], 0) is False
+        assert rules.allows([], 3) is False
+        assert rules.allows([0, 1, 2], 0) is False
+        assert rules.mask([0], 4) == [False, True, True, False]
+        assert rules.filter([0], [0, 1, 2, 3]) == [1, 2]
+        assert AI.RuleSet().mask([0, 1], 3) == [True, True, True]
+
+    def test_ruleset_check_reports_violations(self):
+        rules = self._rules()
+        ok_report = rules.check([0, 1])
+        assert ok_report["ok"] is True
+        assert ok_report["violations"] == []
+        bad = rules.check([0, 1, 3])
+        assert bad["ok"] is False
+        assert [item["position"] for item in bad["violations"]] == [2]
+        assert bad["violations"][0]["rules"] == ["white"]
+        assert rules.check([0, 1, 2])["ok"] is True
+        too_long = rules.check([0, 1, 2, 0])
+        assert too_long["violations"][0]["rules"] == ["no_repeat", "short"]
+
+    def test_apply_rule_mask(self):
+        assert AI.apply_rule_mask([1.0, 2.0, 3.0], [True, False, True]) == \
+            [1.0, float("-inf"), 3.0]
+        with pytest.raises(ValueError):
+            AI.apply_rule_mask([1.0, 2.0], [False, False])
+        with pytest.raises(ValueError):
+            AI.apply_rule_mask([1.0], [True, True])
+        with pytest.raises(ValueError):
+            AI.apply_rule_mask([1.0], [1])
+        with pytest.raises(ValueError):
+            AI.apply_rule_mask([], [])
+        with pytest.raises(ValueError):
+            AI.apply_rule_mask([True], [True])
+
+    def test_constrained_pick(self):
+        assert AI.constrained_pick([0.1, 0.9, 0.5], [True, False, True]) == 2
+        assert AI.constrained_pick([0.5, 0.5], [True, True]) == 0
+        with pytest.raises(ValueError):
+            AI.constrained_pick([0.1], [False])
+
+    def test_constrained_generate_follows_rules(self):
+        def step(prefix):
+            return [3.0 - 0.1 * len(prefix), 1.0, 0.5, 0.1]
+
+        rules = AI.RuleSet([("no_repeat", AI.rule_no_repeat),
+                            ("white", AI.rule_allowed_set([0, 1, 2]))])
+        result = AI.constrained_generate(step, rules, max_len=3, vocab_size=4)
+        assert result["tokens"] == [0, 1, 2]
+        assert result["steps"] == 3
+        assert [len(row) for row in result["logits"]] == [4, 4, 4]
+        assert result["logits"][1][0] == float("-inf")
+        assert result["logits"][2][3] == float("-inf")
+        seeded = AI.constrained_generate(step, AI.RuleSet(), max_len=2,
+                                         vocab_size=4, seed_token=2)
+        assert seeded["tokens"] == [2, 0, 0]
+
+    def test_constrained_generate_rejects_bad_arguments(self):
+        def step(_prefix):
+            return [1.0, 2.0]
+
+        with pytest.raises(ValueError):
+            AI.constrained_generate(step, AI.RuleSet([("only5", AI.rule_allowed_set([5]))]),
+                                    max_len=1, vocab_size=2)
+        with pytest.raises(ValueError):
+            AI.constrained_generate(3, AI.RuleSet())
+        with pytest.raises(ValueError):
+            AI.constrained_generate(step, [])
+        with pytest.raises(ValueError):
+            AI.constrained_generate(step, AI.RuleSet(), max_len=0)
+        with pytest.raises(ValueError):
+            AI.constrained_generate(step, AI.RuleSet(), max_len=1, vocab_size=9)
+
+    def test_ruleset_rejects_bad_definitions(self):
+        with pytest.raises(ValueError):
+            AI.RuleSet([("a", AI.rule_no_repeat), ("a", AI.rule_no_repeat)])
+        with pytest.raises(ValueError):
+            AI.RuleSet([("a",)])
+        with pytest.raises(ValueError):
+            AI.RuleSet([("a", 3)])
+        with pytest.raises(ValueError):
+            AI.RuleSet([("", AI.rule_no_repeat)])
+        with pytest.raises(ValueError):
+            AI.RuleSet("not a list")
+
+    def test_rule_factories_validate(self):
+        with pytest.raises(ValueError):
+            AI.rule_max_length(0)
+        with pytest.raises(ValueError):
+            AI.rule_max_length(True)
+        with pytest.raises(ValueError):
+            AI.rule_allowed_set([])
+        with pytest.raises(ValueError):
+            AI.rule_allowed_set([-1])
+        short = AI.rule_max_length(1)
+        assert short([], 0) is True
+        assert short([0], 1) is False
+        white = AI.rule_allowed_set([1, 2])
+        assert white([], 2) is True
+        assert white([], 0) is False
+
+    def test_ruleset_argument_types(self):
+        rules = self._rules()
+        with pytest.raises(ValueError):
+            rules.allows("ab", 0)
+        with pytest.raises(ValueError):
+            rules.allows([], True)
+        with pytest.raises(ValueError):
+            rules.mask([], 0)
+        with pytest.raises(ValueError):
+            rules.check("abc")
+        with pytest.raises(ValueError):
+            rules.filter([0], [True])
