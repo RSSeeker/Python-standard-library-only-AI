@@ -30527,6 +30527,185 @@ class PatchTSTEmbedding:
     def param_count(self):
         return self.d_model * self.patch_len + self.d_model
 
+# ============================================================================
+#  W18-A：全模块梯度自检（grad_check_all）
+# ============================================================================
+
+_W18A_SKIP_TYPES = (str, bytes, int, float, bool, dict, set, type(None))
+
+
+def _w18a_is_leaf_layer(obj):
+    """判断一个对象是不是「Layer 式」的参数持有者（能单独做局部梯度自检）"""
+    if not hasattr(obj, "weights") or not hasattr(obj, "biases"):
+        return False
+    if not callable(getattr(obj, "forward", None)):
+        return False
+    if not callable(getattr(obj, "backward", None)):
+        return False
+    fan_in = getattr(obj, "fan_in", None)
+    fan_out = getattr(obj, "fan_out", None)
+    return isinstance(fan_in, int) and isinstance(fan_out, int)
+
+
+def _w18a_collect(obj, out, seen, path, skipped):
+    """深度优先收集 Layer 式子模块；容器递归，非 Layer 的参数持有者记进 skipped"""
+    if id(obj) in seen:
+        return
+    seen.add(id(obj))
+    if _w18a_is_leaf_layer(obj):
+        out.append((path or type(obj).__name__, obj))
+        return
+    if hasattr(obj, "weights") and not _w18a_is_leaf_layer(obj):
+        skipped.append({"name": path or type(obj).__name__,
+                        "type": type(obj).__name__,
+                        "reason": "参数持有者但不是 Layer 式模块（缺 forward/backward/fan_in）"})
+        return
+    slots = getattr(obj, "__dict__", None)
+    if not isinstance(slots, dict):
+        return
+    for key in sorted(slots):
+        if key.startswith("_") or key in ("optimizer", "loss_fn", "history"):
+            continue
+        value = slots[key]
+        if isinstance(value, _W18A_SKIP_TYPES) or callable(value):
+            continue
+        child_path = "%s.%s" % (path, key) if path else key
+        if isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                if isinstance(item, _W18A_SKIP_TYPES) or callable(item):
+                    continue
+                _w18a_collect(item, out, seen, "%s[%d]" % (child_path, i), skipped)
+        else:
+            _w18a_collect(value, out, seen, child_path, skipped)
+
+
+def _w18a_dot(a, b):
+    total = 0.0
+    for i in range(len(a)):
+        total += a[i] * b[i]
+    return total
+
+
+def _w18a_check_layer(layer, eps, tol, rng, max_params):
+    """对单个 Layer 式模块做局部中心差分校验（输出方向随机取）"""
+    x = [rng.uniform(-1.0, 1.0) for _ in range(layer.fan_in)]
+    y = layer.forward(x)
+    dout = [rng.uniform(-1.0, 1.0) for _ in range(len(y))]
+    gw, gb, _ = layer.backward(dout)
+
+    names = []
+    for path, _ in _param_leaves(layer.weights):
+        names.append(("weight" + "".join("[%d]" % p for p in path),
+                      layer.weights, path, gw))
+    for path, _ in _param_leaves(layer.biases):
+        names.append(("bias" + "".join("[%d]" % p for p in path),
+                      layer.biases, path, gb))
+    if max_params is not None and len(names) > max_params:
+        rng.shuffle(names)
+        names = names[:max_params]
+
+    checks = []
+    zeros = []
+    for name, param, path, grad in names:
+        analytic = _pget(grad, path)
+        original = _pget(param, path)
+        _pset(param, path, original + eps)
+        plus = _w18a_dot(dout, layer.forward(x))
+        _pset(param, path, original - eps)
+        minus = _w18a_dot(dout, layer.forward(x))
+        _pset(param, path, original)
+        numeric = (plus - minus) / (2.0 * eps)
+        if abs(analytic) < 1e-8 and abs(numeric) < 1e-8:
+            zeros.append(name)
+            continue
+        scale = max(abs(analytic), abs(numeric))
+        rel = abs(analytic - numeric) / (scale if scale > 0.0 else 1.0)
+        checks.append({"name": name, "rel": rel,
+                       "analytic": analytic, "numeric": numeric})
+
+    worst = 0.0
+    worst_name = ""
+    for item in checks:
+        if item["rel"] > worst:
+            worst = item["rel"]
+            worst_name = item["name"]
+    return {"ok": worst <= tol, "worst_name": worst_name, "worst_rel": worst,
+            "checks": checks, "zeros": zeros, "output_size": len(y)}
+
+
+def grad_check_all(module, eps: float = 1e-6, tol: float = 1e-5,
+                   seed: int = 12345, max_params=None):
+    """自动遍历模型里所有「Layer 式」参数持有者，逐个做局部梯度校验。
+
+    和 `grad_check` 的区别：`grad_check` 只支持 MLP / Model / CausalLM / Seq2SeqLM，
+    检查的是**整个模型**的输出对参数的梯度；本函数不关心模型的整体结构，沿
+    `__dict__` 深度优先遍历，把每个带 `weights` / `biases` / `forward` / `backward`
+    的模块挑出来，各自用随机输入与随机上游梯度做一次中心差分：
+
+        x = U(-1, 1)^fan_in          y = layer.forward(x)
+        dout = U(-1, 1)^len(y)       gw, gb, _ = layer.backward(dout)
+        比对 d<dout, y>/dparam 与解析的 gw/gb
+
+    这样卷积、循环、注意力等**非 Layer 结构**不会被假装检查——它们会进 `skipped`
+    并写明原因（缺 forward/backward/fan_in），要用 `grad_check` 或专门的探针覆盖。
+
+    eps:        差分步长
+    tol:        相对误差阈值
+    seed:       随机输入/方向/抽查的种子（可复现）
+    max_params: 每个模块最多抽查多少个标量参数（None = 全查）
+
+    返回 dict：
+        {'ok': bool, 'checked': int, 'failed': [名字, ...],
+         'worst': {'name','rel'} 或 None,
+         'modules': [{'name','type','ok','worst_name','worst_rel','zeros','checks'}],
+         'skipped': [{'name','type','reason'}]}
+    """
+    if not isinstance(eps, float) and not isinstance(eps, int):
+        raise TypeError("grad_check_all: eps 必须是数字")
+    if isinstance(eps, bool) or eps <= 0.0:
+        raise ValueError("grad_check_all: eps 必须为正数")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or tol < 0.0:
+        raise ValueError("grad_check_all: tol 必须是非负数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("grad_check_all: seed 必须是整数")
+    if max_params is not None:
+        if isinstance(max_params, bool) or not isinstance(max_params, int):
+            raise TypeError("grad_check_all: max_params 必须是整数或 None")
+        if max_params <= 0:
+            raise ValueError("grad_check_all: max_params 必须为正数")
+
+    target = getattr(module, "model", module) if hasattr(module, "forward") else module
+    rng = random.Random(seed)
+    layers = []
+    skipped = []
+    _w18a_collect(target, layers, set(), "", skipped)
+    if not layers:
+        raise ValueError("grad_check_all: 没有找到任何 Layer 式子模块"
+                         "（本函数只检查带 weights/biases/forward/backward/fan_in 的模块）")
+
+    reports = []
+    failed = []
+    worst = None
+    for path, layer in layers:
+        report = _w18a_check_layer(layer, float(eps), float(tol), rng, max_params)
+        entry = {"name": path, "type": type(layer).__name__,
+                 "ok": report["ok"],
+                 "worst_name": report["worst_name"],
+                 "worst_rel": report["worst_rel"],
+                 "zeros": list(report["zeros"]),
+                 "checks": report["checks"]}
+        reports.append(entry)
+        if not report["ok"]:
+            failed.append(path)
+        if worst is None or report["worst_rel"] > worst["rel"]:
+            worst = {"name": path + "." + report["worst_name"]
+                     if report["worst_name"] else path,
+                     "rel": report["worst_rel"]}
+
+    return {"ok": not failed, "checked": len(reports), "failed": failed,
+            "worst": worst, "modules": reports, "skipped": skipped}
+
+
 # ======================================================================
 #  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
 # ======================================================================

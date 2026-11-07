@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1644 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1654 项）
 
 ## 特性
 
@@ -2258,6 +2258,44 @@ keep = AI.nms([[0.0, 0.0, 1.0, 1.0], [0.05, 0.05, 0.95, 0.95]], [0.9, 0.8], 0.5)
 - **深度 / 姿态估计不做实现**：它们依赖大规模关键点数据集与数百 MB 的预训练骨干，本库没有可用的权重；与其放一个永远返回占位值的空壳，不如在这里说明取舍。
   返回 `(cx, cy, w, h)`——两者不要混用。
 
+### 全模块梯度自检（W18-A）
+
+| 接口 | 说明 |
+|------|------|
+| `grad_check_all(module, eps=1e-6, tol=1e-5, seed=12345, max_params=None)` | 遍历所有 Layer 式子模块，逐个用随机输入 + 随机上游梯度做中心差分 |
+
+```python
+import AI
+
+net = AI.MLP([3, 8, 4, 2], activations=["relu", "relu", "linear"])
+rep = AI.grad_check_all(net)
+print(rep["ok"], rep["checked"], rep["worst"])
+```
+
+和 `grad_check` 的分工：`grad_check` 只认 MLP / Model / CausalLM / Seq2SeqLM，检查的是
+**整个模型**输出对参数的梯度；`grad_check_all` 不关心模型结构，沿 `__dict__` 深度优先
+遍历，把每个带 `weights` / `biases` / `forward` / `backward` / `fan_in` 的模块挑出来，
+各自验证：
+
+```
+x = U(-1, 1)^fan_in            y = layer.forward(x)
+dout = U(-1, 1)^len(y)         gw, gb, _ = layer.backward(dout)
+比对 d<dout, y> / dparam       与解析的 gw / gb
+```
+
+返回 `{'ok', 'checked', 'failed', 'worst', 'modules', 'skipped'}`；每个模块带
+`worst_rel` 与逐参数 `checks`。
+
+诚实边界：
+
+- 只覆盖 **Layer 式**模块（稠密层、`DropConnect` 这类）。卷积、循环、注意力的参数
+  不是为了「一层一个向量」设计的，它们会进 `skipped` 并写明原因——这类模块要用
+  `grad_check` 或专门探针（`Conv2d` / `LSTM` / `MultiHeadAttention` 各自都有中心差分测试）。
+- 校验的是**单层局部**反向：输入是随机向量，不是真实数据分布；它能抓实现错（比如
+  梯度少乘一个 mask），抓不到「层与层之间的接口约定错了」。
+- `zeros` 沿用 `grad_check` 的口径：解析与数值都 < 1e-8 的标量不参与相对误差
+  （ReLU 死单元、softmax 前的平移不变偏置都会出现这种参数）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2674,7 +2712,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1644 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1654 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2886,6 +2924,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPointCloud` | 最远点采样与手工复算一致、Chamfer 闭式与对称、体素化形状/单点自动边界/越界夹紧、PointNet 形状与置换不变、逐点梯度对中心差分、逐权重梯度对中心差分、参数校验 |
 | `TestVideoModels` | 3D-CNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度对中心差分、`zero_grad` 清空、双流拼接形状与参数量、两路输入梯度与 head 权重梯度、9 处参数校验 |
 | `TestOCRAndDetection` | CRNN 形状与参数量、输入梯度对中心差分、卷积与 head 权重梯度、高度未压到 1 报错、CTC 贪心解码三例（含 blank 过滤与全 blank）、YOLO 网格目标/冲突计数/解码阈值/NMS，共 9 例 |
+| `TestGradCheckAll` | 遍历三层 MLP、Model 包装解包、同种子可复现、`max_params` 上限、故意破坏 `backward` 被定位到具体层、非 Layer 持有者进 `skipped`、零梯度归类、容器递归、空模型报错、11 条参数校验，共 10 例 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2939,7 +2978,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1644 个单元测试
+├── test_ai.py       # 1654 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

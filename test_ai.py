@@ -25308,3 +25308,132 @@ class TestOCRAndDetection:
             AI.nms(boxes, scores[1:])
         with pytest.raises(ValueError):
             AI.nms(boxes, scores, 1.5)
+
+
+class TestGradCheckAll:
+    """W18-A：`grad_check_all` 自动遍历 Layer 式子模块做局部梯度校验。"""
+
+    def _net(self):
+        AI.set_seed(7)
+        return AI.MLP([3, 8, 4, 2], activations=["relu", "relu", "linear"])
+
+    def test_finds_all_layers(self):
+        rep = AI.grad_check_all(self._net())
+        assert rep["checked"] == 3
+        assert rep["ok"] is True
+        assert [m["name"] for m in rep["modules"]] == ["layers[0]", "layers[1]", "layers[2]"]
+        assert rep["failed"] == []
+        assert rep["skipped"] == []
+        assert rep["worst"]["rel"] < 1e-6
+
+    def test_model_wrapper_unwrapped(self):
+        AI.set_seed(7)
+        model = AI.Model(AI.MLP([3, 4, 2], activations=["relu", "linear"]),
+                         loss_fn="mse", optimizer="sgd", lr=0.01)
+        rep = AI.grad_check_all(model)
+        assert rep["checked"] == 2
+        assert rep["ok"] is True
+
+    def test_seed_reproducible(self):
+        net = self._net()
+        a = AI.grad_check_all(net, seed=11)
+        b = AI.grad_check_all(net, seed=11)
+        c = AI.grad_check_all(net, seed=12)
+        assert a["worst"]["rel"] == b["worst"]["rel"]
+        assert a["worst"]["name"] == b["worst"]["name"]
+        assert c["ok"] is True
+
+    def test_max_params_caps_checks(self):
+        rep = AI.grad_check_all(self._net(), max_params=2)
+        assert all(len(m["checks"]) <= 2 for m in rep["modules"])
+        assert rep["ok"] is True
+
+    def test_detects_broken_backward(self):
+        class BadLayer(AI.Layer):
+            def backward(self, delta):
+                gw, gb, nd = AI.Layer.backward(self, delta)
+                for row in gw:
+                    for j in range(len(row)):
+                        row[j] *= 3.0
+                return gw, gb, nd
+
+        AI.set_seed(5)
+        net = AI.MLP([2, 3, 2], activations=["relu", "linear"])
+        net.layers[0] = BadLayer(2, 3, activation="relu")
+        rep = AI.grad_check_all(net)
+        assert rep["ok"] is False
+        assert rep["failed"] == ["layers[0]"]
+        assert rep["modules"][1]["ok"] is True
+        assert "layers[0]" in rep["worst"]["name"]
+
+    def test_skips_non_layer_holders(self):
+        class OpaqueHolder:
+            def __init__(self):
+                self.weights = [[1.0]]
+
+        class Wrapper:
+            def __init__(self, layer):
+                self.core = layer
+                self.opaque = OpaqueHolder()
+
+            def forward(self, x):
+                return self.core.forward(x)
+
+        AI.set_seed(1)
+        rep = AI.grad_check_all(Wrapper(AI.Layer(2, 2)))
+        assert rep["checked"] == 1
+        assert len(rep["skipped"]) == 1
+        assert rep["skipped"][0]["reason"]
+
+    def test_zero_gradients_recorded(self):
+        AI.set_seed(3)
+        net = AI.MLP([1, 1], activations=["relu"])
+        net.layers[0].weights[0][0] = -5.0
+        net.layers[0].biases[0] = -1.0
+        rep = AI.grad_check_all(net)
+        assert rep["ok"] is True
+        assert len(rep["modules"][0]["zeros"]) >= 1
+
+    def test_container_recursion(self):
+        class Holder:
+            def __init__(self, seq):
+                self.body = seq
+
+        AI.set_seed(11)
+        seq = AI.Sequential([AI.Layer(2, 4, activation="relu"),
+                             AI.Layer(4, 2, activation="linear")])
+        rep = AI.grad_check_all(Holder(seq))
+        assert rep["checked"] == 2
+        assert rep["ok"] is True
+
+    def test_empty_model_raises(self):
+        class Empty:
+            pass
+
+        with pytest.raises(ValueError):
+            AI.grad_check_all(Empty())
+
+    def test_validation(self):
+        net = self._net()
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, eps=0.0)
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, eps=-1e-6)
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, eps=True)
+        with pytest.raises(TypeError):
+            AI.grad_check_all(net, eps="1e-6")
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, tol=-1.0)
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, tol=True)
+        with pytest.raises(TypeError):
+            AI.grad_check_all(net, seed=1.5)
+        with pytest.raises(TypeError):
+            AI.grad_check_all(net, seed=True)
+        with pytest.raises(ValueError):
+            AI.grad_check_all(net, max_params=0)
+        with pytest.raises(TypeError):
+            AI.grad_check_all(net, max_params=2.5)
+        with pytest.raises(TypeError):
+            AI.grad_check_all(net, max_params=True)
