@@ -20489,3 +20489,85 @@ class TestRegressionMetricsExtra:
             AI.inference_benchmark(model, [[0.1]], batch_size=0)
         with pytest.raises(ValueError):
             AI.inference_benchmark(model, [], batch_size=4)
+
+
+class TestClassificationMetricsExtra:
+    def test_balanced_accuracy(self):
+        assert abs(AI.balanced_accuracy_score([0, 0, 1, 1], [0, 1, 1, 1]) - 0.75) < 1e-12
+        yt = [0] * 9 + [1]
+        yp = [0] * 10
+        assert abs(AI.accuracy_score(yt, yp) - 0.9) < 1e-12
+        assert abs(AI.balanced_accuracy_score(yt, yp) - 0.5) < 1e-12
+
+    def test_cohen_kappa(self):
+        assert abs(AI.cohen_kappa_score([0, 0, 1, 1], [0, 0, 1, 1]) - 1.0) < 1e-12
+        assert abs(AI.cohen_kappa_score([0, 0, 1, 1], [0, 1, 1, 0])) < 1e-12
+        with pytest.raises(ValueError):
+            AI.cohen_kappa_score([1, 1, 1], [1, 1, 1])
+
+    def test_sensitivity_specificity(self):
+        yt = [1, 1, 0, 0]
+        yp = [1, 0, 0, 0]
+        assert abs(AI.sensitivity_score(yt, yp) - 0.5) < 1e-12
+        assert abs(AI.specificity_score(yt, yp) - 1.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.sensitivity_score([0, 0], [0, 1])
+        with pytest.raises(ValueError):
+            AI.specificity_score([1, 1], [1, 1])
+
+    def test_fbeta_score(self):
+        yt = [1, 1, 0, 0]
+        yp = [1, 0, 0, 0]
+        assert abs(AI.fbeta_score(yt, yp, 1.0) - 2.0 * 1.0 * 0.5 / 1.5) < 1e-12
+        assert AI.fbeta_score(yt, yp, 0.5) > AI.fbeta_score(yt, yp, 1.0) > \
+            AI.fbeta_score(yt, yp, 2.0)
+        yt_r = [1, 1, 1, 0, 0]
+        yp_r = [1, 1, 0, 1, 1]
+        assert AI.fbeta_score(yt_r, yp_r, 0.5) < AI.fbeta_score(yt_r, yp_r, 1.0) < \
+            AI.fbeta_score(yt_r, yp_r, 2.0)
+        with pytest.raises(ValueError):
+            AI.fbeta_score(yt, yp, 0.0)
+
+    def test_hamming_score(self):
+        assert abs(AI.hamming_score([1, 0, 1, 1], [1, 0, 0, 1]) - 0.75) < 1e-12
+        assert abs(AI.hamming_score([[1, 0], [0, 1]], [[1, 0], [1, 1]]) - 0.75) < 1e-12
+        with pytest.raises(ValueError):
+            AI.hamming_score([[1, 0]], [[1, 0, 1]])
+
+    def test_jaccard_score(self):
+        yt = [0, 1, 1, 2]
+        yp = [0, 2, 1, 2]
+        assert abs(AI.jaccard_score(yt, yp) - (1.0 + 0.5 + 0.5) / 3.0) < 1e-12
+        assert abs(AI.jaccard_score(yt, yp, average="micro") - 0.6) < 1e-12
+        assert abs(AI.jaccard_score(yt, yp, average="weighted") - 0.625) < 1e-12
+        assert abs(AI.jaccard_score(yt, yt) - 1.0) < 1e-12
+
+    def test_brier_score(self):
+        assert abs(AI.brier_score([0, 1], [0.2, 0.8]) - 0.04) < 1e-12
+        got = AI.brier_score([0, 1], [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]])
+        assert abs(got - 0.10) < 1e-12
+        with pytest.raises(ValueError):
+            AI.brier_score([2], [0.5])
+
+    def test_log_loss(self):
+        v = AI.log_loss([0, 1], [0.25, 0.75])
+        assert abs(v - (-math.log(0.75))) < 1e-12
+        assert abs(v - AI.cross_entropy_loss([0.25, 0.75], [0.0, 1.0])[0]) < 1e-12
+        assert AI.log_loss([1], [0.0]) > 30.0
+        assert abs(AI.log_loss([0], [0.0])) < 1e-12
+        with pytest.raises(ValueError):
+            AI.log_loss([0, 1], [0.5, 0.5], eps=0.0)
+
+    def test_pr_auc_score(self):
+        assert abs(AI.pr_auc_score([0, 1, 1, 0], [0.1, 0.9, 0.8, 0.7]) - 1.0) < 1e-12
+        assert abs(AI.pr_auc_score([0, 1], [0.9, 0.8]) - 0.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.pr_auc_score([0, 0], [0.2, 0.1])
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.brier_score([0, 1], [0.2])
+        with pytest.raises(ValueError):
+            AI.jaccard_score([0, 1], [0, 1], average="binary")
+        with pytest.raises(ValueError):
+            AI.hamming_score([[1, 0]], [1])

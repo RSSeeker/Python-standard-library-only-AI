@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1286 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1296 项）
 
 ## 特性
 
@@ -1172,6 +1172,31 @@ print(AI.inference_benchmark(model, x_sample, repeats=50, warmup=5))
 C 扩展；`params` 是 `weights`/`biases` 的标量总数，非 MLP 层记为 0。计时用
 `time.perf_counter`，`warmup` 次不计时，`batch_size=None` 时把 `x` 当单样本。
 
+### 评估指标扩展（W13-B：分类）
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `balanced_accuracy_score(y_true, y_pred)` | 各类召回率的宏平均，只在真实样本数 > 0 的类上平均；类别不均衡时比 `accuracy_score` 诚实 |
+| `cohen_kappa_score(y_true, y_pred)` | `(po − pe) / (1 − pe)`，`pe` 由混淆矩阵的行列边际算；所有样本同一类时无定义（`ValueError`） |
+| `sensitivity_score(y_true, y_pred, pos_label=1)` | `TP / (TP + FN)`，正类被找出的比例 |
+| `specificity_score(y_true, y_pred, pos_label=1)` | `TN / (TN + FP)`，负类被正确排除的比例 |
+| `fbeta_score(y_true, y_pred, beta=1.0, average="binary")` | `(1+β²)·P·R / (β²P + R)`；`average` 支持 `binary`/`macro`/`micro`/`weighted` |
+| `hamming_score(y_true, y_pred)` | 逐元素一致的比例（1 − 汉明损失），支持标量与等长嵌套标签 |
+| `jaccard_score(y_true, y_pred, average="macro")` | 每类 `TP / (TP + FP + FN)`（IoU），再按 `macro`/`micro`/`weighted` 聚合 |
+| `brier_score(y_true, y_proba)` | `mean(Σ_c (p_c − 1{y=c})²)`；二元时传单列正类概率即可 |
+| `log_loss(y_true, y_proba, eps=1e-15)` | `−mean(log(max(p_y, eps)))`，与 `cross_entropy_loss` 同值（后者吃概率、返回 `(loss, grad)`） |
+| `pr_auc_score(y_true, y_score)` | PR 曲线下面积（平均精确率），按分数降序累积 `Σ (ΔR)·P`，即 step 阶梯面积 |
+
+```python
+yt = [0, 0, 1, 1]
+yp = [0, 1, 1, 1]
+print(AI.balanced_accuracy_score(yt, yp))   # 0.75（0.5 与 1.0 的平均）
+print(AI.fbeta_score([1, 1, 0, 0], [1, 0, 0, 0], beta=2.0))  # 0.5556，偏召回
+print(AI.brier_score([0, 1], [0.2, 0.8]))   # 0.0400
+```
+
+`pr_auc_score` 用的是**阶梯式**平均精确率（与 sklearn `average_precision_score` 同口径），不是对 PR 曲线做梯形积分；后者在少数点上会高估。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1588,7 +1613,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1286 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1296 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1760,6 +1785,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
 | `TestRegressionMetricsExtra` | MedAE 的奇偶中位与抗离群、MSLE/RMSLE 与手算一致且对负值报错、ExplainedVariance 对系统性偏移不惩罚（对照 R²）、调整 R² 与闭式一致且样本不足报错、Pinball 与 `quantile_loss` 一致、`inference_benchmark` 的字段自洽/`params`/峰值内存与参数校验 |
+| `TestClassificationMetricsExtra` | 平衡准确率 / kappa / 敏感度特异度 / F-beta 单调性 / 汉明 / Jaccard 三种 average / Brier 单列多列 / LogLoss 与 CE 同值 / PR-AUC 阶梯面积 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1813,7 +1839,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1286 个单元测试
+├── test_ai.py       # 1296 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -400,7 +400,8 @@
   - `peak_memory_bytes` 用 `tracemalloc`，只统计 Python 堆（本库全是 `list[float]`），
     不含解释器常驻内存；`params` 是 weights/biases 标量总数，非 MLP 层记 0。
   - `AI.py` 顶部新增 `import tracemalloc`。
-- [ ] 分类：BalancedAccuracy / CohenKappa / Brier / LogLoss / PR-AUC / Specificity / Sensitivity / F-beta / Hamming / Jaccard
+- [x] 分类：BalancedAccuracy / CohenKappa / Brier / LogLoss / PR-AUC / Specificity / Sensitivity / F-beta / Hamming / Jaccard（10 个；`_binary_counts` 统一二元计数、`_proba_matrix` 统一概率矩阵校验；探针 47 项全过，含 kappa 的 pe≥1 无定义、PR-AUC 阶梯面积、log_loss 与 `cross_entropy_loss` 同值）
+  - 单位口径：Brier 单列按 `(p−y)²`、多列按 one-hot 求和平方；`log_loss` 单列时标签必须 0/1
 - [ ] 排序：NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage
 - [ ] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU
 - [ ] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity

@@ -28433,6 +28433,286 @@ def _regression_pairs(y_true, y_pred, who):
     return flat_t, flat_p
 
 
+def balanced_accuracy_score(y_true, y_pred, num_classes: int = None) -> float:
+    """平衡准确率 = 各类召回率的宏平均（只在真实样本数 > 0 的类上平均）。"""
+    mat = confusion_matrix(y_true, y_pred, num_classes)
+    n = len(mat)
+    recalls = []
+    for c in range(n):
+        support = sum(mat[c])
+        if support:
+            recalls.append(mat[c][c] / support)
+    if not recalls:
+        raise ValueError("balanced_accuracy_score: 没有任何类别样本")
+    return sum(recalls) / len(recalls)
+
+
+def cohen_kappa_score(y_true, y_pred, num_classes: int = None) -> float:
+    """Cohen's kappa = (po - pe) / (1 - pe)，po 是观察一致率、pe 是期望一致率。"""
+    mat = confusion_matrix(y_true, y_pred, num_classes)
+    n = len(mat)
+    total = sum(sum(row) for row in mat)
+    if total == 0:
+        raise ValueError("cohen_kappa_score: 没有样本")
+    po = sum(mat[c][c] for c in range(n)) / total
+    pe = 0.0
+    for c in range(n):
+        row = sum(mat[c])
+        col = sum(mat[r][c] for r in range(n))
+        pe += (row / total) * (col / total)
+    if pe >= 1.0:
+        raise ValueError("cohen_kappa_score: 所有样本都落在同一类，kappa 无定义")
+    return (po - pe) / (1.0 - pe)
+
+
+def _binary_counts(y_true, y_pred, pos_label, who):
+    yt, yp = _metric_pairs(y_true, y_pred, who)
+    tp = fp = tn = fn = 0
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        tv = _metric_label(t, f"{who}.y_true", i)
+        pv = _metric_label(p, f"{who}.y_pred", i)
+        if tv == pos_label:
+            if pv == pos_label:
+                tp += 1
+            else:
+                fn += 1
+        else:
+            if pv == pos_label:
+                fp += 1
+            else:
+                tn += 1
+    if tp + fn == 0:
+        raise ValueError(f"{who}: 没有正类样本（pos_label={pos_label}）")
+    if tn + fp == 0:
+        raise ValueError(f"{who}: 没有负类样本（pos_label={pos_label}）")
+    return tp, fp, tn, fn
+
+
+def sensitivity_score(y_true, y_pred, pos_label: int = 1) -> float:
+    """敏感度（召回率）= TP / (TP + FN)，即正类被找出来的比例。"""
+    if isinstance(pos_label, bool) or not isinstance(pos_label, int):
+        raise ValueError(f"sensitivity_score: pos_label 必须是整数，收到 {pos_label!r}")
+    tp, _fp, _tn, fn = _binary_counts(y_true, y_pred, pos_label, "sensitivity_score")
+    return tp / (tp + fn)
+
+
+def specificity_score(y_true, y_pred, pos_label: int = 1) -> float:
+    """特异度 = TN / (TN + FP)，即负类被正确排除的比例。"""
+    if isinstance(pos_label, bool) or not isinstance(pos_label, int):
+        raise ValueError(f"specificity_score: pos_label 必须是整数，收到 {pos_label!r}")
+    _tp, fp, tn, _fn = _binary_counts(y_true, y_pred, pos_label, "specificity_score")
+    return tn / (tn + fp)
+
+
+def fbeta_score(y_true, y_pred, beta: float = 1.0, average: str = "binary",
+                pos_label: int = 1, num_classes: int = None) -> float:
+    """F-beta = (1+β²)·P·R / (β²·P + R)。
+
+    average: 'binary'（只看 pos_label，默认）/ 'macro' / 'micro' / 'weighted'。
+    β<1 偏精确率，β>1 偏召回率。
+    """
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise ValueError(f"fbeta_score: beta 必须是数字，收到 {beta!r}")
+    if not float(beta) > 0.0:
+        raise ValueError(f"fbeta_score: beta 必须 > 0，收到 {beta}")
+    if average not in ("binary", "macro", "micro", "weighted"):
+        raise ValueError(
+            f"fbeta_score: average 必须是 binary/macro/micro/weighted，收到 {average!r}")
+    b2 = float(beta) ** 2
+
+    def _f(p, r):
+        denom = b2 * p + r
+        return (1.0 + b2) * p * r / denom if denom else 0.0
+
+    if average == "binary":
+        tp, fp, _tn, fn = _binary_counts(y_true, y_pred, pos_label, "fbeta_score")
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn)
+        return _f(precision, recall)
+
+    stats = precision_recall_f1(y_true, y_pred, average="none", num_classes=num_classes)
+    per_class = stats["per_class"]
+    if average == "micro":
+        return _f(stats["precision"], stats["recall"])
+    if average == "weighted":
+        total = sum(row["support"] for row in per_class)
+        if not total:
+            return 0.0
+        return sum(_f(row["precision"], row["recall"]) * row["support"]
+                   for row in per_class) / total
+    used = [row for row in per_class if row["support"]]
+    if not used:
+        raise ValueError("fbeta_score: 没有任何类别样本")
+    return sum(_f(row["precision"], row["recall"]) for row in used) / len(used)
+
+
+def hamming_score(y_true, y_pred) -> float:
+    """1 - 汉明损失：逐元素一致的比例（支持标量与等长嵌套标签）。"""
+    yt, yp = _metric_pairs(y_true, y_pred, "hamming_score")
+    hit = 0
+    total = 0
+    for i, (t, p) in enumerate(zip(yt, yp)):
+        t_list = isinstance(t, (list, tuple))
+        p_list = isinstance(p, (list, tuple))
+        if t_list and p_list:
+            if len(t) != len(p):
+                raise ValueError(
+                    f"hamming_score: 第 {i} 个样本长度不同（{len(t)} vs {len(p)}）")
+            for j, (tv, pv) in enumerate(zip(t, p)):
+                hit += 1 if _metric_label(tv, f"hamming_score.y_true[{i}][{j}]", j) == \
+                    _metric_label(pv, f"hamming_score.y_pred[{i}][{j}]", j) else 0
+                total += 1
+        elif t_list or p_list:
+            raise ValueError(f"hamming_score: 第 {i} 个样本一个标量一个序列")
+        else:
+            hit += 1 if _metric_label(t, "hamming_score.y_true", i) == \
+                _metric_label(p, "hamming_score.y_pred", i) else 0
+            total += 1
+    if total == 0:
+        raise ValueError("hamming_score: 没有可比较的元素")
+    return hit / total
+
+
+def jaccard_score(y_true, y_pred, average: str = "macro",
+                  num_classes: int = None) -> float:
+    """Jaccard（IoU）：每类 TP/(TP+FP+FN)，再按 average 聚合。"""
+    if average not in ("macro", "micro", "weighted"):
+        raise ValueError(
+            f"jaccard_score: average 必须是 macro/micro/weighted，收到 {average!r}")
+    mat = confusion_matrix(y_true, y_pred, num_classes)
+    n = len(mat)
+    tp_all = fp_all = fn_all = 0
+    per_class = []
+    for c in range(n):
+        tp = mat[c][c]
+        support = sum(mat[c])
+        predicted = sum(mat[r][c] for r in range(n))
+        fp = predicted - tp
+        fn = support - tp
+        tp_all += tp
+        fp_all += fp
+        fn_all += fn
+        union = tp + fp + fn
+        per_class.append((tp / union if union else 0.0, support))
+    if average == "micro":
+        union = tp_all + fp_all + fn_all
+        if union == 0:
+            raise ValueError("jaccard_score: 所有预测与标签都为空")
+        return tp_all / union
+    used = [v for v, s in per_class if s]
+    if not used:
+        raise ValueError("jaccard_score: 没有任何类别样本")
+    if average == "weighted":
+        total = sum(s for _v, s in per_class)
+        return sum(v * s for v, s in per_class) / total
+    return sum(used) / len(used)
+
+
+def _proba_matrix(y_proba, n: int, who):
+    rows = list(y_proba)
+    if not rows:
+        raise ValueError(f"{who}: y_proba 不能为空")
+    first = rows[0]
+    if isinstance(first, (list, tuple)):
+        if len(rows) != n:
+            raise ValueError(f"{who}: y_proba 行数 {len(rows)} 与标签数 {n} 不同")
+        width = len(first)
+        out = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, (list, tuple)):
+                raise ValueError(f"{who}: 第 {i} 行不是序列")
+            if len(row) != width:
+                raise ValueError(f"{who}: 第 {i} 行宽度 {len(row)} 与第 0 行 {width} 不同")
+            vals = [_metric_number(v, f"{who}.y_proba[{i}]", j) for j, v in enumerate(row)]
+            out.append(vals)
+        return out
+    if len(rows) != n:
+        raise ValueError(f"{who}: y_proba 长度 {len(rows)} 与标签数 {n} 不同")
+    return [[_metric_number(v, f"{who}.y_proba", i)] for i, v in enumerate(rows)]
+
+
+def brier_score(y_true, y_proba) -> float:
+    """Brier 分数：`mean(Σ_c (p_c - 1{y=c})²)`（二元时传单列概率即可）。"""
+    yt, _ = _metric_pairs(y_true, list(y_true), "brier_score")
+    rows = _proba_matrix(y_proba, len(yt), "brier_score")
+    width = len(rows[0])
+    total = 0.0
+    for i, (t, row) in enumerate(zip(yt, rows)):
+        tv = _metric_label(t, "brier_score.y_true", i)
+        if width == 1:
+            if tv not in (0, 1):
+                raise ValueError(
+                    f"brier_score: 单列概率要求标签是 0/1，y_true[{i}] = {tv}")
+            p = row[0]
+            total += (p - tv) ** 2
+        else:
+            if not 0 <= tv < width:
+                raise ValueError(
+                    f"brier_score: y_true[{i}] = {tv} 超出概率列数 {width}")
+            for c in range(width):
+                target = 1.0 if c == tv else 0.0
+                total += (row[c] - target) ** 2
+    return total / len(yt)
+
+
+def log_loss(y_true, y_proba, eps: float = 1e-15) -> float:
+    """对数损失（交叉熵）：`-mean(log(max(p_y, eps)))`。
+
+    概率列数 > 1 时按类别索引取列；单列时视为正类概率，`p(y=1)=p`。
+    """
+    if not float(eps) > 0.0 or float(eps) >= 1.0:
+        raise ValueError(f"log_loss: eps 必须在 (0, 1) 内，收到 {eps}")
+    yt, _ = _metric_pairs(y_true, list(y_true), "log_loss")
+    rows = _proba_matrix(y_proba, len(yt), "log_loss")
+    width = len(rows[0])
+    total = 0.0
+    for i, (t, row) in enumerate(zip(yt, rows)):
+        tv = _metric_label(t, "log_loss.y_true", i)
+        if width == 1:
+            if tv not in (0, 1):
+                raise ValueError(f"log_loss: 单列概率要求标签是 0/1，y_true[{i}] = {tv}")
+            p = row[0] if tv == 1 else 1.0 - row[0]
+        else:
+            if not 0 <= tv < width:
+                raise ValueError(f"log_loss: y_true[{i}] = {tv} 超出概率列数 {width}")
+            p = row[tv]
+        if p < eps:
+            p = eps
+        total -= math.log(p)
+    return total / len(yt)
+
+
+def pr_auc_score(y_true, y_score) -> float:
+    """PR 曲线下面积（平均精确率）：按分数降序累积 `Σ (ΔR)·P`。"""
+    yt, _ = _metric_pairs(y_true, list(y_true), "pr_auc_score")
+    scores = _proba_matrix(y_score, len(yt), "pr_auc_score")
+    pairs = []
+    positives = 0
+    for i, (t, row) in enumerate(zip(yt, scores)):
+        tv = _metric_label(t, "pr_auc_score.y_true", i)
+        if tv not in (0, 1):
+            raise ValueError(f"pr_auc_score: 标签必须是 0/1，y_true[{i}] = {tv}")
+        positives += tv
+        pairs.append((row[0], tv, i))
+    if positives == 0:
+        raise ValueError("pr_auc_score: 没有正类样本")
+    pairs.sort(key=lambda item: (-item[0], item[2]))
+    tp = 0
+    fp = 0
+    prev_recall = 0.0
+    area = 0.0
+    for _score, label, _idx in pairs:
+        if label:
+            tp += 1
+        else:
+            fp += 1
+        recall = tp / positives
+        precision = tp / (tp + fp)
+        area += (recall - prev_recall) * precision
+        prev_recall = recall
+    return area
+
+
 def median_absolute_error(y_true, y_pred) -> float:
     """MedAE：绝对误差的中位数（比 MAE 抗离群点）。"""
     yt, yp = _regression_pairs(y_true, y_pred, "median_absolute_error")
