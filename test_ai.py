@@ -21571,3 +21571,139 @@ class TestPermutationFeatureMaps:
             AI.feature_maps_ascii([[1.0, 2.0]], max_width=0)
         with pytest.raises(ValueError):
             AI.feature_maps_ascii([[[1.0, 2.0]]], channels=[])
+
+
+import pytest
+
+
+class TestCAM:
+    """W14-D：GradCAM / GradCAM++ / LayerCAM / ScoreCAM。"""
+
+    X = [[[1.0, 2.0, 3.0],
+          [4.0, 5.0, 6.0],
+          [7.0, 8.0, 9.0]]]
+
+    @staticmethod
+    def _model():
+        conv = AI.Conv2d(1, 2, 3, padding=1)
+        conv.weights = [[[[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+                        [[[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]]]
+        conv.biases = [0.0, 0.0]
+        lin = AI.Layer(18, 2, activation="linear")
+        lin.weights = [[1.0] * 9 + [0.0] * 9, [0.0] * 9 + [1.0] * 9]
+        lin.biases = [0.0, 0.0]
+        model = AI.Sequential(conv, AI.Flatten(), lin)
+        model.eval()
+        return model, conv
+
+    def test_gradcam_closed_form_weights(self):
+        model, _ = self._model()
+        heat, weights = AI.cam_heatmap(model, self.X, 0, class_index=0)
+        assert len(heat) == 3 and len(heat[0]) == 3
+        assert abs(weights[0] - 1.0) < 1e-12
+        assert abs(weights[1]) < 1e-12
+        assert abs(max(max(row) for row in heat) - 1.0) < 1e-12
+        assert all(v >= 0.0 for row in heat for v in row)
+
+    def test_gradcam_heat_matches_activation(self):
+        model, _ = self._model()
+        heat, _ = AI.cam_heatmap(model, self.X, 0, class_index=0)
+        acts, _ = AI._cam_logits(model, model.modules, self.X, 0)
+        peak = max(max(row) for row in acts[0])
+        for r in range(3):
+            for k in range(3):
+                assert abs(heat[r][k] - acts[0][r][k] / peak) < 1e-12
+
+    def test_gradcam_class_switch_flips_weights(self):
+        model, _ = self._model()
+        _, w0 = AI.cam_heatmap(model, self.X, 0, class_index=0)
+        heat1, w1 = AI.cam_heatmap(model, self.X, 0, class_index=1)
+        assert abs(w1[1] - 1.0) < 1e-12
+        assert abs(w1[0]) < 1e-12
+        assert len(heat1) == 3
+
+    def test_gradcam_default_class_is_argmax(self):
+        model, _ = self._model()
+        logits = model.forward(self.X)
+        best = 0 if logits[0] >= logits[1] else 1
+        _, w = AI.cam_heatmap(model, self.X, 0, class_index=best)
+        _, wd = AI.cam_heatmap(model, self.X, 0)
+        assert w == wd
+
+    def test_gradcam_variants(self):
+        model, _ = self._model()
+        _, w = AI.cam_heatmap(model, self.X, 0, class_index=0, method="gradcam")
+        heat_pp, w_pp = AI.cam_heatmap(model, self.X, 0, class_index=0,
+                                    method="gradcam++")
+        assert w_pp != w
+        assert abs(max(max(row) for row in heat_pp) - 1.0) < 1e-12
+        heat_lc, w_lc = AI.cam_heatmap(model, self.X, 0, class_index=0,
+                                   method="layercam")
+        assert w_lc is None
+        assert len(heat_lc) == 3
+
+    def test_layercam_matches_elementwise_product(self):
+        model, _ = self._model()
+        heat_lc, _ = AI.cam_heatmap(model, self.X, 0, class_index=0,
+                                 method="layercam")
+        acts, grads, _ = AI._cam_grad_output(model, model.modules, self.X, 0, 0)
+        want = [[0.0] * 3 for _ in range(3)]
+        for c in range(2):
+            for r in range(3):
+                for k in range(3):
+                    want[r][k] += acts[c][r][k] * grads[c][r][k]
+        top = max(max(row) for row in want)
+        for r in range(3):
+            for k in range(3):
+                assert abs(heat_lc[r][k] - want[r][k] / top) < 1e-12
+
+    def test_negative_heatmap_handled(self):
+        conv = AI.Conv2d(1, 2, 3, padding=1)
+        conv.weights = [[[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]],
+                        [[[0.0, 0.0, 0.0], [0.0, -0.1, 0.0], [0.0, 0.0, 0.0]]]]
+        conv.biases = [0.0, 5.0]
+        lin = AI.Layer(18, 2, activation="linear")
+        lin.weights = [[1.0] * 9 + [-1.0] * 9, [0.0] * 18]
+        lin.biases = [0.0, 0.0]
+        model = AI.Sequential(conv, AI.Flatten(), lin)
+        model.eval()
+        raw, _ = AI.cam_heatmap(model, self.X, 0, class_index=0, relu=False)
+        assert raw[0][0] < 0.0 < raw[2][2]
+        relu_heat, _ = AI.cam_heatmap(model, self.X, 0, class_index=0)
+        assert all(v >= 0.0 for row in relu_heat for v in row)
+
+    def test_scorecam(self):
+        model, _ = self._model()
+        heat, weights = AI.scorecam_heatmap(model, self.X, 0, class_index=0)
+        assert len(heat) == 3 and len(heat[0]) == 3
+        assert abs(sum(weights) - 1.0) < 1e-12
+        assert all(v >= 0.0 for v in weights)
+        assert abs(max(max(row) for row in heat) - 1.0) < 1e-12
+        only, w1 = AI.scorecam_heatmap(model, self.X, 0, class_index=0, n_masks=1)
+        assert w1 == [1.0]
+        assert only != heat
+
+    def test_cam_rejects_bad_input(self):
+        model, _ = self._model()
+        with pytest.raises(ValueError):
+            AI.cam_heatmap(model, self.X, 0, method="scorecam")
+        with pytest.raises(ValueError):
+            AI.cam_heatmap(model, self.X, 9)
+        with pytest.raises(ValueError):
+            AI.cam_heatmap(model, self.X, 0, class_index=5)
+        with pytest.raises(ValueError):
+            AI.cam_heatmap(model, self.X, 1)
+        with pytest.raises(ValueError):
+            AI.cam_heatmap(model, [1.0, 2.0], 0)
+        with pytest.raises(ValueError):
+            AI.scorecam_heatmap(model, self.X, 0, n_masks=0)
+        with pytest.raises(ValueError):
+            AI.gradcam_weights([[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            AI.gradcam_weights([[[1.0]]], method="gradcam++")
+
+    def test_cam_ascii(self):
+        model, _ = self._model()
+        heat, _ = AI.cam_heatmap(model, self.X, 0, class_index=0)
+        text = AI.cam_ascii(heat, max_width=3)
+        assert "(3x3" in text.split("\n")[0]

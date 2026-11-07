@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1401 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1411 项）
 
 ## 特性
 
@@ -1507,6 +1507,27 @@ print(feature_maps_ascii(conv_out, channels=[0]))  # 只看第 0 个通道
 - 打乱用的是本地 `random.Random(seed)`，不推进全局 RNG；同 seed 可复现。
 - `feature_maps_ascii` 与 `attention_ascii` 共用字符表，但**每个通道独立归一**——绝对值不可跨通道比较，只能看同一张图内部的相对分布。
 
+### 类激活图（W14-D）
+
+| API | 说明 |
+| --- | --- |
+| `cam_heatmap(model, x, layer_index, class_index=None, method='gradcam', relu=True)` | GradCAM / GradCAM++ / LayerCAM 热图，返回 `(heatmap, weights)`；`heatmap` 是目标层空间尺寸的 `[0,1]` 网格 |
+| `gradcam_weights(grads, method='gradcam', acts=None, eps=1e-8)` | 三种变体的通道权重算法（LayerCAM 返回 `None`，它按元素相乘不需要通道权重） |
+| `scorecam_heatmap(model, x, layer_index, class_index=None, n_masks=None, relu=True)` | ScoreCAM：把每个通道上采样成输入尺寸当遮罩，重新前向取目标类分数再 softmax 加权 |
+| `cam_ascii(heatmap, max_width=24)` | 热图转 ASCII（复用 `feature_maps_ascii` 的字符表） |
+
+```python
+net = Sequential(Conv2d(1, 8, 3, padding=1), Flatten(), Layer(8 * 8 * 8, 10))
+net.eval()                       # CAM 前务必 eval()，否则 Dropout 会让热图抖动
+heat, weights = cam_heatmap(net, image, 0, class_index=3)
+print(cam_ascii(heat, max_width=16))
+```
+
+- 依赖顺序容器的反向协议：每个模块 `backward(delta)` 要么直接返回上一层 delta，要么返回元组并按 `delta_index`（默认 `-1`）取。所以 CAM **只能定位到 backward 返回值与本层输出同形的卷积层**——定位到 `Flatten`/`Layer` 会明确报错而不是给出错误热图。
+- `method='layercam'` 是逐元素 `A ⊙ g` 求和，不做通道平均，定位更细但噪声更大。
+- ScoreCAM 需要 `C` 次额外前向（`n_masks` 可以只取前几个通道），纯 Python 下比 GradCAM 慢一个量级。
+- `relu=False` 保留负贡献；由于最后按最大值归一到 `[0,1]`，**全负的热图会被压成全零**——这是归一化的定义，不是丢数据。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1923,7 +1944,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1401 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1411 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2108,6 +2129,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAttribution` | 线性网络闭式梯度、Grad×Input 与梯度的关系、IG 完备性（线性精确 / ReLU 收敛）、DeepLIFT 完备性、SmoothGrad 退化与可复现、多分类 class_index、九条非法输入、softmax 拒绝 |
 | `TestAttentionAttribution` | 单位/均匀注意力的闭式结果、行和归一、flow 的列守恒、三种头部融合、discard_ratio 丢最小项、`attention_maps` 与多层 CausalLM 输入、八条非法输入 |
 | `TestPermutationFeatureMaps` | 置换重要性的基准/常数特征/重要特征/单次重复 std=0/种子复现/自定义 metric/参数校验；特征图 ASCII 的表头、峰值字符、通道选择、下采样宽度、常量与负值、六处非法输入 |
+| `TestCAM` | GradCAM 通道权重闭式解、热图 = 归一化激活、换类别翻转权重、默认类 = argmax、GradCAM++ 与 LayerCAM 对照、relu=False 的混合符号、ScoreCAM 权重和为 1 与 `n_masks`、8 处非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2161,7 +2183,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1401 个单元测试
+├── test_ai.py       # 1411 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

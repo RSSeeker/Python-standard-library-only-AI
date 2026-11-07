@@ -28714,6 +28714,332 @@ def _cf_matrix(ratings, who, allow_none):
 
 
 # ============================================================================
+# ============================================================================
+#  可解释性：CAM 系列（W14-D：GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+# ============================================================================
+
+def _cam_modules(model):
+    """取出顺序容器里的模块列表（Sequential.modules 或 MLP.layers）。"""
+    mods = getattr(model, "modules", None)
+    if mods is None:
+        mods = getattr(model, "layers", None)
+    if mods is None:
+        raise ValueError(
+            f"_cam_modules: {type(model).__name__} 既没有 modules 也没有 layers，"
+            f"无法定位卷积层"
+        )
+    mods = list(mods)
+    if not mods:
+        raise ValueError("_cam_modules: 容器里没有模块")
+    return mods
+
+
+def _cam_index(modules, layer_index, who):
+    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
+        raise ValueError(f"{who}: layer_index 必须是整数，收到 {layer_index!r}")
+    if not (0 <= layer_index < len(modules)):
+        raise ValueError(
+            f"{who}: layer_index={layer_index} 超出范围 [0, {len(modules)})"
+        )
+    return layer_index
+
+
+def _cam_is_map(x):
+    """判断是不是 (C, H, W) 三层嵌套的浮点张量。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        return False
+    if not isinstance(x[0], (list, tuple)) or not x[0]:
+        return False
+    if not isinstance(x[0][0], (list, tuple)):
+        return False
+    return True
+
+
+def _cam_check_map(t, who):
+    if not _cam_is_map(t):
+        raise ValueError(f"{who}: 需要 (C, H, W) 形式的特征图，收到 {type(t).__name__}")
+    h = len(t[0])
+    w = len(t[0][0])
+    out = []
+    for c, plane in enumerate(t):
+        if len(plane) != h:
+            raise ValueError(f"{who}: 第 {c} 个通道行数 {len(plane)} 与 {h} 不一致")
+        row = []
+        for r, line in enumerate(plane):
+            if len(line) != w:
+                raise ValueError(
+                    f"{who}: 第 {c} 通道第 {r} 行列数 {len(line)} 与 {w} 不一致"
+                )
+            vals = []
+            for v in line:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"{who}: 特征图元素必须是数字，收到 {v!r}")
+                vals.append(float(v))
+            row.append(vals)
+        out.append(row)
+    return out
+
+
+def _cam_forward_trace(modules, x, stop_index):
+    """手工前向到 stop_index（含），返回 (A, logits)。"""
+    a = x
+    for i, m in enumerate(modules):
+        a = m.forward(a)
+        if i == stop_index:
+            return a, None
+    return None, a
+
+
+def _cam_logits(model, modules, x, stop_index):
+    """前向一遍：返回 (target 层输出 A, 最终 logits)。"""
+    a = x
+    target = None
+    for i, m in enumerate(modules):
+        a = m.forward(a)
+        if i == stop_index:
+            target = a
+    return target, a
+
+
+def _cam_grad_output(model, modules, x, stop_index, class_index):
+    """返回 dScore/dA（A 是第 stop_index 个模块的输出）。"""
+    target, logits = _cam_logits(model, modules, x, stop_index)
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError(
+            "_cam_grad_output: 模型最后一层输出必须是 1 维 logits 列表，"
+            f"收到 {type(logits).__name__}（CAM 只支持分类输出）"
+        )
+    for v in logits:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("_cam_grad_output: logits 里必须全是数字")
+    n = len(logits)
+    if class_index is None:
+        best = 0
+        for i in range(1, n):
+            if logits[i] > logits[best]:
+                best = i
+        class_index = best
+    if not isinstance(class_index, int) or isinstance(class_index, bool):
+        raise ValueError(f"_cam_grad_output: class_index 必须是整数，收到 {class_index!r}")
+    if not (0 <= class_index < n):
+        raise ValueError(
+            f"_cam_grad_output: class_index={class_index} 超出 logits 维度 {n}"
+        )
+    delta = [1.0 if i == class_index else 0.0 for i in range(n)]
+    for m in reversed(modules[stop_index + 1:]):
+        result = m.backward(delta)
+        if result is None:
+            continue
+        delta = (result[getattr(m, "delta_index", -1)]
+                 if isinstance(result, tuple) else result)
+    return target, delta, class_index
+
+
+def _cam_normalize(heat):
+    """把热图按最大值归一到 [0, 1]（全零时原样返回 0）。"""
+    top = None
+    for row in heat:
+        for v in row:
+            if top is None or v > top:
+                top = v
+    if top is None or top <= 0.0:
+        return [[0.0] * len(heat[0]) for _ in range(len(heat))]
+    return [[v / top for v in row] for row in heat]
+
+
+def _cam_relu(v):
+    return v if v > 0.0 else 0.0
+
+
+def gradcam_weights(grads, method="gradcam", acts=None, eps=1e-8):
+    """按 CAM 变体算每个通道的权重。
+
+    - ``gradcam``：对梯度取空间平均
+    - ``gradcam++``：α = g² / (2g² + Σ_ab A_ab g_ab³)，再对 α·relu(g) 求和
+    - ``layercam``：权重退化为逐元素（返回 None，热图直接按元素相乘）
+    """
+    g = _cam_check_map(grads, "gradcam_weights")
+    if method == "layercam":
+        return None
+    if method == "gradcam":
+        out = []
+        for plane in g:
+            total = 0.0
+            count = 0
+            for row in plane:
+                for v in row:
+                    total += v
+                    count += 1
+            out.append(total / count)
+        return out
+    if method != "gradcam++":
+        raise ValueError(
+            f"gradcam_weights: method 必须是 'gradcam' / 'gradcam++' / 'layercam'，"
+            f"收到 {method!r}"
+        )
+    if acts is None:
+        raise ValueError("gradcam_weights: gradcam++ 需要同时传入 acts")
+    a = _cam_check_map(acts, "gradcam_weights")
+    if len(a) != len(g) or len(a[0]) != len(g[0]) or len(a[0][0]) != len(g[0][0]):
+        raise ValueError("gradcam_weights: acts 与 grads 形状必须一致")
+    if not isinstance(eps, (int, float)) or eps <= 0.0:
+        raise ValueError(f"gradcam_weights: eps 必须 > 0，收到 {eps!r}")
+    out = []
+    for c in range(len(g)):
+        total = 0.0
+        for r in range(len(g[c])):
+            for k in range(len(g[c][r])):
+                gg = g[c][r][k]
+                denom = 2.0 * gg * gg
+                for rr in range(len(a[c])):
+                    for kk in range(len(a[c][rr])):
+                        denom += a[c][rr][kk] * gg * gg * gg
+                alpha = (gg * gg) / (denom + eps)
+                total += alpha * _cam_relu(gg)
+        out.append(total)
+    return out
+
+
+def cam_heatmap(model, x, layer_index, class_index=None, method="gradcam",
+                relu=True):
+    """GradCAM / GradCAM++ / LayerCAM 热图（返回 ``(heatmap, weights)``）。
+
+    ``heatmap`` 是 H×W 的 [0,1] 列表（``layer_index`` 那层特征图的空间尺寸），
+    ``weights`` 是每通道权重（LayerCAM 为 None）。
+    """
+    if method not in ("gradcam", "gradcam++", "layercam"):
+        raise ValueError(
+            f"cam_heatmap: method 必须是 'gradcam' / 'gradcam++' / 'layercam'，"
+            f"收到 {method!r}（ScoreCAM 用 scorecam_heatmap）"
+        )
+    modules = _cam_modules(model)
+    idx = _cam_index(modules, layer_index, "cam_heatmap")
+    acts, grads, _ = _cam_grad_output(model, modules, x, idx, class_index)
+    a = _cam_check_map(acts, "cam_heatmap")
+    g = _cam_check_map(grads, "cam_heatmap")
+    if len(a) != len(g) or len(a[0]) != len(g[0]) or len(a[0][0]) != len(g[0][0]):
+        raise ValueError(
+            f"cam_heatmap: 第 {idx} 层的输出与回传梯度形状不一致"
+            f"（{len(a)}x{len(a[0])}x{len(a[0][0])} vs "
+            f"{len(g)}x{len(g[0])}x{len(g[0][0])}）；该层 backward 必须返回"
+            f"与本层输出同形的梯度"
+        )
+    w = gradcam_weights(g, method=method, acts=a)
+    heat = [[0.0] * len(a[0][0]) for _ in range(len(a[0]))]
+    if method == "layercam":
+        for c in range(len(a)):
+            for r in range(len(a[c])):
+                for k in range(len(a[c][r])):
+                    heat[r][k] += a[c][r][k] * g[c][r][k]
+    else:
+        for c in range(len(a)):
+            wc = w[c]
+            for r in range(len(a[c])):
+                for k in range(len(a[c][r])):
+                    heat[r][k] += wc * a[c][r][k]
+    if relu:
+        heat = [[_cam_relu(v) for v in row] for row in heat]
+    return _cam_normalize(heat), w
+
+
+def _cam_upsample(plane, height, width):
+    """最近邻上采样一张 H×W 平面到 height×width。"""
+    h = len(plane)
+    w = len(plane[0])
+    out = []
+    for r in range(height):
+        src_r = min(h - 1, r * h // height)
+        row = []
+        for k in range(width):
+            src_k = min(w - 1, k * w // width)
+            row.append(plane[src_r][src_k])
+        out.append(row)
+    return out
+
+
+def _cam_spatial(x):
+    if not _cam_is_map(x):
+        raise ValueError(f"_cam_spatial: 输入必须是 (C, H, W)，收到 {type(x).__name__}")
+    return len(x[0]), len(x[0][0])
+
+
+def scorecam_heatmap(model, x, layer_index, class_index=None, n_masks=None,
+                     relu=True):
+    """ScoreCAM 热图（返回 ``(heatmap, weights)``）。
+
+    用第 ``layer_index`` 层的每个通道上采样后**遮罩输入**，重新前向取目标类
+    分数，再对分数做 softmax 得到通道权重。代价是 ``C`` 次额外前向，所以
+    ``n_masks`` 可以只取权重最大的前几个通道。
+    """
+    modules = _cam_modules(model)
+    idx = _cam_index(modules, layer_index, "scorecam_heatmap")
+    acts, _ = _cam_logits(model, modules, x, idx)
+    a = _cam_check_map(acts, "scorecam_heatmap")
+    height, width = _cam_spatial(x)
+    nchan = len(a)
+    if n_masks is None:
+        n_masks = nchan
+    if not isinstance(n_masks, int) or isinstance(n_masks, bool):
+        raise ValueError(f"scorecam_heatmap: n_masks 必须是整数，收到 {n_masks!r}")
+    if not (1 <= n_masks <= nchan):
+        raise ValueError(
+            f"scorecam_heatmap: n_masks 必须在 [1, {nchan}] 内，收到 {n_masks}"
+        )
+    _, logits = _cam_logits(model, modules, x, idx)
+    if class_index is None:
+        best = 0
+        for i in range(1, len(logits)):
+            if logits[i] > logits[best]:
+                best = i
+        class_index = best
+    if not isinstance(class_index, int) or isinstance(class_index, bool):
+        raise ValueError(f"scorecam_heatmap: class_index 必须是整数，收到 {class_index!r}")
+    if not (0 <= class_index < len(logits)):
+        raise ValueError(
+            f"scorecam_heatmap: class_index={class_index} 超出 logits 维度 {len(logits)}"
+        )
+
+    picked = list(range(nchan))[:n_masks]
+    masks = []          # 每个被选通道的上采样遮罩
+    scores = []
+    for c in picked:
+        up = _cam_upsample(a[c], height, width)
+        masked = [[[x[ch][r][k] * up[r][k] for k in range(width)]
+                   for r in range(height)] for ch in range(len(x))]
+        a2 = masked
+        for m in modules:
+            a2 = m.forward(a2)
+        masks.append(up)
+        scores.append(a2[class_index])
+
+    top = None
+    for v in scores:
+        if top is None or v > top:
+            top = v
+    exps = [0.0] * len(scores)
+    if top is None:
+        weights = [1.0 / len(scores)] * len(scores)
+    else:
+        total = 0.0
+        for i, v in enumerate(scores):
+            exps[i] = math.exp(v - top)
+            total += exps[i]
+        weights = [e / total for e in exps]
+
+    heat = [[0.0] * width for _ in range(height)]
+    for up, wc in zip(masks, weights):
+        for r in range(height):
+            for k in range(width):
+                heat[r][k] += wc * up[r][k]
+    if relu:
+        heat = [[_cam_relu(v) for v in row] for row in heat]
+    return _cam_normalize(heat), weights
+
+
+def cam_ascii(heatmap, max_width=24):
+    """把 [0,1] 热图渲染成 ASCII（复用 ``feature_maps_ascii`` 的字符表）。"""
+    return feature_maps_ascii([heatmap], max_width=max_width)
+
 #  可解释性：置换重要性 / 特征图字符画（W14-C）
 # ============================================================================
 

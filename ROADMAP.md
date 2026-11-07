@@ -464,7 +464,10 @@
   - `permutation_importance`：本地 `random.Random(seed)` 打乱、默认 `model.score`、返回 baseline/mean/std/names，探针 39 项
   - `feature_maps_ascii`：单张 `H×W` 与 `(C,H,W)` 两种输入、每通道独立归一、块均值下采样
   - 探针首跑 3 条失败都是我自己的期望值错（重要性的符号、峰值字符、零点字符表）
-- [ ] CNN：GradCAM / GradCAM++ / ScoreCAM / LayerCAM
+- [x] CNN：GradCAM / GradCAM++ / ScoreCAM / LayerCAM
+  - `cam_heatmap`（GradCAM / GradCAM++ / LayerCAM）+ `scorecam_heatmap` + `gradcam_weights` + `cam_ascii`
+  - 复用 `Sequential` 的反向协议（`delta_index` 取 delta），定位到非卷积层会明确报错
+  - 探针 54 项；首跑 2 条失败是我自己的期望值错（全负热图归一化后必为 0、`cam_ascii` 的表头带通道名）
 - [ ] 嵌入可视化（复用 t-SNE）；SHAP（KernelSHAP 简化）/ LIME（简化）/ Anchors
 - [ ] TCAV；Activation Maximization / Network Dissection；Counterfactual / CEM；Prototypes / Influence（简化）
 
