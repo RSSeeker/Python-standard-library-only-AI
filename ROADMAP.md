@@ -388,8 +388,18 @@
     子词复现、`max_piece_len` 约束、未登录与中文单字、与 `tokenize_batch` 的协作、30 条非法输入。
 
 ### W13 指标扩展（§9）
-- [ ] 回归：MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Quantile
-- [ ] 效率：`inference_benchmark`（时间 / 吞吐 / 峰值内存）
+- [x] 回归：MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Quantile
+  - `median_absolute_error` / `mean_squared_log_error` / `root_mean_squared_log_error` /
+    `explained_variance_score` / `adjusted_r2_score(..., n_features)` / `mean_pinball_loss`。
+  - MSLE 要求目标与预测都非负（负值直接 `ValueError`）；`explained_variance_score` 不惩罚
+    系统性偏移，与 `r2_score` 的差别在 README 里用「预测整体 +5」的例子说明。
+  - 探针 49 项：六个指标的闭式/手算对照、常量目标约定、与 `quantile_loss` 的数值一致、
+    以及全部非法输入。
+- [x] 效率：`inference_benchmark`（时间 / 吞吐 / 峰值内存）
+  - 返回 `total_seconds` / `per_call_ms` / `throughput_per_s` / `peak_memory_bytes` / `params`。
+  - `peak_memory_bytes` 用 `tracemalloc`，只统计 Python 堆（本库全是 `list[float]`），
+    不含解释器常驻内存；`params` 是 weights/biases 标量总数，非 MLP 层记 0。
+  - `AI.py` 顶部新增 `import tracemalloc`。
 - [ ] 分类：BalancedAccuracy / CohenKappa / Brier / LogLoss / PR-AUC / Specificity / Sensitivity / F-beta / Hamming / Jaccard
 - [ ] 排序：NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage
 - [ ] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU

@@ -20371,3 +20371,121 @@ class TestTokenizers:
             AI.SentencePieceTokenizer(vocab_size=4).train(["abcdefgh"])
         with pytest.raises(TypeError):
             AI.SentencePieceTokenizer().train(["abc"], vocab_size=1.5)
+
+class TestRegressionMetricsExtra:
+    """W13-A：MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Pinball。"""
+
+    def test_median_absolute_error(self):
+        assert AI.median_absolute_error([1, 2, 3], [1, 2, 3]) == 0.0
+        assert AI.median_absolute_error([0, 0, 0], [0, 1, 10]) == 1.0
+        assert AI.median_absolute_error([0, 0, 0, 0], [1, 2, 3, 4]) == 2.5
+        assert AI.median_absolute_error([[1, 2], [3, 4]], [[1, 3], [5, 4]]) == 0.5
+        assert (AI.median_absolute_error([0, 0, 0], [0, 1, 10])
+                < AI.mean_absolute_error([0, 0, 0], [0, 1, 10]))
+        with pytest.raises(ValueError):
+            AI.median_absolute_error([], [])
+        with pytest.raises(ValueError):
+            AI.median_absolute_error([1], ["a"])
+
+    def test_msle_matches_manual(self):
+        yt = [1.0, 2.0, 3.0]
+        yp = [1.5, 2.5, 2.5]
+        manual = sum((math.log1p(t) - math.log1p(p)) ** 2
+                     for t, p in zip(yt, yp)) / 3.0
+        assert abs(AI.mean_squared_log_error(yt, yp) - manual) < 1e-15
+        assert abs(AI.root_mean_squared_log_error(yt, yp) - math.sqrt(manual)) < 1e-15
+        assert AI.mean_squared_log_error([1, 2], [1, 2]) == 0.0
+
+    def test_msle_tolerant_on_large_values(self):
+        # 相同的绝对误差下，大值域的相对误差更小
+        assert (AI.mean_squared_log_error([1], [1.1])
+                < AI.mean_squared_log_error([100], [110]))
+        assert (AI.root_mean_squared_log_error([1], [1.1])
+                < AI.root_mean_squared_log_error([100], [110]))
+
+    def test_msle_rejects_negative(self):
+        with pytest.raises(ValueError):
+            AI.mean_squared_log_error([-1, 1], [1, 1])
+        with pytest.raises(ValueError):
+            AI.mean_squared_log_error([1], [-0.5])
+        with pytest.raises(ValueError):
+            AI.root_mean_squared_log_error([1], [-1])
+
+    def test_explained_variance_vs_r2(self):
+        assert AI.explained_variance_score([1, 2, 3], [1, 2, 3]) == 1.0
+        # 系统性偏移不惩罚方差，但 R² 会
+        assert abs(AI.explained_variance_score([1, 2, 3], [6, 7, 8]) - 1.0) < 1e-15
+        assert AI.r2_score([1, 2, 3], [6, 7, 8]) < 0.0
+        assert abs(AI.explained_variance_score([0, 2], [0, 0]) - 0.0) < 1e-15
+        assert AI.explained_variance_score([5, 5], [5, 5]) == 1.0
+        assert AI.explained_variance_score([5, 5], [5, 6]) == 0.0
+        with pytest.raises(ValueError):
+            AI.explained_variance_score([], [])
+
+    def test_adjusted_r2(self):
+        assert abs(AI.adjusted_r2_score([1, 2, 3, 4], [1, 2, 3, 4], 1) - 1.0) < 1e-15
+        yt = [1, 2, 3, 4, 5]
+        yp = [1.1, 2.1, 2.9, 4.2, 4.8]
+        r2 = AI.r2_score(yt, yp)
+        adj = AI.adjusted_r2_score(yt, yp, 1)
+        assert abs(adj - (1.0 - (1.0 - r2) * 4 / 3)) < 1e-15
+        assert adj <= r2
+        yt2 = [1, 2, 3, 4, 5, 6]
+        yp2 = [1.1, 2.1, 2.9, 4.2, 4.8, 6.3]
+        assert (AI.adjusted_r2_score(yt2, yp2, 2)
+                <= AI.adjusted_r2_score(yt2, yp2, 1) + 1e-15)
+
+    def test_adjusted_r2_validation(self):
+        with pytest.raises(ValueError):
+            AI.adjusted_r2_score([1, 2], [1, 2], 2)
+        with pytest.raises(ValueError):
+            AI.adjusted_r2_score([1, 2, 3], [1, 2, 3], 0)
+        with pytest.raises(TypeError):
+            AI.adjusted_r2_score([1, 2, 3], [1, 2, 3], 1.5)
+        with pytest.raises(TypeError):
+            AI.adjusted_r2_score([1, 2, 3], [1, 2, 3], True)
+
+    def test_pinball_loss(self):
+        assert abs(AI.mean_pinball_loss([0, 0], [1, -1], 0.5) - 0.5) < 1e-15
+        assert abs(AI.mean_pinball_loss([1, 2, 3], [1.5, 1.5, 2.0], 0.3)
+                   - AI.quantile_loss([1, 2, 3], [1.5, 1.5, 2.0], 0.3)[0]) < 1e-15
+        assert AI.mean_pinball_loss([0], [1], 0.9) < AI.mean_pinball_loss([0], [1], 0.1)
+        assert AI.mean_pinball_loss([1], [0], 0.9) > AI.mean_pinball_loss([1], [0], 0.1)
+
+    def test_pinball_validation(self):
+        with pytest.raises(ValueError):
+            AI.mean_pinball_loss([1], [1], 0.0)
+        with pytest.raises(ValueError):
+            AI.mean_pinball_loss([1], [1], 1.0)
+        with pytest.raises(TypeError):
+            AI.mean_pinball_loss([1], [1], "0.5")
+        with pytest.raises(TypeError):
+            AI.mean_pinball_loss([1], [1], True)
+
+    def test_inference_benchmark(self):
+        xs = [[0.5], [1.0], [-0.5]]
+        ys = [[1.0], [1.0], [0.0]]
+        model = AI.Model(AI.MLP([1, 4, 1]), loss_fn="mse", optimizer="adam")
+        model.fit(xs, ys, epochs=2, batch_size=3)
+        res = AI.inference_benchmark(model, xs[0], repeats=3, warmup=1)
+        assert res["repeats"] == 3 and res["warmup"] == 1
+        assert res["total_seconds"] > 0.0 and res["per_call_ms"] > 0.0
+        assert res["throughput_per_s"] > 0.0
+        assert abs(res["throughput_per_s"] * res["per_call_ms"] / 1000.0 - 1.0) < 1e-9
+        assert res["peak_memory_bytes"] > 0
+        assert res["params"] == 1 * 4 + 4 + 4 * 1 + 1
+        batched = AI.inference_benchmark(model, xs, repeats=2, batch_size=2)
+        assert batched["params"] == res["params"]
+
+    def test_inference_benchmark_validation(self):
+        model = AI.Model(AI.MLP([1, 2, 1]), loss_fn="mse", optimizer="adam")
+        with pytest.raises(ValueError):
+            AI.inference_benchmark(model, [0.1], repeats=0)
+        with pytest.raises(TypeError):
+            AI.inference_benchmark(model, [0.1], repeats=1.5)
+        with pytest.raises(ValueError):
+            AI.inference_benchmark(model, [0.1], warmup=-1)
+        with pytest.raises(ValueError):
+            AI.inference_benchmark(model, [[0.1]], batch_size=0)
+        with pytest.raises(ValueError):
+            AI.inference_benchmark(model, [], batch_size=4)

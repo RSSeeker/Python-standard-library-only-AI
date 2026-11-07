@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1275 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1286 项）
 
 ## 特性
 
@@ -1144,6 +1144,34 @@ assert sp.decode(sp.encode("hello world")) == "hello world"
 **强制包含训练语料里的全部单字符**，因此常见字符都有回退路径；词表装不下字符会在
 `train` 阶段直接报 `ValueError`（而不是训练完才发现编码全变 `<unk>`）。
 
+### 评估指标扩展（W13-A：回归 + 效率）
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `median_absolute_error(y_true, y_pred)` | 绝对误差的**中位数**，抗离群点；偶数个误差取中间两个的平均 |
+| `mean_squared_log_error(y_true, y_pred)` | `mean((log1p(ŷ) − log1p(y))²)`，要求两者**非负**（负值直接 `ValueError`） |
+| `root_mean_squared_log_error(y_true, y_pred)` | `sqrt(MSLE)` |
+| `explained_variance_score(y_true, y_pred)` | `1 − Var(y−ŷ)/Var(y)`；**不惩罚系统性偏移**（与 R² 的关键差别） |
+| `adjusted_r2_score(y_true, y_pred, n_features)` | `1 − (1−R²)(n−1)/(n−p−1)`；`n` 是展平后的样本数，要求 `n > p+1` |
+| `mean_pinball_loss(y_true, y_pred, quantile)` | 分位数（pinball）损失，与 `quantile_loss` 的损失值一致 |
+| `inference_benchmark(model, x, repeats=50, warmup=5, batch_size=None)` | 前向计时：`total_seconds` / `per_call_ms` / `throughput_per_s` / `peak_memory_bytes`（`tracemalloc`，只算 Python 堆）/ `params` |
+
+```python
+print(AI.mean_squared_log_error([1, 2, 3], [1.1, 2.1, 2.9]))
+print(AI.adjusted_r2_score(y_test, y_pred, n_features=8))
+print(AI.inference_benchmark(model, x_sample, repeats=50, warmup=5))
+```
+
+`explained_variance_score` 与 `r2_score` 的区别用一句话说明：把预测整体平移 `+5`
+时前者仍是 1.0（方差没变），后者会给出很大的负数——判断「模型有没有学到趋势」
+用前者，判断「预测值能不能直接用」用后者。两者在常量目标上的约定一致：
+完全预测返回 `1.0`，否则返回 `0.0`。
+
+`inference_benchmark` 的 `peak_memory_bytes` 来自 `tracemalloc`，因此只覆盖 Python
+堆分配（本库全部是 `list[float]`，这个口径是可信的），**不包含**解释器常驻内存与
+C 扩展；`params` 是 `weights`/`biases` 的标量总数，非 MLP 层记为 0。计时用
+`time.perf_counter`，`warmup` 次不计时，`batch_size=None` 时把 `x` 当单样本。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1560,7 +1588,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1275 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1286 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1731,6 +1759,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
+| `TestRegressionMetricsExtra` | MedAE 的奇偶中位与抗离群、MSLE/RMSLE 与手算一致且对负值报错、ExplainedVariance 对系统性偏移不惩罚（对照 R²）、调整 R² 与闭式一致且样本不足报错、Pinball 与 `quantile_loss` 一致、`inference_benchmark` 的字段自洽/`params`/峰值内存与参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1784,7 +1813,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1275 个单元测试
+├── test_ai.py       # 1286 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

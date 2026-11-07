@@ -67,6 +67,7 @@ import operator
 import random
 import re
 import time
+import tracemalloc
 from typing import List, Tuple, Optional, Callable, Any
 
 # 热路径别名：Layer / _matmul 每次调用都要用到 operator.mul
@@ -28430,6 +28431,159 @@ def _regression_pairs(y_true, y_pred, who):
     if not flat_t:
         raise ValueError(f"{who}: 没有可比较的数值")
     return flat_t, flat_p
+
+
+def median_absolute_error(y_true, y_pred) -> float:
+    """MedAE：绝对误差的中位数（比 MAE 抗离群点）。"""
+    yt, yp = _regression_pairs(y_true, y_pred, "median_absolute_error")
+    errs = sorted(abs(t - p) for t, p in zip(yt, yp))
+    n = len(errs)
+    mid = n // 2
+    if n % 2:
+        return errs[mid]
+    return 0.5 * (errs[mid - 1] + errs[mid])
+
+
+def _nonneg_targets(y_true, y_pred, who):
+    yt, yp = _regression_pairs(y_true, y_pred, who)
+    for i, v in enumerate(yt):
+        if v < 0.0:
+            raise ValueError(f"{who}: y_true[{i}] = {v} 为负，对数空间的指标要求非负")
+    for i, v in enumerate(yp):
+        if v < 0.0:
+            raise ValueError(f"{who}: y_pred[{i}] = {v} 为负，对数空间的指标要求非负")
+    return yt, yp
+
+
+def mean_squared_log_error(y_true, y_pred) -> float:
+    """MSLE = mean((log1p(y_true) - log1p(y_pred))^2)，要求两者非负。"""
+    yt, yp = _nonneg_targets(y_true, y_pred, "mean_squared_log_error")
+    return sum((math.log1p(t) - math.log1p(p)) ** 2
+               for t, p in zip(yt, yp)) / len(yt)
+
+
+def root_mean_squared_log_error(y_true, y_pred) -> float:
+    """RMSLE = sqrt(MSLE)。"""
+    return math.sqrt(mean_squared_log_error(y_true, y_pred))
+
+
+def explained_variance_score(y_true, y_pred) -> float:
+    """ExplainedVariance = 1 - Var(y_true - y_pred) / Var(y_true)。
+
+    与 R² 的区别：不惩罚系统性偏移（偏差项被消掉）。真实标签方差为 0 时，
+    完全预测返回 1.0，否则返回 0.0（与 R² 的常量目标约定一致）。
+    """
+    yt, yp = _regression_pairs(y_true, y_pred, "explained_variance_score")
+    n = len(yt)
+    mean_t = sum(yt) / n
+    diffs = [t - p for t, p in zip(yt, yp)]
+    mean_d = sum(diffs) / n
+    var_t = sum((t - mean_t) ** 2 for t in yt) / n
+    var_d = sum((d - mean_d) ** 2 for d in diffs) / n
+    if var_t == 0.0:
+        return 1.0 if var_d == 0.0 else 0.0
+    return 1.0 - var_d / var_t
+
+
+def adjusted_r2_score(y_true, y_pred, n_features: int) -> float:
+    """调整 R²：1 - (1-R²)(n-1)/(n-p-1)，n 是展平后的样本数、p 是特征数。"""
+    if isinstance(n_features, bool) or not isinstance(n_features, int):
+        raise TypeError(f"adjusted_r2_score: n_features 必须是 int，收到 {type(n_features).__name__}")
+    if n_features < 1:
+        raise ValueError(f"adjusted_r2_score: n_features 必须 >= 1，收到 {n_features}")
+    yt, _ = _regression_pairs(y_true, y_pred, "adjusted_r2_score")
+    n = len(yt)
+    if n <= n_features + 1:
+        raise ValueError(
+            f"adjusted_r2_score: 样本数 {n} 不足以估计 {n_features} 个特征"
+            f"（需要 n > p + 1）")
+    r2 = r2_score(y_true, y_pred)
+    return 1.0 - (1.0 - r2) * (n - 1) / (n - n_features - 1)
+
+
+def mean_pinball_loss(y_true, y_pred, quantile: float = 0.5) -> float:
+    """分位数损失（数值口径），与 `quantile_loss` 的损失定义一致。"""
+    if isinstance(quantile, bool) or not isinstance(quantile, (int, float)):
+        raise TypeError(f"mean_pinball_loss: quantile 必须是数字，收到 {type(quantile).__name__}")
+    if not 0.0 < float(quantile) < 1.0:
+        raise ValueError(f"mean_pinball_loss: quantile 必须在 (0, 1) 内，收到 {quantile}")
+    yt, yp = _regression_pairs(y_true, y_pred, "mean_pinball_loss")
+    q = float(quantile)
+    total = 0.0
+    for t, p in zip(yt, yp):
+        err = t - p
+        total += q * err if err >= 0.0 else (q - 1.0) * err
+    return total / len(yt)
+
+
+def _bench_param_count(model) -> int:
+    core = getattr(model, "model", model)
+    total = 0
+    for layer in getattr(core, "layers", ()) or ():
+        for w in getattr(layer, "weights", ()) or ():
+            total += len(w)
+        total += len(getattr(layer, "biases", ()) or ())
+    return total
+
+
+def inference_benchmark(model, x, repeats: int = 50, warmup: int = 5,
+                        batch_size: int = None) -> dict:
+    """测量前向推理的时间 / 吞吐 / Python 峰值内存。
+
+    - `repeats` 次计时取总计，`warmup` 次预热不计时；
+    - `batch_size=None` 时把 `x` 当作单个样本；否则 `x` 是样本列表，按批前向；
+    - `peak_memory_bytes` 来自 `tracemalloc`，只统计 Python 堆分配（本库全是
+      list[float]，因此可信；不含解释器与 C 扩展的常驻内存）；
+    - `params` 是 `weights`/`biases` 的标量总数（非 MLP 层记为 0）。
+    """
+    if isinstance(repeats, bool) or not isinstance(repeats, int):
+        raise TypeError(f"inference_benchmark: repeats 必须是 int，收到 {type(repeats).__name__}")
+    if repeats < 1:
+        raise ValueError(f"inference_benchmark: repeats 必须 >= 1，收到 {repeats}")
+    if isinstance(warmup, bool) or not isinstance(warmup, int):
+        raise TypeError(f"inference_benchmark: warmup 必须是 int，收到 {type(warmup).__name__}")
+    if warmup < 0:
+        raise ValueError(f"inference_benchmark: warmup 必须 >= 0，收到 {warmup}")
+    if batch_size is not None:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError(
+                f"inference_benchmark: batch_size 必须是 int 或 None，收到 {type(batch_size).__name__}")
+        if batch_size < 1:
+            raise ValueError(f"inference_benchmark: batch_size 必须 >= 1，收到 {batch_size}")
+
+    if batch_size is None:
+        samples = [x]
+    else:
+        samples = list(x)
+        if not samples:
+            raise ValueError("inference_benchmark: x 不能是空列表")
+
+    def run_once():
+        if batch_size is None:
+            return model.forward(samples[0])
+        return [model.forward(s) for s in samples]
+
+    for _ in range(warmup):
+        run_once()
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    for _ in range(repeats):
+        run_once()
+    elapsed = time.perf_counter() - started
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    calls = repeats
+    return {
+        "repeats": repeats,
+        "warmup": warmup,
+        "total_seconds": elapsed,
+        "per_call_ms": elapsed * 1000.0 / calls,
+        "throughput_per_s": calls / elapsed if elapsed > 0.0 else float("inf"),
+        "peak_memory_bytes": peak,
+        "params": _bench_param_count(model),
+    }
 
 
 def mean_absolute_error(y_true, y_pred) -> float:
