@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1571 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1580 项）
 
 ## 特性
 
@@ -1993,6 +1993,35 @@ logit = wd.logits([[1.0, 0, 0, 0, 0, 0]], [[0.5, -0.2, 0.1, 0.3]])[0]
 - 三者都只做二分类/回归打分，不含负采样、召回评估与特征工程；
   `DeepFM` / `DIN` 尚未实现（`ROADMAP.md` 的 W17-B-2）。
 
+### 推荐模型（W17-B-2：DeepFM / DIN）
+
+| API | 说明 |
+| --- | --- |
+| `DeepFM(num_fields, num_factors=4, hidden=(8,), seed=None)` | 一阶线性 + FM 二阶交叉 + 深侧 MLP |
+| `DIN(num_factors=4, hidden=(8,), seed=None)` | 候选 × 历史序列的注意力池化 + MLP 打分 |
+
+```python
+fm = DeepFM(num_fields=6, num_factors=4, hidden=(8,))
+logit = fm.logits([[0, 1, 2]], [[1.0, 0.5, -0.3]])[0]     # 未出现的域按 0 处理
+loss, grads = fm.loss_and_grads([[0, 1]], [[1.0, 0.5]], [1.0])
+fm.apply_grads(grads, lr=0.05)
+
+din = DIN(num_factors=4, hidden=(8,))
+attn = din.attention_weights(candidate, history, mask=[1, 1, 0])  # masked 位置权重恰 0
+loss, grads = din.loss_and_grads([candidate], [history], [1.0], [[1, 1, 0]])
+grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
+```
+
+`DeepFM` 的 FM 项用 `0.5 * Σ_k ((Σ_j v_jk)^2 - Σ_j v_jk^2)`（`v_jk = emb[j][k] * value_j`），
+不需要枚举交叉对；`DIN` 的注意力是缩放点积，`loss_and_grads` 同时给出参数梯度与**输入梯度**。
+两者的梯度都逐权重对过中心差分（< 1e-6）。三条边界：
+
+- `DeepFM` 每个域只允许出现一次（多值域请拆成多个域），未出现的域按取值 0 处理，
+  因此深侧输入固定为 `num_fields * num_factors` 维；没有稀疏特征哈希与特征工程。
+- `DIN` 没有嵌入表、没有 Dice 激活单元、没有「候选-历史外积注意力」，
+  只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
+- 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2409,7 +2438,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1571 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1580 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2613,6 +2642,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFederatedLearning` | 参数摊平往返、FedAvg 加权平均、FedProx 梯度、FedBN 拆分与聚合 |
 | `TestTimeSeriesModels` | 因果卷积闭式与反向、TCN 梯度与因果性、Informer 稀疏注意力、Autoformer 分解、PatchTST 嵌入 |
 | `TestRecommenders` | 矩阵分解收敛与可复现、NCF 的 logit 重算与逐权重梯度、Wide&Deep 训练与宽侧梯度、三者的参数校验 |
+| `TestDeepFMAndDIN` | DeepFM 的 logit 重算与二阶项闭式、六处中心差分、DIN 的注意力归一与 mask、参数/输入梯度、训练与校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2666,7 +2696,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1571 个单元测试
+├── test_ai.py       # 1580 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

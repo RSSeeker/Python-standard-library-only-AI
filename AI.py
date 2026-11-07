@@ -30527,6 +30527,446 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ======================================================================
+#  领域应用 W17-B-2：DeepFM / DIN
+# ======================================================================
+
+
+def _w17b2_field_values(field_ids, field_values, num_fields, who):
+    """把 (field_ids, field_values) 变成「每域一个取值」的定长列表（缺域记 0）。"""
+    if not isinstance(field_ids, (list, tuple)) or not isinstance(field_values, (list, tuple)):
+        raise TypeError(f"{who}: field_ids / field_values 必须是列表")
+    if len(field_ids) != len(field_values):
+        raise ValueError(f"{who}: field_ids 与 field_values 长度不一致")
+    if not field_ids:
+        raise ValueError(f"{who}: 至少需要一个特征")
+    out = [0.0] * num_fields
+    seen = [False] * num_fields
+    for idx, (fid, value) in enumerate(zip(field_ids, field_values)):
+        f = _w17b_int(fid, who, f"第 {idx} 个 field_id")
+        if f >= num_fields:
+            raise ValueError(f"{who}: field_id {f} 越界（共 {num_fields} 个域）")
+        if seen[f]:
+            raise ValueError(f"{who}: 域 {f} 重复出现（本实现每个域只允许一个取值）")
+        seen[f] = True
+        out[f] = _w17b_float(value, who, f"第 {idx} 个 value")
+    return out
+
+
+class DeepFM:
+    """DeepFM：一阶线性 + FM 二阶交叉 + 深侧 MLP，logit 相加。
+
+    输入是「域 id + 取值」两条等长列表，未出现的域按 0 处理，因此深侧输入
+    固定为 `num_fields * num_factors` 维（每个域一个嵌入向量乘自己的取值）。
+    二阶项用 `0.5 * Σ_k ((Σ_j v_jk)^2 - Σ_j v_jk^2)`，`v_jk = emb[j][k] * value_j`，
+    不需要显式枚举交叉对；每个域只允许出现一次（多值域请改成多个域）。
+    """
+
+    def __init__(self, num_fields, num_factors=4, hidden=(8,), seed=None):
+        self.num_fields = _w17b_int(num_fields, "DeepFM", "num_fields", 1)
+        self.num_factors = _w17b_int(num_factors, "DeepFM", "num_factors", 1)
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("DeepFM: hidden 需要非空的层宽列表")
+        self.hidden_sizes = [_w17b_int(h, "DeepFM", "hidden", 1) for h in hidden]
+        if seed is not None:
+            _w17b_int(seed, "DeepFM", "seed", 0)
+        self.seed = seed
+
+        rng = _w17b_rng(seed)
+        f = self.num_factors
+        self.linear_w = [rng.gauss(0.0, 0.1) for _ in range(self.num_fields)]
+        self.b0 = 0.0
+        self.emb = [[rng.gauss(0.0, 0.1) for _ in range(f)]
+                    for _ in range(self.num_fields)]
+
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed + 1)
+            self.hidden = []
+            fan_in = self.num_fields * f
+            for width in self.hidden_sizes:
+                self.hidden.append(Layer(fan_in, width, activation="relu"))
+                fan_in = width
+        finally:
+            random.setstate(state)
+        self.out_w = [rng.gauss(0.0, 0.1) for _ in range(fan_in)]
+        self.out_b = 0.0
+
+    def _vectors(self, values):
+        """逐域的 `emb[j] * value_j`（定长 `num_fields` 条）。"""
+        return [[self.emb[j][k] * values[j] for k in range(self.num_factors)]
+                for j in range(self.num_fields)]
+
+    def _fm(self, vectors):
+        f = self.num_factors
+        sums = [0.0] * f
+        for vec in vectors:
+            for k in range(f):
+                sums[k] += vec[k]
+        total = 0.0
+        for k in range(f):
+            sq = 0.0
+            for vec in vectors:
+                sq += vec[k] * vec[k]
+            total += sums[k] * sums[k] - sq
+        return 0.5 * total, sums
+
+    def logits(self, field_ids, field_values):
+        """返回逐样本 logit（两条入参都是「样本列表的列表」）。"""
+        if len(field_ids) != len(field_values):
+            raise ValueError("DeepFM.logits: field_ids 与 field_values 样本数不一致")
+        if not field_ids:
+            raise ValueError("DeepFM.logits: 至少需要一个样本")
+        out = []
+        for ids, values in zip(field_ids, field_values):
+            vals = _w17b2_field_values(ids, values, self.num_fields, "DeepFM.logits")
+            vectors = self._vectors(vals)
+            fm, _sums = self._fm(vectors)
+            h = [x for vec in vectors for x in vec]
+            for layer in self.hidden:
+                h = layer.forward(h)
+            logit = self.b0 + fm
+            for j in range(self.num_fields):
+                logit += self.linear_w[j] * vals[j]
+            logit += _w17b_dot(self.out_w, h) + self.out_b
+            out.append(logit)
+        return out
+
+    def loss_and_grads(self, field_ids, field_values, labels):
+        """二分类交叉熵 + 梯度；返回 `(loss, grads)`。"""
+        if not isinstance(labels, (list, tuple)):
+            raise TypeError("DeepFM.loss_and_grads: labels 必须是列表")
+        n = len(labels)
+        if n == 0:
+            raise ValueError("DeepFM.loss_and_grads: 至少需要一个样本")
+        if len(field_ids) != n or len(field_values) != n:
+            raise ValueError("DeepFM.loss_and_grads: 样本数与 labels 不一致")
+        ys = []
+        for idx, y in enumerate(labels):
+            v = _w17b_float(y, "DeepFM.loss_and_grads", f"第 {idx} 个 label")
+            if v < 0.0 or v > 1.0:
+                raise ValueError("DeepFM.loss_and_grads: label 必须在 [0, 1] 内")
+            ys.append(v)
+
+        f = self.num_factors
+        grads = {
+            "linear_w": [0.0] * self.num_fields,
+            "b0": 0.0,
+            "emb": [[0.0] * f for _ in range(self.num_fields)],
+            "hidden": [
+                ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                 [0.0] * layer.fan_out)
+                for layer in self.hidden
+            ],
+            "out_w": [0.0] * len(self.out_w),
+            "out_b": 0.0,
+        }
+        total_loss = 0.0
+        for ids, values, y in zip(field_ids, field_values, ys):
+            vals = _w17b2_field_values(ids, values, self.num_fields,
+                                       "DeepFM.loss_and_grads")
+            vectors = self._vectors(vals)
+            fm, sums = self._fm(vectors)
+            h = [x for vec in vectors for x in vec]
+            for layer in self.hidden:
+                h = layer.forward(h)
+            logit = self.b0 + fm
+            for j in range(self.num_fields):
+                logit += self.linear_w[j] * vals[j]
+            logit += _w17b_dot(self.out_w, h) + self.out_b
+
+            total_loss += _w17b_bce(logit, y)
+            g = 1.0 / (1.0 + math.exp(-logit)) - y
+
+            grads["b0"] += g
+            for j in range(self.num_fields):
+                grads["linear_w"][j] += g * vals[j]
+            for j in range(len(self.out_w)):
+                grads["out_w"][j] += g * h[j]
+            grads["out_b"] += g
+
+            dh = [g * self.out_w[j] for j in range(len(self.out_w))]
+            for idx in range(len(self.hidden) - 1, -1, -1):
+                layer = self.hidden[idx]
+                gw, gb, dh = layer.backward(dh)
+                acc_w, acc_b = grads["hidden"][idx]
+                for r in range(layer.fan_out):
+                    for c in range(layer.fan_in):
+                        acc_w[r][c] += gw[r][c]
+                    acc_b[r] += gb[r]
+
+            for j in range(self.num_fields):
+                if vals[j] == 0.0:
+                    continue
+                for k in range(f):
+                    dv = g * (sums[k] - vectors[j][k]) + dh[j * f + k]
+                    grads["emb"][j][k] += dv * vals[j]
+
+        scale = 1.0 / n
+        for j in range(self.num_fields):
+            grads["linear_w"][j] *= scale
+            for k in range(f):
+                grads["emb"][j][k] *= scale
+        grads["b0"] *= scale
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    acc_w[r][c] *= scale
+                acc_b[r] *= scale
+        for j in range(len(self.out_w)):
+            grads["out_w"][j] *= scale
+        grads["out_b"] *= scale
+        return total_loss / n, grads
+
+    def apply_grads(self, grads, lr=0.05):
+        """原地 SGD 一步。"""
+        lr = _w17b_float(lr, "DeepFM.apply_grads", "lr")
+        if lr < 0.0:
+            raise ValueError("DeepFM.apply_grads: lr 必须 >= 0")
+        for j in range(self.num_fields):
+            self.linear_w[j] -= lr * grads["linear_w"][j]
+            for k in range(self.num_factors):
+                self.emb[j][k] -= lr * grads["emb"][j][k]
+        self.b0 -= lr * grads["b0"]
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    layer.weights[r][c] -= lr * acc_w[r][c]
+                layer.biases[r] -= lr * acc_b[r]
+        for j in range(len(self.out_w)):
+            self.out_w[j] -= lr * grads["out_w"][j]
+        self.out_b -= lr * grads["out_b"]
+
+    def param_count(self):
+        """可训练标量个数。"""
+        total = self.num_fields + 1 + self.num_fields * self.num_factors
+        for layer in self.hidden:
+            total += layer.fan_out * layer.fan_in + layer.fan_out
+        total += len(self.out_w) + 1
+        return total
+
+
+class DIN:
+    """DIN：候选 × 历史序列的注意力池化 + MLP 打分层（无嵌入表）。
+
+    注意力用缩放点积 `s_j = candidate·history_j / sqrt(f)` 再 softmax；
+    池化 `p = Σ a_j history_j`，把 `[candidate, p]` 送进 ReLU MLP 出 logit。
+    真实 DIN 的 Dice 激活单元与「候选-历史共同输入的外积注意力」未实现；
+    `mask` 为 0 的位置被排除在 softmax 之外（权重恰为 0）。
+    """
+
+    def __init__(self, num_factors=4, hidden=(8,), seed=None):
+        self.num_factors = _w17b_int(num_factors, "DIN", "num_factors", 1)
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("DIN: hidden 需要非空的层宽列表")
+        self.hidden_sizes = [_w17b_int(h, "DIN", "hidden", 1) for h in hidden]
+        if seed is not None:
+            _w17b_int(seed, "DIN", "seed", 0)
+        self.seed = seed
+
+        rng = _w17b_rng(seed)
+        f = self.num_factors
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed + 1)
+            self.hidden = []
+            fan_in = 2 * f
+            for width in self.hidden_sizes:
+                self.hidden.append(Layer(fan_in, width, activation="relu"))
+                fan_in = width
+        finally:
+            random.setstate(state)
+        self.out_w = [rng.gauss(0.0, 0.1) for _ in range(fan_in)]
+        self.out_b = 0.0
+
+    def _check_seq(self, candidate, history, mask, who):
+        f = self.num_factors
+        cand = _w17b_rows([candidate], f, who)[0]
+        if not isinstance(history, (list, tuple)) or not history:
+            raise ValueError(f"{who}: history 需要非空的历史序列")
+        seq = [_w17b_rows([row], f, who)[0] for row in history]
+        if mask is None:
+            m = [1.0] * len(seq)
+        else:
+            if not isinstance(mask, (list, tuple)) or len(mask) != len(seq):
+                raise ValueError(f"{who}: mask 长度必须与 history 一致")
+            m = []
+            for idx, flag in enumerate(mask):
+                v = _w17b_float(flag, who, f"mask[{idx}]")
+                if v not in (0.0, 1.0):
+                    raise ValueError(f"{who}: mask 只能是 0 或 1")
+                m.append(v)
+            if sum(m) == 0.0:
+                raise ValueError(f"{who}: mask 全为 0，没有可注意的历史")
+        return cand, seq, m
+
+    def _softmax_attn(self, cand, seq, m):
+        scale = 1.0 / math.sqrt(self.num_factors)
+        raw = []
+        for j, row in enumerate(seq):
+            raw.append(-1e30 if m[j] == 0.0 else _w17b_dot(cand, row) * scale)
+        top = max(raw)
+        exps = [0.0 if r <= -1e29 else math.exp(r - top) for r in raw]
+        total = sum(exps)
+        return [e / total for e in exps]
+
+    def attention_weights(self, candidate, history, mask=None):
+        """返回归一化后的注意力权重（mask 位置恰为 0）。"""
+        cand, seq, m = self._check_seq(candidate, history, mask, "DIN.attention_weights")
+        return self._softmax_attn(cand, seq, m)
+
+    def _forward_one(self, cand, seq, m):
+        attn = self._softmax_attn(cand, seq, m)
+        pooled = [0.0] * self.num_factors
+        for j, row in enumerate(seq):
+            if attn[j] == 0.0:
+                continue
+            for k in range(self.num_factors):
+                pooled[k] += attn[j] * row[k]
+        z = cand + pooled
+        h = z
+        for layer in self.hidden:
+            h = layer.forward(h)
+        logit = _w17b_dot(self.out_w, h) + self.out_b
+        return logit, attn, pooled, h
+
+    def logits(self, candidates, histories, masks=None):
+        """批量打分。"""
+        n = len(candidates)
+        if n == 0:
+            raise ValueError("DIN.logits: 至少需要一个样本")
+        if masks is None:
+            masks = [None] * n
+        if len(histories) != n or len(masks) != n:
+            raise ValueError("DIN.logits: candidates / histories / masks 样本数不一致")
+        out = []
+        for cand, hist, mask in zip(candidates, histories, masks):
+            c, seq, m = self._check_seq(cand, hist, mask, "DIN.logits")
+            out.append(self._forward_one(c, seq, m)[0])
+        return out
+
+    def loss_and_grads(self, candidates, histories, labels, masks=None):
+        """二分类交叉熵 + 参数梯度；返回 `(loss, grads)`。
+
+        `grads` 除参数外还带 `"dcandidate"` / `"dhistory"`（逐样本输入梯度），
+        形状与入参一致，便于对拍与向上游传播。
+        """
+        if not isinstance(labels, (list, tuple)):
+            raise TypeError("DIN.loss_and_grads: labels 必须是列表")
+        n = len(labels)
+        if n == 0:
+            raise ValueError("DIN.loss_and_grads: 至少需要一个样本")
+        if len(candidates) != n or len(histories) != n:
+            raise ValueError("DIN.loss_and_grads: 样本数与 labels 不一致")
+        ys = []
+        for idx, y in enumerate(labels):
+            v = _w17b_float(y, "DIN.loss_and_grads", f"第 {idx} 个 label")
+            if v < 0.0 or v > 1.0:
+                raise ValueError("DIN.loss_and_grads: label 必须在 [0, 1] 内")
+            ys.append(v)
+        if masks is None:
+            masks = [None] * n
+        if len(masks) != n:
+            raise ValueError("DIN.loss_and_grads: masks 样本数不一致")
+
+        f = self.num_factors
+        grads = {
+            "hidden": [
+                ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                 [0.0] * layer.fan_out)
+                for layer in self.hidden
+            ],
+            "out_w": [0.0] * len(self.out_w),
+            "out_b": 0.0,
+            "dcandidate": [],
+            "dhistory": [],
+        }
+        total_loss = 0.0
+        for cand_raw, hist_raw, y, mask in zip(candidates, histories, ys, masks):
+            cand, seq, m = self._check_seq(cand_raw, hist_raw, mask,
+                                           "DIN.loss_and_grads")
+            logit, attn, pooled, h = self._forward_one(cand, seq, m)
+            total_loss += _w17b_bce(logit, y)
+            g = 1.0 / (1.0 + math.exp(-logit)) - y
+
+            for j in range(len(self.out_w)):
+                grads["out_w"][j] += g * h[j]
+            grads["out_b"] += g
+            dh = [g * self.out_w[j] for j in range(len(self.out_w))]
+            for idx in range(len(self.hidden) - 1, -1, -1):
+                layer = self.hidden[idx]
+                gw, gb, dh = layer.backward(dh)
+                acc_w, acc_b = grads["hidden"][idx]
+                for r in range(layer.fan_out):
+                    for c in range(layer.fan_in):
+                        acc_w[r][c] += gw[r][c]
+                    acc_b[r] += gb[r]
+
+            dcand = list(dh[:f])
+            dpool = list(dh[f:])
+            dot_dp_pool = _w17b_dot(dpool, pooled)
+            scale = 1.0 / math.sqrt(f)
+            ds = []
+            for j in range(len(seq)):
+                ds.append(attn[j] * (_w17b_dot(dpool, seq[j]) - dot_dp_pool))
+            dhist = []
+            for j in range(len(seq)):
+                row = [0.0] * f
+                for k in range(f):
+                    row[k] = dpool[k] * attn[j] + ds[j] * cand[k] * scale
+                dhist.append(row)
+            for j in range(len(seq)):
+                for k in range(f):
+                    dcand[k] += ds[j] * seq[j][k] * scale
+            grads["dcandidate"].append(dcand)
+            grads["dhistory"].append(dhist)
+
+        scale_all = 1.0 / n
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    acc_w[r][c] *= scale_all
+                acc_b[r] *= scale_all
+        for j in range(len(self.out_w)):
+            grads["out_w"][j] *= scale_all
+        grads["out_b"] *= scale_all
+        for idx in range(n):
+            for k in range(f):
+                grads["dcandidate"][idx][k] *= scale_all
+            for row in grads["dhistory"][idx]:
+                for k in range(f):
+                    row[k] *= scale_all
+        return total_loss / n, grads
+
+    def apply_grads(self, grads, lr=0.05):
+        """原地 SGD 一步（只更新参数，不碰输入梯度）。"""
+        lr = _w17b_float(lr, "DIN.apply_grads", "lr")
+        if lr < 0.0:
+            raise ValueError("DIN.apply_grads: lr 必须 >= 0")
+        for idx, layer in enumerate(self.hidden):
+            acc_w, acc_b = grads["hidden"][idx]
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    layer.weights[r][c] -= lr * acc_w[r][c]
+                layer.biases[r] -= lr * acc_b[r]
+        for j in range(len(self.out_w)):
+            self.out_w[j] -= lr * grads["out_w"][j]
+        self.out_b -= lr * grads["out_b"]
+
+    def param_count(self):
+        """可训练标量个数（不含输入侧）。"""
+        total = 0
+        for layer in self.hidden:
+            total += layer.fan_out * layer.fan_in + layer.fan_out
+        total += len(self.out_w) + 1
+        return total
+
+
+# ======================================================================
 #  领域应用 W17-B：推荐（矩阵分解 / NCF / Wide&Deep）
 # ======================================================================
 

@@ -554,7 +554,11 @@
   - `series_decompose` / `auto_correlation` / `autoformer_aggregate`
   - `PatchTSTEmbedding`（patch + 线性嵌入 + RevIN）
   - 探针 47 项；修掉 `TCNBlock` 反向漏掉第二道 ReLU 掩码（conv2 梯度多算，差 1.768e-01）
-- [ ] 推荐：MF / NCF / Wide&Deep / DeepFM / DIN
+- [x] 推荐：MF / NCF / Wide&Deep / DeepFM / DIN
+  - `matrix_factorization` / `mf_predict` / `mf_rmse`（显式反馈，逐条 SGD）
+  - `NCF`（GMF + MLP 融合，逐样本手写反向）、`WideAndDeep`（宽 + 深，logit 相加）
+  - `DeepFM`（FM 二阶交叉闭式 + 深侧）、`DIN`（点积注意力池化 + 输入梯度）
+  - 探针 42 + 37 项，参数梯度全部对过中心差分（< 1e-6）
   - `matrix_factorization` / `mf_predict` / `mf_rmse`（显式反馈，逐条 SGD）
   - `NCF`（GMF + MLP 融合，逐样本手写反向）、`WideAndDeep`（宽 + 深，logit 相加）
   - 探针 42 项（含 8 组参数的中心差分 < 1e-7）

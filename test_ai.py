@@ -24006,3 +24006,202 @@ class TestRecommenders:
             wd.logits([[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
         with pytest.raises(ValueError):
             wd.loss_and_grads([[0.0, 0.0, 0.0]], [[0.0, 0.0]], [1.0, 0.0])
+
+
+class TestDeepFMAndDIN:
+    """W17-B-2：DeepFM（FM 二阶交叉）与 DIN（注意力池化）。"""
+
+    def test_deepfm_logit_and_param_count(self):
+        model = AI.DeepFM(num_fields=3, num_factors=2, hidden=(4,), seed=9)
+        assert model.param_count() == 3 + 1 + 3 * 2 + (4 * 6 + 4) + 4 + 1
+        ids = [[0, 1], [1, 2]]
+        vals = [[1.0, 0.5], [0.8, -1.2]]
+        slot = [0.0] * 3
+        for fid, v in zip(ids[0], vals[0]):
+            slot[fid] = v
+        terms = [[model.emb[j][k] * slot[j] for k in range(2)] for j in range(3)]
+        sums = [sum(t[k] for t in terms) for k in range(2)]
+        fm = 0.5 * sum(sums[k] ** 2 - sum(t[k] ** 2 for t in terms) for k in range(2))
+        flat = [x for t in terms for x in t]
+        h = flat
+        for layer in model.hidden:
+            h = layer.forward(h)
+        manual = model.b0 + fm
+        manual += sum(model.linear_w[j] * slot[j] for j in range(3))
+        manual += sum(model.out_w[j] * h[j] for j in range(4)) + model.out_b
+        assert abs(model.logits(ids, vals)[0] - manual) < 1e-12
+
+    def test_deepfm_gradients(self):
+        model = AI.DeepFM(num_fields=3, num_factors=2, hidden=(4,), seed=9)
+        ids = [[0, 1], [1, 2], [0, 2, 1]]
+        vals = [[1.0, 0.5], [0.8, -1.2], [0.3, 0.7, -0.4]]
+        labels = [1.0, 0.0, 1.0]
+        _loss, grads = model.loss_and_grads(ids, vals, labels)
+        eps = 1e-6
+
+        def total():
+            return model.loss_and_grads(ids, vals, labels)[0]
+
+        def fd(getter, setter, analytic, tol=1e-6):
+            old = getter()
+            setter(old + eps)
+            hi = total()
+            setter(old - eps)
+            lo = total()
+            setter(old)
+            assert abs((hi - lo) / (2 * eps) - analytic) < tol
+
+        fd(lambda: model.b0, lambda v: setattr(model, "b0", v), grads["b0"])
+        fd(lambda: model.linear_w[1], lambda v: model.linear_w.__setitem__(1, v),
+           grads["linear_w"][1])
+        fd(lambda: model.emb[2][1], lambda v: model.emb[2].__setitem__(1, v),
+           grads["emb"][2][1])
+        fd(lambda: model.out_w[3], lambda v: model.out_w.__setitem__(3, v),
+           grads["out_w"][3])
+        fd(lambda: model.out_b, lambda v: setattr(model, "out_b", v), grads["out_b"])
+        fd(lambda: model.hidden[0].weights[2][3],
+           lambda v: model.hidden[0].weights[2].__setitem__(3, v),
+           grads["hidden"][0][0][2][3])
+
+    def test_deepfm_second_order_term(self):
+        model = AI.DeepFM(num_fields=2, num_factors=2, hidden=(3,), seed=1)
+        model.linear_w = [0.0, 0.0]
+        model.b0 = 0.0
+        model.out_w = [0.0] * 3
+        model.out_b = 0.0
+        model.emb = [[1.0, 2.0], [3.0, 4.0]]
+        got = model.logits([[0, 1]], [[1.0, 1.0]])[0]
+        v0 = [1.0, 2.0]
+        v1 = [3.0, 4.0]
+        expected = 0.5 * ((v0[0] + v1[0]) ** 2 - (v0[0] ** 2 + v1[0] ** 2)
+                          + (v0[1] + v1[1]) ** 2 - (v0[1] ** 2 + v1[1] ** 2))
+        assert abs(got - expected) < 1e-12
+
+    def test_deepfm_trains(self):
+        model = AI.DeepFM(num_fields=2, num_factors=2, hidden=(4,), seed=4)
+        ids = [[0], [1], [0], [1]]
+        vals = [[1.0], [1.0], [-1.0], [-1.0]]
+        y = [1.0, 0.0, 0.0, 1.0]
+        first = model.loss_and_grads(ids, vals, y)[0]
+        for _ in range(400):
+            _l, grads = model.loss_and_grads(ids, vals, y)
+            model.apply_grads(grads, lr=0.5)
+        final = model.loss_and_grads(ids, vals, y)[0]
+        assert final < 0.05 and final < first
+
+    def test_deepfm_validation(self):
+        model = AI.DeepFM(num_fields=3, num_factors=2, hidden=(4,), seed=9)
+        with pytest.raises(ValueError):
+            AI.DeepFM(0)
+        with pytest.raises(ValueError):
+            AI.DeepFM(2, hidden=())
+        with pytest.raises(ValueError):
+            model.logits([[0, 1]], [[1.0]])
+        with pytest.raises(ValueError):
+            model.logits([[0, 3]], [[1.0, 1.0]])
+        with pytest.raises(ValueError):
+            model.logits([[]], [[]])
+        with pytest.raises(ValueError):
+            model.logits([[0, 0]], [[1.0, 2.0]])
+        with pytest.raises(ValueError):
+            model.loss_and_grads([[0]], [[1.0]], [1.0, 0.0])
+        _l, grads = model.loss_and_grads([[0]], [[1.0]], [1.0])
+        with pytest.raises(ValueError):
+            model.apply_grads(grads, lr=-0.1)
+
+    def test_din_attention(self):
+        din = AI.DIN(num_factors=3, hidden=(4,), seed=6)
+        cand = [0.5, -0.2, 0.1]
+        hist = [[0.4, 0.1, -0.3], [0.2, 0.5, 0.0], [-0.1, 0.3, 0.6]]
+        attn = din.attention_weights(cand, hist, [1, 1, 0])
+        assert abs(sum(attn) - 1.0) < 1e-12
+        assert attn[2] == 0.0
+        one = din.attention_weights(cand, [hist[0]])
+        assert abs(one[0] - 1.0) < 1e-12
+        assert din.param_count() == (4 * 6 + 4) + 4 + 1
+
+    def test_din_gradients(self):
+        din = AI.DIN(num_factors=3, hidden=(4,), seed=6)
+        cand = [0.5, -0.2, 0.1]
+        hist = [[0.4, 0.1, -0.3], [0.2, 0.5, 0.0], [-0.1, 0.3, 0.6]]
+        mask = [1, 1, 0]
+        _loss, grads = din.loss_and_grads([cand], [hist], [1.0], [mask])
+        eps = 1e-6
+
+        def total():
+            return din.loss_and_grads([cand], [hist], [1.0], [mask])[0]
+
+        def fd(getter, setter, analytic):
+            old = getter()
+            setter(old + eps)
+            hi = total()
+            setter(old - eps)
+            lo = total()
+            setter(old)
+            assert abs((hi - lo) / (2 * eps) - analytic) < 1e-6
+
+        fd(lambda: din.out_w[2], lambda v: din.out_w.__setitem__(2, v), grads["out_w"][2])
+        fd(lambda: din.out_b, lambda v: setattr(din, "out_b", v), grads["out_b"])
+        fd(lambda: din.hidden[0].weights[1][5],
+           lambda v: din.hidden[0].weights[1].__setitem__(5, v),
+           grads["hidden"][0][0][1][5])
+
+        # 输入梯度：候选与历史各自对差分
+        cand_mut = [list(cand)]
+
+        def total_c():
+            return din.loss_and_grads([cand_mut[0]], [hist], [1.0], [mask])[0]
+
+        old = cand_mut[0][1]
+        cand_mut[0][1] = old + eps
+        hi = total_c()
+        cand_mut[0][1] = old - eps
+        lo = total_c()
+        cand_mut[0][1] = old
+        assert abs((hi - lo) / (2 * eps) - grads["dcandidate"][0][1]) < 1e-6
+
+        hist_mut = [[list(r) for r in hist]]
+
+        def total_h():
+            return din.loss_and_grads([cand], [hist_mut[0]], [1.0], [mask])[0]
+
+        for j, k in ((0, 2), (1, 0)):
+            old_h = hist_mut[0][j][k]
+            hist_mut[0][j][k] = old_h + eps
+            hi = total_h()
+            hist_mut[0][j][k] = old_h - eps
+            lo = total_h()
+            hist_mut[0][j][k] = old_h
+            assert abs((hi - lo) / (2 * eps) - grads["dhistory"][0][j][k]) < 1e-6
+
+    def test_din_trains(self):
+        din = AI.DIN(num_factors=2, hidden=(4,), seed=2)
+        cands = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]
+        hists = [[[1.0, 0.0], [0.0, 1.0]]] * 4
+        y = [1.0, 0.0, 1.0, 0.0]
+        first = din.loss_and_grads(cands, hists, y)[0]
+        for _ in range(400):
+            _l, grads = din.loss_and_grads(cands, hists, y)
+            din.apply_grads(grads, lr=0.5)
+        final = din.loss_and_grads(cands, hists, y)[0]
+        assert final < 0.05 and final < first
+
+    def test_din_validation(self):
+        din = AI.DIN(num_factors=3, hidden=(4,), seed=6)
+        cand = [0.5, -0.2, 0.1]
+        hist = [[0.4, 0.1, -0.3], [0.2, 0.5, 0.0]]
+        with pytest.raises(ValueError):
+            AI.DIN(0)
+        with pytest.raises(ValueError):
+            din.attention_weights(cand, hist, [0, 0])
+        with pytest.raises(ValueError):
+            din.attention_weights([0.0], hist)
+        with pytest.raises(ValueError):
+            din.attention_weights(cand, [])
+        with pytest.raises(ValueError):
+            din.logits([cand], [hist, hist])
+        with pytest.raises(ValueError):
+            din.loss_and_grads([cand], [hist], [1.0, 0.0])
+        _l, grads = din.loss_and_grads([cand], [hist], [1.0])
+        with pytest.raises(ValueError):
+            din.apply_grads(grads, lr=-1.0)
