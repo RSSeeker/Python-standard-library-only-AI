@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1551 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1561 项）
 
 ## 特性
 
@@ -1928,6 +1928,36 @@ shared_avg, privates = fedbn_average(updates)
 - `fedprox_penalty` 的梯度是对 `local` 的（`mu*(local-global)`），客户端把它加到自己的梯度上即可，本库不替你合并。
 - `fedbn_split` 按**键名前缀**区分私有参数，`fedbn_average` 只平均共享键；若所有键都是私有会直接报错，而不是静默返回空。
 
+### 时序模型（W17-A：TCN / Informer / Autoformer / PatchTST）
+
+| API | 说明 |
+| --- | --- |
+| `TCN(in_channels, hidden=16, levels=3, kernel_size=3, seed=None)` | 膨胀因果卷积堆叠，`(T, C) -> (T, hidden)`，带手写反向 |
+| `TCNBlock(in_channels, out_channels, kernel_size=3, dilation=1, seed=None)` | 两段因果卷积 + 残差（ReLU） |
+| `prob_sparse_attention(q, k, v, factor=5)` | Informer 的稀疏注意力（简化，前向） |
+| `series_decompose(x, kernel=25)` | 滑动平均分解 `(trend, seasonal)` |
+| `auto_correlation(values, max_lag=None)` | 自相关，0 阶为 1 |
+| `autoformer_aggregate(seasonal, period, top_k=2, weights=None)` | 按自相关挑 top-k 周期做加权平移平均 |
+| `PatchTSTEmbedding(patch_len=16, stride=8, d_model=32, seed=None)` | patch 切分 + 线性嵌入 + RevIN |
+
+```python
+tcn = TCN(in_channels=4, hidden=16, levels=3)
+h = tcn.forward(series)          # series: (T, 4)
+dx = tcn.backward(dh)            # 手写反向，可直接接优化器
+
+trend, seasonal = series_decompose(values, kernel=25)
+lag_agg, meta = autoformer_aggregate(seasonal, period=24, top_k=2)
+
+emb = PatchTSTEmbedding(patch_len=16, stride=8, d_model=32)
+patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
+```
+
+三条边界：
+
+- `TCN` 是因果的（第 t 步只看 `<= t`），`kernel_size`/`dilation` 决定感受野；它只做「时序编码」，不含池化/预测头。
+- `prob_sparse_attention` 是 Informer 的**简化前向近似**：只让稀疏度评分最高的 u 个查询看全部键，其余查询退化为值的均值，没有反向实现；`Autoformer` 的聚合同样是简化版（无 FFT、无频域）。
+- `PatchTSTEmbedding` 只做 patch 嵌入与 RevIN 归一化/反归一化，不含通道独立的多变量建模与预测头。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2344,7 +2374,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1551 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1561 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2546,6 +2576,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRLInfrastructure` | W16-G：ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
 | `TestMetaLearning` | MAML 内/外循环、Reptile 均值更新、ProtoNet 梯度、Matching 注意力 |
 | `TestFederatedLearning` | 参数摊平往返、FedAvg 加权平均、FedProx 梯度、FedBN 拆分与聚合 |
+| `TestTimeSeriesModels` | 因果卷积闭式与反向、TCN 梯度与因果性、Informer 稀疏注意力、Autoformer 分解、PatchTST 嵌入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2599,7 +2630,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1551 个单元测试
+├── test_ai.py       # 1561 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

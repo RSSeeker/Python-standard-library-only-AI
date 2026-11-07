@@ -23647,3 +23647,184 @@ class TestFederatedLearning:
         assert sorted(grad.keys()) == sorted(p1.keys())
         AI.load_named_params(m1, p1)
         assert AI.named_params(m1) == p1
+
+
+class TestTimeSeriesModels:
+    """W17-A：TCN / Informer 稀疏注意力 / Autoformer 分解 / PatchTST。"""
+
+    def test_causal_conv_closed_form(self):
+        conv = AI._CausalConv1d(1, 1, kernel_size=2, dilation=1, seed=7)
+        conv.weights = [[[0.5, -0.25]]]
+        conv.biases = [0.1]
+        x = [[1.0], [2.0], [3.0], [4.0]]
+        out = conv.forward(x)
+        for t in range(4):
+            prev = x[t - 1][0] if t > 0 else 0.0
+            assert abs(out[t][0] - (0.1 + 0.5 * prev - 0.25 * x[t][0])) < 1e-12
+        x2 = [list(r) for r in x]
+        x2[2][0] = 100.0
+        out2 = conv.forward(x2)
+        assert abs(out2[0][0] - out[0][0]) < 1e-12
+        assert abs(out2[1][0] - out[1][0]) < 1e-12
+        assert abs(out2[2][0] - out[2][0]) > 1.0
+
+    def test_causal_conv_backward_finite_diff(self):
+        conv = AI._CausalConv1d(1, 1, kernel_size=2, dilation=1, seed=3)
+        conv.weights = [[[0.3, -0.7]]]
+        conv.biases = [0.05]
+        xs = [[0.4], [0.9], [-0.2]]
+        conv.zero_grad()
+        conv.forward(xs)
+        dx = conv.backward([[1.0], [2.0], [3.0]])
+        eps = 1e-6
+
+        def loss():
+            o = conv.forward(xs)
+            return sum(o[t][0] * (t + 1) for t in range(3))
+
+        for k in range(2):
+            old = conv.weights[0][0][k]
+            conv.weights[0][0][k] = old + eps
+            hi = loss()
+            conv.weights[0][0][k] = old - eps
+            lo = loss()
+            conv.weights[0][0][k] = old
+            num = (hi - lo) / (2 * eps)
+            assert abs(num - conv.grad_w[0][0][k]) < 1e-6
+        for t in range(3):
+            xh = [list(r) for r in xs]
+            xh[t][0] += eps
+            hi = sum(conv.forward(xh)[i][0] * (i + 1) for i in range(3))
+            xl = [list(r) for r in xs]
+            xl[t][0] -= eps
+            lo = sum(conv.forward(xl)[i][0] * (i + 1) for i in range(3))
+            num = (hi - lo) / (2 * eps)
+            assert abs(num - dx[t][0]) < 1e-6
+
+    def test_tcn_block_forward_shape_and_param_count(self):
+        block = AI.TCNBlock(2, 3, kernel_size=3, dilation=2, seed=5)
+        xb = [[0.5, -0.5], [0.1, 0.2], [0.3, -0.1], [-0.4, 0.6], [0.2, 0.0]]
+        out = block.forward(xb)
+        assert len(out) == 5 and len(out[0]) == 3
+        expected = (3 * 2 * 3 + 3) + (3 * 3 * 3 + 3) + (3 * 2 * 1 + 3)
+        assert block.param_count() == expected
+
+    def test_tcn_block_backward_finite_diff(self):
+        # 这条用例的关键：部分时刻 h2 <= 0（第二道 ReLU 之前是负的），
+        # 早期版本漏了这道掩码，conv2 的梯度会多算。
+        block = AI.TCNBlock(2, 3, kernel_size=3, dilation=2, seed=5)
+        xb = [[0.5, -0.5], [0.1, 0.2], [0.3, -0.1], [-0.4, 0.6], [0.2, 0.0]]
+        g = [[1.0, 0.0, -1.0] for _ in range(5)]
+
+        def block_loss(b):
+            o = b.forward(xb)
+            return sum(o[t][c] * g[t][c] for t in range(5) for c in range(3))
+
+        block.zero_grad()
+        block.forward(xb)
+        block.backward(g)
+        analytic = [[list(row) for row in ch] for ch in block.conv1.grad_w]
+        eps = 1e-6
+        for oc in range(3):
+            for ic in range(2):
+                for k in range(3):
+                    old = block.conv1.weights[oc][ic][k]
+                    block.conv1.weights[oc][ic][k] = old + eps
+                    hi = block_loss(block)
+                    block.conv1.weights[oc][ic][k] = old - eps
+                    lo = block_loss(block)
+                    block.conv1.weights[oc][ic][k] = old
+                    num = (hi - lo) / (2 * eps)
+                    assert abs(num - analytic[oc][ic][k]) < 1e-5
+
+    def test_tcn_causality(self):
+        tcn = AI.TCN(2, hidden=4, levels=3, kernel_size=3, seed=9)
+        xb = [[0.5, -0.5], [0.1, 0.2], [0.3, -0.1], [-0.4, 0.6], [0.2, 0.0]]
+        out = tcn.forward(xb)
+        assert len(out) == 5 and len(out[0]) == 4
+        xb2 = [list(r) for r in xb]
+        xb2[4][0] += 5.0
+        out2 = tcn.forward(xb2)
+        for t in range(4):
+            for j in range(4):
+                assert abs(out2[t][j] - out[t][j]) < 1e-12
+        deep1 = tcn.blocks[0].conv1.forward(xb)
+        deep2 = tcn.blocks[0].conv1.forward(xb2)
+        assert any(abs(deep2[4][j] - deep1[4][j]) > 1e-9 for j in range(4))
+        assert len(tcn.backward([[1.0, 0.0, 0.0, 0.0] for _ in range(5)])) == 5
+
+    def test_tcn_validation(self):
+        with pytest.raises(ValueError):
+            AI.TCN(2, levels=0)
+        with pytest.raises(RuntimeError):
+            AI.TCN(2, levels=1).backward([[1.0]])
+        conv = AI._CausalConv1d(1, 1, kernel_size=2)
+        with pytest.raises(ValueError):
+            conv.forward([[1.0, 2.0]])
+        with pytest.raises(RuntimeError):
+            AI._CausalConv1d(1, 1, kernel_size=2).backward([[1.0]])
+
+    def test_prob_sparse_attention(self):
+        q = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5], [0.9, 0.1], [0.1, 0.9], [0.3, 0.3]]
+        k = [[1.0, 0.0], [0.0, 1.0], [0.6, 0.4], [0.2, 0.8], [0.7, 0.7], [0.4, 0.2]]
+        v = [[1.0, 0.0], [0.0, 1.0], [2.0, 2.0], [3.0, 0.0], [0.0, 3.0], [1.0, 1.0]]
+        out, stats = AI.prob_sparse_attention(q, k, v, factor=5)
+        assert len(out) == 6 and len(out[0]) == 2
+        u_expected = max(1, min(6, int(5 * math.log(6))))
+        assert stats["u"] == u_expected
+        assert len(stats["selected"]) == stats["u"]
+        mean_v = [sum(v[j][d] for j in range(6)) / 6 for d in range(2)]
+        for i in range(6):
+            if i in stats["selected"]:
+                continue
+            for d in range(2):
+                assert abs(out[i][d] - mean_v[d]) < 1e-12
+        with pytest.raises(ValueError):
+            AI.prob_sparse_attention(q, k, v, factor=0.0)
+        with pytest.raises(ValueError):
+            AI.prob_sparse_attention([[1.0]], [[1.0, 2.0]], v)
+
+    def test_series_decompose_and_autocorrelation(self):
+        series = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        trend, seasonal = AI.series_decompose(series, kernel=3)
+        for i in range(8):
+            assert abs(trend[i] + seasonal[i] - series[i]) < 1e-12
+        assert max(trend) - min(trend) < max(series) - min(series)
+        _t, cs = AI.series_decompose([2.0] * 6)
+        assert all(abs(v) < 1e-12 for v in cs)
+        with pytest.raises(ValueError):
+            AI.series_decompose([1.0], kernel=0)
+        corr = AI.auto_correlation([1.0, 2.0, 1.0, 2.0, 1.0, 2.0])
+        assert abs(corr[0] - 1.0) < 1e-12
+        assert abs(corr[2] - 2.0 / 3.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.auto_correlation([1.0, 2.0], max_lag=5)
+        with pytest.raises(ValueError):
+            AI.auto_correlation([1.0, 1.0, 1.0])
+
+    def test_autoformer_aggregate(self):
+        agg, meta = AI.autoformer_aggregate(
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0], period=2, top_k=2)
+        assert len(agg) == 8
+        assert abs(sum(meta["weights"]) - 1.0) < 1e-12
+        assert meta["lags"] == sorted(meta["lags"])
+        with pytest.raises(ValueError):
+            AI.autoformer_aggregate([1.0, 2.0], period=5)
+        with pytest.raises(ValueError):
+            AI.autoformer_aggregate([1.0, 2.0, 3.0, 4.0], period=1, top_k=1, weights=[1.0, 2.0])
+
+    def test_patchtst_embedding(self):
+        emb = AI.PatchTSTEmbedding(patch_len=4, stride=2, d_model=3, seed=4)
+        patches = emb.forward([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+        assert len(patches) == 2 and len(patches[0]) == 3
+        normed, mean, std = AI.PatchTSTEmbedding.rev_in(emb, [1.0, 2.0, 3.0])
+        assert abs(sum(normed) / 3.0) < 1e-12
+        assert abs((sum(v * v for v in normed) / 3.0) ** 0.5 - 1.0) < 1e-12
+        back = AI.PatchTSTEmbedding.rev_inverse(normed, mean, std)
+        for i in range(3):
+            assert abs(back[i] - [1.0, 2.0, 3.0][i]) < 1e-12
+        assert emb.param_count() == 3 * 4 + 3
+        with pytest.raises(ValueError):
+            AI.PatchTSTEmbedding(patch_len=8, stride=4, d_model=2).forward([1.0, 2.0])
+        with pytest.raises(ValueError):
+            AI.PatchTSTEmbedding(stride=0)

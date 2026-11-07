@@ -30147,6 +30147,386 @@ class PPOAgent:
         return self.policy.param_count() + self.value.param_count()
 
 # ============================================================================
+#  领域应用 W17-A：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+# ============================================================================
+
+def _w17_pad_left(x, pad):
+    """在序列左侧补零（因果卷积用）。"""
+    if pad <= 0:
+        return [list(row) for row in x]
+    width = len(x[0]) if x else 0
+    out = [[0.0] * width for _ in range(pad)]
+    out.extend([list(row) for row in x])
+    return out
+
+
+class _CausalConv1d:
+    """内部用的因果膨胀一维卷积：``(T, C) -> (T, O)``，权重 ``[O][C][k]``。"""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, seed=None):
+        if out_channels < 1 or in_channels < 1:
+            raise ValueError("_CausalConv1d: 通道数必须 >= 1")
+        if kernel_size < 1:
+            raise ValueError(f"_CausalConv1d: kernel_size 必须 >= 1，收到 {kernel_size!r}")
+        if dilation < 1:
+            raise ValueError(f"_CausalConv1d: dilation 必须 >= 1，收到 {dilation!r}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        rng = random.Random(seed) if seed is not None else random
+        std = math.sqrt(2.0 / (in_channels * kernel_size))
+        self.weights = [[[rng.gauss(0.0, std) for _ in range(kernel_size)]
+                         for _ in range(in_channels)] for _ in range(out_channels)]
+        self.biases = [0.0] * out_channels
+        self.grad_w = [[[0.0] * kernel_size for _ in range(in_channels)]
+                       for _ in range(out_channels)]
+        self.grad_b = [0.0] * out_channels
+        self._padded = None
+        self._length = 0
+
+    def zero_grad(self):
+        for oc in range(self.out_channels):
+            for ic in range(self.in_channels):
+                self.grad_w[oc][ic] = [0.0] * self.kernel_size
+        self.grad_b = [0.0] * self.out_channels
+
+    def forward(self, x):
+        if not x or not x[0]:
+            raise ValueError("_CausalConv1d.forward: 输入必须是非空 (T, C) 序列")
+        if len(x[0]) != self.in_channels:
+            raise ValueError(
+                f"_CausalConv1d.forward: 输入通道 {len(x[0])} 与 in_channels="
+                f"{self.in_channels} 不一致")
+        t_len = len(x)
+        pad = (self.kernel_size - 1) * self.dilation
+        xp = _w17_pad_left(x, pad)
+        self._padded = xp
+        self._length = t_len
+        out = []
+        for t in range(t_len):
+            row = []
+            for oc in range(self.out_channels):
+                acc = self.biases[oc]
+                w_oc = self.weights[oc]
+                for ic in range(self.in_channels):
+                    w_ic = w_oc[ic]
+                    for kk in range(self.kernel_size):
+                        acc += w_ic[kk] * xp[t + kk * self.dilation][ic]
+                row.append(acc)
+            out.append(row)
+        return out
+
+    def backward(self, dout):
+        if self._padded is None:
+            raise RuntimeError("_CausalConv1d.backward: 需要先调用 forward")
+        if len(dout) != self._length:
+            raise ValueError(
+                f"_CausalConv1d.backward: dout 长度 {len(dout)} 与序列长度 {self._length} 不一致")
+        pad = (self.kernel_size - 1) * self.dilation
+        width = self.in_channels
+        dxp = [[0.0] * width for _ in range(len(self._padded))]
+        for t in range(self._length):
+            drow = dout[t]
+            if len(drow) != self.out_channels:
+                raise ValueError("_CausalConv1d.backward: dout 通道数与 out_channels 不一致")
+            for oc in range(self.out_channels):
+                g = drow[oc]
+                if g == 0.0:
+                    continue
+                self.grad_b[oc] += g
+                w_oc = self.weights[oc]
+                gw_oc = self.grad_w[oc]
+                for ic in range(self.in_channels):
+                    w_ic = w_oc[ic]
+                    gw_ic = gw_oc[ic]
+                    for kk in range(self.kernel_size):
+                        pos = t + kk * self.dilation
+                        gw_ic[kk] += g * self._padded[pos][ic]
+                        dxp[pos][ic] += g * w_ic[kk]
+        return dxp[pad:]
+
+
+class TCNBlock:
+    """时序卷积块：两段因果膨胀卷积 + 残差（ReLU），带手写反向。"""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, seed=None):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dilation = dilation
+        self.conv1 = _CausalConv1d(in_channels, out_channels, kernel_size, dilation, seed)
+        self.conv2 = _CausalConv1d(
+            out_channels, out_channels, kernel_size, dilation,
+            None if seed is None else seed + 1)
+        self.proj = None
+        if in_channels != out_channels:
+            self.proj = _CausalConv1d(in_channels, out_channels, 1, 1, seed)
+        self._cache = None
+
+    def zero_grad(self):
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        if self.proj is not None:
+            self.proj.zero_grad()
+
+    def forward(self, x):
+        h1 = [[max(0.0, v) for v in row] for row in self.conv1.forward(x)]
+        pre2 = self.conv2.forward(h1)
+        h2 = [[max(0.0, v) for v in row] for row in pre2]
+        if self.proj is None:
+            residual = [list(row) for row in x]
+        else:
+            residual = self.proj.forward(x)
+        pre_out = [[h2[t][j] + residual[t][j] for j in range(self.out_channels)]
+                   for t in range(len(x))]
+        out = [[max(0.0, v) for v in row] for row in pre_out]
+        self._cache = (x, h1, h2, residual, out)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("TCNBlock.backward: 需要先调用 forward")
+        x, h1, h2, residual, out = self._cache
+        dpre = [[dout[t][j] if out[t][j] > 0.0 else 0.0 for j in range(self.out_channels)]
+                for t in range(len(dout))]
+        # h2 = relu(pre2)：还要再过一道 ReLU 的掩码，否则 conv2 会拿到未经掩码的梯度
+        dh2 = [[dpre[t][j] if h2[t][j] > 0.0 else 0.0 for j in range(self.out_channels)]
+               for t in range(len(dout))]
+        dh1 = self.conv2.backward(dh2)
+        dh1 = [[dh1[t][j] if h1[t][j] > 0.0 else 0.0 for j in range(self.out_channels)]
+               for t in range(len(dh1))]
+        dx1 = self.conv1.backward(dh1)
+        if self.proj is None:
+            dxp = dpre
+        else:
+            dxp = self.proj.backward(dpre)
+        return [[dx1[t][j] + dxp[t][j] for j in range(self.in_channels)]
+                for t in range(len(dout))]
+
+    def param_count(self):
+        n = (self.conv1.out_channels * self.conv1.in_channels * self.conv1.kernel_size
+             + self.conv1.out_channels)
+        n += (self.conv2.out_channels * self.conv2.in_channels * self.conv2.kernel_size
+              + self.conv2.out_channels)
+        if self.proj is not None:
+            n += self.proj.out_channels * self.proj.in_channels + self.proj.out_channels
+        return n
+
+
+class TCN:
+    """多层时序卷积网络（膨胀指数 1, 2, 4, ...），``(T, C) -> (T, hidden)``。"""
+
+    def __init__(self, in_channels, hidden=16, levels=3, kernel_size=3, seed=None):
+        if levels < 1:
+            raise ValueError(f"TCN: levels 必须 >= 1，收到 {levels!r}")
+        base = random.Random(seed) if seed is not None else random
+        seeds = [base.randrange(1 << 30) for _ in range(levels)]
+        self.blocks = []
+        cur = in_channels
+        for i in range(levels):
+            self.blocks.append(
+                TCNBlock(cur, hidden, kernel_size, 2 ** i, seeds[i]))
+            cur = hidden
+        self.hidden = hidden
+        self.levels = levels
+        self._x = None
+
+    def zero_grad(self):
+        for block in self.blocks:
+            block.zero_grad()
+
+    def forward(self, x):
+        self._x = x
+        h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+    def backward(self, dout):
+        if self._x is None:
+            raise RuntimeError("TCN.backward: 需要先调用 forward")
+        d = dout
+        for block in reversed(self.blocks):
+            d = block.backward(d)
+        return d
+
+    def param_count(self):
+        return sum(b.param_count() for b in self.blocks)
+
+
+def prob_sparse_attention(q, k, v, factor=5):
+    """Informer 的稀疏注意力（简化）：只让「稀疏度评分最高」的 u 个查询看全部键。
+
+    其余查询退化为「值的均值」。返回 ``(out, stats)``，``stats`` 给
+    ``{"u", "total", "selected"}``。这是**前向**近似，不做反向。
+    """
+    if not q or not k or not v:
+        raise ValueError("prob_sparse_attention: q / k / v 必须非空")
+    if len(q[0]) != len(k[0]) or len(k) != len(v):
+        raise ValueError("prob_sparse_attention: q/k 维度或 k/v 长度不一致")
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor <= 0:
+        raise ValueError(f"prob_sparse_attention: factor 必须 > 0，收到 {factor!r}")
+    t_len = len(q)
+    dim = len(q[0])
+    u = max(1, min(t_len, int(factor * math.log(max(2, t_len)))))
+    scores = []
+    for i in range(t_len):
+        row = [sum(q[i][d] * k[j][d] for d in range(dim)) / math.sqrt(dim)
+               for j in range(t_len)]
+        scores.append((max(row) - sum(row) / t_len, row))
+    order = sorted(range(t_len), key=lambda i: (-scores[i][0], i))[:u]
+    selected = sorted(order)
+    mean_v = [sum(v[j][d] for j in range(t_len)) / t_len for d in range(len(v[0]))]
+    out = [list(mean_v) for _ in range(t_len)]
+    for i in selected:
+        row = scores[i][1]
+        m = max(row)
+        ex = [math.exp(s - m) for s in row]
+        z = sum(ex)
+        probs = [e / z for e in ex]
+        out[i] = [sum(probs[j] * v[j][d] for j in range(t_len))
+                  for d in range(len(v[0]))]
+    stats = {"u": u, "total": t_len, "selected": selected}
+    return out, stats
+
+
+def series_decompose(x, kernel=25):
+    """Autoformer 式滑动平均分解：返回 ``(trend, seasonal)``，``x`` 是 1D 序列。"""
+    if not x:
+        raise ValueError("series_decompose: x 必须非空")
+    if isinstance(kernel, bool) or not isinstance(kernel, int) or kernel < 1:
+        raise ValueError(f"series_decompose: kernel 必须是 >=1 的整数，收到 {kernel!r}")
+    half = kernel // 2
+    trend = []
+    for i in range(len(x)):
+        lo = max(0, i - half)
+        hi = min(len(x), i + half + 1)
+        trend.append(sum(x[lo:hi]) / (hi - lo))
+    seasonal = [x[i] - trend[i] for i in range(len(x))]
+    return trend, seasonal
+
+
+def auto_correlation(values, max_lag=None):
+    """自相关（0 阶为 1），返回 ``[r_0, r_1, ...]``。"""
+    if not values:
+        raise ValueError("auto_correlation: values 必须非空")
+    n = len(values)
+    if max_lag is None:
+        max_lag = n - 1
+    if isinstance(max_lag, bool) or not isinstance(max_lag, int) or max_lag < 0:
+        raise ValueError(f"auto_correlation: max_lag 必须是非负整数，收到 {max_lag!r}")
+    if max_lag > n - 1:
+        raise ValueError(
+            f"auto_correlation: max_lag={max_lag} 超过序列长度减一（{n - 1}）")
+    mean = sum(values) / n
+    denom = sum((v - mean) ** 2 for v in values)
+    if denom <= 0.0:
+        raise ValueError("auto_correlation: 常数序列的自相关没有定义")
+    out = []
+    for lag in range(max_lag + 1):
+        num = sum((values[i] - mean) * (values[i + lag] - mean)
+                  for i in range(n - lag))
+        out.append(num / denom)
+    return out
+
+
+def autoformer_aggregate(seasonal, period, top_k=2, weights=None):
+    """按自相关挑 top-k 个周期做加权平移平均（Autoformer 的序列聚合简化）。"""
+    if not seasonal:
+        raise ValueError("autoformer_aggregate: seasonal 必须非空")
+    if isinstance(period, bool) or not isinstance(period, int) or period < 1:
+        raise ValueError(f"autoformer_aggregate: period 必须是 >=1 的整数，收到 {period!r}")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError(f"autoformer_aggregate: top_k 必须是 >=1 的整数，收到 {top_k!r}")
+    n = len(seasonal)
+    if period >= n:
+        raise ValueError(
+            f"autoformer_aggregate: period={period} 必须小于序列长度 {n}")
+    corr = auto_correlation(seasonal, min(n - 1, 3 * period))
+    lags = sorted(range(1, len(corr)), key=lambda l: (-corr[l], l))[:top_k]
+    if weights is None:
+        w = [1.0 / len(lags)] * len(lags)
+    else:
+        if len(weights) != len(lags):
+            raise ValueError(
+                f"autoformer_aggregate: weights 长度 {len(weights)} 与 top_k={len(lags)} 不一致")
+        total = sum(weights)
+        if total <= 0.0:
+            raise ValueError("autoformer_aggregate: weights 之和必须 > 0")
+        w = [float(v) / total for v in weights]
+    out = []
+    for t in range(n):
+        acc = 0.0
+        for lag, ww in zip(lags, w):
+            idx = t - lag
+            acc += ww * (seasonal[idx] if idx >= 0 else seasonal[0])
+        out.append(acc)
+    return out, {"lags": lags, "weights": w}
+
+
+class PatchTSTEmbedding:
+    """PatchTST 的 patch 切分 + 线性嵌入 + RevIN（实例归一化）双向变换。"""
+
+    def __init__(self, patch_len=16, stride=8, d_model=32, seed=None):
+        if isinstance(patch_len, bool) or not isinstance(patch_len, int) or patch_len < 1:
+            raise ValueError(f"PatchTSTEmbedding: patch_len 必须是 >=1 的整数，收到 {patch_len!r}")
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError(f"PatchTSTEmbedding: stride 必须是 >=1 的整数，收到 {stride!r}")
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"PatchTSTEmbedding: d_model 必须是 >=1 的整数，收到 {d_model!r}")
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        rng = random.Random(seed) if seed is not None else random
+        std = math.sqrt(2.0 / patch_len)
+        self.weights = [[rng.gauss(0.0, std) for _ in range(patch_len)]
+                        for _ in range(d_model)]
+        self.biases = [0.0] * d_model
+        self._stats = None
+
+    def rev_in(self, x):
+        """实例归一化：减去均值、除以标准差，返回 ``(normalized, mean, std)``。"""
+        n = len(x)
+        if n == 0:
+            raise ValueError("PatchTSTEmbedding.rev_in: x 必须非空")
+        mean = sum(x) / n
+        var = sum((v - mean) ** 2 for v in x) / n
+        std = math.sqrt(var) if var > 0.0 else 1.0
+        return [(v - mean) / std for v in x], mean, std
+
+    @staticmethod
+    def rev_inverse(normalized, mean, std=1.0):
+        """RevIN 的逆变换。"""
+        return [v * std + mean for v in normalized]
+
+    def forward(self, x):
+        normed, mean, std = self.rev_in(x)
+        self._stats = (mean, std)
+        patches = []
+        start = 0
+        while start + self.patch_len <= len(normed):
+            patches.append(normed[start:start + self.patch_len])
+            start += self.stride
+        if not patches:
+            raise ValueError(
+                f"PatchTSTEmbedding.forward: 序列长度 {len(normed)} 不足一个 patch "
+                f"({self.patch_len})")
+        out = []
+        for patch in patches:
+            row = []
+            for d in range(self.d_model):
+                acc = self.biases[d]
+                w = self.weights[d]
+                for i in range(self.patch_len):
+                    acc += w[i] * patch[i]
+                row.append(acc)
+            out.append(row)
+        return out
+
+    def param_count(self):
+        return self.d_model * self.patch_len + self.d_model
+
+# ============================================================================
 #  联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
 # ============================================================================
 

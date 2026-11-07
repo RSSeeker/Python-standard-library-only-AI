@@ -548,7 +548,12 @@
   - 探针 40 项；不含客户端训练循环与通信调度（README 已写明）
 
 ### W17 领域应用（§16）
-- [ ] 时序：TCN / Informer（简化）/ Autoformer（简化）/ PatchTST
+- [x] 时序：TCN / Informer（简化）/ Autoformer（简化）/ PatchTST
+  - `TCN` / `TCNBlock`（因果膨胀卷积 + 残差，手写反向）
+  - `prob_sparse_attention`（Informer 稀疏注意力，前向近似）
+  - `series_decompose` / `auto_correlation` / `autoformer_aggregate`
+  - `PatchTSTEmbedding`（patch + 线性嵌入 + RevIN）
+  - 探针 47 项；修掉 `TCNBlock` 反向漏掉第二道 ReLU 掩码（conv2 梯度多算，差 1.768e-01）
 - [ ] 推荐：MF / NCF / Wide&Deep / DeepFM / DIN
 - [ ] 图像：风格迁移（NST）/ 超分（SRCNN / SRGAN）/ 去噪（DnCNN）
 - [ ] 检索：Faiss 式暴力 + HNSW（简化）/ IVF（概念）
