@@ -27650,3 +27650,192 @@ class TestSpeculativeDecoding:
                 AI.self_speculative_probs(lm, draft_layers=bad)
         with pytest.raises(ValueError):
             AI.target_probs("not a model")
+
+class TestConvGANVariants:
+    """DCGAN 风格卷积 GAN、WGAN-GP 罚项与 StyleGAN/CycleGAN/Pix2Pix 构件"""
+
+    @staticmethod
+    def _img(c, h, w, seed=0):
+        rng = random.Random(seed)
+        return [[[rng.uniform(-1.0, 1.0) for _ in range(w)] for _ in range(h)]
+                for _ in range(c)]
+
+    @staticmethod
+    def _flat(x):
+        out = []
+        for item in x:
+            if isinstance(item, (list, tuple)):
+                out.extend(TestConvGANVariants._flat(item))
+            else:
+                out.append(float(item))
+        return out
+
+    def test_upsample_and_fade_endpoints(self):
+        x = [[[1.0, 2.0], [3.0, 4.0]]]
+        up = AI.upsample_nearest2d(x, 2)
+        assert (len(up), len(up[0]), len(up[0][0])) == (1, 4, 4)
+        assert up[0][0] == [1.0, 1.0, 2.0, 2.0]
+        assert AI.upsample_nearest2d(x, 1) == x
+        high = self._img(1, 4, 4, 2)
+        assert AI.fade_in(x, high, 0.0) == AI.upsample_nearest2d(x, 2)
+        assert AI.fade_in(x, high, 1.0) == high
+        mid = AI.fade_in(x, high, 0.5)
+        lo = AI.upsample_nearest2d(x, 2)
+        assert abs(mid[0][0][0] - (lo[0][0][0] + high[0][0][0]) / 2.0) < 1e-12
+
+    def test_progressive_schedule(self):
+        assert AI.progressive_alpha(0, 10) == 0.0
+        assert AI.progressive_alpha(99, 10) == 1.0
+        assert abs(AI.progressive_alpha(5, 10) - 0.5) < 1e-12
+        stages = AI.progressive_stages([4, 8, 16], fade_steps=2)
+        assert len(stages) == 2 * 3
+        assert stages[0][:2] == (4, 8) and stages[3][:2] == (8, 16)
+        assert stages[2][2] == 1.0 and stages[5][2] == 1.0
+
+    def test_generator_shape_and_params(self):
+        g = AI.DCGANGenerator(latent_dim=4, channels=(4, 2), out_channels=1,
+                              base=2, seed=7)
+        assert g.out_shape() == (1, 8, 8)
+        manual = sum(AI._w8a_layer_params(layer) for layer in g.layers())
+        assert g.param_count() == manual
+        out = g.forward([0.1, -0.2, 0.3, 0.4])
+        assert (len(out), len(out[0])) == (1, 8)
+        assert all(-1.0 <= v <= 1.0 for v in self._flat(out))
+
+    def test_generator_input_gradient(self):
+        g = AI.DCGANGenerator(latent_dim=3, channels=(2,), out_channels=1,
+                              base=2, seed=3)
+        z = [0.2, -0.1, 0.4]
+        dout = self._img(1, 4, 4, 9)
+        g.zero_grad()
+        g.forward(z)
+        dz = g.backward(dout)
+        for i in range(3):
+            eps = 1e-6
+            zp = list(z)
+            zm = list(z)
+            zp[i] += eps
+            zm[i] -= eps
+            lp = sum(a * b for a, b in zip(self._flat(g.forward(zp)),
+                                           self._flat(dout)))
+            lm = sum(a * b for a, b in zip(self._flat(g.forward(zm)),
+                                           self._flat(dout)))
+            assert abs(dz[i] - (lp - lm) / (2 * eps)) < 1e-5
+
+    def test_generator_sgd_step_lowers_output(self):
+        g = AI.DCGANGenerator(latent_dim=3, channels=(2,), out_channels=1,
+                              base=2, seed=13)
+        z = [0.3, -0.4, 0.2]
+        first = None
+        for _ in range(200):
+            out = g.forward(z)
+            loss = sum(v * v for v in self._flat(out))
+            if first is None:
+                first = loss
+            g.zero_grad()
+            g.backward([[row[:] for row in out[0]]])
+            g.sgd_step(0.005)
+        assert loss < 0.5 * first
+
+    def test_discriminator_score_and_gradient(self):
+        d = AI.DCGANDiscriminator(in_channels=1, channels=(2,), base=8, seed=5)
+        img = self._img(1, 8, 8, 7)
+        score = d.forward(img)
+        assert isinstance(score, float)
+        prob = d.prob(img)
+        expect = 1.0 / (1.0 + math.exp(-score))
+        assert abs(prob - expect) < 1e-12
+        d.forward(img)
+        d.zero_grad()
+        dx = d.backward(1.0)
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
+        v = self._img(1, 8, 8, 8)
+        eps = 1e-6
+        xp = [[[img[k][i][j] + eps * v[k][i][j] for j in range(8)]
+               for i in range(8)] for k in range(1)]
+        xm = [[[img[k][i][j] - eps * v[k][i][j] for j in range(8)]
+               for i in range(8)] for k in range(1)]
+        directional = (d.forward(xp) - d.forward(xm)) / (2 * eps)
+        got = sum(a * b for a, b in zip(self._flat(dx), self._flat(v)))
+        assert abs(got - directional) < 1e-5
+
+    def test_wgan_gp_penalty_matches_finite_difference(self):
+        d = AI.DCGANDiscriminator(in_channels=1, channels=(2,), base=4, seed=2)
+        real = self._img(1, 4, 4, 11)
+        fake = self._img(1, 4, 4, 12)
+        d.zero_grad()
+        info = AI.wgan_gp_penalty(d, real, fake, lambda_gp=10.0, seed=3)
+        assert abs(info["penalty"] - 10.0 * info["penalty_unscaled"]) < 1e-12
+        assert abs(info["penalty_unscaled"] - (info["grad_norms"] - 1.0) ** 2) < 1e-12
+        x_hat = AI._w8a_interpolate(real, fake, info["eps"])
+        d.forward(x_hat)
+        d.zero_grad()
+        d.backward(1.0)
+        fd = 0.0
+        for i in range(4):
+            for j in range(4):
+                eps = 1e-6
+                xp = [[[x_hat[c][b][a] + (eps if (b, a) == (i, j) else 0.0)
+                        for a in range(4)] for b in range(4)] for c in range(1)]
+                xm = [[[x_hat[c][b][a] - (eps if (b, a) == (i, j) else 0.0)
+                        for a in range(4)] for b in range(4)] for c in range(1)]
+                fd += ((d.forward(xp) - d.forward(xm)) / (2 * eps)) ** 2
+        assert abs(info["grad_norms"] - math.sqrt(fd)) < 1e-5
+
+    def test_adain_and_truncation(self):
+        feat = [[[1.0, 2.0, 3.0]]]
+        out, stats = AI.adain_style(feat, [2.0, 0.0])
+        assert abs(sum(self._flat(out)) / 3.0) < 1e-9
+        assert abs(stats[0][0] - 2.0) < 1e-12 and stats[0][1] > 0.0
+        shifted = AI.adain_style(feat, [2.0, 5.0])[0]
+        assert abs(shifted[0][0][0] - out[0][0][0] - 5.0) < 1e-12
+        assert AI.truncation_trick([2.0, 4.0], [1.0, 1.0], 0.0) == [1.0, 1.0]
+        assert AI.truncation_trick([2.0, 4.0], [1.0, 1.0], 1.0) == [2.0, 4.0]
+        assert AI.truncation_trick([2.0, 4.0], [0.0, 0.0], 0.5) == [1.0, 2.0]
+
+    def test_cycle_identity_and_pix2pix_losses(self):
+        a = [[[1.0, 2.0]]]
+        a_rec = [[[1.0, 4.0]]]
+        b = [[[0.0]]]
+        b_rec = [[[1.0]]]
+        loss, grads = AI.cycle_consistency_loss(a, a_rec, b, b_rec, lambda_cycle=10.0)
+        assert abs(loss - 30.0) < 1e-9
+        assert abs(grads[0][0][0][1] + 5.0) < 1e-9
+        assert abs(grads[0][0][0][0]) < 1e-12
+        assert abs(AI.identity_mapping_loss(a, a_rec, b, b_rec, 5.0) - 15.0) < 1e-9
+        assert AI.patchgan_targets(2, 3, real=True) == [[1.0] * 3] * 2
+        assert AI.patchgan_targets(1, 1, real=False) == [[0.0]]
+        pix = AI.pix2pix_g_loss([[0.0, 2.0]], [[[1.0]]], [[[0.0]]], lambda_l1=0.0)
+        bce = (-math.log(0.5) - math.log(1.0 / (1.0 + math.exp(-2.0)))) / 2.0
+        assert abs(pix - bce) < 1e-9
+        pix_l1 = AI.pix2pix_g_loss([[0.0, 2.0]], [[[1.0]]], [[[0.0]]],
+                                  lambda_l1=100.0)
+        assert abs(pix_l1 - bce - 100.0) < 1e-9
+
+    def test_invalid_arguments(self):
+        x = [[[1.0, 2.0], [3.0, 4.0]]]
+        high = self._img(1, 4, 4, 2)
+        with pytest.raises(ValueError):
+            AI.upsample_nearest2d(x, 0)
+        with pytest.raises(ValueError):
+            AI.fade_in(x, self._img(1, 3, 3, 0), 0.5)
+        with pytest.raises(ValueError):
+            AI.fade_in(x, high, 1.5)
+        with pytest.raises(ValueError):
+            AI.progressive_stages([8, 4])
+        with pytest.raises(ValueError):
+            AI.DCGANGenerator(latent_dim=0, channels=(2,), base=2)
+        with pytest.raises(ValueError):
+            AI.DCGANDiscriminator(channels=(), base=8)
+        with pytest.raises(ValueError):
+            AI.DCGANDiscriminator(channels=(2, 2), base=3)
+        d = AI.DCGANDiscriminator(in_channels=1, channels=(2,), base=4, seed=1)
+        with pytest.raises(ValueError):
+            AI.wgan_gp_penalty(d, self._img(1, 4, 4, 1), self._img(1, 8, 8, 2))
+        with pytest.raises(ValueError):
+            AI.wgan_gp_penalty(d, self._img(1, 4, 4, 1), self._img(1, 4, 4, 2),
+                               lambda_gp=-1.0)
+        with pytest.raises(ValueError):
+            AI.adain_style([[[1.0, 2.0]]], [1.0])
+        with pytest.raises(ValueError):
+            AI.truncation_trick([1.0], [1.0, 2.0])

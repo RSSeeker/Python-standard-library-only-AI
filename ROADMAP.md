@@ -229,7 +229,11 @@
   - **WGAN 必须裁剪**：不裁时 400 步判别器损失到 -71.96、样本距离 3.21（发散）；裁剪到 `±0.01` 后稳定
   - R1/R2 只返回数值：手写单阶反向没有二阶图，无法把罚项回传进参数，故为诊断量（PyTorch 的 `autograd.grad` 才行）
   - 实测样本平均最近距离（4 角点 / hidden=16 / 1200 步）：hinge 1.03、lsgan 1.30、wgan 2.41–2.61（小容量下几乎学不动）、bce 1.21
-- [ ] GAN 变体剩余：DCGAN / WGAN-GP / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive
+- [x] GAN 变体剩余：DCGAN / WGAN-GP / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive
+  - `DCGANGenerator` / `DCGANDiscriminator` 用真卷积（前向 + 手写反向 + `sgd_step`），但**不用 BatchNorm**（BN2d 反向返回三元组且带运行统计，混进手写链会让梯度约定复杂），故声明为「DCGAN 风格的最小卷积 GAN」
+  - `wgan_gp_penalty` 的 `∇_x D` 是**真反向**不是数值差分：罚项 `λ(n−1)²` 闭式与 `‖∇D‖` 有限差分都对上；坑是内部没先对 `x̂` 前向（用了上一次 forward 的缓存），实测差 1.1661 vs 1.3400
+  - StyleGAN / CycleGAN / Pix2Pix / Progressive 只给构件（AdaIN 调制、截断、循环一致性、identity、PatchGAN 目标、淡入与阶段调度），不给空壳训练接口
+  - 两个库内约定：`Layer.backward` 返回 `(grad_w, grad_b, next_delta)` **且不自存梯度**（手写容器必须自己累积，否则 Layer 参数永远为 0）；`Layer` **没有** `sgd_step`，要自己写或只对卷积层调用
 - [x] `RealNVP` 仿射耦合流：`log|det J| = Σs` **精确**、`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 是真密度（2 维网格积分 0.9989）、`nll` 最大似然训练 3.2951 → 1.4170（120 轮 lr=3e-3）
   - 实现坑：`Layer` 不支持 `tanh`（改用 sigmoid 打底、外面再套 `tanh` 限幅）；`Layer` 没有 `rng` 参数（临时 `random.seed` 再恢复 `getstate`）
   - `nll = 0.5|y|² + 0.5d·log2π − logdet` ⇒ `dL/dlogdet = -1`，符号写反会让训练朝反方向走

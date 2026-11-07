@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1815 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1825 项）
 
 ## 特性
 
@@ -2730,6 +2730,35 @@ print(out["ids"], out["stats"]["accept_rate"])
 - **`target_calls` 才是真正省下的量**。`draft_calls` 每个候选都要算一次，所以草稿比目标便宜才有收益；`tokens_per_target_call` 小于 1 时这轮投机是亏的。
 - **Medusa / EAGLE 只解释机制、不实现**。Medusa 需要额外训练多个预测头并做树形验证，EAGLE 需要特征级草稿与对齐训练；本库没有这些权重，故只在本节说明差异，不提供空壳接口。
 
+### GAN 变体族（W8-A）
+
+| API | 说明 |
+|-----|------|
+| `DCGANGenerator(latent_dim=8, channels=(8,4), out_channels=1, base=2, seed=None)` | 全卷积生成器：`Layer` 潜码投影 → 逐级 `ConvTranspose2d(k=4,s=2,p=1)`+ReLU → `tanh`；`out_shape()`/`forward`/`backward`/`sgd_step`/`param_count` |
+| `DCGANDiscriminator(in_channels=1, channels=(4,8), base=8, seed=None)` | 步长 2 的 `Conv2d` 栈 + LeakyReLU → 线性打分头；`forward` 返回裸分数、`prob` 取 sigmoid、`backward(dscore)` 回输入梯度 |
+| `wgan_gp_penalty(discriminator, real, fake, lambda_gp=10.0, seed=None)` | WGAN-GP 罚项：`λ(E‖∇_x D(x̂)‖−1)²`，`x̂` 在真假样本连线上均匀取；梯度用**手写反向真算**而非数值差分 |
+| `adain_style(features, style, eps=1e-5)` / `truncation_trick(w, w_avg, psi=0.7)` | StyleGAN 的两件：逐通道 AdaIN 调制（`style` 长 2C）、潜码向滑动均值截断 |
+| `cycle_consistency_loss` / `identity_mapping_loss` / `patchgan_targets` / `pix2pix_g_loss` | CycleGAN 与 Pix2Pix 的损失构件（L1 循环一致性、identity 映射、PatchGAN 目标、BCE+λL1） |
+| `upsample_nearest2d` / `fade_in` / `progressive_alpha` / `progressive_stages` | Progressive GAN 的最近邻上采样、淡入混合与阶段调度 |
+
+```python
+import AI
+
+g = AI.DCGANGenerator(latent_dim=4, channels=(4, 2), out_channels=1, base=2, seed=7)
+d = AI.DCGANDiscriminator(in_channels=1, channels=(4, 2), base=8, seed=7)
+img = g.forward([0.1, -0.2, 0.3, 0.0])
+score = d.forward(img)
+gp = AI.wgan_gp_penalty(d, img, g.forward([0.0, 0.0, 0.0, 0.0]))
+print(g.out_shape(), g.param_count(), score, gp["penalty"])
+```
+
+四条边界：
+
+- **不用 BatchNorm**。`BatchNorm2d.backward` 返回三元组、且带运行统计，混进这里的手写反向链会让梯度约定变复杂；所以这是个「DCGAN 风格的最小卷积 GAN」，不是论文复现（论文用 BN）。
+- **StyleGAN / CycleGAN / Pix2Pix / Progressive 只给构件与损失**，不提供空壳训练接口：完整训练需要两套对抗目标、配对图像数据或分阶段调度，超出「可测的最小实现」范围。
+- **`wgan_gp_penalty` 会污染判别器的梯度缓冲**（它内部对输入做一次反向）。调用前后都要 `discriminator.zero_grad()`，否则下一次 `sgd_step` 会把罚项梯度一起用上。
+- **判别器的 `base` 必须等于输入边长**（`base=8` 配 8×8），否则卷积栈压不到 1×1，最后报 `Layer.forward: 输入长度 ... 与本层 fan_in ... 不一致`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3146,7 +3175,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1815 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1825 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3373,6 +3402,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestNeuroSymbolic` | 规则集合与掩码、整条序列体检、约束贪心解码、全屏蔽报错 |
 | `TestMixtureOfDepths` | MoD 容量/排序/权重归一、块输出透传、早退三分支、savings、参数校验 |
 | `TestLotteryTicket` | 掩码生成/剪枝/掩码内重初始化、迭代剪枝的乘性收缩、参数校验 |
+| `TestConvGANVariants` | DCGAN 生成/判别器的前向形状、输入与参数梯度对中心差分、`wgan_gp_penalty` 的罚项闭式与 `‖∇D‖` 对有限差分、AdaIN 调制与截断、cycle/identity/pix2pix/patchgan 闭式值、非法参数 |
 | `TestPrivacyAndMembership` | 全局裁剪的范数与比例、加噪的 σ·C 口径与同种子复现、隐私记账的闭式值/单调性/越界、逐样本损失（回归平方误差、分类交叉熵）、成员推断的完美分离/完全反向/无信号三种 AUC、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
@@ -3427,7 +3457,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1815 个单元测试
+├── test_ai.py       # 1825 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

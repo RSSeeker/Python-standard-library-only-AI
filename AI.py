@@ -9864,6 +9864,620 @@ def target_probs(model):
     return probs_fn
 
 
+# ============================================================================
+#  W8-A：GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 /
+#        Pix2Pix / Progressive Growing）
+# ============================================================================
+#  诚实边界（同时写在 README 与各 docstring 里）：
+#  * DCGAN 生成器 / 判别器是**真能训练**的小卷积网络（前向 + 手写反向 + SGD）。
+#    没有 BatchNorm——本库 BN2d 反向返回三元组，混进这条手写链会让梯度约定变复杂，
+#    因此它是 "DCGAN 风格的最小卷积 GAN"，不是论文复刻。
+#  * StyleGAN / CycleGAN / Pix2Pix / Progressive 只提供**构件与损失**：
+#    AdaIN 调制、截断技巧、循环一致性、identity 映射、patch 判别器目标、
+#    淡入混合与逐阶段调度。完整的风格网络 / 双生成器循环 / U-Net 跳连 / 逐阶段
+#    增长都需要成对训练基础设施，本库不提供空壳接口。
+#  * WGAN-GP 的罚项是**真算**的：用手写反向对输入求 ∇_x D，而不是数值差分。
+
+def _w8a_channels(value, who):
+    """通道元组校验：正整数序列"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{who}: channels 必须是非空 list/tuple，收到 {value!r}")
+    out = []
+    for c in value:
+        if isinstance(c, bool) or not isinstance(c, int) or c < 1:
+            raise ValueError(f"{who}: channels 里必须都是 >=1 的整数，收到 {c!r}")
+        out.append(c)
+    return tuple(out)
+
+
+def _w8a_pos_int(value, name, who, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{who}: {name} 必须是 >= {minimum} 的整数，收到 {value!r}")
+    return value
+
+
+def _w8a_image(x, channels, who):
+    """校验 (C, H, W) 并返回 (H, W)"""
+    if not isinstance(x, (list, tuple)) or len(x) != channels:
+        raise ValueError(
+            f"{who}: 输入必须是 {channels} 通道的 (C, H, W)，收到 {type(x).__name__}")
+    if not x or not x[0] or not x[0][0]:
+        raise ValueError(f"{who}: 图像不能为空")
+    h, w = len(x[0]), len(x[0][0])
+    for c in range(channels):
+        if len(x[c]) != h:
+            raise ValueError(f"{who}: 通道 {c} 高度 {len(x[c])} 与第 0 通道 {h} 不一致")
+        for r in range(h):
+            if len(x[c][r]) != w:
+                raise ValueError(
+                    f"{who}: 通道 {c} 第 {r} 行宽 {len(x[c][r])} 与 {w} 不一致")
+            for v in x[c][r]:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"{who}: 像素必须是数字，收到 {v!r}")
+    return h, w
+
+
+def _w8a_zeros(shape):
+    c, h, w = shape
+    return [[[0.0] * w for _ in range(h)] for _ in range(c)]
+
+
+def _w8a_relu(x):
+    """逐元素 ReLU，返回 (y, mask)"""
+    y = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+    mask = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+    return y, mask
+
+
+def _w8a_leaky(x, slope=0.2):
+    """LeakyReLU，返回 (y, mask)（负数位置的 mask 记 slope）"""
+    y = [[[v if v > 0.0 else slope * v for v in row] for row in ch] for ch in x]
+    mask = [[[1.0 if v > 0.0 else slope for v in row] for row in ch] for ch in x]
+    return y, mask
+
+
+def _w8a_tanh(x):
+    return [[[math.tanh(v) for v in row] for row in ch] for ch in x]
+
+
+def _w8a_mask_grad(dout, mask):
+    """按元素乘 mask（形状须一致）"""
+    c, h, w = len(dout), len(dout[0]), len(dout[0][0])
+    return [[[dout[k][i][j] * mask[k][i][j] for j in range(w)] for i in range(h)]
+            for k in range(c)]
+
+
+def _w8a_flat(x):
+    out = []
+    for ch in x:
+        for row in ch:
+            out.extend(float(v) for v in row)
+    return out
+
+
+def _w8a_unflat(flat, shape):
+    c, h, w = shape
+    if len(flat) != c * h * w:
+        raise ValueError(
+            f"_w8a_unflat: 需要 {c * h * w} 个元素，收到 {len(flat)}")
+    out = _w8a_zeros(shape)
+    p = 0
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                out[k][i][j] = float(flat[p])
+                p += 1
+    return out
+
+
+def _w8a_is_conv(layer):
+    return isinstance(layer, (Conv2d, ConvTranspose2d))
+
+
+def _w8a_layer_params(layer):
+    """权重 + 偏置个数（Layer / Conv2d / ConvTranspose2d 三种布局）"""
+    if isinstance(layer, Layer):
+        return layer.fan_in * layer.fan_out + layer.fan_out
+    if isinstance(layer, ConvTranspose2d):
+        return (layer.in_channels * layer.og * layer.kh * layer.kw
+                + layer.out_channels)
+    if isinstance(layer, Conv2d):
+        return (layer.out_channels * layer.cg * layer.kh * layer.kw
+                + layer.out_channels)
+    raise ValueError(f"_w8a_layer_params: 不认识的层 {type(layer).__name__}")
+
+
+def _w8a_accum_layer(layer, gw, gb):
+    """把 `(grad_w, grad_b)` 累加进 Layer 的梯度缓冲
+
+    `Layer.backward` 只返回三元组、**不保存**梯度（库内约定），而
+    `ConvTranspose2d` / `Conv2d` 会自己累积。所以手写反向的容器要替
+    Layer 建缓冲，否则 `sgd_step` 无从下手。
+    """
+    if getattr(layer, "grad_w", None) is None:
+        layer.grad_w = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+        layer.grad_b = [0.0] * layer.fan_out
+    for j in range(layer.fan_out):
+        row = layer.grad_w[j]
+        g_row = gw[j]
+        for i in range(layer.fan_in):
+            row[i] += g_row[i]
+        layer.grad_b[j] += gb[j]
+
+
+def _w8a_sgd_layer(layer, lr):
+    """对单层做一步 SGD；Layer 用自建缓冲，卷积层用它自己的 sgd_step
+
+    返回是否真的更新了（Layer 从未反向过时返回 False）。
+    """
+    if isinstance(layer, Layer):
+        gw = getattr(layer, "grad_w", None)
+        gb = getattr(layer, "grad_b", None)
+        if gw is None or gb is None:
+            return False
+        for j in range(layer.fan_out):
+            w_row = layer.weights[j]
+            g_row = gw[j]
+            for i in range(layer.fan_in):
+                w_row[i] -= lr * g_row[i]
+            layer.biases[j] -= lr * gb[j]
+        return True
+    layer.sgd_step(lr)
+    return True
+
+
+def _w8a_zero_grad_layer(layer):
+    """把 grad_w / grad_b 清零（Layer 与两种卷积层）
+
+    Layer 的梯度缓冲要等第一次 backward 才存在，所以在没跑过反向时
+    这里应当安静地什么都不做，而不是 AttributeError。
+    """
+    if isinstance(layer, Layer):
+        gw = getattr(layer, "grad_w", None)
+        gb = getattr(layer, "grad_b", None)
+        if gw is None or gb is None:
+            return
+        for j in range(layer.fan_out):
+            for i in range(layer.fan_in):
+                gw[j][i] = 0.0
+            gb[j] = 0.0
+        return
+    for ci in range(layer.in_channels if isinstance(layer, ConvTranspose2d)
+                    else layer.out_channels):
+        g_w = layer.grad_w[ci]
+        slot = g_w if isinstance(layer, ConvTranspose2d) else g_w
+        if isinstance(layer, ConvTranspose2d):
+            for og in range(layer.og):
+                for a in range(layer.kh):
+                    for b in range(layer.kw):
+                        slot[og][a][b] = 0.0
+        else:
+            for g in slot:
+                for a in range(len(g)):
+                    for b in range(len(g[a])):
+                        g[a][b] = 0.0
+    for o in range(layer.out_channels):
+        layer.grad_b[o] = 0.0
+
+
+def upsample_nearest2d(x, scale=2):
+    """最近邻上采样：每个像素复制成 scale×scale 的块"""
+    c = len(x) if isinstance(x, (list, tuple)) else 1
+    h, w = _w8a_image(x, c, "upsample_nearest2d")
+    scale = _w8a_pos_int(scale, "scale", "upsample_nearest2d")
+    out = _w8a_zeros((c, h * scale, w * scale))
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                v = float(x[k][i][j])
+                for di in range(scale):
+                    for dj in range(scale):
+                        out[k][i * scale + di][j * scale + dj] = v
+    return out
+
+
+def fade_in(low_res, high_res, alpha):
+    """Progressive growing 的淡入：`(1-α)·上采样(低分辨率) + α·高分辨率`"""
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"fade_in: alpha 必须是数字，收到 {alpha!r}")
+    a = float(alpha)
+    if not (0.0 <= a <= 1.0):
+        raise ValueError(f"fade_in: alpha 必须在 [0, 1]，收到 {alpha!r}")
+    c = len(low_res)
+    lh, lw = _w8a_image(low_res, c, "fade_in(low_res)")
+    hh, hw = _w8a_image(high_res, c, "fade_in(high_res)")
+    if (hh, hw) != (lh * 2, lw * 2):
+        raise ValueError(
+            f"fade_in: 高分辨率必须是低分辨率的 2 倍，收到 {lh}x{lw} 与 {hh}x{hw}")
+    up = upsample_nearest2d(low_res, 2)
+    return [[[(1.0 - a) * up[k][i][j] + a * float(high_res[k][i][j])
+              for j in range(hw)] for i in range(hh)] for k in range(c)]
+
+
+def progressive_alpha(step, total):
+    """淡入系数：`step/total` 夹到 [0, 1]"""
+    for name, value in (("step", step), ("total", total)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"progressive_alpha: {name} 必须是 >=0 的整数，收到 {value!r}")
+    if total < 1:
+        raise ValueError(f"progressive_alpha: total 必须 >= 1，收到 {total!r}")
+    return min(1.0, max(0.0, step / float(total)))
+
+
+def progressive_stages(resolutions, fade_steps=10):
+    """把递增的分辨率序列展开成 `[(low, high, alpha), ...]` 的逐阶段调度"""
+    if not isinstance(resolutions, (list, tuple)) or len(resolutions) < 2:
+        raise ValueError("progressive_stages: resolutions 至少要有两个分辨率")
+    res = []
+    for r in resolutions:
+        r = _w8a_pos_int(r, "resolution", "progressive_stages")
+        if res and r <= res[-1]:
+            raise ValueError(f"progressive_stages: 分辨率必须递增，收到 {res + [r]}")
+        res.append(r)
+    fade_steps = _w8a_pos_int(fade_steps, "fade_steps", "progressive_stages")
+    stages = []
+    for i in range(1, len(res)):
+        for s in range(fade_steps):
+            stages.append((res[i - 1], res[i], progressive_alpha(s, fade_steps)))
+        stages.append((res[i - 1], res[i], 1.0))
+    return stages
+
+
+class DCGANGenerator:
+    """DCGAN 风格的最小卷积生成器：`z -> 线性 -> 逐级 ConvTranspose2d -> tanh`
+
+    `channels=(c0, c1, ...)`：潜变量先线性升到 `c0 × base × base`，
+    再对每个后续通道做一次 `ConvTranspose2d(k=4, stride=2, padding=1)`（分辨率翻倍），
+    中间 ReLU，最后再翻倍一次到 `out_channels` 并 `tanh` 到 [-1, 1]。
+    """
+
+    def __init__(self, latent_dim=8, channels=(8, 4), out_channels=1, base=2,
+                 seed=None):
+        self.name = "DCGANGenerator"
+        self.latent_dim = _w8a_pos_int(latent_dim, "latent_dim", self.name)
+        self.channels = _w8a_channels(channels, self.name)
+        self.out_channels = _w8a_pos_int(out_channels, "out_channels", self.name)
+        self.base = _w8a_pos_int(base, "base", self.name)
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"{self.name}: seed 必须是整数或 None")
+        prev = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.fc = Layer(self.latent_dim, self.channels[0] * self.base * self.base,
+                            activation="relu")
+            self.convs = []
+            cur = self.channels[0]
+            for nxt in self.channels[1:]:
+                self.convs.append(ConvTranspose2d(cur, nxt, 4, stride=2, padding=1))
+                cur = nxt
+            self.out_conv = ConvTranspose2d(cur, self.out_channels, 4, stride=2,
+                                            padding=1)
+        finally:
+            if seed is not None:
+                random.setstate(prev)
+        self._cache = None
+
+    def out_shape(self):
+        """生成图像形状 `(C, H, W)`"""
+        side = self.base * (2 ** (len(self.convs) + 1))
+        return (self.out_channels, side, side)
+
+    def forward(self, z):
+        if not isinstance(z, (list, tuple)) or len(z) != self.latent_dim:
+            got = len(z) if isinstance(z, (list, tuple)) else type(z).__name__
+            raise ValueError(f"{self.name}.forward: z 维度应为 {self.latent_dim}，收到 {got}")
+        for v in z:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{self.name}.forward: z 里必须是数字，收到 {v!r}")
+        h = self.fc.forward(list(z))
+        x = _w8a_unflat(h, (self.channels[0], self.base, self.base))
+        masks = []
+        for conv in self.convs:
+            x = conv.forward(x)
+            x, m = _w8a_relu(x)
+            masks.append(m)
+        x = self.out_conv.forward(x)
+        out = _w8a_tanh(x)
+        self._cache = (masks, out)
+        return out
+
+    def backward(self, dout):
+        """返回对 z 的梯度；参数梯度累加在各自层里（与库内一致）"""
+        if self._cache is None:
+            raise ValueError(f"{self.name}.backward: 必须先 forward")
+        masks, out = self._cache
+        _w8a_image(dout, self.out_channels, f"{self.name}.backward")
+        d = [[[(1.0 - o * o) * g for o, g in zip(ro, rg)]
+              for ro, rg in zip(co, cg)] for co, cg in zip(out, dout)]
+        d = self.out_conv.backward(d)
+        for conv, m in zip(reversed(self.convs), reversed(masks)):
+            d = _w8a_mask_grad(d, m)
+            d = conv.backward(d)
+        gw, gb, dz = self.fc.backward(_w8a_flat(d))
+        _w8a_accum_layer(self.fc, gw, gb)
+        return dz
+
+    def layers(self):
+        return [self.fc] + list(self.convs) + [self.out_conv]
+
+    def zero_grad(self):
+        for layer in self.layers():
+            _w8a_zero_grad_layer(layer)
+
+    def param_count(self):
+        return sum(_w8a_layer_params(layer) for layer in self.layers())
+
+    def sgd_step(self, lr):
+        for layer in self.layers():
+            _w8a_sgd_layer(layer, lr)
+
+
+class DCGANDiscriminator:
+    """DCGAN 风格的最小卷积判别器：`Conv2d(stride=2) × n -> Flatten -> 线性分数`
+
+    输出是**裸分数**（不是概率），可直接接 hinge / WGAN 损失；要概率就
+    `prob(x)`（内部取 sigmoid）。
+    """
+
+    def __init__(self, in_channels=1, channels=(4, 8), base=8, seed=None):
+        self.name = "DCGANDiscriminator"
+        self.in_channels = _w8a_pos_int(in_channels, "in_channels", self.name)
+        self.channels = _w8a_channels(channels, self.name)
+        self.base = _w8a_pos_int(base, "base", self.name)
+        div = 2 ** len(self.channels)
+        if self.base % div != 0:
+            raise ValueError(f"{self.name}: base={self.base} 必须能被 2^{len(self.channels)} 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"{self.name}: seed 必须是整数或 None")
+        prev = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.convs = []
+            cur = self.in_channels
+            for nxt in self.channels:
+                self.convs.append(Conv2d(cur, nxt, 4, stride=2, padding=1))
+                cur = nxt
+            side = self.base // div
+            self._feat_shape = (self.channels[-1], side, side)
+            self.out = Layer(self.channels[-1] * side * side, 1, activation="linear")
+        finally:
+            if seed is not None:
+                random.setstate(prev)
+        self._cache = None
+
+    def forward(self, x):
+        _w8a_image(x, self.in_channels, f"{self.name}.forward")
+        masks = []
+        h = x
+        for conv in self.convs:
+            h = conv.forward(h)
+            h, m = _w8a_leaky(h)
+            masks.append(m)
+        flat = _w8a_flat(h)
+        score = self.out.forward(flat)[0]
+        self._cache = (masks, flat)
+        return score
+
+    def prob(self, x):
+        return _sigmoid_scalar(self.forward(x))
+
+    def backward(self, dscore):
+        """返回对输入图像的梯度；参数梯度累加在各层里"""
+        if self._cache is None:
+            raise ValueError(f"{self.name}.backward: 必须先 forward")
+        if isinstance(dscore, bool) or not isinstance(dscore, (int, float)):
+            raise ValueError(f"{self.name}.backward: dscore 必须是数字，收到 {dscore!r}")
+        masks, _ = self._cache
+        gw, gb, d_flat = self.out.backward([float(dscore)])
+        _w8a_accum_layer(self.out, gw, gb)
+        d = _w8a_unflat(d_flat, self._feat_shape)
+        for conv, m in zip(reversed(self.convs), reversed(masks)):
+            d = _w8a_mask_grad(d, m)
+            d = conv.backward(d)
+        return d
+
+    def layers(self):
+        return list(self.convs) + [self.out]
+
+    def zero_grad(self):
+        for layer in self.layers():
+            _w8a_zero_grad_layer(layer)
+
+    def param_count(self):
+        return sum(_w8a_layer_params(layer) for layer in self.layers())
+
+    def sgd_step(self, lr):
+        for layer in self.layers():
+            _w8a_sgd_layer(layer, lr)
+
+
+def _w8a_interpolate(real, fake, eps):
+    """逐像素线性插值 `x̂ = ε·real + (1-ε)·fake`，并返回形状"""
+    c = len(real)
+    h, w = _w8a_image(real, c, "wgan_gp_penalty(real)")
+    hf, wf = _w8a_image(fake, c, "wgan_gp_penalty(fake)")
+    if (hf, wf) != (h, w):
+        raise ValueError(f"wgan_gp_penalty: real 与 fake 形状不一致 ({h}x{w} vs {hf}x{wf})")
+    out = [[[eps * float(real[k][i][j]) + (1.0 - eps) * float(fake[k][i][j])
+             for j in range(w)] for i in range(h)] for k in range(c)]
+    return out
+
+
+def wgan_gp_penalty(discriminator, real, fake, lambda_gp=10.0, seed=None):
+    """WGAN-GP 梯度罚项：`λ·(‖∇_x D(x̂)‖₂ − 1)²`，`x̂` 在 real/fake 连线上随机取
+
+    梯度是**真算**的（对输入手写反向），不是数值差分。注意：为了取 ∇_x D，
+    这里会调用 `discriminator.backward`，因此**会污染判别器的参数梯度缓冲**，
+    调用前请先 `discriminator.zero_grad()`、调用后再清零（文档已说明）。
+    返回 `{"penalty", "grad_norms", "penalty_unscaled"}`。
+    """
+    if isinstance(lambda_gp, bool) or not isinstance(lambda_gp, (int, float)) or lambda_gp < 0:
+        raise ValueError(f"wgan_gp_penalty: lambda_gp 必须是非负数，收到 {lambda_gp!r}")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("wgan_gp_penalty: seed 必须是整数或 None")
+    rng = random.Random(seed)
+    eps = rng.random()
+    x_hat = _w8a_interpolate(real, fake, eps)
+    # 必须先对 x_hat 前向：否则 backward 用的是上一次 forward 的缓存，
+    # 梯度会落在别的输入点上（实测 ‖∇D‖ 1.1661 vs 真实 1.3400）
+    discriminator.forward(x_hat)
+    d = discriminator.backward(1.0)
+    norms = []
+    for ch in d:
+        for row in ch:
+            for v in row:
+                norms.append(float(v) * float(v))
+    norm = math.sqrt(sum(norms))
+    penalty = lambda_gp * (norm - 1.0) ** 2
+    return {"penalty": penalty, "grad_norms": norm,
+            "penalty_unscaled": (norm - 1.0) ** 2, "eps": eps}
+
+
+def adain_style(features, style, eps=1e-5):
+    """AdaIN：按通道把 features 标准化后再用 style 的 (scale, bias) 调制
+
+    `style` 是长度 `2*C` 的 list（前半 scale、后半 bias），返回 `(out, cache)`
+    以便调用方需要时手写反向；本函数只做前向。
+    """
+    c = len(features)
+    h, w = _w8a_image(features, c, "adain_style")
+    if not isinstance(style, (list, tuple)) or len(style) != 2 * c:
+        raise ValueError(f"adain_style: style 长度应为 {2 * c}，收到 "
+                         f"{len(style) if isinstance(style, (list, tuple)) else type(style).__name__}")
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+        raise ValueError(f"adain_style: eps 必须是正数，收到 {eps!r}")
+    out = _w8a_zeros((c, h, w))
+    stats = []
+    for k in range(c):
+        vals = [float(v) for row in features[k] for v in row]
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        std = math.sqrt(var + float(eps))
+        stats.append((mean, std))
+        scale, bias = float(style[k]), float(style[c + k])
+        for i in range(h):
+            for j in range(w):
+                out[k][i][j] = (float(features[k][i][j]) - mean) / std * scale + bias
+    return out, stats
+
+
+def truncation_trick(w, w_avg, psi=0.7):
+    """StyleGAN 截断：`w' = w_avg + ψ·(w − w_avg)`，ψ∈[0,1] 越小越"平均脸\""""
+    if isinstance(psi, bool) or not isinstance(psi, (int, float)):
+        raise ValueError(f"truncation_trick: psi 必须是数字，收到 {psi!r}")
+    if not (0.0 <= float(psi) <= 1.0):
+        raise ValueError(f"truncation_trick: psi 必须在 [0, 1]，收到 {psi!r}")
+    if not isinstance(w, (list, tuple)) or not isinstance(w_avg, (list, tuple)):
+        raise ValueError("truncation_trick: w 与 w_avg 都必须是序列")
+    if len(w) != len(w_avg):
+        raise ValueError(f"truncation_trick: 维度不一致，{len(w)} vs {len(w_avg)}")
+    p = float(psi)
+    out = []
+    for a, b in zip(w, w_avg):
+        if isinstance(a, bool) or not isinstance(a, (int, float)) or \
+                isinstance(b, bool) or not isinstance(b, (int, float)):
+            raise ValueError("truncation_trick: w 与 w_avg 里必须是数字")
+        out.append(float(b) + p * (float(a) - float(b)))
+    return out
+
+
+def cycle_consistency_loss(a, a_rec, b, b_rec, lambda_cycle=10.0):
+    """CycleGAN 循环一致性：`λ·(‖a − a_rec‖₁ + ‖b − b_rec‖₁)`，并返回两侧梯度"""
+    if isinstance(lambda_cycle, bool) or not isinstance(lambda_cycle, (int, float)) \
+            or lambda_cycle < 0:
+        raise ValueError(
+            f"cycle_consistency_loss: lambda_cycle 必须是非负数，收到 {lambda_cycle!r}")
+    for name, x, y in (("a", a, a_rec), ("b", b, b_rec)):
+        c = len(x)
+        h, w = _w8a_image(x, c, f"cycle_consistency_loss({name})")
+        hy, wy = _w8a_image(y, c, f"cycle_consistency_loss({name}_rec)")
+        if (hy, wy) != (h, w):
+            raise ValueError(
+                f"cycle_consistency_loss: {name} 与重建形状不一致 ({h}x{w} vs {hy}x{wy})")
+    total = 0.0
+    grads = []
+    for x, y, sign in ((a, a_rec, 1.0), (b, b_rec, 1.0)):
+        c = len(x)
+        h, w = len(x[0]), len(x[0][0])
+        n = c * h * w
+        g = _w8a_zeros((c, h, w))
+        for k in range(c):
+            for i in range(h):
+                for j in range(w):
+                    diff = float(x[k][i][j]) - float(y[k][i][j])
+                    total += abs(diff)
+                    g[k][i][j] = sign * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+        grads.append([[[v * lambda_cycle / n for v in row] for row in ch] for ch in g])
+    return lambda_cycle * total, grads
+
+
+def identity_mapping_loss(a, g_ba, b, g_ab, lambda_identity=5.0):
+    """CycleGAN identity 映射：`λ·(‖G_BA(a) − a‖₁ + ‖G_AB(b) − b‖₁)`"""
+    if isinstance(lambda_identity, bool) or \
+            not isinstance(lambda_identity, (int, float)) or lambda_identity < 0:
+        raise ValueError("identity_mapping_loss: lambda_identity 必须是非负数，"
+                         f"收到 {lambda_identity!r}")
+    total = 0.0
+    for x, y in ((a, g_ba), (b, g_ab)):
+        c = len(x)
+        h, w = _w8a_image(x, c, "identity_mapping_loss(x)")
+        hy, wy = _w8a_image(y, c, "identity_mapping_loss(y)")
+        if (hy, wy) != (h, w):
+            raise ValueError("identity_mapping_loss: 形状不一致 "
+                             f"({h}x{w} vs {hy}x{wy})")
+        for k in range(c):
+            for i in range(h):
+                for j in range(w):
+                    total += abs(float(x[k][i][j]) - float(y[k][i][j]))
+    return lambda_identity * total
+
+
+def patchgan_targets(height, width, real=True):
+    """PatchGAN 判别器目标：全 real 填 1、全 fake 填 0 的 patch 网格"""
+    height = _w8a_pos_int(height, "height", "patchgan_targets")
+    width = _w8a_pos_int(width, "width", "patchgan_targets")
+    if not isinstance(real, bool):
+        raise ValueError(f"patchgan_targets: real 必须是 bool，收到 {real!r}")
+    v = 1.0 if real else 0.0
+    return [[v] * width for _ in range(height)]
+
+
+def pix2pix_g_loss(fake_scores, fake_image, real_image, lambda_l1=100.0):
+    """Pix2Pix 生成器损失：`BCE(D(fake), 1) + λ·L1(fake, real)`
+
+    `fake_scores` 是 patch 分数网格（裸分数，内部取 sigmoid）。
+    """
+    if isinstance(lambda_l1, bool) or not isinstance(lambda_l1, (int, float)) \
+            or lambda_l1 < 0:
+        raise ValueError(f"pix2pix_g_loss: lambda_l1 必须是非负数，收到 {lambda_l1!r}")
+    if not isinstance(fake_scores, (list, tuple)) or not fake_scores:
+        raise ValueError("pix2pix_g_loss: fake_scores 必须是非空网格")
+    bce = 0.0
+    n = 0
+    for row in fake_scores:
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"pix2pix_g_loss: 分数必须是数字，收到 {v!r}")
+            p = min(max(_sigmoid_scalar(float(v)), 1e-12), 1.0 - 1e-12)
+            bce -= math.log(p)
+            n += 1
+    bce /= n
+    c = len(fake_image)
+    h, w = _w8a_image(fake_image, c, "pix2pix_g_loss(fake_image)")
+    hr, wr = _w8a_image(real_image, c, "pix2pix_g_loss(real_image)")
+    if (hr, wr) != (h, w):
+        raise ValueError(f"pix2pix_g_loss: 图像形状不一致 ({h}x{w} vs {hr}x{wr})")
+    l1 = 0.0
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                l1 += abs(float(fake_image[k][i][j]) - float(real_image[k][i][j]))
+    l1 /= (c * h * w)
+    return bce + float(lambda_l1) * l1
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 
