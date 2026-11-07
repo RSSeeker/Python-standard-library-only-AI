@@ -486,7 +486,10 @@
   - 特征蒸馏复用 W1-C 的 `hint_loss`；QAT 提供 `qat_grads`（直通估计，只给梯度）；
   - PTQ 用 `quantize_weights` 真存 int 编码 + 每层一个 scale，`quantization_error` 给误差上界；
   - SmoothQuant 只提供 `smooth_quant_scale` 与 `smooth_quant_apply`（激活端除 `s` 由调用方做）；GPTQ / AWQ 未实现，README 已写明。
-- [ ] 集成：Voting / Stacking / Bagging / Boosting
+- [x] 集成：Voting / Stacking / Bagging / Boosting
+  - `VotingEnsemble`（soft 平均概率 / hard 多数票，类别数不一致直接报错）、`BaggingEnsemble`（有放回重采样 + 局部 RNG）、`stack_features` + `StackingEnsemble`（元特征再训元模型）、`AdaBoostStumps`（二分类桩，`alpha = lr·½ln((1−err)/err)`）。
+  - 实现修正：`StackingEnsemble.fit` 一开始给 `Model.fit` 传了 `lr=`，而 `fit` 没有这个参数（学习率在 `Model` 构造时给）⇒ 改成写进 `meta_model.optimizer.lr`。
+  - 探针 39 项；测试 `TestEnsembles` 10 例。
 - [ ] 推理优化：投机解码（已在 W7 实现，此处做集成）、序列打包、连续批处理（W7 已实现 `ContinuousBatcher`）、并行概念（文档）
 
 ### W16 自监督·多模态·RL（§13）

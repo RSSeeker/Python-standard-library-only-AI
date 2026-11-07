@@ -28716,6 +28716,302 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  推理与部署：集成学习（W15-C：Voting / Bagging / Stacking / AdaBoost）
+# ============================================================================
+
+def _w15c_models(models, who):
+    if not isinstance(models, (list, tuple)) or not models:
+        raise ValueError(f"{who}: models 必须是非空列表")
+    for i, m in enumerate(models):
+        if not hasattr(m, "forward"):
+            raise ValueError(f"{who}: 第 {i} 个模型没有 forward 方法")
+    return list(models)
+
+
+def _w15c_scores(model, x):
+    out = model.forward(list(x))
+    if not isinstance(out, (list, tuple)) or not out:
+        raise ValueError(
+            f"_w15c_scores: 模型输出必须是长度 > 0 的列表，收到 {type(out).__name__}"
+        )
+    vals = []
+    for v in out:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"_w15c_scores: 输出里必须全是数字，收到 {v!r}")
+        vals.append(float(v))
+    return vals
+
+
+def _w15c_argmax(values):
+    best = 0
+    for i in range(1, len(values)):
+        if values[i] > values[best]:
+            best = i
+    return best
+
+
+def _w15c_proba(model, x):
+    """把模型输出当 logits 走 softmax 变成概率。"""
+    return _softmax_row(_w15c_scores(model, x))
+
+
+class VotingEnsemble:
+    """投票集成：``voting='soft'`` 平均概率，``'hard'`` 取多数票。
+
+    ``models`` 里每个模型只需有 ``forward(x) -> list[float]``；输出按类别
+    顺序对齐，类别数不一致会报错。
+    """
+
+    def __init__(self, models, voting="soft"):
+        self.models = _w15c_models(models, "VotingEnsemble")
+        if voting not in ("soft", "hard"):
+            raise ValueError(f"VotingEnsemble: voting 只能是 soft/hard，收到 {voting!r}")
+        self.voting = voting
+
+    def predict_proba(self, x):
+        probs = [_w15c_proba(m, x) for m in self.models]
+        width = len(probs[0])
+        for i, p in enumerate(probs):
+            if len(p) != width:
+                raise ValueError(
+                    f"VotingEnsemble: 第 {i} 个模型的类别数 {len(p)} 与 {width} 不一致"
+                )
+        if self.voting == "soft":
+            out = [0.0] * width
+            for p in probs:
+                for c in range(width):
+                    out[c] += p[c]
+            return [v / len(probs) for v in out]
+        votes = [0.0] * width
+        for p in probs:
+            votes[_w15c_argmax(p)] += 1.0
+        total = float(len(probs))
+        return [v / total for v in votes]
+
+    def predict(self, x):
+        return _w15c_argmax(self.predict_proba(x))
+
+    def forward(self, x):
+        return self.predict_proba(x)
+
+
+class BaggingEnsemble:
+    """Bagging：对训练集做有放回重采样，训练多个同构模型后平均概率。
+
+    ``estimator_factory`` 是无参可调用对象，每次调用返回一个**未训练**的模型
+    （需要自带 ``fit(xs, ys, ...)``，例如 ``Model``）。
+    """
+
+    def __init__(self, estimator_factory, n_estimators=5, sample_ratio=1.0, seed=None):
+        if not callable(estimator_factory):
+            raise ValueError("BaggingEnsemble: estimator_factory 必须可调用")
+        if not isinstance(n_estimators, int) or isinstance(n_estimators, bool) \
+                or n_estimators < 1:
+            raise ValueError(
+                f"BaggingEnsemble: n_estimators 必须是 >=1 的整数，收到 {n_estimators!r}"
+            )
+        if not isinstance(sample_ratio, (int, float)) or not (0.0 < sample_ratio <= 1.0):
+            raise ValueError(
+                f"BaggingEnsemble: sample_ratio 必须在 (0, 1] 内，收到 {sample_ratio!r}"
+            )
+        self.factory = estimator_factory
+        self.n_estimators = n_estimators
+        self.sample_ratio = float(sample_ratio)
+        self.seed = seed
+        self.models = []
+
+    def fit(self, xs, ys, **kwargs):
+        if not isinstance(xs, (list, tuple)) or not xs:
+            raise ValueError("BaggingEnsemble.fit: xs 不能为空")
+        if len(xs) != len(ys):
+            raise ValueError(
+                f"BaggingEnsemble.fit: xs 有 {len(xs)} 行，ys 有 {len(ys)} 个"
+            )
+        rng = random.Random(self.seed)
+        count = max(1, int(round(len(xs) * self.sample_ratio)))
+        self.models = []
+        for _ in range(self.n_estimators):
+            picked = [rng.randrange(len(xs)) for _ in range(count)]
+            sub_x = [xs[i] for i in picked]
+            sub_y = [ys[i] for i in picked]
+            model = self.factory()
+            if not hasattr(model, "fit"):
+                raise ValueError("BaggingEnsemble.fit: 子模型必须自带 fit 方法")
+            model.fit(sub_x, sub_y, **kwargs)
+            self.models.append(model)
+        return self
+
+    def _check_fitted(self):
+        if not self.models:
+            raise ValueError("BaggingEnsemble: 还没有 fit")
+
+    def predict_proba(self, x):
+        self._check_fitted()
+        probs = [_w15c_proba(m, x) for m in self.models]
+        width = len(probs[0])
+        out = [0.0] * width
+        for p in probs:
+            if len(p) != width:
+                raise ValueError("BaggingEnsemble: 子模型类别数不一致")
+            for c in range(width):
+                out[c] += p[c]
+        return [v / len(probs) for v in out]
+
+    def predict(self, x):
+        return _w15c_argmax(self.predict_proba(x))
+
+    def forward(self, x):
+        return self.predict_proba(x)
+
+
+def stack_features(models, xs):
+    """把每个基模型的概率拼成元特征：返回 ``len(xs)`` 行、``n_models*n_classes`` 列。"""
+    models = _w15c_models(models, "stack_features")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("stack_features: xs 不能为空")
+    out = []
+    for x in xs:
+        row = []
+        for m in models:
+            row.extend(_w15c_proba(m, x))
+        out.append(row)
+    return out
+
+
+class StackingEnsemble:
+    """Stacking：用基模型的输出概率作为元特征，再训一个元模型。
+
+    基模型必须**已经训练好**且与元训练数据尽量不相交（本库没有 clone 机制，
+    所以不做自动 OOF 切分，文档已写明）。
+    """
+
+    def __init__(self, base_models, meta_model, meta_epochs=300, meta_lr=0.05,
+                 seed=None):
+        self.base_models = _w15c_models(base_models, "StackingEnsemble")
+        if not hasattr(meta_model, "fit"):
+            raise ValueError("StackingEnsemble: meta_model 必须自带 fit 方法")
+        if not isinstance(meta_epochs, int) or isinstance(meta_epochs, bool) \
+                or meta_epochs < 1:
+            raise ValueError(
+                f"StackingEnsemble: meta_epochs 必须是 >=1 的整数，收到 {meta_epochs!r}"
+            )
+        self.meta_model = meta_model
+        self.meta_epochs = meta_epochs
+        self.meta_lr = meta_lr
+        self.seed = seed
+
+    def fit(self, xs, ys):
+        feats = stack_features(self.base_models, xs)
+        opt = getattr(self.meta_model, "optimizer", None)
+        if self.meta_lr is not None and opt is not None and hasattr(opt, "lr"):
+            opt.lr = float(self.meta_lr)
+        self.meta_model.fit(feats, ys, epochs=self.meta_epochs)
+        return self
+
+    def predict_proba(self, x):
+        feats = stack_features(self.base_models, [x])
+        return _w15c_proba(self.meta_model, feats[0])
+
+    def predict(self, x):
+        return _w15c_argmax(self.predict_proba(x))
+
+    def forward(self, x):
+        return self.predict_proba(x)
+
+
+class AdaBoostStumps:
+    """二分类 AdaBoost（决策树桩）：每一轮在单特征阈值上找加权误差最小的桩。
+
+    标签必须是 0/1（内部映射成 -1/+1）。``predict_proba`` 返回
+    ``[P(y=0), P(y=1)]``，由 ``sigmoid(2 * margin)`` 得到。
+    """
+
+    def __init__(self, n_estimators=10, learning_rate=1.0):
+        if not isinstance(n_estimators, int) or isinstance(n_estimators, bool) \
+                or n_estimators < 1:
+            raise ValueError(
+                f"AdaBoostStumps: n_estimators 必须是 >=1 的整数，收到 {n_estimators!r}"
+            )
+        if not isinstance(learning_rate, (int, float)) or learning_rate <= 0.0:
+            raise ValueError(
+                f"AdaBoostStumps: learning_rate 必须 > 0，收到 {learning_rate!r}"
+            )
+        self.n_estimators = n_estimators
+        self.learning_rate = float(learning_rate)
+        self.stumps = []
+        self.alphas = []
+
+    def _stump(self, xs, ys01, weights):
+        width = len(xs[0])
+        best = None
+        for j in range(width):
+            values = sorted(set(xs[i][j] for i in range(len(xs))))
+            if len(values) < 2:
+                continue
+            thresholds = [(values[k] + values[k + 1]) / 2.0
+                          for k in range(len(values) - 1)]
+            for thr in thresholds:
+                for polarity in (1.0, -1.0):
+                    err = 0.0
+                    for i in range(len(xs)):
+                        pred = 1.0 if (xs[i][j] - thr) * polarity >= 0.0 else -1.0
+                        if pred != ys01[i]:
+                            err += weights[i]
+                    if best is None or err < best[0]:
+                        best = (err, j, thr, polarity)
+        if best is None:
+            raise ValueError("AdaBoostStumps: 没有可用的特征阈值（特征全为常数）")
+        return best
+
+    def fit(self, xs, ys):
+        if not isinstance(xs, (list, tuple)) or not xs:
+            raise ValueError("AdaBoostStumps.fit: xs 不能为空")
+        if len(xs) != len(ys):
+            raise ValueError(
+                f"AdaBoostStumps.fit: xs 有 {len(xs)} 行，ys 有 {len(ys)} 个"
+            )
+        for v in ys:
+            if v not in (0, 1, 0.0, 1.0):
+                raise ValueError(f"AdaBoostStumps.fit: 只支持二分类标签 0/1，收到 {v!r}")
+        signed = [1.0 if int(v) == 1 else -1.0 for v in ys]
+        n = len(xs)
+        weights = [1.0 / n] * n
+        self.stumps = []
+        self.alphas = []
+        for _ in range(self.n_estimators):
+            err, j, thr, polarity = self._stump(xs, signed, weights)
+            err = min(max(err, 1e-12), 1.0 - 1e-12)
+            alpha = self.learning_rate * 0.5 * math.log((1.0 - err) / err)
+            self.stumps.append((j, thr, polarity))
+            self.alphas.append(alpha)
+            for i in range(n):
+                pred = 1.0 if (xs[i][j] - thr) * polarity >= 0.0 else -1.0
+                weights[i] *= math.exp(-alpha * signed[i] * pred)
+            total = sum(weights)
+            weights = [w / total for w in weights]
+        return self
+
+    def decision_function(self, x):
+        if not self.stumps:
+            raise ValueError("AdaBoostStumps: 还没有 fit")
+        total = 0.0
+        for (j, thr, polarity), alpha in zip(self.stumps, self.alphas):
+            pred = 1.0 if (float(x[j]) - thr) * polarity >= 0.0 else -1.0
+            total += alpha * pred
+        return total
+
+    def predict_proba(self, x):
+        margin = self.decision_function(x)
+        p1 = 1.0 / (1.0 + math.exp(-2.0 * margin))
+        return [1.0 - p1, p1]
+
+    def predict(self, x):
+        return 1 if self.decision_function(x) > 0.0 else 0
+
+    def forward(self, x):
+        return self.predict_proba(x)
+
+# ============================================================================
 #  推理与部署：量化（W15-B：PTQ / QAT / SmoothQuant）
 # ============================================================================
 

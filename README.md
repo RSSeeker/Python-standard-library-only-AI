@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1449 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1459 项）
 
 ## 特性
 
@@ -1632,6 +1632,32 @@ grads = qat_grads(net, xs, ys, bits=8)  # 直通估计梯度
 - GPTQ / AWQ 未实现；SmoothQuant 只提供缩放因子与权重列迁移，激活端除以 `s` 由调用方完成。
 - 特征蒸馏（hint layer）复用 W1-C 的 `hint_loss`，这里不重复实现。
 
+### 集成学习（W15-C）
+
+| API | 语义 |
+| --- | --- |
+| `VotingEnsemble(models, voting='soft')` | `'soft'` 平均各类概率，`'hard'` 多数票；类别数不一致报错 |
+| `BaggingEnsemble(estimator_factory, n_estimators=5, sample_ratio=1.0, seed=None)` | 有放回重采样训练多个同构子模型后平均概率 |
+| `stack_features(models, xs)` | 把每个基模型的概率拼成元特征（行数 = 样本数，列数 = 模型数 × 类别数） |
+| `StackingEnsemble(base_models, meta_model, meta_epochs=300, meta_lr=0.05)` | 用元特征再训一个元模型 |
+| `AdaBoostStumps(n_estimators=10, learning_rate=1.0)` | 二分类决策树桩 AdaBoost，`predict_proba = sigmoid(2·margin)` |
+
+```python
+base = [AI.MLP([2, 2], activations=["linear"]), AI.MLP([2, 2], activations=["linear"])]
+meta = AI.Model(AI.MLP([4, 2], activations=["linear"]), loss_fn="mse", optimizer="adam", lr=0.05)
+stack = AI.StackingEnsemble(base, meta, meta_epochs=40).fit(xs, y_onehot)
+stack.predict([1.0, -1.0])
+```
+
+三条边界：
+
+1. 基模型只需要 `forward(x) -> list[float]`，输出按类别顺序对齐；`AdaBoostStumps`
+   只支持二分类 0/1 标签。
+2. Stacking **不做自动 OOF 切分**（本库没有 `clone`），元训练数据必须与基模型
+   的训练数据不相交，否则元特征里含有基模型已经见过的样本。
+3. `Bagging` 的子模型必须自带 `fit`；`Stacking` 只传 `epochs`，学习率通过
+   `meta_model.optimizer.lr` 设置（`meta_lr` 会写进去）。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2048,7 +2074,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1449 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1459 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2238,6 +2264,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExplanationExtras` | TCAV、激活最大化、网络解剖、原型、反事实、影响分数的行为与参数校验（10 例） |
 | `TestStructuredPruning` | 通道分数、掩码式通道剪枝、头分数与剪枝、删层重建、稀疏度统计（8 例） |
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
+| `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2291,7 +2318,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1449 个单元测试
+├── test_ai.py       # 1459 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

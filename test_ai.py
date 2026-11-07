@@ -22175,3 +22175,154 @@ class TestQuantization:
         layer = AI.Layer(2, 2, activation="linear")
         with pytest.raises(ValueError):
             AI.smooth_quant_apply(layer, [1.0])
+
+
+class TestEnsembles:
+    """W15-C：Voting / Bagging / Stacking / AdaBoostStumps。"""
+
+    class _Fixed:
+        def __init__(self, out):
+            self.out = list(out)
+
+        def forward(self, x):
+            return list(self.out)
+
+    class _Toy:
+        def __init__(self):
+            self.seen = []
+
+        def fit(self, xs, ys, **kwargs):
+            self.seen = [tuple(x) for x in xs]
+            return self
+
+        def forward(self, x):
+            return [0.0, 0.0]
+
+    def test_voting_soft(self):
+        a = self._Fixed([2.0, 0.0])
+        b = self._Fixed([0.0, 2.0])
+        v = AI.VotingEnsemble([a, b], voting="soft")
+        p = v.predict_proba([0.0])
+        assert abs(p[0] - 0.5) < 1e-12
+        assert abs(p[1] - 0.5) < 1e-12
+        assert v.predict([0.0]) == 0
+        assert v.forward([0.0]) == p
+
+    def test_voting_hard(self):
+        h = AI.VotingEnsemble(
+            [self._Fixed([3.0, 0.0]), self._Fixed([0.0, 3.0]),
+             self._Fixed([2.0, 1.0])], voting="hard")
+        p = h.predict_proba([0.0])
+        assert abs(p[0] - 2.0 / 3.0) < 1e-12
+        assert h.predict([0.0]) == 0
+
+    def test_voting_validation(self):
+        a = self._Fixed([1.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.VotingEnsemble([a], voting="rank")
+        with pytest.raises(ValueError):
+            AI.VotingEnsemble([])
+        with pytest.raises(ValueError):
+            AI.VotingEnsemble([object()])
+
+    def test_voting_class_mismatch(self):
+        v = AI.VotingEnsemble([self._Fixed([1.0, 0.0]),
+                               self._Fixed([1.0, 0.0, 0.0])], voting="soft")
+        with pytest.raises(ValueError):
+            v.predict_proba([0.0])
+
+    def test_bagging_control(self):
+        xs = [[float(i)] for i in range(10)]
+        ys = [0] * 10
+        made = []
+
+        def factory():
+            t = self._Toy()
+            made.append(t)
+            return t
+
+        bag = AI.BaggingEnsemble(factory, n_estimators=3, sample_ratio=0.5, seed=7)
+        bag.fit(xs, ys)
+        assert len(bag.models) == 3
+        assert len(made) == 3
+        assert all(len(m.seen) == 5 for m in bag.models)
+        again = AI.BaggingEnsemble(factory, 3, 0.5, seed=7).fit(xs, ys)
+        assert [m.seen for m in again.models] == [m.seen for m in bag.models]
+        other = AI.BaggingEnsemble(factory, 3, 0.5, seed=8).fit(xs, ys)
+        assert [m.seen for m in other.models] != [m.seen for m in bag.models]
+
+    def test_bagging_validation(self):
+        xs = [[float(i)] for i in range(10)]
+        ys = [0] * 10
+
+        def factory():
+            return self._Toy()
+
+        with pytest.raises(ValueError):
+            AI.BaggingEnsemble(factory).predict([0.0])
+        with pytest.raises(ValueError):
+            AI.BaggingEnsemble(factory, n_estimators=0)
+        with pytest.raises(ValueError):
+            AI.BaggingEnsemble(factory, sample_ratio=0.0)
+        with pytest.raises(ValueError):
+            AI.BaggingEnsemble(42)
+        with pytest.raises(ValueError):
+            AI.BaggingEnsemble(factory).fit(xs, ys[:3])
+
+    def test_stack_features(self):
+        a = self._Fixed([2.0, 0.0])
+        b = self._Fixed([0.0, 2.0])
+        feats = AI.stack_features([a, b], [[0.0], [1.0]])
+        assert len(feats) == 2
+        assert len(feats[0]) == 4
+        assert abs(sum(feats[0][:2]) - 1.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.stack_features([a], [])
+
+    def test_stacking_end_to_end(self):
+        base1 = AI.MLP([2, 2], activations=["linear"])
+        base2 = AI.MLP([2, 2], activations=["linear"])
+        meta = AI.Model(AI.MLP([4, 2], activations=["linear"]), loss_fn="mse",
+                        optimizer="adam", lr=0.05)
+        stack = AI.StackingEnsemble([base1, base2], meta, meta_epochs=40,
+                                    meta_lr=0.05)
+        train_x = [[-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0]]
+        train_y = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]
+        stack.fit(train_x, train_y)
+        assert stack.predict([1.0, 1.0]) in (0, 1)
+        assert abs(sum(stack.predict_proba([1.0, 1.0])) - 1.0) < 1e-9
+        with pytest.raises(ValueError):
+            AI.StackingEnsemble([base1], object())
+        with pytest.raises(ValueError):
+            AI.StackingEnsemble([base1], meta, meta_epochs=0)
+
+    def test_adaboost_accuracy(self):
+        data = [[-2.0, 0.0], [-1.0, 0.3], [-0.5, -0.2],
+                [0.5, 0.1], [1.0, -0.3], [2.0, 0.2]]
+        labels = [0, 0, 0, 1, 1, 1]
+        ada = AI.AdaBoostStumps(n_estimators=10)
+        ada.fit(data, labels)
+        acc = sum(1 for x, y in zip(data, labels) if ada.predict(x) == y) / len(data)
+        assert abs(acc - 1.0) < 1e-12
+        assert len(ada.stumps) == 10
+        assert ada.decision_function([2.0, 0.2]) > 0.0
+        assert ada.decision_function([-2.0, 0.0]) < 0.0
+        p = ada.predict_proba([2.0, 0.2])
+        assert abs(sum(p) - 1.0) < 1e-12
+        assert p[1] > 0.5
+        assert ada.forward([2.0, 0.2]) == p
+
+    def test_adaboost_validation(self):
+        data = [[-1.0, 0.0], [1.0, 0.0]]
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps().fit([[1.0, 1.0], [1.0, 1.0]], [0, 1])
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps().fit(data, [0, 2])
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps().decision_function([0.0, 0.0])
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps(n_estimators=0)
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps(learning_rate=0.0)
+        with pytest.raises(ValueError):
+            AI.AdaBoostStumps().fit(data, [0])
