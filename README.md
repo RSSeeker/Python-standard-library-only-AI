@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1314 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1322 项）
 
 ## 特性
 
@@ -1249,6 +1249,32 @@ print(AI.hd95(gt, pred))             # 1.0
 （距离无定义）。`hd95` 用的是双向距离合并后取分位数，与 MONAI 的 `compute_hausdorff_distance(percent=95)`
 同口径但只做二维、不降采样。
 
+### 文本生成指标（W13-E）
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `corpus_bleu(candidates, references, max_n=4, smooth=1.0)` | 语料级 BLEU：全语料累计截断 n-gram 计数后算精度，再乘简短惩罚；短句不会被重复惩罚 |
+| `rouge_n(pred, ref, n=1, beta=1.0)` | ROUGE-N 的 F 值（n-gram 截断重叠）；`beta=1` 即 F1 |
+| `rouge_1(pred, ref)` / `rouge_2(pred, ref)` | unigram / bigram 的便捷封装 |
+| `meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5)` | METEOR 简化版：精确匹配 + 片段（chunk）惩罚，无词干/同义词表 |
+| `cider_score(candidate, references, n=4)` | CIDEr 简化版：1..n gram 的 TF-IDF 余弦平均 × 10 |
+| `self_bleu(candidates, max_n=4)` | 每个候选以其余候选为参考算 BLEU 再平均；越高说明生成越不多样 |
+
+```python
+print(AI.corpus_bleu(["a b c d"], ["a b c e"]))     # 0.5946
+print(AI.rouge_1("a b c", "a b d"))                 # 0.6667
+print(AI.meteor_score("a b c d", "a b c d"))        # 0.9922
+print(AI.cider_score("a b c d", ["a b c d"]))       # 10.0
+```
+
+参考的写法：`references` 每条是字符串或 token 列表都表示**单条**参考；
+多条参考要写成「列表的列表」，例如 `[[["a", "b"], ["a", "c"]]]`
+（`["a b", "a c"]` 会被当成一条含两个 token 的参考，这是有意的确定行为）。
+
+`cider_score` 的 IDF 只用这一条候选的参考集统计、不跨语料，所以绝对值偏乐观——
+适合在同一组参考下比较多个候选。`corpus_bleu` 的 `smooth>0` 只对「该阶一个都没命中」生效，
+与 NLTK 的 `method0` 同思路但公式是 `smooth/(total+smooth)`。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1665,7 +1691,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1314 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1322 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1840,6 +1866,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestClassificationMetricsExtra` | 平衡准确率 / kappa / 敏感度特异度 / F-beta 单调性 / 汉明 / Jaccard 三种 average / Brier 单列多列 / LogLoss 与 CE 同值 / PR-AUC 阶梯面积 |
 | `TestRankingMetrics` | P@k / R@k / HitRate / RR / AP@k / NDCG@k（含分级相关性）/ MAP@k / MRR / 平均 NDCG / Coverage，以及 k 截断与全部非法输入 |
 | `TestSegmentationMetrics` | PixelAcc / mIoU / Dice / FW-IoU 手算对照、ignore_index、BoundaryF1 的 tolerance 两档、HD95 双向分位数、形状与标签校验 |
+| `TestTextGenerationMetrics` | corpus BLEU（手算四阶精度 / 多参考 / 简短惩罚）/ ROUGE-1·2 / METEOR 闭式（含片段惩罚）/ CIDEr 三个端点 / Self-BLEU 相同与互异 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1893,7 +1920,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1314 个单元测试
+├── test_ai.py       # 1322 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

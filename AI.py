@@ -28717,6 +28717,265 @@ def pr_auc_score(y_true, y_score) -> float:
 #  排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
 # ============================================================================
 
+# ============================================================================
+#  文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+# ============================================================================
+
+def _text_ref_sets(references, who):
+    """把「一条候选的参考」规范成 list[list[str|tokens]]（支持单/多参考）。"""
+    if not isinstance(references, (list, tuple)):
+        raise ValueError(f"{who}: references 必须是列表")
+    out = []
+    for i, item in enumerate(references):
+        if isinstance(item, str):
+            out.append([item])
+        elif isinstance(item, (list, tuple)):
+            if not item:
+                raise ValueError(f"{who}: 第 {i} 条参考不能为空")
+            if isinstance(item[0], str):
+                out.append([list(item)])
+            else:
+                for j, r in enumerate(item):
+                    if not isinstance(r, (str, list, tuple)):
+                        raise ValueError(
+                            f"{who}: 第 {i} 条参考的第 {j} 项必须是字符串或 token 列表")
+                out.append(list(item))
+        else:
+            raise ValueError(
+                f"{who}: 第 {i} 条参考必须是字符串、token 列表或它们的列表")
+    return out
+
+
+def corpus_bleu(candidates, references, max_n=4, smooth=1.0):
+    """语料级 BLEU：全语料累计截断 n-gram 计数后再算精度与简短惩罚。
+
+    与句级 `bleu_score` 的区别：句级先算每句精度再平均，短句会被重复惩罚；
+    语料级把计数加总，是论文里通常报告的 BLEU。
+    `smooth=0` 表示不平滑（n≥2 缺命中时该阶精度记 0）。
+    `references` 每条可以是字符串或 token 列表（都表示**单条**参考）；
+    多条参考必须写成「列表的列表」，例如 `[[["a", "b"], ["a", "c"]]]`。
+    """
+    who = "corpus_bleu"
+    if isinstance(max_n, bool) or not isinstance(max_n, int) or max_n < 1:
+        raise ValueError(f"{who}: max_n 必须是 ≥1 的整数，收到 {max_n!r}")
+    if isinstance(smooth, bool) or not isinstance(smooth, (int, float)) or smooth < 0:
+        raise ValueError(f"{who}: smooth 必须是非负数，收到 {smooth!r}")
+    if not isinstance(candidates, (list, tuple)):
+        raise ValueError(f"{who}: candidates 必须是列表")
+    if len(candidates) != len(references):
+        raise ValueError(
+            f"{who}: 候选数 {len(candidates)} 与参考数 {len(references)} 不一致")
+    if not candidates:
+        raise ValueError(f"{who}: 至少要有一个候选")
+    cand = [_as_tokens(c, who + ".candidate") for c in candidates]
+    ref_sets = _text_ref_sets(references, who)
+    refs = [[_as_tokens(r, who + ".reference") for r in rs] for rs in ref_sets]
+    clip = [0] * max_n
+    total = [0] * max_n
+    c_len = 0
+    r_len = 0
+    for ct, rts in zip(cand, refs):
+        if not ct:
+            continue
+        c_len += len(ct)
+        best = None
+        for rt in rts:
+            cand_len = abs(len(rt) - len(ct))
+            if best is None or cand_len < best[0]:
+                best = (cand_len, len(rt))
+        r_len += best[1]
+        for n in range(1, max_n + 1):
+            total[n - 1] += max(0, len(ct) - n + 1)
+            c_counts = _ngram_counts(ct, n)
+            for key, cnt in c_counts.items():
+                hit = 0
+                for rt in rts:
+                    hit = max(hit, min(cnt, _ngram_counts(rt, n).get(key, 0)))
+                clip[n - 1] += hit
+    if c_len == 0:
+        return 0.0
+    if clip[0] == 0:
+        return 0.0
+    log_sum = 0.0
+    used = 0
+    for n in range(1, max_n + 1):
+        if total[n - 1] <= 0:
+            continue
+        used += 1
+        if clip[n - 1] == 0:
+            if smooth <= 0.0:
+                prec = 0.0
+            else:
+                prec = smooth / (total[n - 1] + smooth)
+        else:
+            prec = clip[n - 1] / float(total[n - 1])
+        if prec <= 0.0:
+            return 0.0
+        log_sum += math.log(prec)
+    if used == 0:
+        return 0.0
+    bp = 1.0
+    if c_len < r_len:
+        bp = math.exp(1.0 - r_len / float(c_len))
+    return bp * math.exp(log_sum / used)
+
+
+def rouge_n(pred, ref, n=1, beta=1.0):
+    """ROUGE-N 的 F 值（n-gram 截断重叠；`beta=1` 时是 F1）。"""
+    who = "rouge_n"
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"{who}: n 必须是 ≥1 的整数，收到 {n!r}")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta <= 0:
+        raise ValueError(f"{who}: beta 必须是正数，收到 {beta!r}")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    p_counts = _ngram_counts(p_tokens, n)
+    r_counts = _ngram_counts(r_tokens, n)
+    overlap = 0
+    for key, cnt in p_counts.items():
+        overlap += min(cnt, r_counts.get(key, 0))
+    if overlap == 0:
+        return 0.0
+    precision = overlap / float(sum(p_counts.values()))
+    recall = overlap / float(sum(r_counts.values()))
+    b2 = beta * beta
+    return ((1.0 + b2) * precision * recall) / (b2 * precision + recall)
+
+
+def rouge_1(pred, ref, beta=1.0):
+    """ROUGE-1（unigram 重叠）的 F 值。"""
+    return rouge_n(pred, ref, 1, beta)
+
+
+def rouge_2(pred, ref, beta=1.0):
+    """ROUGE-2（bigram 重叠）的 F 值。"""
+    return rouge_n(pred, ref, 2, beta)
+
+
+def _meteor_chunks(p_tokens, r_tokens):
+    """按候选顺序贪心对齐后，统计匹配片段的个数（METEOR 的 fragmentation）。"""
+    remain = {}
+    for tok in r_tokens:
+        remain[tok] = remain.get(tok, 0) + 1
+    marks = []
+    for tok in p_tokens:
+        if remain.get(tok, 0) > 0:
+            remain[tok] -= 1
+            marks.append(True)
+        else:
+            marks.append(False)
+    chunks = 0
+    prev = False
+    for m in marks:
+        if m and not prev:
+            chunks += 1
+        prev = m
+    return sum(1 for m in marks if m), chunks
+
+
+def meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5):
+    """METEOR 的简化版：精确匹配 + 片段惩罚（无词干/同义词表）。"""
+    who = "meteor_score"
+    for name, v in (("alpha", alpha), ("beta", beta), ("gamma", gamma)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{who}: {name} 必须是数字，收到 {v!r}")
+        if v < 0.0:
+            raise ValueError(f"{who}: {name} 必须是非负数，收到 {v}")
+    if alpha > 1.0:
+        raise ValueError(f"{who}: alpha 必须在 [0, 1]，收到 {alpha}")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    matched, chunks = _meteor_chunks(p_tokens, r_tokens)
+    if matched == 0:
+        return 0.0
+    precision = matched / float(len(p_tokens))
+    recall = matched / float(len(r_tokens))
+    if precision + recall <= 0.0:
+        return 0.0
+    f_mean = (precision * recall) / (alpha * precision + (1.0 - alpha) * recall)
+    penalty = gamma * ((chunks / float(matched)) ** beta)
+    return f_mean * (1.0 - penalty)
+
+
+def _tfidf_vector(tokens, n, idf):
+    """n-gram 的 TF-IDF 向量（TF 用原始计数，与 CIDEr 一致）。"""
+    vec = {}
+    counts = _ngram_counts(tokens, n)
+    total = float(sum(counts.values())) or 1.0
+    for key, cnt in counts.items():
+        weight = idf.get(key)
+        if weight is None:
+            continue
+        vec[key] = (cnt / total) * weight
+    return vec
+
+
+def cider_score(candidate, references, n=4):
+    """CIDEr 的简化版：1..n gram 的 TF-IDF 余弦相似度平均 × 10。
+
+    IDF 只用**这条候选**的参考集统计（不跨语料），所以绝对值偏乐观，
+    适合在同一组参考下比较多个候选，不适合跨数据集报数。
+    """
+    who = "cider_score"
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"{who}: n 必须是 ≥1 的整数，收到 {n!r}")
+    if not isinstance(references, (list, tuple)) or not references:
+        raise ValueError(f"{who}: references 必须是非空列表")
+    cand = _as_tokens(candidate, who + ".candidate")
+    if not cand:
+        return 0.0
+    ref_tokens = [_as_tokens(r, who + ".reference") for r in references]
+    if not any(ref_tokens):
+        raise ValueError(f"{who}: 参考全是空串，CIDEr 无定义")
+    scores = []
+    for order in range(1, n + 1):
+        df = {}
+        for rt in ref_tokens:
+            for key in _ngram_counts(rt, order):
+                df[key] = df.get(key, 0) + 1
+        total_docs = float(len(ref_tokens))
+        idf = {}
+        for key, d in df.items():
+            idf[key] = math.log((total_docs + 1.0) / (d + 1.0)) + 1.0
+        cv = _tfidf_vector(cand, order, idf)
+        c_norm = math.sqrt(sum(v * v for v in cv.values()))
+        if c_norm <= 0.0:
+            scores.append(0.0)
+            continue
+        best = 0.0
+        for rt in ref_tokens:
+            rv = _tfidf_vector(rt, order, idf)
+            r_norm = math.sqrt(sum(v * v for v in rv.values()))
+            if r_norm <= 0.0:
+                continue
+            dot = 0.0
+            for key, v in cv.items():
+                r_val = rv.get(key)
+                if r_val is not None:
+                    dot += v * r_val
+            best = max(best, dot / (c_norm * r_norm))
+        scores.append(best)
+    return 10.0 * sum(scores) / float(len(scores))
+
+
+def self_bleu(candidates, max_n=4):
+    """Self-BLEU：每个候选以其余候选为参考算 BLEU，取平均；越高越不多样。"""
+    who = "self_bleu"
+    if not isinstance(candidates, (list, tuple)):
+        raise ValueError(f"{who}: candidates 必须是列表")
+    if len(candidates) < 2:
+        raise ValueError(f"{who}: 至少需要两个候选，收到 {len(candidates)}")
+    vals = []
+    for i, cand in enumerate(candidates):
+        others = [c for j, c in enumerate(candidates) if j != i]
+        vals.append(max(bleu_score(cand, ref, max_n=max_n) for ref in others))
+    return sum(vals) / float(len(vals))
+
+
 def _rank_k(k, n, who):
     """把 k 归一化到 [1, n]；None 表示全取。"""
     if k is None:

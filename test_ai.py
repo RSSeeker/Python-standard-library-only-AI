@@ -20739,3 +20739,62 @@ class TestSegmentationMetrics:
             AI.boundary_f1(gt, pred, tolerance=-1)
         with pytest.raises(ValueError):
             AI.boundary_f1(gt, pred, tolerance=True)
+
+
+class TestTextGenerationMetrics:
+    def test_corpus_bleu_perfect(self):
+        assert abs(AI.corpus_bleu(["a b c d"], ["a b c d"]) - 1.0) < 1e-12
+        assert abs(AI.corpus_bleu(["a b"], ["a b"]) - 1.0) < 1e-12
+        assert abs(AI.corpus_bleu(["x y"], ["a b"])) < 1e-12
+
+    def test_corpus_bleu_hand(self):
+        precs = [3.0 / 4.0, 2.0 / 3.0, 1.0 / 2.0, 0.5]
+        want = math.exp(sum(math.log(p) for p in precs) / 4.0)
+        got = AI.corpus_bleu(["a b c d"], ["a b c e"])
+        assert abs(got - want) < 1e-12
+
+    def test_corpus_bleu_multi_ref_and_bp(self):
+        refs = [[["a", "b"], ["a", "c"]]]
+        assert abs(AI.corpus_bleu(["a b"], refs) - 1.0) < 1e-12
+        bp = math.exp(1.0 - 4.0 / 2.0)
+        assert abs(AI.corpus_bleu(["a b"], ["a b c d"]) - bp) < 1e-12
+
+    def test_rouge(self):
+        assert abs(AI.rouge_1("a b c", "a b d") - 2.0 / 3.0) < 1e-12
+        assert abs(AI.rouge_2("a b c", "a b d") - 0.5) < 1e-12
+        assert abs(AI.rouge_2("a b", "c d")) < 1e-12
+        assert abs(AI.rouge_1("a b c", "a b c") - 1.0) < 1e-12
+
+    def test_meteor(self):
+        want = 1.0 - 0.5 * (1.0 / 4.0) ** 3.0
+        assert abs(AI.meteor_score("a b c d", "a b c d") - want) < 1e-12
+        f_mean = (2.0 / 3.0 * 1.0) / (0.9 * (2.0 / 3.0) + 0.1 * 1.0)
+        got = AI.meteor_score("a x b", "a b")
+        assert abs(got - f_mean * 0.5) < 1e-12
+        assert abs(AI.meteor_score("x y", "a b")) < 1e-12
+
+    def test_cider(self):
+        assert abs(AI.cider_score("a b c d", ["a b c d"]) - 10.0) < 1e-12
+        assert abs(AI.cider_score("a b c d", ["w x y z"])) < 1e-12
+        mid = AI.cider_score("a b c d", ["a b x y"])
+        assert 0.0 < mid < 10.0
+
+    def test_self_bleu(self):
+        assert abs(AI.self_bleu(["a b c", "a b c", "a b c"]) - 1.0) < 1e-12
+        assert abs(AI.self_bleu(["a b c", "x y z", "p q r"])) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.corpus_bleu(["a"], ["a", "b"])
+        with pytest.raises(ValueError):
+            AI.corpus_bleu([], [])
+        with pytest.raises(ValueError):
+            AI.corpus_bleu(["a"], ["a"], max_n=0)
+        with pytest.raises(ValueError):
+            AI.rouge_n("a", "a", n=0)
+        with pytest.raises(ValueError):
+            AI.meteor_score("a", "a", alpha=1.5)
+        with pytest.raises(ValueError):
+            AI.cider_score("a", [])
+        with pytest.raises(ValueError):
+            AI.self_bleu(["a b"])

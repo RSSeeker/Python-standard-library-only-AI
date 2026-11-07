@@ -406,7 +406,8 @@
   - 口径：`k=None` 取全部、`k>n` 截到 n；P@k 分母是 `min(k, n)`；NDCG 增益 `2^rel−1`
 - [x] 分割：mIoU / Dice / HD95 / BoundaryF1 / PixelAcc / FW-IoU（6 个；`_seg_confusion` 统一混淆矩阵与 `ignore_index`，`_seg_boundary` 用四邻域差分取边界；探针 37 项全过，含手算 IoU/Dice、tolerance=0/1 两档 BoundaryF1、HD95=1.0、一侧空边界的两种处理）
   - 口径：边界只在图像内部判定（图外邻域不制造边界）；HD95 是双向距离合并后取第 95 百分位
-- [ ] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity
+- [x] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity（6 个新函数；`perplexity` 早已存在、是 `CausalLM` 的方法；`_text_ref_sets` 统一参考写法、`_meteor_chunks` 做贪心对齐；探针 36 项全过）
+  - 口径：多参考必须写「列表的列表」；`cider_score` 的 IDF 只在本条候选的参考集内统计；smooth 只对「该阶零命中」生效
 - [ ] 语音：WER / CER / SER（编辑距离）
 - [ ] 聚类：Silhouette / Calinski-Harabasz / Davies-Bouldin / ARI / NMI / AMI
 - [ ] 校准：ECE / MCE / ReliabilityDiagram
