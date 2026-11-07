@@ -26577,6 +26577,199 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
 
 
 # ============================================================================
+#  W10-F：梯度检查点（activation checkpointing）与混合精度模拟
+# ============================================================================
+
+def _w10f_segments(n_layers, segments):
+    """把 n 层切成 segments 段，返回每段的 [start, end) 列表（最后一段收到末尾）"""
+    if isinstance(segments, bool) or not isinstance(segments, int) or segments < 1:
+        raise ValueError(f"梯度检查点: segments 必须是 >=1 的整数，收到 {segments!r}")
+    if segments > n_layers:
+        segments = n_layers
+    base = n_layers // segments
+    extra = n_layers % segments
+    bounds = []
+    start = 0
+    for i in range(segments):
+        size = base + (1 if i < extra else 0)
+        bounds.append((start, start + size))
+        start += size
+    return bounds
+
+
+def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None):
+    """用**梯度检查点**算一批样本的梯度，返回 ``(loss, grads)``
+
+    做法：前向只保留每段**边界处**的激活（以 ``x`` 的形式），段内的中间激活丢掉；
+    反向时逐段重放前向、重建该段的层缓存再反传。与 ``_mlp_backward`` 的差别只是
+    「用时间换显存」。
+
+    诚实说明：本库的 ``Layer`` 把缓存挂在层对象上、每层只留最后一次前向的输入，
+    所以**真实内存并不会下降**（本来就只存 O(层数) 份输入）；这个函数实现的是
+    重放机制本身，并保证梯度与普通反传逐位一致，方便在更占内存的模型上复用。
+    ``loss_fn`` 省略时用 ``model._loss``。
+    """
+    net = getattr(model, "model", model)
+    layers = net.layers
+    if not layers:
+        raise ValueError("checkpoint_grads: 模型没有层")
+    if not xs:
+        raise ValueError("checkpoint_grads: xs 不能为空")
+    if len(xs) != len(ys):
+        raise ValueError(
+            f"checkpoint_grads: xs 有 {len(xs)} 个，ys 有 {len(ys)} 个"
+        )
+    bounds = _w10f_segments(len(layers), segments)
+    use = model._loss if loss_fn is None else loss_fn
+    acc = [(None, None) for _ in layers]
+    total = 0.0
+    for x, y in zip(xs, ys):
+        h = list(x)
+        for s, e in bounds:
+            for i in range(s, e):
+                h = layers[i].forward(h)
+        loss, grad = use(h, y)
+        total += loss
+        delta = list(grad)
+        for s, e in reversed(bounds):
+            h = list(x)
+            for i in range(0, s):
+                h = layers[i].forward(h)
+            for i in range(s, e):
+                h = layers[i].forward(h)
+            for i in range(e - 1, s - 1, -1):
+                gw, gb, delta = layers[i].backward(delta)
+                if gw is None and gb is None:
+                    continue
+                aw, ab = acc[i]
+                if gw is not None:
+                    if aw is None:
+                        aw = [[0.0] * len(r) for r in gw]
+                    for j, row in enumerate(gw):
+                        for k, v in enumerate(row):
+                            aw[j][k] += v
+                if gb is not None:
+                    if ab is None:
+                        ab = [0.0] * len(gb)
+                    for j, v in enumerate(gb):
+                        ab[j] += v
+                acc[i] = (aw, ab)
+    n = float(len(xs))
+    grads = []
+    for gw, gb in acc:
+        if gw is not None:
+            gw = [[v / n for v in row] for row in gw]
+        if gb is not None:
+            gb = [v / n for v in gb]
+        grads.append((gw, gb))
+    return total / n, grads
+
+
+def fp16_round(value):
+    """把浮点数舍入到 IEEE 半精度（fp16）能表示的最接近值（返回 float）
+
+    溢出（绝对值大于 65504）返回 ``inf``，下溢到次正规以下返回 0.0 ——
+    这正是模拟半精度训练时要注意的两件事。
+    """
+    import struct
+    v = float(value)
+    try:
+        return struct.unpack("<e", struct.pack("<e", v))[0]
+    except OverflowError:
+        return float("inf") if v > 0 else float("-inf")
+
+
+def bf16_round(value):
+    """把浮点数舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even）"""
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        return v
+    if v == 0.0:
+        return v
+    import struct
+    bits = struct.unpack("<I", struct.pack("<f", v))[0]
+    lsb = (bits >> 16) & 1
+    bias = 0x7FFF + lsb
+    bits = (bits + bias) & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def quantize_model(model, dtype="fp16"):
+    """把模型权重与偏置**原地**舍入到 ``fp16`` / ``bf16`` 精度（模拟用）"""
+    if dtype not in ("fp16", "bf16"):
+        raise ValueError(f"quantize_model: dtype 只能是 'fp16' 或 'bf16'，收到 {dtype!r}")
+    fn = fp16_round if dtype == "fp16" else bf16_round
+    net = getattr(model, "model", model)
+    for layer in net.layers:
+        if not hasattr(layer, "weights"):
+            continue
+        for row in layer.weights:
+            for k in range(len(row)):
+                row[k] = fn(row[k])
+        for k in range(len(layer.biases)):
+            layer.biases[k] = fn(layer.biases[k])
+    return model
+
+
+def mixed_precision_grads(model, xs, ys, scale=1024.0, dtype="fp16"):
+    """模拟「loss scaling + 低精度梯度存储」的一步梯度，返回 ``(loss, grads)``
+
+    流程：正常 fp32 前向反传 → 梯度乘 ``scale`` → 舍入到 ``fp16``/``bf16``
+    → 除回 ``scale``。这正是 AMP 里 ``GradScaler`` 保护小梯度不下溢的做法。
+    这里**只模拟舍入**，不做真正的半精度矩阵乘，因此速度不会变快——docstring
+    在 README 里也写明「模拟无真收益」。
+    """
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) \
+            or scale != scale or scale <= 0.0 or scale == float("inf"):
+        raise ValueError(f"mixed_precision_grads: scale 必须是正的有限实数，收到 {scale!r}")
+    if dtype not in ("fp16", "bf16"):
+        raise ValueError(
+            f"mixed_precision_grads: dtype 只能是 'fp16' 或 'bf16'，收到 {dtype!r}"
+        )
+    if not xs:
+        raise ValueError("mixed_precision_grads: xs 不能为空")
+    if len(xs) != len(ys):
+        raise ValueError(
+            f"mixed_precision_grads: xs 有 {len(xs)} 个，ys 有 {len(ys)} 个"
+        )
+    net = getattr(model, "model", model)
+    fn = fp16_round if dtype == "fp16" else bf16_round
+    acc = [(None, None) for _ in net.layers]
+    total = 0.0
+    for x, y in zip(xs, ys):
+        pred = net.forward(list(x))
+        loss, grad = model._loss(pred, y)
+        total += loss
+        delta = list(grad)
+        for i in range(len(net.layers) - 1, -1, -1):
+            gw, gb, delta = net.layers[i].backward(delta)
+            if gw is None and gb is None:
+                continue
+            aw, ab = acc[i]
+            if gw is not None:
+                if aw is None:
+                    aw = [[0.0] * len(r) for r in gw]
+                for j, row in enumerate(gw):
+                    for k, v in enumerate(row):
+                        aw[j][k] += v
+            if gb is not None:
+                if ab is None:
+                    ab = [0.0] * len(gb)
+                for j, v in enumerate(gb):
+                    ab[j] += v
+            acc[i] = (aw, ab)
+    n = float(len(xs))
+    grads = []
+    for gw, gb in acc:
+        if gw is not None:
+            gw = [[fn(v * scale / n) / scale for v in row] for row in gw]
+        if gb is not None:
+            gb = [fn(v * scale / n) / scale for v in gb]
+        grads.append((gw, gb))
+    return total / n, grads
+
+
+# ============================================================================
 #  W10-E：半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
 # ============================================================================
 

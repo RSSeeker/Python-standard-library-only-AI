@@ -293,7 +293,14 @@
       - `mixmatch_targets`（多次增强平均后按 `T` 锐化）+ `soft_target_ce`（软标签 CE 与梯度）；
       - `MeanTeacher` + `mean_teacher_regularizer`：教师权重 EMA（`update`）、教师前向用「换入 → 前向 → 换回」实现；**真 bug**：`_swap_in` 原先用 `list(layer.weights)` 保存现场，行对象是同一份引用，换回时学生权重已被教师权重覆盖 —— 改成 `_semi_copy` 深拷贝后修复；
       - 探针 `probe_w10e.py` 全绿（闭式梯度 vs 有限差分：`mse` 1.0e-11、`kl` 4.6e-11），`TestSemiSupervised` 10 例，全库 1173 passed。
-- [ ] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）
+- [x] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）
+  - `checkpoint_grads`：前向只留段边界、反向逐段重放；`segments=1/2/3` 与普通反传
+    逐位相同。诚实边界：本库本来就只缓存 O(层数) 份输入，**不会真省内存**。
+  - `fp16_round` / `bf16_round`：IEEE 半精度（`struct` `'e'`）/ bfloat16 RNE 截断；
+    `|v| > 65504` 溢出为 `inf`，低于次正规归 0。
+  - `quantize_model`（原地舍入，幂等）、`mixed_precision_grads`（loss scaling 后
+    舍入再除回；实测 `1e-9` 的梯度不缩放会被舍成 0，`scale=8192` 时保住）。
+  - 混合精度**只模拟舍入**，不做半精度矩阵乘，因此没有真实加速。
 
 ### W11 数据管道（§7）
 - [ ] `Dataset` 抽象 + 流式/懒加载；`Sampler` 体系（Weighted / Stratified / Curriculum / Subset / BatchSampler）

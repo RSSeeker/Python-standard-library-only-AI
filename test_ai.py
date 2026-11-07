@@ -19022,3 +19022,110 @@ class TestSemiSupervised:
         for fn, exc in bad_calls:
             with pytest.raises(exc):
                 fn()
+
+
+class TestCheckpointMixedPrecision:
+    """W10-F：梯度检查点与混合精度模拟"""
+
+    @staticmethod
+    def _net():
+        return AI.Model(AI.MLP([3, 4, 2], activations=["relu", "linear"]),
+                        loss_fn=AI.mse_loss)
+
+    @staticmethod
+    def _data():
+        xs = [[0.1, -0.2, 0.3], [0.4, 0.5, -0.6], [-0.7, 0.8, 0.9]]
+        ys = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+        return xs, ys
+
+    def test_checkpoint_grads_matches_plain_backward(self):
+        model = self._net()
+        xs, ys = self._data()
+        loss, grads = AI.checkpoint_grads(model, xs, ys, segments=2)
+        n = float(len(xs))
+        acc = [[[0.0] * len(r) for r in layer.weights] for layer in model.model.layers]
+        total = 0.0
+        for x, y in zip(xs, ys):
+            pred = model.forward(x)
+            one, g = model._loss(pred, y)
+            total += one
+            for i, (gw, _gb) in enumerate(AI._mlp_backward(model.model, g)):
+                if gw is None:
+                    continue
+                for j, row in enumerate(gw):
+                    for k, v in enumerate(row):
+                        acc[i][j][k] += v
+        assert loss == total / n
+        for (gw, _gb), ref in zip(grads, acc):
+            if gw is None:
+                continue
+            for row, ref_row in zip(gw, ref):
+                for v, want in zip(row, ref_row):
+                    assert v == want / n
+
+    def test_checkpoint_segments_variants(self):
+        model = self._net()
+        xs, ys = self._data()
+        base = AI.checkpoint_grads(model, xs, ys, segments=1)
+        for seg in (2, 3, 99):
+            got = AI.checkpoint_grads(model, xs, ys, segments=seg)
+            assert got[0] == base[0]
+            assert got[1] == base[1]
+
+    def test_checkpoint_invalid(self):
+        model = self._net()
+        xs, ys = self._data()
+        for seg in (0, -1, 1.5, True, "2"):
+            with pytest.raises((ValueError, TypeError)):
+                AI.checkpoint_grads(model, xs, ys, segments=seg)
+        with pytest.raises(ValueError):
+            AI.checkpoint_grads(model, xs, ys[:2])
+        with pytest.raises(ValueError):
+            AI.checkpoint_grads(model, [], [])
+
+    def test_fp16_round(self):
+        assert AI.fp16_round(1.0) == 1.0
+        assert AI.fp16_round(65504.0) == 65504.0
+        assert AI.fp16_round(70000.0) == float("inf")
+        assert AI.fp16_round(-70000.0) == float("-inf")
+        assert AI.fp16_round(1e-8) == 0.0
+
+    def test_bf16_round(self):
+        assert AI.bf16_round(1.0) == 1.0
+        assert AI.bf16_round(0.1) == 0.10009765625
+        assert AI.bf16_round(float("inf")) == float("inf")
+
+    def test_quantize_model_idempotent(self):
+        model = self._net()
+        before = [list(r) for r in model.model.layers[0].weights]
+        AI.quantize_model(model, dtype="fp16")
+        once = [list(r) for r in model.model.layers[0].weights]
+        assert once != before
+        AI.quantize_model(model, dtype="fp16")
+        assert once == [list(r) for r in model.model.layers[0].weights]
+        AI.quantize_model(model, dtype="bf16")
+        with pytest.raises(ValueError):
+            AI.quantize_model(model, dtype="int8")
+
+    def test_mixed_precision_grads(self):
+        model = self._net()
+        xs, ys = self._data()
+        loss, grads = AI.mixed_precision_grads(model, xs, ys, scale=8192.0)
+        base_loss, base = AI.checkpoint_grads(model, xs, ys, segments=1)
+        assert loss == base_loss
+        for (gw, _gb), (rw, _rb) in zip(grads, base):
+            for row_out, row_ref in zip(gw, rw):
+                for v, want in zip(row_out, row_ref):
+                    assert v == AI.fp16_round(want * 8192.0) / 8192.0
+        # loss scaling 保住了 fp16 存不下的极小梯度
+        assert AI.fp16_round(1e-9 * 8192.0) / 8192.0 != 0.0
+        assert AI.fp16_round(1e-9) == 0.0
+
+    def test_mixed_precision_invalid(self):
+        model = self._net()
+        xs, ys = self._data()
+        for scale in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                AI.mixed_precision_grads(model, xs, ys, scale=scale)
+        with pytest.raises(ValueError):
+            AI.mixed_precision_grads(model, xs, ys, dtype="fp32")
