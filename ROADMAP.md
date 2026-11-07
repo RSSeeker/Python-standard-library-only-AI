@@ -408,7 +408,8 @@
   - 口径：边界只在图像内部判定（图外邻域不制造边界）；HD95 是双向距离合并后取第 95 百分位
 - [x] 文本：语料级 BLEU / ROUGE-1/2 / METEOR（简化）/ CIDEr（简化）/ Self-BLEU / Perplexity（6 个新函数；`perplexity` 早已存在、是 `CausalLM` 的方法；`_text_ref_sets` 统一参考写法、`_meteor_chunks` 做贪心对齐；探针 36 项全过）
   - 口径：多参考必须写「列表的列表」；`cider_score` 的 IDF 只在本条候选的参考集内统计；smooth 只对「该阶零命中」生效
-- [ ] 语音：WER / CER / SER（编辑距离）
+- [x] 语音：WER / CER / SER（编辑距离）（`_edit_ops` 做 DP 回溯给出替换/删除/插入三元组、`_speech_check_empty` 统一空参考；探针 26 项全过，含中文字符级 CER 与 SER 的多出槽位）
+  - 口径：参考为空抛 ValueError，假设可为空；SER 的分子包含「多出的槽位」
 - [ ] 聚类：Silhouette / Calinski-Harabasz / Davies-Bouldin / ARI / NMI / AMI
 - [ ] 校准：ECE / MCE / ReliabilityDiagram
 - [ ] 检测：mAP / mAP@0.5 / mAP@[.5:.95] / AR（简化）

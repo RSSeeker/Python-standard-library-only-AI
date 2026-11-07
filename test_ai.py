@@ -20798,3 +20798,48 @@ class TestTextGenerationMetrics:
             AI.cider_score("a", [])
         with pytest.raises(ValueError):
             AI.self_bleu(["a b"])
+
+
+class TestSpeechMetrics:
+    def test_wer(self):
+        assert abs(AI.word_error_rate("a b c d", "a b c d")) < 1e-12
+        assert abs(AI.word_error_rate("a b c d", "a x c d") - 0.25) < 1e-12
+        assert abs(AI.word_error_rate("a b c d", "a b c") - 0.25) < 1e-12
+        assert abs(AI.word_error_rate("a b c", "a b c d") - 1.0 / 3.0) < 1e-12
+        assert abs(AI.word_error_rate("a b", "x y") - 1.0) < 1e-12
+        assert abs(AI.word_error_rate("a b", "") - 1.0) < 1e-12
+        assert abs(AI.word_error_rate(["a", "b"], ["a", "c"]) - 0.5) < 1e-12
+
+    def test_edit_ops(self):
+        assert AI._edit_ops(["a", "b", "c"], ["a", "x", "c", "y"]) == (1, 0, 1)
+        assert AI._edit_ops(["a", "b", "c"], ["a", "c"]) == (0, 1, 0)
+        assert AI._edit_ops(["a"], ["a"]) == (0, 0, 0)
+
+    def test_cer(self):
+        assert abs(AI.character_error_rate("abc", "abd") - 1.0 / 3.0) < 1e-12
+        assert abs(AI.character_error_rate("你好世界", "你好") - 0.5) < 1e-12
+        assert abs(AI.character_error_rate("abc", "abc")) < 1e-12
+        assert abs(AI.character_error_rate(["a", "b"], ["a", "b", "c"]) - 0.5) < 1e-12
+
+    def test_ser(self):
+        assert abs(AI.slot_error_rate({"a": 1, "b": 2}, {"a": 1, "b": 2})) < 1e-12
+        assert abs(AI.slot_error_rate({"a": 1, "b": 2}, {"a": 1, "b": 3}) - 0.5) < 1e-12
+        assert abs(AI.slot_error_rate({"a": 1, "b": 2}, {"a": 1}) - 0.5) < 1e-12
+        assert abs(AI.slot_error_rate({"a": 1}, {"a": 1, "b": 2}) - 1.0) < 1e-12
+        assert abs(AI.slot_error_rate([("a", 1), ("b", 2)], [("a", 1), ("b", 2)])) < 1e-12
+
+    def test_validation(self):
+        with pytest.raises(ValueError):
+            AI.word_error_rate("", "a")
+        with pytest.raises(ValueError):
+            AI.character_error_rate("", "a")
+        with pytest.raises(ValueError):
+            AI.character_error_rate(1, "a")
+        with pytest.raises(ValueError):
+            AI.slot_error_rate({}, {"a": 1})
+        with pytest.raises(ValueError):
+            AI.slot_error_rate([("a",)], {"a": 1})
+        with pytest.raises(ValueError):
+            AI.slot_error_rate([("a", 1), ("a", 2)], {"a": 1})
+        with pytest.raises(ValueError):
+            AI.slot_error_rate(3, {"a": 1})

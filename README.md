@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1322 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1327 项）
 
 ## 特性
 
@@ -1275,6 +1275,25 @@ print(AI.cider_score("a b c d", ["a b c d"]))       # 10.0
 适合在同一组参考下比较多个候选。`corpus_bleu` 的 `smooth>0` 只对「该阶一个都没命中」生效，
 与 NLTK 的 `method0` 同思路但公式是 `smooth/(total+smooth)`。
 
+### 语音识别指标（W13-F）
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `word_error_rate(reference, hypothesis)` | WER = (替换 + 删除 + 插入) / 参考词数；字符串按空白切词，也可直接传 token 列表 |
+| `character_error_rate(reference, hypothesis)` | CER = 字符级编辑距离 / 参考字符数；中文按字符拆，所以 "你好世界" vs "你好" 是 0.5 |
+| `slot_error_rate(reference_slots, hypothesis_slots)` | SER = (值错 + 缺失 + 多出) / 参考槽位数；槽位用 dict 或 `(key, value)` 列表 |
+
+```python
+print(AI.word_error_rate("a b c d", "a x c d"))   # 0.25
+print(AI.character_error_rate("你好世界", "你好"))  # 0.5
+print(AI.slot_error_rate({"city": "北京"}, {"city": "上海"}))  # 1.0
+```
+
+编辑操作由 `_edit_ops` 的 DP 回溯给出精确的 (替换, 删除, 插入) 三元组，
+不是用「长度差」估算。参考为空时三个指标都抛 `ValueError`（分母无定义）；
+假设可以为空串（WER 会是 1.0）。SER 的分子把「多出来的槽位」也算错误，
+所以删词与加词都会让分数上升。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -1691,7 +1710,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1322 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1327 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -1867,6 +1886,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRankingMetrics` | P@k / R@k / HitRate / RR / AP@k / NDCG@k（含分级相关性）/ MAP@k / MRR / 平均 NDCG / Coverage，以及 k 截断与全部非法输入 |
 | `TestSegmentationMetrics` | PixelAcc / mIoU / Dice / FW-IoU 手算对照、ignore_index、BoundaryF1 的 tolerance 两档、HD95 双向分位数、形状与标签校验 |
 | `TestTextGenerationMetrics` | corpus BLEU（手算四阶精度 / 多参考 / 简短惩罚）/ ROUGE-1·2 / METEOR 闭式（含片段惩罚）/ CIDEr 三个端点 / Self-BLEU 相同与互异 |
+| `TestSpeechMetrics` | WER 的五种编辑组合、`_edit_ops` 三元组、CER 的中英文、SER 的值错/缺失/多出与四种非法输入 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -1920,7 +1940,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1322 个单元测试
+├── test_ai.py       # 1327 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

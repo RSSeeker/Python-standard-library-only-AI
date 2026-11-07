@@ -28721,6 +28721,112 @@ def pr_auc_score(y_true, y_score) -> float:
 #  文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
 # ============================================================================
 
+# ============================================================================
+#  语音识别指标（WER / CER / SER）
+# ============================================================================
+
+def _edit_ops(reference, hypothesis):
+    """编辑距离的 (替换, 删除, 插入) 计数（把参考变成假设的最短路径）。"""
+    n = len(reference)
+    m = len(hypothesis)
+    # dp[i][j] = 把 reference[:i] 变成 hypothesis[:j] 的最小编辑数
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = i
+    for j in range(1, m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if reference[i - 1] == hypothesis[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+    subs = dels = ins = 0
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and reference[i - 1] == hypothesis[j - 1]:
+            i -= 1
+            j -= 1
+            continue
+        if i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + 1:
+            subs += 1
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            dels += 1
+            i -= 1
+        else:
+            ins += 1
+            j -= 1
+    return subs, dels, ins
+
+
+def _speech_check_empty(tokens, who, side):
+    if not tokens:
+        raise ValueError(f"{who}: {side}不能为空（分母/对齐基准都要求非空）")
+    return tokens
+
+
+def word_error_rate(reference, hypothesis):
+    """WER = (替换 + 删除 + 插入) / 参考词数；输入是字符串（按空白切分）或 token 列表。"""
+    who = "word_error_rate"
+    ref = _speech_check_empty(_as_tokens(reference, who + ".reference"), who, "参考")
+    hyp = _as_tokens(hypothesis, who + ".hypothesis")
+    subs, dels, ins = _edit_ops(ref, hyp)
+    return (subs + dels + ins) / float(len(ref))
+
+
+def character_error_rate(reference, hypothesis):
+    """CER = 字符级编辑距离 / 参考字符数；字符串按字符拆（中文友好），列表按元素。"""
+    who = "character_error_rate"
+    if isinstance(reference, str):
+        ref = list(reference)
+    elif isinstance(reference, (list, tuple)):
+        ref = list(reference)
+    else:
+        raise ValueError(f"{who}: reference 必须是字符串或列表")
+    if isinstance(hypothesis, str):
+        hyp = list(hypothesis)
+    elif isinstance(hypothesis, (list, tuple)):
+        hyp = list(hypothesis)
+    else:
+        raise ValueError(f"{who}: hypothesis 必须是字符串或列表")
+    _speech_check_empty(ref, who, "参考")
+    subs, dels, ins = _edit_ops(ref, hyp)
+    return (subs + dels + ins) / float(len(ref))
+
+
+def slot_error_rate(reference_slots, hypothesis_slots):
+    """SER = (值错 + 缺失 + 多出) / 参考槽位数；槽位用 dict 或 (key, value) 对表示。"""
+    who = "slot_error_rate"
+
+    def _as_slots(slots, side):
+        if isinstance(slots, dict):
+            return dict(slots)
+        if isinstance(slots, (list, tuple)):
+            out = {}
+            for i, item in enumerate(slots):
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError(
+                        f"{who}: {side}第 {i} 项必须是 (key, value) 二元组")
+                key = item[0]
+                if key in out:
+                    raise ValueError(f"{who}: {side}出现重复槽位 {key!r}")
+                out[key] = item[1]
+            return out
+        raise ValueError(f"{who}: {side}必须是 dict 或 (key, value) 列表")
+
+    ref = _as_slots(reference_slots, "参考")
+    hyp = _as_slots(hypothesis_slots, "假设")
+    if not ref:
+        raise ValueError(f"{who}: 参考槽位不能为空")
+    wrong = 0
+    for key, value in ref.items():
+        if key not in hyp or hyp[key] != value:
+            wrong += 1
+    extra = sum(1 for key in hyp if key not in ref)
+    return (wrong + extra) / float(len(ref))
+
 def _text_ref_sets(references, who):
     """把「一条候选的参考」规范成 list[list[str|tokens]]（支持单/多参考）。"""
     if not isinstance(references, (list, tuple)):
