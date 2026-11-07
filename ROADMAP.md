@@ -502,7 +502,10 @@
   - `barlow_twins_loss` / `vicreg_loss` / `swav_loss` / `dino_loss` + `sinkhorn` / `update_dino_center` 只返回损失值（批次统计与 Sinkhorn 的梯度容易写错，README 已写明不提供未核对的梯度）；
   - 实现修正三处：`feat = [ua[i] + ub[i] ...]` 把两行拼成 2d 长的行（应为 `ua + ub`）、BYOL 梯度漏了 `1/n`、`sinkhorn` 的行/列目标写成 `1` 与 `1`（应为 `1/n` 与 `1/k`）；
   - 探针 38 项；测试 `TestContrastiveLearning` 8 例。
-- [ ] 掩码建模：MAE / BeiT / SimMIM（视觉侧）
+- [x] 掩码建模：MAE / BeiT / SimMIM（视觉侧）
+  - `patchify` / `unpatchify`、`random_masking`（`mask_ratio=0` 时一个都不遮，这条是探针逼出来的语义修正）、`block_mask`
+  - `mae_loss`（被遮 patch 的 MSE）、`simmim_loss`（平滑 L1）、`beit_loss`（离散 token 交叉熵）
+  - 只提供掩码与损失，编码器/解码器由用户拿 `TransformerEncoder` 自己拼；`beit_loss` 的 dVAE tokenizer 不在本库范围内
 - [ ] 多模态：CLIP（双塔 + InfoNCE）、跨模态融合（CrossAttention 扩展）
 - [ ] 预测式自监督：Rotation / Jigsaw
 - [ ] RL 环境：`GridWorld` / `CartPole`（内置）

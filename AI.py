@@ -28716,6 +28716,232 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
+# ============================================================================
+
+def patchify(image, patch_size):
+    """把 ``(C, H, W)`` 图像切成 ``(H/p)*(W/p)`` 个展平 patch（按行优先）。"""
+    if not isinstance(image, (list, tuple)) or not image:
+        raise ValueError("patchify: image 必须是非空列表")
+    if not isinstance(patch_size, int) or isinstance(patch_size, bool) or patch_size < 1:
+        raise ValueError(f"patchify: patch_size 必须是 >=1 的整数，收到 {patch_size!r}")
+    rows = []
+    for c, chan in enumerate(image):
+        if not isinstance(chan, (list, tuple)) or not chan:
+            raise ValueError(f"patchify: 第 {c} 个通道必须是非空列表")
+        rows.append([list(r) for r in chan])
+    channels = len(rows)
+    height = len(rows[0])
+    width = len(rows[0][0])
+    for c in range(channels):
+        if len(rows[c]) != height:
+            raise ValueError(f"patchify: 第 {c} 个通道行数不一致")
+        for r in rows[c]:
+            if len(r) != width:
+                raise ValueError(f"patchify: 第 {c} 个通道里有宽度不一致的行")
+    if height % patch_size != 0 or width % patch_size != 0:
+        raise ValueError(
+            f"patchify: 高宽 ({height}, {width}) 必须都能被 patch_size={patch_size} 整除"
+        )
+    gh = height // patch_size
+    gw = width // patch_size
+    out = []
+    for gy in range(gh):
+        for gx in range(gw):
+            vec = []
+            for c in range(channels):
+                for dy in range(patch_size):
+                    row = rows[c][gy * patch_size + dy]
+                    for dx in range(patch_size):
+                        vec.append(float(row[gx * patch_size + dx]))
+            out.append(vec)
+    return out
+
+
+def unpatchify(patches, channels, height, width, patch_size):
+    """``patchify`` 的逆操作：把 patch 列表还原成 ``(C, H, W)`` 图像。"""
+    if not isinstance(patches, (list, tuple)) or not patches:
+        raise ValueError("unpatchify: patches 必须是非空列表")
+    for name, v in (("channels", channels), ("height", height),
+                    ("width", width), ("patch_size", patch_size)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            raise ValueError(f"unpatchify: {name} 必须是 >=1 的整数，收到 {v!r}")
+    if height % patch_size != 0 or width % patch_size != 0:
+        raise ValueError("unpatchify: 高宽必须都能被 patch_size 整除")
+    gh = height // patch_size
+    gw = width // patch_size
+    if len(patches) != gh * gw:
+        raise ValueError(
+            f"unpatchify: patch 数 {len(patches)} 与网格 {gh}x{gw} 不一致"
+        )
+    need = channels * patch_size * patch_size
+    for i, p in enumerate(patches):
+        if not isinstance(p, (list, tuple)) or len(p) != need:
+            raise ValueError(
+                f"unpatchify: 第 {i} 个 patch 长度应为 {need}，收到 {len(p) if isinstance(p, (list, tuple)) else type(p).__name__}"
+            )
+    out = [[[0.0] * width for _ in range(height)] for _ in range(channels)]
+    idx = 0
+    for gy in range(gh):
+        for gx in range(gw):
+            vec = patches[idx]
+            idx += 1
+            k = 0
+            for c in range(channels):
+                for dy in range(patch_size):
+                    for dx in range(patch_size):
+                        out[c][gy * patch_size + dy][gx * patch_size + dx] = float(vec[k])
+                        k += 1
+    return out
+
+
+def random_masking(num_patches, mask_ratio=0.75, seed=None):
+    """MAE 的随机掩码：打乱后保留前 ``ceil(n*(1-ratio))`` 个，返回排好序的下标。
+
+    返回 ``(keep, masked)``：``keep`` 是可见 patch 的原始下标（升序），``masked``
+    是要重建的下标（升序）。
+    """
+    if not isinstance(num_patches, int) or isinstance(num_patches, bool) \
+            or num_patches < 1:
+        raise ValueError(
+            f"random_masking: num_patches 必须是 >=1 的整数，收到 {num_patches!r}"
+        )
+    if not isinstance(mask_ratio, (int, float)) or not (0.0 <= mask_ratio < 1.0):
+        raise ValueError(
+            f"random_masking: mask_ratio 必须在 [0, 1) 内，收到 {mask_ratio!r}"
+        )
+    rng = random.Random(seed)
+    order = list(range(num_patches))
+    rng.shuffle(order)
+    keep_n = int(round(num_patches * (1.0 - mask_ratio)))
+    if mask_ratio > 0.0:
+        keep_n = max(1, min(num_patches - 1, keep_n)) if num_patches > 1 else 1
+    else:
+        keep_n = num_patches
+    keep = sorted(order[:keep_n])
+    masked = sorted(order[keep_n:])
+    return keep, masked
+
+
+def block_mask(height, width, block_h, block_w, num_blocks=4, seed=None):
+    """BeiT 风格的块状掩码：在 ``height x width`` 的 patch 网格上放若干个块。
+
+    返回 ``(grid, masked)``：``grid`` 是 0/1 的二维列表（1 = 被遮），``masked`` 是
+    被遮位置的展平下标（升序）。
+    """
+    for name, v in (("height", height), ("width", width), ("block_h", block_h),
+                    ("block_w", block_w), ("num_blocks", num_blocks)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            raise ValueError(f"block_mask: {name} 必须是 >=1 的整数，收到 {v!r}")
+    if block_h > height or block_w > width:
+        raise ValueError(
+            f"block_mask: 块大小 ({block_h}, {block_w}) 超过网格 ({height}, {width})"
+        )
+    rng = random.Random(seed)
+    grid = [[0] * width for _ in range(height)]
+    for _ in range(num_blocks):
+        y = rng.randrange(height - block_h + 1)
+        x = rng.randrange(width - block_w + 1)
+        for dy in range(block_h):
+            for dx in range(block_w):
+                grid[y + dy][x + dx] = 1
+    masked = []
+    for y in range(height):
+        for x in range(width):
+            if grid[y][x]:
+                masked.append(y * width + x)
+    if not masked:
+        raise ValueError("block_mask: 一个位置都没遮住")
+    return grid, masked
+
+
+def _mb_check(recon, target, masked, who):
+    if not isinstance(recon, (list, tuple)) or not recon:
+        raise ValueError(f"{who}: recon 必须是非空列表")
+    if not isinstance(target, (list, tuple)) or len(target) != len(recon):
+        raise ValueError(f"{who}: recon 与 target 的 patch 数必须一致")
+    if not isinstance(masked, (list, tuple)) or not masked:
+        raise ValueError(f"{who}: masked 必须是非空下标列表")
+    n = len(recon)
+    for i, idx in enumerate(masked):
+        if isinstance(idx, bool) or not isinstance(idx, int) or not (0 <= idx < n):
+            raise ValueError(f"{who}: masked[{i}]={idx!r} 越界（patch 数 {n}）")
+    for i in range(n):
+        a = recon[i]
+        b = target[i]
+        if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)) \
+                or len(a) != len(b):
+            raise ValueError(f"{who}: 第 {i} 个 patch 的 recon/target 形状不一致")
+    return n
+
+
+def mae_loss(recon, target, masked):
+    """MAE 的重建损失：只在被遮 patch 上算 MSE，返回 ``(loss, grad_recon)``。"""
+    n = _mb_check(recon, target, masked, "mae_loss")
+    width = len(recon[0])
+    grad = [[0.0] * width for _ in range(n)]
+    total = 0.0
+    for idx in masked:
+        for d in range(width):
+            e = float(recon[idx][d]) - float(target[idx][d])
+            total += e * e
+            grad[idx][d] = 2.0 * e / len(masked)
+    return total / len(masked), grad
+
+
+def simmim_loss(recon, target, masked, beta=1.0):
+    """SimMIM 的平滑 L1：``beta`` 内是二次的，外面是线性的。返回 ``(loss, grad)``。"""
+    n = _mb_check(recon, target, masked, "simmim_loss")
+    if not isinstance(beta, (int, float)) or beta <= 0.0:
+        raise ValueError(f"simmim_loss: beta 必须 > 0，收到 {beta!r}")
+    width = len(recon[0])
+    grad = [[0.0] * width for _ in range(n)]
+    total = 0.0
+    for idx in masked:
+        for d in range(width):
+            e = float(recon[idx][d]) - float(target[idx][d])
+            if abs(e) < beta:
+                total += 0.5 * e * e / beta
+                grad[idx][d] = e / beta / len(masked)
+            else:
+                total += abs(e) - 0.5 * beta
+                grad[idx][d] = (1.0 if e > 0 else -1.0) / len(masked)
+    return total / len(masked), grad
+
+
+def beit_loss(logits, targets, masked):
+    """BeiT 的掩码 patch 分类损失（交叉熵），返回 ``(loss, grad_logits)``。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("beit_loss: logits 必须是非空列表")
+    n = len(logits)
+    if not isinstance(targets, (list, tuple)) or len(targets) != n:
+        raise ValueError("beit_loss: targets 长度必须等于 patch 数")
+    if not isinstance(masked, (list, tuple)) or not masked:
+        raise ValueError("beit_loss: masked 必须是非空下标列表")
+    for i, idx in enumerate(masked):
+        if isinstance(idx, bool) or not isinstance(idx, int) or not (0 <= idx < n):
+            raise ValueError(f"beit_loss: masked[{i}]={idx!r} 越界（patch 数 {n}）")
+    for i, idx in enumerate(masked):
+        t = targets[idx]
+        if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+            raise ValueError(f"beit_loss: targets[{idx}] 必须是非负整数，收到 {t!r}")
+        if t >= len(logits[idx]):
+            raise ValueError(f"beit_loss: targets[{idx}]={t} 超出类别数 {len(logits[idx])}")
+    grad = [[0.0] * len(row) for row in logits]
+    total = 0.0
+    inv = 1.0 / len(masked)
+    for idx in masked:
+        row = [float(v) for v in logits[idx]]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        s = sum(exps)
+        probs = [v / s for v in exps]
+        total += -(row[targets[idx]] - mx - math.log(s))
+        for j in range(len(row)):
+            grad[idx][j] = (probs[j] - (1.0 if j == targets[idx] else 0.0)) * inv
+    return total / len(masked), grad
+
+# ============================================================================
 #  自监督：对比学习（W16-A：SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
 # ============================================================================
 

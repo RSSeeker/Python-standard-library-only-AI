@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1472 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1482 项）
 
 ## 特性
 
@@ -1706,6 +1706,27 @@ stats["accept_rate"]   # 实测接受率
 3. `sinkhorn` 用交替归一化，两个约束只能同时近似成立（最后一步是列归一化，
    所以列和精确、行和近似）。
 
+### 视觉掩码建模（W16-B）
+
+| API | 说明 |
+| --- | --- |
+| `patchify(image, patch_size)` | `(C,H,W)` → `(H/p)*(W/p)` 个展平 patch（行优先，通道在外层） |
+| `unpatchify(patches, channels, height, width, patch_size)` | 逆操作，校验 patch 数与长度 |
+| `random_masking(num_patches, mask_ratio=0.75, seed=None)` | MAE 随机掩码，返回升序的 `(keep, masked)`；`mask_ratio=0` 表示一个都不遮 |
+| `block_mask(height, width, block_h, block_w, num_blocks=4, seed=None)` | BeiT 风格块状掩码，返回 `(grid, masked)` |
+| `mae_loss(recon, target, masked)` | 只在被遮 patch 上算 MSE，返回 `(loss, grad_recon)` |
+| `simmim_loss(recon, target, masked, beta=1.0)` | 平滑 L1（`beta` 内二次、外面线性），返回 `(loss, grad)` |
+| `beit_loss(logits, targets, masked)` | 被遮 patch 的分类交叉熵，返回 `(loss, grad_logits)` |
+
+```python
+patches = AI.patchify(image, 4)
+keep, masked = AI.random_masking(len(patches), 0.75, seed=0)
+visible = [patches[i] for i in keep]      # 只把可见 patch 送进编码器
+loss, grad = AI.mae_loss(recon, patches, masked)
+```
+
+三条边界：`patchify` 只做展平切块，不做归一化；`mae_loss` 的梯度是针对 **重建输出** 的，不是参数梯度；`beit_loss` 需要外部先给每个 patch 的离散目标（dVAE token），本库不训练那个 tokenizer。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2122,7 +2143,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1472 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1482 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2315,6 +2336,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
+| `TestMaskedVisionModeling` | patchify/unpatchify 往返、掩码数量与可复现、`mask_ratio=0` 不遮、块状掩码一致性、三种损失的闭式值与梯度行和、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2368,7 +2390,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1472 个单元测试
+├── test_ai.py       # 1482 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

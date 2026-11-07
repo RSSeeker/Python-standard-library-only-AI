@@ -22505,3 +22505,104 @@ class TestContrastiveLearning:
             AI.dino_loss(self._Z1, self._Z2, [0.0])
         with pytest.raises(ValueError):
             AI.update_dino_center(center, self._Z2, 1.5)
+class TestMaskedVisionModeling:
+    """W16-B：视觉掩码建模（patchify / random_masking / block_mask / 三种损失）。"""
+
+    IMG = [
+        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0],
+         [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]],
+        [[-1.0, -2.0, -3.0, -4.0], [-5.0, -6.0, -7.0, -8.0],
+         [-9.0, -10.0, -11.0, -12.0], [-13.0, -14.0, -15.0, -16.0]],
+    ]
+
+    def test_patchify_layout(self):
+        patches = AI.patchify(self.IMG, 2)
+        assert len(patches) == 4
+        assert all(len(p) == 8 for p in patches)
+        assert patches[0] == [1.0, 2.0, 5.0, 6.0, -1.0, -2.0, -5.0, -6.0]
+
+    def test_unpatchify_roundtrip(self):
+        patches = AI.patchify(self.IMG, 2)
+        back = AI.unpatchify(patches, 2, 4, 4, 2)
+        flat = [back[c][r][j] for c in range(2) for r in range(4) for j in range(4)]
+        want = [self.IMG[c][r][j] for c in range(2) for r in range(4) for j in range(4)]
+        assert flat == want
+
+    def test_patchify_validation(self):
+        with pytest.raises(ValueError):
+            AI.patchify(self.IMG, 3)
+        with pytest.raises(ValueError):
+            AI.patchify(self.IMG, 0)
+        with pytest.raises(ValueError):
+            AI.unpatchify(AI.patchify(self.IMG, 2)[:3], 2, 4, 4, 2)
+        with pytest.raises(ValueError):
+            AI.unpatchify([[1.0]] * 4, 2, 4, 4, 2)
+
+    def test_random_masking_counts(self):
+        keep, masked = AI.random_masking(12, 0.75, seed=3)
+        assert len(keep) == 3
+        assert len(masked) == 9
+        assert sorted(keep + masked) == list(range(12))
+        assert keep == sorted(keep) and masked == sorted(masked)
+        assert AI.random_masking(12, 0.75, seed=3) == (keep, masked)
+        assert AI.random_masking(12, 0.75, seed=4) != (keep, masked)
+
+    def test_random_masking_zero_ratio_keeps_all(self):
+        keep, masked = AI.random_masking(4, 0.0, seed=1)
+        assert keep == [0, 1, 2, 3]
+        assert masked == []
+
+    def test_random_masking_validation(self):
+        with pytest.raises(ValueError):
+            AI.random_masking(4, 1.0)
+        with pytest.raises(ValueError):
+            AI.random_masking(0)
+
+    def test_block_mask(self):
+        grid, masked = AI.block_mask(4, 4, 2, 2, num_blocks=2, seed=5)
+        assert len(grid) == 4 and all(len(row) == 4 for row in grid)
+        assert len(masked) >= 4
+        assert sorted(y * 4 + x for y in range(4) for x in range(4) if grid[y][x]) == masked
+        assert AI.block_mask(4, 4, 2, 2, 2, seed=5) == (grid, masked)
+        with pytest.raises(ValueError):
+            AI.block_mask(4, 4, 5, 2)
+        with pytest.raises(ValueError):
+            AI.block_mask(4, 4, 2, 2, 0)
+
+    def test_mae_loss(self):
+        recon = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+        target = [[0.0, 0.0], [2.0, 2.0], [5.0, 5.0]]
+        loss, grad = AI.mae_loss(recon, target, [0, 2])
+        assert abs(loss - 5.0) < 1e-12
+        assert grad[1] == [0.0, 0.0]
+        assert abs(grad[0][0] - 1.0) < 1e-12
+        assert abs(grad[2][0] + 2.0) < 1e-12
+        with pytest.raises(ValueError):
+            AI.mae_loss(recon, target, [])
+        with pytest.raises(ValueError):
+            AI.mae_loss(recon, target, [3])
+
+    def test_simmim_loss(self):
+        recon = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+        target = [[0.0, 0.0], [2.0, 2.0], [5.0, 5.0]]
+        loss, grad = AI.simmim_loss(recon, target, [0, 2], beta=1.0)
+        assert abs(loss - 2.0) < 1e-12
+        assert abs(grad[0][0] - 0.5) < 1e-12
+        assert abs(grad[2][0] + 0.5) < 1e-12
+        loss2, _ = AI.simmim_loss([[3.0]], [[0.0]], [0], beta=1.0)
+        assert abs(loss2 - 2.5) < 1e-12
+        with pytest.raises(ValueError):
+            AI.simmim_loss(recon, target, [0], 0.0)
+
+    def test_beit_loss(self):
+        logits = [[2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]
+        loss, grad = AI.beit_loss(logits, [0, 0, 1], [0, 2])
+        assert 0.0 < loss < 10.0
+        assert grad[1] == [0.0, 0.0, 0.0]
+        assert abs(sum(grad[0])) < 1e-12 and abs(sum(grad[2])) < 1e-12
+        with pytest.raises(ValueError):
+            AI.beit_loss(logits, [0, 0, 3], [2])
+        with pytest.raises(ValueError):
+            AI.beit_loss(logits, [0, 0, -1], [2])
+        with pytest.raises(ValueError):
+            AI.beit_loss(logits, [0, 0], [0])
