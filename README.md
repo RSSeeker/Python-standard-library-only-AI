@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1697 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1705 项）
 
 ## 特性
 
@@ -2390,6 +2390,37 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### 实验追踪与模型元数据（W19-A）
+
+| API | 说明 |
+| --- | --- |
+| `ExperimentTracker(directory, name="run", config=None, clock=None, extra=None)` | 一次实验 = 一个 JSON 文件；支持 `with`，异常时自动记 `status="failed"` |
+| `.log_metrics({...})` / `.log_curve(label, [...])` | 指标只收数字（bool 拒绝），曲线收数字序列 |
+| `.finish(**metrics)` | 写盘并返回文件路径；`duration_seconds` 由起止时间自动算 |
+| `load_experiment(path)` | 读回一次实验记录 |
+| `summarize_experiments(directory, metric="acc", best="max")` | 扫目录按某指标排序，缺该指标的实验跳过 |
+| `model_metadata(model, config=None, metrics=None, extra=None, directory=None)` | `created_at` / `python_version` / `git_hash` / `param_count` / config / metrics |
+| `save_model_metadata(path, meta)` / `load_model_metadata(path)` | 元数据 JSON 读写 |
+| `git_hash(directory=None)` | 尽力取 git HEAD，取不到返回 `None`（不抛异常） |
+
+```python
+with AI.ExperimentTracker("runs", name="xor", config={"lr": 0.05}) as run:
+    run.log_metrics({"acc": 0.9}).log_curve("loss", [1.0, 0.5, 0.2])
+print(run.path, AI.load_experiment(run.path)["duration_seconds"])
+
+best = AI.summarize_experiments("runs", metric="acc", best="max")[0]
+AI.save_model_metadata("model.json", AI.model_metadata(model, metrics={"acc": 0.9}))
+```
+
+边界与口径：
+
+- 文件名是 `<name>-<三位序号>.json`，序号取自目录里已有的同名前缀，**不会覆盖**历史实验；
+  `name` 里不允许出现 `/`、`\`、`:`。
+- 指标只接受数字，`True/False` 会被拒（bool 是 int 的子类，混进指标最容易埋坑）。
+- `clock` 可注入固定时间，测试里因此能断言 `duration_seconds == 3.5`。
+- `git_hash` 依赖外部 `git`：没有 git、不是仓库、超时，一律返回 `None`——元数据不该让训练失败。
+- 这里只做「记录」，不做可视化/对比面板；`summarize_experiments` 返回的就是排序后的普通列表。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2806,7 +2837,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1697 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1705 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3024,6 +3055,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestIntegrationTraining` | 端到端训练到指标：XOR / 三分类 / 自编码器 / CausalLM / grad_check_all |
 | `TestDoctests` | docstring 示例可运行 + 反例确实被抓到 |
 | `TestInvariants` | 随机输入下的不变量（概率分布、形状、因果性、池化、IoU 等） |
+| `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3077,7 +3109,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1697 个单元测试
+├── test_ai.py       # 1705 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

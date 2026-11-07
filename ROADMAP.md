@@ -603,7 +603,12 @@
 
 
 ### W19 工程化收尾（§14 剩余）
-- [ ] 实验追踪（JSON：配置/指标/曲线/耗时）；模型元数据（created_at/git_hash/config/metrics）
+- [x] 实验追踪（JSON：配置/指标/曲线/耗时）；模型元数据（created_at/git_hash/config/metrics）
+  - 已实现 `ExperimentTracker`（context manager、异常自动记 failed、文件名带序号不覆盖）、
+    `load_experiment` / `summarize_experiments` / `model_metadata` / `save_model_metadata` /
+    `load_model_metadata` / `git_hash`（取不到返回 None，不抛异常）。
+  - 口径：指标只收数字（拒绝 bool）；`clock` 可注入以便测试断言耗时；不做可视化面板。
+  - 探针 55 项 + `TestExperimentTracking` 8 例。
 - [ ] CLI 子命令：train / predict / eval / export / finetune
 - [ ] 配置支持 YAML/TOML；`logging` 集成；内存监控（tracemalloc）；模型注册表/版本管理
 

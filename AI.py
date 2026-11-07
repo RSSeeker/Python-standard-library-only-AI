@@ -30908,6 +30908,266 @@ def _w18b_user_why():
     return "要么返回全有限值，要么显式报错——不要静默产生 NaN"
 
 
+# ==== W19-A：实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据 ====
+
+def git_hash(directory=None):
+    """尽力取当前 git HEAD；取不到返回 None（不是所有环境都有 git 或仓库）。
+
+    用 `subprocess` 调 `git rev-parse HEAD`，失败/超时/非仓库一律返回 None，
+    绝不抛异常——元数据是辅助信息，不该让训练失败。
+    """
+    import subprocess
+    if directory is not None and (not isinstance(directory, str) or not directory):
+        raise TypeError("git_hash: directory 必须是非空字符串或 None")
+    cmd = ["git", "rev-parse", "HEAD"]
+    try:
+        out = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.decode("utf-8", "replace").strip()
+    return text or None
+
+
+def _w19a_number(value, who):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("%s: 指标必须是数字，收到 %r" % (who, value))
+    return float(value)
+
+
+def _w19a_metrics(mapping, who):
+    if not isinstance(mapping, dict):
+        raise TypeError("%s: 期望 dict，收到 %s" % (who, type(mapping).__name__))
+    out = {}
+    for key, value in mapping.items():
+        if not isinstance(key, str) or not key:
+            raise TypeError("%s: 指标名必须是非空字符串，收到 %r" % (who, key))
+        out[key] = _w19a_number(value, who)
+    return out
+
+
+class ExperimentTracker:
+    """把一次实验写成一个 JSON 文件：配置、指标、曲线、起止时间与耗时。
+
+        with ExperimentTracker("runs", name="xor", config={"lr": 0.05}) as run:
+            run.log_metrics({"acc": 0.9})
+            run.log_curve("loss", [1.0, 0.5, 0.2])
+
+    文件落在 `<directory>/<name>-<序号>.json`；`clock` 可注入（测试用固定时间）。
+    序号由目录里已有的同名前缀文件数决定，因此同一目录多次运行不会互相覆盖。
+    """
+
+    def __init__(self, directory, name="run", config=None, clock=None, extra=None):
+        if not isinstance(directory, str) or not directory:
+            raise TypeError("ExperimentTracker: directory 必须是非空字符串")
+        if not isinstance(name, str) or not name:
+            raise TypeError("ExperimentTracker: name 必须是非空字符串")
+        if any(ch in name for ch in ("/", "\\", ":", "\0")):
+            raise ValueError("ExperimentTracker: name 不能包含路径分隔符或冒号")
+        if clock is not None and not callable(clock):
+            raise TypeError("ExperimentTracker: clock 必须是可调用对象或 None")
+        self.directory = directory
+        self.name = name
+        self._clock = clock if clock is not None else time.time
+        self.config = _w19a_metrics(config, "ExperimentTracker.config") if config else {}
+        self.extra = dict(extra) if extra else {}
+        self.metrics = {}
+        self.curves = {}
+        self.started_at = None
+        self.finished_at = None
+        self.path = None
+        self._finished = False
+
+    # --- 生命周期 ---
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.finish()
+        else:
+            self.finish(status="failed", error="%s: %s" % (exc_type.__name__, exc))
+        return False
+
+    def start(self):
+        if self.started_at is not None:
+            raise RuntimeError("ExperimentTracker: 已经 start 过")
+        os.makedirs(self.directory, exist_ok=True)
+        index = 0
+        while True:
+            candidate = os.path.join(self.directory, "%s-%03d.json" % (self.name, index))
+            if not os.path.exists(candidate):
+                break
+            index += 1
+        self.path = candidate
+        self.started_at = float(self._clock())
+        self._write(status="running")
+        return self
+
+    def log_metrics(self, mapping):
+        if self.started_at is None:
+            raise RuntimeError("ExperimentTracker: 请先 start（或用 with）")
+        if self._finished:
+            raise RuntimeError("ExperimentTracker: 已经 finish，不能再写指标")
+        self.metrics.update(_w19a_metrics(mapping, "ExperimentTracker.log_metrics"))
+        return self
+
+    def log_curve(self, label, values):
+        if self.started_at is None:
+            raise RuntimeError("ExperimentTracker: 请先 start（或用 with）")
+        if self._finished:
+            raise RuntimeError("ExperimentTracker: 已经 finish，不能再写曲线")
+        if not isinstance(label, str) or not label:
+            raise TypeError("ExperimentTracker.log_curve: label 必须是非空字符串")
+        if not isinstance(values, (list, tuple)):
+            raise TypeError("ExperimentTracker.log_curve: values 必须是 list/tuple")
+        self.curves[label] = [_w19a_number(v, "ExperimentTracker.log_curve") for v in values]
+        return self
+
+    def finish(self, status="ok", error=None, **metrics):
+        if self.started_at is None:
+            raise RuntimeError("ExperimentTracker: 还没 start 就 finish")
+        if self._finished:
+            raise RuntimeError("ExperimentTracker: 重复 finish")
+        if metrics:
+            self.metrics.update(_w19a_metrics(metrics, "ExperimentTracker.finish"))
+        if status not in ("ok", "failed"):
+            raise ValueError("ExperimentTracker.finish: status 只能是 'ok'/'failed'")
+        self.finished_at = float(self._clock())
+        self._finished = True
+        self._write(status=status, error=error)
+        return self.path
+
+    # --- 序列化 ---
+    def to_dict(self, status="running", error=None):
+        record = {
+            "format": 1,
+            "name": self.name,
+            "status": status,
+            "config": dict(self.config),
+            "metrics": dict(self.metrics),
+            "curves": {k: list(v) for k, v in self.curves.items()},
+            "extra": dict(self.extra),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+        if self.started_at is not None and self.finished_at is not None:
+            record["duration_seconds"] = self.finished_at - self.started_at
+        if error is not None:
+            record["error"] = str(error)
+        return record
+
+    def _write(self, status="running", error=None):
+        text = json.dumps(self.to_dict(status, error), sort_keys=True, indent=2,
+                          allow_nan=False)
+        io.open(self.path, "w", encoding="utf-8", newline="\n").write(text + "\n")
+
+    def __repr__(self):
+        return "ExperimentTracker(name=%r, path=%r)" % (self.name, self.path)
+
+
+def load_experiment(path):
+    """读回一次实验记录（JSON）。"""
+    if not isinstance(path, str) or not path:
+        raise TypeError("load_experiment: path 必须是非空字符串")
+    if not os.path.exists(path):
+        raise ValueError("load_experiment: 文件不存在 %s" % path)
+    try:
+        record = json.loads(io.open(path, encoding="utf-8").read())
+    except ValueError as exc:
+        raise ValueError("load_experiment: 不是合法 JSON（%s）" % exc)
+    if not isinstance(record, dict) or "metrics" not in record:
+        raise ValueError("load_experiment: 缺少 metrics 字段")
+    return record
+
+
+def summarize_experiments(directory, metric="acc", best="max"):
+    """扫目录里所有实验，按某个指标排序，返回 `[{"path","name","value"}, ...]`。
+
+    缺该指标的实验被跳过（不进结果），`best='max'` 降序、`'min'` 升序。
+    """
+    if not isinstance(directory, str) or not directory:
+        raise TypeError("summarize_experiments: directory 必须是非空字符串")
+    if best not in ("max", "min"):
+        raise ValueError("summarize_experiments: best 只能是 'max'/'min'")
+    if not isinstance(metric, str) or not metric:
+        raise TypeError("summarize_experiments: metric 必须是非空字符串")
+    if not os.path.isdir(directory):
+        raise ValueError("summarize_experiments: 目录不存在 %s" % directory)
+    rows = []
+    for fname in sorted(os.listdir(directory)):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(directory, fname)
+        try:
+            record = load_experiment(path)
+        except ValueError:
+            continue
+        value = record.get("metrics", {}).get(metric)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        rows.append({"path": path, "name": record.get("name"), "value": float(value)})
+    rows.sort(key=lambda r: r["value"], reverse=(best == "max"))
+    return rows
+
+
+def model_metadata(model, config=None, metrics=None, extra=None, directory=None):
+    """收集模型元数据：时间、git 版本、参数量、配置、指标。
+
+    返回值可以直接 `json.dump`；`git_hash` 取不到时是 None（不报错）。
+    """
+    net = getattr(model, "model", model)
+    count = None
+    if hasattr(net, "param_count") and callable(net.param_count):
+        count = int(net.param_count())
+    elif hasattr(net, "layers"):
+        total = 0
+        for layer in getattr(net, "layers", []):
+            if hasattr(layer, "fan_in") and hasattr(layer, "fan_out"):
+                total += int(layer.fan_in) * int(layer.fan_out) + int(layer.fan_out)
+        count = total
+    meta = {
+        "format": 1,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "python_version": "%d.%d.%d" % sys.version_info[:3],
+        "git_hash": git_hash(directory),
+        "param_count": count,
+        "config": _w19a_metrics(config, "model_metadata.config") if config else {},
+        "metrics": _w19a_metrics(metrics, "model_metadata.metrics") if metrics else {},
+        "extra": dict(extra) if extra else {},
+    }
+    return meta
+
+
+def save_model_metadata(path, metadata):
+    """把元数据写成 JSON 文件（UTF-8、末尾换行、禁止 NaN/Inf）。"""
+    if not isinstance(path, str) or not path:
+        raise TypeError("save_model_metadata: path 必须是非空字符串")
+    if not isinstance(metadata, dict):
+        raise TypeError("save_model_metadata: metadata 必须是 dict")
+    text = json.dumps(metadata, sort_keys=True, indent=2, allow_nan=False)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(text + "\n")
+    return path
+
+
+def load_model_metadata(path):
+    """读回元数据；要求至少含 param_count 字段以区别于实验记录。"""
+    if not isinstance(path, str) or not path:
+        raise TypeError("load_model_metadata: path 必须是非空字符串")
+    if not os.path.exists(path):
+        raise ValueError("load_model_metadata: 文件不存在 %s" % path)
+    try:
+        meta = json.loads(io.open(path, encoding="utf-8").read())
+    except ValueError as exc:
+        raise ValueError("load_model_metadata: 不是合法 JSON（%s）" % exc)
+    if not isinstance(meta, dict) or "param_count" not in meta:
+        raise ValueError("load_model_metadata: 缺少 param_count 字段")
+    return meta
+
+
 # ==== W18-C：回归基线快照（固定 seed 下数值存 JSON，CI 比对） ====
 
 _W18C_FORMAT = 1

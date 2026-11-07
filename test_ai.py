@@ -25938,3 +25938,141 @@ class TestInvariants:
             AI.check_shape_consistency(model, [[0.1, -0.2]])
         with pytest.raises(TypeError):
             AI.check_shape_consistency(object(), xs)
+
+class TestExperimentTracking:
+    """W19-A：实验追踪（JSON）与模型元数据。"""
+
+    def _clock(self, box):
+        return lambda: box[0]
+
+    def test_tracker_writes_record(self, tmp_path):
+        box = [1000.0]
+        with AI.ExperimentTracker(str(tmp_path), "xor", config={"lr": 0.05},
+                                  clock=self._clock(box)) as run:
+            run.log_metrics({"acc": 0.9}).log_curve("loss", [1.0, 0.5])
+            box[0] = 1003.5
+        record = AI.load_experiment(run.path)
+        assert record["status"] == "ok"
+        assert record["config"] == {"lr": 0.05}
+        assert record["metrics"] == {"acc": 0.9}
+        assert record["curves"]["loss"] == [1.0, 0.5]
+        assert record["duration_seconds"] == pytest.approx(3.5)
+
+    def test_tracker_numbering(self, tmp_path):
+        for _ in range(3):
+            run = AI.ExperimentTracker(str(tmp_path), "run", clock=lambda: 0.0)
+            run.start().finish()
+        names = sorted(p.name for p in tmp_path.glob("run-*.json"))
+        assert names == ["run-000.json", "run-001.json", "run-002.json"]
+
+    def test_tracker_marks_failure(self, tmp_path):
+        run = None
+        with pytest.raises(RuntimeError):
+            with AI.ExperimentTracker(str(tmp_path), "boom", clock=lambda: 0.0) as run:
+                raise RuntimeError("故意失败")
+        record = AI.load_experiment(run.path)
+        assert record["status"] == "failed"
+        assert "故意失败" in record["error"]
+
+    def test_tracker_lifecycle_errors(self, tmp_path):
+        run = AI.ExperimentTracker(str(tmp_path), "state", clock=lambda: 0.0)
+        with pytest.raises(RuntimeError):
+            run.log_metrics({"x": 1.0})
+        with pytest.raises(RuntimeError):
+            run.finish()
+        run.start()
+        with pytest.raises(RuntimeError):
+            run.start()
+        run.finish()
+        with pytest.raises(RuntimeError):
+            run.log_metrics({"x": 1.0})
+        with pytest.raises(RuntimeError):
+            run.log_curve("c", [1.0])
+        with pytest.raises(RuntimeError):
+            run.finish()
+
+    def test_tracker_validation(self, tmp_path):
+        d = str(tmp_path)
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker("", "n")
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(123, "n")
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(d, "")
+        with pytest.raises(ValueError):
+            AI.ExperimentTracker(d, "a/b")
+        with pytest.raises(ValueError):
+            AI.ExperimentTracker(d, "a:b")
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(d, "n", clock=1)
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(d, "n", config=[1])
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(d, "n", config={"a": "x"})
+        with pytest.raises(TypeError):
+            AI.ExperimentTracker(d, "n", config={"a": True})
+        run = AI.ExperimentTracker(d, "v", clock=lambda: 0.0)
+        run.start()
+        with pytest.raises(TypeError):
+            run.log_metrics({1: 2.0})
+        with pytest.raises(TypeError):
+            run.log_metrics({"a": None})
+        with pytest.raises(TypeError):
+            run.log_curve("c", 1.0)
+        with pytest.raises(TypeError):
+            run.log_curve("c", ["x"])
+        with pytest.raises(TypeError):
+            run.log_curve("", [])
+        with pytest.raises(ValueError):
+            run.finish(status="weird")
+
+    def test_load_and_summarize(self, tmp_path):
+        with pytest.raises(ValueError):
+            AI.load_experiment(str(tmp_path / "missing.json"))
+        bad = tmp_path / "bad.json"
+        bad.write_text("{oops", encoding="utf-8")
+        with pytest.raises(ValueError):
+            AI.load_experiment(str(bad))
+        nom = tmp_path / "nom.json"
+        nom.write_text('{"a": 1}', encoding="utf-8")
+        with pytest.raises(ValueError):
+            AI.load_experiment(str(nom))
+        with pytest.raises(TypeError):
+            AI.load_experiment(None)
+
+        for name, metrics in (("a", {"acc": 0.5}), ("b", {"acc": 0.9}), ("c", {"loss": 1.0})):
+            run = AI.ExperimentTracker(str(tmp_path), name, clock=lambda: 0.0)
+            run.start().log_metrics(metrics).finish()
+        top = AI.summarize_experiments(str(tmp_path), "acc", best="max")
+        assert [r["value"] for r in top] == [0.9, 0.5]
+        low = AI.summarize_experiments(str(tmp_path), "acc", best="min")
+        assert [r["value"] for r in low] == [0.5, 0.9]
+        with pytest.raises(ValueError):
+            AI.summarize_experiments(str(tmp_path), "acc", best="avg")
+        with pytest.raises(ValueError):
+            AI.summarize_experiments(str(tmp_path / "nope"), "acc")
+        with pytest.raises(TypeError):
+            AI.summarize_experiments(str(tmp_path), "")
+
+    def test_model_metadata(self, tmp_path):
+        model = AI.baseline_model()
+        meta = AI.model_metadata(model, config={"lr": 0.1}, metrics={"acc": 1.0},
+                                 extra={"note": "hi"}, directory=str(tmp_path))
+        assert meta["param_count"] == (3 * 4 + 4) + (4 * 2 + 2)
+        assert meta["python_version"].count(".") == 2
+        assert len(meta["created_at"]) == 19
+        assert meta["git_hash"] is None
+        path = tmp_path / "meta.json"
+        AI.save_model_metadata(str(path), meta)
+        assert AI.load_model_metadata(str(path)) == meta
+        with pytest.raises(TypeError):
+            AI.save_model_metadata(str(path), [1])
+        with pytest.raises(ValueError):
+            AI.load_model_metadata(str(tmp_path / "nope.json"))
+
+    def test_git_hash_best_effort(self, tmp_path):
+        assert AI.git_hash(r"D:\vscode\Python-standard-library-only-AI-main") is not None
+        assert AI.git_hash(str(tmp_path)) is None
+        assert AI.git_hash(str(tmp_path / "nope")) is None
+        with pytest.raises(TypeError):
+            AI.git_hash(123)
