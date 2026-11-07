@@ -26390,3 +26390,124 @@ class TestConfigRegistry:
         assert sorted(reg.describe()) == ["from_path"]
         with pytest.raises(ValueError):
             reg.register("y", 123)
+class TestPrivacyAndMembership:
+    """DP-SGD（全局裁剪 / 高斯噪声 / 隐私记账）与损失阈值成员推断。"""
+
+    GRADS = [([[3.0, 4.0]], [0.0]), ([[0.0, 1.0]], [2.0])]
+
+    def test_squeeze(self):
+        assert AI.squeeze_grads(self.GRADS) == [3.0, 4.0, 0.0, 0.0, 1.0, 2.0]
+        assert AI.squeeze_grads([None]) == []
+        with pytest.raises(ValueError):
+            AI.squeeze_grads([[[1.0]]])
+        with pytest.raises(ValueError):
+            AI.squeeze_grads([([["x"]], [0.0])])
+
+    def test_global_clip(self):
+        clipped, info = AI.clip_grads_global(self.GRADS, 3.0)
+        assert abs(info["norm"] - math.sqrt(30.0)) < 1e-12
+        assert abs(info["clip_scale"] - 3.0 / math.sqrt(30.0)) < 1e-12
+        assert info["clipped"] is True
+        after = math.sqrt(sum(v * v for v in AI.squeeze_grads(clipped)))
+        assert abs(after - 3.0) < 1e-12
+        kept, info2 = AI.clip_grads_global([([[[0.3]]], [[0.4]])], 10.0)
+        assert info2["clip_scale"] == 1.0 and info2["clipped"] is False
+        assert AI.squeeze_grads(kept) == [0.3, 0.4]
+        zero, info3 = AI.clip_grads_global([([[[0.0]]], [[0.0]])], 1.0)
+        assert info3["norm"] == 0.0 and info3["clip_scale"] == 1.0
+        for bad in (0.0, -1.0, True, "3"):
+            with pytest.raises(ValueError):
+                AI.clip_grads_global(self.GRADS, bad)
+
+    def test_dp_grads(self):
+        noisy, info = AI.dp_grads(self.GRADS, 1.0, 2.0, seed=7)
+        assert info["noise_std"] == 2.0
+        assert info["clip_scale"] < 1.0
+        again, _ = AI.dp_grads(self.GRADS, 1.0, 2.0, seed=7)
+        assert AI.squeeze_grads(noisy) == AI.squeeze_grads(again)
+        other, _ = AI.dp_grads(self.GRADS, 1.0, 2.0, seed=8)
+        assert AI.squeeze_grads(noisy) != AI.squeeze_grads(other)
+        samples = []
+        for trial in range(200):
+            got, _ = AI.dp_grads([([[[0.0]]], [0.0])], 1.0, 1.0, seed=500 + trial)
+            samples.append(AI.squeeze_grads(got)[0])
+        mean = sum(samples) / len(samples)
+        var = sum((v - mean) ** 2 for v in samples) / len(samples)
+        assert abs(mean) < 0.3
+        assert 0.6 < var < 1.5
+        with pytest.raises(ValueError):
+            AI.dp_grads(self.GRADS, 1.0, -0.5)
+
+    def test_privacy_accountant(self):
+        acc = AI.PrivacyAccountant(1.1, sample_rate=0.01, delta=1e-5)
+        want = 0.01 * math.sqrt(2.0 * math.log(1.25 / 1e-5)) / 1.1
+        assert abs(acc.eps_step - want) < 1e-12
+        assert acc.epsilon == 0.0 and acc.steps == 0
+        assert abs(acc.step(10) - 10 * want) < 1e-12
+        assert acc.steps == 10
+        advanced = AI.PrivacyAccountant(1.1, sample_rate=0.01, delta=1e-5, advanced=True)
+        assert advanced.step(10) <= acc.epsilon + 1e-12
+        summary = acc.summary()
+        assert sorted(summary) == ["delta", "eps_step", "epsilon", "method",
+                                   "sample_rate", "sigma", "steps"]
+        assert summary["method"] == "simple"
+        with pytest.raises(ValueError):
+            acc.step(0)
+        with pytest.raises(ValueError):
+            acc.step(1.5)
+        with pytest.raises(ValueError):
+            AI.PrivacyAccountant(1.0, sample_rate=0.0)
+        with pytest.raises(ValueError):
+            AI.PrivacyAccountant(1.0, sample_rate=2.0)
+        with pytest.raises(ValueError):
+            AI.PrivacyAccountant(1.0, delta=0.0)
+
+    def test_per_sample_losses_regression(self):
+        model = AI.Model(AI.MLP([1, 1], activations=["linear"]), loss_fn="mse",
+                         optimizer="sgd", lr=0.01)
+        model.model.layers[0].weights = [[0.0]]
+        model.model.layers[0].biases = [0.0]
+        assert AI.per_sample_losses(model, [[1.0], [2.0]], [1.0, 3.0]) == [1.0, 9.0]
+        with pytest.raises(ValueError):
+            AI.per_sample_losses(model, [], [])
+        with pytest.raises(ValueError):
+            AI.per_sample_losses(model, [[1.0]], [])
+
+    def test_per_sample_losses_classification(self):
+        model = AI.Model(AI.MLP([2, 2], activations=["softmax"]), loss_fn="cross_entropy",
+                         optimizer="sgd", lr=0.01, task="classification")
+        model.model.layers[0].weights = [[0.0, 0.0], [0.0, 0.0]]
+        model.model.layers[0].biases = [0.0, 0.0]
+        losses = AI.per_sample_losses(model, [[1.0, 0.0]], [0])
+        assert abs(losses[0] - math.log(2.0)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.per_sample_losses(model, [[1.0, 0.0]], [5])
+
+    def test_membership_attack(self):
+        perfect = AI.membership_inference_attack([0.1, 0.2, 0.3], [0.9, 1.0, 1.1])
+        assert perfect["auc"] == 1.0
+        assert perfect["tpr"] == 1.0 and perfect["fpr"] == 0.0
+        assert perfect["accuracy"] == 1.0
+        reversed_attack = AI.membership_inference_attack([0.9, 1.0], [0.1, 0.2])
+        assert reversed_attack["auc"] == 0.0 and reversed_attack["tpr"] == 0.0
+        same = AI.membership_inference_attack([0.5, 0.5], [0.5, 0.5])
+        assert same["auc"] == 0.5
+        picked = AI.membership_inference_attack([0.1, 0.4], [0.6, 0.9], thresholds=[0.5])
+        assert picked["threshold"] == 0.5
+
+    def test_membership_errors(self):
+        with pytest.raises(ValueError):
+            AI.membership_inference_attack([float("nan")], [1.0])
+        with pytest.raises(ValueError):
+            AI.membership_inference_attack([], [1.0])
+        with pytest.raises(ValueError):
+            AI.membership_inference_attack([1.0], [])
+        with pytest.raises(ValueError):
+            AI.membership_inference_attack([0.1], [1.0], thresholds=[])
+
+    def test_defense_delta(self):
+        delta = AI.membership_defense_delta([0.1, 0.2], [0.8, 0.9])
+        assert abs(delta["loss_gap"] - 0.7) < 1e-12
+        assert delta["attack_auc"] == 1.0
+        assert sorted(delta) == ["attack_accuracy", "attack_auc", "loss_gap",
+                                 "mean_member", "mean_nonmember"]

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1727 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1736 项）
 
 ## 特性
 
@@ -2390,6 +2390,36 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
+### 隐私保护与成员推断（W20-A）
+
+| API | 说明 |
+| --- | --- |
+| `clip_grads_global(grads, max_norm)` | 按**全局 L2 范数**裁剪（所有层合并），返回 `(grads, info)` |
+| `dp_grads(grads, max_norm, noise_multiplier=1.0, seed=None)` | 先全局裁剪再加 `N(0, (σ·C)²)` 噪声 |
+| `squeeze_grads(grads)` | 把 `_mlp_backward` 的 `(grad_w, grad_b)` 摊成数字列表 |
+| `PrivacyAccountant(noise_multiplier, sample_rate, delta, advanced=False)` | 高斯机制隐私记账（`.step()` / `.epsilon` / `.summary()`） |
+| `per_sample_losses(model, xs, ys)` | 逐样本损失，成员推断的攻击信号 |
+| `membership_inference_attack(member_losses, nonmember_losses, thresholds=None)` | 损失阈值攻击，返回 `threshold/tpr/fpr/accuracy/auc` |
+| `membership_defense_delta(member_losses, nonmember_losses)` | 一行结论：损失差 + 攻击 AUC |
+
+```python
+clipped, info = AI.clip_grads_global(grads, max_norm=1.0)      # 先看 info["clip_scale"]
+noisy, info = AI.dp_grads(grads, 1.0, noise_multiplier=1.1, seed=0)
+accountant = AI.PrivacyAccountant(1.1, sample_rate=1 / 60000, delta=1e-5)
+accountant.step()                                               # 每步调用一次
+print(accountant.summary())                                     # {"epsilon": ..., "method": "simple"}
+
+member = AI.per_sample_losses(model, train_x, train_y)
+other = AI.per_sample_losses(model, heldout_x, heldout_y)
+print(AI.membership_inference_attack(member, other))            # auc 越接近 0.5 越安全
+```
+
+**隐私记账的口径（重要）**：`eps_step = q · sqrt(2 ln(1.25/δ)) / σ`，
+`T` 步按**简单组合**累加 `T · eps_step`；`advanced=True` 换成高级组合上界（取两者较小）。
+这只是一个**偏松的上界**，不是 RDP / 矩记账，不要拿它和 opacus 的数字对齐。
+成员推断同理：损失阈值攻击的 AUC 只说明「这个模型有没有明显的过拟合信号」，
+不构成严格的隐私证明。
+
 ### 配置 / 日志 / 内存 / 注册表（W19-C）
 
 | API | 说明 |
@@ -2897,7 +2927,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1727 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1736 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3118,6 +3148,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExperimentTracking` | 实验记录写入/编号/异常标记、生命周期与参数校验、元数据往返 |
 | `TestCLI` | 五个子命令的端到端行为（模型文件可重载、预测与 `Model.predict` 一致、导出含元数据、微调写出新模型）、错误路径退出码 2、`parse_hidden` 边界、`--help` 退出 0 |
 | `TestConfigRegistry` | YAML 子集解析/往返与三类错误、四种格式读写、日志 handler 不叠加、`track_memory` 恢复追踪状态、注册表版本自增/取版本/回滚/失败不污染索引 |
+| `TestPrivacyAndMembership` | 全局裁剪的范数与比例、加噪的 σ·C 口径与同种子复现、隐私记账的闭式值/单调性/越界、逐样本损失（回归平方误差、分类交叉熵）、成员推断的完美分离/完全反向/无信号三种 AUC、参数校验 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -3171,7 +3202,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1727 个单元测试
+├── test_ai.py       # 1736 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

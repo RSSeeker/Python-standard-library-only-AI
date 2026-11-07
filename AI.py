@@ -30909,6 +30909,244 @@ def _w18b_user_why():
 
 
 # ============================================================================
+#  研究前沿 W20-A：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+# ============================================================================
+
+def squeeze_grads(grads):
+    """把 `_mlp_backward` 的 `(grad_w, grad_b)` 列表摊成数字列表（None 跳过）。"""
+    if not isinstance(grads, list):
+        raise ValueError("squeeze_grads 需要梯度列表")
+    flat = []
+    for item in grads:
+        if item is None:
+            continue
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("每层梯度必须是 (grad_w, grad_b) 二元组")
+        for part in item:
+            _w20_flatten_into(part, flat)
+    return flat
+
+
+def _w20_flatten_into(value, out):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _w20_flatten_into(item, out)
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("梯度里出现非数值: %r" % (value,))
+    out.append(float(value))
+
+
+def _w20_map(value, fn):
+    if isinstance(value, (list, tuple)):
+        return [_w20_map(item, fn) for item in value]
+    return fn(float(value))
+
+
+def _w20_pos(value, what, allow_zero=True):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s 必须是数字" % what)
+    if value < 0 or (value == 0 and not allow_zero):
+        raise ValueError("%s 必须 %s" % (what, "非负" if allow_zero else "为正"))
+    return float(value)
+
+
+def clip_grads_global(grads, max_norm):
+    """按**全局 L2 范数**裁剪：超阈值时整体等比缩小。
+
+    返回 `(new_grads, info)`，`info` 含 `norm` / `clip_scale` / `clipped`。
+    与逐层裁剪（`clip_grad_by_norm`）不同，这里范数是所有层合并算的，DP-SGD 需要这个口径。
+    """
+    limit = _w20_pos(max_norm, "max_norm", allow_zero=False)
+    flat = squeeze_grads(grads)
+    norm = math.sqrt(sum(v * v for v in flat)) if flat else 0.0
+    scale = 1.0 if norm <= limit or norm == 0.0 else limit / norm
+    new_grads = [None if item is None else (_w20_map(item[0], lambda v: v * scale),
+                                            _w20_map(item[1], lambda v: v * scale))
+                 for item in grads]
+    return new_grads, {"norm": norm, "clip_scale": scale, "clipped": scale < 1.0}
+
+
+def dp_grads(grads, max_norm, noise_multiplier=1.0, seed=None):
+    """一步 DP-SGD 的梯度处理：先全局裁剪，再加 `N(0, (σ·C)²)` 噪声。
+
+    `σ = noise_multiplier`、`C = max_norm`；噪声加在每个坐标上（与裁剪后的敏感度匹配）。
+    返回 `(new_grads, info)`，`info` 额外含 `noise_std` 与 `steps` 增量所需的信息。
+    """
+    sigma = _w20_pos(noise_multiplier, "noise_multiplier")
+    clipped, info = clip_grads_global(grads, max_norm)
+    std = sigma * float(max_norm)
+    rng = random.Random(seed) if seed is not None else random
+    noisy = []
+    for item in clipped:
+        if item is None:
+            noisy.append(None)
+            continue
+        noisy.append((_w20_map(item[0], lambda v: v + rng.gauss(0.0, std)),
+                      _w20_map(item[1], lambda v: v + rng.gauss(0.0, std))))
+    info = dict(info)
+    info["noise_std"] = std
+    info["noise_multiplier"] = sigma
+    return noisy, info
+
+
+class PrivacyAccountant:
+    """最简隐私预算记账：高斯机制的**简单组合**上界。
+
+    单步：`eps_step = q * sqrt(2 * ln(1.25 / delta)) / sigma`（`q` = 采样率，`delta` 见下）。
+    `T` 步简单组合 `eps_total = T * eps_step`（可用 `advanced=True` 换成
+    高级组合的 `sqrt(2T ln(1/delta)) * eps_step + T eps_step (e^eps_step - 1)`）。
+
+    这是**上界**且偏松：真实 RDP / 矩记账会给更小的值。本库只保证「口径写清楚、可复现」，
+    不声称与 opacus 之类的数字一致。
+    """
+
+    def __init__(self, noise_multiplier, sample_rate=1.0, delta=1e-5, advanced=False):
+        self.sigma = _w20_pos(noise_multiplier, "noise_multiplier", allow_zero=False)
+        self.q = _w20_pos(sample_rate, "sample_rate")
+        if not 0.0 < self.q <= 1.0:
+            raise ValueError("sample_rate 必须在 (0, 1] 之间")
+        if not 0.0 < float(delta) < 1.0:
+            raise ValueError("delta 必须在 (0, 1) 之间")
+        self.delta = float(delta)
+        self.advanced = bool(advanced)
+        self.steps = 0
+
+    @property
+    def eps_step(self):
+        return self.q * math.sqrt(2.0 * math.log(1.25 / self.delta)) / self.sigma
+
+    def step(self, times=1):
+        """记账 `times` 步，返回当前累计 epsilon。"""
+        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
+            raise ValueError("times 必须是 >= 1 的整数")
+        self.steps += times
+        return self.epsilon
+
+    @property
+    def epsilon(self):
+        if self.steps == 0:
+            return 0.0
+        base = self.steps * self.eps_step
+        if not self.advanced:
+            return base
+        adv = self.eps_step * math.sqrt(2.0 * self.steps * math.log(1.0 / self.delta))
+        return min(base, adv + self.steps * self.eps_step * math.expm1(self.eps_step))
+
+    def summary(self):
+        """返回 `{steps, sigma, sample_rate, delta, eps_step, epsilon, method}`。"""
+        return {
+            "steps": self.steps,
+            "sigma": self.sigma,
+            "sample_rate": self.q,
+            "delta": self.delta,
+            "eps_step": self.eps_step,
+            "epsilon": self.epsilon,
+            "method": "advanced" if self.advanced else "simple",
+        }
+
+
+def per_sample_losses(model, xs, ys):
+    """逐样本损失（分类用交叉熵、回归用平方误差），成员推断的攻击信号就用它。"""
+    net = getattr(model, "model", model)
+    if not isinstance(xs, list) or not xs:
+        raise ValueError("per_sample_losses: xs 不能为空")
+    if not isinstance(ys, list) or len(ys) != len(xs):
+        raise ValueError("per_sample_losses: ys 长度必须与 xs 一致")
+    task = getattr(model, "task", None) or getattr(net, "task", None) or "regression"
+    losses = []
+    for x, y in zip(xs, ys):
+        pred = net.forward(x)
+        if task == "classification":
+            target = y if isinstance(y, list) else _w20_onehot(y, len(pred))
+            if len(target) != len(pred):
+                raise ValueError("per_sample_losses: 标签维度与输出不一致")
+            value = 0.0
+            for p, t in zip(pred, target):
+                value -= float(t) * math.log(max(float(p), 1e-300))
+            losses.append(value)
+        else:
+            want = y[0] if isinstance(y, list) and len(y) == 1 else y
+            if isinstance(want, list):
+                raise ValueError("per_sample_losses: 回归标签必须是标量")
+            losses.append((float(pred[0]) - float(want)) ** 2)
+    return losses
+
+
+def _w20_onehot(index, width):
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise ValueError("分类标签必须是整数下标")
+    if not 0 <= index < width:
+        raise ValueError("分类标签越界: %d（输出维度 %d）" % (index, width))
+    row = [0.0] * width
+    row[index] = 1.0
+    return row
+
+
+def membership_inference_attack(member_losses, nonmember_losses, thresholds=None):
+    """损失阈值成员推断（Shokri 式最简版）。
+
+    设定：训练集样本的 loss 通常更低，所以规则是 `loss <= t` 判为「成员」。
+    返回 `{threshold, accuracy, tpr, fpr, auc, best_accuracy}`：
+    - `threshold` 是让 balanced accuracy 最大的阈值（候选来自两侧损失的均值）；
+    - `auc` 是 Mann-Whitney 统计量，`P(loss_member < loss_nonmember)`。
+    """
+    if not isinstance(member_losses, list) or not member_losses:
+        raise ValueError("member_losses 不能为空")
+    if not isinstance(nonmember_losses, list) or not nonmember_losses:
+        raise ValueError("nonmember_losses 不能为空")
+    for values, name in ((member_losses, "member_losses"), (nonmember_losses, "nonmember_losses")):
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("%s 里出现非数值" % name)
+            if not math.isfinite(float(value)):
+                raise ValueError("%s 里出现 NaN/inf" % name)
+    members = [float(v) for v in member_losses]
+    others = [float(v) for v in nonmember_losses]
+    if thresholds is None:
+        candidates = sorted({(a + b) / 2.0 for a in members for b in others})
+    else:
+        candidates = [float(t) for t in thresholds]
+        if not candidates:
+            raise ValueError("thresholds 不能为空列表")
+
+    best = None
+    for threshold in candidates:
+        tpr = sum(1 for v in members if v <= threshold) / len(members)
+        fpr = sum(1 for v in others if v <= threshold) / len(others)
+        score = 0.5 * (tpr + (1.0 - fpr))
+        if best is None or score > best["best_accuracy"] or (
+                score == best["best_accuracy"] and threshold < best["threshold"]):
+            best = {"threshold": threshold, "tpr": tpr, "fpr": fpr,
+                    "accuracy": 0.5 * (tpr + (1.0 - fpr)), "best_accuracy": score}
+
+    wins = 0.0
+    for a in members:
+        for b in others:
+            if a < b:
+                wins += 1.0
+            elif a == b:
+                wins += 0.5
+    auc = wins / (len(members) * len(others))
+    best["auc"] = auc
+    best.pop("best_accuracy")
+    return best
+
+
+def membership_defense_delta(member_losses, nonmember_losses):
+    """防御侧的一行结论：`abs(mean_member - mean_nonmember)` 与攻击 AUC 一起看。"""
+    attack = membership_inference_attack(member_losses, nonmember_losses)
+    mean_member = sum(member_losses) / len(member_losses)
+    mean_other = sum(nonmember_losses) / len(nonmember_losses)
+    return {
+        "loss_gap": abs(mean_member - mean_other),
+        "mean_member": mean_member,
+        "mean_nonmember": mean_other,
+        "attack_auc": attack["auc"],
+        "attack_accuracy": attack["accuracy"],
+    }
+
+# ============================================================================
 #  工程化收尾 W19-C：配置文件 / 日志 / 内存监控 / 模型注册表
 # ============================================================================
 

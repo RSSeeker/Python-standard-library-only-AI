@@ -630,7 +630,12 @@
     全库 1716 -> 1727 passed。
 
 ### W20 研究前沿（§17，文档 + 最小演示）
-- [ ] DP-SGD（梯度裁剪 + 高斯噪声 + 隐私预算记账）
+- [x] DP-SGD（梯度裁剪 + 高斯噪声 + 隐私预算记账）
+  - `clip_grads_global`（全局 L2 范数，跨层合并）→ `dp_grads`（裁剪后加 `N(0, (σ·C)²)`）、
+    `squeeze_grads` 摊平工具；`PrivacyAccountant` 用**简单组合**上界
+    `eps_step = q·sqrt(2 ln(1.25/δ))/σ`，`advanced=True` 取高级组合与简单组合的较小者。
+  - 口径写在 README：这是偏松上界，**不是** RDP / 矩记账，不与 opacus 对数字。
+  - 探针 43 项 + `TestPrivacyAndMembership` 9 例；全库 1727 -> 1736 passed。
 - [ ] 成员推断攻击与防御（最简版）
 - [ ] Lottery Ticket（迭代剪枝 + 重初始化）
 - [ ] Mixture-of-Depths / Early Exit
