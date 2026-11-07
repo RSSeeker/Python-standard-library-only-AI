@@ -28716,6 +28716,318 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
+#  多模态：CLIP 双塔 + 跨模态融合（W16-C）
+# ============================================================================
+
+def _cm_rows(x, who, width=None):
+    """校验「行列表」：非空、每行等长、元素是有限数字。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 必须是非空的行列表")
+    rows = []
+    for i, row in enumerate(x):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 第 {i} 行第 {j} 列不是数字：{v!r}")
+            fv = float(v)
+            if fv != fv or fv in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 第 {i} 行第 {j} 列不是有限数")
+            vals.append(fv)
+        rows.append(vals)
+    if width is not None:
+        for i, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(
+                    f"{who}: 第 {i} 行宽度 {len(row)} 与第一个 {width} 不一致")
+    return rows
+
+
+def _cm_unit(row, who):
+    n = math.sqrt(sum(v * v for v in row))
+    if n <= 0.0:
+        raise ValueError(f"{who}: 不能对全零向量做归一化")
+    return [v / n for v in row], n
+
+
+def clip_similarity(image_embeds, text_embeds):
+    """双塔嵌入的余弦相似度矩阵 ``S[i][j] = <img_i, txt_j>``（行已归一化）。"""
+    imgs = _cm_rows(image_embeds, "clip_similarity(image_embeds)")
+    txts = _cm_rows(text_embeds, "clip_similarity(text_embeds)")
+    if len(imgs[0]) != len(txts[0]):
+        raise ValueError(
+            f"clip_similarity: 图像维度 {len(imgs[0])} 与文本维度 {len(txts[0])} 不一致")
+    units_i = [_cm_unit(r, "clip_similarity")[0] for r in imgs]
+    units_t = [_cm_unit(r, "clip_similarity")[0] for r in txts]
+    return [[sum(a * b for a, b in zip(u, v)) for v in units_t] for u in units_i]
+
+
+def clip_loss(image_embeds, text_embeds, temperature=0.07):
+    """对称 InfoNCE（CLIP 的对比损失），返回 ``(loss, grad_img, grad_txt)``。
+
+    绑定关系是「第 i 张图配第 i 段文本」，所以正样本在对角线上；两侧交叉熵各占一半。
+    """
+    if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) \
+            or temperature <= 0.0:
+        raise ValueError(f"clip_loss: temperature 必须 > 0，收到 {temperature!r}")
+    imgs = _cm_rows(image_embeds, "clip_loss(image_embeds)")
+    txts = _cm_rows(text_embeds, "clip_loss(text_embeds)")
+    n = len(imgs)
+    if len(txts) != n:
+        raise ValueError(
+            f"clip_loss: 图像 {n} 条与文本 {len(txts)} 条数量必须相同（第 i 对是正样本）")
+    if len(imgs[0]) != len(txts[0]):
+        raise ValueError(
+            f"clip_loss: 图像维度 {len(imgs[0])} 与文本维度 {len(txts[0])} 不一致")
+    ui, ni = [], []
+    for r in imgs:
+        u, k = _cm_unit(r, "clip_loss")
+        ui.append(u)
+        ni.append(k)
+    ut, nt = [], []
+    for r in txts:
+        u, k = _cm_unit(r, "clip_loss")
+        ut.append(u)
+        nt.append(k)
+    d = len(ui[0])
+    tau = float(temperature)
+    s = [[sum(a * b for a, b in zip(ui[i], ut[j])) / tau for j in range(n)]
+         for i in range(n)]
+    p = [_softmax_row(row) for row in s]
+    cols = [[s[i][j] for i in range(n)] for j in range(n)]
+    q = [_softmax_row(row) for row in cols]
+    loss = 0.0
+    for i in range(n):
+        loss += -math.log(max(p[i][i], 1e-300))
+    for j in range(n):
+        loss += -math.log(max(q[j][j], 1e-300))
+    loss /= (2.0 * n)
+    ds = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            ds[i][j] = 0.5 * ((p[i][j] - (1.0 if i == j else 0.0)) / n
+                              + (q[j][i] - (1.0 if i == j else 0.0)) / n)
+    d_ui = [[sum(ds[i][j] * ut[j][k] for j in range(n)) / tau for k in range(d)]
+            for i in range(n)]
+    d_ut = [[sum(ds[i][j] * ui[i][k] for i in range(n)) / tau for k in range(d)]
+            for j in range(n)]
+    g_img = []
+    for i in range(n):
+        dot = sum(a * b for a, b in zip(d_ui[i], ui[i]))
+        g_img.append([(d_ui[i][k] - ui[i][k] * dot) / ni[i] for k in range(d)])
+    g_txt = []
+    for j in range(n):
+        dot = sum(a * b for a, b in zip(d_ut[j], ut[j]))
+        g_txt.append([(d_ut[j][k] - ut[j][k] * dot) / nt[j] for k in range(d)])
+    return loss, g_img, g_txt
+
+
+def contrastive_retrieval_accuracy(image_embeds, text_embeds):
+    """图文检索准确率：返回 ``{"i2t", "t2i", "mean"}``（正确配对在对角线上）。"""
+    sim = clip_similarity(image_embeds, text_embeds)
+    n = len(sim)
+    if len(sim[0]) != n:
+        raise ValueError(
+            f"contrastive_retrieval_accuracy: 相似度矩阵不是方阵（{n}x{len(sim[0])}）")
+    hit_i = 0
+    for i in range(n):
+        if max(range(n), key=lambda j: sim[i][j]) == i:
+            hit_i += 1
+    hit_t = 0
+    for j in range(n):
+        if max(range(n), key=lambda i: sim[i][j]) == j:
+            hit_t += 1
+    i2t = hit_i / n
+    t2i = hit_t / n
+    return {"i2t": i2t, "t2i": t2i, "mean": 0.5 * (i2t + t2i)}
+
+
+class CLIPProjector:
+    """CLIP 的两个线性投影头：``img -> embed_dim`` 与 ``txt -> embed_dim``。
+
+    只做投影 + 损失 + 梯度，不内置编码器；梯度是**对本类参数**的解析梯度，
+    可以直接喂给 `Adam` / `SGD` 的逐层接口，也可以只当参考实现。
+    """
+
+    def __init__(self, image_dim, text_dim, embed_dim=32, temperature=0.07, seed=None):
+        for name, v in (("image_dim", image_dim), ("text_dim", text_dim),
+                        ("embed_dim", embed_dim)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"CLIPProjector: {name} 必须是 >=1 的整数，收到 {v!r}")
+        if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) \
+                or temperature <= 0.0:
+            raise ValueError(
+                f"CLIPProjector: temperature 必须 > 0，收到 {temperature!r}")
+        self.image_dim = image_dim
+        self.text_dim = text_dim
+        self.embed_dim = embed_dim
+        self.temperature = float(temperature)
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            s_img = math.sqrt(2.0 / image_dim)
+            s_txt = math.sqrt(2.0 / text_dim)
+            self.W_img = [[random.gauss(0.0, s_img) for _ in range(image_dim)]
+                          for _ in range(embed_dim)]
+            self.b_img = [0.0] * embed_dim
+            self.W_txt = [[random.gauss(0.0, s_txt) for _ in range(text_dim)]
+                          for _ in range(embed_dim)]
+            self.b_txt = [0.0] * embed_dim
+        finally:
+            random.setstate(state)
+        self._img_x = None
+        self._txt_x = None
+
+    def param_count(self):
+        """可训练标量个数（两个权重矩阵 + 两个偏置）。"""
+        return (self.embed_dim * self.image_dim + self.embed_dim
+                + self.embed_dim * self.text_dim + self.embed_dim)
+
+    def project(self, image_feats, text_feats):
+        """把两组特征投到同一空间，返回 ``(img_emb, txt_emb)``（行列表）。"""
+        imgs = _cm_rows(image_feats, "CLIPProjector.project(image_feats)", self.image_dim)
+        txts = _cm_rows(text_feats, "CLIPProjector.project(text_feats)", self.text_dim)
+        self._img_x = imgs
+        self._txt_x = txts
+        img_emb = [[sum(self.W_img[j][k] * row[k] for k in range(self.image_dim))
+                    + self.b_img[j] for j in range(self.embed_dim)] for row in imgs]
+        txt_emb = [[sum(self.W_txt[j][k] * row[k] for k in range(self.text_dim))
+                    + self.b_txt[j] for j in range(self.embed_dim)] for row in txts]
+        return img_emb, txt_emb
+
+    def loss(self, image_feats, text_feats):
+        """投影后算 ``clip_loss``，只返回损失值。"""
+        img_emb, txt_emb = self.project(image_feats, text_feats)
+        return clip_loss(img_emb, txt_emb, self.temperature)[0]
+
+    def loss_and_grads(self, image_feats, text_feats):
+        """返回 ``(loss, grads)``，``grads`` 形如 ``{"W_img","b_img","W_txt","b_txt"}``。"""
+        imgs = _cm_rows(image_feats, "CLIPProjector.loss_and_grads(image_feats)",
+                        self.image_dim)
+        txts = _cm_rows(text_feats, "CLIPProjector.loss_and_grads(text_feats)",
+                        self.text_dim)
+        if len(imgs) != len(txts):
+            raise ValueError(
+                f"CLIPProjector: 图像 {len(imgs)} 条与文本 {len(txts)} 条必须一一配对")
+        img_emb, txt_emb = self.project(imgs, txts)
+        loss, g_img, g_txt = clip_loss(img_emb, txt_emb, self.temperature)
+        gw_img = [[0.0] * self.image_dim for _ in range(self.embed_dim)]
+        gb_img = [0.0] * self.embed_dim
+        gw_txt = [[0.0] * self.text_dim for _ in range(self.embed_dim)]
+        gb_txt = [0.0] * self.embed_dim
+        for row, g in zip(imgs, g_img):
+            for j in range(self.embed_dim):
+                gb_img[j] += g[j]
+                gwj = gw_img[j]
+                for k in range(self.image_dim):
+                    gwj[k] += g[j] * row[k]
+        for row, g in zip(txts, g_txt):
+            for j in range(self.embed_dim):
+                gb_txt[j] += g[j]
+                gwj = gw_txt[j]
+                for k in range(self.text_dim):
+                    gwj[k] += g[j] * row[k]
+        return loss, {"W_img": gw_img, "b_img": gb_img,
+                      "W_txt": gw_txt, "b_txt": gb_txt}
+
+    def apply_grads(self, grads, lr, kind="sgd"):
+        """按 ``grads`` 更新一次（``kind`` 只有 ``"sgd"`` 一种，留给手写训练循环）。"""
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0.0:
+            raise ValueError(f"CLIPProjector.apply_grads: lr 必须 > 0，收到 {lr!r}")
+        if kind != "sgd":
+            raise ValueError(f"CLIPProjector.apply_grads: 只支持 kind='sgd'，收到 {kind!r}")
+        for name, W in (("W_img", self.W_img), ("W_txt", self.W_txt)):
+            if name not in grads:
+                raise ValueError(f"CLIPProjector.apply_grads: grads 缺少 {name}")
+            gW = grads[name]
+            for j in range(len(W)):
+                for k in range(len(W[j])):
+                    W[j][k] -= lr * gW[j][k]
+        for name, b in (("b_img", self.b_img), ("b_txt", self.b_txt)):
+            if name not in grads:
+                raise ValueError(f"CLIPProjector.apply_grads: grads 缺少 {name}")
+            gb = grads[name]
+            for j in range(len(b)):
+                b[j] -= lr * gb[j]
+
+
+def _cm_norm_forward(rows):
+    """逐行 LayerNorm（固定 gamma=1、beta=0），返回 ``(out, caches)``。"""
+    out = []
+    caches = []
+    for row in rows:
+        d = len(row)
+        mean = sum(row) / d
+        var = sum((v - mean) ** 2 for v in row) / d
+        inv = 1.0 / math.sqrt(var + 1e-5)
+        x_hat = [(v - mean) * inv for v in row]
+        out.append(list(x_hat))
+        caches.append((x_hat, inv, d))
+    return out, caches
+
+
+def _cm_norm_backward(caches, dout):
+    """逐行 LayerNorm 的输入梯度（无仿射参数）。"""
+    grads = []
+    for (x_hat, inv, d), dy in zip(caches, dout):
+        m = sum(dy) / d
+        m2 = sum(a * b for a, b in zip(dy, x_hat)) / d
+        grads.append([inv * (dy[j] - m - x_hat[j] * m2) for j in range(d)])
+    return grads
+
+
+class CrossModalBlock:
+    """跨模态融合块：文本作 query、图像作 memory 做交叉注意力，再残差 + 逐行归一化。
+
+    不带 FFN（需要更深的融合时，把输出接给 `TransformerEncoderLayer`）。backward
+    同时返回 ``(d_image, d_text)``，因为交叉注意力两侧都收到梯度。
+    """
+
+    def __init__(self, d_model, num_heads=2, dropout=0.0):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(
+                f"CrossModalBlock: d_model 必须是 >=1 的整数，收到 {d_model!r}")
+        self.d_model = d_model
+        self.attn = CrossAttention(d_model, num_heads, dropout)
+        self._text = None
+        self._image = None
+        self._caches = None
+
+    def zero_grad(self):
+        """清零交叉注意力的参数梯度。"""
+        self.attn.zero_grad()
+
+    def forward(self, image_feats, text_feats):
+        """``image_feats`` / ``text_feats`` 都是 ``(T, d_model)`` 的行列表。"""
+        imgs = _cm_rows(image_feats, "CrossModalBlock.forward(image_feats)", self.d_model)
+        txts = _cm_rows(text_feats, "CrossModalBlock.forward(text_feats)", self.d_model)
+        attn_out = self.attn.forward(txts, imgs)
+        merged = [[txts[i][j] + attn_out[i][j] for j in range(self.d_model)]
+                  for i in range(len(txts))]
+        fused, caches = _cm_norm_forward(merged)
+        self._text = txts
+        self._image = imgs
+        self._caches = caches
+        return fused
+
+    def backward(self, d_fused):
+        """返回 ``(d_image_feats, d_text_feats)``；同时把参数梯度累加进 ``attn.grads``。"""
+        if self._caches is None:
+            raise RuntimeError("CrossModalBlock.backward: 必须先调用 forward()")
+        rows = _cm_rows(d_fused, "CrossModalBlock.backward", self.d_model)
+        if len(rows) != len(self._text):
+            raise ValueError(
+                f"CrossModalBlock.backward: 梯度行数 {len(rows)} 与文本长度 "
+                f"{len(self._text)} 不一致")
+        d_merged = _cm_norm_backward(self._caches, rows)
+        d_text_attn, d_memory = self.attn.backward(d_merged)
+        d_text = [[d_merged[i][j] + d_text_attn[i][j] for j in range(self.d_model)]
+                  for i in range(len(self._text))]
+        return d_memory, d_text
+
+# ============================================================================
 #  自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
 # ============================================================================
 

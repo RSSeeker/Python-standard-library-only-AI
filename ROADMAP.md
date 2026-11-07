@@ -506,7 +506,10 @@
   - `patchify` / `unpatchify`、`random_masking`（`mask_ratio=0` 时一个都不遮，这条是探针逼出来的语义修正）、`block_mask`
   - `mae_loss`（被遮 patch 的 MSE）、`simmim_loss`（平滑 L1）、`beit_loss`（离散 token 交叉熵）
   - 只提供掩码与损失，编码器/解码器由用户拿 `TransformerEncoder` 自己拼；`beit_loss` 的 dVAE tokenizer 不在本库范围内
-- [ ] 多模态：CLIP（双塔 + InfoNCE）、跨模态融合（CrossAttention 扩展）
+- [x] 多模态：CLIP（双塔 + InfoNCE）、跨模态融合（CrossAttention 扩展）
+  - `clip_similarity` / `clip_loss`（对称 InfoNCE，两侧梯度都对中心差分）/ `contrastive_retrieval_accuracy`
+  - `CLIPProjector`：两个线性投影头 + `loss_and_grads` + SGD 更新，30 步实测 loss 1.857 -> 0.376
+  - `CrossModalBlock`：文本 query × 图像 memory 的交叉注意力 + 残差 + 逐行归一化，backward 同时回传图像与文本两侧；memory 只有 1 行时 `W_q` 梯度恰为 0（softmax 恒定），测试里专门记了这一条
 - [ ] 预测式自监督：Rotation / Jigsaw
 - [ ] RL 环境：`GridWorld` / `CartPole`（内置）
 - [ ] RL 算法：DQN / Double / Dueling / Rainbow（简化）/ REINFORCE / A2C / PPO / SAC / TD3 / DDPG

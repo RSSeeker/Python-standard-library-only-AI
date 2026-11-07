@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1482 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1490 项）
 
 ## 特性
 
@@ -1727,6 +1727,25 @@ loss, grad = AI.mae_loss(recon, patches, masked)
 
 三条边界：`patchify` 只做展平切块，不做归一化；`mae_loss` 的梯度是针对 **重建输出** 的，不是参数梯度；`beit_loss` 需要外部先给每个 patch 的离散目标（dVAE token），本库不训练那个 tokenizer。
 
+### 多模态：CLIP 双塔与跨模态融合（W16-C）
+
+| API | 说明 |
+| --- | --- |
+| `clip_similarity(image_embeds, text_embeds)` | 行归一化后的余弦相似度矩阵 `S[i][j]` |
+| `clip_loss(image_embeds, text_embeds, temperature=0.07)` | 对称 InfoNCE（第 i 对是正样本），返回 `(loss, grad_img, grad_txt)` |
+| `contrastive_retrieval_accuracy(image_embeds, text_embeds)` | 图文检索命中率，返回 `{"i2t", "t2i", "mean"}` |
+| `CLIPProjector(image_dim, text_dim, embed_dim=32, temperature=0.07, seed=None)` | 两个线性投影头：`project` / `loss` / `loss_and_grads` / `apply_grads` / `param_count` |
+| `CrossModalBlock(d_model, num_heads=2, dropout=0.0)` | 文本作 query、图像作 memory 的交叉注意力 + 残差 + 逐行归一化，`backward` 返回 `(d_image, d_text)` |
+
+```python
+proj = AI.CLIPProjector(64, 128, embed_dim=32, seed=0)
+loss, grads = proj.loss_and_grads(image_feats, text_feats)   # grads 可喂给任意优化器
+img_emb, txt_emb = proj.project(image_feats, text_feats)
+print(AI.contrastive_retrieval_accuracy(img_emb, txt_emb))
+```
+
+四条边界：`clip_loss` 是**批内**对比损失，正样本固定在对角线上（不读 label）；`CLIPProjector` 不内置编码器，只做投影 + 损失 + 梯度；`CrossModalBlock` 的归一化是固定 `gamma=1/beta=0` 的逐行 LayerNorm（无仿射参数）；memory 只有 1 行时 softmax 恒为 1，交叉注意力输出与 query 无关，`W_q` 的梯度恰为 0——这是数学结果，不是 bug。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -2143,7 +2162,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1482 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1490 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -2337,6 +2356,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
 | `TestMaskedVisionModeling` | patchify/unpatchify 往返、掩码数量与可复现、`mask_ratio=0` 不遮、块状掩码一致性、三种损失的闭式值与梯度行和、参数校验 |
+| `TestMultimodal` | CLIP 相似度/损失手算、两侧梯度对中心差分（<1e-6）、检索准确率、投影头 30 步 SGD 降 loss、跨模态融合块两侧梯度对中心差分（<1e-5）、单 key 时 `W_q` 梯度为 0 |
 | `TestPerplexity` | `perplexity == exp(evaluate)`、溢出保护 |
 | `TestLMPersistence` | 存档往返参数与 logits 逐位相同、带 Adam 状态的续训与不中断训练逐位相同、不恢复优化器时确实不同、坏存档（format/形状/NaN/缺文件）报错、`Seq2SeqLM` 往返 |
 | `TestLMPersistenceMatrix` | 存档把 `rope`/`window`/`num_kv_heads` 一起带走，重载后 forward/evaluate/generate 逐位相同、`step_count` 恢复 |
@@ -2390,7 +2410,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1482 个单元测试
+├── test_ai.py       # 1490 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

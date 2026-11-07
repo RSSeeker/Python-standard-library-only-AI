@@ -22606,3 +22606,148 @@ class TestMaskedVisionModeling:
             AI.beit_loss(logits, [0, 0, -1], [2])
         with pytest.raises(ValueError):
             AI.beit_loss(logits, [0, 0], [0])
+class TestMultimodal:
+    """W16-C：CLIP 双塔（相似度 / 对称 InfoNCE / 检索准确率 / 投影头）+ 跨模态融合块。"""
+
+    IMG = [[1.0, 0.0], [0.0, 1.0]]
+    TXT = [[2.0, 0.0], [0.0, 3.0]]
+
+    def test_clip_similarity(self):
+        sim = AI.clip_similarity(self.IMG, self.TXT)
+        assert len(sim) == 2 and len(sim[0]) == 2
+        assert abs(sim[0][0] - 1.0) < 1e-12
+        assert abs(sim[1][1] - 1.0) < 1e-12
+        assert abs(sim[0][1]) < 1e-12 and abs(sim[1][0]) < 1e-12
+        with pytest.raises(ValueError):
+            AI.clip_similarity([[1.0, 0.0]], [[1.0]])
+        with pytest.raises(ValueError):
+            AI.clip_similarity([[0.0, 0.0]], [[1.0, 0.0]])
+
+    def test_clip_loss_value(self):
+        loss = AI.clip_loss(self.IMG, self.TXT, 0.07)[0]
+        p = 1.0 / (1.0 + AI.math.exp(-(1.0 / 0.07)))
+        assert abs(loss + AI.math.log(p)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.clip_loss(self.IMG, self.TXT, 0.0)
+        with pytest.raises(ValueError):
+            AI.clip_loss(self.IMG, [[1.0, 0.0]])
+        with pytest.raises(ValueError):
+            AI.clip_loss([[1.0, 0.0]], [[1.0, 0.0, 0.0]])
+
+    def test_clip_loss_gradients(self):
+        random.seed(3)
+        I = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+        T = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+        _, gI, gT = AI.clip_loss(I, T, 0.5)
+        eps = 1e-6
+        for a in range(3):
+            for b in range(3):
+                up = [row[:] for row in I]
+                dn = [row[:] for row in I]
+                up[a][b] += eps
+                dn[a][b] -= eps
+                num = (AI.clip_loss(up, T, 0.5)[0] - AI.clip_loss(dn, T, 0.5)[0]) / (2 * eps)
+                assert abs(num - gI[a][b]) < 1e-6
+        for a in range(3):
+            for b in range(3):
+                up = [row[:] for row in T]
+                dn = [row[:] for row in T]
+                up[a][b] += eps
+                dn[a][b] -= eps
+                num = (AI.clip_loss(I, up, 0.5)[0] - AI.clip_loss(I, dn, 0.5)[0]) / (2 * eps)
+                assert abs(num - gT[a][b]) < 1e-6
+
+    def test_retrieval_accuracy(self):
+        hit = AI.contrastive_retrieval_accuracy(self.IMG, self.IMG)
+        assert hit["i2t"] == 1.0 and hit["t2i"] == 1.0 and hit["mean"] == 1.0
+        miss = AI.contrastive_retrieval_accuracy(self.IMG, [[0.0, 1.0], [1.0, 0.0]])
+        assert miss["i2t"] == 0.0 and miss["t2i"] == 0.0
+        with pytest.raises(ValueError):
+            AI.contrastive_retrieval_accuracy([[1.0, 0.0]], self.IMG)
+
+    def test_clip_projector(self):
+        Xi = [[0.1, 0.2, 0.3], [0.4, -0.2, 0.0], [1.0, 1.0, -1.0]]
+        Xt = [[0.5, 0.1, 0.2, 0.0], [0.0, 0.3, -0.3, 0.2], [-0.4, 0.9, 0.1, 0.1]]
+        proj = AI.CLIPProjector(3, 4, embed_dim=2, temperature=0.5, seed=7)
+        loss, grads = proj.loss_and_grads(Xi, Xt)
+        emb_i, emb_t = proj.project(Xi, Xt)
+        assert abs(loss - AI.clip_loss(emb_i, emb_t, 0.5)[0]) < 1e-12
+        assert proj.param_count() == 2 * 3 + 2 + 2 * 4 + 2
+        assert sorted(grads) == ["W_img", "W_txt", "b_img", "b_txt"]
+        eps = 1e-6
+        w = proj.W_img[0][0]
+        proj.W_img[0][0] = w + eps
+        up = proj.loss(Xi, Xt)
+        proj.W_img[0][0] = w - eps
+        dn = proj.loss(Xi, Xt)
+        proj.W_img[0][0] = w
+        assert abs((up - dn) / (2 * eps) - grads["W_img"][0][0]) < 1e-6
+        with pytest.raises(ValueError):
+            proj.loss_and_grads(Xi[:2], Xt)
+        with pytest.raises(ValueError):
+            AI.CLIPProjector(3, 4, 0)
+
+    def test_clip_projector_training(self):
+        Xi = [[0.1, 0.2, 0.3], [0.4, -0.2, 0.0], [1.0, 1.0, -1.0]]
+        Xt = [[0.5, 0.1, 0.2, 0.0], [0.0, 0.3, -0.3, 0.2], [-0.4, 0.9, 0.1, 0.1]]
+        proj = AI.CLIPProjector(3, 4, embed_dim=2, temperature=0.5, seed=5)
+        first = proj.loss(Xi, Xt)
+        for _ in range(30):
+            _, g = proj.loss_and_grads(Xi, Xt)
+            proj.apply_grads(g, 0.2)
+        assert proj.loss(Xi, Xt) < first - 1e-3
+        with pytest.raises(ValueError):
+            proj.apply_grads(g, 0.0)
+        with pytest.raises(ValueError):
+            proj.apply_grads(g, 0.1, "adam")
+
+    def test_cross_modal_block(self):
+        random.seed(17)
+        block = AI.CrossModalBlock(4, num_heads=2, dropout=0.0)
+        Xi = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(3)]
+        Xt = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(2)]
+        fused = block.forward(Xi, Xt)
+        assert len(fused) == 2 and len(fused[0]) == 4
+        assert all(abs(sum(r) / 4) < 1e-9 for r in fused)
+        coef = [[0.3, -0.2, 0.5, 0.1], [0.7, 0.2, -0.4, 0.6]]
+        d_img, d_txt = block.backward(coef)
+
+        def scalar(img_feats, txt_feats):
+            out = block.forward(img_feats, txt_feats)
+            return sum(out[i][j] * coef[i][j] for i in range(len(out)) for j in range(4))
+
+        eps = 1e-6
+        for i in range(3):
+            for j in range(4):
+                up = [row[:] for row in Xi]
+                dn = [row[:] for row in Xi]
+                up[i][j] += eps
+                dn[i][j] -= eps
+                num = (scalar(up, Xt) - scalar(dn, Xt)) / (2 * eps)
+                assert abs(num - d_img[i][j]) < 1e-5
+        for i in range(2):
+            for j in range(4):
+                up = [row[:] for row in Xt]
+                dn = [row[:] for row in Xt]
+                up[i][j] += eps
+                dn[i][j] -= eps
+                num = (scalar(Xi, up) - scalar(Xi, dn)) / (2 * eps)
+                assert abs(num - d_txt[i][j]) < 1e-5
+
+    def test_cross_modal_validation(self):
+        block = AI.CrossModalBlock(4)
+        with pytest.raises(RuntimeError):
+            block.backward([[0.0] * 4])
+        with pytest.raises(ValueError):
+            AI.CrossModalBlock(4).forward([[0.0] * 3], [[0.0] * 4])
+        with pytest.raises(ValueError):
+            AI.CrossModalBlock(0)
+        random.seed(1)
+        b2 = AI.CrossModalBlock(4)
+        # memory 长度必须 > 1：只有 1 个 key 时 softmax 恒为 1，输出与 Q 无关，W_q 梯度必然为 0
+        b2.forward([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                   [[0.2, 0.1, 0.0, 0.3], [0.5, 0.2, 0.1, 0.0]])
+        b2.backward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        assert any(abs(v) > 0 for row in b2.attn.grads["W_q"] for v in row)
+        b2.zero_grad()
+        assert all(v == 0.0 for row in b2.attn.grads["W_q"] for v in row)
