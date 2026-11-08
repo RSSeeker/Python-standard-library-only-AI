@@ -36026,6 +36026,445 @@ class ElectraModel:
         return self.discriminator.probabilities(ids)
 
 
+# ============================================================================
+#  RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+# ============================================================================
+
+
+class RWKVBlock:
+    """RWKV 风格 block：time-mixing（可学习指数衰减的状态递推）+ channel-mixing
+
+    简化点（docstring 已注明）：
+      * 不做 token-shift（把上一 token 的输入混进来），只靠状态递推携带历史；
+      * channel-mixing 用 `r ⊙ relu(k)² ⊙ v`，不做 GELU 变体；
+      * 无 dropout。其余结构与 RWKV-4 一致：time-mixing 的 `k`/`v` 进入
+        逐通道状态 `state = decay*state + k*v`，输出 `r ⊙ (state + u*v)`。
+    """
+
+    def __init__(self, d_model, d_ff=None, eps=1e-5, seed=None):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"RWKVBlock: d_model 必须是正整数，收到 {d_model!r}")
+        self.d_model = d_model
+        self.d_ff = 4 * d_model if d_ff is None else d_ff
+        if not isinstance(self.d_ff, int) or isinstance(self.d_ff, bool) or self.d_ff < 1:
+            raise ValueError(f"RWKVBlock: d_ff 必须是正整数，收到 {d_ff!r}")
+
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.ln1 = LayerNorm(d_model, eps=eps)
+            self.Wr = Layer(d_model, d_model, "linear")
+            self.Wk = Layer(d_model, d_model, "linear")
+            self.Wv = Layer(d_model, d_model, "linear")
+            self.Wo = Layer(d_model, d_model, "linear")
+            # decay = exp(-exp(w_raw))，初值让 decay≈0.9
+            self.w_raw = [math.log(-math.log(0.9)) + random.gauss(0.0, 0.02)
+                          for _ in range(d_model)]
+            self.u = [0.1] * d_model
+            self.ln2 = LayerNorm(d_model, eps=eps)
+            self.Wr2 = Layer(d_model, self.d_ff, "linear")
+            self.Wk2 = Layer(d_model, self.d_ff, "linear")
+            self.Wv2 = Layer(d_model, self.d_ff, "linear")
+            self.Wo2 = Layer(self.d_ff, d_model, "linear")
+        finally:
+            random.setstate(state)
+
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        """清零所有参数梯度"""
+        self.grads = {
+            "Wr": None, "Wk": None, "Wv": None, "Wo": None,
+            "Wr2": None, "Wk2": None, "Wv2": None, "Wo2": None,
+        }
+        self.norm_grads = {"ln1": None, "ln2": None}
+        self.grad_w_raw = [0.0] * self.d_model
+        self.grad_u = [0.0] * self.d_model
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _decay(self):
+        return [math.exp(-math.exp(w)) for w in self.w_raw]
+
+    def forward(self, x):
+        """x: (T, d_model) → (T, d_model)"""
+        T = len(x)
+        d = self.d_model
+        h1, c1 = _norm_rows_forward(self.ln1, x)
+        r, cr = _dense_rows_forward(self.Wr, h1)
+        k, ck = _dense_rows_forward(self.Wk, h1)
+        v, cv = _dense_rows_forward(self.Wv, h1)
+
+        decay = self._decay()
+        state = [0.0] * d
+        states = []
+        y = []
+        for t in range(T):
+            row = [0.0] * d
+            for j in range(d):
+                state[j] = decay[j] * state[j] + k[t][j] * v[t][j]
+                row[j] = r[t][j] * (state[j] + self.u[j] * v[t][j])
+            states.append(list(state))
+            y.append(row)
+
+        out1, co1 = _dense_rows_forward(self.Wo, y)
+        x1 = [[x[t][j] + out1[t][j] for j in range(d)] for t in range(T)]
+
+        h2, c2 = _norm_rows_forward(self.ln2, x1)
+        r2, cr2 = _dense_rows_forward(self.Wr2, h2)
+        zk, ck2 = _dense_rows_forward(self.Wk2, h2)
+        v2, cv2 = _dense_rows_forward(self.Wv2, h2)
+        kact = [[max(0.0, zk[t][j]) for j in range(self.d_ff)] for t in range(T)]
+        ksq = [[kact[t][j] * kact[t][j] for j in range(self.d_ff)] for t in range(T)]
+        y2 = [[r2[t][j] * ksq[t][j] * v2[t][j] for j in range(self.d_ff)]
+              for t in range(T)]
+        out2, co2 = _dense_rows_forward(self.Wo2, y2)
+        out = [[x1[t][j] + out2[t][j] for j in range(d)] for t in range(T)]
+
+        self._cache = {
+            "x": x, "h1": h1, "c1": c1,
+            "r": r, "cr": cr, "k": k, "ck": ck, "v": v, "cv": cv,
+            "decay": decay, "states": states, "y": y,
+            "out1": out1, "co1": co1, "x1": x1,
+            "h2": h2, "c2": c2, "r2": r2, "cr2": cr2,
+            "zk": zk, "ck2": ck2, "v2": v2, "cv2": cv2,
+            "kact": kact, "ksq": ksq, "y2": y2, "out2": out2, "co2": co2,
+        }
+        return out
+
+    def backward(self, dout):
+        """dout: (T, d_model) 输出梯度，返回输入梯度"""
+        if self._cache is None:
+            raise RuntimeError("RWKVBlock.backward: 必须先调用 forward()")
+        c = self._cache
+        T = len(c["x"])
+        d = self.d_model
+        ff = self.d_ff
+
+        dx = [list(row) for row in dout]
+        d_out2 = dout
+
+        gW2, gb2, d_y2 = _dense_rows_backward(self.Wo2, c["co2"], d_out2)
+        self._acc_dense("Wo2", gW2, gb2)
+
+        d_r2 = [[d_y2[t][j] * c["ksq"][t][j] * c["v2"][t][j] for j in range(ff)]
+                for t in range(T)]
+        d_ksq = [[d_y2[t][j] * c["r2"][t][j] * c["v2"][t][j] for j in range(ff)]
+                 for t in range(T)]
+        d_v2 = [[d_y2[t][j] * c["r2"][t][j] * c["ksq"][t][j] for j in range(ff)]
+                for t in range(T)]
+        d_zk = [[d_ksq[t][j] * 2.0 * c["kact"][t][j] *
+                 (1.0 if c["zk"][t][j] > 0.0 else 0.0)
+                 for j in range(ff)] for t in range(T)]
+
+        gWr2, gbr2, d_h2a = _dense_rows_backward(self.Wr2, c["cr2"], d_r2)
+        gWk2, gbk2, d_h2b = _dense_rows_backward(self.Wk2, c["ck2"], d_zk)
+        gWv2, gbv2, d_h2c = _dense_rows_backward(self.Wv2, c["cv2"], d_v2)
+        self._acc_dense("Wr2", gWr2, gbr2)
+        self._acc_dense("Wk2", gWk2, gbk2)
+        self._acc_dense("Wv2", gWv2, gbv2)
+
+        d_h2 = [[d_h2a[t][j] + d_h2b[t][j] + d_h2c[t][j] for j in range(d)]
+                for t in range(T)]
+        g2, b2, d_x1_ln = _norm_rows_backward(self.ln2, c["c2"], d_h2)
+        self.norm_grads["ln2"] = (g2, b2)
+
+        d_x1 = [[dx[t][j] + d_x1_ln[t][j] for j in range(d)] for t in range(T)]
+        d_out1 = d_x1
+
+        gWo, gbo, d_y = _dense_rows_backward(self.Wo, c["co1"], d_out1)
+        self._acc_dense("Wo", gWo, gbo)
+
+        d_r = [[0.0] * d for _ in range(T)]
+        d_k = [[0.0] * d for _ in range(T)]
+        d_v = [[0.0] * d for _ in range(T)]
+        d_decay = [0.0] * d
+        for t in range(T):
+            for j in range(d):
+                d_r[t][j] = d_y[t][j] * (c["states"][t][j] +
+                                         self.u[j] * c["v"][t][j])
+                d_v[t][j] = d_y[t][j] * c["r"][t][j] * self.u[j]
+                self.grad_u[j] += d_y[t][j] * c["r"][t][j] * c["v"][t][j]
+
+        ds_next = [0.0] * d
+        for t in range(T - 1, -1, -1):
+            ds = [0.0] * d
+            for j in range(d):
+                ds[j] = d_y[t][j] * c["r"][t][j] + c["decay"][j] * ds_next[j]
+            for j in range(d):
+                d_k[t][j] += ds[j] * c["v"][t][j]
+                d_v[t][j] += ds[j] * c["k"][t][j]
+                if t > 0:
+                    d_decay[j] += ds[j] * c["states"][t - 1][j]
+            ds_next = ds
+
+        for j in range(d):
+            w = self.w_raw[j]
+            decay = math.exp(-math.exp(w))
+            self.grad_w_raw[j] += d_decay[j] * (-math.exp(w) * decay)
+
+        gWr, gbr, d_h1a = _dense_rows_backward(self.Wr, c["cr"], d_r)
+        gWk, gbk, d_h1b = _dense_rows_backward(self.Wk, c["ck"], d_k)
+        gWv, gbv, d_h1c = _dense_rows_backward(self.Wv, c["cv"], d_v)
+        self._acc_dense("Wr", gWr, gbr)
+        self._acc_dense("Wk", gWk, gbk)
+        self._acc_dense("Wv", gWv, gbv)
+
+        d_h1 = [[d_h1a[t][j] + d_h1b[t][j] + d_h1c[t][j] for j in range(d)]
+                for t in range(T)]
+        g1, b1, d_x_ln = _norm_rows_backward(self.ln1, c["c1"], d_h1)
+        self.norm_grads["ln1"] = (g1, b1)
+        for t in range(T):
+            for j in range(d):
+                dx[t][j] += d_x_ln[t][j]
+        return dx
+
+    def _acc_dense(self, name, gw, gb):
+        old = self.grads[name]
+        if old is None:
+            self.grads[name] = (gw, gb)
+            return
+        ogw, ogb = old
+        for i in range(len(gw)):
+            for j in range(len(gw[i])):
+                ogw[i][j] += gw[i][j]
+            ogb[i] += gb[i]
+
+    def sgd_step(self, lr):
+        """SGD 更新全部参数"""
+        for name in ("Wr", "Wk", "Wv", "Wo", "Wr2", "Wk2", "Wv2", "Wo2"):
+            layer = getattr(self, name)
+            grads = self.grads[name]
+            if grads is not None:
+                _dense_apply_sgd(layer, grads, lr)
+        for name, norm in (("ln1", self.ln1), ("ln2", self.ln2)):
+            grads = self.norm_grads[name]
+            if grads is not None:
+                _norm_apply_sgd(norm, grads, lr)
+        for j in range(self.d_model):
+            self.w_raw[j] -= lr * self.grad_w_raw[j]
+            self.u[j] -= lr * self.grad_u[j]
+
+    def param_count(self):
+        """参数总数"""
+        total = 0
+        for name in ("Wr", "Wk", "Wv", "Wo", "Wr2", "Wk2", "Wv2", "Wo2"):
+            total += _dense_param_count(getattr(self, name))
+        total += _norm_param_count(self.ln1) + _norm_param_count(self.ln2)
+        total += 2 * self.d_model
+        return total
+
+
+class RWKVModel:
+    """RWKV 语言模型：Embedding → N×RWKVBlock → LayerNorm → 词表头"""
+
+    def __init__(self, vocab_size, d_model=32, d_ff=None, num_layers=2,
+                 max_len=64, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"RWKVModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"RWKVModel: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"RWKVModel: num_layers 必须是正整数，收到 {num_layers!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"RWKVModel: max_len 必须 >= 1，收到 {max_len!r}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.max_len = max_len
+        std = math.sqrt(2.0 / d_model)
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self._emb = [[random.gauss(0.0, std) for _ in range(d_model)]
+                         for _ in range(vocab_size)]
+        finally:
+            random.setstate(state)
+        self._emb_grad = [[0.0] * d_model for _ in range(vocab_size)]
+        self._last_ids = []
+        self.blocks = [RWKVBlock(d_model, d_ff, seed=None if seed is None else seed + i)
+                       for i in range(num_layers)]
+        self.ln_out = LayerNorm(d_model)
+        self._init_head()
+
+    def _init_head(self):
+        std = math.sqrt(2.0 / self.d_model)
+        self.W_out = Layer(self.d_model, self.vocab_size, "linear")
+        self.grad_W_out = None
+
+    def zero_grad(self):
+        for b in self.blocks:
+            b.zero_grad()
+        self.grad_W_out = None
+        self.grad_ln_out = None
+        for i in range(self.vocab_size):
+            row = self._emb_grad[i]
+            for j in range(self.d_model):
+                row[j] = 0.0
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _check_ids(self, ids):
+        ids = _check_token_ids(ids, self.vocab_size, "RWKVModel")
+        if not ids:
+            raise ValueError("RWKVModel: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"RWKVModel: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        return ids
+
+    def _embed(self, ids):
+        self._last_ids = ids
+        return [list(self._emb[i]) for i in ids]
+
+    def forward(self, ids):
+        ids = self._check_ids(ids)
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, c = _norm_rows_forward(self.ln_out, x)
+        logits_rows, head_cache = _dense_rows_forward(self.W_out, h)
+        return logits_rows
+
+    def embedding_backward(self, dx):
+        for t, i in enumerate(self._last_ids):
+            for j in range(self.d_model):
+                self._emb_grad[i][j] += dx[t][j]
+
+    def _run_loss_and_backward(self, ids, targets):
+        ids = self._check_ids(ids)
+        T = len(ids)
+        n_pred = T - 1
+        logits = []
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, c = _norm_rows_forward(self.ln_out, x)
+        logits, head_cache = _dense_rows_forward(self.W_out, h)
+
+        loss = 0.0
+        dlogits = [[0.0] * self.vocab_size for _ in range(T)]
+        for t in range(n_pred):
+            target = targets[t]
+            probs = _softmax_row(logits[t])
+            loss += -math.log(probs[target] if probs[target] > 1e-12 else 1e-12)
+            drow = dlogits[t]
+            for v in range(self.vocab_size):
+                drow[v] = probs[v] / n_pred
+            drow[target] -= 1.0 / n_pred
+
+        gW, gb, d_h = _dense_rows_backward(self.W_out, head_cache, dlogits)
+        self.grad_W_out = (gW, gb)
+        g_ln, b_ln, d_x = _norm_rows_backward(self.ln_out, c, d_h)
+        self.grad_ln_out = (g_ln, b_ln)
+
+        for block in reversed(self.blocks):
+            d_x = block.backward(d_x)
+        self.embedding_backward(d_x)
+        return loss / n_pred
+
+    def sgd_step(self, lr):
+        for block in self.blocks:
+            block.sgd_step(lr)
+        if self.grad_W_out is not None:
+            _dense_apply_sgd(self.W_out, self.grad_W_out, lr)
+        if self.grad_ln_out is not None:
+            _norm_apply_sgd(self.ln_out, self.grad_ln_out, lr)
+        if hasattr(self, "_emb_grad"):
+            for i in range(self.vocab_size):
+                for j in range(self.d_model):
+                    self._emb[i][j] -= lr * self._emb_grad[i][j]
+
+    def param_count(self):
+        total = self.vocab_size * self.d_model
+        for block in self.blocks:
+            total += block.param_count()
+        total += _norm_param_count(self.ln_out)
+        total += _dense_param_count(self.W_out)
+        return total
+
+    def fit(self, sequences, epochs=10, lr=0.01, shuffle=True, seed=None,
+            verbose=False):
+        """在若干 token 序列上训练，返回每个 epoch 的平均 loss"""
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("RWKVModel.fit: sequences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"RWKVModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or lr <= 0.0:
+            raise ValueError(f"RWKVModel.fit: lr 必须是正有限数，收到 {lr!r}")
+        rng = random.Random(seed)
+        history = []
+        for ep in range(epochs):
+            order = list(range(len(sequences)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                seq = self._check_ids(list(sequences[idx]))
+                if len(seq) < 2:
+                    raise ValueError("RWKVModel.fit: 每条序列至少需要 2 个 token")
+                self.zero_grad()
+                total += self._run_loss_and_backward(seq, seq[1:])
+                self.sgd_step(lr)
+            avg = total / len(sequences)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def generate(self, prompt_ids, max_new_tokens=8, temperature=1.0,
+                 top_k=None, seed=None):
+        """自回归采样生成"""
+        ids = self._check_ids(list(prompt_ids))
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+                or max_new_tokens < 0:
+            raise ValueError(
+                f"RWKVModel.generate: max_new_tokens 必须是非负整数，收到 {max_new_tokens!r}")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not math.isfinite(float(temperature)) or temperature <= 0.0:
+            raise ValueError(
+                f"RWKVModel.generate: temperature 必须是正有限数，收到 {temperature!r}")
+        if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool)
+                                  or top_k < 1):
+            raise ValueError(
+                f"RWKVModel.generate: top_k 必须是正整数或 None，收到 {top_k!r}")
+        rng = random.Random(seed)
+        out = list(ids)
+        for _ in range(max_new_tokens):
+            ctx = out[-(self.max_len - 1):] if self.max_len > 1 else out[-1:]
+            logits = self.forward(ctx)
+            row = logits[-1]
+            probs = _softmax_row([v / temperature for v in row])
+            if top_k is not None:
+                order = sorted(range(len(probs)), key=lambda i: probs[i],
+                               reverse=True)[:top_k]
+                keep = set(order)
+                probs = [p if i in keep else 0.0 for i, p in enumerate(probs)]
+                s = sum(probs)
+                probs = [p / s for p in probs]
+            r = rng.random()
+            acc = 0.0
+            pick = len(probs) - 1
+            for i, p in enumerate(probs):
+                acc += p
+                if r <= acc:
+                    pick = i
+                    break
+            out.append(pick)
+        return out
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 

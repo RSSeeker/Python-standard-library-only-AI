@@ -775,10 +775,14 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] RWKV：`RWKVBlock`（time-mixing 逐通道指数衰减状态 + channel-mixing `relu(k)²`
+  门控，手写时间反向）与 `RWKVModel`（Embedding → N×block → LM 头，含 `fit`/`generate`）；
+  测试 `TestRWKV` 5 例
+
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 1989 passed（新增 150 例）。
+全量测试：1839 → 1994 passed（新增 155 例）。
 
 ---
 

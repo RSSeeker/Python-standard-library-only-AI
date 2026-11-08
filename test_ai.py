@@ -30286,3 +30286,105 @@ class TestElectra:
         per_layer = 4 * d * d + 4 * d + 2 * d * ff + ff + d + 4 * d
         expect = (vocab + 1) * d + layers * per_layer + 2 * d + 2
         assert m.discriminator.param_count() == expect == 2402
+
+
+def _rwkv_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as err:  # noqa: BLE001
+        raise AssertionError(f"期望 {exc.__name__}，实际 {type(err).__name__}: {err}")
+    raise AssertionError(f"期望 {exc.__name__}，函数没有抛异常")
+
+
+class TestRWKV:
+    """RWKV 块与语言模型：形状/参数量/数值梯度/训练/生成/非法输入"""
+
+    @staticmethod
+    def _block(**kw):
+        cfg = dict(d_model=4, d_ff=8, seed=3)
+        cfg.update(kw)
+        return AI.RWKVBlock(**cfg)
+
+    def test_block_forward_and_param_count(self):
+        b = self._block()
+        x = [[0.1 * (t + j) for j in range(4)] for t in range(5)]
+        out = b.forward(x)
+        assert len(out) == 5 and len(out[0]) == 4
+        # 4 个 time-mixing 线性层 + 3 个通道混合线性层 + 输出投影 + 两层 LN + w_raw/u
+        assert b.param_count() == 260
+
+    def test_block_numerical_gradients(self):
+        b = self._block()
+        rng = random.Random(0)
+        x = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+        c = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+
+        def loss():
+            out = b.forward(x)
+            return sum(out[t][j] * c[t][j] for t in range(5) for j in range(4))
+
+        b.zero_grad()
+        b.forward(x)
+        b.backward(c)
+        eps = 1e-6
+
+        def num_grad(arr, i):
+            old = arr[i]
+            arr[i] += eps
+            lp = loss()
+            arr[i] = old - eps
+            lm = loss()
+            arr[i] = old
+            return (lp - lm) / (2 * eps)
+
+        def close(a, b):
+            return abs(a - b) <= 1e-4 * max(1.0, abs(a), abs(b))
+
+        assert close(num_grad(b.Wr.weights[0], 0), b.grads["Wr"][0][0][0])
+        assert close(num_grad(b.Wk2.weights[1], 0), b.grads["Wk2"][0][1][0])
+        assert close(num_grad(b.Wo2.weights[0], 0), b.grads["Wo2"][0][0][0])
+        assert close(num_grad(b.w_raw, 0), b.grad_w_raw[0])
+        assert close(num_grad(b.u, 0), b.grad_u[0])
+        assert close(num_grad(b.ln1.gamma, 0), b.norm_grads["ln1"][0][0])
+
+    def test_model_forward_fit_generate(self):
+        m = AI.RWKVModel(vocab_size=6, d_model=8, num_layers=1,
+                         max_len=8, seed=1)
+        ids = [1, 2, 3, 4, 5]
+        logits = m.forward(ids)
+        assert len(logits) == 5 and len(logits[0]) == 6
+
+        seqs = [[1, 2, 3, 4, 5], [0, 2, 4, 1, 3]]
+        hist = m.fit(seqs, epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+
+        out = m.generate([0, 1], max_new_tokens=3, temperature=0.8, seed=2)
+        assert len(out) == 5 and all(0 <= i < 6 for i in out)
+
+        out2 = m.generate([0, 1], max_new_tokens=3, temperature=0.8, seed=2)
+        assert out == out2
+
+        assert m.param_count() == 1582
+
+    def test_model_invalid_inputs(self):
+        m = AI.RWKVModel(vocab_size=6, d_model=8, num_layers=1, max_len=4)
+        _rwkv_raises(lambda: m.forward([]), ValueError)
+        _rwkv_raises(lambda: m.forward([1, 2, 3, 4, 5]), ValueError)   # 超长
+        _rwkv_raises(lambda: m.forward([1, 6]), ValueError)            # 越界
+        _rwkv_raises(lambda: m.forward([1, 1.5]), ValueError)          # 非 int
+        _rwkv_raises(lambda: m.fit([], epochs=2, lr=0.1), ValueError)
+        _rwkv_raises(lambda: m.fit([[3]], epochs=2, lr=0.1), ValueError)  # 单 token
+        _rwkv_raises(lambda: m.fit([[1, 2]], epochs=0, lr=0.1), ValueError)
+        _rwkv_raises(lambda: m.fit([[1, 2]], epochs=2, lr=-0.1), ValueError)
+        _rwkv_raises(lambda: m.generate([1, 2], max_new_tokens=2, temperature=0.0),
+               ValueError)
+        _rwkv_raises(lambda: m.generate([1, 2], max_new_tokens=2, top_k=0),
+               ValueError)
+
+    def test_block_invalid_inputs(self):
+        _rwkv_raises(lambda: AI.RWKVBlock(0), ValueError)
+        _rwkv_raises(lambda: AI.RWKVBlock(4, d_ff=0), ValueError)
+        b = self._block()
+        _rwkv_raises(lambda: b.backward([[0.0] * 4] * 5), RuntimeError)

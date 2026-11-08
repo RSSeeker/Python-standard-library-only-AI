@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1989 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1994 项）
 
 ## 特性
 
@@ -2044,6 +2044,28 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### RWKV（线性注意力式循环语言模型）
+
+RWKV 用逐通道的可学习指数衰减代替 softmax 注意力：状态按 token 顺序递推，
+每个 token 只需 O(d) 的状态更新，推理成本与序列长度线性相关。
+
+| API | 说明 |
+|---|---|
+| `RWKVBlock(d_model, d_ff=None, eps=1e-5, seed=None)` | time-mixing（`ln1 → Wr/Wk/Wv`，逐通道状态 `state = decay*state + k*v`，输出 `r ⊙ (state + u*v)`，`decay = exp(-exp(w_raw))`）+ channel-mixing（`ln2` 后 `r ⊙ relu(k)² ⊙ v`），手写反向与 SGD |
+| `RWKVModel(vocab_size, d_model=32, d_ff=None, num_layers=2, max_len=64, seed=None)` | 字符级语言模型：Embedding → N×`RWKVBlock` → `LayerNorm` → 词表头；`forward` / `loss_and_backward`（teacher forcing）/ `fit` / `generate` / `sgd_step` / `param_count` |
+
+```python
+import AI
+
+model = AI.RWKVModel(vocab_size=6, d_model=8, num_layers=1, max_len=8, seed=1)
+model.fit([[1, 2, 3, 4, 5]], epochs=40, lr=0.05)
+print(model.generate([0, 1], max_new_tokens=3, temperature=0.8))
+```
+
+边界：这是简化版 RWKV-4——不做 token-shift（不把上一 token 的输入混入当前 token），
+channel-mixing 使用 `relu(k)²` 而不是 GELU 变体，也没有 dropout；注意力退化为逐通道
+状态递推，因此训练时按完整序列前向/反向，不做并行扫描优化。
+
 ### 神经 ODE 与物理信息网络（Neural ODE / PINN）
 
 | API | 说明 |
@@ -3463,7 +3485,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1989 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1994 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3647,6 +3669,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSAC` | squashed-Gaussian 的采样/`log_prob` 一致性、确定性动作、SAC 双 Q 与目标网络初始化、更新损失、在合成环境上学到动作、非法输入 |
 | `TestSelectiveScan` | Mamba S6 扫描的前向 naive 对比、`ddelta` 的滞后梯度、`dA`/`dB`/`dC`/`dD` 有限差分、`delta=0` 与 `D=None` 边界、非法输入 |
 | `TestMambaBlockAndModel` | `MambaBlock` 前向/参数量/反向形状、卷积与 `A`/`D`/`in_proj` 梯度有限差分、`MambaModel` 拟合与生成、非法输入 |
+| `TestRWKV` | `RWKVBlock` 前向/参数量、`Wr`/`Wk2`/`Wo2`/`w_raw`/`u`/`ln1` 梯度有限差分、`RWKVModel` 拟合与采样生成、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3772,7 +3795,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1989 个单元测试
+├── test_ai.py       # 1994 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
