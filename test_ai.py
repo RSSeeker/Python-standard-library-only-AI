@@ -28868,3 +28868,94 @@ class TestViTEntryPoints:
                             ValueError)
         assert self._raises(lambda: model.pretrain(imgs, epochs=0), ValueError)
         assert self._raises(lambda: model.pretrain(imgs, lr=-0.1), ValueError)
+
+
+class TestAdvancedMetrics:
+    def test_mahalanobis_scores_and_ood(self):
+        feats = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+        model = AI.fit_mahalanobis(feats)
+        assert model["dim"] == 2
+        assert model["mean"] == [0.5, 0.5]
+        center = AI.mahalanobis_distance([0.5, 0.5], model)
+        far = AI.mahalanobis_distance([8.0, 8.0], model)
+        assert center < 1e-9
+        assert far > 10.0
+        scores = AI.mahalanobis_scores(feats, model)
+        assert len(scores) == 4
+        assert all(s >= 0.0 for s in scores)
+        auroc = AI.ood_mahalanobis_auroc(feats, [[8.0, 8.0], [9.0, 9.0]])
+        assert auroc == 1.0
+
+    def test_mahalanobis_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.fit_mahalanobis([])
+        with pytest.raises(ValueError):
+            AI.fit_mahalanobis([[1.0, 2.0], [3.0]])
+        with pytest.raises(ValueError):
+            AI.fit_mahalanobis([[1.0], []])
+        with pytest.raises(ValueError):
+            AI.fit_mahalanobis([[1.0, 2.0]], eps=0.0)
+        model = AI.fit_mahalanobis([[0.0, 0.0], [1.0, 1.0]])
+        with pytest.raises(ValueError):
+            AI.mahalanobis_distance([1.0, 2.0, 3.0], model)
+        with pytest.raises(ValueError):
+            AI.mahalanobis_distance([1.0, 2.0], {})
+        with pytest.raises(ValueError):
+            AI.mahalanobis_scores([[1.0]], model)
+
+    def test_conformal_quantile_and_sets(self):
+        scores = [0.1, 0.2, 0.3, 0.4, 0.5]
+        assert AI.conformal_quantile(scores, 0.2) == 0.5
+        assert AI.conformal_quantile(scores, 0.5) == 0.3
+        assert AI.conformal_quantile([0.1], 0.1) == float("inf")
+        with pytest.raises(ValueError):
+            AI.conformal_quantile([], 0.1)
+        with pytest.raises(ValueError):
+            AI.conformal_quantile(scores, 0.0)
+        with pytest.raises(ValueError):
+            AI.conformal_quantile(scores, 1.0)
+        proba = [[0.9], [0.4]]
+        assert AI.conformal_prediction_sets(proba, 0.5) == [[1], [0]]
+        with pytest.raises(ValueError):
+            AI.conformal_prediction_sets(proba, -0.1)
+        with pytest.raises(ValueError):
+            AI.conformal_prediction_sets([[1.5]], 0.5)
+
+    def test_conformal_coverage_and_size(self):
+        proba = [[0.9], [0.4]]
+        assert AI.conformal_coverage([1, 0], proba, 0.5) == 1.0
+        assert AI.conformal_coverage([0, 1], proba, 0.5) == 0.0
+        assert AI.average_conformal_set_size(proba, 0.5) == 1.0
+        assert AI.average_conformal_set_size(proba, float("inf")) == 2.0
+        with pytest.raises(ValueError):
+            AI.conformal_coverage([2, 0], proba, 0.5)
+
+    def test_robust_accuracy_and_asr(self):
+        assert AI.robust_accuracy([0, 1, 1], [0, 1, 0]) == pytest.approx(2.0 / 3.0)
+        assert AI.adversarial_success_rate(
+            [0, 1, 1], [0, 1, 0], [1, 1, 1]) == pytest.approx(0.5)
+        with pytest.raises(ValueError):
+            AI.adversarial_success_rate([0, 1], [1, 0], [0, 1])
+        with pytest.raises(ValueError):
+            AI.robust_accuracy([0, 1], [0])
+
+    def test_equalized_odds_difference(self):
+        y_true = [1, 0, 1, 0, 1, 0, 1, 0]
+        y_pred = [1, 0, 0, 1, 1, 1, 1, 0]
+        sens = ["a", "a", "a", "a", "b", "b", "b", "b"]
+        assert AI.equalized_odds_difference(y_true, y_pred, sens) == pytest.approx(0.5)
+        assert AI.equalized_odds_difference(y_true, y_true, sens) == pytest.approx(0.0)
+        with pytest.raises(ValueError):
+            AI.equalized_odds_difference(y_true, y_pred, ["a"] * 8)
+        with pytest.raises(ValueError):
+            AI.equalized_odds_difference(y_true, y_pred[:3], sens)
+
+    def test_group_calibration_error(self):
+        yt = [0, 1, 0, 1]
+        yp = [[0.1], [0.9], [1.0], [0.0]]
+        sg = ["a", "a", "b", "b"]
+        assert AI.group_calibration_error(yt, yp, sg) == pytest.approx(0.9)
+        with pytest.raises(ValueError):
+            AI.group_calibration_error(yt, yp, ["a"] * 4)
+        with pytest.raises(ValueError):
+            AI.group_calibration_error(yt, yp[:3], sg)

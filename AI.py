@@ -43614,6 +43614,63 @@ def disparate_impact_ratio(y_pred, sensitive, positive_label: int = 1) -> float:
     return min(rates) / hi
 
 
+def equalized_odds_difference(y_true, y_pred, sensitive,
+                              positive_label: int = 1) -> float:
+    """均等化胜率差：各分组 TPR 差与 FPR 差中的最大值（0 为完全均等）。"""
+    who = "equalized_odds_difference"
+    yt, s1 = _fair_check(y_true, sensitive, who, "y_true")
+    yp, s2 = _fair_check(y_pred, sensitive, who, "y_pred")
+    groups = _fair_groups(s1, who)
+    pos = _metric_label(positive_label, who, 0)
+    tprs = []
+    fprs = []
+    for idx in groups.values():
+        positives = [i for i in idx
+                     if _metric_label(yt[i], who, i) == pos]
+        negatives = [i for i in idx
+                     if _metric_label(yt[i], who, i) != pos]
+        if positives:
+            hit = sum(1 for i in positives
+                      if _metric_label(yp[i], who, i) == pos)
+            tprs.append(hit / float(len(positives)))
+        if negatives:
+            hit = sum(1 for i in negatives
+                      if _metric_label(yp[i], who, i) == pos)
+            fprs.append(hit / float(len(negatives)))
+    gaps = []
+    if len(tprs) >= 2:
+        gaps.append(max(tprs) - min(tprs))
+    if len(fprs) >= 2:
+        gaps.append(max(fprs) - min(fprs))
+    if not gaps:
+        raise ValueError(
+            f"{who}: 分组内正/负样本不足，无法比较均等化胜率")
+    return max(gaps)
+
+
+def group_calibration_error(y_true, y_proba, sensitive, n_bins: int = 10,
+                            strategy: str = "uniform") -> float:
+    """分组校准差：各分组 ECE 的 `max − min`（0 为各组校准一致）。"""
+    who = "group_calibration_error"
+    yt, s1 = _fair_check(y_true, sensitive, who, "y_true")
+    rows, classes = _proba_rows(y_proba, who)
+    if len(rows) != len(yt):
+        raise ValueError(f"{who}: y_proba 行数 {len(rows)} 与标签数 {len(yt)} 不同")
+    groups = _fair_groups(s1, who)
+    eces = []
+    for idx in groups.values():
+        sub_y = [yt[i] for i in idx]
+        if len(rows[0]) == 1:
+            sub_p = [[1.0 - rows[i][0], rows[i][0]] for i in idx]
+        else:
+            sub_p = [list(rows[i]) for i in idx]
+        eces.append(
+            expected_calibration_error(sub_y, sub_p, n_bins, strategy))
+    if len(eces) < 2:
+        raise ValueError(f"{who}: 至少需要 2 个分组")
+    return max(eces) - min(eces)
+
+
 def psnr_score(a, b, data_range: float = 1.0) -> float:
     """PSNR = `10*log10(range²/MSE)`；完全相同时返回 `inf`。"""
     who = "psnr_score"
@@ -44451,6 +44508,227 @@ def pr_auc_score(y_true, y_score) -> float:
         area += (recall - prev_recall) * precision
         prev_recall = recall
     return area
+
+
+# ---------------------------------------------------------------------------
+#  高级评估：Mahalanobis OOD / Conformal Prediction / 鲁棒性
+# ---------------------------------------------------------------------------
+
+def _feature_matrix_rows(features, who):
+    """校验特征矩阵：非空、每行非空、等宽、元素为有限数字。"""
+    if not isinstance(features, (list, tuple)) or not features:
+        raise ValueError(f"{who}: features 必须是非空列表")
+    rows = []
+    width = None
+    for i, row in enumerate(features):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 个特征必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 个特征维度 {len(row)} 与第一个 {width} 不一致")
+        rows.append(
+            [_metric_number(v, f"{who}.features[{i}]", j)
+             for j, v in enumerate(row)])
+    return rows, width
+
+
+def _matrix_inverse(a, who):
+    """Gauss-Jordan 求逆（部分选主元）；奇异矩阵报错。"""
+    n = len(a)
+    aug = [list(a[i]) + [1.0 if i == j else 0.0 for j in range(n)]
+           for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-12:
+            raise ValueError(f"{who}: 协方差矩阵奇异，无法求逆")
+        if pivot != col:
+            aug[col], aug[pivot] = aug[pivot], aug[col]
+        pv = aug[col][col]
+        aug[col] = [v / pv for v in aug[col]]
+        for r in range(n):
+            if r == col:
+                continue
+            f = aug[r][col]
+            if f != 0.0:
+                aug[r] = [x - f * y for x, y in zip(aug[r], aug[col])]
+    return [row[n:] for row in aug]
+
+
+def _mean_vector(rows):
+    """按列求均值。"""
+    n = float(len(rows))
+    return [sum(row[j] for row in rows) / n for j in range(len(rows[0]))]
+
+
+def _covariance_matrix(rows, mean, eps):
+    """总体协方差（除以 n）+ 对角线 ridge eps。"""
+    n = float(len(rows))
+    d = len(mean)
+    cov = [[0.0] * d for _ in range(d)]
+    for row in rows:
+        diff = [row[j] - mean[j] for j in range(d)]
+        for a in range(d):
+            da = diff[a]
+            row_cov = cov[a]
+            for b in range(d):
+                row_cov[b] += da * diff[b]
+    inv_n = 1.0 / n
+    return [[cov[a][b] * inv_n + (float(eps) if a == b else 0.0)
+             for b in range(d)] for a in range(d)]
+
+
+def fit_mahalanobis(features, eps: float = 1e-6):
+    """用特征拟合高斯模型，返回 `{"mean", "inv_cov", "dim"}`。"""
+    who = "fit_mahalanobis"
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not float(eps) > 0.0:
+        raise ValueError(f"{who}: eps 必须是正数，收到 {eps!r}")
+    rows, dim = _feature_matrix_rows(features, who)
+    mean = _mean_vector(rows)
+    cov = _covariance_matrix(rows, mean, eps)
+    inv = _matrix_inverse(cov, who)
+    return {"mean": mean, "inv_cov": inv, "dim": dim}
+
+
+def mahalanobis_distance(x, model, who: str = "mahalanobis_distance"):
+    """单样本到高斯模型的马氏距离。"""
+    if not isinstance(model, dict) or "mean" not in model or "inv_cov" not in model:
+        raise ValueError(f"{who}: model 必须是 fit_mahalanobis 的返回值")
+    dim = int(model["dim"])
+    if not isinstance(x, (list, tuple)) or len(x) != dim:
+        raise ValueError(f"{who}: x 必须是长度 {dim} 的向量")
+    row = [_metric_number(v, f"{who}.x", j) for j, v in enumerate(x)]
+    diff = [row[j] - model["mean"][j] for j in range(dim)]
+    quad = 0.0
+    for a in range(dim):
+        for b in range(dim):
+            quad += diff[a] * model["inv_cov"][a][b] * diff[b]
+    return math.sqrt(max(0.0, quad))
+
+
+def mahalanobis_scores(features, model, who: str = "mahalanobis_scores"):
+    """批量马氏距离（越小越像 in-distribution）。"""
+    rows, _ = _feature_matrix_rows(features, who)
+    return [mahalanobis_distance(row, model) for row in rows]
+
+
+def ood_mahalanobis_auroc(in_features, ood_features, eps: float = 1e-6) -> float:
+    """用 in-distribution 特征拟合高斯，返回马氏距离的 OOD AUROC。"""
+    who = "ood_mahalanobis_auroc"
+    model = fit_mahalanobis(in_features, eps)
+    in_scores = mahalanobis_scores(in_features, model, who)
+    ood_scores = mahalanobis_scores(ood_features, model, who)
+    # ood_detection_auroc 约定分数越大越像 in-distribution，这里距离越小越像
+    return ood_detection_auroc([-s for s in in_scores], [-s for s in ood_scores])
+
+
+def _proba_rows(y_proba, who):
+    """概率矩阵 → (rows, 类别数)；单列视为二分类正类概率。"""
+    seq = list(y_proba)
+    if not seq:
+        raise ValueError(f"{who}: y_proba 不能为空")
+    rows = _proba_matrix(seq, len(seq), who)
+    width = len(rows[0])
+    classes = 2 if width == 1 else width
+    for i, row in enumerate(rows):
+        for c, p in enumerate(row):
+            if not 0.0 <= p <= 1.0:
+                raise ValueError(
+                    f"{who}: y_proba[{i}][{c}] = {p} 不在 [0, 1] 内")
+    return rows, classes
+
+
+def conformal_quantile(scores, alpha: float = 0.1) -> float:
+    """split-conformal 的分位数：`ceil((n+1)(1-alpha))` 阶顺序统计量。
+
+    超过样本数时返回 `inf`（保证有限样本覆盖率 ≥ 1-alpha）。
+    """
+    who = "conformal_quantile"
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float))             or not 0.0 < float(alpha) < 1.0:
+        raise ValueError(f"{who}: alpha 必须在 (0, 1) 内，收到 {alpha!r}")
+    vals = [_metric_number(v, f"{who}.scores", i) for i, v in enumerate(scores)]
+    if not vals:
+        raise ValueError(f"{who}: scores 不能为空")
+    n = len(vals)
+    k = int(math.ceil((n + 1) * (1.0 - float(alpha))))
+    if k > n:
+        return float("inf")
+    return sorted(vals)[k - 1]
+
+
+def conformal_prediction_sets(y_proba, q) -> list:
+    """给定非一致性分位数 q，返回每个样本的预测标签集合。"""
+    who = "conformal_prediction_sets"
+    if isinstance(q, bool) or not isinstance(q, (int, float)) or float(q) < 0.0:
+        raise ValueError(f"{who}: q 必须是非负数，收到 {q!r}")
+    rows, _ = _proba_rows(y_proba, who)
+    qv = float(q)
+    out = []
+    for row in rows:
+        probs = [1.0 - row[0], row[0]] if len(row) == 1 else row
+        out.append([c for c, p in enumerate(probs) if 1.0 - p <= qv + 1e-12])
+    return out
+
+
+def conformal_coverage(y_true, y_proba, q) -> float:
+    """经验覆盖率：真实标签落在 conformal 预测集合里的比例。"""
+    who = "conformal_coverage"
+    yt, _ = _metric_pairs(y_true, list(y_true), who)
+    rows, classes = _proba_rows(y_proba, who)
+    if len(rows) != len(yt):
+        raise ValueError(f"{who}: y_proba 行数 {len(rows)} 与标签数 {len(yt)} 不同")
+    sets = conformal_prediction_sets(y_proba, q)
+    hits = 0
+    for i, (t, s) in enumerate(zip(yt, sets)):
+        tv = _metric_label(t, f"{who}.y_true", i)
+        if not 0 <= tv < classes:
+            raise ValueError(f"{who}: y_true[{i}] = {tv} 超出标签范围 0..{classes - 1}")
+        if tv in s:
+            hits += 1
+    return hits / float(len(yt))
+
+
+def average_conformal_set_size(y_proba, q) -> float:
+    """平均预测集合大小（效率指标，越小越好）。"""
+    who = "average_conformal_set_size"
+    sets = conformal_prediction_sets(y_proba, q)
+    return sum(len(s) for s in sets) / float(len(sets))
+
+
+def robust_accuracy(y_true, adv_pred) -> float:
+    """对抗扰动后的分类准确率。"""
+    who = "robust_accuracy"
+    yt, yp = _metric_pairs(y_true, adv_pred, who)
+    if not yt:
+        raise ValueError(f"{who}: 样本不能为空")
+    hits = 0
+    for i in range(len(yt)):
+        tv = _metric_label(yt[i], f"{who}.y_true", i)
+        pv = _metric_label(yp[i], f"{who}.adv_pred", i)
+        if tv == pv:
+            hits += 1
+    return hits / float(len(yt))
+
+
+def adversarial_success_rate(y_true, clean_pred, adv_pred) -> float:
+    """攻击成功率：干净样本分类正确、对抗样本分类错误的比例。"""
+    who = "adversarial_success_rate"
+    yt, cp = _metric_pairs(y_true, clean_pred, who)
+    _, ap = _metric_pairs(y_true, adv_pred, who + ".adv")
+    clean_ok = []
+    for i in range(len(yt)):
+        tv = _metric_label(yt[i], f"{who}.y_true", i)
+        if _metric_label(cp[i], f"{who}.clean_pred", i) == tv:
+            clean_ok.append(i)
+    if not clean_ok:
+        raise ValueError(f"{who}: 没有干净样本被正确分类，成功率无定义")
+    success = 0
+    for i in clean_ok:
+        tv = _metric_label(yt[i], f"{who}.y_true", i)
+        if _metric_label(ap[i], f"{who}.adv_pred", i) != tv:
+            success += 1
+    return success / float(len(clean_ok))
 
 
 # ============================================================================

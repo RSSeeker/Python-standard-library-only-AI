@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1900 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1907 项）
 
 ## 特性
 
@@ -1459,6 +1459,33 @@ for row in reliability_diagram(y, p, n_bins=5):
 - ECE/MCE 只统计非空箱，所以输出恒为「有样本的箱」的加权或最大值；概率要求落在
   `[0,1]`（不做归一化，softmax 输出可直接传）。
 
+### 高级评估（OOD / Conformal / 鲁棒性）
+
+| 函数 | 说明 |
+|---|---|
+| `fit_mahalanobis(features, eps=1e-6)` | 拟合高斯模型 `{"mean","inv_cov","dim"}`，协方差对角线加 ridge `eps` |
+| `mahalanobis_distance(x, model)` / `mahalanobis_scores(features, model)` | 单样本 / 批量马氏距离（越小越像 in-distribution） |
+| `ood_mahalanobis_auroc(in_features, ood_features, eps=1e-6)` | 用 in-distribution 特征拟合，返回马氏距离的 OOD AUROC |
+| `conformal_quantile(scores, alpha=0.1)` | split-conformal 的分位数：`ceil((n+1)(1-alpha))` 阶顺序统计量，超出返回 `inf` |
+| `conformal_prediction_sets(y_proba, q)` | 每个样本的预测标签集合 `{c : 1-p_c <= q}` |
+| `conformal_coverage(y_true, y_proba, q)` / `average_conformal_set_size(y_proba, q)` | 经验覆盖率 / 平均集合大小 |
+| `robust_accuracy(y_true, adv_pred)` | 对抗扰动后的分类准确率 |
+| `adversarial_success_rate(y_true, clean_pred, adv_pred)` | 干净样本分对、对抗样本分错的比例 |
+
+```python
+feats = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+model = fit_mahalanobis(feats)
+print(mahalanobis_distance([8.0, 8.0], model))                 # 21.213...
+print(ood_mahalanobis_auroc(feats, [[8.0, 8.0], [9.0, 9.0]]))  # 1.0
+scores = [0.1, 0.2, 0.3, 0.4, 0.5]
+q = conformal_quantile(scores, 0.2)                            # 0.5
+print(conformal_prediction_sets([[0.9], [0.4]], q))            # [[1], [0]]
+```
+
+口径说明：马氏距离用总体协方差（除以 n）加 ridge `eps`，奇异时抛 `ValueError`；
+conformal 是 split-conformal，`q` 由校准集分数用 `conformal_quantile` 得到，预测集合取
+`1-p_c <= q`；鲁棒性两项只做描述统计，不包含攻击实现。
+
 ### 检测指标
 
 | 函数 | 说明 |
@@ -1550,6 +1577,8 @@ print(deep_lift(net, [1.0, 2.0]))               # 同一差值的乘子分解
 | `demographic_parity_difference(y_pred, sensitive)` | 各组正预测率的 `max − min` |
 | `equal_opportunity_difference(y_true, y_pred, sensitive)` | 各组真阳率的 `max − min`，无正样本的分组被跳过 |
 | `disparate_impact_ratio(y_pred, sensitive)` | 各组正预测率的 `min / max`（0.8 以下常视为有问题） |
+| `equalized_odds_difference(y_true, y_pred, sensitive)` | 均等化胜率差：各分组 TPR 差与 FPR 差中的最大值 |
+| `group_calibration_error(y_true, y_proba, sensitive, n_bins=10)` | 分组校准差：各分组 ECE 的 `max − min` |
 
 ```python
 print(fleiss_kappa([[0, 0, 0], [1, 1, 1], [0, 0, 1]]))        # 0.55
@@ -3330,7 +3359,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1900 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1907 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3458,6 +3487,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMLPMixer` | 形状与参数量 891、`dx` 与 block 内 `t1/t2/c1/c2` 四组权重梯度中心差分、head 与 block 内 LayerNorm 梯度中心差分、两次 `backward` 线性累加且 `zero_grad` 清空、120 步 Adam 收敛且 4 张图全对、9 类非法输入 |
 | `TestSwinTransformer` | 窗口划分与移位 `perm` 语义、形状与参数量 1243、`dx` 与 block 内 `q/k/v/o/f1/f2` 六组权重梯度中心差分、head 与 block 内 LayerNorm 梯度、累加语义与 `zero_grad`、150 步 Adam 收敛且 4 张图全对、10 类非法输入 |
 | `TestSwinMaskAndPatchMerging` | 移位窗口 mask 结构（同/异原始窗口的 0/-inf、跨窗口隔离）、`PatchMerging` 前向/反向与 reduction 权重中心差分、非法输入、层级 Swin（4×4→2×2）前向/反向/输入梯度差分、默认单 stage 参数 1243 兼容 |
+| `TestAdvancedMetrics` | Mahalanobis 距离与 OOD AUROC、conformal 分位/预测集合/覆盖率/集合大小、鲁棒准确率与攻击成功率、均等化胜率差、分组校准差，以及各函数非法输入 |
 | `TestRoPEScaling` | `rope_inv_freqs` 的 none/linear/NTK 闭式解、YaRN 两端点退化与逐项夹逼、MHA 默认频率不变、缩放后 `W_q/W_k/W_v/W_o` 梯度仍与中心差分一致 ≤1e-6、7 类非法参数 |
 | `TestLearnedPositionalEncoding` | 加常数语义、`param_count`、`dx == dout`、梯度累加、`sgd_step` 精确 `lr*grad`、`adam_step` 真的更新、超长输入自动扩表、8 类非法输入 |
 | `TestLinearAttention` | 形状与参数量 168、单头非 causal 闭式解、causal 的「改尾部不影响前部」、`W_q/W_k/W_v/W_o` 与输入梯度中心差分（两种模式 ≤1e-5）、梯度累加与 `zero_grad`、`sgd_step`/`adam_step` 真更新、120 步 Adam 收敛、9 类非法输入 |
@@ -3623,7 +3653,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1900 个单元测试
+├── test_ai.py       # 1907 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
