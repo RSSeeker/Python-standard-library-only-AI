@@ -775,6 +775,10 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] 投机解码（Medusa / EAGLE）：`MedusaHeads`（K 个线性头共享目标模型隐藏状态，预测未来 1..K 个 token，
+  含 `loss_and_backward`/`sgd_step`）与 `medusa_decode`（多头草稿 + 目标模型贪心验证，被拒回退）；
+  `EagleDrafter`（特征级草稿器：`tanh(W_f·feature+W_e·emb(prev))` → 词表 logits，自回归草稿）与
+  `eagle_decode`（特征草稿链 + 一次验证）；测试 `TestMedusaEagle` 5 例
 - [x] ONNX 导出：`export_onnx_mlp`（`MLP` → 手写 protobuf 的 ONNX ModelProto：每层 `Gemm`(transB=1)
   + 激活节点，`ir_version=8`/`opset=13`）、`onnx_mlp_to_dict`（解析为嵌套 dict）、
   `onnx_mlp_forward`（纯 Python 执行 Gemm/Relu/LeakyRelu/Tanh/Sigmoid/Softmax/Identity）；
@@ -807,7 +811,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2044 passed（新增 205 例）。
+全量测试：1839 → 2049 passed（新增 210 例）。
 
 ---
 

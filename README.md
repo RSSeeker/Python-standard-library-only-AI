@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2044 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2049 项）
 
 ## 特性
 
@@ -3139,7 +3139,38 @@ print(out["ids"], out["stats"]["accept_rate"])
 
 - **分布等价只在采样温度 1 下成立**。拒绝采样修正的是「按概率接受、否则用残差分布重采样」，任何温度缩放/截断采样都必须放到两个回调内部，本函数不再做二次修正。
 - **`target_calls` 才是真正省下的量**。`draft_calls` 每个候选都要算一次，所以草稿比目标便宜才有收益；`tokens_per_target_call` 小于 1 时这轮投机是亏的。
-- **Medusa / EAGLE 只解释机制、不实现**。Medusa 需要额外训练多个预测头并做树形验证，EAGLE 需要特征级草稿与对齐训练；本库没有这些权重，故只在本节说明差异，不提供空壳接口。
+- **Medusa / EAGLE 的轻量实现见下一节**：Medusa 用多个预测头共享目标模型隐藏状态，EAGLE 用特征级草稿器；两者都只用目标模型的贪心验证，没有预训练权重。
+
+### 投机解码：Medusa 多头 / EAGLE 特征草稿
+
+`speculative_generate` / `speculative_decode` 用「独立的草稿模型 + 目标模型」；Medusa 和 EAGLE
+改成让草稿直接挂在目标模型的内部表示上，省掉一整份草稿模型：
+
+| API | 语义要点 |
+|---|---|
+| `MedusaHeads(d_model, vocab_size, num_heads=4, seed=None)` | `num_heads` 个独立线性头，输入同一个隐藏状态 `h_t`，第 k 个头预测 `t+1+k`；`forward(hidden_rows)` 返回每头 logits、`loss_and_backward(hidden_rows, targets)` 按头算交叉熵并回填梯度、`sgd_step(lr)`、`param_count()` |
+| `medusa_decode(target, prompt_ids, heads, max_new_tokens=8, eos_id=None)` | 每一轮：目标模型前向拿 `target.h[-1]` → 多头草稿 → 目标模型一次验证 `prompt+草稿` → 接受连续匹配的贪心前缀，否则回退目标模型自己的下一个 token；返回 `{"ids", "tokens", "stats"}` |
+| `EagleDrafter(d_model, vocab_size, hidden=64, seed=None)` | 特征级草稿器：`tanh(W_f·feature + W_e·emb(prev) + b)` → 词表 logits；`draft(feature, prev_token, k, embed_weight, vocab_size)` 自回归出 k 个草稿 token |
+| `eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=None)` | 用目标模型最后隐藏状态当 `feature`，先取目标贪心 token 起头，再让草稿器连出 `gamma-1` 个，一次前向验证整条链；返回结构同 `medusa_decode` |
+
+```python
+lm = AI.CausalLM(vocab_size=32, d_model=16, num_heads=2, num_layers=1)
+heads = AI.MedusaHeads(16, 32, num_heads=4)
+res = AI.medusa_decode(lm, [1, 2, 3], heads, max_new_tokens=8)
+print(res["tokens"], res["stats"]["accept_rate"])
+
+drafter = AI.EagleDrafter(16, 32, hidden=32)
+res2 = AI.eagle_decode(lm, [1, 2, 3], drafter, max_new_tokens=8, gamma=4)
+```
+
+边界与口径：
+
+- 多头/草稿器都是**随机初始化、未训练**的教学实现：`MedusaHeads` 提供 `loss_and_backward` +
+  `sgd_step` 可以自己对齐，`EagleDrafter` 只给了前向和草稿，没有内置训练循环。
+- 验证按**目标模型的贪心 token** 做严格匹配；因而 `medusa_decode` / `eagle_decode` 的输出与
+  「目标模型逐 token 贪心生成」逐位一致。采样温度、树形候选、top-k 分叉都没有实现。
+- `stats` 里 `drafted` / `accepted` / `target_calls` / `accept_rate` 只统计本函数内的调用；
+  草稿全被拒时 `accept_rate` 为 0，是合法结果，不代表接口坏了。
 
 ### GAN 变体族
 
@@ -3657,7 +3688,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2044 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2049 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3861,6 +3892,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAudioMetrics` | STOI 对加噪等级的单调性、极性反转与长度裁剪、PESQ 单调性与 [1,4.5] 边界、两项指标的非法输入 |
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
+| `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
@@ -3977,7 +4009,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2044 个单元测试
+├── test_ai.py       # 2049 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

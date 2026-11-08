@@ -31462,3 +31462,94 @@ class TestOnnxExport:
         _onnx_raises(lambda: AI.onnx_mlp_forward(data, [[1.0, "x"]]), exc=TypeError)
         _onnx_raises(lambda: AI.onnx_mlp_forward(data, [[1.0, True]]), exc=TypeError)
         _onnx_raises(lambda: AI.onnx_mlp_forward(data, []))
+
+
+def _me_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestMedusaEagle:
+    def test_medusa_heads_forward_and_params(self):
+        heads = AI.MedusaHeads(d_model=8, vocab_size=5, num_heads=3, seed=1)
+        assert heads.param_count() == 3 * (8 * 5 + 5)
+        hidden = [[0.2, -0.1, 0.3, 0.0, 0.1, -0.2, 0.4, 0.0],
+                  [0.1, 0.2, -0.3, 0.1, 0.0, 0.2, -0.1, 0.3]]
+        outs, caches = heads.forward(hidden)
+        assert len(outs) == 3 and len(caches) == 3
+        for k in range(3):
+            assert len(outs[k]) == 2 and len(outs[k][0]) == 5
+        probs = heads.predict(hidden[0])
+        assert len(probs) == 3
+        for p in probs:
+            assert len(p) == 5
+            assert abs(sum(p) - 1.0) < 1e-9
+
+    def test_medusa_heads_gradients(self):
+        heads = AI.MedusaHeads(d_model=4, vocab_size=3, num_heads=2, seed=4)
+        hidden = [[0.3, -0.2, 0.1, 0.5]]
+        targets = [[1], [2]]
+        heads.zero_grad()
+        loss = heads.loss_and_backward(hidden, targets)
+        assert loss > 0.0
+        analytic = heads.grads[0][0][0][0]
+        w0 = heads.heads[0].weights[0][0]
+        eps = 1e-6
+        heads.heads[0].weights[0][0] = w0 + eps
+        lp = heads.loss_and_backward(hidden, targets)
+        heads.heads[0].weights[0][0] = w0 - eps
+        lm = heads.loss_and_backward(hidden, targets)
+        heads.heads[0].weights[0][0] = w0
+        fd = (lp - lm) / (2 * eps)
+        assert abs(analytic - fd) < 1e-4 * max(1.0, abs(fd)), (analytic, fd)
+
+    def test_medusa_decode_matches_greedy(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=24)
+        heads = AI.MedusaHeads(d_model=8, vocab_size=5, num_heads=3, seed=2)
+        res = AI.medusa_decode(lm, [0, 1], heads, max_new_tokens=4)
+        greedy = AI._me_greedy(lm, [0, 1], 4)
+        assert res["tokens"] == greedy
+        assert res["ids"] == [0, 1] + greedy
+        stats = res["stats"]
+        assert stats["target_calls"] >= 2
+        assert 0.0 <= stats["accept_rate"] <= 1.0
+        # 草稿头若全空，接受数为 0 也合法；这里只验证统计自洽
+        assert stats["drafted"] >= stats["accepted"]
+
+    def test_eagle_drafter_and_decode(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=24)
+        drafter = AI.EagleDrafter(d_model=8, vocab_size=5, hidden=16, seed=3)
+        assert drafter.param_count() == 2 * 16 * 8 + 16 + 5 * 16 + 5
+        logits = drafter.forward([0.1] * 8, [0.2] * 8)
+        assert len(logits) == 5
+        drafts = drafter.draft([0.1] * 8, 0, 3, lm.embedding.weight, 5)
+        assert len(drafts) == 3
+        assert all(isinstance(t, int) and 0 <= t < 5 for t in drafts)
+        res = AI.eagle_decode(lm, [0, 1], drafter, max_new_tokens=4, gamma=3)
+        greedy = AI._me_greedy(lm, [0, 1], 4)
+        assert res["tokens"] == greedy
+        assert res["stats"]["target_calls"] >= 2
+
+    def test_medusa_eagle_invalid_inputs(self):
+        _me_raises(lambda: AI.MedusaHeads(0, 5), ValueError)
+        _me_raises(lambda: AI.MedusaHeads(4, 0), ValueError)
+        _me_raises(lambda: AI.MedusaHeads(4, 5, num_heads=0), ValueError)
+        _me_raises(lambda: AI.MedusaHeads("4", 5), TypeError)
+        heads = AI.MedusaHeads(4, 3, num_heads=2, seed=1)
+        _me_raises(lambda: heads.forward([]), ValueError)
+        _me_raises(lambda: heads.loss_and_backward([[0.0] * 4], [[1]]), ValueError)
+        _me_raises(lambda: heads.loss_and_backward([[0.0] * 4], [[1], [3]]), ValueError)
+        lm = AI.CausalLM(vocab_size=3, d_model=4, num_heads=2, num_layers=1, max_len=8)
+        _me_raises(lambda: AI.medusa_decode(lm, [], heads), ValueError)
+        _me_raises(lambda: AI.medusa_decode(lm, [0, 99], heads), ValueError)
+        _me_raises(lambda: AI.medusa_decode(lm, [0], "not heads"), TypeError)
+        d = AI.EagleDrafter(d_model=4, vocab_size=3, hidden=8, seed=1)
+        _me_raises(lambda: AI.eagle_decode(lm, [0], d, max_new_tokens=2, gamma=0), ValueError)
+        _me_raises(lambda: AI.eagle_decode(lm, [0], "not drafter"), TypeError)
+        _me_raises(lambda: d.forward([0.0] * 3, [0.0] * 4), ValueError)
+        _me_raises(lambda: d.draft([0.0] * 4, 0, -1, lm.embedding.weight, 3), ValueError)

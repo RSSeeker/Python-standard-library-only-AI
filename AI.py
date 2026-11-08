@@ -39183,6 +39183,367 @@ class EGNNModel:
             history.append(total / len(graphs))
         return history
 
+"""Medusa / EAGLE 投机解码（轻量教学实现）"""
+
+
+def _me_check_int(value, name, minimum=None, maximum=None):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} 必须是整数，收到 {value!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} 必须 >= {minimum}，收到 {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} 必须 <= {maximum}，收到 {value}")
+    return value
+
+
+def _me_log_softmax(row):
+    m = max(row)
+    z = [math.exp(v - m) for v in row]
+    s = sum(z)
+    return [v - m - math.log(s) for v in row]
+
+
+def _me_softmax(row):
+    m = max(row)
+    z = [math.exp(v - m) for v in row]
+    s = sum(z)
+    return [v / s for v in z]
+
+
+def _me_argmax(row):
+    best = 0
+    for i in range(1, len(row)):
+        if row[i] > row[best]:
+            best = i
+    return best
+
+
+def _me_check_ids(ids, vocab_size, name="ids"):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"{name} 不能为空")
+    out = []
+    for i, tok in enumerate(ids):
+        if isinstance(tok, bool) or not isinstance(tok, int):
+            raise TypeError(f"{name}[{i}] 必须是整数，收到 {tok!r}")
+        if not 0 <= tok < vocab_size:
+            raise ValueError(f"{name}[{i}]={tok} 越界（词表大小 {vocab_size}）")
+        out.append(tok)
+    return out
+
+
+class MedusaHeads:
+    """Medusa 多分支草稿头：同一个隐藏状态同时预测未来 K 个 token。"""
+
+    def __init__(self, d_model, vocab_size, num_heads=4, seed=None):
+        _me_check_int(d_model, "MedusaHeads.d_model", minimum=1)
+        _me_check_int(vocab_size, "MedusaHeads.vocab_size", minimum=1)
+        _me_check_int(num_heads, "MedusaHeads.num_heads", minimum=1)
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.num_heads = num_heads
+        state = None
+        if seed is not None:
+            state = random.getstate()
+            random.seed(seed)
+        try:
+            self.heads = [Layer(d_model, vocab_size, "linear") for _ in range(num_heads)]
+        finally:
+            if state is not None:
+                random.setstate(state)
+        self.grads = None
+
+    def zero_grad(self):
+        self.grads = None
+
+    def param_count(self):
+        return sum(_dense_param_count(h) for h in self.heads)
+
+    def forward(self, hidden_rows):
+        if not isinstance(hidden_rows, (list, tuple)) or not hidden_rows:
+            raise ValueError("MedusaHeads.forward: hidden_rows 不能为空")
+        outs = []
+        caches = []
+        for head in self.heads:
+            out, cache = _dense_rows_forward(head, hidden_rows)
+            outs.append(out)
+            caches.append(cache)
+        return outs, caches
+
+    def loss_and_backward(self, hidden_rows, targets):
+        """targets: 长度 num_heads，每项是与 hidden_rows 等长的目标 token 列表。"""
+        outs, caches = self.forward(hidden_rows)
+        n_rows = len(hidden_rows)
+        if not isinstance(targets, (list, tuple)) or len(targets) != self.num_heads:
+            raise ValueError("MedusaHeads.loss_and_backward: targets 必须按头给出一组目标序列")
+        total = 0.0
+        scale = 1.0 / (self.num_heads * n_rows)
+        grads = []
+        for k in range(self.num_heads):
+            row_targets = targets[k]
+            if not isinstance(row_targets, (list, tuple)) or len(row_targets) != n_rows:
+                raise ValueError(f"MedusaHeads: 第 {k} 个头的目标长度与 hidden_rows 不一致")
+            d_rows = []
+            for r in range(n_rows):
+                tok = row_targets[r]
+                if isinstance(tok, bool) or not isinstance(tok, int) or not 0 <= tok < self.vocab_size:
+                    raise ValueError(f"MedusaHeads: targets[{k}][{r}]={tok!r} 不是合法 token")
+                logp = _me_log_softmax(outs[k][r])
+                total -= logp[tok] * scale
+                probs = [math.exp(v) for v in logp]
+                probs[tok] -= 1.0
+                d_rows.append([v * scale for v in probs])
+            gw, gb, _ = _dense_rows_backward(self.heads[k], caches[k], d_rows)
+            grads.append((gw, gb))
+        self.grads = grads
+        return total
+
+    def sgd_step(self, lr):
+        for k, head in enumerate(self.heads):
+            if self.grads is not None:
+                _dense_apply_sgd(head, self.grads[k], lr)
+
+    def predict(self, hidden_row):
+        outs, _ = self.forward([hidden_row])
+        return [_me_softmax(outs[k][0]) for k in range(self.num_heads)]
+
+
+class EagleDrafter:
+    """EAGLE 风格的特征级草稿器：由目标模型隐藏状态 + 上一 token 嵌入预测下一 token。"""
+
+    def __init__(self, d_model, vocab_size, hidden=64, seed=None):
+        _me_check_int(d_model, "EagleDrafter.d_model", minimum=1)
+        _me_check_int(vocab_size, "EagleDrafter.vocab_size", minimum=1)
+        _me_check_int(hidden, "EagleDrafter.hidden", minimum=1)
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.hidden = hidden
+        state = None
+        if seed is not None:
+            state = random.getstate()
+            random.seed(seed)
+        try:
+            std = math.sqrt(2.0 / (d_model))
+            self.Wf = [[random.gauss(0.0, std) for _ in range(d_model)] for _ in range(hidden)]
+            self.We = [[random.gauss(0.0, std) for _ in range(d_model)] for _ in range(hidden)]
+            self.bh = [0.0] * hidden
+            self.Wh = [[random.gauss(0.0, std) for _ in range(hidden)] for _ in range(vocab_size)]
+            self.bo = [0.0] * vocab_size
+        finally:
+            if state is not None:
+                random.setstate(state)
+
+    def param_count(self):
+        return (self.hidden * self.d_model * 2 + self.hidden + self.vocab_size * self.hidden
+                + self.vocab_size)
+
+    def hidden_state(self, feature, prev_emb):
+        if not isinstance(feature, (list, tuple)) or len(feature) != self.d_model:
+            raise ValueError(f"EagleDrafter: feature 长度必须是 {self.d_model}")
+        if not isinstance(prev_emb, (list, tuple)) or len(prev_emb) != self.d_model:
+            raise ValueError(f"EagleDrafter: prev_emb 长度必须是 {self.d_model}")
+        h = []
+        for j in range(self.hidden):
+            v = self.bh[j]
+            wf = self.Wf[j]
+            we = self.We[j]
+            for i in range(self.d_model):
+                v += wf[i] * feature[i] + we[i] * prev_emb[i]
+            h.append(math.tanh(v))
+        return h
+
+    def forward(self, feature, prev_emb):
+        h = self.hidden_state(feature, prev_emb)
+        logits = []
+        for v in range(self.vocab_size):
+            row = self.Wh[v]
+            s = self.bo[v]
+            for j in range(self.hidden):
+                s += row[j] * h[j]
+            logits.append(s)
+        return logits
+
+    def draft(self, feature, prev_token, k, embed_weight, vocab_size):
+        _me_check_int(k, "EagleDrafter.draft.k", minimum=0)
+        if not isinstance(embed_weight, (list, tuple)) or len(embed_weight) < vocab_size:
+            raise ValueError("EagleDrafter.draft: embed_weight 与 vocab_size 不匹配")
+        out = []
+        prev = prev_token
+        for _ in range(k):
+            logits = self.forward(feature, embed_weight[prev])
+            prev = _me_argmax(logits)
+            out.append(prev)
+        return out
+
+
+def _me_greedy(target, prompt_ids, max_new_tokens):
+    n = _me_check_int(max_new_tokens, "max_new_tokens", minimum=1)
+    ids = list(prompt_ids)
+    out = []
+    for _ in range(n):
+        logits = target.forward(ids)
+        tok = _me_argmax(logits[-1])
+        ids.append(tok)
+        out.append(tok)
+    return out
+
+
+def medusa_decode(target, prompt_ids, heads, max_new_tokens=8, eos_id=None):
+    """用 Medusa 多头草稿 + 目标模型验证；不接受时回退目标模型的贪心 token。"""
+    vocab = getattr(target, "vocab_size", None)
+    if vocab is None:
+        raise TypeError("medusa_decode: target 必须有 vocab_size")
+    prompt = _me_check_ids(prompt_ids, vocab, "prompt_ids")
+    if not isinstance(heads, MedusaHeads):
+        raise TypeError("medusa_decode: heads 必须是 MedusaHeads")
+    if heads.vocab_size != vocab:
+        raise ValueError("medusa_decode: heads.vocab_size 与目标模型不一致")
+    if heads.d_model != getattr(target, "d_model", heads.d_model):
+        raise ValueError("medusa_decode: heads.d_model 与目标模型不一致")
+    n = _me_check_int(max_new_tokens, "max_new_tokens", minimum=1)
+    if eos_id is not None:
+        _me_check_int(eos_id, "eos_id", minimum=0)
+    ctx = list(prompt)
+    out = []
+    drafted = 0
+    accepted = 0
+    target_calls = 0
+    k = heads.num_heads
+    max_len = getattr(target, "max_len", None)
+    while len(out) < n:
+        if max_len is not None and len(ctx) + k + 1 > max_len:
+            logits = target.forward(ctx)
+            target_calls += 1
+            tok = _me_argmax(logits[-1])
+            out.append(tok)
+            ctx.append(tok)
+            if eos_id is not None and tok == eos_id:
+                break
+            continue
+        logits = target.forward(ctx)
+        target_calls += 1
+        h_last = target.h[-1]
+        head_logits, _ = heads.forward([h_last])
+        drafts = [_me_argmax(head_logits[h][0]) for h in range(k)]
+        drafted += k
+        verify = target.forward(ctx + drafts)
+        target_calls += 1
+        acc = 0
+        for i in range(k):
+            pos = len(ctx) - 1 + i
+            if _me_argmax(verify[pos]) == drafts[i]:
+                acc += 1
+            else:
+                break
+        accepted += acc
+        stop = False
+        for t in drafts[:acc]:
+            if len(out) >= n:
+                break
+            out.append(t)
+            ctx.append(t)
+            if eos_id is not None and t == eos_id:
+                stop = True
+                break
+        if stop or len(out) >= n:
+            break
+        tok = _me_argmax(verify[len(ctx) - 1])
+        out.append(tok)
+        ctx.append(tok)
+        if eos_id is not None and tok == eos_id:
+            break
+    return {
+        "ids": list(prompt) + out,
+        "tokens": out,
+        "stats": {
+            "drafted": drafted,
+            "accepted": accepted,
+            "target_calls": target_calls,
+            "accept_rate": (accepted / drafted) if drafted else 0.0,
+        },
+    }
+
+
+def eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=None):
+    """用 EAGLE 风格特征级草稿器生成草稿链，再交目标模型验证。"""
+    vocab = getattr(target, "vocab_size", None)
+    if vocab is None:
+        raise TypeError("eagle_decode: target 必须有 vocab_size")
+    prompt = _me_check_ids(prompt_ids, vocab, "prompt_ids")
+    if not isinstance(drafter, EagleDrafter):
+        raise TypeError("eagle_decode: drafter 必须是 EagleDrafter")
+    if drafter.vocab_size != vocab:
+        raise ValueError("eagle_decode: drafter.vocab_size 与目标模型不一致")
+    if drafter.d_model != getattr(target, "d_model", drafter.d_model):
+        raise ValueError("eagle_decode: drafter.d_model 与目标模型不一致")
+    n = _me_check_int(max_new_tokens, "max_new_tokens", minimum=1)
+    gamma = _me_check_int(gamma, "gamma", minimum=1)
+    if eos_id is not None:
+        _me_check_int(eos_id, "eos_id", minimum=0)
+    ctx = list(prompt)
+    out = []
+    drafted = 0
+    accepted = 0
+    target_calls = 0
+    max_len = getattr(target, "max_len", None)
+    embed_weight = target.embedding.weight
+    while len(out) < n:
+        if max_len is not None and len(ctx) + gamma + 1 > max_len:
+            logits = target.forward(ctx)
+            target_calls += 1
+            tok = _me_argmax(logits[-1])
+            out.append(tok)
+            ctx.append(tok)
+            if eos_id is not None and tok == eos_id:
+                break
+            continue
+        logits = target.forward(ctx)
+        target_calls += 1
+        feature = target.h[-1]
+        first = _me_argmax(logits[-1])
+        drafts = [first]
+        prev = first
+        for _ in range(gamma - 1):
+            d_logits = drafter.forward(feature, embed_weight[prev])
+            prev = _me_argmax(d_logits)
+            drafts.append(prev)
+        drafted += gamma
+        verify = target.forward(ctx + drafts)
+        target_calls += 1
+        acc = 0
+        for i in range(gamma):
+            pos = len(ctx) - 1 + i
+            if _me_argmax(verify[pos]) == drafts[i]:
+                acc += 1
+            else:
+                break
+        accepted += acc
+        stop = False
+        for t in drafts[:acc]:
+            if len(out) >= n:
+                break
+            out.append(t)
+            ctx.append(t)
+            if eos_id is not None and t == eos_id:
+                stop = True
+                break
+        if stop or len(out) >= n:
+            break
+        tok = _me_argmax(verify[len(ctx) - 1])
+        out.append(tok)
+        ctx.append(tok)
+        if eos_id is not None and tok == eos_id:
+            break
+    return {
+        "ids": list(prompt) + out,
+        "tokens": out,
+        "stats": {
+            "drafted": drafted,
+            "accepted": accepted,
+            "target_calls": target_calls,
+            "accept_rate": (accepted / drafted) if drafted else 0.0,
+        },
+    }
+
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 
