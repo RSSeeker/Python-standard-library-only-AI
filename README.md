@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2054 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2059 项）
 
 ## 特性
 
@@ -3172,6 +3172,33 @@ res2 = AI.eagle_decode(lm, [1, 2, 3], drafter, max_new_tokens=8, gamma=4)
 - `stats` 里 `drafted` / `accepted` / `target_calls` / `accept_rate` 只统计本函数内的调用；
   草稿全被拒时 `accept_rate` 为 0，是合法结果，不代表接口坏了。
 
+### StyleGAN（映射网络 + AdaIN 风格调制）
+
+`StyleGANGenerator` 是「潜码 z → 映射网络 w → 逐级风格调制」的最小可训练版本：
+常数 4×4 特征先经卷积与 AdaIN 注入 w，再上采样、再调制，最后 `to_rgb` + `tanh` 得到 16×16 图像。
+
+```python
+gen = AI.StyleGANGenerator(latent_dim=8, d_model=8, base=4, out_channels=1, seed=3)
+img = gen.forward([0.1 * (i + 1) for i in range(8)])   # 1×16×16，值域 [-1, 1]
+dout = [[[1.0] * 16 for _ in range(16)]]                # 任意上游梯度
+gen.backward(dout)                                      # 累积 conv/style/mapping 梯度
+gen.sgd_step(1e-3)
+
+w_avg = AI.StyleGANGenerator.average_w(gen, [[0.0] * 8, [0.5] * 8])
+w = gen.mapping.forward([0.0] * 8)
+w_trunc = gen.truncate([0.0] * 8, w_avg, psi=0.5)       # w_avg + ψ·(w − w_avg)
+```
+
+| API | 语义要点 |
+|---|---|
+| `StyleGANGenerator(latent_dim=8, d_model=8, base=4, out_channels=1, seed=None)` | `mapping=MLP([latent_dim,d_model,d_model])`、可学习 4×4 常数特征、`conv1/conv2` + 两个 `Layer(d_model, 2*base)` 风格层 + `to_rgb`；`forward(z)` 返回 `(C,16,16)`、`backward(dout)` 累积梯度（含 AdaIN 反向）、`zero_grad()`/`sgd_step(lr)`/`param_count()`（默认 685） |
+| `StyleGANGenerator.average_w(generator, zs)` | 对一批 z 的映射输出取平均，得到截断用的 `w_avg` |
+| `generator.truncate(z, w_avg, psi=0.7)` | 返回截断后的 w（`ψ→0` 越接近平均风格） |
+| `generator.sample(z)` | `forward` 的别名 |
+
+边界：只有两级合成块（4×4 → 8×8 → 16×16），上采样是最近邻复制；没有噪声注入、style mixing
+正则、路径长度正则与感知损失；style 只来自单个 w，不区分 coarse/middle/fine 层；无内置 GAN 训练循环。
+
 ### Pix2Pix（可训练图像到图像）
 
 `DCGANGenerator` 是「潜码 → 图像」，Pix2Pix 是「图像 → 图像」：源图编码后解码成目标图，
@@ -3718,7 +3745,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2054 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2059 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3923,6 +3950,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
+| `TestStyleGAN` | 生成器前向形状/参数 685/同 z 可复现、conv1/style1/style2/mapping 权重有限差分、不同 z 输出不同与 average_w/truncate、30 步 SGD 使重建损失减半、非法输入与未 forward 先 backward |
 | `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
@@ -4040,7 +4068,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2054 个单元测试
+├── test_ai.py       # 2059 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

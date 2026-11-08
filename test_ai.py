@@ -31658,3 +31658,135 @@ class TestPix2Pix:
         _p2p_raises(lambda: AI.train_pix2pix_step(gen, disc, _p2p_const(0.5),
                                                   _p2p_const(0.7, size=4)), ValueError)
         _p2p_raises(lambda: AI.fit_pix2pix(gen, disc, [], steps=3), ValueError)
+
+
+import random
+
+import AI
+
+
+def _sg_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError(f"期望 {exc.__name__}，实际 {type(other).__name__}: {other}")
+    raise AssertionError(f"期望 {exc.__name__}，但未抛异常")
+
+
+def _sg_fixed_w(seed=7):
+    return [[[random.Random(seed + i * 13 + j).uniform(-1.0, 1.0) for j in range(16)]
+             for i in range(16)]]
+
+
+def _sg_loss_and_grads(g, z, w):
+    g.zero_grad()
+    y = g.forward(z)
+    g.backward(w)
+    return sum(y[k][i][j] * w[k][i][j]
+               for k in range(len(y)) for i in range(len(y[0]))
+               for j in range(len(y[0][0])))
+
+
+def _sg_fd(g, z, w, getter, setter, analytic, h=1e-5):
+    p0 = getter()
+    setter(p0 + h)
+    lp = _sg_loss_and_grads(g, z, w)
+    setter(p0 - h)
+    lm = _sg_loss_and_grads(g, z, w)
+    setter(p0)
+    fd_val = (lp - lm) / (2.0 * h)
+    return abs(fd_val - analytic) / max(1e-9, abs(fd_val) + abs(analytic))
+
+
+class TestStyleGAN:
+    def test_forward_and_param_count(self):
+        g = AI.StyleGANGenerator(seed=3)
+        assert g.param_count() == 685
+        z = [0.1 * (i + 1) for i in range(8)]
+        y = g.forward(z)
+        assert len(y) == 1 and len(y[0]) == 16 and len(y[0][0]) == 16
+        assert all(-1.0 <= v <= 1.0 for ch in y for row in ch for v in row)
+        y2 = g.forward(z)
+        assert all(abs(y[0][i][j] - y2[0][i][j]) < 1e-12 for i in range(16) for j in range(16))
+
+    def test_numerical_gradients(self):
+        z = [0.1 * (i + 1) for i in range(8)]
+        g = AI.StyleGANGenerator(seed=3)
+        w = _sg_fixed_w()
+        _sg_loss_and_grads(g, z, w)
+
+        def set_conv1(v):
+            g.conv1.weights[2][0][1][1] = v
+
+        def set_style1(v):
+            g.style1.weights[2][0] = v
+
+        def set_style2(v):
+            g.style2.weights[0][0] = v
+
+        def set_map(v):
+            g.mapping.layers[0].weights[0][0] = v
+
+        rels = [
+            _sg_fd(g, z, w, lambda: g.conv1.weights[2][0][1][1], set_conv1,
+                   g.conv1.grad_w[2][0][1][1]),
+            _sg_fd(g, z, w, lambda: g.style1.weights[2][0], set_style1,
+                   g.grads_style[0][0][2][0]),
+            _sg_fd(g, z, w, lambda: g.style2.weights[0][0], set_style2,
+                   g.grads_style[1][0][0][0]),
+            _sg_fd(g, z, w, lambda: g.mapping.layers[0].weights[0][0], set_map,
+                   g.grads_map[0][0][0][0]),
+        ]
+        assert max(rels) < 1e-4, rels
+
+    def test_different_z_and_truncate(self):
+        g = AI.StyleGANGenerator(seed=5)
+        z1 = [0.0] * 8
+        z2 = [0.5] * 8
+        y1 = g.forward(z1)
+        y2 = g.forward(z2)
+        diff = max(abs(y1[0][i][j] - y2[0][i][j]) for i in range(16) for j in range(16))
+        assert diff > 1e-3
+        zs = [[0.01 * (i + 1) for i in range(8)], [0.3 - 0.01 * i for i in range(8)]]
+        w_avg = AI.StyleGANGenerator.average_w(g, zs)
+        assert len(w_avg) == 8
+        w = g.mapping.forward(z1)
+        assert len(w) == 8
+        w_tr = g.truncate(z1, w_avg, 0.5)
+        assert len(w_tr) == 8
+        for k in range(8):
+            assert abs(w_tr[k] - (w_avg[k] + 0.5 * (w[k] - w_avg[k]))) < 1e-12
+
+    def test_sgd_step_reduces_loss(self):
+        g = AI.StyleGANGenerator(seed=2)
+        z = [0.2] * 8
+        target = [[[0.5 for _ in range(16)] for _ in range(16)]]
+        losses = []
+        for _ in range(30):
+            y = g.forward(z)
+            dout = [[[2.0 * (y[k][i][j] - target[k][i][j]) / 256.0
+                      for j in range(16)] for i in range(16)] for k in range(1)]
+            loss = sum((y[k][i][j] - target[k][i][j]) ** 2 for k in range(1)
+                       for i in range(16) for j in range(16)) / 256.0
+            losses.append(loss)
+            g.zero_grad()
+            g.forward(z)
+            g.backward(dout)
+            g.sgd_step(0.05)
+        assert losses[-1] < losses[0] * 0.5, (losses[0], losses[-1])
+
+    def test_invalid_inputs(self):
+        g = AI.StyleGANGenerator(seed=1)
+        _sg_raises(lambda: g.forward([0.0] * 7))
+        _sg_raises(lambda: g.forward([0.0] * 7 + ["x"]))
+        _sg_raises(lambda: g.backward([[[0.0] * 16] * 16]), RuntimeError)
+        g.forward([0.0] * 8)
+        _sg_raises(lambda: g.backward([[[0.0] * 15] * 15]))
+        _sg_raises(lambda: AI.StyleGANGenerator(latent_dim=0))
+        _sg_raises(lambda: AI.StyleGANGenerator(d_model=0))
+        _sg_raises(lambda: AI.StyleGANGenerator(base=0))
+        _sg_raises(lambda: AI.StyleGANGenerator(out_channels=0))
+        _sg_raises(lambda: AI.StyleGANGenerator.average_w(g, []))
+        _sg_raises(lambda: g.truncate([0.0] * 8, [0.0] * 8, 1.5))

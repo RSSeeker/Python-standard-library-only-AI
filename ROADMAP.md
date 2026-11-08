@@ -232,7 +232,7 @@
 - [x] GAN 变体剩余：DCGAN / WGAN-GP / StyleGAN（简化）/ CycleGAN（简化）/ Pix2Pix / Progressive
   - `DCGANGenerator` / `DCGANDiscriminator` 用真卷积（前向 + 手写反向 + `sgd_step`），但**不用 BatchNorm**（BN2d 反向返回三元组且带运行统计，混进手写链会让梯度约定复杂），故声明为「DCGAN 风格的最小卷积 GAN」
   - `wgan_gp_penalty` 的 `∇_x D` 是**真反向**不是数值差分：罚项 `λ(n−1)²` 闭式与 `‖∇D‖` 有限差分都对上；坑是内部没先对 `x̂` 前向（用了上一次 forward 的缓存），实测差 1.1661 vs 1.3400
-  - StyleGAN / CycleGAN / Pix2Pix / Progressive 只给构件（AdaIN 调制、截断、循环一致性、identity、PatchGAN 目标、淡入与阶段调度），不给空壳训练接口
+  - StyleGAN / Pix2Pix 已有可训练实现（见下方 bullet）；CycleGAN / Progressive 只给构件（循环一致性、identity、PatchGAN 目标、淡入与阶段调度），不给空壳训练接口
   - 两个库内约定：`Layer.backward` 返回 `(grad_w, grad_b, next_delta)` **且不自存梯度**（手写容器必须自己累积，否则 Layer 参数永远为 0）；`Layer` **没有** `sgd_step`，要自己写或只对卷积层调用
 - [x] `RealNVP` 仿射耦合流：`log|det J| = Σs` **精确**、`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 是真密度（2 维网格积分 0.9989）、`nll` 最大似然训练 3.2951 → 1.4170（120 轮 lr=3e-3）
   - 实现坑：`Layer` 不支持 `tanh`（改用 sigmoid 打底、外面再套 `tanh` 限幅）；`Layer` 没有 `rng` 参数（临时 `random.seed` 再恢复 `getstate`）
@@ -775,6 +775,10 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] StyleGAN 可训练生成器：`StyleGANGenerator`（映射网络 MLP z→w、可学习 4×4 常数、
+  两级 `Conv2d` + AdaIN 风格调制 + 最近邻上采样到 16×16、`tanh` 输出；手写反向含 AdaIN 反向与
+  style/mapping 梯度、`sgd_step`、`param_count` 685）、`average_w`/`truncate` 截断采样；
+  测试 `TestStyleGAN` 5 例
 - [x] Pix2Pix 可训练基础设施：`Pix2PixGenerator`（两次 stride-2 `Conv2d` 编码 + 两次
   `ConvTranspose2d` 解码，`tanh` 输出；手写反向、`sgd_step`、`param_count`）与
   `PatchDiscriminator`（LeakyReLU 卷积打分头，输出裸 logit patch 网格）；`train_pix2pix_step`
@@ -815,7 +819,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2054 passed（新增 215 例）。
+全量测试：1839 → 2059 passed（新增 220 例）。
 
 ---
 

@@ -11158,6 +11158,227 @@ def fit_pix2pix(generator, discriminator, pairs, steps=30, lambda_l1=100.0,
     return history
 
 # =============================================================================
+"""StyleGAN 轻量可训练生成器：映射网络 + 常数输入 + AdaIN 风格调制 + 逐级上采样。"""
+
+
+def _sg_check_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} 必须是 >= {minimum} 的整数，收到 {value!r}")
+    return value
+
+
+def _sg_scale_check(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{name} 必须是正数，收到 {value!r}")
+    return float(value)
+
+
+def _sg_zeros(channels, h, w):
+    return [[[0.0 for _ in range(w)] for _ in range(h)] for _ in range(channels)]
+
+
+def _sg_upsample(x):
+    c, h, w = len(x), len(x[0]), len(x[0][0])
+    out = _sg_zeros(c, 2 * h, 2 * w)
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                v = x[k][i][j]
+                out[k][2 * i][2 * j] = v
+                out[k][2 * i][2 * j + 1] = v
+                out[k][2 * i + 1][2 * j] = v
+                out[k][2 * i + 1][2 * j + 1] = v
+    return out
+
+
+def _sg_upsample_backward(dout, h, w):
+    c = len(dout)
+    out = _sg_zeros(c, h, w)
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                out[k][i][j] = (dout[k][2 * i][2 * j] + dout[k][2 * i][2 * j + 1]
+                                + dout[k][2 * i + 1][2 * j] + dout[k][2 * i + 1][2 * j + 1])
+    return out
+
+
+def _sg_adain_backward(dout, cache):
+    x, mean, std, scale, bias = cache["x"], cache["mean"], cache["std"], cache["scale"], cache["bias"]
+    c, h, w = len(x), len(x[0]), len(x[0][0])
+    n = h * w
+    d_xhat = [[[dout[k][i][j] * scale[k] for j in range(w)] for i in range(h)] for k in range(c)]
+    d_scale = [sum(dout[k][i][j] * (x[k][i][j] - mean[k]) / std[k]
+                   for i in range(h) for j in range(w)) for k in range(c)]
+    d_bias = [sum(dout[k][i][j] for i in range(h) for j in range(w)) for k in range(c)]
+    dx = _sg_zeros(c, h, w)
+    for k in range(c):
+        m1 = sum(d_xhat[k][i][j] for i in range(h) for j in range(w)) / n
+        m2 = sum(d_xhat[k][i][j] * (x[k][i][j] - mean[k]) / std[k]
+                 for i in range(h) for j in range(w)) / n
+        for i in range(h):
+            for j in range(w):
+                xhat = (x[k][i][j] - mean[k]) / std[k]
+                dx[k][i][j] = (d_xhat[k][i][j] - m1 - xhat * m2) / std[k]
+    d_style = d_scale + d_bias
+    return dx, d_style
+
+
+class StyleGANGenerator:
+    """简化 StyleGAN：z → 映射网络 w；常数 4×4 特征逐级 AdaIN 调制并上采样到 16×16。"""
+
+    def __init__(self, latent_dim=8, d_model=8, base=4, out_channels=1, seed=None):
+        _sg_check_int(latent_dim, "StyleGANGenerator.latent_dim")
+        _sg_check_int(d_model, "StyleGANGenerator.d_model")
+        _sg_check_int(base, "StyleGANGenerator.base")
+        _sg_check_int(out_channels, "StyleGANGenerator.out_channels")
+        self.latent_dim = latent_dim
+        self.d_model = d_model
+        self.base = base
+        self.out_channels = out_channels
+        self.latent_dim = latent_dim
+        self.num_blocks = 2
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.mapping = MLP([latent_dim, d_model, d_model], ["relu", "linear"])
+            std = math.sqrt(2.0 / (base * 16))
+            self.const = [[[random.gauss(0.0, std) for _ in range(4)] for _ in range(4)]
+                          for _ in range(base)]
+            self.conv1 = Conv2d(base, base, 3, padding=1)
+            self.conv2 = Conv2d(base, base, 3, padding=1)
+            self.style1 = Layer(d_model, 2 * base, "linear")
+            self.style2 = Layer(d_model, 2 * base, "linear")
+            self.to_rgb = Conv2d(base, out_channels, 3, padding=1)
+        finally:
+            random.setstate(state)
+        self.grads_style = None
+        self.grads_map = None
+        self._cache = None
+
+    def zero_grad(self):
+        for c in (self.conv1, self.conv2, self.to_rgb):
+            c.zero_grad()
+        self.grads_style = None
+        self.grads_map = None
+
+    def param_count(self):
+        return (self.base * 16
+                + _conv_param_count(self.conv1)
+                + _conv_param_count(self.conv2)
+                + _dense_param_count(self.style1)
+                + _dense_param_count(self.style2)
+                + _conv_param_count(self.to_rgb)
+                + sum(_dense_param_count(l) for l in self.mapping.layers))
+
+    def _style(self, layer, w):
+        out, cache = _dense_rows_forward(layer, [w])
+        style = out[0]
+        c = self.base
+        return [style[:c], style[c:]], cache
+
+    def forward(self, z):
+        if not isinstance(z, (list, tuple)) or len(z) != self.latent_dim:
+            raise ValueError(f"StyleGANGenerator.forward: z 长度必须是 {self.latent_dim}")
+        for v in z:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError("StyleGANGenerator.forward: z 必须是数字列表")
+        w = self.mapping.forward(list(z))
+        (scale1, bias1), cache_s1 = self._style(self.style1, w)
+        (scale2, bias2), cache_s2 = self._style(self.style2, w)
+        p1 = self.conv1.forward(self.const)
+        a1, p1_stats = adain_style(p1, scale1 + bias1)
+        r1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a1]
+        m1 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a1]
+        u1 = _sg_upsample(r1)
+        p2 = self.conv2.forward(u1)
+        a2, p2_stats = adain_style(p2, scale2 + bias2)
+        r2 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a2]
+        m2 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in a2]
+        u2 = _sg_upsample(r2)
+        rgb = self.to_rgb.forward(u2)
+        y = [[[math.tanh(v) for v in row] for row in ch] for ch in rgb]
+        self._cache = {
+            "w": w, "z": list(z),
+            "p1": p1, "a1": a1, "m1": m1, "scale1": scale1, "bias1": bias1,
+            "p2": p2, "a2": a2, "m2": m2, "scale2": scale2, "bias2": bias2,
+            "u1": u1, "u2": u2, "y": y, "cache_s1": cache_s1, "cache_s2": cache_s2,
+            "p1_stats": p1_stats, "p2_stats": p2_stats,
+        }
+        return y
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("StyleGANGenerator.backward: 先调用 forward")
+        cache = self._cache
+        y = cache["y"]
+        c, h, w = len(y), len(y[0]), len(y[0][0])
+        if not isinstance(dout, (list, tuple)) or len(dout) != c \
+                or len(dout[0]) != h or len(dout[0][0]) != w:
+            raise ValueError("StyleGANGenerator.backward: dout 形状与输出不一致")
+        d_rgb = [[[float(dout[k][i][j]) * (1.0 - y[k][i][j] * y[k][i][j])
+                   for j in range(w)] for i in range(h)] for k in range(c)]
+        d_u2 = self.to_rgb.backward(d_rgb)
+        d_r2 = _sg_upsample_backward(d_u2, len(cache["p2"][0]), len(cache["p2"][0][0]))
+        d_a2 = [[[d_r2[k][i][j] * cache["m2"][k][i][j] for j in range(len(d_r2[0][0]))]
+                 for i in range(len(d_r2[0]))] for k in range(len(d_r2))]
+        a2_cache = {"x": cache["p2"], "mean": [s[0] for s in cache["p2_stats"]],
+                    "std": [s[1] for s in cache["p2_stats"]],
+                    "scale": cache["scale2"], "bias": cache["bias2"]}
+        d_p2, d_style2 = _sg_adain_backward(d_a2, a2_cache)
+        d_u1 = self.conv2.backward(d_p2)
+        d_r1 = _sg_upsample_backward(d_u1, len(cache["p1"][0]), len(cache["p1"][0][0]))
+        d_a1 = [[[d_r1[k][i][j] * cache["m1"][k][i][j] for j in range(len(d_r1[0][0]))]
+                 for i in range(len(d_r1[0]))] for k in range(len(d_r1))]
+        a1_cache = {"x": cache["p1"], "mean": [s[0] for s in cache["p1_stats"]],
+                    "std": [s[1] for s in cache["p1_stats"]],
+                    "scale": cache["scale1"], "bias": cache["bias1"]}
+        d_p1, d_style1 = _sg_adain_backward(d_a1, a1_cache)
+        self.conv1.backward(d_p1)
+
+        gs = []
+        for layer, cache_s, d_style in ((self.style1, cache["cache_s1"], d_style1),
+                                        (self.style2, cache["cache_s2"], d_style2)):
+            gw, gb, _ = _dense_rows_backward(layer, cache_s, [d_style])
+            gs.append((gw, gb))
+        self.grads_style = gs
+
+        d_w = [0.0] * self.d_model
+        for layer, cache_s, d_style in ((self.style1, cache["cache_s1"], d_style1),
+                                        (self.style2, cache["cache_s2"], d_style2)):
+            gw, gb, dx = _dense_rows_backward(layer, cache_s, [d_style])
+            for k in range(self.d_model):
+                d_w[k] += dx[0][k]
+        self.grads_map = _mlp_backward(self.mapping, d_w)
+        return None
+
+    def sample(self, z):
+        return self.forward(z)
+
+    @staticmethod
+    def average_w(generator, zs):
+        if not isinstance(zs, (list, tuple)) or not zs:
+            raise ValueError("StyleGANGenerator.average_w: zs 不能为空")
+        ws = [generator.mapping.forward(list(z)) for z in zs]
+        n = len(ws)
+        return [sum(w[k] for w in ws) / n for k in range(len(ws[0]))]
+
+    def truncate(self, z, w_avg, psi=0.7):
+        if self._cache is None or self._cache.get("z") != list(z):
+            self.forward(z)
+        w = self.mapping.forward(list(z))
+        return truncation_trick(w, w_avg, psi)
+
+    def sgd_step(self, lr):
+        for c in (self.conv1, self.conv2, self.to_rgb):
+            _p2p_sgd_layer(c, lr)
+        if self.grads_style is not None:
+            _dense_apply_sgd(self.style1, self.grads_style[0], lr)
+            _dense_apply_sgd(self.style2, self.grads_style[1], lr)
+        if self.grads_map is not None:
+            for layer, grad in zip(self.mapping.layers, self.grads_map):
+                _dense_apply_sgd(layer, grad, lr)
+
 #  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 # =============================================================================
 #  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要
