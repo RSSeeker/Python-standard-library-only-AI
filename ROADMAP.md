@@ -775,6 +775,9 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] 离线强化学习：`IQLAgent`（expectile 回归 V(s) + 无 max 的 Q TD 目标 + AWR 加权策略提取）与
+  `CQLAgent`（TD 损失 + `alpha·(logsumexp Q − Q(s,a))` 保守项）；离散动作，复用 `PolicyNetwork` /
+  `ValueNetwork` / `ReplayBuffer` / `Adam`，含 `update`/`fit`/`act`；测试 `TestOfflineRL` 4 例
 - [x] DETR：`DETR`（两层 stride-2 CNN backbone + 固定二维正弦位置编码 + Transformer encoder/decoder + 可学习 query + 分类/框头；暴力匈牙利匹配 + 分类 CE + 5×L1 框损失，含 `fit`/`predict`）；测试 `TestDETR` 5 例
 - [x] DeBERTa：`DeBERTaBlock`（解耦注意力：content-to-content + content-to-position + position-to-content，相对距离截断到 `max_rel`，单头教学版）、`DeBERTaModel`（Embedding → N×block → LM 头，含 `fit`/`generate`）；测试 `TestDeBERTa` 5 例
 - [x] xLSTM：`XLSTMBlock`（pre-norm `sLSTM cell`：指数输入门 + 归一化标量记忆
@@ -790,7 +793,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2015 passed（新增 176 例）。
+全量测试：1839 → 2019 passed（新增 180 例）。
 
 ---
 

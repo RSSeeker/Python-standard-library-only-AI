@@ -38162,6 +38162,314 @@ class DETR:
                  + _dense_param_count(self.box_head)
                  + 2 * self.num_queries * d)
         return total
+# ============================================================================
+#  离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+# ============================================================================
+#  说明：
+#  - 两者都面向「离线数据集」：Q 网络只从 ReplayBuffer 里采样更新，不做在线探索。
+#  - IQL（Implicit Q-Learning）：不做 max 查询，用 expectile 回归拟合 V(s)，
+#    再用 AWR 权重做策略提取，避免 OOD 动作被高估。
+#  - CQL（Conservative Q-Learning）：在 TD 损失之外加保守项
+#    alpha * (logsumexp_a Q(s,a) - Q(s, a_data))，压低数据集外动作的 Q 值。
+#  - 复用现有 PolicyNetwork（离散 Q / 策略）与 ValueNetwork（V），
+#    优化器用现有 Adam（按层 zip 更新）。
+
+
+def _offline_zeros_like(model):
+    """为 MLP 的每层生成 (grad_w, grad_b) 零梯度。"""
+    zeros = []
+    for layer in model.layers:
+        gw = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+        gb = [0.0] * layer.fan_out
+        zeros.append((gw, gb))
+    return zeros
+
+
+def _offline_accumulate(acc, grads):
+    """把单样本梯度累加进累加器。"""
+    for li, (gw, gb) in enumerate(grads):
+        acc_w, acc_b = acc[li]
+        for j in range(len(gw)):
+            row = acc_w[j]
+            for k in range(len(gw[j])):
+                row[k] += gw[j][k]
+            acc_b[j] += gb[j]
+
+
+def _offline_average(acc, n):
+    """累加器求平均，返回可直接喂给 Adam.step 的结构。"""
+    inv = 1.0 / n
+    out = []
+    for gw, gb in acc:
+        out.append(([[v * inv for v in row] for row in gw],
+                    [v * inv for v in gb]))
+    return out
+
+
+def _offline_softmax(row):
+    """数值稳定 softmax。"""
+    m = max(row)
+    ex = [math.exp(v - m) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _offline_soft_update(target, source, tau):
+    """目标网络软更新：target = tau*target + (1-tau)*source。"""
+    for tl, sl in zip(target.model.layers, source.model.layers):
+        for j in range(tl.fan_out):
+            tw = tl.weights[j]
+            sw = sl.weights[j]
+            for i in range(tl.fan_in):
+                tw[i] = tau * tw[i] + (1.0 - tau) * sw[i]
+            tl.biases[j] = tau * tl.biases[j] + (1.0 - tau) * sl.biases[j]
+
+
+def _offline_check_int(value, name, low, high=None):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} 必须是整数，收到 {value!r}")
+    if value < low or (high is not None and value > high):
+        bound = f"[{low}, {high}]" if high is not None else f">= {low}"
+        raise ValueError(f"{name} 必须在 {bound}，收到 {value}")
+
+
+def _offline_check_float(value, name, low, high, low_open=False, high_open=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是数字，收到 {value!r}")
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f"{name} 必须是有限数字，收到 {value!r}")
+    if low_open and not (v > low):
+        raise ValueError(f"{name} 必须 > {low}，收到 {value!r}")
+    if not low_open and v < low:
+        raise ValueError(f"{name} 必须 >= {low}，收到 {value!r}")
+    if high_open and not (v < high):
+        raise ValueError(f"{name} 必须 < {high}，收到 {value!r}")
+    if high is not None and not high_open and v > high:
+        raise ValueError(f"{name} 必须 <= {high}，收到 {value!r}")
+
+
+class IQLAgent:
+    """IQL：expectile V + 无 max 的 Q 回归 + AWR 策略提取（离散动作）。"""
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), actor_lr=1e-3,
+                 critic_lr=1e-3, tau=0.7, beta=3.0, gamma=0.99,
+                 target_tau=0.005, seed=None):
+        _offline_check_int(state_dim, "IQLAgent: state_dim", 1)
+        _offline_check_int(num_actions, "IQLAgent: num_actions", 1)
+        _offline_check_float(actor_lr, "IQLAgent: actor_lr", 0.0, None, low_open=True)
+        _offline_check_float(critic_lr, "IQLAgent: critic_lr", 0.0, None, low_open=True)
+        _offline_check_float(tau, "IQLAgent: tau", 0.0, 1.0, low_open=True, high_open=True)
+        _offline_check_float(beta, "IQLAgent: beta", 0.0, None, low_open=True)
+        _offline_check_float(gamma, "IQLAgent: gamma", 0.0, 1.0)
+        _offline_check_float(target_tau, "IQLAgent: target_tau", 0.0, 1.0,
+                             low_open=True, high_open=True)
+        for v in list(hidden):
+            _offline_check_int(v, "IQLAgent: hidden 元素", 1)
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.tau = float(tau)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.target_tau = float(target_tau)
+
+        self.q = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.q_target = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.q_target.copy_from(self.q)
+        self.v = ValueNetwork(state_dim, hidden, seed=seed)
+        self.v_target = ValueNetwork(state_dim, hidden, seed=seed)
+        self.v_target.copy_from(self.v)
+        self.policy = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+
+        self.q_opt = Adam(self.q.model, lr=critic_lr)
+        self.v_opt = Adam(self.v.model, lr=critic_lr)
+        self.policy_opt = Adam(self.policy.model, lr=actor_lr)
+
+    def update(self, states, actions, rewards, next_states, dones):
+        """对一批转移做一次 IQL 更新，返回损失字典。"""
+        n = len(states)
+        if n < 1:
+            raise ValueError("IQLAgent.update: 批次不能为空")
+        for name, seq in (("actions", actions), ("rewards", rewards),
+                          ("next_states", next_states), ("dones", dones)):
+            if len(seq) != n:
+                raise ValueError(f"IQLAgent.update: {name} 长度必须与 states 一致")
+        q_acc = _offline_zeros_like(self.q.model)
+        v_acc = _offline_zeros_like(self.v.model)
+        pi_acc = _offline_zeros_like(self.policy.model)
+        q_loss = v_loss = pi_loss = 0.0
+        for i in range(n):
+            s = list(states[i])
+            sp = list(next_states[i])
+            a = actions[i]
+            _offline_check_int(a, "IQLAgent.update: action", 0, self.num_actions - 1)
+            r = float(rewards[i])
+            d = bool(dones[i])
+
+            qs = self.q.logits(s)
+            q_a = qs[a]
+            v = self.v.value(s)
+
+            # V 的 expectile 回归：Q(s,a) 为回归目标，按误差符号加权
+            diff = q_a - v
+            w = self.tau if diff > 0.0 else (1.0 - self.tau)
+            v_loss += w * diff * diff / n
+            v_grads = self.v.gradients(-2.0 * w * diff / n)
+            _offline_accumulate(v_acc, v_grads)
+
+            # Q 的 TD 目标使用 V_target(s')（IQL 不做 max）
+            if d:
+                y = r
+            else:
+                y = r + self.gamma * self.v_target.value(sp)
+            q_loss += (q_a - y) * (q_a - y) / n
+            dq = [0.0] * self.num_actions
+            dq[a] = 2.0 * (q_a - y) / n
+            q_grads = self.q.gradients(dq)
+            _offline_accumulate(q_acc, q_grads)
+
+            # 策略提取：AWR 加权行为克隆（优势 = Q(s,a) - V(s)）
+            adv = q_a - v
+            weight = math.exp(min(self.beta * adv, 30.0))
+            probs = self.policy.probs(s)
+            pi_loss += -weight * math.log(max(probs[a], 1e-12)) / n
+            dlogits = [0.0] * self.num_actions
+            for j in range(self.num_actions):
+                target = 1.0 if j == a else 0.0
+                dlogits[j] = weight * (probs[j] - target) / n
+            pi_grads = self.policy.gradients(dlogits)
+            _offline_accumulate(pi_acc, pi_grads)
+
+        self.v_opt.step(_offline_average(v_acc, n))
+        self.q_opt.step(_offline_average(q_acc, n))
+        self.policy_opt.step(_offline_average(pi_acc, n))
+        _offline_soft_update(self.q_target, self.q, self.target_tau)
+        _offline_soft_update(self.v_target, self.v, self.target_tau)
+        return {"q_loss": q_loss, "v_loss": v_loss, "policy_loss": pi_loss}
+
+    def fit(self, buffer, steps=100, batch_size=32):
+        """从 ReplayBuffer 采样并更新 ``steps`` 轮，返回最后一轮统计。"""
+        _offline_check_int(steps, "IQLAgent.fit: steps", 1)
+        _offline_check_int(batch_size, "IQLAgent.fit: batch_size", 1)
+        if len(buffer) < 1:
+            raise ValueError("IQLAgent.fit: ReplayBuffer 不能为空")
+        last = None
+        for _ in range(steps):
+            batch = buffer.sample(batch_size)
+            last = self.update(*batch)
+        return last
+
+    def act(self, state):
+        """贪心动作（用策略网络）。"""
+        probs = self.policy.probs(state)
+        return max(range(self.num_actions), key=lambda j: probs[j])
+
+    def param_count(self):
+        return (self.q.param_count() + self.q_target.param_count()
+                + self.v.param_count() + self.v_target.param_count()
+                + self.policy.param_count())
+
+
+class CQLAgent:
+    """CQL：TD 损失 + 保守项 alpha*(logsumexp Q - Q(s,a)) 的离线策略学习。"""
+
+    def __init__(self, state_dim, num_actions, hidden=(32,), actor_lr=1e-3,
+                 critic_lr=1e-3, alpha=0.5, beta=3.0, gamma=0.99,
+                 target_tau=0.005, seed=None):
+        _offline_check_int(state_dim, "CQLAgent: state_dim", 1)
+        _offline_check_int(num_actions, "CQLAgent: num_actions", 1)
+        _offline_check_float(actor_lr, "CQLAgent: actor_lr", 0.0, None, low_open=True)
+        _offline_check_float(critic_lr, "CQLAgent: critic_lr", 0.0, None, low_open=True)
+        _offline_check_float(alpha, "CQLAgent: alpha", 0.0, None)
+        _offline_check_float(beta, "CQLAgent: beta", 0.0, None, low_open=True)
+        _offline_check_float(gamma, "CQLAgent: gamma", 0.0, 1.0)
+        _offline_check_float(target_tau, "CQLAgent: target_tau", 0.0, 1.0,
+                             low_open=True, high_open=True)
+        for v in list(hidden):
+            _offline_check_int(v, "CQLAgent: hidden 元素", 1)
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.target_tau = float(target_tau)
+
+        self.q = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.q_target = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.q_target.copy_from(self.q)
+        self.policy = PolicyNetwork(state_dim, num_actions, hidden, seed=seed)
+        self.q_opt = Adam(self.q.model, lr=critic_lr)
+        self.policy_opt = Adam(self.policy.model, lr=actor_lr)
+
+    def update(self, states, actions, rewards, next_states, dones):
+        n = len(states)
+        if n < 1:
+            raise ValueError("CQLAgent.update: 批次不能为空")
+        for name, seq in (("actions", actions), ("rewards", rewards),
+                          ("next_states", next_states), ("dones", dones)):
+            if len(seq) != n:
+                raise ValueError(f"CQLAgent.update: {name} 长度必须与 states 一致")
+        q_acc = _offline_zeros_like(self.q.model)
+        pi_acc = _offline_zeros_like(self.policy.model)
+        q_loss = pi_loss = 0.0
+        for i in range(n):
+            s = list(states[i])
+            sp = list(next_states[i])
+            a = actions[i]
+            _offline_check_int(a, "CQLAgent.update: action", 0, self.num_actions - 1)
+            r = float(rewards[i])
+            d = bool(dones[i])
+
+            qs = self.q.logits(s)
+            q_a = qs[a]
+            q_next = self.q_target.logits(sp)
+            y = r if d else r + self.gamma * max(q_next)
+            probs_q = _offline_softmax(qs)
+            m = max(qs)
+            lse = m + math.log(sum(math.exp(v - m) for v in qs))
+            q_loss += (q_a - y) * (q_a - y) / n + self.alpha * (lse - q_a) / n
+            dq = [self.alpha * (probs_q[j] - (1.0 if j == a else 0.0)) / n
+                  for j in range(self.num_actions)]
+            dq[a] += 2.0 * (q_a - y) / n
+            q_grads = self.q.gradients(dq)
+            _offline_accumulate(q_acc, q_grads)
+
+            adv = q_a - lse
+            weight = math.exp(min(self.beta * adv, 30.0))
+            probs = self.policy.probs(s)
+            pi_loss += -weight * math.log(max(probs[a], 1e-12)) / n
+            dlogits = [0.0] * self.num_actions
+            for j in range(self.num_actions):
+                target = 1.0 if j == a else 0.0
+                dlogits[j] = weight * (probs[j] - target) / n
+            pi_grads = self.policy.gradients(dlogits)
+            _offline_accumulate(pi_acc, pi_grads)
+
+        self.q_opt.step(_offline_average(q_acc, n))
+        self.policy_opt.step(_offline_average(pi_acc, n))
+        _offline_soft_update(self.q_target, self.q, self.target_tau)
+        return {"q_loss": q_loss, "policy_loss": pi_loss}
+
+    def fit(self, buffer, steps=100, batch_size=32):
+        _offline_check_int(steps, "CQLAgent.fit: steps", 1)
+        _offline_check_int(batch_size, "CQLAgent.fit: batch_size", 1)
+        if len(buffer) < 1:
+            raise ValueError("CQLAgent.fit: ReplayBuffer 不能为空")
+        last = None
+        for _ in range(steps):
+            batch = buffer.sample(batch_size)
+            last = self.update(*batch)
+        return last
+
+    def act(self, state):
+        """贪心动作（直接取 Q 的最大值）。"""
+        qs = self.q.logits(state)
+        return max(range(self.num_actions), key=lambda j: qs[j])
+
+    def param_count(self):
+        return (self.q.param_count() + self.q_target.param_count()
+                + self.policy.param_count())
+
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 

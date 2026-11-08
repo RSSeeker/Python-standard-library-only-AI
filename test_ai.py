@@ -30873,3 +30873,104 @@ class TestDETR:
             lambda: m.fit([img], [[(0, [0.5, 0.5, 0.2, 0.2])]], epochs=0, lr=0.05))
         assert _detr_raises(
             lambda: m.fit([img], [[(0, [0.5, 0.5, 0.2, 0.2])]], epochs=2, lr=-0.1))
+
+
+import math
+import random
+
+
+def _offline_rl_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+def _offline_rl_bandit():
+    k_num, a_num = 4, 3
+    rewards = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+    def state(k):
+        row = [0.0] * k_num
+        row[k] = 1.0
+        return row
+
+    rng = random.Random(0)
+    buf = AI.ReplayBuffer(capacity=2010, seed=1)
+    for _ in range(2000):
+        k = rng.randrange(k_num)
+        a = rng.randrange(a_num)
+        buf.add(state(k), a, rewards[k][a] + rng.gauss(0.0, 0.01), state(k), True)
+    return k_num, a_num, rewards, state, buf
+
+
+def _offline_rl_accuracy(agent, rewards, state):
+    ok = 0
+    for k in range(len(rewards)):
+        a = agent.act(state(k))
+        if abs(rewards[k][a] - max(rewards[k])) < 1e-9:
+            ok += 1
+    return ok / len(rewards)
+
+
+class TestOfflineRL:
+    def test_iql_learns_contextual_bandit(self):
+        k_num, a_num, rewards, state, buf = _offline_rl_bandit()
+        agent = AI.IQLAgent(k_num, a_num, hidden=(32,), seed=2, beta=10.0,
+                            actor_lr=1e-2, critic_lr=1e-2)
+        stats = agent.fit(buf, steps=120, batch_size=16)
+        assert set(stats.keys()) == {"q_loss", "v_loss", "policy_loss"}
+        assert stats["q_loss"] == stats["q_loss"]
+        assert _offline_rl_accuracy(agent, rewards, state) >= 0.75
+        assert 0 <= agent.act(state(0)) < a_num
+
+    def test_cql_learns_contextual_bandit_and_is_conservative(self):
+        k_num, a_num, rewards, state, buf = _offline_rl_bandit()
+        agent = AI.CQLAgent(k_num, a_num, hidden=(32,), seed=2, alpha=0.1, beta=10.0,
+                            actor_lr=1e-2, critic_lr=1e-2)
+        stats = agent.fit(buf, steps=120, batch_size=16)
+        assert set(stats.keys()) == {"q_loss", "policy_loss"}
+        scores = [agent.q.logits(state(0))[j] for j in range(a_num)]
+        assert scores[0] == max(scores)
+        # 保守项压低了数据集外动作：最优动作 Q 与次优 Q 有明显间隔
+        ordered = sorted(scores, reverse=True)
+        assert ordered[0] - ordered[1] > 0.1
+        assert _offline_rl_accuracy(agent, rewards, state) >= 0.75
+
+    def test_softmax_and_average_helpers(self):
+        probs = AI._offline_softmax([1.0, 2.0, 3.0])
+        assert abs(sum(probs) - 1.0) < 1e-12
+        assert probs[2] > probs[1] > probs[0]
+        avg = AI._offline_average([([[2.0, 4.0]], [2.0])], 2)
+        assert avg == [([[1.0, 2.0]], [1.0])]
+
+    def test_param_counts_and_invalid_inputs(self):
+        iql = AI.IQLAgent(4, 3, hidden=(8,), seed=1)
+        cql = AI.CQLAgent(4, 3, hidden=(8,), seed=1)
+        assert iql.param_count() == 299
+        assert cql.param_count() == 201
+        for bad in (0, -1):
+            _offline_rl_raises(lambda: AI.IQLAgent(bad, 3))
+            _offline_rl_raises(lambda: AI.CQLAgent(4, bad))
+            _offline_rl_raises(lambda: AI.IQLAgent(4, 3, hidden=(bad,)))
+        _offline_rl_raises(lambda: AI.IQLAgent(4, 3, tau=0.0))
+        _offline_rl_raises(lambda: AI.IQLAgent(4, 3, tau=1.0))
+        _offline_rl_raises(lambda: AI.IQLAgent(4, 3, beta=0.0))
+        _offline_rl_raises(lambda: AI.IQLAgent(4, 3, gamma=1.5))
+        _offline_rl_raises(lambda: AI.CQLAgent(4, 3, alpha=-0.1))
+        _offline_rl_raises(lambda: AI.CQLAgent(4, 3, target_tau=0.0))
+        state0 = [1.0, 0.0, 0.0, 0.0]
+        s = AI.IQLAgent(4, 3, hidden=(8,), seed=1)
+        _offline_rl_raises(lambda: s.update([], [], [], [], []))
+        _offline_rl_raises(lambda: s.update([state0], [7], [1.0], [state0], [True]))
+        _offline_rl_raises(lambda: s.update([state0], [0], [1.0], [state0], [True, True]))
+        _offline_rl_raises(lambda: s.fit(AI.ReplayBuffer(capacity=4), steps=2, batch_size=2))
+        _offline_rl_raises(lambda: s.fit(AI.ReplayBuffer(capacity=4), steps=0, batch_size=2))

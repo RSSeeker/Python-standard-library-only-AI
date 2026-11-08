@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2015 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2019 项）
 
 ## 特性
 
@@ -2029,6 +2029,25 @@ print(agent.policy.probs(env.reset(seed=0)))
 
 四条边界：离散部分只支持离散动作；连续动作请用 `ContinuousReplayBuffer` + `DDPGAgent` / `TD3Agent`（DDPG/TD3 是确定性策略；SAC 用 `SACAgent` 的 tanh 挤压高斯与重参数化采样）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
 
+### 离线强化学习（IQL / CQL）
+
+| API | 说明 |
+|-----|------|
+| `IQLAgent(state_dim, num_actions, hidden=(32,), actor_lr=1e-3, critic_lr=1e-3, tau=0.7, beta=3.0, gamma=0.99, target_tau=0.005, seed=None)` | 隐式 Q 学习：expectile 回归 V(s)、无 max 的 Q TD 目标、AWR 加权策略提取；`update` / `fit(buffer, steps, batch_size)` / `act` / `param_count` |
+| `CQLAgent(state_dim, num_actions, hidden=(32,), actor_lr=1e-3, critic_lr=1e-3, alpha=0.5, beta=3.0, gamma=0.99, target_tau=0.005, seed=None)` | 保守 Q 学习：TD 损失 + `alpha·(logsumexp_a Q(s,a) − Q(s,a_data))` 保守项，AWR 策略提取；接口同 `IQLAgent` |
+
+```python
+import AI
+
+buf = AI.ReplayBuffer(capacity=10000, seed=1)
+# 离线数据：buf.add(state, action, reward, next_state, done)
+iql = AI.IQLAgent(state_dim=4, num_actions=3, hidden=(32,), seed=2)
+iql.fit(buf, steps=200, batch_size=32)
+print(iql.act([1.0, 0.0, 0.0, 0.0]))
+```
+
+四条边界：只支持**离散动作**（连续动作请用 DDPG / TD3 / SAC 的在线版本）；IQL 的 V 用 expectile 回归 `Q(s,a)`（`tau` 控制上分位），Q 的 TD 目标用 `V_target(s')` 而**不做 max**；CQL 的保守项在数据集动作上把 Q 推高、在其它动作上压低，`alpha` 越大越保守；两者都按单样本累加梯度再平均（小批量慢，教学用途），目标网络用 Polyak 软更新 `target_tau`。
+
 ### 状态空间模型（Mamba S6）
 
 | API | 说明 |
@@ -3570,7 +3589,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2015 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2019 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3759,6 +3778,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestXLSTM` | `XLSTMBlock` 前向/参数量、`W1`/`W2`/`Wg`/`Wo`/`ln1` 梯度有限差分、`XLSTMModel` 拟合/生成/参数与非法输入 |
 | `TestDeBERTa` | `DeBERTaBlock` 前向/参数量、`Wq`/`Wk`/`Wv`/`Wo`/`W1`/`W2`、`Rk`/`Rq` 与 `ln1` 的梯度有限差分、`DeBERTaModel` 拟合/生成/参数与非法输入 |
 | `TestDETR` | 小合成图上前向/参数量、conv1/两个头/queries 梯度有限差分、匈牙利匹配、30 epochs 拟合 loss 下降与非法输入 |
+| `TestOfflineRL` | 合成 contextual bandit 上 IQL / CQL 策略准确率、CQL 保守性（最优 Q 与次优间隔）、softmax/平均 helper、参数量 299/201 与非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3884,7 +3904,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2015 个单元测试
+├── test_ai.py       # 2019 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
