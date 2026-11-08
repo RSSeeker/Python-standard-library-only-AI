@@ -806,7 +806,7 @@ W0 + W1 + W3 + W9 + W13 + W2 的部分 = 约 8–10 个会话，就能让这个�
 - [x] `silu` / `mish` / `elu` / `selu`（扩 `act_apply` 枚举；`activations_reference.json`，silu 全逐位，其余在 `z=-1e-8` 或 `log1p`/`tanh` 上按实测标 `tol=1e-12`）
 - [ ] GELU 版 FFN（C 的 `FeedForward` 目前只走 ReLU）
 - [x] 损失枚举补齐：focal / bce / bce_with_logits / huber（`losses.c`；`loss_reference.json` + `tests/compare_loss`：24 用例 48 个标量/数组里 47 个逐位，唯一差异是 `pow(0.6,3.0)` 的 1 ULP；`LossKind` 2→6，训练与验证共用一个 `trainer_loss_apply`，`tests/test_loss.c` 验集成）
-- [ ] 指标模块：accuracy / precision / recall / f1 / confusion_matrix / mae / rmse / mape / top-k / roc_auc
+- [x] 指标模块：`confusion_matrix` / `accuracy_score` / `precision_recall_f1`（macro·micro·weighted·none 四种口径 + per-class 明细）/ `matthews_corrcoef` / `top_k_accuracy` / `roc_auc_score` / `mean_absolute_error` / `root_mean_squared_error` / `mean_absolute_percentage_error` / `r2_score`（`metrics.c`；`metrics_reference.json` 32 用例 141 项检查**全部逐位相同、容差 0**，`tests/test_metrics.c` 另有 50 项独立自测。回归四项里 mae/rmse 用 Neumaier 对齐 Python 的 `sum()`，mape/r2 保持朴素 `+=`，两种累加不能互换）
 - [ ] `Conv2d` 的 `groups` / `dilation`；`Conv1d` / `ConvTranspose2d`
 - [ ] `BatchNorm2d` / `GroupNorm` / `InstanceNorm` / `DropPath`
 - [ ] Mixup / CutMix / Cutout / RandAugment（纯张量运算，A 档）
