@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1967 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1972 项）
 
 ## 特性
 
@@ -364,6 +364,11 @@ model.train()     # 回到训练
 | `DDPM(data_dim, hidden_dim=32, steps=50, prediction="eps")` | 扩散模型：线性 beta 表 + 累积 `abar`；`prediction` 可选 `eps`/`v`/`x0`（`target()` 与 `pred_to_x0_eps()` 互为反函数）；`q_sample` 加噪、`sample` DDPM 反向去噪、`ddim_sample(steps=, eta=)` 确定性 DDIM（可只走子序列）；`train_step(..., min_snr_gamma=)` 按 `min(SNR, γ)/SNR` 加权 |
 | `VQVAE(input_dim, hidden_dim=32, latent_dim=2, num_codes=8, beta=0.25)` | 向量量化自编码器：`encode` / `quantize` / `decode`，重构 + 码本 + commitment 三项损失，straight-through 反向；`codebook_histogram()` 看码字使用 |
 | `FlowMatching(data_dim, hidden_dim=32, t_dim=8)` | Flow Matching / Rectified Flow：直线路径 `x_t=(1-t)x0+t·noise`、目标速度 `noise-x0`，`velocity` / `train_step` / `fit`；`sample(steps, solver="euler"\|"heun")` 从 t=1 积分到 t=0 |
+
+| `edm_euler_sampler(denoise_fn, x, steps=18, sigma_min=0.002, sigma_max=80, rho=7)` | EDM 的一阶 Euler 采样（VE 参数化）：`dx/dsigma = (x - D(x,sigma)) / sigma`，sigma 调度为对数间隔 + rho 弯曲 |
+| `edm_heun_sampler(denoise_fn, x, ...)` | EDM 的二阶 Heun 采样：Euler 预测 + 端点平均校正，同等步数下误差更小 |
+| `dpm_solver_sampler(denoise_fn, x, steps=20, ...)` | DPM-Solver 的一阶指数积分器：区间内假设 x0 恒定，`x(sigma_next) = x0 + (sigma_next/sigma)*(x - x0)`，取得比 Euler 更大的有效步长 |
+| `consistency_training_loss(student_fn, teacher_fn, x, sigma, sigma_next)` / `consistency_sampler(student_fn, x, steps=8, ...)` | 一致性蒸馏（CD）的逐样本损失与采样器：student 直接预测 x0，teacher 用两步 Euler 目标；采样时逐级预测 x0 并重新加噪 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` / `window=N` / `alibi=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` / `window` 会传给每一层） |
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
@@ -3401,7 +3406,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1967 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1972 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3431,6 +3436,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMinSNR` | 权重 ∈ (0,1] 且随 t 单调、`γ` 越小越不放大、加权后 loss 恰为 `w×` 原 loss、非法 `γ` |
 | `TestVQVAE` | `quantize` 最近邻与平局、三项损失闭式解、straight-through 与 `beta=0` 退化、码本与 decoder 梯度中心差分、warmup 不动码本、`histogram`、优化器、训练与非法输入 |
 | `TestFlowMatching` | 直线路径与目标速度、时间编码、速度场输入梯度、三层参数梯度中心差分、训练收敛与两种采样器的确定性、优化器与 15 类非法输入 |
+| `TestDiffusionSamplers` | sigma 调度的端点/单调性、常数去噪器收敛、shrinkage 去噪器与解析解对比（步数越多越准）、一致性损失与采样、非法输入 |
 | `TestActNorm` | `data_init` 后首批输出零均值单位方差、逆变换与 `logdet`、`dx`/`g_b`/`g_log_s` 中心差分、优化器步与非法输入 |
 | `TestInvertibleLinear` | 逆变换精确、`logdet` 对数值 Jacobian、`dx` 与 `g_W`（含 `g_logdet·W^{-T}`）、无 logdet 项时 `g_W = g_y x^T`、奇异矩阵与优化器步 |
 | `TestRealNVP` | forward/inverse 互逆（dim 2–5）、掩码交替（偶数棋盘格 / 奇数半区）、解析 log-det vs 数值 Jacobian、输入与四组层参数梯度、nll 训练下降与采样确定性、非法输入 |
@@ -3706,7 +3712,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1967 个单元测试
+├── test_ai.py       # 1972 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

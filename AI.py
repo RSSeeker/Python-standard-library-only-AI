@@ -53654,6 +53654,143 @@ class DDPM:
         return out
 
 
+# ============================================================================
+#  EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+# ============================================================================
+
+def _diffusion_sigmas(steps, sigma_min, sigma_max, rho=7.0):
+    """EDM 的 sigma 调度：对数间隔 + rho 弯曲，返回 [sigma_max, ..., sigma_min]。"""
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 2:
+        raise ValueError(f"_diffusion_sigmas: steps 必须是 >= 2 的整数，收到 {steps!r}")
+    for name, value in (("sigma_min", sigma_min), ("sigma_max", sigma_max), ("rho", rho)):
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError(f"_diffusion_sigmas: {name} 必须是正有限数，收到 {value!r}")
+    if sigma_min >= sigma_max:
+        raise ValueError(
+            f"_diffusion_sigmas: sigma_min={sigma_min} 必须小于 sigma_max={sigma_max}")
+    lo, hi = sigma_min ** (1.0 / rho), sigma_max ** (1.0 / rho)
+    sigmas = []
+    for i in range(steps):
+        s = hi + (lo - hi) * i / (steps - 1)
+        sigmas.append(s ** rho)
+    sigmas.append(0.0)
+    return sigmas
+
+
+def _diffusion_denoise(denoise_fn, x, sigma, who):
+    """调用去噪函数并校验返回向量（x: List[float] → List[float]）。"""
+    if not callable(denoise_fn):
+        raise ValueError(f"{who}: denoise_fn 必须可调用")
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: x 必须是非空向量")
+    out = denoise_fn(list(x), float(sigma))
+    if not isinstance(out, (list, tuple)) or len(out) != len(x):
+        raise ValueError(
+            f"{who}: denoise_fn 返回长度 {len(out) if isinstance(out, (list, tuple)) else '?'}"
+            f" 与 x 长度 {len(x)} 不一致")
+    return [float(v) for v in out]
+
+
+def _edm_euler_step(x, x0, sigma, sigma_next):
+    if sigma <= 0.0:
+        return list(x0)
+    return [x[i] + (sigma_next - sigma) * (x[i] - x0[i]) / sigma for i in range(len(x))]
+
+
+def edm_euler_sampler(denoise_fn, x, steps=18, sigma_min=0.002, sigma_max=80.0, rho=7.0):
+    """EDM 的一阶 Euler 采样器（VE 参数化）：dx/dsigma = (x - D(x,sigma)) / sigma。"""
+    sigmas = _diffusion_sigmas(steps, sigma_min, sigma_max, rho)
+    cur = [float(v) for v in x]
+    for i in range(steps):
+        x0 = _diffusion_denoise(denoise_fn, cur, sigmas[i], "edm_euler_sampler")
+        cur = _edm_euler_step(cur, x0, sigmas[i], sigmas[i + 1])
+    return cur
+
+
+def edm_heun_sampler(denoise_fn, x, steps=18, sigma_min=0.002, sigma_max=80.0, rho=7.0):
+    """EDM 的二阶 Heun 采样器：Euler 预测 + 端点平均校正。"""
+    sigmas = _diffusion_sigmas(steps, sigma_min, sigma_max, rho)
+    cur = [float(v) for v in x]
+    for i in range(steps):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        x0 = _diffusion_denoise(denoise_fn, cur, sigma, "edm_heun_sampler")
+        pred = _edm_euler_step(cur, x0, sigma, sigma_next)
+        if sigma_next > 0.0:
+            x0_next = _diffusion_denoise(denoise_fn, pred, sigma_next, "edm_heun_sampler")
+            cur = [cur[j] + (sigma_next - sigma) * 0.5 * (
+                (cur[j] - x0[j]) / sigma + (pred[j] - x0_next[j]) / sigma_next)
+                for j in range(len(cur))]
+        else:
+            cur = pred
+    return cur
+
+
+def dpm_solver_sampler(denoise_fn, x, steps=20, sigma_min=0.002, sigma_max=80.0,
+                       rho=7.0):
+    """DPM-Solver 的一阶指数积分器（VE 参数化）。
+
+    对区间内假设 x0 恒定的 ODE，精确解是
+    ``x(sigma_next) = x0 + (sigma_next / sigma) * (x - x0)``；
+    本函数就是逐步使用该解的确定性采样器，等价于 DDIM 式指数积分。
+    """
+    sigmas = _diffusion_sigmas(steps, sigma_min, sigma_max, rho)
+    cur = [float(v) for v in x]
+    for i in range(steps):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        x0 = _diffusion_denoise(denoise_fn, cur, sigma, "dpm_solver_sampler")
+        if sigma_next <= 0.0:
+            cur = list(x0)
+        else:
+            ratio = sigma_next / sigma
+            cur = [x0[j] + ratio * (cur[j] - x0[j]) for j in range(len(cur))]
+    return cur
+
+
+def consistency_training_loss(student_fn, teacher_fn, x, sigma, sigma_next):
+    """一致性蒸馏（CD）的逐样本损失：student(x,sigma) 对齐 teacher 的两步 Euler 目标。"""
+    for name, fn in (("student_fn", student_fn), ("teacher_fn", teacher_fn)):
+        if not callable(fn):
+            raise ValueError(f"consistency_training_loss: {name} 必须可调用")
+    if (not isinstance(sigma, (int, float)) or isinstance(sigma, bool)
+            or not math.isfinite(sigma) or sigma <= 0):
+        raise ValueError(f"consistency_training_loss: sigma 必须是正有限数，收到 {sigma!r}")
+    if (not isinstance(sigma_next, (int, float)) or isinstance(sigma_next, bool)
+            or not math.isfinite(sigma_next) or sigma_next < 0 or sigma_next >= sigma):
+        raise ValueError(
+            f"consistency_training_loss: sigma_next 必须在 [0, sigma) 内，收到 {sigma_next!r}")
+    x = [float(v) for v in x]
+    pred = _diffusion_denoise(student_fn, x, sigma, "consistency_training_loss")
+    teacher_x0 = _diffusion_denoise(teacher_fn, x, sigma, "consistency_training_loss")
+    if sigma_next > 0.0:
+        ratio = sigma_next / sigma
+        x_next = [teacher_x0[j] + ratio * (x[j] - teacher_x0[j]) for j in range(len(x))]
+        target = _diffusion_denoise(teacher_fn, x_next, sigma_next,
+                                    "consistency_training_loss")
+    else:
+        target = teacher_x0
+    diff = [pred[j] - target[j] for j in range(len(x))]
+    return sum(v * v for v in diff) / len(diff)
+
+
+def consistency_sampler(student_fn, x, steps=8, sigma_min=0.02, sigma_max=80.0,
+                        rho=7.0):
+    """一致性模型采样：按 sigma 调度逐级用 student 预测 x0 并重新加噪。"""
+    if not callable(student_fn):
+        raise ValueError("consistency_sampler: student_fn 必须可调用")
+    sigmas = _diffusion_sigmas(steps, sigma_min, sigma_max, rho)
+    cur = [float(v) for v in x]
+    for i in range(steps):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        x0 = _diffusion_denoise(student_fn, cur, sigma, "consistency_sampler")
+        if sigma_next <= 0.0:
+            cur = list(x0)
+        else:
+            ratio = sigma_next / sigma
+            cur = [x0[j] + ratio * (cur[j] - x0[j]) for j in range(len(cur))]
+    return cur
+
+
 # ── 工厂函数
 
 def _flow_time_features(t, dim=8):

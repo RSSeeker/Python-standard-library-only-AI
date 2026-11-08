@@ -29947,3 +29947,80 @@ class TestMambaBlockAndModel:
         with pytest.raises(ValueError):
             model.generate([0, 1], max_new_tokens=2, top_k=0)
         assert model.forward([0, 1, 2]) is not None
+
+
+class TestDiffusionSamplers:
+    def test_sigma_schedule(self):
+        sigmas = AI._diffusion_sigmas(4, 0.1, 10.0, 2.0)
+        assert len(sigmas) == 5
+        assert abs(sigmas[0] - 10.0) < 1e-12
+        assert abs(sigmas[-1] - 0.0) < 1e-12
+        assert abs(sigmas[-2] - 0.1) < 1e-9
+        assert all(sigmas[i] > sigmas[i + 1] for i in range(len(sigmas) - 1))
+        with pytest.raises(ValueError):
+            AI._diffusion_sigmas(1, 0.1, 10.0)
+        with pytest.raises(ValueError):
+            AI._diffusion_sigmas(4, 10.0, 0.1)
+        with pytest.raises(ValueError):
+            AI._diffusion_sigmas(4, 0.0, 10.0)
+
+    def test_constant_denoiser(self):
+        def denoise(x, sigma):
+            return [0.5] * len(x)
+
+        for fn in (AI.edm_euler_sampler, AI.edm_heun_sampler, AI.dpm_solver_sampler):
+            out = fn(denoise, [0.0, -2.0, 3.0], steps=8)
+            assert all(abs(v - 0.5) < 1e-12 for v in out)
+        assert AI.consistency_sampler(denoise, [0.0], steps=8) == [0.5]
+
+    def test_shrinkage_denoiser_converges_to_analytic(self):
+        # D(x, sigma) = x / (1+sigma^2) 时 ODE 的精确解为 x(sigma)=x0*sqrt(1+sigma^2)
+        def denoise(x, sigma):
+            return [v / (1.0 + sigma * sigma) for v in x]
+
+        sigma_max = 80.0
+        start = 1.0
+        # 从 sigma_max 走到 0：x(0) = x(sigma_max) / sqrt(1+sigma_max^2)
+        analytic = start / math.sqrt(1.0 + sigma_max * sigma_max)
+        errs = {}
+        for fn in (AI.edm_euler_sampler, AI.edm_heun_sampler, AI.dpm_solver_sampler):
+            errs[fn.__name__] = abs(fn(denoise, [start], steps=256, sigma_max=sigma_max)[0]
+                                    - analytic)
+        assert max(errs.values()) < 0.05
+        e_few = abs(AI.edm_euler_sampler(denoise, [start], steps=8,
+                                         sigma_max=sigma_max)[0] - analytic)
+        e_many = abs(AI.edm_euler_sampler(denoise, [start], steps=256,
+                                          sigma_max=sigma_max)[0] - analytic)
+        assert e_many <= e_few
+
+    def test_consistency_loss(self):
+        def denoise(x, sigma):
+            return [0.5] * len(x)
+
+        def shifted(x, sigma):
+            return [1.5] * len(x)
+
+        assert AI.consistency_training_loss(denoise, denoise, [0.0], 10.0, 1.0) == 0.0
+        assert abs(AI.consistency_training_loss(shifted, denoise, [0.0], 10.0, 1.0) - 1.0) < 1e-12
+        assert abs(AI.consistency_training_loss(
+            denoise, denoise, [0.0, 2.0], 5.0, 0.0)) < 1e-12
+        with pytest.raises(ValueError):
+            AI.consistency_training_loss(denoise, denoise, [0.0], 0.0, 0.0)
+        with pytest.raises(ValueError):
+            AI.consistency_training_loss(denoise, denoise, [0.0], 1.0, 2.0)
+        with pytest.raises(ValueError):
+            AI.consistency_training_loss(None, denoise, [0.0], 1.0, 0.0)
+
+    def test_sampler_invalid_inputs(self):
+        def bad(x, sigma):
+            return [0.0]
+
+        with pytest.raises(ValueError):
+            AI.edm_euler_sampler(None, [0.0])
+        with pytest.raises(ValueError):
+            AI.edm_euler_sampler(bad, [0.0, 1.0])
+        with pytest.raises(ValueError):
+            AI.edm_euler_sampler(lambda x, sigma: [0.0] * len(x), [])
+        with pytest.raises(ValueError):
+            AI.dpm_solver_sampler(lambda x, sigma: [0.0] * len(x), [0.0], steps=20,
+                                  sigma_min=1.0, sigma_max=0.5)

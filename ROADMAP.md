@@ -763,7 +763,11 @@
   `selective_scan`、门控 + 残差）与 `MambaModel`（Embedding → N×block → LM 头，含
   `fit`/`generate`）；测试 `TestMambaBlockAndModel` 4 例
 
-全量测试：1839 → 1967 passed（新增 128 例）。
+- [x] 扩散采样器：`edm_euler_sampler` / `edm_heun_sampler`（EDM，VE 参数化，二阶 Heun 校正）、
+  `dpm_solver_sampler`（DPM-Solver 一阶指数积分）、`consistency_training_loss` /
+  `consistency_sampler`（一致性蒸馏损失与采样）；测试 `TestDiffusionSamplers` 5 例
+
+全量测试：1839 → 1972 passed（新增 133 例）。
 
 ---
 
