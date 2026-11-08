@@ -30024,3 +30024,105 @@ class TestDiffusionSamplers:
         with pytest.raises(ValueError):
             AI.dpm_solver_sampler(lambda x, sigma: [0.0] * len(x), [0.0], steps=20,
                                   sigma_min=1.0, sigma_max=0.5)
+
+
+class TestNeuralODEAndPINN:
+    def _ode_target(self):
+        return math.exp(-1.0)
+
+    def test_ode_backward_fd(self):
+        m = AI.NeuralODE(data_dim=1, hidden_dim=8, t_dim=4, steps=4)
+        m.zero_grad()
+        m.loss_and_backward([1.0], 0.0, 1.0, [self._ode_target()])
+
+        def fl():
+            y, _ = m.integrate([1.0], 0.0, 1.0)
+            return (y[0] - self._ode_target()) ** 2
+
+        eps = 1e-6
+        old = m.l3.weights[0][0]
+        m.l3.weights[0][0] = old + eps
+        fp = fl()
+        m.l3.weights[0][0] = old - eps
+        fm = fl()
+        m.l3.weights[0][0] = old
+        fd = (fp - fm) / (2 * eps)
+        analytic = m._g[2][0][0][0]
+        assert abs(fd - analytic) <= 1e-4 * max(1.0, abs(analytic)), (fd, analytic)
+
+    def test_ode_fit_learns_decay(self):
+        m = AI.NeuralODE(data_dim=1, hidden_dim=16, t_dim=4, steps=8)
+        losses = m.fit([([1.0], [self._ode_target()])], t0=0.0, t1=1.0,
+                       epochs=250, lr=0.05, seed=1)
+        assert losses[-1] < 1e-4, losses[-1]
+        y, traj = m.integrate([1.0], 0.0, 1.0)
+        assert len(traj) == 9
+        assert abs(y[0] - self._ode_target()) < 5e-3, y[0]
+
+    def test_ode_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.NeuralODE(data_dim=0)
+        with pytest.raises(ValueError):
+            AI.NeuralODE(data_dim=1, steps=0)
+        m = AI.NeuralODE(data_dim=2)
+        with pytest.raises(ValueError):
+            m.integrate([1.0], 0.0, 1.0)
+        with pytest.raises(ValueError):
+            m.integrate([1.0, 2.0], 0.0, 0.0)
+        with pytest.raises(ValueError):
+            m.loss_and_backward([1.0, 2.0], 0.0, 1.0, [1.0])
+        with pytest.raises(ValueError):
+            m.sgd_step(-0.1)
+
+    def test_pinn_poisson_solution(self):
+        p = AI.PINN1D(hidden_dim=16, seed=3)
+        xs = [i / 10 for i in range(1, 10)]
+        losses = p.fit(xs, [-1.0] * 9)
+        assert losses[-1] < 1e-2, losses[-1]
+        assert abs(p.predict(0.5) - 0.125) < 5e-3, p.predict(0.5)
+        assert abs(p.predict(0.25) - 0.09375) < 5e-3, p.predict(0.25)
+        assert abs(p.predict(0.0)) < 1e-9
+        assert abs(p.predict(1.0)) < 1e-9
+
+    def test_pinn_backward_fd(self):
+        p = AI.PINN1D(hidden_dim=4, seed=3)
+        xs = [0.2, 0.5, 0.8]
+        fs = [-1.0] * 3
+
+        def lossv():
+            h = 1e-3
+            total = 0.0
+            for x, f in zip(xs, fs):
+                total += ((p.predict(x + h) - 2 * p.predict(x) + p.predict(x - h))
+                          / (h * h) - f) ** 2 / len(xs)
+            return total
+
+        p.zero_grad()
+        p.loss_and_backward(xs, fs)
+        eps = 1e-6
+        old = p.l2.weights[0][0]
+        p.l2.weights[0][0] = old + eps
+        lp = lossv()
+        p.l2.weights[0][0] = old - eps
+        lm = lossv()
+        p.l2.weights[0][0] = old
+        fd = (lp - lm) / (2 * eps)
+        analytic = p._g[1][0][0][0]
+        assert abs(fd - analytic) <= 2e-2 * max(1.0, abs(analytic)), (fd, analytic)
+
+    def test_pinn_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.PINN1D(hidden_dim=0)
+        p = AI.PINN1D(hidden_dim=4, seed=1)
+        with pytest.raises(ValueError):
+            p.loss_and_backward([], [])
+        with pytest.raises(ValueError):
+            p.loss_and_backward([0.5], [1.0, 2.0])
+        with pytest.raises(ValueError):
+            p.loss_and_backward([0.5], [-1.0], h=0.0)
+        with pytest.raises(ValueError):
+            p.loss_and_backward([0.0], [-1.0])
+        with pytest.raises(ValueError):
+            p.loss_and_backward([1.5], [-1.0])
+        with pytest.raises(ValueError):
+            p.sgd_step(-0.1)

@@ -767,7 +767,11 @@
   `dpm_solver_sampler`（DPM-Solver 一阶指数积分）、`consistency_training_loss` /
   `consistency_sampler`（一致性蒸馏损失与采样）；测试 `TestDiffusionSamplers` 5 例
 
-全量测试：1839 → 1972 passed（新增 133 例）。
+- [x] Neural ODE 与 PINN：`NeuralODE`（Euler 积分 + 终态 MSE 的逐步显式反向、`integrate`/`fit`）
+  与 `PINN1D`（一维 Poisson、试函数 `x(1-x)·NN(x)` 吸收零边界、中心差分残差）；测试
+  `TestNeuralODEAndPINN` 6 例
+
+全量测试：1839 → 1978 passed（新增 139 例）。
 
 ---
 

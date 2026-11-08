@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1972 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1978 项）
 
 ## 特性
 
@@ -2023,6 +2023,24 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### 神经 ODE 与物理信息网络（Neural ODE / PINN）
+
+| API | 说明 |
+|-----|------|
+| `NeuralODE(data_dim, hidden_dim=32, t_dim=8, steps=16)` | 学习向量场 `dy/dt = f(t, y)`：Euler 积分 + 逐步显式反向（终态 MSE 监督）；`integrate` / `loss_and_backward` / `fit` / `sgd_step` |
+| `PINN1D(hidden_dim=16, seed=None)` | 一维稳态 Poisson `u''(x)=f(x)`、零边界：试函数 `u(x)=x(1-x)·NN(x)`，中心差分残差 + 残差平方训练；`predict` / `loss_and_backward` / `fit` |
+
+```python
+ode = AI.NeuralODE(data_dim=1, hidden_dim=16, t_dim=4, steps=8)
+ode.fit([([1.0], [0.36787944117144233])], t0=0.0, t1=1.0, epochs=250, lr=0.05)
+
+pinn = AI.PINN1D(hidden_dim=16, seed=3)
+pinn.fit([i / 10 for i in range(1, 10)], [-1.0] * 9)   # u'' = -1
+pinn.predict(0.5)   # ≈ 0.125
+```
+
+边界：`NeuralODE` 只用 Euler 积分器（无自适应步长、无连续伴随），只对终态做监督；`PINN1D` 只处理一维、零边界与有限差分二阶导（`h` 默认 1e-3，残差梯度含 `1/h²` 因子，学习率需按 `h` 选择）。
+
 ### RL 基础设施与 RLHF 奖励
 
 | API | 说明 |
@@ -3406,7 +3424,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1972 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1978 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3437,6 +3455,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVQVAE` | `quantize` 最近邻与平局、三项损失闭式解、straight-through 与 `beta=0` 退化、码本与 decoder 梯度中心差分、warmup 不动码本、`histogram`、优化器、训练与非法输入 |
 | `TestFlowMatching` | 直线路径与目标速度、时间编码、速度场输入梯度、三层参数梯度中心差分、训练收敛与两种采样器的确定性、优化器与 15 类非法输入 |
 | `TestDiffusionSamplers` | sigma 调度的端点/单调性、常数去噪器收敛、shrinkage 去噪器与解析解对比（步数越多越准）、一致性损失与采样、非法输入 |
+| `TestNeuralODEAndPINN` | ODE 终态收敛到 e^-1、输入/参数梯度中心差分、非法输入；PINN 解 Poisson `u(0.5)≈0.125` 且两端为 0、梯度中心差分、非法输入 |
 | `TestActNorm` | `data_init` 后首批输出零均值单位方差、逆变换与 `logdet`、`dx`/`g_b`/`g_log_s` 中心差分、优化器步与非法输入 |
 | `TestInvertibleLinear` | 逆变换精确、`logdet` 对数值 Jacobian、`dx` 与 `g_W`（含 `g_logdet·W^{-T}`）、无 logdet 项时 `g_W = g_y x^T`、奇异矩阵与优化器步 |
 | `TestRealNVP` | forward/inverse 互逆（dim 2–5）、掩码交替（偶数棋盘格 / 奇数半区）、解析 log-det vs 数值 Jacobian、输入与四组层参数梯度、nll 训练下降与采样确定性、非法输入 |
@@ -3712,7 +3731,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1972 个单元测试
+├── test_ai.py       # 1978 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

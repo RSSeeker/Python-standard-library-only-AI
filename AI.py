@@ -35322,6 +35322,261 @@ class MambaModel:
         return self
 
 
+class NeuralODE:
+    """神经 ODE（Euler 积分 + 离散反向）。
+
+    学习向量场 ``f(t, y)``：``y_{n+1} = y_n + h * f(t_n, y_n)``，只对最终状态做监督。
+    反向是「先离散步、再按步反传」的精确链式（不是连续伴随法），因此边界：
+    只支持 Euler 积分器、只对终态监督、不估计连续伴随的数值误差。
+    """
+
+    def __init__(self, data_dim, hidden_dim=32, t_dim=8, steps=16):
+        for name, value in (("data_dim", data_dim), ("hidden_dim", hidden_dim),
+                            ("t_dim", t_dim), ("steps", steps)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"NeuralODE: {name} 必须是 >= 1 的整数，收到 {value!r}")
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.t_dim = t_dim if t_dim % 2 == 0 else t_dim + 1
+        self.steps = steps
+        self.l1 = Layer(data_dim + self.t_dim, hidden_dim, activation="relu")
+        self.l2 = Layer(hidden_dim, hidden_dim, activation="relu")
+        self.l3 = Layer(hidden_dim, data_dim, activation="linear")
+        self.layers = [self.l1, self.l2, self.l3]
+        self.zero_grad()
+
+    def zero_grad(self):
+        self._g = [None] * len(self.layers)
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+            return
+        cur_w, cur_b = self._g[i]
+        for r in range(len(cur_w)):
+            for c in range(len(cur_w[r])):
+                cur_w[r][c] += gw[r][c]
+        for k in range(len(cur_b)):
+            cur_b[k] += gb[k]
+
+    def param_count(self):
+        return sum(_dense_param_count(layer) for layer in self.layers)
+
+    def _field(self, y, t):
+        feats = _flow_time_features(t, self.t_dim)
+        rows = [list(y) + feats]
+        caches = []
+        row = rows[0]
+        for layer in self.layers:
+            out, cache = _dense_rows_forward(layer, [row])
+            caches.append(cache)
+            row = out[0]
+        return row, caches
+
+    def integrate(self, y0, t0, t1, steps=None):
+        if steps is None:
+            steps = self.steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"NeuralODE.integrate: steps 必须是 >= 1 的整数，收到 {steps!r}")
+        if not isinstance(y0, (list, tuple)) or len(y0) != self.data_dim:
+            raise ValueError(f"NeuralODE.integrate: y0 长度必须为 {self.data_dim}")
+        for value in (t0, t1):
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value)):
+                raise ValueError(f"NeuralODE.integrate: t0/t1 必须是有限数，收到 {value!r}")
+        if t1 <= t0:
+            raise ValueError(f"NeuralODE.integrate: 需要 t1 > t0，收到 {t0!r} -> {t1!r}")
+        h = (t1 - t0) / steps
+        y = [float(v) for v in y0]
+        traj = [list(y)]
+        for n in range(steps):
+            t = t0 + n * h
+            f, _ = self._field(y, t)
+            y = [y[j] + h * f[j] for j in range(self.data_dim)]
+            traj.append(list(y))
+        return y, traj
+
+    def loss_and_backward(self, y0, t0, t1, target, steps=None):
+        if steps is None:
+            steps = self.steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(
+                f"NeuralODE.loss_and_backward: steps 必须是 >= 1 的整数，收到 {steps!r}")
+        if not isinstance(target, (list, tuple)) or len(target) != self.data_dim:
+            raise ValueError(
+                f"NeuralODE.loss_and_backward: target 长度必须为 {self.data_dim}")
+        h = (t1 - t0) / steps
+        y = [float(v) for v in y0]
+        fs = []
+        caches_all = []
+        for n in range(steps):
+            t = t0 + n * h
+            f, caches = self._field(y, t)
+            fs.append(f)
+            caches_all.append(caches)
+            y = [y[j] + h * f[j] for j in range(self.data_dim)]
+        diff = [y[j] - target[j] for j in range(self.data_dim)]
+        loss = sum(v * v for v in diff) / self.data_dim
+        dy = [2.0 * diff[j] / self.data_dim for j in range(self.data_dim)]
+        for n in range(steps - 1, -1, -1):
+            d_f = [h * dy[j] for j in range(self.data_dim)]
+            d = d_f
+            caches = caches_all[n]
+            for li in range(len(self.layers) - 1, -1, -1):
+                gw, gb, dx = _dense_rows_backward(self.layers[li], caches[li], [d])
+                self._acc(li, gw, gb)
+                d = dx[0]
+            dy = [dy[j] + d[j] for j in range(self.data_dim)]
+        return loss
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"NeuralODE.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i, layer in enumerate(self.layers):
+            _dense_apply_sgd(layer, self._g[i], lr)
+
+    def fit(self, pairs, t0, t1, epochs=100, lr=1e-2, shuffle=True, seed=None, verbose=False):
+        if not pairs:
+            raise ValueError("NeuralODE.fit: pairs 不能为空")
+        rng = random.Random(seed)
+        order = list(range(len(pairs)))
+        losses = []
+        for epoch in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                y0, y1 = pairs[idx]
+                self.zero_grad()
+                total += self.loss_and_backward(y0, t0, t1, y1)
+                self.sgd_step(lr)
+            losses.append(total / len(pairs))
+            if verbose:
+                print(f"  epoch {epoch + 1}/{epochs} loss={losses[-1]:.6f}")
+        return losses
+
+
+class PINN1D:
+    """一维稳态 Poisson 方程的物理信息网络：``u''(x) = f(x)``，边界 u(0)=u(1)=0。
+
+    用试函数 ``u(x) = x(1-x)·NN(x)`` 把边界条件严格吸收进网络输出（无需边界损失），
+    二阶导用中心差分近似。训练损失 = 内部采样点残差平方均值：
+    ``res = (u(x+h)-2u(x)+u(x-h))/h² - f(x)``。
+    边界：只支持一维、零边界、有限差分近似二阶导（非自动微分）。
+    """
+
+    def __init__(self, hidden_dim=16, seed=None):
+        if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim < 1:
+            raise ValueError(f"PINN1D: hidden_dim 必须是 >= 1 的整数，收到 {hidden_dim!r}")
+        if seed is not None:
+            _old = random.getstate()
+            random.seed(seed)
+        self.l1 = Layer(1, hidden_dim, activation="silu")
+        self.l2 = Layer(hidden_dim, hidden_dim, activation="silu")
+        self.l3 = Layer(hidden_dim, 1, activation="linear")
+        self.layers = [self.l1, self.l2, self.l3]
+        if seed is not None:
+            random.setstate(_old)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self._g = [None] * len(self.layers)
+
+    def _acc(self, i, gw, gb):
+        if self._g[i] is None:
+            self._g[i] = [gw, gb]
+            return
+        cur_w, cur_b = self._g[i]
+        for r in range(len(cur_w)):
+            for c in range(len(cur_w[r])):
+                cur_w[r][c] += gw[r][c]
+        for k in range(len(cur_b)):
+            cur_b[k] += gb[k]
+
+    def param_count(self):
+        return sum(_dense_param_count(layer) for layer in self.layers)
+
+    @staticmethod
+    def _trial_factor(x):
+        return x * (1.0 - x)
+
+    def _raw(self, x):
+        row = [float(x)]
+        caches = []
+        for layer in self.layers:
+            out, cache = _dense_rows_forward(layer, [row])
+            caches.append(cache)
+            row = out[0]
+        return row[0], caches
+
+    def _u(self, x):
+        raw, caches = self._raw(x)
+        return self._trial_factor(x) * raw, caches
+
+    def _backprop_raw(self, caches, dout):
+        d = [dout]
+        for li in range(len(self.layers) - 1, -1, -1):
+            gw, gb, dx = _dense_rows_backward(self.layers[li], caches[li], [d])
+            self._acc(li, gw, gb)
+            d = dx[0]
+
+    def predict(self, x):
+        return self._u(x)[0]
+
+    def loss_and_backward(self, points, f_values, h=1e-3):
+        if not points or len(points) != len(f_values):
+            raise ValueError("PINN1D: points 与 f_values 必须等长且非空")
+        if (not isinstance(h, (int, float)) or isinstance(h, bool)
+                or not math.isfinite(h) or h <= 0):
+            raise ValueError(f"PINN1D.loss_and_backward: h 必须是正有限数，收到 {h!r}")
+        n = len(points)
+        loss = 0.0
+        plans = []
+        for x, f in zip(points, f_values):
+            if (not isinstance(x, (int, float)) or isinstance(x, bool)
+                    or not math.isfinite(x) or not 0.0 < x < 1.0):
+                raise ValueError(f"PINN1D.loss_and_backward: 采样点 x 必须在 (0,1) 内，收到 {x!r}")
+            x = float(x)
+            fm = self._trial_factor(x - h)
+            f0 = self._trial_factor(x)
+            fp = self._trial_factor(x + h)
+            um, cm = self._raw(x - h)
+            u0, c0 = self._raw(x)
+            up, cp = self._raw(x + h)
+            um *= fm
+            u0 *= f0
+            up *= fp
+            res = (up - 2.0 * u0 + um) / (h * h) - float(f)
+            loss += res * res / n
+            coef = 2.0 * res / n / (h * h)
+            plans.append((cm, coef * fm))
+            plans.append((c0, -2.0 * coef * f0))
+            plans.append((cp, coef * fp))
+        for caches, coef in plans:
+            self._backprop_raw(caches, coef)
+        return loss
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"PINN1D.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i, layer in enumerate(self.layers):
+            _dense_apply_sgd(layer, self._g[i], lr)
+
+    def fit(self, points, f_values, epochs=300, lr=1e-2, shuffle=False, seed=None,
+            verbose=False):
+        rng = random.Random(seed)
+        idxs = list(range(len(points)))
+        losses = []
+        for epoch in range(epochs):
+            self.zero_grad()
+            loss = self.loss_and_backward(points, f_values)
+            self.sgd_step(lr)
+            losses.append(loss)
+            if verbose and (epoch + 1) % 50 == 0:
+                print(f"  epoch {epoch + 1}/{epochs} loss={loss:.6e}")
+        return losses
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
