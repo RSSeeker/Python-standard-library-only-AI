@@ -36465,6 +36465,472 @@ class RWKVModel:
                     break
             out.append(pick)
         return out
+
+# ============================================================================
+#  RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+# ============================================================================
+
+
+def _retnet_gammas(num_heads):
+    """每头固定的保留衰减 gamma_h = 1 - 2^(-5-h)（论文默认值，不参与训练）"""
+    return [1.0 - 2.0 ** (-5.0 - h) for h in range(num_heads)]
+
+
+def _retention_forward(q, k, v, gamma, scale):
+    """多尺度保留（并行形式）
+
+    q/k/v: 每头 (T, head_dim)；返回 (out (T, d), cache)。
+    对 t 位置：out[t] = Σ_{j<=t} gamma^(t-j)·(q_t·k_j)·v_j / denom_t
+    其中 denom_t = Σ_{j<=t} gamma^(t-j)，scale = 1/sqrt(head_dim)。
+    """
+    T = len(q)
+    dim = len(v[0])
+    denom = []
+    acc = 0.0
+    gpow = 1.0
+    for t in range(T):
+        if t == 0:
+            acc = 1.0
+        else:
+            acc = acc * gamma + 1.0
+        denom.append(acc)
+    out = [[0.0] * dim for _ in range(T)]
+    scores = [[0.0] * T for _ in range(T)]   # scores[t][j]，j<=t
+    for t in range(T):
+        row = scores[t]
+        for j in range(t + 1):
+            s = 0.0
+            for i in range(len(q[t])):
+                s += q[t][i] * k[j][i]
+            row[j] = (s * scale) * (gamma ** (t - j))
+        d = denom[t]
+        for i in range(dim):
+            total = 0.0
+            for j in range(t + 1):
+                total += row[j] * v[j][i]
+            out[t][i] = total / d
+    cache = {"q": q, "k": k, "v": v, "gamma": gamma, "scale": scale,
+             "denom": denom, "scores": scores}
+    return out, cache
+
+
+def _retention_backward(dout, cache):
+    """返回 (dq, dk, dv)"""
+    q, k, v = cache["q"], cache["k"], cache["v"]
+    gamma, scale = cache["gamma"], cache["scale"]
+    denom, scores = cache["denom"], cache["scores"]
+    T = len(dout)
+    dim = len(v[0])
+    dq = [[0.0] * len(q[0]) for _ in range(T)]
+    dk = [[0.0] * len(k[0]) for _ in range(T)]
+    dv = [[0.0] * dim for _ in range(T)]
+    for t in range(T):
+        d = denom[t]
+        dS = [dout[t][i] / d for i in range(dim)]
+        for j in range(t + 1):
+            score = scores[t][j]
+            # dscore = ∂L/∂score_j = Σ_i dS_t[i]·v_j[i]
+            dscore = 0.0
+            for i in range(dim):
+                dscore += dS[i] * v[j][i]
+            if dscore:
+                kq = dscore * (gamma ** (t - j)) * scale
+                for i in range(len(q[t])):
+                    dq[t][i] += kq * k[j][i]
+                    dk[j][i] += kq * q[t][i]
+            for i in range(dim):
+                dv[j][i] += dS[i] * score
+    return dq, dk, dv
+
+
+class RetNetBlock:
+    """RetNet block：保留层（retention）+ FFN，两层 pre-norm 残差"""
+
+    def __init__(self, d_model, num_heads, d_ff=None, eps=1e-5, seed=None):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"RetNetBlock: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(f"RetNetBlock: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads:
+            raise ValueError(
+                f"RetNetBlock: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_ff = 4 * d_model if d_ff is None else d_ff
+        if not isinstance(self.d_ff, int) or isinstance(self.d_ff, bool) or self.d_ff < 1:
+            raise ValueError(f"RetNetBlock: d_ff 必须是正整数，收到 {d_ff!r}")
+        self.gammas = _retnet_gammas(num_heads)
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.ln1 = LayerNorm(d_model, eps=eps)
+            self.Wq = Layer(d_model, d_model, "linear")
+            self.Wk = Layer(d_model, d_model, "linear")
+            self.Wv = Layer(d_model, d_model, "linear")
+            self.Wo = Layer(d_model, d_model, "linear")
+            self.ln2 = LayerNorm(d_model, eps=eps)
+            self.W1 = Layer(d_model, self.d_ff, "relu")
+            self.W2 = Layer(self.d_ff, d_model, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.grads = {"Wq": None, "Wk": None, "Wv": None, "Wo": None,
+                      "W1": None, "W2": None}
+        self.norm_grads = {"ln1": None, "ln2": None}
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _split_heads(self, rows):
+        h, dh = self.num_heads, self.head_dim
+        return [[rows[t][j * dh:(j + 1) * dh] for j in range(h)]
+                for t in range(len(rows))]
+
+    def forward(self, x):
+        """x: (T, d_model) → (T, d_model)"""
+        T = len(x)
+        d = self.d_model
+        h1, c1 = _norm_rows_forward(self.ln1, x)
+        qflat, cq = _dense_rows_forward(self.Wq, h1)
+        kflat, ck = _dense_rows_forward(self.Wk, h1)
+        vflat, cv = _dense_rows_forward(self.Wv, h1)
+        qh = self._split_heads(qflat)
+        kh = self._split_heads(kflat)
+        vh = self._split_heads(vflat)
+
+        ret_outs = []
+        ret_caches = []
+        for h in range(self.num_heads):
+            q_h = [qh[t][h] for t in range(T)]
+            k_h = [kh[t][h] for t in range(T)]
+            v_h = [vh[t][h] for t in range(T)]
+            out_h, cache_h = _retention_forward(q_h, k_h, v_h,
+                                               self.gammas[h], self.scale)
+            ret_outs.append(out_h)
+            ret_caches.append(cache_h)
+
+        concat = [[0.0] * d for _ in range(T)]
+        for h in range(self.num_heads):
+            off = h * self.head_dim
+            for t in range(T):
+                for i in range(self.head_dim):
+                    concat[t][off + i] = ret_outs[h][t][i]
+        out1, co1 = _dense_rows_forward(self.Wo, concat)
+        x1 = [[x[t][j] + out1[t][j] for j in range(d)] for t in range(T)]
+
+        h2, c2 = _norm_rows_forward(self.ln2, x1)
+        a2, ca2 = _dense_rows_forward(self.W1, h2)
+        out2, co2 = _dense_rows_forward(self.W2, a2)
+        out = [[x1[t][j] + out2[t][j] for j in range(d)] for t in range(T)]
+
+        self._cache = {"x": x, "h1": h1, "c1": c1,
+                       "qh": qh, "kh": kh, "vh": vh,
+                       "cq": cq, "ck": ck, "cv": cv,
+                       "ret_caches": ret_caches, "concat": concat,
+                       "co1": co1, "x1": x1, "h2": h2, "c2": c2,
+                       "a2": a2, "ca2": ca2, "co2": co2}
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("RetNetBlock.backward: 必须先调用 forward()")
+        c = self._cache
+        T = len(c["x"])
+        d = self.d_model
+        head_dim = self.head_dim
+
+        dx = [list(row) for row in dout]
+        # FFN 分支
+        gW2, gb2, d_a2 = _dense_rows_backward(self.W2, c["co2"], dout)
+        self._acc("W2", gW2, gb2)
+        gW1, gb1, d_h2 = _dense_rows_backward(self.W1, c["ca2"], d_a2)
+        self._acc("W1", gW1, gb1)
+        g_ln2, b_ln2, d_x1a = _norm_rows_backward(self.ln2, c["c2"], d_h2)
+        self.norm_grads["ln2"] = (g_ln2, b_ln2)
+
+        d_x1 = [[dx[t][j] + d_x1a[t][j] for j in range(d)] for t in range(T)]
+        d_concat, d_out1 = None, d_x1
+        gWo, gbo, d_concat = _dense_rows_backward(self.Wo, c["co1"], d_out1)
+        self._acc("Wo", gWo, gbo)
+
+        head_grads = []
+        for h in range(self.num_heads):
+            off = h * head_dim
+            d_out_h = [[d_concat[t][off + i] for i in range(head_dim)]
+                       for t in range(T)]
+            head_grads.append(_retention_backward(d_out_h,
+                                                  c["ret_caches"][h]))
+
+        dq_flat = [[0.0] * d for _ in range(T)]
+        dk_flat = [[0.0] * d for _ in range(T)]
+        dv_flat = [[0.0] * d for _ in range(T)]
+        for h in range(self.num_heads):
+            dq_h, dk_h, dv_h = head_grads[h]
+            off = h * head_dim
+            for t in range(T):
+                for i in range(head_dim):
+                    dq_flat[t][off + i] = dq_h[t][i]
+                    dk_flat[t][off + i] = dk_h[t][i]
+                    dv_flat[t][off + i] = dv_h[t][i]
+
+        gWq, gbq, d_h1a = _dense_rows_backward(self.Wq, c["cq"], dq_flat)
+        gWk, gbk, d_h1b = _dense_rows_backward(self.Wk, c["ck"], dk_flat)
+        gWv, gbv, d_h1c = _dense_rows_backward(self.Wv, c["cv"], dv_flat)
+        self._acc("Wq", gWq, gbq)
+        self._acc("Wk", gWk, gbk)
+        self._acc("Wv", gWv, gbv)
+
+        d_h1 = [[d_h1a[t][j] + d_h1b[t][j] + d_h1c[t][j] for j in range(d)]
+                for t in range(T)]
+        g_ln1, b_ln1, d_x_ln = _norm_rows_backward(self.ln1, c["c1"], d_h1)
+        self.norm_grads["ln1"] = (g_ln1, b_ln1)
+        for t in range(T):
+            for j in range(d):
+                dx[t][j] += d_x_ln[t][j]
+        return dx
+
+    def _acc(self, name, gw, gb):
+        old = self.grads[name]
+        if old is None:
+            self.grads[name] = (gw, gb)
+            return
+        ogw, ogb = old
+        for i in range(len(gw)):
+            for j in range(len(gw[i])):
+                ogw[i][j] += gw[i][j]
+            ogb[i] += gb[i]
+
+    def sgd_step(self, lr):
+        for name in ("Wq", "Wk", "Wv", "Wo", "W1", "W2"):
+            grads = self.grads[name]
+            if grads is not None:
+                _dense_apply_sgd(getattr(self, name), grads, lr)
+        for name, norm in (("ln1", self.ln1), ("ln2", self.ln2)):
+            grads = self.norm_grads[name]
+            if grads is not None:
+                _norm_apply_sgd(norm, grads, lr)
+
+    def param_count(self):
+        total = 0
+        for name in ("Wq", "Wk", "Wv", "Wo", "W1", "W2"):
+            total += _dense_param_count(getattr(self, name))
+        total += _norm_param_count(self.ln1) + _norm_param_count(self.ln2)
+        return total
+
+
+class RetNetModel:
+    """RetNet 语言模型：Embedding → N×RetNetBlock → LayerNorm → 词表头"""
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=None,
+                 num_layers=2, max_len=64, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"RetNetModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"RetNetModel: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(f"RetNetModel: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads:
+            raise ValueError(
+                f"RetNetModel: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"RetNetModel: num_layers 必须是正整数，收到 {num_layers!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"RetNetModel: max_len 必须 >= 1，收到 {max_len!r}")
+        if d_ff is not None:
+            if not isinstance(d_ff, int) or isinstance(d_ff, bool) or d_ff < 1:
+                raise ValueError(f"RetNetModel: d_ff 必须是正整数或 None，收到 {d_ff!r}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.max_len = max_len
+        std = math.sqrt(2.0 / d_model)
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self._emb = [[random.gauss(0.0, std) for _ in range(d_model)]
+                         for _ in range(vocab_size)]
+        finally:
+            random.setstate(state)
+        self._emb_grad = [[0.0] * d_model for _ in range(vocab_size)]
+        self._last_ids = []
+        self.blocks = [RetNetBlock(d_model, num_heads, d_ff,
+                                   seed=None if seed is None else seed + i)
+                       for i in range(num_layers)]
+        self.ln_out = LayerNorm(d_model)
+        self.W_out = Layer(d_model, vocab_size, "linear")
+
+    def zero_grad(self):
+        for b in self.blocks:
+            b.zero_grad()
+        self.grad_W_out = None
+        self.grad_ln_out = None
+        for i in range(self.vocab_size):
+            row = self._emb_grad[i]
+            for j in range(self.d_model):
+                row[j] = 0.0
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _check_ids(self, ids):
+        ids = _check_token_ids(ids, self.vocab_size, "RetNetModel")
+        if not ids:
+            raise ValueError("RetNetModel: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"RetNetModel: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        return ids
+
+    def _embed(self, ids):
+        self._last_ids = ids
+        return [list(self._emb[i]) for i in ids]
+
+    def forward(self, ids):
+        ids = self._check_ids(ids)
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, c = _norm_rows_forward(self.ln_out, x)
+        logits, head_cache = _dense_rows_forward(self.W_out, h)
+        return logits
+
+    def embedding_backward(self, dx):
+        for t, i in enumerate(self._last_ids):
+            for j in range(self.d_model):
+                self._emb_grad[i][j] += dx[t][j]
+
+    def _run_loss_and_backward(self, ids, targets):
+        ids = self._check_ids(ids)
+        T = len(ids)
+        n_pred = T - 1
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, c = _norm_rows_forward(self.ln_out, x)
+        logits, head_cache = _dense_rows_forward(self.W_out, h)
+
+        loss = 0.0
+        dlogits = [[0.0] * self.vocab_size for _ in range(T)]
+        for t in range(n_pred):
+            target = targets[t]
+            probs = _softmax_row(logits[t])
+            loss += -math.log(probs[target] if probs[target] > 1e-12 else 1e-12)
+            drow = dlogits[t]
+            for v in range(self.vocab_size):
+                drow[v] = probs[v] / n_pred
+            drow[target] -= 1.0 / n_pred
+
+        gW, gb, d_h = _dense_rows_backward(self.W_out, head_cache, dlogits)
+        self.grad_W_out = (gW, gb)
+        g_ln, b_ln, d_x = _norm_rows_backward(self.ln_out, c, d_h)
+        self.grad_ln_out = (g_ln, b_ln)
+        for block in reversed(self.blocks):
+            d_x = block.backward(d_x)
+        self.embedding_backward(d_x)
+        return loss / n_pred
+
+    def sgd_step(self, lr):
+        for block in self.blocks:
+            block.sgd_step(lr)
+        if self.grad_W_out is not None:
+            _dense_apply_sgd(self.W_out, self.grad_W_out, lr)
+        if self.grad_ln_out is not None:
+            _norm_apply_sgd(self.ln_out, self.grad_ln_out, lr)
+        for i in range(self.vocab_size):
+            for j in range(self.d_model):
+                self._emb[i][j] -= lr * self._emb_grad[i][j]
+
+    def param_count(self):
+        total = self.vocab_size * self.d_model
+        for block in self.blocks:
+            total += block.param_count()
+        total += _norm_param_count(self.ln_out)
+        total += _dense_param_count(self.W_out)
+        return total
+
+    def fit(self, sequences, epochs=10, lr=0.01, shuffle=True, seed=None,
+            verbose=False):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("RetNetModel.fit: sequences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"RetNetModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or lr <= 0.0:
+            raise ValueError(f"RetNetModel.fit: lr 必须是正有限数，收到 {lr!r}")
+        rng = random.Random(seed)
+        history = []
+        for ep in range(epochs):
+            order = list(range(len(sequences)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                seq = self._check_ids(list(sequences[idx]))
+                if len(seq) < 2:
+                    raise ValueError("RetNetModel.fit: 每条序列至少需要 2 个 token")
+                self.zero_grad()
+                total += self._run_loss_and_backward(seq, seq[1:])
+                self.sgd_step(lr)
+            avg = total / len(sequences)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def generate(self, prompt_ids, max_new_tokens=8, temperature=1.0,
+                 top_k=None, seed=None):
+        ids = self._check_ids(list(prompt_ids))
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+                or max_new_tokens < 0:
+            raise ValueError(
+                f"RetNetModel.generate: max_new_tokens 必须是非负整数，收到 {max_new_tokens!r}")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not math.isfinite(float(temperature)) or temperature <= 0.0:
+            raise ValueError(
+                f"RetNetModel.generate: temperature 必须是正有限数，收到 {temperature!r}")
+        if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool)
+                                  or top_k < 1):
+            raise ValueError(
+                f"RetNetModel.generate: top_k 必须是正整数或 None，收到 {top_k!r}")
+        rng = random.Random(seed)
+        out = list(ids)
+        for _ in range(max_new_tokens):
+            ctx = out[-self.max_len:] if len(out) > self.max_len else out
+            logits = self.forward(ctx)
+            row = logits[-1]
+            probs = _softmax_row([v / temperature for v in row])
+            if top_k is not None:
+                order = sorted(range(len(probs)), key=lambda i: probs[i],
+                               reverse=True)[:top_k]
+                keep = set(order)
+                probs = [p if i in keep else 0.0 for i, p in enumerate(probs)]
+                s = sum(probs)
+                probs = [p / s for p in probs]
+            r = rng.random()
+            acc = 0.0
+            pick = len(probs) - 1
+            for i, p in enumerate(probs):
+                acc += p
+                if r <= acc:
+                    pick = i
+                    break
+            out.append(pick)
+        return out
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 

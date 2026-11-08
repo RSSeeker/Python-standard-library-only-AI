@@ -30388,3 +30388,129 @@ class TestRWKV:
         _rwkv_raises(lambda: AI.RWKVBlock(4, d_ff=0), ValueError)
         b = self._block()
         _rwkv_raises(lambda: b.backward([[0.0] * 4] * 5), RuntimeError)
+
+
+def _retnet_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestRetNet:
+    """RetNet 多尺度保留（multi-scale retention）单元测试"""
+
+    def test_retention_forward_matches_naive(self):
+        import math
+        import random as _random
+        rng = _random.Random(5)
+        T, dk, dv = 4, 2, 2
+        q = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        k = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        v = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(T)]
+        gamma = 0.9
+        scale = 1.0 / math.sqrt(dk)
+        out, _cache = AI._retention_forward(q, k, v, gamma, scale)
+        exp = [[0.0] * dv for _ in range(T)]
+        for t in range(T):
+            denom = sum(gamma ** (t - j) for j in range(t + 1))
+            for i in range(dv):
+                s = 0.0
+                for j in range(t + 1):
+                    d = sum(q[t][x] * k[j][x] for x in range(dk))
+                    s += (gamma ** (t - j)) * scale * d * v[j][i]
+                exp[t][i] = s / denom
+        for t in range(T):
+            for i in range(dv):
+                assert abs(out[t][i] - exp[t][i]) < 1e-12
+
+    def test_block_forward_and_param_count(self):
+        blk = AI.RetNetBlock(4, 2, d_ff=8, seed=3)
+        x = [[0.1 * (t + 1), -0.2 * (t + 1), 0.3, 0.4] for t in range(5)]
+        out = blk.forward(x)
+        assert len(out) == 5 and len(out[0]) == 4
+        assert blk.param_count() == 172
+
+    def test_block_numerical_gradients(self):
+        import random as _random
+        rng = _random.Random(11)
+        x = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+        c = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+        blk = AI.RetNetBlock(4, 2, d_ff=8, seed=3)
+
+        def loss_of():
+            out = blk.forward(x)
+            return sum(out[t][j] * c[t][j] for t in range(5) for j in range(4))
+
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(c)
+        eps = 1e-5
+        for name in ("Wq", "Wk", "Wv", "Wo", "W1", "W2"):
+            layer = getattr(blk, name)
+            ana = blk.grads[name][0][0][0]
+            old = layer.weights[0][0]
+            layer.weights[0][0] = old + eps
+            lp = loss_of()
+            layer.weights[0][0] = old - eps
+            lm = loss_of()
+            layer.weights[0][0] = old
+            num = (lp - lm) / (2 * eps)
+            rel = abs(num - ana) / max(1.0, abs(num), abs(ana))
+            assert rel < 5e-4, (name, ana, num, rel)
+        ana = blk.norm_grads["ln1"][0][0]
+        old = blk.ln1.gamma[0]
+        blk.ln1.gamma[0] = old + eps
+        lp = loss_of()
+        blk.ln1.gamma[0] = old - eps
+        lm = loss_of()
+        blk.ln1.gamma[0] = old
+        num = (lp - lm) / (2 * eps)
+        assert abs(num - ana) / max(1.0, abs(num), abs(ana)) < 5e-4
+
+    def test_model_forward_fit_generate(self):
+        m = AI.RetNetModel(vocab_size=6, d_model=8, num_heads=2, num_layers=1,
+                           max_len=8, seed=1)
+        logits = m.forward([0, 1, 2, 3, 0])
+        assert len(logits) == 5 and len(logits[0]) == 6
+        assert m.param_count() == 990
+        seqs = [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 1, 2], [2, 3, 0, 1, 2, 3]]
+        hist = m.fit(seqs, epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+        g1 = m.generate([0, 1], max_new_tokens=3, temperature=0.8, top_k=3,
+                        seed=2)
+        g2 = m.generate([0, 1], max_new_tokens=3, temperature=0.8, top_k=3,
+                        seed=2)
+        assert len(g1) == 5 and g1 == g2
+
+    def test_model_invalid_inputs(self):
+        assert _retnet_raises(
+            lambda: AI.RetNetModel(0), ValueError)
+        assert _retnet_raises(
+            lambda: AI.RetNetModel(6, d_model=8, num_heads=3), ValueError)
+        assert _retnet_raises(
+            lambda: AI.RetNetModel(6, num_layers=0), ValueError)
+        m = AI.RetNetModel(vocab_size=6, d_model=8, num_heads=2, num_layers=1,
+                           max_len=4, seed=1)
+        assert _retnet_raises(lambda: m.forward([]), ValueError)
+        assert _retnet_raises(lambda: m.forward([0, 1, 2, 3, 0]), ValueError)
+        assert _retnet_raises(lambda: m.forward([0, 6]), ValueError)
+        assert _retnet_raises(
+            lambda: m.fit([], epochs=2, lr=0.01), ValueError)
+        assert _retnet_raises(
+            lambda: m.fit([[0, 1]], epochs=0, lr=0.01), ValueError)
+        assert _retnet_raises(
+            lambda: m.fit([[0, 1]], epochs=2, lr=0.0), ValueError)
+        assert _retnet_raises(
+            lambda: m.generate([0, 1], max_new_tokens=2, temperature=0.0),
+            ValueError)
+        assert _retnet_raises(
+            lambda: m.generate([0, 1], max_new_tokens=2, top_k=0), ValueError)
+
+    def test_block_invalid_inputs(self):
+        assert _retnet_raises(lambda: AI.RetNetBlock(0, 2), ValueError)
+        assert _retnet_raises(lambda: AI.RetNetBlock(4, 0), ValueError)
+        assert _retnet_raises(lambda: AI.RetNetBlock(4, 3), ValueError)
+        assert _retnet_raises(
+            lambda: AI.RetNetBlock(4, 2, d_ff=0), ValueError)
