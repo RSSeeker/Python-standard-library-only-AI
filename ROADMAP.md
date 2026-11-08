@@ -812,7 +812,7 @@ W0 + W1 + W3 + W9 + W13 + W2 的部分 = 约 8–10 个会话，就能让这个�
 - [x] Mixup / CutMix / Cutout / RandAugment（纯张量运算，A 档）——已完成：`c/augment.{h,c}` 提供 brightness / contrast / shift / rotate90 / cutout / cutmix（含 `aug_cutmix_box`）/ mixup / mixup_soft / randaugment 九个内核；随机量（lam / 裁剪框 / 洞位置 / 操作序列与强度）由参考脚本注入，`compare_augment` 24 项**全部 0.000e+00**，`tests/test_augment.c` 另加 7 组自测（含 rotate90 转 4 次恒等、cutmix 有效 lam 公式）；注意 `round()` 语义差异（Python 四舍六入五成双 ⇒ C 用 `rint()`）
 - [ ] MoE / 序列标注头 / 多标签头（B 档）
 - [ ] BPE / WordPiece 分词器（B 档）
-- [ ] LoRA、EMA / SWA / Lookahead（等 Python 侧 W9 完成后同步）
+- [x] LoRA、EMA / SWA / Lookahead（等 Python 侧 W9 完成后同步——已完成：C 侧 `adapt.c` 的 `lora_forward/backward/merge`、`ema_*`、`swa_*`、`lookahead_step`，4 个用例 28 个数组与 `AI.py` 逐位相同（`tools/adapt_reference.py` → `tests/compare_adapt.c`），`tests/test_adapt.c` 另加 21 项恒等式自测
 
 ### 7.5 Web 同步范围
 
