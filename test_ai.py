@@ -29675,3 +29675,74 @@ class TestContinuousRL:
             AI.TD3Agent(1, 1, policy_delay=0)
         with pytest.raises(ValueError):
             AI.TD3Agent(1, 1, target_noise=-0.1)
+
+
+class TestSAC:
+    def test_squashed_gaussian_policy(self):
+        policy = AI.SquashedGaussianPolicy(2, 3, hidden=(8,), action_scale=2.0, seed=1)
+        mu, log_std = policy.forward([0.1, -0.2])
+        assert len(mu) == 3 and len(log_std) == 3
+        assert all(-20.0 <= v <= 2.0 for v in log_std)
+        action, logp = policy.sample([0.1, -0.2], seed=7)
+        assert len(action) == 3
+        assert all(-2.0 <= v <= 2.0 for v in action)
+        assert abs(policy.log_prob([0.1, -0.2], action) - logp) < 1e-10
+        det = policy.deterministic_action([0.1, -0.2])
+        assert all(abs(v) <= 2.0 for v in det)
+        with pytest.raises(RuntimeError):
+            AI.SquashedGaussianPolicy(2, 3, seed=1).gradients([0.0] * 3, [0.0] * 3)
+        grads_mu, grads_std = policy.gradients([0.1] * 3, [-0.1] * 3)
+        assert len(grads_mu) == 2 and len(grads_std) == 2
+
+    def test_sac_agent_init_and_act(self):
+        agent = AI.SACAgent(2, 1, hidden=(8,), seed=1)
+        assert agent.param_count() == (agent.actor.param_count()
+                                       + agent.critic1.param_count()
+                                       + agent.critic2.param_count())
+        for dst, src in ((agent.target1, agent.critic1),
+                         (agent.target2, agent.critic2)):
+            for dl, sl in zip(dst.model.layers, src.model.layers):
+                assert dl.weights == sl.weights
+        det = agent.act([0.0, 0.0], deterministic=True)
+        assert len(det) == 1
+        sampled = agent.act([0.0, 0.0])
+        assert len(sampled) == 1 and -1.0 <= sampled[0] <= 1.0
+
+    def test_sac_update_and_invalid(self):
+        agent = AI.SACAgent(1, 1, hidden=(8,), batch_size=4, seed=1)
+        with pytest.raises(ValueError):
+            agent.update()
+        for _ in range(8):
+            agent.remember([0.0], [0.1], -0.1, [0.0], False)
+        losses = agent.update()
+        assert set(losses) == {"critic_loss", "actor_loss"}
+        assert all(math.isfinite(v) for v in losses.values())
+        assert agent.updates == 1
+        with pytest.raises(ValueError):
+            AI.SACAgent(1, 1, alpha=-0.1)
+        with pytest.raises(ValueError):
+            AI.SACAgent(1, 1, actor_lr=0.0)
+        with pytest.raises(ValueError):
+            AI.SACAgent(1, 1, batch_size=0)
+
+    def test_sac_learns(self):
+        agent = AI.SACAgent(1, 1, hidden=(16, 16), actor_lr=0.005,
+                            critic_lr=0.005, alpha=0.2, gamma=0.9, tau=0.02,
+                            batch_size=16, seed=1)
+        env = _ContinuousEnv()
+        agent.train(env, episodes=40)
+        action = agent.actor.deterministic_action([0.0])[0]
+        assert abs(action - 0.4) < 0.15
+
+    def test_squashed_gaussian_invalid(self):
+        with pytest.raises(ValueError):
+            AI.SquashedGaussianPolicy(0, 1)
+        with pytest.raises(ValueError):
+            AI.SquashedGaussianPolicy(1, 1, action_scale=0.0)
+        with pytest.raises(ValueError):
+            AI.SquashedGaussianPolicy(1, 1, log_std_min=1.0, log_std_max=1.0)
+        policy = AI.SquashedGaussianPolicy(1, 1, seed=1)
+        with pytest.raises(ValueError):
+            policy.log_prob([0.0], [0.0, 0.1])
+        with pytest.raises(ValueError):
+            policy.forward([0.0, 0.0])

@@ -753,7 +753,10 @@
   `ContinuousQNetwork`、`DDPGAgent`、`TD3Agent`（双 Q 取最小、目标策略平滑、
   延迟 actor 更新，目标网络软更新）；测试 `TestContinuousRL` 8 例
 
-全量测试：1839 → 1953 passed（新增 114 例）。
+- [x] SAC：`SquashedGaussianPolicy`（两个 MLP 分别输出均值/对数标准差，tanh 挤压）与
+  `SACAgent`（双 Q 取最小 + 熵正则，固定温度 alpha；目标网络软更新）；测试 `TestSAC` 5 例
+
+全量测试：1839 → 1958 passed（新增 119 例）。
 
 ---
 

@@ -34565,6 +34565,303 @@ class TD3Agent(DDPGAgent):
                 + self.critic2.param_count())
 
 
+class SquashedGaussianPolicy:
+    """SAC 的随机策略：两个 MLP 分别输出均值与对数标准差，tanh 挤压。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64), action_scale=1.0,
+                 log_std_min=-20.0, log_std_max=2.0, seed=None):
+        for name, v in (("state_dim", state_dim), ("action_dim", action_dim)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(
+                    f"SquashedGaussianPolicy: {name} 必须是 >=1 的整数，收到 {v!r}")
+        if isinstance(action_scale, bool) or not isinstance(action_scale, (int, float)) \
+                or action_scale <= 0.0:
+            raise ValueError(
+                f"SquashedGaussianPolicy: action_scale 必须是 >0 的数字，收到 {action_scale!r}")
+        for name, v in (("log_std_min", log_std_min), ("log_std_max", log_std_max)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"SquashedGaussianPolicy: {name} 必须是数字，收到 {v!r}")
+        if not float(log_std_min) < float(log_std_max):
+            raise ValueError(
+                "SquashedGaussianPolicy: log_std_min 必须小于 log_std_max")
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.action_scale = float(action_scale)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
+        sizes = [state_dim] + list(hidden) + [action_dim]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            self.mu_net = MLP(sizes, activations=acts)
+            if seed is not None:
+                random.seed(seed + 1)
+            self.log_std_net = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.sizes = sizes
+        self._sample_cache = None
+
+    def _check_state(self, state):
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(
+                f"SquashedGaussianPolicy: state 长度必须是 {self.state_dim}")
+
+    def forward(self, state):
+        """返回 (mu, log_std)。"""
+        self._check_state(state)
+        sx = [float(v) for v in state]
+        mu = self.mu_net.forward(sx)
+        log_std = [min(self.log_std_max, max(self.log_std_min, v))
+                   for v in self.log_std_net.forward(sx)]
+        return mu, log_std
+
+    def sample(self, state, seed=None):
+        """重参数化采样，返回 (action, log_prob) 并缓存内部量供反向。"""
+        mu, log_std = self.forward(state)
+        rng = random.Random(seed) if seed is not None else random
+        eps = [rng.gauss(0.0, 1.0) for _ in range(self.action_dim)]
+        sigma = [math.exp(v) for v in log_std]
+        z = [mu[i] + sigma[i] * eps[i] for i in range(self.action_dim)]
+        t = [math.tanh(v) for v in z]
+        action = [self.action_scale * v for v in t]
+        log_prob = 0.0
+        for i in range(self.action_dim):
+            log_prob += (-0.5 * eps[i] * eps[i] - log_std[i]
+                         - 0.5 * math.log(2.0 * math.pi))
+            log_prob -= math.log(max(1e-12, 1.0 - t[i] * t[i]))
+            log_prob -= math.log(self.action_scale)
+        self._sample_cache = (mu, log_std, eps, sigma, z, t)
+        return action, log_prob
+
+    def log_prob(self, state, action):
+        """给定动作的对数概率（把动作反 tanh）。"""
+        self._check_state(state)
+        if not isinstance(action, (list, tuple)) or len(action) != self.action_dim:
+            raise ValueError(
+                f"SquashedGaussianPolicy.log_prob: action 长度必须是 {self.action_dim}")
+        mu, log_std = self.forward(state)
+        sigma = [math.exp(v) for v in log_std]
+        total = 0.0
+        for i in range(self.action_dim):
+            a = float(action[i]) / self.action_scale
+            if not -1.0 < a < 1.0:
+                a = min(1.0 - 1e-12, max(-1.0 + 1e-12, a))
+            z = math.atanh(a)
+            t = math.tanh(z)
+            total += (-0.5 * ((z - mu[i]) / sigma[i]) ** 2
+                      - log_std[i] - 0.5 * math.log(2.0 * math.pi))
+            total -= math.log(max(1e-12, 1.0 - t * t))
+            total -= math.log(self.action_scale)
+        return total
+
+    def deterministic_action(self, state):
+        """均值动作（评估用）。"""
+        mu, _log_std = self.forward(state)
+        return [self.action_scale * math.tanh(v) for v in mu]
+
+    def gradients(self, dmu, dlog_std):
+        """把 dL/dmu、dL/dlog_std 反传到两个网络的参数。"""
+        if self._sample_cache is None:
+            raise RuntimeError(
+                "SquashedGaussianPolicy.gradients: 必须先调用 sample()")
+        if len(dmu) != self.action_dim or len(dlog_std) != self.action_dim:
+            raise ValueError(
+                "SquashedGaussianPolicy.gradients: 梯度长度必须是 action_dim")
+        mu_grads = _mlp_backward(self.mu_net, [float(v) for v in dmu])
+        std_grads = _mlp_backward(self.log_std_net, [float(v) for v in dlog_std])
+        return mu_grads, std_grads
+
+    def param_count(self):
+        """可训练标量个数（两个 MLP 之和）。"""
+        total = 0
+        for net in (self.mu_net, self.log_std_net):
+            total += sum(layer.fan_out * layer.fan_in + layer.fan_out
+                         for layer in net.layers)
+        return total
+
+    def copy_from(self, other):
+        """复制同形状策略的权重。"""
+        if not isinstance(other, SquashedGaussianPolicy) or other.sizes != self.sizes:
+            raise ValueError("SquashedGaussianPolicy.copy_from: 只接受同形状的网络")
+        for dst, src in ((self.mu_net, other.mu_net),
+                         (self.log_std_net, other.log_std_net)):
+            for dl, sl in zip(dst.layers, src.layers):
+                for j in range(len(dl.weights)):
+                    dl.weights[j][:] = sl.weights[j]
+                dl.biases[:] = sl.biases
+
+
+class SACAgent:
+    """SAC：随机 squashed-Gaussian actor + 双 Q critic + 熵正则（固定温度）。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64), actor_lr=3e-4,
+                 critic_lr=3e-4, alpha=0.2, gamma=0.99, tau=0.005,
+                 action_scale=1.0, buffer_capacity=10000, batch_size=32,
+                 seed=None):
+        for name, v in (("actor_lr", actor_lr), ("critic_lr", critic_lr)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0.0:
+                raise ValueError(f"SACAgent: {name} 必须 >0，收到 {v!r}")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
+                or alpha < 0.0:
+            raise ValueError(f"SACAgent: alpha 必须是非负数字，收到 {alpha!r}")
+        if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) \
+                or not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"SACAgent: gamma 必须在 [0,1]，收到 {gamma!r}")
+        if isinstance(tau, bool) or not isinstance(tau, (int, float)) \
+                or not 0.0 < tau <= 1.0:
+            raise ValueError(f"SACAgent: tau 必须在 (0,1]，收到 {tau!r}")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+                or batch_size < 1:
+            raise ValueError(
+                f"SACAgent: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.tau = float(tau)
+        self.batch_size = batch_size
+        self.action_scale = float(action_scale)
+        self.actor = SquashedGaussianPolicy(
+            state_dim, action_dim, hidden, action_scale, seed=seed)
+        self.critic1 = ContinuousQNetwork(state_dim, action_dim, hidden, seed=seed)
+        self.critic2 = ContinuousQNetwork(state_dim, action_dim, hidden, seed=None)
+        self.critic2.copy_from(self.critic1)
+        self.target1 = ContinuousQNetwork(state_dim, action_dim, hidden, seed=None)
+        self.target1.copy_from(self.critic1)
+        self.target2 = ContinuousQNetwork(state_dim, action_dim, hidden, seed=None)
+        self.target2.copy_from(self.critic1)
+        self.actor_opt = Adam(self.actor.mu_net, lr=float(actor_lr))
+        self.actor_std_opt = Adam(self.actor.log_std_net, lr=float(actor_lr))
+        self.critic1_opt = Adam(self.critic1.model, lr=float(critic_lr))
+        self.critic2_opt = Adam(self.critic2.model, lr=float(critic_lr))
+        self.buffer = ContinuousReplayBuffer(buffer_capacity, seed=seed)
+        self.rng = random.Random(seed)
+        self.updates = 0
+
+    def act(self, state, deterministic=False):
+        """采样动作；deterministic=True 时用均值动作。"""
+        if deterministic:
+            return self.actor.deterministic_action(state)
+        action, _logp = self.actor.sample(state, self.rng.randrange(1 << 30))
+        return action
+
+    def remember(self, state, action, reward, next_state, done):
+        """写入经验。"""
+        self.buffer.add(state, action, reward, next_state, done)
+
+    def update(self, batch_size=None):
+        """从回放池取一个 batch 更新双 critic 与 actor，返回损失字典。"""
+        bs = self.batch_size if batch_size is None else batch_size
+        states, actions, rewards, next_states, dones = self.buffer.sample(bs)
+        inv = 1.0 / bs
+        c1w = _mlp_zero_grads(self.critic1.model)
+        c1b = _mlp_acc_bias(self.critic1.model)
+        c2w = _mlp_zero_grads(self.critic2.model)
+        c2b = _mlp_acc_bias(self.critic2.model)
+        aw = _mlp_zero_grads(self.actor.mu_net)
+        ab = _mlp_acc_bias(self.actor.mu_net)
+        sw = _mlp_zero_grads(self.actor.log_std_net)
+        sb = _mlp_acc_bias(self.actor.log_std_net)
+        q_loss = 0.0
+        actor_loss = 0.0
+        for i in range(bs):
+            if dones[i]:
+                target = rewards[i]
+            else:
+                next_action, next_logp = self.actor.sample(
+                    next_states[i], self.rng.randrange(1 << 30))
+                q1t = self.target1.q(next_states[i], next_action)
+                q2t = self.target2.q(next_states[i], next_action)
+                target = rewards[i] + self.gamma * (
+                    min(q1t, q2t) - self.alpha * next_logp)
+            q1 = self.critic1.q(states[i], actions[i])
+            q2 = self.critic2.q(states[i], actions[i])
+            e1 = q1 - target
+            e2 = q2 - target
+            _q, g1, _ds, _da = self.critic1.q_grads(states[i], actions[i], e1)
+            _q, g2, _ds, _da = self.critic2.q_grads(states[i], actions[i], e2)
+            _mlp_accumulate(c1w, c1b, g1)
+            _mlp_accumulate(c2w, c2b, g2)
+            q_loss += e1 * e1 + e2 * e2
+
+            act, logp = self.actor.sample(states[i], self.rng.randrange(1 << 30))
+            qa1 = self.critic1.q(states[i], act)
+            qa2 = self.critic2.q(states[i], act)
+            _, _, _ds, da1 = self.critic1.q_grads(states[i], act, 1.0)
+            _, _, _ds, da2 = self.critic2.q_grads(states[i], act, 1.0)
+            daction = [-(da1[j] + da2[j]) * 0.5 * inv
+                       for j in range(self.action_dim)]
+            mu, log_std, eps, sigma, z, t = self.actor._sample_cache
+            dmu = []
+            dlog_std = []
+            for j in range(self.action_dim):
+                dz = (daction[j] * self.action_scale * (1.0 - t[j] * t[j])
+                      + self.alpha * (-(z[j] - mu[j]) / (sigma[j] * sigma[j])
+                                      + 2.0 * t[j]) * inv)
+                dmu.append(dz)
+                dlog_std.append(dz * eps[j] * sigma[j])
+            mu_grads, std_grads = self.actor.gradients(dmu, dlog_std)
+            _mlp_accumulate(aw, ab, mu_grads)
+            _mlp_accumulate(sw, sb, std_grads)
+            actor_loss += (self.alpha * logp - min(qa1, qa2))
+        def _avg(w, b):
+            return ([[[v * inv for v in row] for row in layer] for layer in w],
+                    [[v * inv for v in row] for row in b])
+        for opt, w, b in ((self.critic1_opt, c1w, c1b),
+                          (self.critic2_opt, c2w, c2b),
+                          (self.actor_opt, aw, ab),
+                          (self.actor_std_opt, sw, sb)):
+            aw2, ab2 = _avg(w, b)
+            opt.step([(x, y) for x, y in zip(aw2, ab2)])
+        _soft_update(self.target1, self.critic1, self.tau)
+        _soft_update(self.target2, self.critic2, self.tau)
+        self.updates += 1
+        return {"critic_loss": q_loss * inv, "actor_loss": actor_loss * inv}
+
+    def train(self, env, episodes=20, batch_size=None, max_steps=200,
+              min_buffer=None):
+        """在连续动作环境上训练，返回每回合回报。"""
+        if not hasattr(env, "reset") or not hasattr(env, "step"):
+            raise ValueError("SACAgent.train: env 必须提供 reset()/step()")
+        if isinstance(episodes, bool) or not isinstance(episodes, int) \
+                or episodes < 1:
+            raise ValueError(
+                f"SACAgent.train: episodes 必须是 >=1 的整数，收到 {episodes!r}")
+        bs = self.batch_size if batch_size is None else batch_size
+        need = max(bs, 1 if min_buffer is None else min_buffer)
+        returns = []
+        for _ in range(episodes):
+            state = env.reset()
+            total = 0.0
+            steps = 0
+            while True:
+                action = self.act(state)
+                out = env.step(action)
+                if not isinstance(out, (list, tuple)) or len(out) != 4:
+                    raise ValueError(
+                        "SACAgent.train: env.step 必须返回 (next_state, reward, done, info)")
+                next_state, reward, done, _info = out
+                self.remember(state, action, reward, next_state, done)
+                total += float(reward)
+                state = next_state
+                steps += 1
+                if len(self.buffer) >= need:
+                    self.update(bs)
+                if done or (max_steps is not None and steps >= max_steps):
+                    break
+            returns.append(total)
+        return returns
+
+    def param_count(self):
+        """actor + 双 critic 参数量。"""
+        return (self.actor.param_count() + self.critic1.param_count()
+                + self.critic2.param_count())
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1953 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1958 项）
 
 ## 特性
 
@@ -1988,6 +1988,8 @@ print(agent.q_values(env.reset(seed=0)))
 | `ContinuousQNetwork(state_dim, action_dim, hidden=(64,64), seed=None)` | Q(s,a) critic，`q` / `q_grads`（含 dQ/ds 与 dQ/da） |
 | `DDPGAgent(...)` | 确定性 actor + 单 Q + 目标网络软更新，`act` / `remember` / `update` / `train` |
 | `TD3Agent(...)` | DDPG + 双 Q 取最小 + 目标策略平滑 + 延迟 actor 更新，接口同 `DDPGAgent` |
+| `SquashedGaussianPolicy(state_dim, action_dim, hidden=(64,64), action_scale=1.0, log_std_min=-20.0, log_std_max=2.0, seed=None)` | tanh 挤压高斯策略（两个 MLP 分别输出均值/对数标准差），`sample` / `log_prob` / `deterministic_action` / `gradients` |
+| `SACAgent(...)` | 双 Q + 熵正则（固定温度 alpha），`act` / `remember` / `update` / `train` |
 
 ```python
 import AI
@@ -1999,7 +2001,7 @@ for episode in range(40):
 print(agent.policy.probs(env.reset(seed=0)))
 ```
 
-四条边界：离散部分只支持离散动作；连续动作请用 `ContinuousReplayBuffer` + `DDPGAgent` / `TD3Agent`（它们是确定性策略，不是高斯策略的 reparameterization；SAC 尚未实现）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
+四条边界：离散部分只支持离散动作；连续动作请用 `ContinuousReplayBuffer` + `DDPGAgent` / `TD3Agent`（DDPG/TD3 是确定性策略；SAC 用 `SACAgent` 的 tanh 挤压高斯与重参数化采样）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
 
 ### RL 基础设施与 RLHF 奖励
 
@@ -3384,7 +3386,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1953 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1958 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3561,6 +3563,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFlameGraphAndHtmlReport` | `ascii_flame_graph` 的行数/条长/零耗时行与非法输入；`evaluation_report_html` 的转义、数值格式化、表格与备注，以及各类非法结构 |
 | `TestDatasetVersion` | 版本号与键顺序无关、内容变化则版本变化、落盘/读回往返、manifest 追加、缺失版本与篡改内容报错 |
 | `TestContinuousRL` | 连续回放池/actor-critic 形状与 Q 梯度、`_mlp_backward_with_input` 的输入梯度有限差分、DDPG/TD3 在合成目标环境上学到动作、目标网络同步与非法输入 |
+| `TestSAC` | squashed-Gaussian 的采样/`log_prob` 一致性、确定性动作、SAC 双 Q 与目标网络初始化、更新损失、在合成环境上学到动作、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3686,7 +3689,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1953 个单元测试
+├── test_ai.py       # 1958 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
