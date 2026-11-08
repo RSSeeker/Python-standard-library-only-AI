@@ -775,6 +775,9 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] xLSTM：`XLSTMBlock`（pre-norm `sLSTM cell`：指数输入门 + 归一化标量记忆
+  `h_t = o_t·c_t/max(|n_t|, ε)`，手写 BPTT；`ln2 → W1(relu) → W2` 残差）与
+  `XLSTMModel`（Embedding → N×block → LM 头，含 `fit`/`generate`）；测试 `TestXLSTM` 5 例
 - [x] RetNet：`RetNetBlock`（多尺度 retention：每头固定 `gamma_h = 1 - 2^(-5-h)`，
   并行形式 `Σ_{j<=t} gamma^(t-j)·(q_t·k_j)·v_j / Σ_{j<=t} gamma^(t-j)`，手写保留反向）与
   `RetNetModel`（Embedding → N×block → LM 头，含 `fit`/`generate`）；测试 `TestRetNet` 6 例
@@ -785,7 +788,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2000 passed（新增 161 例）。
+全量测试：1839 → 2005 passed（新增 166 例）。
 
 ---
 

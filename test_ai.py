@@ -30514,3 +30514,107 @@ class TestRetNet:
         assert _retnet_raises(lambda: AI.RetNetBlock(4, 3), ValueError)
         assert _retnet_raises(
             lambda: AI.RetNetBlock(4, 2, d_ff=0), ValueError)
+
+
+"""Batch 20 测试：xLSTM 指数门控 sLSTM block 与语言模型。"""
+
+import math
+import random
+
+
+def _xlstm_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected exception not raised")
+
+
+def _xlstm_block_loss(blk, x, c):
+    out = blk.forward(x)
+    return sum(out[t][j] * c[t][j]
+               for t in range(len(x)) for j in range(len(x[0])))
+
+
+class TestXLSTM:
+    def test_block_forward_and_param_count(self):
+        blk = AI.XLSTMBlock(4, d_ff=8, seed=3)
+        x = [[0.1 * i, -0.2 * j, 0.3, 0.4] for i in range(3) for j in range(1)]
+        x = [[0.1, -0.2, 0.3, 0.4], [0.2, -0.1, 0.0, 0.5], [0.3, 0.0, -0.2, 0.1]]
+        out = blk.forward(x)
+        assert len(out) == 3 and len(out[0]) == 4
+        assert blk.param_count() == 192
+
+    def test_block_numerical_gradients(self):
+        rng = random.Random(7)
+        x = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+        c = [[rng.uniform(-1, 1) for _ in range(4)] for _ in range(5)]
+        blk = AI.XLSTMBlock(4, d_ff=8, seed=3)
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(c)
+        eps = 1e-5
+
+        def rel_err(ana, num):
+            return abs(num - ana) / max(1.0, abs(num), abs(ana))
+
+        def fd_layer(layer, ana):
+            old = layer.weights[0][0]
+            layer.weights[0][0] = old + eps
+            lp = _xlstm_block_loss(blk, x, c)
+            layer.weights[0][0] = old - eps
+            lm = _xlstm_block_loss(blk, x, c)
+            layer.weights[0][0] = old
+            return rel_err(ana, (lp - lm) / (2 * eps))
+
+        assert fd_layer(blk.W1, blk.grad_W1[0][0][0]) < 1e-4
+        assert fd_layer(blk.W2, blk.grad_W2[0][0][0]) < 1e-4
+        assert fd_layer(blk.cell.Wg, blk.cell.grad_Wg[0][0][0]) < 1e-4
+        assert fd_layer(blk.cell.Wo, blk.cell.grad_Wo[0][0][0]) < 1e-4
+
+        gamma = blk.ln1.gamma
+        ana = blk.norm_grads["ln1"][0][0]
+        old = gamma[0]
+        gamma[0] = old + eps
+        lp = _xlstm_block_loss(blk, x, c)
+        gamma[0] = old - eps
+        lm = _xlstm_block_loss(blk, x, c)
+        gamma[0] = old
+        assert rel_err(ana, (lp - lm) / (2 * eps)) < 1e-4
+
+    def test_model_forward_fit_generate(self):
+        m = AI.XLSTMModel(vocab_size=6, d_model=8, num_layers=1,
+                          max_len=8, seed=1)
+        assert m.param_count() == 1062
+        assert len(m.forward([0, 1, 2])) == 3
+        seqs = [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 1, 2], [2, 3, 0, 1, 2, 3]]
+        h = m.fit(seqs, epochs=40, lr=0.05, seed=1)
+        assert h[-1] < h[0] * 0.5
+        g1 = m.generate([0, 1], max_new_tokens=3, temperature=0.8,
+                        top_k=3, seed=2)
+        g2 = m.generate([0, 1], max_new_tokens=3, temperature=0.8,
+                        top_k=3, seed=2)
+        assert len(g1) == 5 and g1 == g2
+
+    def test_model_invalid_inputs(self):
+        m = AI.XLSTMModel(vocab_size=6, d_model=8, num_layers=1,
+                          max_len=4, seed=1)
+        _xlstm_raises(lambda: m.forward([]))
+        _xlstm_raises(lambda: m.forward([0, 1, 2, 3, 4]))
+        _xlstm_raises(lambda: m.forward([0, 6]))
+        _xlstm_raises(lambda: m.forward([0, 1.5]))
+        _xlstm_raises(lambda: AI.XLSTMModel(0))
+        _xlstm_raises(lambda: AI.XLSTMModel(6, num_layers=0))
+        _xlstm_raises(lambda: AI.XLSTMModel(6, max_len=0))
+        _xlstm_raises(lambda: m.fit([], epochs=1))
+        _xlstm_raises(lambda: m.fit([[0, 1]], epochs=0))
+        _xlstm_raises(lambda: m.fit([[0, 1]], epochs=1, lr=-0.1))
+        _xlstm_raises(lambda: m.generate([0], max_new_tokens=-1))
+        _xlstm_raises(lambda: m.generate([0], temperature=0.0))
+        _xlstm_raises(lambda: m.generate([0], top_k=0))
+
+    def test_block_invalid_inputs(self):
+        _xlstm_raises(lambda: AI.XLSTMBlock(0))
+        _xlstm_raises(lambda: AI.XLSTMBlock(4, d_ff=0))
+        blk = AI.XLSTMBlock(4, d_ff=8, seed=1)
+        _xlstm_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
