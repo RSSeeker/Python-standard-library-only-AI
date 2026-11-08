@@ -29746,3 +29746,116 @@ class TestSAC:
             policy.log_prob([0.0], [0.0, 0.1])
         with pytest.raises(ValueError):
             policy.forward([0.0, 0.0])
+
+
+class TestSelectiveScan:
+    def _data(self):
+        u = [[0.3, -0.2], [0.1, 0.4], [-0.5, 0.2]]
+        delta = [[0.2, 0.1], [0.15, 0.3], [0.1, 0.25]]
+        A = [[-1.0, -2.0], [0.5, -0.3]]
+        B = [[0.5, 0.2], [0.3, -0.4], [0.6, 0.1]]
+        C = [[1.0, 0.5], [0.2, 0.8], [0.7, -0.3]]
+        D = [0.1, -0.2]
+        return u, delta, A, B, C, D
+
+    def test_forward_matches_naive(self):
+        u, delta, A, B, C, D = self._data()
+        y, _back = AI.selective_scan(u, delta, A, B, C, D)
+        T, d_in, d_state = len(u), len(u[0]), len(A[0])
+        h = [[0.0] * d_state for _ in range(d_in)]
+        for t in range(T):
+            h = [[math.exp(delta[t][i] * A[i][s]) * h[i][s]
+                  + delta[t][i] * B[t][s] * u[t][i]
+                  for s in range(d_state)] for i in range(d_in)]
+            for i in range(d_in):
+                expected = (sum(C[t][s] * h[i][s] for s in range(d_state))
+                            + D[i] * u[t][i])
+                assert abs(y[t][i] - expected) < 1e-12
+        assert len(y) == T and len(y[0]) == d_in
+
+    def test_lagged_delta_gradient(self):
+        u, delta, A, B, C, D = self._data()
+        _y, back = AI.selective_scan(u, delta, A, B, C, D)
+        w = [[0.5, -0.3], [0.2, 0.4], [0.1, -0.6]]
+        grads = back(w)
+
+        def loss():
+            ys, _ = AI.selective_scan(u, delta, A, B, C, D)
+            return sum(ys[t][i] * w[t][i] for t in range(3) for i in range(2))
+
+        eps = 1e-6
+        for t in range(3):
+            for i in range(2):
+                old = delta[t][i]
+                delta[t][i] = old + eps
+                fp = loss()
+                delta[t][i] = old - eps
+                fm = loss()
+                delta[t][i] = old
+                fd = (fp - fm) / (2 * eps)
+                assert abs(fd - grads["ddelta"][t][i]) < 2e-6
+
+    def test_a_b_c_d_gradients(self):
+        u, delta, A, B, C, D = self._data()
+        _y, back = AI.selective_scan(u, delta, A, B, C, D)
+        w = [[0.5, -0.3], [0.2, 0.4], [0.1, -0.6]]
+        grads = back(w)
+        eps = 1e-6
+
+        def loss():
+            ys, _ = AI.selective_scan(u, delta, A, B, C, D)
+            return sum(ys[t][i] * w[t][i] for t in range(3) for i in range(2))
+
+        for name, vec, got in (("dA", A, grads["dA"]),
+                               ("dB", B, grads["dB"]),
+                               ("dC", C, grads["dC"])):
+            for t in range(len(vec)):
+                for s in range(len(vec[t])):
+                    old = vec[t][s]
+                    vec[t][s] = old + eps
+                    fp = loss()
+                    vec[t][s] = old - eps
+                    fm = loss()
+                    vec[t][s] = old
+                    fd = (fp - fm) / (2 * eps)
+                    assert abs(fd - got[t][s]) < 2e-6
+        for i in range(len(D)):
+            old = D[i]
+            D[i] = old + eps
+            fp = loss()
+            D[i] = old - eps
+            fm = loss()
+            D[i] = old
+            fd = (fp - fm) / (2 * eps)
+            assert abs(fd - grads["dD"][i]) < 2e-6
+
+    def test_zero_delta_and_d_none(self):
+        u = [[0.5], [1.0]]
+        delta = [[0.0], [0.0]]
+        A = [[-1.0, 0.5]]
+        B = [[0.2, 0.1], [0.3, 0.4]]
+        C = [[1.0, -1.0], [0.5, 0.5]]
+        y, back = AI.selective_scan(u, delta, A, B, C)
+        assert y == [[0.0], [0.0]]
+        grads = back([[1.0], [1.0]])
+        assert grads["dD"] == [0.0]
+        y, back = AI.selective_scan(u, delta, A, B, C, [0.5])
+        assert y == [[0.25], [0.5]]
+        grads = back([[1.0], [1.0]])
+        assert abs(grads["dD"][0] - 1.5) < 1e-12
+
+    def test_selective_scan_invalid(self):
+        u, delta, A, B, C, D = self._data()
+        with pytest.raises(ValueError):
+            AI.selective_scan([], delta, A, B, C, D)
+        with pytest.raises(ValueError):
+            AI.selective_scan(u, delta[:2], A, B, C, D)
+        with pytest.raises(ValueError):
+            AI.selective_scan(u, delta, A, B, C, D[:1])
+        with pytest.raises(ValueError):
+            AI.selective_scan(u, delta, [[-1.0, 0.5], [0.2]], B, C, D)
+        with pytest.raises(ValueError):
+            AI.selective_scan(u, delta, A, B, C, ["x", 0.1])
+        y, back = AI.selective_scan(u, delta, A, B, C, D)
+        with pytest.raises(ValueError):
+            back([[1.0, 2.0]])

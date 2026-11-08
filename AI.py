@@ -34862,6 +34862,159 @@ class SACAgent:
                 + self.critic2.param_count())
 
 
+def _ssm_check_vec(name, value, rows, cols=None):
+    """selective_scan 的形状校验：rows×[cols] 的数值表格。"""
+    if not isinstance(value, (list, tuple)) or len(value) != rows:
+        raise ValueError(
+            f"selective_scan: {name} 必须是长度 {rows} 的列表")
+    out = []
+    for i, row in enumerate(value):
+        if cols is None:
+            if isinstance(row, bool) or not isinstance(row, (int, float)):
+                raise ValueError(
+                    f"selective_scan: {name}[{i}] 必须是数字")
+            fv = float(row)
+            if not math.isfinite(fv):
+                raise ValueError(
+                    f"selective_scan: {name}[{i}] 必须是有限数")
+            out.append(fv)
+            continue
+        if not isinstance(row, (list, tuple)) or len(row) != cols:
+            raise ValueError(
+                f"selective_scan: {name}[{i}] 必须是长度 {cols} 的列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"selective_scan: {name}[{i}][{j}] 必须是数字")
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(
+                    f"selective_scan: {name}[{i}][{j}] 必须是有限数")
+            vals.append(fv)
+        out.append(vals)
+    return out
+
+
+def selective_scan(u, delta, A, B, C, D=None):
+    """Mamba 的 S6 选择性扫描（对角 A），返回 (y, backward_handle)。
+
+    u/delta: (T, d_in)；A: (d_in, d_state)；B/C: (T, d_state)；
+    D: (d_in,) 或 None。递推：
+        h_t = exp(delta_t * A) ⊙ h_{t-1} + delta_t * B_t ⊙ u_t
+        y_t = C_t · h_t + D ⊙ u_t
+    backward_handle(dy) 返回各输入梯度（含 du/ddelta/dA/dB/dC/dD）。
+    """
+    who = "selective_scan"
+    if not isinstance(u, (list, tuple)) or not u:
+        raise ValueError(f"{who}: u 必须是非空 (T, d_in) 列表")
+    T = len(u)
+    if not isinstance(u[0], (list, tuple)) or not u[0]:
+        raise ValueError(f"{who}: u[0] 必须是非空列表")
+    d_in = len(u[0])
+    uu = _ssm_check_vec("u", u, T, d_in)
+    dd = _ssm_check_vec("delta", delta, T, d_in)
+    if not isinstance(A, (list, tuple)) or len(A) != d_in:
+        raise ValueError(f"{who}: A 必须是 {d_in} 行的列表")
+    aa = []
+    d_state = None
+    for i, row in enumerate(A):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: A[{i}] 必须是非空列表")
+        if d_state is None:
+            d_state = len(row)
+        elif len(row) != d_state:
+            raise ValueError(f"{who}: A 各行长度必须一致")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: A[{i}][{j}] 必须是数字")
+            vals.append(float(v))
+        aa.append(vals)
+    bb = _ssm_check_vec("B", B, T, d_state)
+    cc = _ssm_check_vec("C", C, T, d_state)
+    if D is None:
+        dvec = [0.0] * d_in
+    else:
+        dvec = _ssm_check_vec("D", D, d_in)
+    h = [[0.0] * d_state for _ in range(d_in)]
+    h_hist = []
+    abar_hist = []
+    bbar_hist = []
+    y = []
+    for t in range(T):
+        abar = [[0.0] * d_state for _ in range(d_in)]
+        bbar = [[0.0] * d_state for _ in range(d_in)]
+        h_next = [[0.0] * d_state for _ in range(d_in)]
+        uk = uu[t]
+        dk = dd[t]
+        for i in range(d_in):
+            ui = uk[i]
+            di = dk[i]
+            hi = h[i]
+            ai = aa[i]
+            hni = h_next[i]
+            for s in range(d_state):
+                a = math.exp(di * ai[s])
+                b = di * bb[t][s]
+                abar[i][s] = a
+                bbar[i][s] = b
+                hni[s] = a * hi[s] + b * ui
+        h = h_next
+        h_hist.append(h)
+        abar_hist.append(abar)
+        bbar_hist.append(bbar)
+        row = []
+        for i in range(d_in):
+            acc = dvec[i] * uk[i]
+            for s in range(d_state):
+                acc += cc[t][s] * h[i][s]
+            row.append(acc)
+        y.append(row)
+
+    def backward_handle(dy):
+        dyv = _ssm_check_vec("dy", dy, T, d_in)
+        du = [[0.0] * d_in for _ in range(T)]
+        ddelta = [[0.0] * d_in for _ in range(T)]
+        dA = [[0.0] * d_state for _ in range(d_in)]
+        dB = [[0.0] * d_state for _ in range(T)]
+        dC = [[0.0] * d_state for _ in range(T)]
+        dD = [0.0] * d_in
+        dh_next = [[0.0] * d_state for _ in range(d_in)]
+        for t in range(T - 1, -1, -1):
+            dh = [[0.0] * d_state for _ in range(d_in)]
+            for i in range(d_in):
+                dyi = dyv[t][i]
+                for s in range(d_state):
+                    dh[i][s] = dyi * cc[t][s] + dh_next[i][s]
+            ht = h_hist[t]
+            for i in range(d_in):
+                dyi = dyv[t][i]
+                hti = ht[i]
+                for s in range(d_state):
+                    dC[t][s] += dyi * hti[s]
+            for i in range(d_in):
+                ui = uu[t][i]
+                di = dd[t][i]
+                for s in range(d_state):
+                    dhi = dh[i][s]
+                    du[t][i] += dhi * bbar_hist[t][i][s]
+                    ddelta[t][i] += dhi * bb[t][s] * ui
+                    if t > 0:
+                        hm = h_hist[t - 1][i][s]
+                        ddelta[t][i] += dhi * abar_hist[t][i][s] * aa[i][s] * hm
+                        dA[i][s] += dhi * abar_hist[t][i][s] * di * hm
+                    dB[t][s] += dhi * di * ui
+                    dh_next[i][s] = dhi * abar_hist[t][i][s]
+            for i in range(d_in):
+                du[t][i] += dvec[i] * dyv[t][i]
+                if D is not None:
+                    dD[i] += dyv[t][i] * uu[t][i]
+        return {"du": du, "ddelta": ddelta, "dA": dA, "dB": dB, "dC": dC, "dD": dD}
+
+    return y, backward_handle
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================

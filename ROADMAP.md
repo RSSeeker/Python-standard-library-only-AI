@@ -756,7 +756,10 @@
 - [x] SAC：`SquashedGaussianPolicy`（两个 MLP 分别输出均值/对数标准差，tanh 挤压）与
   `SACAgent`（双 Q 取最小 + 熵正则，固定温度 alpha；目标网络软更新）；测试 `TestSAC` 5 例
 
-全量测试：1839 → 1958 passed（新增 119 例）。
+- [x] Mamba S6 选择性扫描：`selective_scan(u, delta, A, B, C, D=None)`（对角 A 的顺序递推，
+  返回 `(y, backward_handle)`；反向含 `du`/`ddelta`/`dA`/`dB`/`dC`/`dD`）；测试 `TestSelectiveScan` 5 例
+
+全量测试：1839 → 1963 passed（新增 124 例）。
 
 ---
 
