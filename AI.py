@@ -125,6 +125,7 @@ import sys
 import math
 import operator
 import heapq
+import html
 import random
 import re
 import time
@@ -22294,6 +22295,170 @@ def profile_model(model, x, backward: bool = False, repeat: int = 3):
         "backward_total_ms": (sum(bwd) * 1000.0) if backward else None,
         "params": params,
     }
+
+
+def ascii_flame_graph(profile, width=40, char="█"):
+    """把 ``profile_model`` 的结果画成 ASCII 火焰图（按前向耗时比例条）。
+
+    每行一个层：``索引 类型 耗时ms |bar``；条长与最慢层的耗时成比例（至少 1 格）。
+    返回多行字符串；纯文本、可直接 print。``backward_ms`` 只在 profile 含反向时
+    才有意义，本函数只用 ``forward_ms``，避免拿两套不同单位的数字混排。
+    """
+    if not isinstance(profile, dict) or not isinstance(profile.get("layers"), list):
+        raise ValueError("ascii_flame_graph: profile 必须是 profile_model 返回的 dict")
+    if not profile["layers"]:
+        raise ValueError("ascii_flame_graph: profile 里没有任何层")
+    if isinstance(width, bool) or not isinstance(width, int) or not 10 <= width <= 200:
+        raise ValueError(f"ascii_flame_graph: width 必须是 [10, 200] 的整数，收到 {width!r}")
+    if not isinstance(char, str) or len(char) != 1:
+        raise ValueError(f"ascii_flame_graph: char 必须是单个字符，收到 {char!r}")
+    times = []
+    for i, row in enumerate(profile["layers"]):
+        if not isinstance(row, dict):
+            raise ValueError(f"ascii_flame_graph: layers[{i}] 必须是 dict")
+        fwd = row.get("forward_ms")
+        if isinstance(fwd, bool) or not isinstance(fwd, (int, float)):
+            raise ValueError(f"ascii_flame_graph: layers[{i}].forward_ms 必须是数字")
+        times.append(max(0.0, float(fwd)))
+    peak = max(times)
+    lines = ["索引 层类型           前向耗时     占比条"]
+    for i, row in enumerate(profile["layers"]):
+        t = times[i]
+        bar = char * max(1, int(round(t / peak * width))) if peak > 0.0 and t > 0.0 else ""
+        pct = (t / peak * 100.0) if peak > 0.0 else 0.0
+        name = str(row.get("type", "?"))[:16]
+        lines.append(f"{i:>3} {name:<16} {t:>9.3f}ms {pct:>5.1f}% |{bar}")
+    return "\n".join(lines)
+
+
+def evaluation_report_html(title, metrics, tables=None, notes=None):
+    """生成一份零依赖的独立 HTML 评估报告（字符串），可直接写文件/浏览器打开。
+
+    ``metrics`` 是 ``名称 -> 数值`` 的 dict；``tables`` 是
+    ``[{"caption": str, "columns": [str, ...], "rows": [[...], ...]}, ...]``；
+    ``notes`` 是字符串列表。所有内容都做 HTML 转义，不插入任何脚本。
+    """
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("evaluation_report_html: title 必须是非空字符串")
+    if not isinstance(metrics, dict):
+        raise ValueError("evaluation_report_html: metrics 必须是 dict")
+    if tables is None:
+        tables = []
+    if not isinstance(tables, list):
+        raise ValueError("evaluation_report_html: tables 必须是列表")
+    if notes is None:
+        notes = []
+    if not isinstance(notes, list) or any(not isinstance(n, str) for n in notes):
+        raise ValueError("evaluation_report_html: notes 必须是字符串列表")
+    esc = html.escape
+
+    def fmt_metric(value):
+        if isinstance(value, bool):
+            return esc("是" if value else "否")
+        if isinstance(value, float):
+            return esc(f"{value:.6g}")
+        if value is None:
+            return "—"
+        if isinstance(value, (int, str)):
+            return esc(str(value))
+        raise ValueError(
+            f"evaluation_report_html: metrics 的值必须是数字/字符串/bool/None，收到 {type(value).__name__}"
+        )
+
+    body = [f"<h1>{esc(title)}</h1>", "<h2>指标</h2>", "<table class=\"metrics\">"]
+    for name in sorted(metrics):
+        if not isinstance(name, str) or not name:
+            raise ValueError("evaluation_report_html: metrics 的键必须是非空字符串")
+        body.append(f"<tr><th>{esc(name)}</th><td>{fmt_metric(metrics[name])}</td></tr>")
+    body.append("</table>")
+    for block in tables:
+        if not isinstance(block, dict):
+            raise ValueError("evaluation_report_html: tables 的每一项必须是 dict")
+        caption = block.get("caption", "")
+        columns = block.get("columns")
+        rows = block.get("rows")
+        if not isinstance(caption, str):
+            raise ValueError("evaluation_report_html: table.caption 必须是字符串")
+        if not isinstance(columns, list) or not columns or \
+                any(not isinstance(c, str) or not c for c in columns):
+            raise ValueError("evaluation_report_html: table.columns 必须是非空字符串列表")
+        if not isinstance(rows, list):
+            raise ValueError("evaluation_report_html: table.rows 必须是列表")
+        body.append(f"<h2>{esc(caption)}</h2>" if caption else "<h2>表格</h2>")
+        body.append("<table>")
+        body.append("<tr>" + "".join(f"<th>{esc(c)}</th>" for c in columns) + "</tr>")
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != len(columns):
+                raise ValueError("evaluation_report_html: table.rows 每行长度必须与 columns 一致")
+            body.append("<tr>" + "".join(f"<td>{esc(str(v))}</td>" for v in row) + "</tr>")
+        body.append("</table>")
+    if notes:
+        body.append("<h2>备注</h2><ul>")
+        body.extend(f"<li>{esc(n)}</li>" for n in notes)
+        body.append("</ul>")
+    style = ("body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:960px;"
+             "margin:2rem auto;padding:0 1rem;line-height:1.55;color:#222}"
+             "table{border-collapse:collapse;margin:.5rem 0 1.5rem}"
+             "th,td{border:1px solid #c8cdd4;padding:.3rem .7rem;text-align:left}"
+             "th{background:#eef2f7}table.metrics th{width:12rem}code{background:#f3f4f6;padding:.1rem .3rem}")
+    head = (f"<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            f"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            f"<title>{esc(title)}</title><style>{style}</style></head><body>")
+    return head + "\n".join(body) + "</body></html>"
+
+
+def dataset_version(data, store_dir=None):
+    """给 Python 数据做内容寻址版本（DVC 风格，零依赖）。
+
+    用 ``json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))``
+    的 UTF-8 字节算 SHA-256 作为版本号；``store_dir`` 给定时把内容写到
+    ``<store_dir>/objects/<version[:2]>/<version[2:]>.json``（已存在则不重写），
+    并向 ``<store_dir>/versions.jsonl`` 追加一行 ``{"version","bytes","created_at"}``。
+    返回 ``{"version","bytes","stored"}``；``stored`` 为 None 表示只算哈希未落盘。
+
+    局限：这是**单机教学版**，没有远端存储/垃圾回收/锁；大文件会整体读入内存。
+    """
+    if store_dir is not None and (not isinstance(store_dir, str) or not store_dir):
+        raise ValueError("dataset_version: store_dir 必须是非空字符串或 None")
+    try:
+        payload = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"dataset_version: data 必须可 JSON 序列化（{exc}）")
+    raw = payload.encode("utf-8")
+    version = hashlib.sha256(raw).hexdigest()
+    stored = None
+    if store_dir is not None:
+        obj_dir = os.path.join(store_dir, "objects", version[:2])
+        path = os.path.join(obj_dir, version[2:] + ".json")
+        os.makedirs(obj_dir, exist_ok=True)
+        if not os.path.exists(path):
+            with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+        manifest = os.path.join(store_dir, "versions.jsonl")
+        with io.open(manifest, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps({"version": version, "bytes": len(raw),
+                                "created_at": int(time.time())}, ensure_ascii=False) + "\n")
+        stored = path
+    return {"version": version, "bytes": len(raw), "stored": stored}
+
+
+def load_dataset_version(store_dir, version):
+    """按版本号从 ``dataset_version`` 的对象库读回数据（会校验 SHA-256）。"""
+    if not isinstance(store_dir, str) or not store_dir:
+        raise ValueError("load_dataset_version: store_dir 必须是非空字符串")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9a-f]{64}", version):
+        raise ValueError(f"load_dataset_version: version 必须是 64 位小写十六进制，收到 {version!r}")
+    path = os.path.join(store_dir, "objects", version[:2], version[2:] + ".json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"load_dataset_version: 版本 {version[:12]}… 不存在（{path}）")
+    with io.open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest != version:
+        raise ValueError(
+            f"load_dataset_version: 内容校验失败（期望 {version}，实际 {digest}）"
+        )
+    return json.loads(text)
 
 
 def lr_finder(model, data=None, x=None, y=None, start_lr: float = 1e-5,

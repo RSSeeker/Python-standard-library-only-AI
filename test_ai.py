@@ -29434,3 +29434,113 @@ class TestCheckpointReleaseAndFp8:
             AI.mixed_precision_grads(m, xs, ys, dtype="fp8_e3m4")
         with pytest.raises(ValueError):
             AI.quantize_model(mp, dtype="int8")
+
+
+class TestFlameGraphAndHtmlReport:
+    def _profile(self):
+        net = AI.MLP([4, 6, 3], ["relu", "linear"])
+        return AI.profile_model(net, [0.1, 0.2, 0.3, 0.4], backward=True, repeat=1)
+
+    def test_ascii_flame_graph(self):
+        prof = self._profile()
+        text = AI.ascii_flame_graph(prof, width=20)
+        lines = text.splitlines()
+        assert len(lines) == 1 + len(prof["layers"])
+        assert lines[0].startswith("索引")
+        for line in lines[1:]:
+            assert "ms" in line and "|" in line
+        slowest = max(row["forward_ms"] for row in prof["layers"])
+        for line, row in zip(lines[1:], prof["layers"]):
+            if row["forward_ms"] <= 0.0:
+                continue
+            assert len(line.split("|", 1)[1]) >= 1
+        # 最慢层条长应为 20（宽度）
+        idx = max(range(len(prof["layers"])), key=lambda i: prof["layers"][i]["forward_ms"])
+        assert len(lines[idx + 1].split("|", 1)[1]) == 20 if slowest > 0.0 else True
+        zero = AI.ascii_flame_graph({"layers": [{"type": "Layer", "forward_ms": 0.0}]})
+        assert "|" in zero
+
+    def test_ascii_flame_graph_invalid(self):
+        with pytest.raises(ValueError):
+            AI.ascii_flame_graph({})
+        with pytest.raises(ValueError):
+            AI.ascii_flame_graph({"layers": []})
+        with pytest.raises(ValueError):
+            AI.ascii_flame_graph({"layers": [{"type": "x"}]})
+        prof = self._profile()
+        with pytest.raises(ValueError):
+            AI.ascii_flame_graph(prof, width=5)
+        with pytest.raises(ValueError):
+            AI.ascii_flame_graph(prof, char="ab")
+
+    def test_evaluation_report_html(self):
+        html_text = AI.evaluation_report_html(
+            "测试 <报告>",
+            {"acc": 0.9512345, "n": 3, "ok": True, "none": None},
+            [{"caption": "混淆", "columns": ["a", "b"], "rows": [[1, "<2>"]]}],
+            ["备注 & <说明>"],
+        )
+        assert html_text.startswith("<!DOCTYPE html>")
+        assert "&lt;报告&gt;" in html_text and "&lt;2&gt;" in html_text
+        assert "&amp;" in html_text and "&lt;说明&gt;" in html_text
+        assert "0.951234" in html_text and "是" in html_text
+
+    def test_evaluation_report_html_invalid(self):
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("", {})
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("t", [])
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("t", {"a": object()})
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("t", {}, tables=[{"columns": [], "rows": []}])
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("t", {}, tables=[{"columns": ["a"], "rows": [[1, 2]]}])
+        with pytest.raises(ValueError):
+            AI.evaluation_report_html("t", {}, notes=[1])
+
+
+class TestDatasetVersion:
+    def test_dataset_version_deterministic(self, tmp_path):
+        data = {"b": [3, 2, 1], "a": {"x": 1.5, "y": None}}
+        r1 = AI.dataset_version(data, store_dir=str(tmp_path))
+        r2 = AI.dataset_version({"a": {"y": None, "x": 1.5}, "b": [3, 2, 1]},
+                                store_dir=str(tmp_path))
+        assert r1["version"] == r2["version"]
+        assert r1["bytes"] > 0
+        assert r1["stored"] is not None and str(tmp_path) in r1["stored"]
+        manifest = (tmp_path / "versions.jsonl").read_text(encoding="utf-8")
+        assert manifest.count(r1["version"]) == 2
+
+    def test_dataset_version_roundtrip(self, tmp_path):
+        data = {"rows": [[1, 2], [3, 4]], "name": "数据集"}
+        info = AI.dataset_version(data, store_dir=str(tmp_path))
+        back = AI.load_dataset_version(str(tmp_path), info["version"])
+        assert back == data
+        info2 = AI.dataset_version(data)
+        assert info2["version"] == info["version"]
+        assert info2["stored"] is None
+
+    def test_dataset_version_changes_with_content(self, tmp_path):
+        a = AI.dataset_version({"x": 1})["version"]
+        b = AI.dataset_version({"x": 2})["version"]
+        assert a != b
+
+    def test_dataset_version_invalid(self, tmp_path):
+        with pytest.raises(ValueError):
+            AI.dataset_version({"x": object()})
+        with pytest.raises(ValueError):
+            AI.dataset_version({"x": 1}, store_dir="")
+        with pytest.raises(ValueError):
+            AI.load_dataset_version(str(tmp_path), "abc")
+        with pytest.raises(FileNotFoundError):
+            AI.load_dataset_version(str(tmp_path), "0" * 64)
+        with pytest.raises(ValueError):
+            AI.load_dataset_version(3, "0" * 64)
+
+    def test_dataset_version_corruption_detected(self, tmp_path):
+        info = AI.dataset_version({"x": 1}, store_dir=str(tmp_path))
+        path = tmp_path / "objects" / info["version"][:2] / (info["version"][2:] + ".json")
+        path.write_text('{"x": 2}', encoding="utf-8")
+        with pytest.raises(ValueError):
+            AI.load_dataset_version(str(tmp_path), info["version"])

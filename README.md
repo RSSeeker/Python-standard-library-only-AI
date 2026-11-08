@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1936 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1945 项）
 
 ## 特性
 
@@ -2662,6 +2662,8 @@ print(AI.membership_inference_attack(member, other))            # auc 越接近 
 | `log_metrics(metrics, logger=None, prefix='')` | 把数字指标写成一行 `key=value` 日志 |
 | `memory_usage()` / `track_memory(label=None)` | `tracemalloc` 的当前/峰值；上下文管理器给增量与耗时 |
 | `ModelRegistry(directory)` | `register` / `versions` / `latest` / `get` / `describe` / `rollback` |
+| `dataset_version(data, store_dir=None)` | 给数据做内容寻址版本（DVC 风格）：规范化 JSON 的 SHA-256 作为版本号；给定 `store_dir` 时写 `objects/<前2位>/<其余>.json` 并追加 `versions.jsonl` |
+| `load_dataset_version(store_dir, version)` | 按版本号读回数据并校验 SHA-256；版本缺失抛 `FileNotFoundError`，内容被篡改抛 `ValueError` |
 
 ```python
 cfg = AI.load_config("train.yaml")            # 也可以 .json / .toml / .ini
@@ -3005,6 +3007,8 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 | `attention_maps(module, x, layer_index=None)` | 跑一次前向取回每头注意力权重；支持 `MultiHeadAttention` / `TransformerEncoderLayer` / `TransformerEncoder` / `CausalLM`，采样期间切 eval 以避开 dropout 噪声、结束后恢复原模式 |
 | `attention_ascii(maps, head=0, max_width=48)` | 把注意力矩阵画成字符热图（每行按自身最大值缩放，支持 `max_width` 抽样） |
 | `profile_model(model, x, backward=False)` | 逐层前向/反向墙钟耗时 + 参数量；`repeat` 取最小值降抖动（纯计时，无内存统计） |
+| `ascii_flame_graph(profile, width=40, char="█")` | 把 `profile_model` 的结果画成按前向耗时比例的 ASCII 火焰图（每层一行） |
+| `evaluation_report_html(title, metrics, tables=None, notes=None)` | 生成零依赖的独立 HTML 评估报告字符串；指标表/自定义表格/备注，全部内容 HTML 转义、不插脚本 |
 | `svd_low_rank(matrix, rank=None, sweeps=100)` | 截断 SVD（AᵀA + Jacobi 对称特征分解），返回 `{"U","S","V","rank"}`；rank 缺省 min(m,n) |
 | `low_rank_approximation(matrix, rank=None, sweeps=100)` | 用截断 SVD 重建矩阵：A_r = U·diag(S)·V |
 | `lr_finder(model, x=..., y=..., start_lr, end_lr, steps)` | LR range test：等比扫 lr、记录平滑 loss，按 fastai 规则推荐「最低点 / 10」；会改动权重，结束后恢复 `optimizer.lr` |
@@ -3375,7 +3379,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1936 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1945 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3549,6 +3553,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAdversarialTraining` | FGSM 闭式解、L∞ 球与取值裁剪、单步 PGD = FGSM、对抗样本抬高损失、TRADES/MART 的手算 KL、`adv_eps=0` 逐位不变、对抗训练能降 loss、4 类非法超参 |
 | `TestNoiseCurriculumEnsemble` | 权重/梯度/输入噪声的零均值零方差与可复现、`curriculum_fraction` 三种 schedule、采样器「只取最简比例」且同种子可复现、manifold mixup 端点与中点、快照集成的单快照=普通前向与无副作用、13 类非法参数 |
 | `TestSemiSupervised` | `softmax_rows` 与手算 softmax 一致、一致性损失的自身为 0/对称性/手算核对、`consistency_regularizer` 梯度对有限差分、VAT 扰动 L2 范数 = eps 与 `eps=0` 恒等、伪标签置信度过滤、`soft_target_ce` 与 CE 一致 + 梯度差分 + 零权重、FixMatch 置信度阈值 1.0 时损失 0、MixMatch 平均与锐化、MeanTeacher 的 EMA 与「教师前向不污染学生权重」、11 类非法参数 |
+| `TestFlameGraphAndHtmlReport` | `ascii_flame_graph` 的行数/条长/零耗时行与非法输入；`evaluation_report_html` 的转义、数值格式化、表格与备注，以及各类非法结构 |
+| `TestDatasetVersion` | 版本号与键顺序无关、内容变化则版本变化、落盘/读回往返、manifest 追加、缺失版本与篡改内容报错 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3674,7 +3680,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1936 个单元测试
+├── test_ai.py       # 1945 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

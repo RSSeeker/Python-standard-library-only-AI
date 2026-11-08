@@ -743,7 +743,13 @@
   只训练编码器与重建头，重建头首次调用时创建、不计入 `param_count`）；
   测试 `TestViTEntryPoints` 4 例
 
-全量测试：1839 → 1936 passed（新增 97 例）。
+- [x] 诊断/报告与数据版本工具：`ascii_flame_graph`（把 `profile_model` 的逐层耗时画成
+  比例条）、`evaluation_report_html`（零依赖独立 HTML 报告，内容全转义）、
+  `dataset_version`/`load_dataset_version`（规范化 JSON 的 SHA-256 内容寻址，
+  DVC 风格对象库 + `versions.jsonl` manifest）；测试 `TestFlameGraphAndHtmlReport` 5 例、
+  `TestDatasetVersion` 4 例
+
+全量测试：1839 → 1945 passed（新增 106 例）。
 
 ---
 
