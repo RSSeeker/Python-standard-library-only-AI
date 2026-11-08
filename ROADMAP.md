@@ -759,7 +759,11 @@
 - [x] Mamba S6 选择性扫描：`selective_scan(u, delta, A, B, C, D=None)`（对角 A 的顺序递推，
   返回 `(y, backward_handle)`；反向含 `du`/`ddelta`/`dA`/`dB`/`dC`/`dD`）；测试 `TestSelectiveScan` 5 例
 
-全量测试：1839 → 1963 passed（新增 124 例）。
+- [x] Mamba 完整网络：`MambaBlock`（in_proj 拆 x/z、因果卷积 + SiLU、delta/B/C 投影进
+  `selective_scan`、门控 + 残差）与 `MambaModel`（Embedding → N×block → LM 头，含
+  `fit`/`generate`）；测试 `TestMambaBlockAndModel` 4 例
+
+全量测试：1839 → 1967 passed（新增 128 例）。
 
 ---
 

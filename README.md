@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1963 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1967 项）
 
 ## 特性
 
@@ -2008,6 +2008,8 @@ print(agent.policy.probs(env.reset(seed=0)))
 | API | 说明 |
 |-----|------|
 | `selective_scan(u, delta, A, B, C, D=None)` | Mamba 的选择性扫描（对角 A）：`h_t = exp(delta_t ⊙ A) ⊙ h_{t-1} + delta_t ⊙ B_t ⊙ u_t`，`y_t = C_t · h_t + D ⊙ u_t`；返回 `(y, backward_handle)`，反向给出 `du` / `ddelta` / `dA` / `dB` / `dC` / `dD` |
+| `MambaBlock(d_model, d_state=4, d_conv=4, expand=2, seed=None)` | 选择性状态空间块：`in_proj` 拆 x/z，x 过因果卷积+SiLU，再经 `delta`/`B`/`C` 投影进 `selective_scan`，`out = x + out_proj(y ⊙ SiLU(z))`；含手写反向与 SGD |
+| `MambaModel(vocab_size, d_model=32, d_state=4, d_conv=4, expand=2, num_layers=2, max_len=64, seed=None)` | 字符级 Mamba 语言模型：Embedding → N×`MambaBlock` → 线性 LM 头；`forward` / `loss_and_backward` / `fit` / `generate` / `sgd_step` |
 
 ```python
 y, back = AI.selective_scan(u, delta, A, B, C, D)
@@ -3399,7 +3401,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1963 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1967 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3578,6 +3580,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestContinuousRL` | 连续回放池/actor-critic 形状与 Q 梯度、`_mlp_backward_with_input` 的输入梯度有限差分、DDPG/TD3 在合成目标环境上学到动作、目标网络同步与非法输入 |
 | `TestSAC` | squashed-Gaussian 的采样/`log_prob` 一致性、确定性动作、SAC 双 Q 与目标网络初始化、更新损失、在合成环境上学到动作、非法输入 |
 | `TestSelectiveScan` | Mamba S6 扫描的前向 naive 对比、`ddelta` 的滞后梯度、`dA`/`dB`/`dC`/`dD` 有限差分、`delta=0` 与 `D=None` 边界、非法输入 |
+| `TestMambaBlockAndModel` | `MambaBlock` 前向/参数量/反向形状、卷积与 `A`/`D`/`in_proj` 梯度有限差分、`MambaModel` 拟合与生成、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3703,7 +3706,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1963 个单元测试
+├── test_ai.py       # 1967 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

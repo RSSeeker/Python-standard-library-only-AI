@@ -29859,3 +29859,91 @@ class TestSelectiveScan:
         y, back = AI.selective_scan(u, delta, A, B, C, D)
         with pytest.raises(ValueError):
             back([[1.0, 2.0]])
+
+
+class TestMambaBlockAndModel:
+    def _block(self):
+        return AI.MambaBlock(d_model=4, d_state=3, d_conv=3, expand=2)
+
+    def _x(self):
+        return [[0.1 * ((t + 1) * (i + 2)) for i in range(4)] for t in range(5)]
+
+    def _w(self):
+        return [[0.3 - 0.1 * i for i in range(4)] for _ in range(5)]
+
+    def test_block_forward_and_param_count(self):
+        block = self._block()
+        out = block.forward(self._x())
+        assert len(out) == 5 and len(out[0]) == 4
+        assert block.param_count() == 474
+        dx = block.backward(self._w())
+        assert len(dx) == 5 and len(dx[0]) == 4
+
+    def test_block_gradients_finite_difference(self):
+        block = self._block()
+        x, w = self._x(), self._w()
+        block.zero_grad()
+        block.forward(x)
+        block.backward(w)
+
+        def loss():
+            o = block.forward(x)
+            return sum(o[t][i] * w[t][i] for t in range(5) for i in range(4))
+
+        eps = 1e-6
+        pairs = [
+            (block.conv.weights[1][0], 0, block.conv.grad_w[1][0][0]),
+            (block.A[0], 1, block.grad_A[0][1]),
+            (block.D, 2, block.grad_D[2]),
+        ]
+        for arr, key, got in pairs:
+            old = arr[key]
+            arr[key] = old + eps
+            fp = loss()
+            arr[key] = old - eps
+            fm = loss()
+            arr[key] = old
+            assert abs((fp - fm) / (2 * eps) - got) < 2e-6
+        old = block.in_proj.weights[0][0]
+        block.in_proj.weights[0][0] = old + eps
+        fp = loss()
+        block.in_proj.weights[0][0] = old - eps
+        fm = loss()
+        block.in_proj.weights[0][0] = old
+        assert abs((fp - fm) / (2 * eps) - block.grads["in_proj"][0][0][0]) < 2e-6
+
+    def test_model_fit_and_generate(self):
+        model = AI.MambaModel(vocab_size=6, d_model=8, d_state=3, d_conv=3,
+                              expand=2, num_layers=1, max_len=8)
+        assert model.param_count() == 1748
+        seq = [0, 1, 2, 3, 0, 1]
+        logits = model.forward(seq)
+        assert len(logits) == 6 and len(logits[0]) == 6
+        losses = model.fit([seq], epochs=30, lr=0.02, seed=1)
+        assert losses[-1] < losses[0] * 0.5
+        out = model.generate([0, 1], max_new_tokens=3, temperature=0.7, seed=2)
+        assert out[:2] == [0, 1] and len(out) == 5
+        assert all(0 <= t < 6 for t in out)
+
+    def test_mamba_invalid_inputs(self):
+        block = self._block()
+        with pytest.raises(ValueError):
+            block.forward([])
+        with pytest.raises(ValueError):
+            block.forward([[0.1] * 3])
+        with pytest.raises(RuntimeError):
+            block.backward([[0.1] * 4] * 2)
+        model = AI.MambaModel(vocab_size=6, d_model=8, num_layers=1, max_len=4)
+        with pytest.raises(ValueError):
+            model.forward([])
+        with pytest.raises(ValueError):
+            model.forward([0, 6])
+        with pytest.raises(ValueError):
+            model.forward([0, 1, 2, 3, 4])
+        with pytest.raises(ValueError):
+            model.loss_and_backward([0])
+        with pytest.raises(ValueError):
+            model.generate([0, 1], max_new_tokens=2, temperature=0.0)
+        with pytest.raises(ValueError):
+            model.generate([0, 1], max_new_tokens=2, top_k=0)
+        assert model.forward([0, 1, 2]) is not None
