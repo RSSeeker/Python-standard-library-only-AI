@@ -28333,3 +28333,141 @@ class TestT5AndBertModels:
             b.loss_and_backward([1, 2], [0], [0], nsp_label=2)
         with pytest.raises(ValueError):
             b.forward([1, 2], segment_ids=[0])
+
+
+class TestRougeExtraAndIA3:
+    def test_rouge_s_identical(self):
+        assert AI.rouge_s("a b c", "a b c") == 1.0
+        assert AI.rouge_s(["a", "b", "c"], ["a", "b", "c"]) == 1.0
+
+    def test_rouge_s_partial(self):
+        assert abs(AI.rouge_s("a b", "a b c") - 0.5) < 1e-12
+        # skip-bigram 是有序对：反序不算重叠
+        assert AI.rouge_s("a b", "b a") == 0.0
+        assert abs(AI.rouge_s("a b c", "a c b") - 2.0 / 3.0) < 1e-12
+
+    def test_rouge_s_gap_limit(self):
+        assert AI.rouge_s("a b c", "a b c", max_gap=0) == 1.0
+        # "a x c" vs "a y c"：只有 (a,c) 这一对在无间隔限制时重叠
+        assert AI.rouge_s("a x c", "a y c", max_gap=0) == 0.0
+        assert abs(AI.rouge_s("a x c", "a y c") - 1.0 / 3.0) < 1e-12
+        assert abs(AI.rouge_s("a x c", "a y c", max_gap=1) - 1.0 / 3.0) < 1e-12
+
+    def test_rouge_s_beta(self):
+        p, r = 1.0, 1.0 / 3.0
+        b2 = 0.25
+        want = (1.0 + b2) * p * r / (b2 * p + r)
+        assert abs(AI.rouge_s("a b", "a b c", beta=0.5) - want) < 1e-12
+
+    def test_rouge_s_errors(self):
+        assert AI.rouge_s("a", "a b") == 0.0
+        for bad in (0, -1, True):
+            with pytest.raises(ValueError):
+                AI.rouge_s("a b", "a b", beta=bad)
+        with pytest.raises(ValueError):
+            AI.rouge_s("a b", "a b", max_gap=-1)
+        with pytest.raises(ValueError):
+            AI.rouge_s("a b", "a b", max_gap=1.5)
+
+    def test_rouge_w_identical(self):
+        assert AI.rouge_w("a b c", "a b c") == 1.0
+        assert AI.rouge_w([], "a") == 0.0
+
+    def test_rouge_w_partial(self):
+        assert abs(AI.rouge_w("a b x", "a b y") - 2.0 / 3.0) < 1e-12
+        # 连续匹配（权重 l^2）比断开的匹配得分高
+        contiguous = AI.rouge_w("a b c d", "a b c d")
+        broken = AI.rouge_w("a b c x", "a b x c")
+        assert abs(contiguous - 1.0) < 1e-12
+        assert broken < 0.6
+        assert abs(AI.rouge_w("a b c d", "a b c d", beta=0.5) - 1.0) < 1e-12
+
+    def test_rouge_w_errors(self):
+        assert AI.rouge_w("a", "a") == 1.0
+        for bad in (0, -1, True):
+            with pytest.raises(ValueError):
+                AI.rouge_w("a b", "a b", beta=bad)
+
+    def test_ia3_init_matches_base(self):
+        random.seed(31)
+        layer = AI.Layer(4, 3, activation="linear")
+        x = [0.3, -0.7, 1.1, 0.2]
+        base = list(layer.forward(x))
+        adapter = AI.IA3(layer)
+        assert adapter.forward(x) == base
+        assert adapter.trainable_param_count() == 3
+        assert adapter.total_param_count() == 12 + 3 + 3
+
+    def test_ia3_grad_v_numeric(self):
+        random.seed(32)
+        layer = AI.Layer(3, 2, activation="linear")
+        adapter = AI.IA3(layer)
+        x = [0.5, -0.2, 0.9]
+        delta = [0.7, -1.3]
+
+        def loss():
+            out = adapter.forward(x)
+            return sum(out[j] * delta[j] for j in range(2))
+
+        adapter.zero_grad()
+        adapter.forward(x)
+        dx = adapter.backward(delta)
+        eps = 1e-6
+        for j in range(2):
+            old = adapter.v[j]
+            adapter.v[j] = old + eps
+            up = loss()
+            adapter.v[j] = old - eps
+            dn = loss()
+            adapter.v[j] = old
+            assert abs(adapter.grad_v[j] - (up - dn) / (2 * eps)) < 1e-9
+        # dx 也要与数值导数一致
+        def loss2(xx):
+            out = adapter.forward(xx)
+            return sum(out[j] * delta[j] for j in range(2))
+
+        for i in range(3):
+            old = x[i]
+            x[i] = old + eps
+            up = loss2(x)
+            x[i] = old - eps
+            dn = loss2(x)
+            x[i] = old
+            assert abs(dx[i] - (up - dn) / (2 * eps)) < 1e-8
+
+    def test_ia3_base_frozen_and_training_reduces_loss(self):
+        random.seed(33)
+        layer = AI.Layer(3, 2, activation="linear")
+        W0 = [row[:] for row in layer.weights]
+        B0 = list(layer.biases)
+        adapter = AI.IA3(layer)
+        x = [0.5, -0.2, 0.9]
+        target = [0.0, 0.0]
+        adapter.forward(x)
+        adapter.backward([1.0, -1.0])
+        assert layer.weights == W0
+        assert layer.biases == B0
+
+        def mse():
+            out = adapter.forward(x)
+            return sum((out[j] - target[j]) ** 2 for j in range(2)) / 2.0
+
+        first = mse()
+        for _ in range(30):
+            adapter.zero_grad()
+            out = adapter.forward(x)
+            adapter.backward([out[j] - target[j] for j in range(2)])
+            for j in range(2):
+                adapter.v[j] -= 0.1 * adapter.grad_v[j]
+        assert mse() < first
+        assert layer.weights == W0
+
+    def test_ia3_invalid_args(self):
+        with pytest.raises(TypeError):
+            AI.IA3(object())
+        with pytest.raises(TypeError):
+            AI.IA3(AI.Layer(3, 3), init="x")
+        adapter = AI.IA3(AI.Layer(3, 2))
+        with pytest.raises(RuntimeError):
+            adapter.backward([1.0, 1.0])
+

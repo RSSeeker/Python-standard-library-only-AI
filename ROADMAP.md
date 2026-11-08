@@ -708,7 +708,9 @@
   测试 `TestMultiLabelAndStatistics` 7 例（含精确二项 p 值、并列秩校正与错误路径）
 - [ ] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合
 
-全量测试：1839 → 1860 passed（新增 21 例）。
+- [x] 清单驱动的低成本小件：ROUGE-S / ROUGE-W（`rouge_s` / `rouge_w`）与 IA³ 适配器（`IA3`，冻结原层只训输出通道缩放）；测试 `TestRougeExtraAndIA3` 12 例
+
+全量测试：1839 → 1872 passed（新增 33 例）。
 
 ---
 

@@ -21439,6 +21439,59 @@ class LoRA:
 _ATTN_RAMP = " .:-=+*#%@"
 
 
+class IA3:
+    """IA³ 适配器：冻结原层，只训练输出通道上的缩放向量
+
+    ``y = v * Layer(x)``，``v`` 初始化为全 1，训练开始时不影响原模型输出。
+    与 LoRA 一样是包装类：``forward`` 走原层，``backward`` 把梯度穿过原层
+    （原层梯度被丢弃，不更新），只有 ``v`` 参与优化。参数里每个输出通道
+    只多一个标量，因此比 LoRA 更轻。
+    """
+
+    def __init__(self, layer: Layer, init: float = 1.0):
+        if not isinstance(layer, Layer):
+            raise TypeError(f"IA3: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
+        if isinstance(init, bool) or not isinstance(init, (int, float)):
+            raise TypeError(f"IA3: init 必须是数字，收到 {init!r}")
+        self.layer = layer
+        self.fan_out = layer.fan_out
+        self.v = [float(init)] * self.fan_out
+        self.grad_v = [0.0] * self.fan_out
+        self.base = None
+        self.x = None
+
+    def zero_grad(self):
+        """清零 v 的梯度"""
+        self.grad_v = [0.0] * self.fan_out
+
+    def params(self):
+        """返回 [(参数, 梯度)]，可直接喂给上面的优化器"""
+        return [(self.v, self.grad_v)]
+
+    def trainable_param_count(self):
+        """可训练参数个数（每个输出通道一个缩放标量）"""
+        return self.fan_out
+
+    def total_param_count(self):
+        """总参数个数（原层参数 + 缩放向量）"""
+        return self.fan_out + self.layer.fan_in * self.layer.fan_out + self.fan_out
+
+    def forward(self, x):
+        base = self.layer.forward(x)
+        self.base = base
+        self.x = x
+        return [self.v[j] * base[j] for j in range(self.fan_out)]
+
+    def backward(self, delta_out):
+        """返回 dx；原层参数只收梯度不更新"""
+        if self.base is None:
+            raise RuntimeError("IA3.backward: 必须先调用 forward()")
+        for j in range(self.fan_out):
+            self.grad_v[j] += delta_out[j] * self.base[j]
+        d_base = [self.v[j] * delta_out[j] for j in range(self.fan_out)]
+        return self.layer.backward(d_base)[-1]
+
+
 def _copy_attn_maps(heads, who):
     """把 MHA 缓存的每头权重整理成纯 float 的嵌套列表，并做形状自检。"""
     if heads is None:
@@ -44465,6 +44518,89 @@ def rouge_1(pred, ref, beta=1.0):
 def rouge_2(pred, ref, beta=1.0):
     """ROUGE-2（bigram 重叠）的 F 值。"""
     return rouge_n(pred, ref, 2, beta)
+
+
+def rouge_s(pred, ref, beta=1.0, max_gap=None):
+    """ROUGE-S 的 F 值（skip-bigram：任意有序 token 对，允许中间有间隔）。
+
+    ``max_gap=None`` 表示不限制间隔（标准 ROUGE-S）；``max_gap=4`` 等价于
+    ROUGE-S4。每对按 (前一个 token, 后一个 token) 计数并做截断重叠。
+    """
+    who = "rouge_s"
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta <= 0:
+        raise ValueError(f"{who}: beta 必须是正数，收到 {beta!r}")
+    if max_gap is not None and (isinstance(max_gap, bool)
+                                or not isinstance(max_gap, int) or max_gap < 0):
+        raise ValueError(f"{who}: max_gap 必须是 ≥0 的整数或 None，收到 {max_gap!r}")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if len(p_tokens) < 2 or len(r_tokens) < 2:
+        return 0.0
+
+    def _pair_counts(tokens):
+        counts = {}
+        for i in range(len(tokens) - 1):
+            for j in range(i + 1, len(tokens)):
+                if max_gap is not None and j - i - 1 > max_gap:
+                    continue
+                key = (tokens[i], tokens[j])
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    p_counts = _pair_counts(p_tokens)
+    r_counts = _pair_counts(r_tokens)
+    overlap = 0
+    for key, cnt in p_counts.items():
+        overlap += min(cnt, r_counts.get(key, 0))
+    if overlap == 0:
+        return 0.0
+    precision = overlap / float(sum(p_counts.values()))
+    recall = overlap / float(sum(r_counts.values()))
+    b2 = beta * beta
+    return ((1.0 + b2) * precision * recall) / (b2 * precision + recall)
+
+
+def rouge_w(pred, ref, beta=1.0):
+    """ROUGE-W 的 F 值（加权 LCS：连续匹配越长权重越高，f(l)=l^2）。
+
+    使用 Lin (2004) 的近似 DP：匹配时把「当前连续匹配长度 c」的权重增量
+    ``2c-1`` 累加；最后按 ``f^{-1}(W)=sqrt(W)`` 还原有效匹配长度再算 P/R/F。
+    """
+    who = "rouge_w"
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta <= 0:
+        raise ValueError(f"{who}: beta 必须是正数，收到 {beta!r}")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    m = len(p_tokens)
+    n = len(r_tokens)
+    score = [[0.0] * (n + 1) for _ in range(m + 1)]
+    run = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        pi = p_tokens[i - 1]
+        for j in range(1, n + 1):
+            if pi == r_tokens[j - 1]:
+                c = run[i - 1][j - 1] + 1
+                val = score[i - 1][j - 1] + (2 * c - 1)
+                best = score[i - 1][j] if score[i - 1][j] >= score[i][j - 1] else score[i][j - 1]
+                if val >= best:
+                    score[i][j] = val
+                    run[i][j] = c
+                else:
+                    score[i][j] = best
+                    run[i][j] = 0
+            else:
+                score[i][j] = score[i - 1][j] if score[i - 1][j] >= score[i][j - 1] else score[i][j - 1]
+                run[i][j] = 0
+    weighted = score[m][n]
+    if weighted <= 0.0:
+        return 0.0
+    length = math.sqrt(weighted)
+    precision = length / m
+    recall = length / n
+    b2 = beta * beta
+    return ((1.0 + b2) * precision * recall) / (b2 * precision + recall)
 
 
 def _meteor_chunks(p_tokens, r_tokens):

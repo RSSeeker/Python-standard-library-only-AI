@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1860 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1872 项）
 
 ## 特性
 
@@ -454,6 +454,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `Linear(fan_in, fan_out)` | 无激活全连接层 |
 | `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
 | `LoRA(layer, rank=4, alpha=None)` | 低秩适配：冻结原层，只训 `A (rank, in)` / `B (out, rank)`；`B` 初始为 0（包装后行为不变）；`merge()` 把 `scaling·BA` 折进原层权重 |
+| `IA3(layer, init=1.0)` | IA³ 适配器：冻结原层，只训每个输出通道的缩放标量 `y = v ⊙ Layer(x)`；`v` 初始全 1（包装后行为不变），`params()`/`zero_grad()` 与 LoRA 同构，`trainable_param_count()` 只有输出通道数 |
 | `DoRALinear(layer, rank=4, alpha=None)` | DoRA：权重拆成「幅度 `m` × 方向 `V`」，LoRA 只改方向（`W' = m·Weff/‖Weff‖`），`V`/`m` 也可训；`B=0` 时与原层逐位一致，`merge()` 折回原层 |
 | `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `|A_r|·|B_:,r|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
@@ -1340,6 +1341,8 @@ print(AI.hd95(gt, pred))             # 1.0
 | `corpus_bleu(candidates, references, max_n=4, smooth=1.0)` | 语料级 BLEU：全语料累计截断 n-gram 计数后算精度，再乘简短惩罚；短句不会被重复惩罚 |
 | `rouge_n(pred, ref, n=1, beta=1.0)` | ROUGE-N 的 F 值（n-gram 截断重叠）；`beta=1` 即 F1 |
 | `rouge_1(pred, ref)` / `rouge_2(pred, ref)` | unigram / bigram 的便捷封装 |
+| `rouge_s(pred, ref, beta=1.0, max_gap=None)` | ROUGE-S 的 F 值（skip-bigram：任意有序 token 对；`max_gap` 限制对间隔，`None` 为不限制，`4` 等价 ROUGE-S4） |
+| `rouge_w(pred, ref, beta=1.0)` | ROUGE-W 的 F 值（加权 LCS：连续匹配越长权重越高，`f(l)=l^2` 的近似 DP，`sqrt(W)` 归一化） |
 | `meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5)` | METEOR 简化版：精确匹配 + 片段（chunk）惩罚，无词干/同义词表 |
 | `cider_score(candidate, references, n=4)` | CIDEr 简化版：1..n gram 的 TF-IDF 余弦平均 × 10 |
 | `self_bleu(candidates, max_n=4)` | 每个候选以其余候选为参考算 BLEU 再平均；越高说明生成越不多样 |
@@ -3301,7 +3304,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1860 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1872 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3367,6 +3370,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLoRA` | B=0 等价原层 / A、B、dx 数值梯度 / 原层冻结 / merge 保输出 / 参数量 / 非法参数 |
 | `TestDoRALinear` | B=0 等价原层 / `g_V`、`g_m`、`g_A`、`g_B` 数值梯度 / `denormalized()` 与 forward 一致 / `merge()` 保输出 / 参数量 |
 | `TestAdaLoRALinear` | B=0 等价原层 / A、B 数值梯度 / `prune` 保留 top-k 且死秩全零 / 剪枝后前向等于存活秩之和 / 非法 `keep` |
+| `TestCompositeModels` | LLaMA 前向形状/参数量/fit 降 loss/generate/GQA/非法输入；ResNet 前向/参数量、`Bottleneck2d` stride=2 反向回归、100 轮拟合收敛（合成图案 6/6） |
+| `TestMultiLabelAndStatistics` | 多标签 Exact Match / Ranking Loss / LRAP 手算值；MSP / Energy / OOD AUROC；McNemar 精确与近似；Wilcoxon 对称与单侧 |
+| `TestT5AndBertModels` | T5 forward/param_count=6040/编码器与解码器相对偏置梯度非零/fit 降 loss/非法输入；BERT MLM+NSP forward、loss 下降、mask 标签与 NSP 非法输入 |
+| `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
 | `TestConstrainedDecoding` | token 掩码只留允许集合且概率和仍为 1 / 前缀约束的状态转移与 `eos_id` / 非前缀报错 / 与采样器叠加 / 非法输入 |
 | `TestSpeculativeAccept` | `draft==target` 全接受 / 拒绝后按残差重采样 / 接受率 ≈ Σmin(p,q) / 非法输入 |
@@ -3585,7 +3592,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1860 个单元测试
+├── test_ai.py       # 1872 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
