@@ -30193,3 +30193,96 @@ class TestParallelTrainingUtils:
             AI.sequence_parallel_layer_norm([])
         with pytest.raises(ValueError):
             AI.sequence_parallel_layer_norm([[1.0, 2.0]], eps=0.0)
+
+
+class TestElectra:
+    def _make(self, **kw):
+        params = dict(vocab_size=8, d_model=16, num_heads=2, d_ff=32,
+                      num_layers=1, max_len=8, mask_prob=0.3, seed=7)
+        params.update(kw)
+        return AI.ElectraModel(**params)
+
+    def test_corruption_marks_positions(self):
+        m = self._make()
+        ids = [1, 2, 3, 4, 5, 6]
+        corrupted, positions, targets, labels = m._corrupt(ids, random.Random(3))
+        assert len(corrupted) == len(ids) == len(labels)
+        assert len(targets) == len(positions)
+        assert positions == sorted(set(positions))
+        n_mask = max(1, int(round(len(ids) * m.mask_prob)))
+        assert len(positions) == n_mask
+        for p in positions:
+            assert 0 <= p < len(ids)
+            assert corrupted[p] == m.generator.mask_id
+            assert labels[p] == 1
+            assert targets[positions.index(p)] == ids[p]
+        for t in range(len(ids)):
+            if t not in positions:
+                assert corrupted[t] == ids[t]
+                assert labels[t] == 0
+
+    def test_forward_and_detect_shapes(self):
+        m = self._make()
+        probs = m.detect([1, 2, 3, 4])
+        assert len(probs) == 4
+        assert all(0.0 < p < 1.0 for p in probs)
+        score = m.discriminator.forward([1, 2, 3])
+        assert len(score) == 3
+        with pytest.raises(ValueError):
+            m.detect([])
+        with pytest.raises(ValueError):
+            m.detect([1, 2, 3, 4, 5, 6, 7, 8, 1])
+        with pytest.raises(ValueError):
+            m.detect([1, -1])
+        with pytest.raises(ValueError):
+            m.detect([1, 9])
+        assert len(m.detect([1, 8])) == 2  # mask_id 是合法输入（判别器要能看到被遮位置）
+
+    def test_fit_reduces_generator_loss_and_detects(self):
+        m = self._make()
+        sents = [[1, 2, 3, 4, 5], [2, 3, 4, 5, 1], [3, 4, 5, 1, 2],
+                 [4, 5, 1, 2, 3], [5, 1, 2, 3, 4], [1, 3, 5, 2, 4]]
+        history = m.fit(sents, epochs=40, lr_generator=0.02,
+                        lr_discriminator=0.05, seed=1)
+        assert len(history) == 40
+        assert history[-1]["generator_loss"] < history[0]["generator_loss"] * 0.8
+        assert history[-1]["accuracy"] == 1.0
+
+        ids = [1, 2, 3, 4, 5]
+        corrupted, positions, _, labels = m._corrupt(ids, random.Random(3))
+        probs = m.detect(corrupted)
+        masked = [probs[p] for p in positions]
+        others = [probs[t] for t in range(len(probs)) if t not in positions]
+        assert min(masked) > max(others)
+
+    def test_electra_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.ElectraModel(vocab_size=0)
+        with pytest.raises(ValueError):
+            AI.ElectraModel(vocab_size=8, mask_prob=0.0)
+        with pytest.raises(ValueError):
+            AI.ElectraModel(vocab_size=8, mask_prob=1.0)
+        with pytest.raises(ValueError):
+            AI.ElectraModel(vocab_size=8, mask_prob=True)
+        m = self._make()
+        with pytest.raises(ValueError):
+            m.train_step([])
+        with pytest.raises(ValueError):
+            m.fit([], epochs=2)
+        with pytest.raises(ValueError):
+            m.fit([[1, 2, 3]], epochs=0)
+        with pytest.raises(ValueError):
+            m._corrupt([1, 2, 3, 4, 5, 6, 7, 8, 1], random.Random(0))
+        with pytest.raises(ValueError):
+            m.discriminator.bce_loss_and_backward([1, 2], [1])
+        with pytest.raises(ValueError):
+            m.discriminator.bce_loss_and_backward([1, 2], [1, 2])
+        with pytest.raises(ValueError):
+            m.discriminator.bce_loss_and_backward([1, 2], [1, 0], grad_scale=0.0)
+
+    def test_param_count(self):
+        m = self._make()
+        d, ff, layers, vocab = 16, 32, 1, 8
+        per_layer = 4 * d * d + 4 * d + 2 * d * ff + ff + d + 4 * d
+        expect = (vocab + 1) * d + layers * per_layer + 2 * d + 2
+        assert m.discriminator.param_count() == expect == 2402

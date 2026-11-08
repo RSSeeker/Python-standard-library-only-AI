@@ -35742,6 +35742,290 @@ def sequence_parallel_layer_norm(x_seq, eps=1e-5):
 
 
 # ============================================================================
+# ============================================================================
+#  ELECTRA：生成器 + 判别器的预训练框架
+# ============================================================================
+
+
+class ElectraDiscriminator:
+    """ELECTRA 判别器：双向 Transformer 编码 + 逐位置二分类头
+
+    判别器逐位置判断「这个 token 是否被生成器破坏」。
+    与 `MaskedLM` 的差别：输出不是词表分布，而是每个位置一个 logit
+    （1 表示被替换/被遮罩，0 表示原样）。
+    """
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=64,
+                 num_layers=2, max_len=32, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(
+                f"ElectraDiscriminator: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(
+                f"ElectraDiscriminator: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(
+                f"ElectraDiscriminator: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"ElectraDiscriminator: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(
+                f"ElectraDiscriminator: max_len 必须 >= 1，收到 {max_len!r}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.max_len = max_len
+        self.num_heads = num_heads
+
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.embedding = Embedding(vocab_size + 1, d_model)
+            std = math.sqrt(2.0 / d_model)
+            self.W_d = [[random.gauss(0.0, std) for _ in range(d_model)]
+                        for _ in range(2)]
+        finally:
+            random.setstate(state)
+
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
+                                          0.0, causal=False)
+        self.b_d = [0.0, 0.0]
+
+        self.zero_grad()
+        self.h = None
+        self.score = None
+
+    def zero_grad(self):
+        """清零 embedding / 编码器 / 分类头的梯度"""
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.grad_W_d = [[0.0] * self.d_model for _ in range(2)]
+        self.grad_b_d = [0.0, 0.0]
+
+    def train(self):
+        """训练模式（Dropout 生效，转发给编码器）"""
+        self.encoder.train()
+        return self
+
+    def eval(self):
+        """推理模式（关闭 Dropout）"""
+        self.encoder.eval()
+        return self
+
+    def forward(self, ids):
+        """ids: List[int] → score (T,)（越大越像「被破坏的位置」）"""
+        if not isinstance(ids, (list, tuple)) or not ids:
+            raise ValueError("ElectraDiscriminator.forward: ids 不能为空")
+        ids = _check_token_ids(ids, self.vocab_size + 1, "ElectraDiscriminator.forward")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"ElectraDiscriminator.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        emb = self.embedding.forward(ids)
+        x = self.pos.forward(emb)
+        h = self.encoder.forward(x)
+        self.h = h
+        T = len(h)
+        score = []
+        for t in range(T):
+            s = self.b_d[1] - self.b_d[0]
+            for j in range(self.d_model):
+                s += (self.W_d[1][j] - self.W_d[0][j]) * h[t][j]
+            score.append(s)
+        self.score = score
+        return score
+
+    def probabilities(self, ids):
+        """逐位置「被破坏」概率（sigmoid）"""
+        score = self.forward(ids)
+        return [_sigmoid(v) for v in score]
+
+    def bce_loss_and_backward(self, ids, labels, grad_scale=1.0):
+        """逐位置二分类 BCE（logit 形式），反传并累积梯度，返回平均 loss"""
+        if not isinstance(labels, (list, tuple)) or not labels:
+            raise ValueError("ElectraDiscriminator.bce_loss_and_backward: labels 不能为空")
+        if len(labels) != len(ids):
+            raise ValueError(
+                "ElectraDiscriminator.bce_loss_and_backward: labels 长度 "
+                f"{len(labels)} 与 ids 长度 {len(ids)} 不一致")
+        for t, y in enumerate(labels):
+            if y not in (0, 1) or isinstance(y, bool):
+                raise ValueError(
+                    "ElectraDiscriminator.bce_loss_and_backward: "
+                    f"第 {t} 个标签必须是 0/1，收到 {y!r}")
+        if isinstance(grad_scale, bool) or not isinstance(grad_scale, (int, float)) \
+                or not math.isfinite(float(grad_scale)) or grad_scale <= 0.0:
+            raise ValueError(
+                "ElectraDiscriminator.bce_loss_and_backward: "
+                f"grad_scale 必须是正有限数，收到 {grad_scale!r}")
+        score = self.forward(ids)
+        n = len(score)
+        loss = 0.0
+        ds = [0.0] * n
+        for t in range(n):
+            s = score[t]
+            y = float(labels[t])
+            # softplus(s) - y*s，数值稳定写法
+            loss += math.log1p(math.exp(-abs(s))) + max(s, 0.0) - y * s
+            ds[t] = (_sigmoid(s) - y) * grad_scale
+        loss /= n
+
+        h = self.h
+        for t in range(n):
+            d = ds[t] / n
+            for j in range(self.d_model):
+                self.grad_W_d[1][j] += d * h[t][j]
+                self.grad_W_d[0][j] -= d * h[t][j]
+            self.grad_b_d[1] += d
+            self.grad_b_d[0] -= d
+
+        dh = [[0.0] * self.d_model for _ in range(n)]
+        for t in range(n):
+            d = ds[t] / n
+            for j in range(self.d_model):
+                dh[t][j] = d * (self.W_d[1][j] - self.W_d[0][j])
+        dx = self.encoder.backward(dh)
+        self.embedding.backward(dx)
+        return loss
+
+    def sgd_step(self, lr):
+        """SGD 更新编码器 / embedding / 分类头"""
+        self.encoder.sgd_step(lr)
+        self.embedding.sgd_step(lr)
+        for c in range(2):
+            for j in range(self.d_model):
+                self.W_d[c][j] -= lr * self.grad_W_d[c][j]
+            self.b_d[c] -= lr * self.grad_b_d[c]
+
+    def param_count(self):
+        """参数总数"""
+        d = self.d_model
+        ff = self.d_ff
+        per_layer = 4 * d * d + 4 * d + 2 * d * ff + ff + d + 4 * d
+        return (self.vocab_size + 1) * d + self.num_layers * per_layer + 2 * d + 2
+
+
+class ElectraModel:
+    """ELECTRA 预训练模型：生成器（MaskedLM）+ 判别器（逐位置二分类）
+
+    简化版 ELECTRA：
+      * 生成器直接用 `MaskedLM`，破坏方式为「遮罩位置换成 mask_id」
+        （不做 80/10/10 随机替换），所以判别器的标签就是「该位置是否被遮罩」；
+      * 生成器与判别器分开训练：生成器用 Adam 做掩码语言建模，
+        判别器用 SGD 做二分类，两者梯度互不干扰。
+    """
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=64,
+                 num_layers=2, max_len=32, mask_prob=0.15, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(
+                f"ElectraModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if isinstance(mask_prob, bool) or not isinstance(mask_prob, (int, float)) \
+                or not 0.0 < float(mask_prob) < 1.0:
+            raise ValueError(
+                f"ElectraModel: mask_prob 必须在 (0,1) 内，收到 {mask_prob!r}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        self.mask_prob = float(mask_prob)
+
+        self.generator = MaskedLM(vocab_size, d_model, num_heads, d_ff,
+                                  num_layers, max_len, dropout=0.0,
+                                  mask_prob=mask_prob, replace_prob=0.1)
+        self.discriminator = ElectraDiscriminator(
+            vocab_size, d_model, num_heads, d_ff, num_layers, max_len, seed=seed)
+
+    def _check_ids(self, ids, who):
+        return _check_token_ids(ids, self.vocab_size, who)
+
+    def _corrupt(self, ids, rng):
+        """返回 (corrupted, positions, targets, labels)"""
+        ids = self._check_ids(ids, "ElectraModel._corrupt")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"ElectraModel._corrupt: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        if len(ids) < 1:
+            raise ValueError("ElectraModel._corrupt: ids 不能为空")
+        n_mask = max(1, int(round(len(ids) * self.mask_prob)))
+        n_mask = min(n_mask, len(ids) - 1) if len(ids) > 1 else 1
+        positions = sorted(rng.sample(range(len(ids)), n_mask))
+        corrupted = list(ids)
+        labels = [0] * len(ids)
+        targets = []
+        for p in positions:
+            corrupted[p] = self.generator.mask_id
+            labels[p] = 1
+            targets.append(ids[p])
+        return corrupted, positions, targets, labels
+
+    def train_step(self, ids, lr_generator=0.01, lr_discriminator=0.05,
+                   seed=None):
+        """单条序列一步预训练，返回 (generator_loss, discriminator_loss, accuracy)"""
+        rng = random.Random(seed) if seed is not None else random
+        corrupted, positions, targets, labels = self._corrupt(ids, rng)
+
+        self.generator.zero_grad()
+        g_loss = self.generator._loss_and_backward(corrupted, positions, targets)
+        self.generator.adam_step(lr_generator)
+
+        self.discriminator.zero_grad()
+        d_loss = self.discriminator.bce_loss_and_backward(corrupted, labels)
+        self.discriminator.sgd_step(lr_discriminator)
+
+        probs = [_sigmoid(v) for v in self.discriminator.score]
+        correct = 0
+        for t, y in enumerate(labels):
+            if (1 if probs[t] >= 0.5 else 0) == y:
+                correct += 1
+        return g_loss, d_loss, correct / len(labels)
+
+    def fit(self, sentences, epochs=10, lr_generator=0.01,
+            lr_discriminator=0.05, shuffle=True, seed=None):
+        """在若干 token 序列上做 ELECTRA 式预训练，返回每 epoch 统计"""
+        if not isinstance(sentences, (list, tuple)) or not sentences:
+            raise ValueError("ElectraModel.fit: sentences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"ElectraModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        for name, val in (("lr_generator", lr_generator),
+                          ("lr_discriminator", lr_discriminator)):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                    or not math.isfinite(float(val)) or val <= 0.0:
+                raise ValueError(
+                    f"ElectraModel.fit: {name} 必须是正有限数，收到 {val!r}")
+
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(sentences)))
+            if shuffle:
+                rng.shuffle(order)
+            g_total = d_total = acc_total = 0.0
+            for idx in order:
+                step_seed = rng.randrange(2 ** 31)
+                g_loss, d_loss, acc = self.train_step(
+                    sentences[idx], lr_generator, lr_discriminator,
+                    seed=step_seed)
+                g_total += g_loss
+                d_total += d_loss
+                acc_total += acc
+            n = len(sentences)
+            history.append({
+                "generator_loss": g_total / n,
+                "discriminator_loss": d_total / n,
+                "accuracy": acc_total / n,
+            })
+        return history
+
+    def detect(self, ids):
+        """逐位置「被破坏」概率（0..1）的列表"""
+        return self.discriminator.probabilities(ids)
+
+
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 

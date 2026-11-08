@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1984 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1989 项）
 
 ## 特性
 
@@ -649,6 +649,27 @@ bert.fit([([1, 2, 3, 4, 5], [1, 3], [2, 4], [0, 0, 0, 1, 1], 1)],
 `MultiHeadAttention` 新增可选 `relative_bias` 参数，不传时行为与旧版逐位一致（回归测试覆盖）。
 `BertModel` 由调用方决定 mask 哪些位置，适合需要完全掌控 mask 策略的教学实验。
 
+
+### ELECTRA（生成器 + 判别器）
+
+`ElectraModel` 把 BERT 式编码器拆成两段训练：生成器（`MaskedLM`）先遮住若干位置并尝试还原，
+判别器（`ElectraDiscriminator`）逐位置判断「这个 token 是否被破坏」。两者参数独立、梯度互不干扰。
+
+```python
+m = AI.ElectraModel(vocab_size=32, d_model=32, num_heads=4, num_layers=2, max_len=32,
+                    mask_prob=0.15, seed=0)
+hist = m.fit(token_seqs, epochs=20, lr_generator=1e-2, lr_discriminator=5e-2)
+probs = m.detect(ids)   # 每个位置「被破坏」概率
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `ElectraDiscriminator(vocab_size, d_model=32, num_heads=4, d_ff=64, num_layers=2, max_len=32, seed=None)` | `Embedding(vocab+1,d) → PositionalEncoding → TransformerEncoder(causal=False)`；逐位置单 logit（越大越像被破坏）；`forward` / `probabilities` / `bce_loss_and_backward` / `sgd_step` / `param_count` |
+| `ElectraModel(vocab_size, d_model=32, num_heads=4, d_ff=64, num_layers=2, max_len=32, mask_prob=0.15, seed=None)` | `generator` 为 `MaskedLM`（Adam 训练 MLM），`discriminator` 做二分类（SGD）；`train_step` / `fit` / `detect`；遮罩位置喂 `mask_id`、标签即「是否被遮罩」 |
+
+**边界**：这是简化版 ELECTRA——生成器只做「遮罩替换」不做 80/10/10 采样，判别器标签因此是
+「该位置是否被遮罩」而不是「生成器采样出的 token 是否与原 token 不同」；判别器输入允许
+`mask_id`（词表外一行）出现。
 
 ### 组合模型（ConvNeXt）
 
@@ -3442,7 +3463,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1984 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1989 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3475,6 +3496,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDiffusionSamplers` | sigma 调度的端点/单调性、常数去噪器收敛、shrinkage 去噪器与解析解对比（步数越多越准）、一致性损失与采样、非法输入 |
 | `TestNeuralODEAndPINN` | ODE 终态收敛到 e^-1、输入/参数梯度中心差分、非法输入；PINN 解 Poisson `u(0.5)≈0.125` 且两端为 0、梯度中心差分、非法输入 |
 | `TestParallelTrainingUtils` | FSDP 分片/all-gather 往返、ZeRO-1 更新与普通 SGD 逐位一致、reduce-scatter 平均值、张量并行列/行前向与稠密一致、序列并行 LayerNorm 与全局一致、非法输入 |
+| `TestElectra` | 遮罩位置/标签/目标的构造、判别器前向与 detect 概率形状、fit 后生成器 loss 下降且判别器准确率 1.0、被遮位置概率高于原位置、`param_count` 公式、非法输入 |
 | `TestActNorm` | `data_init` 后首批输出零均值单位方差、逆变换与 `logdet`、`dx`/`g_b`/`g_log_s` 中心差分、优化器步与非法输入 |
 | `TestInvertibleLinear` | 逆变换精确、`logdet` 对数值 Jacobian、`dx` 与 `g_W`（含 `g_logdet·W^{-T}`）、无 logdet 项时 `g_W = g_y x^T`、奇异矩阵与优化器步 |
 | `TestRealNVP` | forward/inverse 互逆（dim 2–5）、掩码交替（偶数棋盘格 / 奇数半区）、解析 log-det vs 数值 Jacobian、输入与四组层参数梯度、nll 训练下降与采样确定性、非法输入 |
@@ -3750,7 +3772,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1984 个单元测试
+├── test_ai.py       # 1989 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
