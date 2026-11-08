@@ -26073,7 +26073,10 @@ class TestExperimentTracking:
             AI.load_model_metadata(str(tmp_path / "nope.json"))
 
     def test_git_hash_best_effort(self, tmp_path):
-        assert AI.git_hash(r"D:\vscode\Python-standard-library-only-AI-main") is not None
+        # 用测试文件所在目录（仓库根）而不是硬编码本机路径：
+        # 在 Linux/macOS 的 CI checkout 里同样能取到 HEAD。
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        assert AI.git_hash(repo_dir) is not None
         assert AI.git_hash(str(tmp_path)) is None
         assert AI.git_hash(str(tmp_path / "nope")) is None
         with pytest.raises(TypeError):
