@@ -698,11 +698,14 @@
 - [x] 修 `Bottleneck2d.backward` 在 stride=2 时按输出空间裁剪 conv1 梯度导致的越界
   （ResNet 回归测试覆盖，旧实现遇到 stride>1 的 block 必崩）
 - [ ] 完整 BERT（MaskedLM + NSP）与完整 T5（Seq2SeqLM + `T5RelativeBias` 注入）
-- [ ] 多标签指标（Exact Match Ratio / Ranking Loss / LRAP）、OOD（MSP / Energy）、
-  McNemar / Wilcoxon（纯数学）
+- [x] 多标签指标（Exact Match Ratio / Ranking Loss / LRAP）、OOD（MSP / Energy）、
+  McNemar / Wilcoxon（纯数学）：`multilabel_exact_match_ratio` /
+  `multilabel_ranking_loss` / `label_ranking_average_precision` / `msp_score` /
+  `energy_score` / `ood_detection_auroc` / `mcnemar_test` / `wilcoxon_signed_rank_test`；
+  测试 `TestMultiLabelAndStatistics` 7 例（含精确二项 p 值、并列秩校正与错误路径）
 - [ ] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合
 
-全量测试：1839 → 1846 passed（新增 7 例）。
+全量测试：1839 → 1853 passed（新增 14 例）。
 
 ---
 

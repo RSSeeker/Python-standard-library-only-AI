@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1846 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1853 项）
 
 ## 特性
 
@@ -1228,6 +1228,32 @@ print(AI.brier_score([0, 1], [0.2, 0.8]))   # 0.0400
 ```
 
 `pr_auc_score` 用的是**阶梯式**平均精确率（与 sklearn `average_precision_score` 同口径），不是对 PR 曲线做梯形积分；后者在少数点上会高估。
+
+### 多标签指标与统计检验
+
+多标签输入是「0/1 的等长行列表」；统计检验是纯数学实现（不依赖 scipy）。
+
+| 函数 | 定义 / 说明 |
+|---|---|
+| `multilabel_exact_match_ratio(y_true, y_pred)` | 整个标签向量完全一致的样本占比（subset accuracy） |
+| `multilabel_ranking_loss(y_true, y_score)` | 正类得分不高于负类的 (正, 负) 对比例；只对同时含正负类的样本平均 |
+| `label_ranking_average_precision(y_true, y_score)` | LRAP：按得分降序，对每个正类的 `precision@rank` 取平均，再对样本平均 |
+| `msp_score(logits)` | OOD 检测的 MSP：softmax 最大概率（越高越像 ID） |
+| `energy_score(logits, temperature=1.0)` | OOD 检测的 Energy：`−T·logsumexp(logits/T)`（越低越像 ID） |
+| `ood_detection_auroc(in_scores, ood_scores)` | ID=1 / OOD=0 的 ROC-AUC（复用 `roc_auc_score`） |
+| `mcnemar_test(y_true, y_pred_a, y_pred_b, exact=None)` | 配对 McNemar：返回 `statistic`/`p_value`/`n10`/`n01`/`discordant`；`exact=None` 时不和谐对 ≤25 用精确二项，否则用带连续性校正的卡方 |
+| `wilcoxon_signed_rank_test(x, y=None)` | Wilcoxon 符号秩检验（配对）：`min(W+, W−)` + 正态近似 p 值（含并列秩校正） |
+
+```python
+print(AI.multilabel_exact_match_ratio([[1, 0], [0, 1]], [[1, 0], [1, 0]]))  # 0.5
+print(AI.label_ranking_average_precision([[1, 0, 1]], [[0.9, 0.1, 0.8]]))   # 1.0
+print(AI.energy_score([0.0, 0.0, 0.0]))                                     # −log 3
+print(AI.wilcoxon_signed_rank_test([1, 2, 3, 4, 5], [0, 0, 0, 0, 0]))
+```
+
+`mcnemar_test` 的 `statistic` 在精确检验时是 `min(n10, n01)` 的计数，在卡方近似时是
+`(|n10−n01|−1)²/(n10+n01)`，两种路径的 `p_value` 都是双尾。`wilcoxon` 的 p 值用正态近似
+（`erfc(|z|/√2)`），样本很少时偏保守，只用于教学演示。
 
 ### 排序指标
 
@@ -3249,7 +3275,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1846 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1853 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3533,7 +3559,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1846 个单元测试
+├── test_ai.py       # 1853 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

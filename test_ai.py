@@ -28175,3 +28175,79 @@ class TestCompositeModels:
         net.eval()
         preds = [max(range(3), key=lambda v: net.logits(img)[v]) for img in images]
         assert preds == labels
+
+
+class TestMultiLabelAndStatistics:
+    """多标签指标 + OOD 分数 + McNemar / Wilcoxon 统计检验。"""
+
+    def test_multilabel_exact_match_ratio(self):
+        yt = [[1, 0], [0, 1], [1, 1]]
+        yp = [[1, 0], [1, 0], [1, 1]]
+        assert AI.multilabel_exact_match_ratio(yt, yp) == pytest.approx(2.0 / 3.0)
+        assert AI.multilabel_exact_match_ratio([[True, False]], [[1, 0]]) == 1.0
+        with pytest.raises(ValueError):
+            AI.multilabel_exact_match_ratio([[1, 0]], [[1]])
+        with pytest.raises(ValueError):
+            AI.multilabel_exact_match_ratio([[2, 0]], [[1, 0]])
+
+    def test_multilabel_ranking_loss(self):
+        assert AI.multilabel_ranking_loss(
+            [[1, 0, 0]], [[0.2, 0.9, 0.1]]) == pytest.approx(0.5)
+        assert AI.multilabel_ranking_loss(
+            [[1, 0, 0]], [[0.9, 0.8, 0.1]]) == 0.0
+        # 没有负类的样本跳过；第二个样本正类得分 0.2 <= 负类 0.9 → 坏对比例 1.0
+        assert AI.multilabel_ranking_loss(
+            [[1, 1], [1, 0]], [[0.9, 0.8], [0.2, 0.9]]) == pytest.approx(1.0)
+        with pytest.raises(ValueError):
+            AI.multilabel_ranking_loss([[1, 1]], [[0.9, 0.8]])
+
+    def test_label_ranking_average_precision(self):
+        assert AI.label_ranking_average_precision(
+            [[1, 0, 1]], [[0.9, 0.1, 0.8]]) == pytest.approx(1.0)
+        assert AI.label_ranking_average_precision(
+            [[1, 0, 0]], [[0.1, 0.9, 0.8]]) == pytest.approx(1.0 / 3.0)
+        with pytest.raises(ValueError):
+            AI.label_ranking_average_precision([[0, 0]], [[0.9, 0.8]])
+
+    def test_msp_and_energy_scores(self):
+        exps = [math.exp(2.0), math.exp(1.0), 1.0]
+        assert AI.msp_score([1, 2, 3]) == pytest.approx(max(exps) / sum(exps))
+        assert AI.energy_score([0, 0, 0]) == pytest.approx(-math.log(3.0))
+        assert AI.energy_score([2, 2, 2], temperature=2.0) \
+            == pytest.approx(-2.0 - 2.0 * math.log(3.0))
+        with pytest.raises(ValueError):
+            AI.energy_score([1, 2], temperature=0.0)
+        with pytest.raises(ValueError):
+            AI.msp_score([])
+
+    def test_ood_detection_auroc(self):
+        assert AI.ood_detection_auroc([3.0, 4.0, 5.0], [0.0, 1.0, 2.0]) == 1.0
+        assert AI.ood_detection_auroc([1.0], [1.0]) == pytest.approx(0.5)
+        with pytest.raises(ValueError):
+            AI.ood_detection_auroc([], [1.0])
+
+    def test_mcnemar_test(self):
+        y = [0, 1, 0, 1, 0, 1, 0, 1]
+        a = [0, 1, 1, 1, 1, 0, 0, 1]
+        b = [0, 1, 0, 0, 0, 1, 1, 1]
+        res = AI.mcnemar_test(y, a, b)
+        assert res["n10"] == 2 and res["n01"] == 3 and res["discordant"] == 5
+        # 精确二项：2 * P(X<=2) = 2 * (1+5+10)/32 = 1.0
+        assert res["p_value"] == pytest.approx(1.0)
+        approx = AI.mcnemar_test(y, a, b, exact=False)
+        assert approx["statistic"] == pytest.approx(0.0)
+        assert approx["p_value"] == pytest.approx(1.0)
+        same = AI.mcnemar_test(y, a, a)
+        assert same["discordant"] == 0 and same["p_value"] == 1.0
+
+    def test_wilcoxon_signed_rank_test(self):
+        res = AI.wilcoxon_signed_rank_test([1, 2, 3, 4, 5], [0, 0, 0, 0, 0])
+        assert res["n"] == 5
+        assert res["statistic"] == pytest.approx(0.0)
+        assert res["p_value"] == pytest.approx(0.04311444678307538, rel=1e-9)
+        symmetric = AI.wilcoxon_signed_rank_test([1, -1, 2, -2, 3, -3])
+        assert symmetric["p_value"] == pytest.approx(1.0)
+        with pytest.raises(ValueError):
+            AI.wilcoxon_signed_rank_test([1, 2, 3], [1, 2, 3])
+        with pytest.raises(ValueError):
+            AI.wilcoxon_signed_rank_test([1, 2], [1])

@@ -31013,6 +31013,238 @@ def roc_auc_score(y_true, y_score) -> float:
     return (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
+def _multilabel_rows(y, who, binary):
+    """把多标签矩阵校验成 list[list]（binary=True 时只收 0/1）。"""
+    if not isinstance(y, (list, tuple)) or not y:
+        raise ValueError(f"{who}: 不能为空")
+    width = None
+    rows = []
+    for i, row in enumerate(y):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(
+                f"{who}: 第 {i} 行长度 {len(row)} 与首行 {width} 不一致")
+        if binary:
+            vals = []
+            for v in row:
+                if isinstance(v, bool):
+                    vals.append(int(v))
+                elif isinstance(v, int) and v in (0, 1):
+                    vals.append(v)
+                else:
+                    raise ValueError(
+                        f"{who}: 第 {i} 行只能包含 0/1，收到 {v!r}")
+        else:
+            vals = [_metric_number(v, who, i) for v in row]
+        rows.append(vals)
+    return rows
+
+
+def _multilabel_pair(y_true, y_pred, who):
+    """校验多标签 y_true / y_pred 形状一致，返回两个 list[list]。"""
+    t = _multilabel_rows(y_true, f"{who}.y_true", True)
+    p = _multilabel_rows(y_pred, f"{who}.y_pred", True)
+    if len(t) != len(p) or len(t[0]) != len(p[0]):
+        raise ValueError(f"{who}: y_true / y_pred 形状不一致")
+    return t, p
+
+
+def multilabel_exact_match_ratio(y_true, y_pred) -> float:
+    """多标签 Exact Match Ratio：整个标签向量完全一致的样本占比。"""
+    t, p = _multilabel_pair(y_true, y_pred, "multilabel_exact_match_ratio")
+    hit = sum(1 for a, b in zip(t, p) if a == b)
+    return hit / len(t)
+
+
+def multilabel_ranking_loss(y_true, y_score) -> float:
+    """多标签 Ranking Loss：正类得分 <= 负类得分的 (正, 负) 对所占比例。
+
+    每个样本先算「坏对数 / (正类数 × 负类数)」，再对**同时含正类和负类**的样本取平均；
+    全都没有正类或负类的样本跳过（与 sklearn 口径一致）。
+    """
+    t = _multilabel_rows(y_true, "multilabel_ranking_loss.y_true", True)
+    s = _multilabel_rows(y_score, "multilabel_ranking_loss.y_score", False)
+    if len(t) != len(s) or len(t[0]) != len(s[0]):
+        raise ValueError("multilabel_ranking_loss: y_true / y_score 形状不一致")
+    total, count = 0.0, 0
+    for ti, si in zip(t, s):
+        pos = [j for j, v in enumerate(ti) if v == 1]
+        neg = [j for j, v in enumerate(ti) if v == 0]
+        if not pos or not neg:
+            continue
+        bad = sum(1 for a in pos for b in neg if si[a] <= si[b])
+        total += bad / (len(pos) * len(neg))
+        count += 1
+    if count == 0:
+        raise ValueError("multilabel_ranking_loss: 所有样本都缺少正类或负类")
+    return total / count
+
+
+def label_ranking_average_precision(y_true, y_score) -> float:
+    """多标签 LRAP：按得分降序，对每个正类的 precision@rank 取平均，再对样本平均。
+
+    LRAP 对每个正类算「到该正类为止命中几个正类 / 排名」，等价于该样本的
+    平均精度（average precision）；没有正类的样本跳过。
+    """
+    t = _multilabel_rows(y_true, "label_ranking_average_precision.y_true", True)
+    s = _multilabel_rows(y_score, "label_ranking_average_precision.y_score", False)
+    if len(t) != len(s) or len(t[0]) != len(s[0]):
+        raise ValueError("label_ranking_average_precision: y_true / y_score 形状不一致")
+    total, count = 0.0, 0
+    for ti, si in zip(t, s):
+        pos = [j for j, v in enumerate(ti) if v == 1]
+        if not pos:
+            continue
+        order = sorted(range(len(si)), key=lambda j: (-si[j], j))
+        hits, precision_sum = 0, 0.0
+        for rank, j in enumerate(order):
+            if ti[j] == 1:
+                hits += 1
+                precision_sum += hits / (rank + 1)
+        total += precision_sum / len(pos)
+        count += 1
+    if count == 0:
+        raise ValueError("label_ranking_average_precision: 所有样本都没有正类")
+    return total / count
+
+
+def _logits_softmax(logits):
+    """校验 logits 列表并返回 softmax 概率与原始值。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("logits 必须是非空列表")
+    z = [_metric_number(v, "logits", i) for i, v in enumerate(logits)]
+    top = max(z)
+    ex = [math.exp(v - top) for v in z]
+    total = sum(ex)
+    return [e / total for e in ex], z
+
+
+def msp_score(logits) -> float:
+    """OOD 检测的 MSP 分数：softmax 最大概率（越高越像分布内样本）。"""
+    probs, _ = _logits_softmax(logits)
+    return max(probs)
+
+
+def energy_score(logits, temperature: float = 1.0) -> float:
+    """OOD 检测的 Energy 分数：`-T·logsumexp(logits/T)`（越低越像分布内样本）。"""
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not temperature > 0:
+        raise ValueError(f"energy_score: temperature 必须是正数，收到 {temperature!r}")
+    _, z = _logits_softmax(logits)
+    scaled = [v / float(temperature) for v in z]
+    top = max(scaled)
+    log_sum_exp = top + math.log(sum(math.exp(v - top) for v in scaled))
+    return -float(temperature) * log_sum_exp
+
+
+def ood_detection_auroc(in_scores, ood_scores) -> float:
+    """OOD 检测 AUROC：ID 样本记 1、OOD 记 0，分数越高越像 ID 时的 ROC-AUC。"""
+    if not isinstance(in_scores, (list, tuple)) or not in_scores:
+        raise ValueError("ood_detection_auroc: in_scores 不能为空")
+    if not isinstance(ood_scores, (list, tuple)) or not ood_scores:
+        raise ValueError("ood_detection_auroc: ood_scores 不能为空")
+    labels = [1] * len(in_scores) + [0] * len(ood_scores)
+    scores = list(in_scores) + list(ood_scores)
+    return roc_auc_score(labels, scores)
+
+
+def _binomial_two_sided_p(n, k):
+    """二项分布 B(n, 0.5) 下 P(X<=k 或 X>=n-k) 的精确双尾 p 值（log 空间求和防溢出）。"""
+    if n <= 0:
+        return 1.0
+    log_half_n = -n * math.log(2.0)
+    total = 0.0
+    for i in range(0, min(k, n) + 1):
+        log_pmf = (math.lgamma(n + 1) - math.lgamma(i + 1)
+                   - math.lgamma(n - i + 1) + log_half_n)
+        total += math.exp(log_pmf)
+    return min(1.0, 2.0 * total)
+
+
+def mcnemar_test(y_true, y_pred_a, y_pred_b, exact=None):
+    """McNemar 检验：同一批样本上两个分类器的错误率是否有显著差异。
+
+    返回 `{"statistic", "p_value", "n10", "n01", "discordant"}`：
+    `n10` = A 对且 B 错，`n01` = A 错且 B 对，`discordant = n10 + n01`。
+    `exact=True` 用精确二项分布，`False` 用带连续性校正的卡方（1 自由度），
+    `None` 时 `discordant <= 25` 用精确值、否则用卡方。
+    """
+    ta, pa = _metric_pairs(y_true, y_pred_a, "mcnemar_test")
+    tb, pb = _metric_pairs(y_true, y_pred_b, "mcnemar_test")
+    if len(ta) != len(tb):
+        raise ValueError("mcnemar_test: 三个序列必须等长")
+    n10 = n01 = 0
+    for i in range(len(ta)):
+        ya = _metric_label(ta[i], "mcnemar_test.y_true", i)
+        a = _metric_label(pa[i], "mcnemar_test.y_pred_a", i)
+        b = _metric_label(pb[i], "mcnemar_test.y_pred_b", i)
+        a_ok, b_ok = (a == ya), (b == ya)
+        if a_ok and not b_ok:
+            n10 += 1
+        elif b_ok and not a_ok:
+            n01 += 1
+    discordant = n10 + n01
+    if discordant == 0:
+        return {"statistic": 0.0, "p_value": 1.0, "n10": 0, "n01": 0,
+                "discordant": 0}
+    use_exact = (25 >= discordant) if exact is None else bool(exact)
+    if use_exact:
+        statistic = float(min(n10, n01))
+        p_value = _binomial_two_sided_p(discordant, min(n10, n01))
+    else:
+        statistic = (abs(n10 - n01) - 1.0) ** 2 / discordant
+        p_value = math.erfc(math.sqrt(statistic / 2.0))
+    return {"statistic": statistic, "p_value": p_value, "n10": n10, "n01": n01,
+            "discordant": discordant}
+
+
+def wilcoxon_signed_rank_test(x, y=None):
+    """Wilcoxon 符号秩检验（配对）：检验 `x - y` 的中位数是否为 0。
+
+    `y` 省略时检验 `x` 本身是否以 0 为中心。返回 `{"statistic", "p_value", "n"}`，
+    `statistic = min(W+, W-)`，p 值用正态近似（含并列秩校正）；`x=y` 的样本先剔除。
+    """
+    if not isinstance(x, (list, tuple)):
+        raise ValueError("wilcoxon_signed_rank_test: x 必须是列表")
+    xs = [_metric_number(v, "wilcoxon_signed_rank_test.x", i) for i, v in enumerate(x)]
+    if y is None:
+        diffs = [v for v in xs if v != 0.0]
+    else:
+        if not isinstance(y, (list, tuple)) or len(y) != len(xs):
+            raise ValueError("wilcoxon_signed_rank_test: y 必须与 x 等长")
+        ys = [_metric_number(v, "wilcoxon_signed_rank_test.y", i) for i, v in enumerate(y)]
+        diffs = [a - b for a, b in zip(xs, ys) if a - b != 0.0]
+    n = len(diffs)
+    if n == 0:
+        raise ValueError("wilcoxon_signed_rank_test: 全部差值都是 0，无法检验")
+    order = sorted(range(n), key=lambda i: abs(diffs[i]))
+    ranks = [0.0] * n
+    tie_term = 0.0
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(diffs[order[j + 1]]) == abs(diffs[order[i]]):
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        tie_size = j - i + 1
+        tie_term += tie_size ** 3 - tie_size
+        i = j + 1
+    w_plus = sum(r for r, d in zip(ranks, diffs) if d > 0)
+    total_rank = n * (n + 1) / 2.0
+    mean = total_rank / 2.0
+    var = n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0
+    if var <= 0:
+        return {"statistic": min(w_plus, total_rank - w_plus), "p_value": 1.0, "n": n}
+    z = (w_plus - mean) / math.sqrt(var)
+    p_value = math.erfc(abs(z) / math.sqrt(2.0))
+    return {"statistic": min(w_plus, total_rank - w_plus), "p_value": p_value, "n": n}
+
+
 def _regression_pairs(y_true, y_pred, who):
     """把回归目标转成一维浮点列表（支持标量列表或多输出逐维平均）。"""
     yt, yp = _metric_pairs(y_true, y_pred, who)
