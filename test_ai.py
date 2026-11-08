@@ -31790,3 +31790,76 @@ class TestStyleGAN:
         _sg_raises(lambda: AI.StyleGANGenerator(out_channels=0))
         _sg_raises(lambda: AI.StyleGANGenerator.average_w(g, []))
         _sg_raises(lambda: g.truncate([0.0] * 8, [0.0] * 8, 1.5))
+
+
+import AI
+
+
+def _cg_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError(f"期望 {exc.__name__}，实际 {type(other).__name__}: {other}")
+    raise AssertionError(f"期望 {exc.__name__}，但未抛异常")
+
+
+def _cg_const(v, channels=1, size=8):
+    return [[[float(v)] * size for _ in range(size)] for _ in range(channels)]
+
+
+def _cg_mean(img):
+    vals = [v for ch in img for row in ch for v in row]
+    return sum(vals) / len(vals)
+
+
+def _cg_make(seed=1):
+    return (AI.Pix2PixGenerator(seed=seed), AI.Pix2PixGenerator(seed=seed + 1),
+            AI.PatchDiscriminator(seed=seed + 2), AI.PatchDiscriminator(seed=seed + 3))
+
+
+class TestCycleGAN:
+    def test_step_and_loss_keys(self):
+        g_ab, g_ba, d_a, d_b = _cg_make()
+        a, b = _cg_const(0.2), _cg_const(0.8)
+        out = AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, a, b)
+        for key in ("d_loss", "g_loss", "adv_loss", "cycle_loss", "identity_loss"):
+            assert key in out and out[key] == out[key]
+        assert out["d_loss"] > 0 and out["g_loss"] > 0
+
+    def test_training_reduces_cycle_loss(self):
+        g_ab, g_ba, d_a, d_b = _cg_make(seed=11)
+        a, b = _cg_const(0.2), _cg_const(0.8)
+        history = AI.fit_cyclegan(g_ab, g_ba, d_a, d_b, [(a, b)], steps=40,
+                                  lr_g=0.005, lr_d=0.005, seed=5)
+        assert len(history) == 40
+        losses = [h["cycle_loss"] for h in history]
+        assert losses[-1] < losses[0] * 0.2, (losses[0], losses[-1])
+        fake_b = g_ab.forward(a)
+        fake_a = g_ba.forward(b)
+        assert _cg_mean(fake_b) > 0.6
+        assert _cg_mean(fake_a) < 0.4
+
+    def test_parameters_update(self):
+        g_ab, g_ba, d_a, d_b = _cg_make(seed=21)
+        before = [[[[float(v) for v in kernel] for kernel in inch] for inch in outch]
+                  for outch in g_ab.enc1.weights]
+        AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, _cg_const(0.2), _cg_const(0.8))
+        after = [[[[float(v) for v in kernel] for kernel in inch] for inch in outch]
+                 for outch in g_ab.enc1.weights]
+        assert before != after
+
+    def test_invalid_inputs(self):
+        g_ab, g_ba, d_a, d_b = _cg_make(seed=31)
+        a, b = _cg_const(0.2), _cg_const(0.8)
+        _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b,
+                                                  _cg_const(0.2, channels=2), b))
+        _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, object(), d_b, a, b), TypeError)
+        _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, d_a, object(), a, b), TypeError)
+        _cg_raises(lambda: AI.train_cyclegan_step(object(), g_ba, d_a, d_b, a, b), TypeError)
+        _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, a, b,
+                                                  lambda_cycle=-1.0))
+        _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, a, b,
+                                                  lr_g=0.0))
+        _cg_raises(lambda: AI.fit_cyclegan(g_ab, g_ba, d_a, d_b, []))

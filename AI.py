@@ -11379,6 +11379,119 @@ class StyleGANGenerator:
             for layer, grad in zip(self.mapping.layers, self.grads_map):
                 _dense_apply_sgd(layer, grad, lr)
 
+"""CycleGAN 训练步：两个生成器（A→B、B→A）与两个判别器，循环一致性 + identity 约束。"""
+
+
+def _cg_add_grads(dst, src):
+    for k in range(len(dst)):
+        for i in range(len(dst[k])):
+            for j in range(len(dst[k][i])):
+                dst[k][i][j] += src[k][i][j]
+    return dst
+
+
+def _cg_cycle_loss(rec, real, weight):
+    return _p2p_l1_and_grad(rec, real, weight)
+
+
+def train_cyclegan_step(g_ab, g_ba, d_a, d_b, real_a, real_b,
+                        lambda_cycle=10.0, lambda_identity=5.0, lr_g=1e-3, lr_d=1e-3):
+    """一步 CycleGAN：先更新两个判别器，再更新两个生成器。"""
+    if not isinstance(g_ab, Pix2PixGenerator) or not isinstance(g_ba, Pix2PixGenerator):
+        raise TypeError("train_cyclegan_step: g_ab/g_ba 必须是 Pix2PixGenerator")
+    if not isinstance(d_a, PatchDiscriminator) or not isinstance(d_b, PatchDiscriminator):
+        raise TypeError("train_cyclegan_step: d_a/d_b 必须是 PatchDiscriminator")
+    for name, value in (("lambda_cycle", lambda_cycle), ("lambda_identity", lambda_identity),
+                        ("lr_g", lr_g), ("lr_d", lr_d)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"train_cyclegan_step: {name} 必须是非负数")
+    for name, value in (("lr_g", lr_g), ("lr_d", lr_d)):
+        if value <= 0:
+            raise ValueError(f"train_cyclegan_step: {name} 必须为正数")
+    h, w = _p2p_image(real_a, g_ab.in_channels, "train_cyclegan_step(real_a)")
+    _p2p_image(real_b, g_ba.in_channels, "train_cyclegan_step(real_b)")
+    h2, w2 = _p2p_image(real_a, g_ba.in_channels, "train_cyclegan_step(real_a→g_ba)")
+    if (h2, w2) != (h, w):
+        raise ValueError("train_cyclegan_step: 两个域的图像形状必须一致")
+
+    fake_b = g_ab.forward(real_a)
+    fake_a = g_ba.forward(real_b)
+
+    # 1) 判别器 D_A / D_B：真图目标 1、假图目标 0
+    d_a.zero_grad()
+    loss_d_real_a, d = _p2p_bce(d_a.forward(real_a), 1.0)
+    d_a.backward(d)
+    loss_d_fake_a, d = _p2p_bce(d_a.forward(fake_a), 0.0)
+    d_a.backward(d)
+    d_a.sgd_step(lr_d)
+
+    d_b.zero_grad()
+    loss_d_real_b, d = _p2p_bce(d_b.forward(real_b), 1.0)
+    d_b.backward(d)
+    loss_d_fake_b, d = _p2p_bce(d_b.forward(fake_b), 0.0)
+    d_b.backward(d)
+    d_b.sgd_step(lr_d)
+    loss_d = 0.5 * (loss_d_real_a + loss_d_fake_a + loss_d_real_b + loss_d_fake_b)
+
+    # 2) 生成器：对抗 + 循环一致性 + identity
+    g_ab.zero_grad()
+    g_ba.zero_grad()
+    fake_b = g_ab.forward(real_a)
+    fake_a = g_ba.forward(real_b)
+
+    d_b.zero_grad()
+    loss_adv_b, d_score = _p2p_bce(d_b.forward(fake_b), 1.0)
+    d_fake_b = d_b.backward(d_score)
+    d_a.zero_grad()
+    loss_adv_a, d_score = _p2p_bce(d_a.forward(fake_a), 1.0)
+    d_fake_a = d_a.backward(d_score)
+
+    rec_a = g_ba.forward(fake_b)
+    loss_cyc_a, d_rec_a = _cg_cycle_loss(rec_a, real_a, lambda_cycle)
+    d_fake_b = _cg_add_grads(d_fake_b, g_ba.backward(d_rec_a))
+
+    rec_b = g_ab.forward(fake_a)
+    loss_cyc_b, d_rec_b = _cg_cycle_loss(rec_b, real_b, lambda_cycle)
+    d_fake_a = _cg_add_grads(d_fake_a, g_ab.backward(d_rec_b))
+
+    id_b = g_ab.forward(real_b)
+    loss_id_b, d_id_b = _cg_cycle_loss(id_b, real_b, lambda_identity)
+    g_ab.backward(d_id_b)
+    id_a = g_ba.forward(real_a)
+    loss_id_a, d_id_a = _cg_cycle_loss(id_a, real_a, lambda_identity)
+    g_ba.backward(d_id_a)
+
+    g_ab.forward(fake_b)
+    g_ab.backward(d_fake_b)
+    g_ba.forward(fake_a)
+    g_ba.backward(d_fake_a)
+    g_ab.sgd_step(lr_g)
+    g_ba.sgd_step(lr_g)
+
+    d_a.zero_grad()
+    d_b.zero_grad()
+    loss_g = loss_adv_a + loss_adv_b + loss_cyc_a + loss_cyc_b + loss_id_a + loss_id_b
+    return {"d_loss": loss_d, "g_loss": loss_g,
+            "adv_loss": loss_adv_a + loss_adv_b,
+            "cycle_loss": loss_cyc_a + loss_cyc_b,
+            "identity_loss": loss_id_a + loss_id_b}
+
+
+def fit_cyclegan(g_ab, g_ba, d_a, d_b, pairs, steps=30,
+                 lambda_cycle=10.0, lambda_identity=5.0, lr_g=1e-3, lr_d=1e-3, seed=None):
+    """在固定的 (A, B) 图像对集合上循环训练，返回每步损失。"""
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("fit_cyclegan: pairs 不能为空")
+    rng = random.Random(seed) if seed is not None else random
+    history = []
+    for _ in range(steps):
+        real_a, real_b = pairs[rng.randrange(len(pairs))]
+        history.append(train_cyclegan_step(
+            g_ab, g_ba, d_a, d_b, real_a, real_b,
+            lambda_cycle=lambda_cycle, lambda_identity=lambda_identity,
+            lr_g=lr_g, lr_d=lr_d))
+    return history
+
 #  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 # =============================================================================
 #  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要

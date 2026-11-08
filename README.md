@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2059 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2063 项）
 
 ## 特性
 
@@ -3199,6 +3199,31 @@ w_trunc = gen.truncate([0.0] * 8, w_avg, psi=0.5)       # w_avg + ψ·(w − w_a
 边界：只有两级合成块（4×4 → 8×8 → 16×16），上采样是最近邻复制；没有噪声注入、style mixing
 正则、路径长度正则与感知损失；style 只来自单个 w，不区分 coarse/middle/fine 层；无内置 GAN 训练循环。
 
+### CycleGAN（双向循环一致性）
+
+CycleGAN 用两个生成器 `G_AB` / `G_BA` 与两个判别器 `D_A` / `D_B` 做无配对图像翻译：
+`A→B→A` 与 `B→A→B` 的循环重建误差约束内容一致，identity 项约束生成器在目标域上近似恒等。
+
+```python
+g_ab = AI.Pix2PixGenerator(seed=1)      # A → B
+g_ba = AI.Pix2PixGenerator(seed=2)      # B → A
+d_a = AI.PatchDiscriminator(seed=3)     # 判别 A 域真伪
+d_b = AI.PatchDiscriminator(seed=4)     # 判别 B 域真伪
+losses = AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, real_a, real_b,
+                                lambda_cycle=10.0, lambda_identity=5.0,
+                                lr_g=1e-3, lr_d=1e-3)
+history = AI.fit_cyclegan(g_ab, g_ba, d_a, d_b, [(real_a, real_b)], steps=40, seed=5)
+```
+
+| API | 语义要点 |
+|---|---|
+| `train_cyclegan_step(g_ab, g_ba, d_a, d_b, real_a, real_b, lambda_cycle=10.0, lambda_identity=5.0, lr_g=1e-3, lr_d=1e-3)` | 一步训练：先更新 `D_A`/`D_B`（真图目标 1、假图目标 0），再更新两个生成器（对抗 + `λ_cycle·L1` 循环 + `λ_identity·L1` identity）；返回 `{d_loss, g_loss, adv_loss, cycle_loss, identity_loss}` |
+| `fit_cyclegan(g_ab, g_ba, d_a, d_b, pairs, steps=30, lambda_cycle=10.0, lambda_identity=5.0, lr_g=1e-3, lr_d=1e-3, seed=None)` | 在固定的 `(A, B)` 图像对集合上循环调用上一步，返回每步损失列表 |
+
+边界：依赖 `Pix2PixGenerator` / `PatchDiscriminator`（固定 8×8、无 U-Net skip、无 InstanceNorm）；
+判别器是裸 logit patch 网格，不是 PatchGAN 的 70×70 感受野；未实现 replay buffer、学习率衰减、
+生成图像池，也不保证跨域语义保持（只要求循环重建与 identity）。
+
 ### Pix2Pix（可训练图像到图像）
 
 `DCGANGenerator` 是「潜码 → 图像」，Pix2Pix 是「图像 → 图像」：源图编码后解码成目标图，
@@ -3745,7 +3770,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2059 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2063 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3950,6 +3975,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
+| `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
 | `TestStyleGAN` | 生成器前向形状/参数 685/同 z 可复现、conv1/style1/style2/mapping 权重有限差分、不同 z 输出不同与 average_w/truncate、30 步 SGD 使重建损失减半、非法输入与未 forward 先 backward |
 | `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
@@ -4068,7 +4094,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2059 个单元测试
+├── test_ai.py       # 2063 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
