@@ -714,6 +714,7 @@
 - [x] PEFT 高级适配器：QLoRA（4-bit 伪量化基座 + LoRA）、VeRA（冻结随机投影 + 逐秩标量缩放）、ReFT（低秩表示干预）；测试 `TestPEFTAdapters` 5 例
 - [x] 跟踪/表面距离指标：`mota_motp_idf1`（逐帧贪心匹配 + 全局 id 二分匹配）与 `assd_score` / `nsd_score` / `surface_dice`（复用边界与最近邻距离）；测试 `TestTrackingAndSurfaceMetrics` 5 例
 - [x] HPO：`tpe_search`（TPE，截断高斯 + 类别平滑频率的 `g/l` 候选筛选）与 `successive_halving`（Hyperband 核心调度，含 budget 倍增）；测试 `TestHpoSearch` 6 例
+- [x] 文本与线性代数工具：`bert_score`（外部嵌入的贪心最大余弦匹配 + IDF 加权，P/R/F_beta）与 `svd_low_rank`/`low_rank_approximation`（AᵀA 的 Jacobi 特征分解实现截断 SVD）；测试 `TestBertScoreAndSvd` 7 例
 - [x] 高级评估小件：`fit_mahalanobis` / `mahalanobis_distance` / `mahalanobis_scores` / `ood_mahalanobis_auroc`（马氏距离 OOD）、`conformal_quantile` / `conformal_prediction_sets` / `conformal_coverage` / `average_conformal_set_size`（split-conformal）、`robust_accuracy` / `adversarial_success_rate`（鲁棒性）、`equalized_odds_difference` / `group_calibration_error`（公平性）；测试 `TestAdvancedMetrics` 7 例
 
 - [x] 完整 ConvNeXt（`ConvNeXt`：stem `Conv2d(k=2, s=2) → GELU` → 多个 `ConvNeXtBlock` stage +
@@ -736,7 +737,7 @@
   只训练编码器与重建头，重建头首次调用时创建、不计入 `param_count`）；
   测试 `TestViTEntryPoints` 4 例
 
-全量测试：1839 → 1923 passed（新增 84 例）。
+全量测试：1839 → 1930 passed（新增 91 例）。
 
 ---
 

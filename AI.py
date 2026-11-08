@@ -30173,6 +30173,126 @@ def ascii_plot(history, keys=("train_loss", "val_loss"), width: int = 60,
     return "\n".join(lines)
 
 
+def _jacobi_eigen_symmetric(matrix, sweeps=100, tol=1e-12):
+    """对称矩阵的 Jacobi 特征分解，返回 (特征值, 特征向量矩阵列形式)。"""
+    n = len(matrix)
+    a = [row[:] for row in matrix]
+    v = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for _ in range(sweeps):
+        off = 0.0
+        for p in range(n):
+            for q in range(p + 1, n):
+                off += abs(a[p][q])
+        if off <= tol:
+            break
+        for p in range(n):
+            for q in range(p + 1, n):
+                if abs(a[p][q]) <= tol:
+                    continue
+                theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q])
+                t = (1.0 if theta >= 0.0 else -1.0) / (
+                    abs(theta) + math.sqrt(theta * theta + 1.0))
+                c = 1.0 / math.sqrt(t * t + 1.0)
+                sn = t * c
+                for k in range(n):
+                    akp, akq = a[k][p], a[k][q]
+                    a[k][p] = c * akp - sn * akq
+                    a[k][q] = sn * akp + c * akq
+                for k in range(n):
+                    apk, aqk = a[p][k], a[q][k]
+                    a[p][k] = c * apk - sn * aqk
+                    a[q][k] = sn * apk + c * aqk
+                for k in range(n):
+                    vkp, vkq = v[k][p], v[k][q]
+                    v[k][p] = c * vkp - sn * vkq
+                    v[k][q] = sn * vkp + c * vkq
+    return [a[i][i] for i in range(n)], v
+
+
+def _mat_check(matrix, who):
+    if not isinstance(matrix, (list, tuple)) or not matrix:
+        raise ValueError(f"{who}: matrix 必须是非空二维列表")
+    rows = []
+    width = None
+    for i, row in enumerate(matrix):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 矩阵各行长度必须一致")
+        vals = []
+        for j, x in enumerate(row):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                raise ValueError(f"{who}: 元素 [{i}][{j}] 必须是数字")
+            fx = float(x)
+            if fx != fx or fx in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 元素 [{i}][{j}] 必须是有限数")
+            vals.append(fx)
+        rows.append(vals)
+    return rows
+
+
+def svd_low_rank(matrix, rank=None, sweeps=100):
+    """对称特征分解实现的截断 SVD：返回 {"U","S","V","rank"}。
+
+    U 是 m×r 行列表，S 是长度 r 的降序奇异值，V 是 r×n（每行一个右奇异向量），
+    因而近似 A ≈ U · diag(S) · V。rank 缺省 min(m,n)。
+    """
+    who = "svd_low_rank"
+    a = _mat_check(matrix, who)
+    m, n = len(a), len(a[0])
+    if isinstance(rank, bool) or (rank is not None and not isinstance(rank, int)):
+        raise ValueError(f"{who}: rank 必须是 int 或 None")
+    max_rank = min(m, n)
+    r = max_rank if rank is None else rank
+    if r < 1 or r > max_rank:
+        raise ValueError(f"{who}: rank 必须在 [1, {max_rank}]，收到 {r}")
+    if isinstance(sweeps, bool) or not isinstance(sweeps, int) or sweeps < 1:
+        raise ValueError(f"{who}: sweeps 必须是 >= 1 的 int")
+    ata = [[0.0] * n for _ in range(n)]
+    for p in range(n):
+        for q in range(p, n):
+            total = 0.0
+            for i in range(m):
+                total += a[i][p] * a[i][q]
+            ata[p][q] = total
+            ata[q][p] = total
+    vals, vecs = _jacobi_eigen_symmetric(ata, sweeps=sweeps)
+    order = sorted(range(n), key=lambda i: -vals[i])
+    order = order[:r]
+    sigmas = [math.sqrt(max(vals[i], 0.0)) for i in order]
+    v_rows = [[vecs[k][i] for k in range(n)] for i in order]
+    u_cols = []
+    for t, i in enumerate(order):
+        s = sigmas[t]
+        col = [0.0] * m
+        if s > 1e-12:
+            v = v_rows[t]
+            for row in range(m):
+                col[row] = sum(a[row][k] * v[k] for k in range(n)) / s
+        u_cols.append(col)
+    u_rows = [[u_cols[t][i] for t in range(r)] for i in range(m)]
+    return {"U": u_rows, "S": sigmas, "V": v_rows, "rank": r}
+
+
+def low_rank_approximation(matrix, rank=None, sweeps=100):
+    """用截断 SVD 重建矩阵：A_r = U · diag(S) · V（rank 默认 min(m,n)）。"""
+    res = svd_low_rank(matrix, rank=rank, sweeps=sweeps)
+    u, s, v = res["U"], res["S"], res["V"]
+    m, n = len(u), len(v[0])
+    out = [[0.0] * n for _ in range(m)]
+    for t in range(len(s)):
+        st = s[t]
+        vt = v[t]
+        for i in range(m):
+            uit = u[i][t] * st
+            row = out[i]
+            for j in range(n):
+                row[j] += uit * vt[j]
+    return out
+
+
 # ============================================================================
 #  Text Processing（分词与文本工具）
 # ============================================================================
@@ -45647,6 +45767,80 @@ def meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5):
     f_mean = (precision * recall) / (alpha * precision + (1.0 - alpha) * recall)
     penalty = gamma * ((chunks / float(matched)) ** beta)
     return f_mean * (1.0 - penalty)
+
+
+def _bs_tokens(text, who):
+    """bert_score 的输入规整：字符串按空白切，列表按元素转字符串。"""
+    if isinstance(text, str):
+        toks = text.split()
+    elif isinstance(text, (list, tuple)):
+        toks = [str(t) for t in text]
+    else:
+        raise ValueError(f"{who}: 文本必须是字符串或 token 列表")
+    return [t for t in toks if t]
+
+
+def _bs_cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+def bert_score(pred, ref, embed_fn, idf=None, beta=1.0):
+    """BERTScore：用外部嵌入做贪心余弦匹配的 P/R/F（IDF 可选）。
+
+    embed_fn(token) -> 向量；idf 是 token -> 权重的 dict（缺省全 1）。
+    对 pred 的每个 token 找 ref 中最相似的 token（贪心、不要求一一对应），
+    以 IDF 加权平均相似度得到 P；R 方向对称；F = (1+β²)PR/(β²P+R)。
+    """
+    who = "bert_score"
+    if not callable(embed_fn):
+        raise ValueError(f"{who}: embed_fn 必须可调用")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise ValueError(f"{who}: beta 必须是数字")
+    beta = float(beta)
+    if beta <= 0.0:
+        raise ValueError(f"{who}: beta 必须 > 0")
+    if idf is not None and not isinstance(idf, dict):
+        raise ValueError(f"{who}: idf 必须是 dict 或 None")
+    p_tokens = _bs_tokens(pred, who + ".pred")
+    r_tokens = _bs_tokens(ref, who + ".ref")
+    if not p_tokens and not r_tokens:
+        return {"precision": 1.0, "recall": 1.0, "f_beta": 1.0}
+    if not p_tokens or not r_tokens:
+        return {"precision": 0.0, "recall": 0.0, "f_beta": 0.0}
+    p_vecs = [list(embed_fn(t)) for t in p_tokens]
+    r_vecs = [list(embed_fn(t)) for t in r_tokens]
+    dims = {len(v) for v in p_vecs + r_vecs}
+    if len(dims) != 1:
+        raise ValueError(f"{who}: 嵌入向量维度不一致，收到 {sorted(dims)}")
+    weights = {}
+    for t in set(p_tokens + r_tokens):
+        w = 1.0 if idf is None else idf.get(t, 1.0)
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0.0:
+            raise ValueError(f"{who}: idf[{t!r}] 必须是非负数字")
+        weights[t] = float(w)
+
+    def direction(src_tokens, src_vecs, tgt_vecs):
+        hit = 0.0
+        total = 0.0
+        for tok, vec in zip(src_tokens, src_vecs):
+            best = max(_bs_cosine(vec, tv) for tv in tgt_vecs)
+            w = weights[tok]
+            hit += w * best
+            total += w
+        return hit / total if total > 0.0 else 0.0
+
+    precision = direction(p_tokens, p_vecs, r_vecs)
+    recall = direction(r_tokens, r_vecs, p_vecs)
+    if precision + recall <= 0.0:
+        f_beta = 0.0
+    else:
+        f_beta = (1.0 + beta * beta) * precision * recall / (
+            beta * beta * precision + recall)
+    return {"precision": precision, "recall": recall, "f_beta": f_beta}
 
 
 def _tfidf_vector(tokens, n, idf):

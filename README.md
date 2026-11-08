@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1923 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1930 项）
 
 ## 特性
 
@@ -1376,6 +1376,7 @@ print(AI.hd95(gt, pred))             # 1.0
 | `rouge_s(pred, ref, beta=1.0, max_gap=None)` | ROUGE-S 的 F 值（skip-bigram：任意有序 token 对；`max_gap` 限制对间隔，`None` 为不限制，`4` 等价 ROUGE-S4） |
 | `rouge_w(pred, ref, beta=1.0)` | ROUGE-W 的 F 值（加权 LCS：连续匹配越长权重越高，`f(l)=l^2` 的近似 DP，`sqrt(W)` 归一化） |
 | `meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5)` | METEOR 简化版：精确匹配 + 片段（chunk）惩罚，无词干/同义词表 |
+| `bert_score(pred, ref, embed_fn, idf=None, beta=1.0)` | BERTScore：用外部嵌入对 token 做贪心最大余弦匹配，可选 IDF 加权，返回 P/R/F_beta（不内置预训练模型，嵌入由调用方提供） |
 | `cider_score(candidate, references, n=4)` | CIDEr 简化版：1..n gram 的 TF-IDF 余弦平均 × 10 |
 | `self_bleu(candidates, max_n=4)` | 每个候选以其余候选为参考算 BLEU 再平均；越高说明生成越不多样 |
 
@@ -3000,6 +3001,8 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 | `attention_maps(module, x, layer_index=None)` | 跑一次前向取回每头注意力权重；支持 `MultiHeadAttention` / `TransformerEncoderLayer` / `TransformerEncoder` / `CausalLM`，采样期间切 eval 以避开 dropout 噪声、结束后恢复原模式 |
 | `attention_ascii(maps, head=0, max_width=48)` | 把注意力矩阵画成字符热图（每行按自身最大值缩放，支持 `max_width` 抽样） |
 | `profile_model(model, x, backward=False)` | 逐层前向/反向墙钟耗时 + 参数量；`repeat` 取最小值降抖动（纯计时，无内存统计） |
+| `svd_low_rank(matrix, rank=None, sweeps=100)` | 截断 SVD（AᵀA + Jacobi 对称特征分解），返回 `{"U","S","V","rank"}`；rank 缺省 min(m,n) |
+| `low_rank_approximation(matrix, rank=None, sweeps=100)` | 用截断 SVD 重建矩阵：A_r = U·diag(S)·V |
 | `lr_finder(model, x=..., y=..., start_lr, end_lr, steps)` | LR range test：等比扫 lr、记录平滑 loss，按 fastai 规则推荐「最低点 / 10」；会改动权重，结束后恢复 `optimizer.lr` |
 | `mlp.register_forward_hook(i, fn)` / `register_backward_hook(i, fn)` | 第 i 层前向/反向后的回调（`fn(layer, output)` / `fn(layer, delta, grad_w, grad_b)`）；不注册时只多一次真假判断，`Model` 上同名方法转发给内部的 `MLP` |
 | `estimate_flops(model, input_shape)` | 前向乘加次数（MACs）/ 参数量 / 逐层明细；支持 MLP 与 `Sequential`（`Layer`/`Conv1d`/`Conv2d`（含 `groups`）/`ConvTranspose2d`/各种池化/`BatchNorm1d`/`LayerNorm`/`GroupNorm`/`InstanceNorm`/`Dropout`/`DropPath`/`Flatten`），不认识的模块报 TypeError 而不是静默估算；`Flatten` 只接受 `(C, H, W)`，传一维/二维会明确报错（`Flatten.forward` 本来也跑不了） |
@@ -3368,7 +3371,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1923 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1930 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3442,6 +3445,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPEFTAdapters` | QLoRA 与量化基座逐位等价、冻结基座、`merge()` 前后输出不变；VeRA 初始等基座、`d` 中心差分、`merge()` 等价、参数量；ReFT 初始等基座、`W`/`b` 中心差分、参数量；三者非法输入（类型/rank/alpha/bits/未 forward 调 backward） |
 | `TestTrackingAndSurfaceMetrics` | ASSD/NSD/Surface Dice 的手算值与边界情形；MOTA/MOTP/IDF1 的手算值、完美匹配、id 互换（全局 IDF1 不降）与跨帧合并 id、非法输入 |
 | `TestHpoSearch` | TPE 在二次目标/混合空间上的收敛与最大化模式、同 seed 可复现、非法空间/参数；successive halving 的轮次/预算/评估次数、最大化模式与非法输入 |
+| `TestBertScoreAndSvd` | BERTScore 的贪心匹配手算值、IDF 与 β 公式、非法输入；SVD 对角矩阵、秩 1 重建、3×2 的 √70、非法矩阵/rank，以及全秩与截断重建的一致性 |
 | `TestConvNeXtNetwork` | ConvNeXt 前向形状/参数量、反向输入梯度与卷积梯度非零、小样本 `fit` 收敛、5 类非法输入 |
 | `TestYarnMscale` | YaRN mscale 公式与默认 1.0 不变性、显式覆盖与 6 类非法值、缩放后前向/反向可用、增量前向与整段前向逐位一致 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
@@ -3665,7 +3669,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1923 个单元测试
+├── test_ai.py       # 1930 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

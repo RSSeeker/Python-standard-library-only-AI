@@ -29257,3 +29257,84 @@ class TestHpoSearch:
             AI.successive_halving(lambda c, b: 0.0, ["x"])
         with pytest.raises(ValueError):
             AI.successive_halving(lambda c, b: 0.0, [{"a": 1}], reduction=1)
+
+
+class TestBertScoreAndSvd:
+    def _emb(self, token):
+        return {"a": [1.0, 0.0], "b": [0.0, 1.0], "c": [1.0, 1.0]}[token]
+
+    def test_bert_score_basic(self):
+        res = AI.bert_score("a b", "a c", self._emb)
+        expected = (1.0 + math.sqrt(2.0) / 2.0) / 2.0
+        assert abs(res["precision"] - expected) < 1e-12
+        assert abs(res["recall"] - expected) < 1e-12
+        assert abs(res["f_beta"] - expected) < 1e-12
+        same = AI.bert_score("a a", "a a", self._emb)
+        assert same["f_beta"] == 1.0
+        none = AI.bert_score("b", "a", self._emb)
+        assert none["f_beta"] == 0.0
+
+    def test_bert_score_idf_and_beta(self):
+        res = AI.bert_score("a b", "a c", self._emb, idf={"b": 3.0}, beta=2.0)
+        assert abs(res["precision"] - (1.0 + 3.0 * 0.7071067811865476) / 4.0) < 1e-12
+        expected_f = 5.0 * res["precision"] * res["recall"] / (
+            4.0 * res["precision"] + res["recall"])
+        assert abs(res["f_beta"] - expected_f) < 1e-12
+
+    def test_bert_score_invalid(self):
+        with pytest.raises(ValueError):
+            AI.bert_score("a", "a", "not callable")
+        with pytest.raises(ValueError):
+            AI.bert_score("a", "a", self._emb, beta=0.0)
+        with pytest.raises(ValueError):
+            AI.bert_score("a", "a", self._emb, idf=[1.0])
+        with pytest.raises(ValueError):
+            AI.bert_score("zzz", "a", lambda t: [1.0, 0.0] if t == "a" else [1.0])
+        with pytest.raises(ValueError):
+            AI.bert_score(3, "a", self._emb)
+
+    def test_svd_diagonal(self):
+        res = AI.svd_low_rank([[3.0, 0.0], [0.0, 2.0]])
+        assert res["rank"] == 2
+        assert abs(res["S"][0] - 3.0) < 1e-12
+        assert abs(res["S"][1] - 2.0) < 1e-12
+        approx = AI.low_rank_approximation([[3.0, 0.0], [0.0, 2.0]])
+        assert abs(approx[0][0] - 3.0) < 1e-12
+        assert abs(approx[1][1] - 2.0) < 1e-12
+        assert abs(approx[0][1]) < 1e-12
+
+    def test_svd_rank1_reconstruction(self):
+        a = [[1.0, 2.0], [2.0, 4.0]]
+        res = AI.svd_low_rank(a)
+        assert abs(res["S"][0] - 5.0) < 1e-12
+        assert abs(res["S"][1]) < 1e-12
+        approx = AI.low_rank_approximation(a, rank=1)
+        for i in range(2):
+            for j in range(2):
+                assert abs(approx[i][j] - a[i][j]) < 1e-12
+        wide = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]]
+        approx = AI.low_rank_approximation(wide, rank=1)
+        for i in range(3):
+            for j in range(2):
+                assert abs(approx[i][j] - wide[i][j]) < 1e-12
+        res = AI.svd_low_rank(wide)
+        assert abs(res["S"][0] - math.sqrt(70.0)) < 1e-12
+
+    def test_svd_invalid(self):
+        for bad in ([], [[1.0, 2.0], [3.0]], [[1.0], [True]], [[float("nan")]]):
+            with pytest.raises(ValueError):
+                AI.svd_low_rank(bad)
+        with pytest.raises(ValueError):
+            AI.svd_low_rank([[1.0, 2.0]], rank=0)
+        with pytest.raises(ValueError):
+            AI.svd_low_rank([[1.0, 2.0]], rank=5)
+        with pytest.raises(ValueError):
+            AI.svd_low_rank([[1.0, 2.0]], sweeps=0)
+
+    def test_svd_low_rank_truncation_error(self):
+        a = [[1.0, 2.0], [2.0, 4.0]]
+        full = AI.low_rank_approximation(a)
+        rank1 = AI.low_rank_approximation(a, rank=1)
+        for i in range(2):
+            for j in range(2):
+                assert abs(full[i][j] - rank1[i][j]) < 1e-12
