@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2049 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2054 项）
 
 ## 特性
 
@@ -3172,6 +3172,36 @@ res2 = AI.eagle_decode(lm, [1, 2, 3], drafter, max_new_tokens=8, gamma=4)
 - `stats` 里 `drafted` / `accepted` / `target_calls` / `accept_rate` 只统计本函数内的调用；
   草稿全被拒时 `accept_rate` 为 0，是合法结果，不代表接口坏了。
 
+### Pix2Pix（可训练图像到图像）
+
+`DCGANGenerator` 是「潜码 → 图像」，Pix2Pix 是「图像 → 图像」：源图编码后解码成目标图，
+判别器看局部 patch，生成器同时受对抗损失与 L1 重建约束。这里给的是能真跑梯度的小网络：
+
+| API | 语义要点 |
+|---|---|
+| `Pix2PixGenerator(in_channels=1, out_channels=1, base=4, seed=None)` | 两次 stride-2 `Conv2d` 编码 + 两次 `ConvTranspose2d` 解码（无 skip，因此不是 U-Net）；`forward` 输出 `tanh` 图像、`backward(dout)` 回输入梯度并累积各层梯度、`sgd_step(lr)`、`param_count()`、`zero_grad()` |
+| `PatchDiscriminator(in_channels=1, base=4, seed=None)` | 两层 stride-2 卷积 + LeakyReLU（斜率 0.2）+ 1 通道逐 patch 打分头；`forward(image)` 返回裸 logit 网格（8×8 输入得 2×2）、`backward(dscore)` 回输入梯度 |
+| `train_pix2pix_step(generator, discriminator, source, target, lambda_l1=100.0, lr_g=1e-3, lr_d=1e-3)` | 一步训练：先更新判别器（真图目标 1、假图目标 0），再更新生成器（`BCE(D(fake),1) + λ·L1`）；返回 `{"d_loss", "g_loss"}` |
+| `fit_pix2pix(generator, discriminator, pairs, steps=30, lambda_l1=100.0, lr_g=1e-3, lr_d=1e-3, seed=None)` | 在固定 `(source, target)` 对上循环调用上一步，返回每步损失列表 |
+
+```python
+gen = AI.Pix2PixGenerator(1, 1, base=4, seed=1)
+disc = AI.PatchDiscriminator(1, base=4, seed=2)
+src = [[[0.5] * 8 for _ in range(8)]]
+tgt = [[[0.7] * 8 for _ in range(8)]]
+hist = AI.fit_pix2pix(gen, disc, [(src, tgt)], steps=30, lr_g=1e-2, lr_d=1e-2)
+print(hist[0]["g_loss"], hist[-1]["g_loss"])
+```
+
+边界与口径：
+
+- 生成器没有 U-Net skip、没有实例归一化 / dropout，分辨率固定为输入的 4 倍到原尺寸；
+  输入高宽需为偶数，`base` 控制通道宽度。
+- `PatchDiscriminator` 的输出是**裸 logit 网格**，BCE 在函数内部按 sigmoid 处理；
+  `patchgan_targets` 可生成对应的全 0/1 目标网格。
+- 没有内置的「训练到收敛」保证：测试只在常数图上验证 30 步内 L1 主导的 `g_loss` 明显下降，
+  对抗博弈的真实收敛需要数据与调参。
+
 ### GAN 变体族
 
 | API | 说明 |
@@ -3197,7 +3227,7 @@ print(g.out_shape(), g.param_count(), score, gp["penalty"])
 四条边界：
 
 - **不用 BatchNorm**。`BatchNorm2d.backward` 返回三元组、且带运行统计，混进这里的手写反向链会让梯度约定变复杂；所以这是个「DCGAN 风格的最小卷积 GAN」，不是论文复现（论文用 BN）。
-- **StyleGAN / CycleGAN / Pix2Pix / Progressive 只给构件与损失**，不提供空壳训练接口：完整训练需要两套对抗目标、配对图像数据或分阶段调度，超出「可测的最小实现」范围。
+- **Pix2Pix 的可训练小网络见下一节**；StyleGAN / CycleGAN / Progressive 仍只给构件与损失，不提供空壳训练接口：完整训练需要两套对抗目标、配对图像数据或分阶段调度。
 - **`wgan_gp_penalty` 会污染判别器的梯度缓冲**（它内部对输入做一次反向）。调用前后都要 `discriminator.zero_grad()`，否则下一次 `sgd_step` 会把罚项梯度一起用上。
 - **判别器的 `base` 必须等于输入边长**（`base=8` 配 8×8），否则卷积栈压不到 1×1，最后报 `Layer.forward: 输入长度 ... 与本层 fan_in ... 不一致`。
 
@@ -3688,7 +3718,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2049 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2054 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3893,6 +3923,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
+| `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
@@ -4009,7 +4040,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2049 个单元测试
+├── test_ai.py       # 2054 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

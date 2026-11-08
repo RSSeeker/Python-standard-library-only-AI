@@ -775,6 +775,10 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] Pix2Pix 可训练基础设施：`Pix2PixGenerator`（两次 stride-2 `Conv2d` 编码 + 两次
+  `ConvTranspose2d` 解码，`tanh` 输出；手写反向、`sgd_step`、`param_count`）与
+  `PatchDiscriminator`（LeakyReLU 卷积打分头，输出裸 logit patch 网格）；`train_pix2pix_step`
+  （先 D 后 G：BCE + λ·L1）与 `fit_pix2pix`；测试 `TestPix2Pix` 5 例
 - [x] 投机解码（Medusa / EAGLE）：`MedusaHeads`（K 个线性头共享目标模型隐藏状态，预测未来 1..K 个 token，
   含 `loss_and_backward`/`sgd_step`）与 `medusa_decode`（多头草稿 + 目标模型贪心验证，被拒回退）；
   `EagleDrafter`（特征级草稿器：`tanh(W_f·feature+W_e·emb(prev))` → 词表 logits，自回归草稿）与
@@ -811,7 +815,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2049 passed（新增 210 例）。
+全量测试：1839 → 2054 passed（新增 215 例）。
 
 ---
 

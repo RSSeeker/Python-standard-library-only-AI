@@ -31553,3 +31553,108 @@ class TestMedusaEagle:
         _me_raises(lambda: AI.eagle_decode(lm, [0], "not drafter"), TypeError)
         _me_raises(lambda: d.forward([0.0] * 3, [0.0] * 4), ValueError)
         _me_raises(lambda: d.draft([0.0] * 4, 0, -1, lm.embedding.weight, 3), ValueError)
+
+
+def _p2p_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+def _p2p_const(v, size=8):
+    return [[[v] * size for _ in range(size)]]
+
+
+class TestPix2Pix:
+    def test_forward_and_param_count(self):
+        gen = AI.Pix2PixGenerator(1, 1, base=4, seed=1)
+        disc = AI.PatchDiscriminator(1, base=4, seed=2)
+        assert gen.param_count() == 40 + 296 + 516 + 65
+        assert disc.param_count() == 40 + 296 + 73
+        fake = gen.forward(_p2p_const(0.5))
+        assert len(fake) == 1 and len(fake[0]) == 8 and len(fake[0][0]) == 8
+        for row in fake[0]:
+            for v in row:
+                assert -1.0 <= v <= 1.0
+        scores = disc.forward(fake)
+        assert len(scores) == 2 and len(scores[0]) == 2
+
+    def test_generator_gradients(self):
+        gen = AI.Pix2PixGenerator(1, 1, base=4, seed=1)
+        src = _p2p_const(0.3)
+        c = 0.01
+        loss_v = lambda: sum(sum(r) for r in gen.forward(src)[0]) * c
+        gen.zero_grad()
+        gen.forward(src)
+        gen.backward([[[c] * 8 for _ in range(8)]])
+        for layer, idx in ((gen.enc1, (0, 0, 1, 1)), (gen.dec1, (0, 0, 2, 2))):
+            an = layer.grad_w[idx[0]][idx[1]][idx[2]][idx[3]]
+            w0 = layer.weights[idx[0]][idx[1]][idx[2]][idx[3]]
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0 + 1e-6
+            lp = loss_v()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0 - 1e-6
+            lm = loss_v()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0
+            fd = (lp - lm) / 2e-6
+            assert abs(an - fd) < 1e-4 * max(1.0, abs(fd)), (an, fd)
+
+    def test_discriminator_gradients(self):
+        disc = AI.PatchDiscriminator(1, base=4, seed=2)
+        img = _p2p_const(0.3)
+        c = 0.01
+
+        def loss_v():
+            return sum(sum(r) for r in disc.forward(img)) * c
+
+        disc.zero_grad()
+        disc.forward(img)
+        scores = disc.forward(img)
+        dscore = [[c] * len(r) for r in scores]
+        disc.zero_grad()
+        disc.forward(img)
+        disc.backward(dscore)
+        for layer, idx in ((disc.conv1, (0, 0, 1, 1)), (disc.conv3, (0, 0, 0, 0))):
+            an = layer.grad_w[idx[0]][idx[1]][idx[2]][idx[3]]
+            w0 = layer.weights[idx[0]][idx[1]][idx[2]][idx[3]]
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0 + 1e-6
+            lp = loss_v()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0 - 1e-6
+            lm = loss_v()
+            layer.weights[idx[0]][idx[1]][idx[2]][idx[3]] = w0
+            fd = (lp - lm) / 2e-6
+            assert abs(an - fd) < 1e-4 * max(1.0, abs(fd)), (an, fd)
+
+    def test_training_step_reduces_loss(self):
+        gen = AI.Pix2PixGenerator(1, 1, base=4, seed=1)
+        disc = AI.PatchDiscriminator(1, base=4, seed=2)
+        src = _p2p_const(0.5)
+        tgt = _p2p_const(0.7)
+        hist = AI.fit_pix2pix(gen, disc, [(src, tgt)], steps=30, lr_g=1e-2, lr_d=1e-2, seed=1)
+        assert len(hist) == 30
+        assert hist[-1]["g_loss"] < hist[0]["g_loss"] * 0.5
+        assert hist[0]["g_loss"] > 0.0 and hist[0]["d_loss"] >= 0.0
+
+    def test_invalid_inputs(self):
+        _p2p_raises(lambda: AI.Pix2PixGenerator(0, 1), ValueError)
+        _p2p_raises(lambda: AI.Pix2PixGenerator(1, 1, base=0), ValueError)
+        _p2p_raises(lambda: AI.PatchDiscriminator(0), ValueError)
+        _p2p_raises(lambda: AI.PatchDiscriminator(1, base=-1), ValueError)
+        gen = AI.Pix2PixGenerator(1, 1, base=4, seed=1)
+        disc = AI.PatchDiscriminator(1, base=4, seed=2)
+        _p2p_raises(lambda: gen.forward([]), ValueError)
+        _p2p_raises(lambda: gen.forward([[[0.0] * 2 for _ in range(2)]]), ValueError)
+        _p2p_raises(lambda: gen.backward([[[0.1] * 4 for _ in range(4)]]), RuntimeError)
+        _p2p_raises(lambda: disc.forward([[[0.0] * 8 for _ in range(8)],
+                                          [[0.0] * 8 for _ in range(8)]]), ValueError)
+        _p2p_raises(lambda: disc.backward([[0.1]]), RuntimeError)
+        _p2p_raises(lambda: AI.train_pix2pix_step(gen, "not disc", _p2p_const(0.5), _p2p_const(0.7)),
+                    TypeError)
+        _p2p_raises(lambda: AI.train_pix2pix_step(gen, disc, _p2p_const(0.5), _p2p_const(0.7),
+                                                  lambda_l1=-1.0), ValueError)
+        _p2p_raises(lambda: AI.train_pix2pix_step(gen, disc, _p2p_const(0.5),
+                                                  _p2p_const(0.7, size=4)), ValueError)
+        _p2p_raises(lambda: AI.fit_pix2pix(gen, disc, [], steps=3), ValueError)

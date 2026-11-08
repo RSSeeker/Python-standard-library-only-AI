@@ -10887,6 +10887,276 @@ def pix2pix_g_loss(fake_scores, fake_image, real_image, lambda_l1=100.0):
     l1 /= (c * h * w)
     return bce + float(lambda_l1) * l1
 
+"""Pix2Pix 可训练基础设施：小型图像到图像生成器 + PatchGAN 判别器。"""
+
+
+def _p2p_image(x, channels, who, minimum=4):
+    if not isinstance(x, (list, tuple)) or len(x) != channels:
+        raise ValueError(f"{who}: 输入必须是 {channels} 通道的 (C, H, W)")
+    if not x or not x[0] or not x[0][0]:
+        raise ValueError(f"{who}: 图像不能为空")
+    h, w = len(x[0]), len(x[0][0])
+    if h < minimum or w < minimum:
+        raise ValueError(f"{who}: 高宽必须 >= {minimum}，收到 {h}x{w}")
+    for c in range(channels):
+        if len(x[c]) != h:
+            raise ValueError(f"{who}: 通道 {c} 高度不一致")
+        for r in range(h):
+            if len(x[c][r]) != w:
+                raise ValueError(f"{who}: 通道 {c} 第 {r} 行宽度不一致")
+            for v in x[c][r]:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise TypeError(f"{who}: 像素必须是数字，收到 {v!r}")
+    return h, w
+
+
+def _p2p_zeros_like(x):
+    return [[[0.0 for _ in row] for row in ch] for ch in x]
+
+
+def _p2p_sigmoid(v):
+    if v >= 0.0:
+        return 1.0 / (1.0 + math.exp(-v))
+    e = math.exp(v)
+    return e / (1.0 + e)
+
+
+def _p2p_leaky_mask(x):
+    return [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+
+def _p2p_apply_mask(d, mask, slope=0.2):
+    return [[[d[c][i][j] * (mask[c][i][j] + slope * (1.0 - mask[c][i][j]))
+              for j in range(len(d[c][i]))] for i in range(len(d[c]))] for c in range(len(d))]
+
+
+def _p2p_sgd_layer(layer, lr):
+    """Conv2d / ConvTranspose2d 通用 SGD 更新：递归更新权重，再按 biases 长度更新偏置。"""
+    def upd(w, g):
+        for i in range(len(w)):
+            if isinstance(w[i], list):
+                upd(w[i], g[i])
+            else:
+                w[i] -= lr * g[i]
+    upd(layer.weights, layer.grad_w)
+    for i in range(len(layer.biases)):
+        layer.biases[i] -= lr * layer.grad_b[i]
+
+
+def _p2p_bce(scores, target):
+    """裸 logit 网格的 BCE，返回 (loss, dscore)。"""
+    total = 0.0
+    n = 0
+    for row in scores:
+        for v in row:
+            p = _p2p_sigmoid(float(v))
+            p = min(max(p, 1e-12), 1.0 - 1e-12)
+            total -= target * math.log(p) + (1.0 - target) * math.log(1.0 - p)
+            n += 1
+    d = [[( _p2p_sigmoid(float(v)) - target) / n for v in row] for row in scores]
+    return total / n if n else 0.0, d
+
+
+class PatchDiscriminator:
+    """三层小 PatchGAN：输入图像 → 分数网格（裸 logit）。"""
+
+    def __init__(self, in_channels=1, base=4, seed=None):
+        for name, v in (("in_channels", in_channels), ("base", base)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"PatchDiscriminator: {name} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.base = base
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.conv1 = Conv2d(in_channels, base, 3, stride=2, padding=1)
+            self.conv2 = Conv2d(base, 2 * base, 3, stride=2, padding=1)
+            self.conv3 = Conv2d(2 * base, 1, 3, padding=1)
+        finally:
+            random.setstate(state)
+        self._cache = None
+
+    def zero_grad(self):
+        for c in (self.conv1, self.conv2, self.conv3):
+            c.zero_grad()
+
+    def param_count(self):
+        return sum(_conv_param_count(c) for c in (self.conv1, self.conv2, self.conv3))
+
+    def sgd_step(self, lr):
+        for c in (self.conv1, self.conv2, self.conv3):
+            _p2p_sgd_layer(c, lr)
+
+    def forward(self, image):
+        h, w = _p2p_image(image, self.in_channels, "PatchDiscriminator.forward")
+        o1 = self.conv1.forward(image)
+        m1 = _p2p_leaky_mask(o1)
+        a1 = [[[v if v > 0.0 else 0.2 * v for v in row] for row in ch] for ch in o1]
+        o2 = self.conv2.forward(a1)
+        m2 = _p2p_leaky_mask(o2)
+        a2 = [[[v if v > 0.0 else 0.2 * v for v in row] for row in ch] for ch in o2]
+        o3 = self.conv3.forward(a2)
+        scores = [[o3[0][i][j] for j in range(len(o3[0][0]))] for i in range(len(o3[0]))]
+        self._cache = {"m1": m1, "m2": m2, "scores": scores}
+        return scores
+
+    def backward(self, dscore):
+        if self._cache is None:
+            raise RuntimeError("PatchDiscriminator.backward: 先调用 forward")
+        scores = self._cache["scores"]
+        hh, ww = len(scores), len(scores[0])
+        if not isinstance(dscore, (list, tuple)) or len(dscore) != hh or len(dscore[0]) != ww:
+            raise ValueError("PatchDiscriminator.backward: dscore 形状与分数网格不一致")
+        d_o3 = [[[float(dscore[i][j]) for j in range(ww)] for i in range(hh)]]
+        d_a2 = self.conv3.backward(d_o3)
+        d_o2 = _p2p_apply_mask(d_a2, self._cache["m2"])
+        d_a1 = self.conv2.backward(d_o2)
+        d_o1 = _p2p_apply_mask(d_a1, self._cache["m1"])
+        return self.conv1.backward(d_o1)
+
+
+class Pix2PixGenerator:
+    """小型图像到图像生成器：两次 stride-2 卷积编码 + 两次转置卷积解码。"""
+
+    def __init__(self, in_channels=1, out_channels=1, base=4, seed=None):
+        for name, v in (("in_channels", in_channels), ("out_channels", out_channels),
+                        ("base", base)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"Pix2PixGenerator: {name} 必须是正整数，收到 {v!r}")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.base = base
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.enc1 = Conv2d(in_channels, base, 3, stride=2, padding=1)
+            self.enc2 = Conv2d(base, 2 * base, 3, stride=2, padding=1)
+            self.dec1 = ConvTranspose2d(2 * base, base, 4, stride=2, padding=1)
+            self.dec2 = ConvTranspose2d(base, out_channels, 4, stride=2, padding=1)
+        finally:
+            random.setstate(state)
+        self._cache = None
+
+    def zero_grad(self):
+        for c in (self.enc1, self.enc2, self.dec1, self.dec2):
+            c.zero_grad()
+
+    def param_count(self):
+        return sum(_conv_param_count(c) for c in (self.enc1, self.enc2, self.dec1, self.dec2))
+
+    def sgd_step(self, lr):
+        for name in ("enc1", "enc2", "dec1", "dec2"):
+            _p2p_sgd_layer(getattr(self, name), lr)
+
+    def forward(self, image):
+        _p2p_image(image, self.in_channels, "Pix2PixGenerator.forward")
+        o1 = self.enc1.forward(image)
+        m1 = _p2p_leaky_mask(o1)
+        a1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in o1]
+        o2 = self.enc2.forward(a1)
+        m2 = _p2p_leaky_mask(o2)
+        a2 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in o2]
+        o3 = self.dec1.forward(a2)
+        m3 = _p2p_leaky_mask(o3)
+        a3 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in o3]
+        out = self.dec2.forward(a3)
+        y = [[[math.tanh(v) for v in row] for row in ch] for ch in out]
+        self._cache = {"m1": m1, "m2": m2, "m3": m3, "y": y}
+        return y
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("Pix2PixGenerator.backward: 先调用 forward")
+        y = self._cache["y"]
+        h, w = len(y[0]), len(y[0][0])
+        if not isinstance(dout, (list, tuple)) or len(dout) != len(y) \
+                or len(dout[0]) != h or len(dout[0][0]) != w:
+            raise ValueError("Pix2PixGenerator.backward: dout 形状与输出不一致")
+        d_out = [[[float(dout[c][i][j]) * (1.0 - y[c][i][j] * y[c][i][j])
+                   for j in range(w)] for i in range(h)] for c in range(len(y))]
+        d_a3 = self.dec2.backward(d_out)
+        d_o3 = _p2p_apply_mask(d_a3, self._cache["m3"], slope=0.0)
+        d_a2 = self.dec1.backward(d_o3)
+        d_o2 = _p2p_apply_mask(d_a2, self._cache["m2"], slope=0.0)
+        d_a1 = self.enc2.backward(d_o2)
+        d_o1 = _p2p_apply_mask(d_a1, self._cache["m1"], slope=0.0)
+        return self.enc1.backward(d_o1)
+
+
+def _p2p_l1_and_grad(fake, real, weight):
+    c = len(fake)
+    h, w = len(fake[0]), len(fake[0][0])
+    n = c * h * w
+    total = 0.0
+    d = [[[0.0 for _ in range(w)] for _ in range(h)] for _ in range(c)]
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                diff = float(fake[k][i][j]) - float(real[k][i][j])
+                total += abs(diff)
+                d[k][i][j] = weight * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0)) / n
+    return weight * total / n, d
+
+
+def train_pix2pix_step(generator, discriminator, source, target,
+                       lambda_l1=100.0, lr_g=1e-3, lr_d=1e-3):
+    """一步 Pix2Pix 训练：先更新判别器，再更新生成器，返回两项损失。"""
+    if not isinstance(generator, Pix2PixGenerator):
+        raise TypeError("train_pix2pix_step: generator 必须是 Pix2PixGenerator")
+    if not isinstance(discriminator, PatchDiscriminator):
+        raise TypeError("train_pix2pix_step: discriminator 必须是 PatchDiscriminator")
+    if isinstance(lambda_l1, bool) or not isinstance(lambda_l1, (int, float)) or lambda_l1 < 0:
+        raise ValueError("train_pix2pix_step: lambda_l1 必须是非负数")
+    h, w = _p2p_image(source, generator.in_channels, "train_pix2pix_step(source)")
+    h2, w2 = _p2p_image(target, generator.out_channels, "train_pix2pix_step(target)")
+    if (h2, w2) != (h, w):
+        raise ValueError("train_pix2pix_step: source 与 target 形状不一致")
+
+    # 1) 判别器：真图目标 1、假图目标 0
+    fake = generator.forward(source)
+    discriminator.zero_grad()
+    real_scores = discriminator.forward(target)
+    loss_d_real, d_real = _p2p_bce(real_scores, 1.0)
+    discriminator.backward(d_real)
+    fake_scores = discriminator.forward(fake)
+    loss_d_fake, d_fake = _p2p_bce(fake_scores, 0.0)
+    discriminator.backward(d_fake)
+    discriminator.sgd_step(lr_d)
+    loss_d = 0.5 * (loss_d_real + loss_d_fake)
+
+    # 2) 生成器：BCE(D(fake), 1) + λ·L1(fake, target)
+    generator.zero_grad()
+    discriminator.zero_grad()
+    fake = generator.forward(source)
+    fake_scores = discriminator.forward(fake)
+    loss_bce, d_score = _p2p_bce(fake_scores, 1.0)
+    l1, d_l1 = _p2p_l1_and_grad(fake, target, lambda_l1)
+    d_fake = discriminator.backward(d_score)
+    for k in range(len(d_fake)):
+        for i in range(len(d_fake[k])):
+            for j in range(len(d_fake[k][i])):
+                d_fake[k][i][j] += d_l1[k][i][j]
+    generator.backward(d_fake)
+    generator.sgd_step(lr_g)
+    return {"d_loss": loss_d, "g_loss": loss_bce + l1}
+
+
+def fit_pix2pix(generator, discriminator, pairs, steps=30, lambda_l1=100.0,
+                lr_g=1e-3, lr_d=1e-3, seed=None):
+    """在固定的 (source, target) 对上循环训练，返回每步损失。"""
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("fit_pix2pix: pairs 不能为空")
+    rng = random.Random(seed) if seed is not None else random
+    history = []
+    for _ in range(steps):
+        source, target = pairs[rng.randrange(len(pairs))]
+        history.append(train_pix2pix_step(
+            generator, discriminator, source, target,
+            lambda_l1=lambda_l1, lr_g=lr_g, lr_d=lr_d))
+    return history
+
 # =============================================================================
 #  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 # =============================================================================
