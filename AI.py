@@ -28,30 +28,86 @@
 ================================================================================
 """
 
-# 目录（按文件顺序，与下面的 # ==== 分节标题一一对应）
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 77 个顶层分节
+# （920 个 def / 297 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+#  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
-#   2. CNN: Conv2d / MaxPool2d / Flatten
-#   3. Regularization: Dropout / BatchNorm1d / LayerNorm
-#   4. RNN / LSTM
-#   5. Matrix helpers (用于 Transformer)
-#   6. GRU (Gated Recurrent Unit)
-#   7. Transformer 组件
-#   8. Embedding / Residual / Sequential
-#   9. Loss Functions
-#  10. Optimizer: Adam
-#  11. More Optimizers: SGD / SGD+Momentum / RMSprop
-#  12. Gradient Clipping / LR Scheduler
-#  13. Data Utilities
-#  14. Text Processing（分词与文本工具）
-#  15. Trainer
-#  16. 评估指标（分类 / 回归 / 序列 / 生成）
-#  17. 模型保存 / 加载 (JSON)
-#  18. 序列标注 / 多标签分类头
-#  19. PyTorch 数值对齐对比
-#  20. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#  21. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  22. 生成模型：VAE / GAN / DDPM
-#  23. Main: 回归 + 分类 + CNN 完整示例
+#   2. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
+#   3. CNN: Conv2d / MaxPool2d / Flatten
+#   4. 领域应用 W7-F：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#   5. W8-A：GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
+#   6. W8-B：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#   7. Regularization: Dropout / BatchNorm1d / LayerNorm
+#   8. RNN / LSTM
+#   9. Matrix helpers (用于 Transformer)
+#  10. GRU (Gated Recurrent Unit)
+#  11. Transformer 组件
+#  12. Embedding / Residual / Sequential
+#  13. Loss Functions
+#  14. Optimizer: Adam
+#  15. More Optimizers: SGD / SGD+Momentum / RMSprop
+#  16. SGDW / Nesterov / Lookahead / SWA / EMA（W9-C）
+#  17. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam（W9-A）
+#  18. Layer-wise Optimizers: LARS / LAMB / Ranger（W9-B）
+#  19. Advanced Optimizers: Adan / Prodigy / CAME（W9-E）
+#  20. Gradient Clipping / LR Scheduler
+#  21. Data Utilities
+#  22. W11-A：Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#  23. Text Processing（分词与文本工具）
+#  24. Trainer
+#  25. 评估指标（分类 / 回归 / 序列 / 生成）
+#  26. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#  27. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#  28. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#  29. 多模态：CLIP 双塔 + 跨模态融合（W16-C）
+#  30. 自监督：预测式任务（W16-D：Rotation / Jigsaw）
+#  31. RL 算法（W16-F：DQN 族）
+#  32. RL 基础设施（W16-G：探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#  33. RL 策略侧（W16-F2：REINFORCE / A2C(GAE) / PPO）
+#  34. 领域应用 W17-A：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#  35. W18-A：全模块梯度自检（grad_check_all）
+#  36. W18-B：数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#  37. 研究前沿 W20-E：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#  38. 研究前沿 W20-D：神经符号（规则约束的候选过滤）
+#  39. 研究前沿 W20-C：Mixture-of-Depths 路由与 Early Exit
+#  40. 研究前沿 W20-B：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#  41. 研究前沿 W20-A：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#  42. 工程化收尾 W19-C：配置文件 / 日志 / 内存监控 / 模型注册表
+#  43. 领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
+#  44. 领域应用 W17-E-2b：视频（3D-CNN / Two-Stream 融合）
+#  45. 领域应用 W17-E-2a：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#  46. 领域应用 W17-E-1：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#  47. 领域应用 W17-D：向量检索（暴力 / IVF / 单层 NSW 图）
+#  48. 领域应用 W17-C-2：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#  49. 领域应用 W17-C-1：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#  50. 领域应用 W17-B-2：DeepFM / DIN
+#  51. 领域应用 W17-B：推荐（矩阵分解 / NCF / Wide&Deep）
+#  52. 联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
+#  53. 元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
+#  54. RL 环境（W16-E：GridWorld / CartPole）
+#  55. 自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
+#  56. 自监督：对比学习（W16-A：SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#  57. 推理与部署：批内打包与投机解码（W15-D）
+#  58. 推理与部署：集成学习（W15-C：Voting / Bagging / Stacking / AdaBoost）
+#  59. 推理与部署：量化（W15-B：PTQ / QAT / SmoothQuant）
+#  60. 推理与部署：结构化剪枝（W15-A：通道 / 头 / 层）
+#  61. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响（W14-F）
+#  62. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors（W14-E）
+#  63. 可解释性：注意力 Rollout / Flow（W14-B）
+#  64. 可解释性：输入归因（W14-A）
+#  65. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#  66. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#  67. 模型保存 / 加载 (JSON)
+#  68. 序列标注 / 多标签分类头
+#  69. PyTorch 数值对齐对比
+#  70. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#  71. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  72. W10-F：梯度检查点（activation checkpointing）与混合精度模拟
+#  73. W10-E：半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#  74. W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#  75. W10-C：对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#  76. 生成模型：VAE / GAN / DDPM
+#  77. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -22451,6 +22507,11 @@ def bce_loss(pred, target, eps: float = 1e-12):
     target 可为 0/1 标量，或与 pred 等长的 0/1 列表。
     loss 取逐元素平均；返回 (loss, grad)，grad 相对 pred
     （Layer 的 sigmoid 导数会再乘上去，所以对 logits 的梯度是对的）。
+
+    注意：pred 越接近 0 或 1，梯度越大（数学上无界，量级约 1/eps）。
+    pred 落在端点时会被 clamp 到 eps / 1-eps，此时梯度量级为 1/eps（默认 1e12）。
+    这是 BCE 本身的数学性质（PyTorch 同样如此），需要数值稳定时请改用
+    ``bce_with_logits_loss``，或显式传更大的 eps。
     """
     if isinstance(target, (list, tuple)):
         if len(target) != len(pred):
@@ -22542,6 +22603,11 @@ def kl_divergence(pred, target, eps: float = 1e-12):
 
     pred 是模型输出的概率分布，target 是目标分布（不要求归一化）。
     返回 (loss, grad)，grad 相对 pred（= -t/p）。
+
+    注意：p→0 且 t>0 时梯度无界（量级约 -t/eps，默认 1e12），这是 KL 的
+    数学性质，与 PyTorch 一致；需要数值稳定时请改用
+    ``bce_with_logits_loss`` 这类自带 log-sum-exp 的稳定形式，
+    或显式传更大的 eps。
     """
     if len(target) != len(pred):
         raise ValueError(
@@ -51112,6 +51178,7 @@ if __name__ == "__main__":
         return x
 
     def cnn_backward(loss_grad):
+        """反向传播：只计算各层梯度，不更新参数（更新在 cnn_sgd_step 里做）"""
         delta = loss_grad
         # 收集 MLP 各层梯度（反向传播）
         fc_grads = []
@@ -51121,25 +51188,24 @@ if __name__ == "__main__":
         delta = flatten.backward(delta)
         delta = pool.backward(delta)
         _ = conv.backward(delta)
+        return fc_grads
 
-# ============================================================================
-#  应用梯度更新权重 (SGD)
-# ============================================================================
-        cnn_lr = 0.01
+    # 应用梯度更新权重 (SGD)：与反向分离后，可以独立替换成 Adam 等优化器
+    def cnn_sgd_step(fc_grads, lr=0.01):
         # 更新 Conv2d 权重
         for oc in range(conv.out_channels):
-            conv.biases[oc] -= cnn_lr * conv.grad_b[oc]
+            conv.biases[oc] -= lr * conv.grad_b[oc]
             for ic in range(conv.in_channels):
                 for kh in range(conv.kh):
                     for kw in range(conv.kw):
-                        conv.weights[oc][ic][kh][kw] -= cnn_lr * conv.grad_w[oc][ic][kh][kw]
+                        conv.weights[oc][ic][kh][kw] -= lr * conv.grad_w[oc][ic][kh][kw]
         # 更新 MLP 权重
         for lidx, (gw, gb) in enumerate(fc_grads):
             layer = fc.layers[lidx]
             for j in range(layer.fan_out):
-                layer.biases[j] -= cnn_lr * gb[j]
+                layer.biases[j] -= lr * gb[j]
                 for i in range(layer.fan_in):
-                    layer.weights[j][i] -= cnn_lr * gw[j][i]
+                    layer.weights[j][i] -= lr * gw[j][i]
 
     print(f"Conv: in=1 out=2 kernel=2  →  Pool: 2×2  →  Flatten  →  {fc}")
     print(f"训练集: {len(imgs)} 样本")
@@ -51152,7 +51218,7 @@ if __name__ == "__main__":
             pred = cnn_forward(img)
             loss, grad = cross_entropy_loss(pred, label)
             total_loss += loss
-            cnn_backward(grad)
+            cnn_sgd_step(cnn_backward(grad))
 
         if epoch % 100 == 0:
             print(f"  Epoch {epoch} | Loss: {total_loss / len(imgs):.6f}")
@@ -51657,8 +51723,8 @@ if __name__ == "__main__":
     tp = TextProcessor(text)
     dataset = tp.prepare_data(text, window_size)
 
-    # 分割训练/测试
-    random.shuffle(dataset)
+    # 分割训练/测试：先按语料顺序切分，再只打乱训练集。
+    # （若先随机打乱再切分，测试窗口的上下文几乎不会在训练集出现，准确率恒为 0%）
     split_idx = int(len(dataset) * 0.85)
     text_train, text_test = dataset[:split_idx], dataset[split_idx:]
 
@@ -51688,16 +51754,34 @@ if __name__ == "__main__":
             text_opt.step(grads)
 
         if epoch % 50 == 0:
-            # 测试集准确率
+            # 训练集拟合准确率：本示例语料只有 48 字、窗口 3，各窗口的上下文几乎唯一，
+            # 模型是逐窗口记忆而非泛化；留出窗口的准确率恒为 0%，不具参考性，
+            # 这里只报告训练集拟合度，生成质量看最后的样例。
             correct = 0
-            for x, y in text_test:
+            for x, y in text_train:
                 probs = text_model.forward(x)
-                pred_idx = probs.index(max(probs))
-                true_idx = y.index(max(y))
-                if pred_idx == true_idx:
+                if probs.index(max(probs)) == y.index(max(y)):
                     correct += 1
-            acc = correct / len(text_test)
-            print(f"  Epoch {epoch} | Loss: {total_loss / len(text_train):.4f} | Test Acc: {acc:.2%}")
+            acc = correct / len(text_train)
+            print(f"  Epoch {epoch} | Loss: {total_loss / len(text_train):.4f} | Train Acc: {acc:.2%}")
+
+    # 留出窗口准确率仅作参考：语料只有 48 字、窗口 3，各窗口的上下文组合几乎唯一，
+    # 训练时没有见过留出窗口的上下文，因此 0% 是逐窗口记忆模型的正常结果，
+    # 本示例以训练集拟合程度和下方生成样例衡量，而不是留出集准确率。
+    train_correct = 0
+    for x, y in text_train:
+        probs = text_model.forward(x)
+        if probs.index(max(probs)) == y.index(max(y)):
+            train_correct += 1
+    test_correct = 0
+    for x, y in text_test:
+        probs = text_model.forward(x)
+        if probs.index(max(probs)) == y.index(max(y)):
+            test_correct += 1
+    print(f"\n最终准确率：训练集 {train_correct}/{len(text_train)} = "
+          f"{train_correct / len(text_train):.0%}，"
+          f"留出窗口 {test_correct}/{len(text_test)} = {test_correct / len(text_test):.0%}"
+          f"（小语料 + 唯一上下文，留出集低分属正常，看下方生成样例）")
 
     # 生成文本
     print("\n文本生成测试:")

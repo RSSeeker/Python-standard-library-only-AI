@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1836 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1839 项）
 
 ## 特性
 
@@ -2530,7 +2530,7 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
 
 - YAML 是**子集**实现：不支持锚点/别名、多文档、块标量（`|` / `>`）、复杂键；
   需要完整 YAML 请自行安装 PyYAML，本库只保证「配置文件够用」；
-- TOML 走标准库 `tomllib`（Python 3.11+，**只读**），所以 `dump_config` 拒绝写回 toml；
+- TOML 走标准库 `tomllib`（自 Python 3.11 起可用，本库要求 3.12+，**只读**），所以 `dump_config` 拒绝写回 toml；
 - INI 用 `configparser`，返回 `{section: {key: str}}`，值一律是字符串；
 - 注册表把每次 `register` 存成 `<root>/<name>/v<n>.json` 并更新 `index.json`
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
@@ -3223,7 +3223,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1836 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1839 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3507,7 +3507,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1836 个单元测试
+├── test_ai.py       # 1839 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
