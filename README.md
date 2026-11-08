@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2063 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2067 项）
 
 ## 特性
 
@@ -3261,6 +3261,11 @@ print(hist[0]["g_loss"], hist[-1]["g_loss"])
 | `DCGANGenerator(latent_dim=8, channels=(8,4), out_channels=1, base=2, seed=None)` | 全卷积生成器：`Layer` 潜码投影 → 逐级 `ConvTranspose2d(k=4,s=2,p=1)`+ReLU → `tanh`；`out_shape()`/`forward`/`backward`/`sgd_step`/`param_count` |
 | `DCGANDiscriminator(in_channels=1, channels=(4,8), base=8, seed=None)` | 步长 2 的 `Conv2d` 栈 + LeakyReLU → 线性打分头；`forward` 返回裸分数、`prob` 取 sigmoid、`backward(dscore)` 回输入梯度 |
 | `wgan_gp_penalty(discriminator, real, fake, lambda_gp=10.0, seed=None)` | WGAN-GP 罚项：`λ(E‖∇_x D(x̂)‖−1)²`，`x̂` 在真假样本连线上均匀取；梯度用**手写反向真算**而非数值差分 |
+| `r1_penalty(d_scores, lam=10.0)` | R1 数值：`lam/2 · mean(‖∇_x D(x)‖²)`，`d_scores` 是每个样本的**扁平**输入梯度列表（单阶反向没有二阶图，故为诊断量，不参与更新） |
+| `r2_penalty(d_scores, lam=10.0)` | R2 数值：数学形式同 R1，但 `d_scores` 应取 real/fake 插值点 `x̂` 上的 `∇_x D(x̂)`；同样是诊断量 |
+| `r1_diagnostics(discriminator, real, lam=10.0)` | 直接对 `DCGANDiscriminator` 取真实样本的输入梯度并算 R1，返回 `{"r1","grad_norms"}` |
+| `r2_diagnostics(discriminator, real, fake, lam=10.0, alpha=0.5)` | 在 `x̂ = alpha·real + (1−alpha)·fake` 上取输入梯度并算 R2，返回 `{"r2","grad_norms","alpha"}` |
+| `gan_penalty_diagnostics(discriminator, real, fake, lam=10.0, alpha=0.5)` | 一次返回 R1/R2 两个诊断量及两条梯度范数 |
 | `adain_style(features, style, eps=1e-5)` / `truncation_trick(w, w_avg, psi=0.7)` | StyleGAN 的两件：逐通道 AdaIN 调制（`style` 长 2C）、潜码向滑动均值截断 |
 | `cycle_consistency_loss` / `identity_mapping_loss` / `patchgan_targets` / `pix2pix_g_loss` | CycleGAN 与 Pix2Pix 的损失构件（L1 循环一致性、identity 映射、PatchGAN 目标、BCE+λL1） |
 | `upsample_nearest2d` / `fade_in` / `progressive_alpha` / `progressive_stages` | Progressive GAN 的最近邻上采样、淡入混合与阶段调度 |
@@ -3281,6 +3286,8 @@ print(g.out_shape(), g.param_count(), score, gp["penalty"])
 - **不用 BatchNorm**。`BatchNorm2d.backward` 返回三元组、且带运行统计，混进这里的手写反向链会让梯度约定变复杂；所以这是个「DCGAN 风格的最小卷积 GAN」，不是论文复现（论文用 BN）。
 - **Pix2Pix 的可训练小网络见下一节**；StyleGAN / CycleGAN / Progressive 仍只给构件与损失，不提供空壳训练接口：完整训练需要两套对抗目标、配对图像数据或分阶段调度。
 - **`wgan_gp_penalty` 会污染判别器的梯度缓冲**（它内部对输入做一次反向）。调用前后都要 `discriminator.zero_grad()`，否则下一次 `sgd_step` 会把罚项梯度一起用上。
+- **R1/R2 诊断同样会污染判别的梯度缓冲**（内部对输入做一次反向）。取完数值后要 `discriminator.zero_grad()`；
+  它们是**诊断量**而不是可反传损失：本库手写反向只有一阶，无法求「梯度的梯度」。
 - **判别器的 `base` 必须等于输入边长**（`base=8` 配 8×8），否则卷积栈压不到 1×1，最后报 `Layer.forward: 输入长度 ... 与本层 fan_in ... 不一致`。
 
 ### Score-based / SDE / 多尺度 Glow
@@ -3770,7 +3777,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2063 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2067 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3975,6 +3982,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
+| `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
 | `TestStyleGAN` | 生成器前向形状/参数 685/同 z 可复现、conv1/style1/style2/mapping 权重有限差分、不同 z 输出不同与 average_w/truncate、30 步 SGD 使重建损失减半、非法输入与未 forward 先 backward |
 | `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
@@ -4094,7 +4102,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2063 个单元测试
+├── test_ai.py       # 2067 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

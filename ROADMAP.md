@@ -775,6 +775,10 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] R1 / R2 梯度罚项诊断：`r2_penalty`（与 R1 同闭式的 `lam/2·mean(‖∇_x D(x̂)‖²)`）、
+  `r1_diagnostics` / `r2_diagnostics` / `gan_penalty_diagnostics`（直接用
+  `DCGANDiscriminator` 对真实样本/插值点做输入反向，返回罚项值与梯度范数；文档注明会污染
+  判别器梯度缓冲、单阶反向故为诊断量）；测试 `TestGanPenalties` 4 例
 - [x] CycleGAN 训练基础设施：`train_cyclegan_step`（两个 `Pix2PixGenerator` + 两个
   `PatchDiscriminator`；先 D 后 G：对抗损失 + `λ_cycle` 双向循环 L1 + `λ_identity` identity L1；
   返回 `d_loss/g_loss/adv_loss/cycle_loss/identity_loss`）与 `fit_cyclegan`；
@@ -824,7 +828,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2063 passed（新增 224 例）。
+全量测试：1839 → 2067 passed（新增 228 例）。
 
 ---
 

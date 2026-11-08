@@ -31863,3 +31863,67 @@ class TestCycleGAN:
         _cg_raises(lambda: AI.train_cyclegan_step(g_ab, g_ba, d_a, d_b, a, b,
                                                   lr_g=0.0))
         _cg_raises(lambda: AI.fit_cyclegan(g_ab, g_ba, d_a, d_b, []))
+
+
+import AI
+
+
+def _gp_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError(f"期望 {exc.__name__}，实际 {type(other).__name__}: {other}")
+    raise AssertionError(f"期望 {exc.__name__}，但未抛异常")
+
+
+def _gp_const(v, size=8):
+    return [[[float(v)] * size for _ in range(size)]]
+
+
+def _gp_ramp():
+    return [[[i / 8.0 for _ in range(8)] for i in range(8)]]
+
+
+class TestGanPenalties:
+    def test_r2_penalty_formula(self):
+        assert AI.r2_penalty([[1.0, 2.0]], 2.0) == 5.0
+        assert AI.r2_penalty([[3.0], [4.0]], 2.0) == 0.5 * 2.0 * (9.0 + 16.0) / 2.0
+        _gp_raises(lambda: AI.r2_penalty([], 10.0))
+        _gp_raises(lambda: AI.r2_penalty([[1.0]], -1.0))
+        _gp_raises(lambda: AI.r2_penalty([[1.0]], True))
+
+    def test_diagnostics_keys_and_same_point(self):
+        d = AI.DCGANDiscriminator(in_channels=1, seed=3)
+        real = _gp_const(0.8)
+        out = AI.gan_penalty_diagnostics(d, real, _gp_const(0.2), lam=10.0, alpha=0.5)
+        for key in ("r1", "r2", "grad_norms_real", "grad_norms_hat", "alpha"):
+            assert key in out
+        assert out["r1"] >= 0 and out["r2"] >= 0
+        assert out["grad_norms_real"] > 0
+        d.zero_grad()
+        same = AI.gan_penalty_diagnostics(d, real, real, lam=10.0)
+        assert abs(same["r1"] - same["r2"]) < 1e-12
+
+    def test_diagnostics_varied_images(self):
+        d = AI.DCGANDiscriminator(in_channels=1, seed=5)
+        real = _gp_ramp()
+        fake = [[[0.9 - v for v in row] for row in ch] for ch in real]
+        out = AI.gan_penalty_diagnostics(d, real, fake, lam=3.0, alpha=0.3)
+        assert out["r1"] == out["r1"] and out["r2"] == out["r2"]
+        assert out["r1"] >= 0 and out["r2"] >= 0
+        assert out["grad_norms_real"] > 0 and out["grad_norms_hat"] > 0
+        # 换插值系数，R2 采样点变化，数值应可复现且非负
+        out2 = AI.r2_diagnostics(d, real, fake, lam=3.0, alpha=0.3)
+        assert abs(out2["r2"] - out["r2"]) < 1e-12
+
+    def test_invalid_diagnostics(self):
+        real = _gp_ramp()
+        _gp_raises(lambda: AI.r1_diagnostics(object(), real), TypeError)
+        _gp_raises(lambda: AI.r2_diagnostics(object(), real, real), TypeError)
+        d = AI.DCGANDiscriminator(in_channels=1, seed=7)
+        _gp_raises(lambda: AI.r1_diagnostics(d, real, lam=-1.0))
+        _gp_raises(lambda: AI.r2_diagnostics(d, real, real, alpha=1.5))
+        _gp_raises(lambda: AI.r2_diagnostics(d, real, _gp_const(0.0, size=4)))
+        _gp_raises(lambda: AI.gan_penalty_diagnostics(object(), real, real), TypeError)

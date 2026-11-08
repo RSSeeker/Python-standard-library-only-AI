@@ -58085,6 +58085,74 @@ def r1_penalty(d_scores, lam=10.0):
     return 0.5 * lam * total / len(d_scores)
 
 
+def r2_penalty(d_scores, lam=10.0):
+    """R2 罚项数值：``lam/2 * mean(||dD/dx̂||^2)``，``x̂`` 应取 real/fake 插值点。
+
+    数学形式与 R1 相同，区别只在采样点：R1 用真实样本、R2 用生成样本或两者插值点。
+    本库没有二阶图，因此返回值是**诊断量**：训练时记录/打印以判断判别器是否过陡，
+    不能直接加进损失反传（PyTorch 的 autograd.grad 才能做到）。
+    """
+    if not isinstance(d_scores, (list, tuple)) or not d_scores:
+        raise ValueError("r2_penalty: d_scores 不能为空")
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)) or lam < 0:
+        raise ValueError("r2_penalty: lam 必须是 >= 0 的数")
+    total = 0.0
+    for g in d_scores:
+        total += sum(float(v) * float(v) for v in g)
+    return 0.5 * lam * total / len(d_scores)
+
+
+def _r1_r2_check_discriminator(discriminator):
+    if not isinstance(discriminator, DCGANDiscriminator):
+        raise TypeError("R1/R2 诊断: discriminator 必须是 DCGANDiscriminator")
+
+
+def _r1_r2_input_grad(discriminator, image):
+    """对给定输入算一次 ∇_x D(x)（会污染判别的参数梯度缓冲，调用方负责清零）。"""
+    discriminator.forward(image)
+    d = discriminator.backward(1.0)
+    flat = [float(v) for ch in d for row in ch for v in row]
+    norm = math.sqrt(sum(v * v for v in flat))
+    return flat, norm
+
+
+def r1_diagnostics(discriminator, real, lam=10.0):
+    """在真实样本上诊断 R1：返回 ``{"r1", "grad_norms"}``。
+
+    R1 = ``lam/2 * mean(||∇_x D(x)||²)``。注意会调用 ``discriminator.backward``，
+    从而把该次梯度累积进判别器参数梯度缓冲；建议先 ``zero_grad()``、取完数值后再清零。
+    """
+    _r1_r2_check_discriminator(discriminator)
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)) or lam < 0:
+        raise ValueError("r1_diagnostics: lam 必须是 >= 0 的数")
+    d, norm = _r1_r2_input_grad(discriminator, real)
+    return {"r1": r1_penalty([d], lam), "grad_norms": norm}
+
+
+def r2_diagnostics(discriminator, real, fake, lam=10.0, alpha=0.5):
+    """在 real/fake 插值点 ``x̂ = alpha·real + (1-alpha)·fake`` 上诊断 R2。
+
+    返回 ``{"r2", "grad_norms", "alpha"}``；与 R1 一样会污染判别器参数梯度缓冲。
+    """
+    _r1_r2_check_discriminator(discriminator)
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)) or lam < 0:
+        raise ValueError("r2_diagnostics: lam 必须是 >= 0 的数")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 <= alpha <= 1.0):
+        raise ValueError("r2_diagnostics: alpha 必须在 [0, 1]")
+    x_hat = _w8a_interpolate(real, fake, float(alpha))
+    d, norm = _r1_r2_input_grad(discriminator, x_hat)
+    return {"r2": r2_penalty([d], lam), "grad_norms": norm, "alpha": float(alpha)}
+
+
+def gan_penalty_diagnostics(discriminator, real, fake, lam=10.0, alpha=0.5):
+    """一次取回 R1/R2 两个诊断量：``{"r1","r2","grad_norms_real","grad_norms_hat","alpha"}``。"""
+    _r1_r2_check_discriminator(discriminator)
+    r1 = r1_diagnostics(discriminator, real, lam=lam)
+    r2 = r2_diagnostics(discriminator, real, fake, lam=lam, alpha=alpha)
+    return {"r1": r1["r1"], "r2": r2["r2"],
+            "grad_norms_real": r1["grad_norms"],
+            "grad_norms_hat": r2["grad_norms"], "alpha": float(alpha)}
+
 _LOG_2PI = math.log(2.0 * math.pi)
 
 
