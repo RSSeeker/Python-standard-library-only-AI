@@ -31373,3 +31373,92 @@ class TestVisualMetrics:
         bad_dim = [[[1.0], [2.0]], [[1.0], [2.0]]]
         _vis_raises(lambda: AI.fvd_lite(frames, bad_dim, embed_fn=lambda f: [1.0] if len(f[0]) == 1 else [1.0, 2.0]))
         _vis_raises(lambda: AI.fvd_lite(frames, frames, embed_fn=lambda f: "xy"))
+
+
+def _onnx_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestOnnxExport:
+    def test_export_roundtrip_and_forward(self):
+        m = AI.MLP([3, 4, 2], ["relu", "linear"])
+        data = AI.export_onnx_mlp(m)
+        assert isinstance(data, bytes) and len(data) > 100
+        d = AI.onnx_mlp_to_dict(data)
+        assert d["ir_version"] == 8
+        assert d["opset"] == 13
+        assert d["producer"] == "python-standard-library-only-ai"
+        assert [n["op_type"] for n in d["graph"]["nodes"]] == ["Gemm", "Relu", "Gemm", "Identity"]
+        assert all(n["attributes"].get("transB") == 1 for n in d["graph"]["nodes"]
+                   if n["op_type"] == "Gemm")
+        inits = d["graph"]["initializers"]
+        assert inits["W0"]["dims"] == [4, 3]
+        assert inits["b0"]["dims"] == [4]
+        assert inits["W1"]["dims"] == [2, 4]
+        assert inits["b1"]["dims"] == [2]
+        assert d["graph"]["inputs"][0]["dims"] == ["batch", 3]
+        assert d["graph"]["outputs"][0]["dims"] == ["batch", 2]
+        rows = [[0.1, -0.2, 0.3], [1.0, 2.0, -1.0], [0.0, 0.0, 0.0]]
+        got = AI.onnx_mlp_forward(data, rows)
+        ref = [m.forward(r) for r in rows]
+        err = max(abs(got[i][j] - ref[i][j]) for i in range(len(rows)) for j in range(2))
+        assert err < 1e-5
+
+    def test_export_activations(self):
+        m = AI.MLP([2, 3, 2], ["leaky_relu", "softmax"])
+        data = AI.export_onnx_mlp(m)
+        d = AI.onnx_mlp_to_dict(data)
+        acts = [(n["op_type"], n["attributes"]) for n in d["graph"]["nodes"]
+                if n["op_type"] not in ("Gemm",)]
+        leaky = [a for a in acts if a[0] == "LeakyRelu"][0]
+        assert abs(leaky[1]["alpha"] - 0.01) < 1e-9
+        sm = [a for a in acts if a[0] == "Softmax"][0]
+        assert sm[1]["axis"] == -1
+        rows = [[0.5, -0.5], [2.0, 0.0]]
+        got = AI.onnx_mlp_forward(data, rows)
+        ref = [m.forward(r) for r in rows]
+        err = max(abs(got[i][j] - ref[i][j]) for i in range(2) for j in range(2))
+        assert err < 1e-5
+        assert all(abs(sum(r) - 1.0) < 1e-6 for r in got)
+
+    def test_export_to_file(self):
+        import os
+        import tempfile
+        m = AI.MLP([2, 2], ["sigmoid"])
+        tmpdir = tempfile.mkdtemp(prefix="onnx-test-")
+        path = os.path.join(tmpdir, "model.onnx")
+        data = AI.export_onnx_mlp(m, path)
+        assert os.path.isfile(path)
+        with open(path, "rb") as f:
+            raw = f.read()
+        assert raw == data
+        d = AI.onnx_mlp_to_dict(raw)
+        assert d["graph"]["nodes"][1]["op_type"] == "Sigmoid"
+        rows = [[0.0, 0.0], [1.0, -1.0]]
+        got = AI.onnx_mlp_forward(raw, rows)
+        ref = [m.forward(r) for r in rows]
+        err = max(abs(got[i][j] - ref[i][j]) for i in range(2) for j in range(2))
+        assert err < 1e-5
+
+    def test_export_invalid_inputs(self):
+        _onnx_raises(lambda: AI.export_onnx_mlp("not a model"), exc=TypeError)
+        _onnx_raises(lambda: AI.export_onnx_mlp(AI.MLP([2, 2]), path=123), exc=TypeError)
+        gelu = AI.MLP([2, 3, 2], ["gelu", "linear"])
+        _onnx_raises(lambda: AI.export_onnx_mlp(gelu))
+        _onnx_raises(lambda: AI.onnx_mlp_to_dict("abc"), exc=TypeError)
+        _onnx_raises(lambda: AI.onnx_mlp_to_dict(b""))
+        _onnx_raises(lambda: AI.onnx_mlp_to_dict(b"\x08"))
+
+    def test_executor_invalid_inputs(self):
+        m = AI.MLP([2, 3], ["relu"])
+        data = AI.export_onnx_mlp(m)
+        _onnx_raises(lambda: AI.onnx_mlp_forward(data, [[1.0]]))
+        _onnx_raises(lambda: AI.onnx_mlp_forward(data, [[1.0, "x"]]), exc=TypeError)
+        _onnx_raises(lambda: AI.onnx_mlp_forward(data, [[1.0, True]]), exc=TypeError)
+        _onnx_raises(lambda: AI.onnx_mlp_forward(data, []))

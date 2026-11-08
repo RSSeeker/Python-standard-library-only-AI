@@ -128,6 +128,7 @@ import heapq
 import html
 import random
 import re
+import struct
 import time
 import tracemalloc
 from typing import List, Tuple, Optional, Callable, Any
@@ -52632,6 +52633,451 @@ def load_model(filepath: str, default_output_activation: Optional[str] = None) -
     print(f"模型已从 {filepath} 加载")
     return model
 
+
+"""把本库的 MLP 导出成 ONNX（ModelProto 字节流），并提供最小解析/执行器。
+
+本项目只依赖标准库，所以这里手写 protobuf 编码，而不是引入 onnx/onnxruntime：
+- `export_onnx_mlp(model, path=None)`：把一个 `MLP` 导出为 ONNX ModelProto 字节；
+  图中每层是一个 `Gemm(transB=1)` + 激活（linear/relu/leaky_relu/tanh/sigmoid/softmax）。
+- `onnx_mlp_to_dict(data)`：解析导出的字节，返回 python 字典（用于测试/检查）。
+- `onnx_mlp_forward(data, rows)`：执行导出的图，按批计算输出。
+
+边界：只覆盖 MLP（没有 Conv/Attention/RNN），也只支持上述六种激活；
+GELU/SiLU/Mish/ELU/SELU 会被拒绝（ONNX 图里没有对应简化节点）。
+"""
+
+_OX_ONNX_OPSET = 13
+_OX_IR_VERSION = 8
+_OX_PRODUCER = "python-standard-library-only-ai"
+_OX_ACT_SUPPORTED = ("linear", "relu", "leaky_relu", "tanh", "sigmoid", "softmax")
+_OX_ACT_OPS = {
+    "linear": "Identity",
+    "relu": "Relu",
+    "leaky_relu": "LeakyRelu",
+    "tanh": "Tanh",
+    "sigmoid": "Sigmoid",
+    "softmax": "Softmax",
+}
+
+
+# ---------- protobuf 基础编码 ----------
+
+def _ox_varint(n):
+    if n < 0:
+        n += 1 << 64
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _ox_tag(field, wire):
+    return _ox_varint((field << 3) | wire)
+
+
+def _ox_int(field, value):
+    return _ox_tag(field, 0) + _ox_varint(int(value))
+
+
+def _ox_bytes(field, data):
+    return _ox_tag(field, 2) + _ox_varint(len(data)) + data
+
+
+def _ox_str(field, s):
+    return _ox_bytes(field, s.encode("utf-8"))
+
+
+def _ox_float32(field, value):
+    return _ox_tag(field, 5) + struct.pack("<f", float(value))
+
+
+def _ox_signed_int64_field(field, value):
+    return _ox_tag(field, 0) + _ox_varint(int(value) & ((1 << 64) - 1))
+
+
+# ---------- protobuf 基础解码 ----------
+
+def _ox_read_varint(data, pos):
+    shift = 0
+    result = 0
+    while True:
+        if pos >= len(data):
+            raise ValueError("onnx: protobuf varint 越界")
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+        if shift > 70:
+            raise ValueError("onnx: protobuf varint 过长")
+
+
+def _ox_decode_message(data):
+    """把一段 protobuf 解成 {field: [values]}；wire=0 是 int，2 是 bytes，5 是 float。"""
+    out = {}
+    pos = 0
+    while pos < len(data):
+        key, pos = _ox_read_varint(data, pos)
+        field = key >> 3
+        wire = key & 7
+        if wire == 0:
+            val, pos = _ox_read_varint(data, pos)
+        elif wire == 2:
+            ln, pos = _ox_read_varint(data, pos)
+            if pos + ln > len(data):
+                raise ValueError("onnx: protobuf 长度越界")
+            val = data[pos:pos + ln]
+            pos += ln
+        elif wire == 5:
+            if pos + 4 > len(data):
+                raise ValueError("onnx: protobuf float32 越界")
+            val = struct.unpack("<f", data[pos:pos + 4])[0]
+            pos += 4
+        elif wire == 1:
+            if pos + 8 > len(data):
+                raise ValueError("onnx: protobuf float64 越界")
+            val = struct.unpack("<d", data[pos:pos + 8])[0]
+            pos += 8
+        else:
+            raise ValueError("onnx: 不支持的 wire type %d" % wire)
+        out.setdefault(field, []).append(val)
+    return out
+
+
+def _ox_first(msg, field, default=None):
+    vals = msg.get(field)
+    return vals[0] if vals else default
+
+
+def _ox_int_value(msg, field, default=0):
+    vals = msg.get(field)
+    if not vals:
+        return default
+    v = vals[0]
+    if v >= (1 << 63):
+        v -= 1 << 64
+    return v
+
+
+def _ox_packed_ints(data):
+    out = []
+    pos = 0
+    while pos < len(data):
+        v, pos = _ox_read_varint(data, pos)
+        out.append(v)
+    return out
+
+
+# ---------- ONNX 子结构编码 ----------
+
+def _ox_tensor(name, dims, values):
+    body = b""
+    packed = b"".join(_ox_varint(d) for d in dims)
+    body += _ox_bytes(1, packed)          # dims（packed）
+    body += _ox_int(2, 1)                 # data_type = FLOAT
+    body += _ox_bytes(9, struct.pack("<%df" % len(values), *[float(v) for v in values]))
+    body += _ox_str(8, name)
+    return body
+
+
+def _ox_dim(shape_dim):
+    if isinstance(shape_dim, str):
+        return _ox_str(2, shape_dim)          # dim_param
+    return _ox_int(1, int(shape_dim))          # dim_value
+
+
+def _ox_tensor_shape(dims):
+    body = b"".join(_ox_bytes(1, _ox_dim(d)) for d in dims)
+    return body
+
+
+def _ox_value_info(name, dims):
+    tensor_type = _ox_int(1, 1) + _ox_bytes(2, _ox_tensor_shape(dims))
+    type_proto = _ox_bytes(1, tensor_type)
+    return _ox_str(1, name) + _ox_bytes(2, type_proto)
+
+
+def _ox_attribute_int(name, value):
+    body = _ox_str(1, name) + _ox_signed_int64_field(3, value) + _ox_int(20, 2)
+    return body
+
+
+def _ox_attribute_float(name, value):
+    body = _ox_str(1, name) + _ox_float32(2, value) + _ox_int(20, 1)
+    return body
+
+
+def _ox_node(op_type, inputs, outputs, name, attributes=()):
+    body = b""
+    for inp in inputs:
+        body += _ox_str(1, inp)
+    for out in outputs:
+        body += _ox_str(2, out)
+    body += _ox_str(3, name)
+    body += _ox_str(4, op_type)
+    for attr in attributes:
+        body += _ox_bytes(5, attr)
+    return body
+
+
+def _ox_operator_set(domain, version):
+    body = _ox_str(1, domain) + _ox_int(2, version)
+    return body
+
+
+# ---------- 导出 ----------
+
+def _ox_check_mlp(model):
+    if not isinstance(model, MLP):
+        raise TypeError("export_onnx_mlp: model 必须是 MLP")
+    for i, layer in enumerate(model.layers):
+        act = layer.activation_name
+        if act not in _OX_ACT_SUPPORTED:
+            raise ValueError(
+                "export_onnx_mlp: 第 %d 层激活 %r 暂不支持导出（支持 %s）"
+                % (i + 1, act, "/".join(_OX_ACT_SUPPORTED)))
+
+
+def export_onnx_mlp(model, path=None):
+    """把 `MLP` 导出为 ONNX ModelProto 字节（可选写入 `path`），返回 bytes。"""
+    _ox_check_mlp(model)
+    if path is not None and not isinstance(path, str):
+        raise TypeError("export_onnx_mlp: path 必须是字符串或 None")
+    nodes = []
+    inits = []
+    current = "input"
+    for i, layer in enumerate(model.layers):
+        w_name = "W%d" % i
+        b_name = "b%d" % i
+        z_name = "z%d" % i
+        y_name = "y%d" % i
+        flat_w = [float(v) for row in layer.weights for v in row]
+        inits.append(_ox_tensor(w_name, [layer.fan_out, layer.fan_in], flat_w))
+        inits.append(_ox_tensor(b_name, [layer.fan_out], [float(v) for v in layer.biases]))
+        attrs = [_ox_attribute_int("transB", 1)]
+        nodes.append(_ox_node("Gemm", [current, w_name, b_name], [z_name],
+                              "gemm%d" % i, attrs))
+        act = layer.activation_name
+        op = _OX_ACT_OPS[act]
+        act_attrs = []
+        if act == "leaky_relu":
+            act_attrs.append(_ox_attribute_float("alpha", 0.01))
+        elif act == "softmax":
+            act_attrs.append(_ox_attribute_int("axis", -1))
+        nodes.append(_ox_node(op, [z_name], [y_name], "act%d" % i, act_attrs))
+        current = y_name
+    graph = b""
+    for node in nodes:
+        graph += _ox_bytes(1, node)
+    graph += _ox_str(2, "mlp")
+    for init in inits:
+        graph += _ox_bytes(5, init)
+    graph += _ox_bytes(11, _ox_value_info("input", ["batch", model.layer_sizes[0]]))
+    graph += _ox_bytes(12, _ox_value_info(current, ["batch", model.layer_sizes[-1]]))
+    model_proto = b""
+    model_proto += _ox_int(1, _OX_IR_VERSION)
+    opset = _ox_operator_set("", _OX_ONNX_OPSET)
+    model_proto += _ox_bytes(2, opset)
+    model_proto += _ox_str(3, _OX_PRODUCER)
+    model_proto += _ox_str(4, "1.0")
+    model_proto += _ox_bytes(7, graph)
+    data = model_proto
+    if path is not None:
+        with open(path, "wb") as f:
+            f.write(data)
+    return data
+
+
+# ---------- 解析 ----------
+
+def _ox_parse_value_info(raw):
+    msg = _ox_decode_message(raw)
+    name = _ox_first(msg, 1, b"").decode("utf-8")
+    dims = []
+    type_raw = _ox_first(msg, 2)
+    if type_raw is not None:
+        type_msg = _ox_decode_message(type_raw)
+        tensor_raw = _ox_first(type_msg, 1)
+        if tensor_raw is not None:
+            tmsg = _ox_decode_message(tensor_raw)
+            shape_raw = _ox_first(tmsg, 2)
+            if shape_raw is not None:
+                shape_msg = _ox_decode_message(shape_raw)
+                for dim_raw in shape_msg.get(1, []):
+                    dmsg = _ox_decode_message(dim_raw)
+                    if 1 in dmsg:
+                        dims.append(_ox_int_value(dmsg, 1))
+                    else:
+                        dims.append(_ox_first(dmsg, 2, b"").decode("utf-8"))
+    return {"name": name, "dims": dims}
+
+
+def _ox_parse_attribute(raw):
+    msg = _ox_decode_message(raw)
+    name = _ox_first(msg, 1, b"").decode("utf-8")
+    attr_type = _ox_int_value(msg, 20, 0)
+    if attr_type == 1:
+        return name, float(_ox_first(msg, 2, 0.0))
+    if attr_type == 2:
+        return name, _ox_int_value(msg, 3, 0)
+    if attr_type == 3:
+        return name, _ox_first(msg, 4, b"").decode("utf-8")
+    return name, None
+
+
+def _ox_parse_tensor(raw):
+    msg = _ox_decode_message(raw)
+    dims = []
+    for chunk in msg.get(1, []):
+        if isinstance(chunk, bytes):
+            dims.extend(_ox_packed_ints(chunk))
+        else:
+            dims.append(chunk)
+    name = _ox_first(msg, 8, b"").decode("utf-8")
+    raw_data = _ox_first(msg, 9, b"")
+    values = list(struct.unpack("<%df" % (len(raw_data) // 4), raw_data)) if raw_data else []
+    return {"name": name, "dims": dims, "values": values}
+
+
+def onnx_mlp_to_dict(data):
+    """解析 `export_onnx_mlp` 产出的字节，返回结构化字典（用于检查/测试）。"""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("onnx_mlp_to_dict: data 必须是 bytes")
+    msg = _ox_decode_message(bytes(data))
+    graph_raw = _ox_first(msg, 7)
+    if graph_raw is None:
+        raise ValueError("onnx_mlp_to_dict: 缺少 graph 字段")
+    gmsg = _ox_decode_message(graph_raw)
+    nodes = []
+    for node_raw in gmsg.get(1, []):
+        nmsg = _ox_decode_message(node_raw)
+        nodes.append({
+            "op_type": _ox_first(nmsg, 4, b"").decode("utf-8"),
+            "name": _ox_first(nmsg, 3, b"").decode("utf-8"),
+            "inputs": [v.decode("utf-8") for v in nmsg.get(1, [])],
+            "outputs": [v.decode("utf-8") for v in nmsg.get(2, [])],
+            "attributes": dict(_ox_parse_attribute(a) for a in nmsg.get(5, [])),
+        })
+    inits = {}
+    for init_raw in gmsg.get(5, []):
+        t = _ox_parse_tensor(init_raw)
+        inits[t["name"]] = t
+    inputs = [_ox_parse_value_info(v) for v in gmsg.get(11, [])]
+    outputs = [_ox_parse_value_info(v) for v in gmsg.get(12, [])]
+    opset_raw = _ox_first(msg, 2)
+    opset = 0
+    if opset_raw is not None:
+        omsg = _ox_decode_message(opset_raw)
+        opset = _ox_int_value(omsg, 2, 0)
+    return {
+        "ir_version": _ox_int_value(msg, 1, 0),
+        "opset": opset,
+        "producer": _ox_first(msg, 3, b"").decode("utf-8"),
+        "graph": {
+            "name": _ox_first(gmsg, 2, b"").decode("utf-8"),
+            "nodes": nodes,
+            "initializers": inits,
+            "inputs": inputs,
+            "outputs": outputs,
+        },
+    }
+
+
+# ---------- 执行 ----------
+
+def _ox_matmul(a, b):
+    n = len(a)
+    k = len(a[0])
+    m = len(b[0])
+    if len(b) != k:
+        raise ValueError("onnx_mlp_forward: 矩阵维度不匹配")
+    out = []
+    for r in range(n):
+        row = [0.0] * m
+        ar = a[r]
+        for c in range(m):
+            acc = 0.0
+            for i in range(k):
+                acc += ar[i] * b[i][c]
+            row[c] = acc
+        out.append(row)
+    return out
+
+
+def _ox_softmax_rows(mat):
+    out = []
+    for row in mat:
+        mx = max(row)
+        ex = [math.exp(v - mx) for v in row]
+        tot = sum(ex)
+        out.append([v / tot for v in ex])
+    return out
+
+
+def onnx_mlp_forward(data, rows):
+    """执行导出的 ONNX 字节，`rows` 是 (样本数, 输入维度)；返回输出矩阵。"""
+    parsed = onnx_mlp_to_dict(data)
+    graph = parsed["graph"]
+    inits = graph["initializers"]
+    in_dim = graph["inputs"][0]["dims"][-1]
+    n = len(rows)
+    if n < 1:
+        raise ValueError("onnx_mlp_forward: rows 不能为空")
+    tensors = {}
+    for name, tensor in inits.items():
+        dims = tensor["dims"]
+        vals = tensor["values"]
+        if len(dims) == 2:
+            rows_n, cols_n = dims
+            tensors[name] = [vals[i * cols_n:(i + 1) * cols_n] for i in range(rows_n)]
+        else:
+            tensors[name] = list(vals)
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) != in_dim:
+            raise ValueError("onnx_mlp_forward: 每行长度必须等于输入维度 %d" % in_dim)
+        for v in r:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("onnx_mlp_forward: 输入必须是数字")
+    tensors["input"] = [[float(v) for v in r] for r in rows]
+    for node in graph["nodes"]:
+        op = node["op_type"]
+        args = [tensors[name] for name in node["inputs"]]
+        if op == "Gemm":
+            a, w, b = args
+            tr = node["attributes"].get("transB", 0)
+            wm = [list(col) for col in zip(*w)] if tr else w
+            out = _ox_matmul(a, wm)
+            for r in range(len(out)):
+                for c in range(len(out[0])):
+                    out[r][c] += b[c]
+        elif op == "MatMul":
+            out = _ox_matmul(args[0], args[1])
+        elif op == "Add":
+            a, b = args
+            out = [[a[r][c] + b[c] for c in range(len(a[0]))] for r in range(len(a))]
+        elif op == "Identity":
+            out = [list(r) for r in args[0]]
+        elif op == "Relu":
+            out = [[max(0.0, v) for v in r] for r in args[0]]
+        elif op == "LeakyRelu":
+            alpha = node["attributes"].get("alpha", 0.01)
+            out = [[v if v > 0 else alpha * v for v in r] for r in args[0]]
+        elif op == "Tanh":
+            out = [[math.tanh(v) for v in r] for r in args[0]]
+        elif op == "Sigmoid":
+            out = [[1.0 / (1.0 + math.exp(-v)) for v in r] for r in args[0]]
+        elif op == "Softmax":
+            out = _ox_softmax_rows(args[0])
+        else:
+            raise ValueError("onnx_mlp_forward: 不支持的节点 %r" % op)
+        tensors[node["outputs"][0]] = out
+    return tensors[graph["outputs"][0]["name"]]
 
 def save_conv_model(conv_layers, fc_model, filepath: str):
     """保存 CNN + MLP 组合模型

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2039 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2044 项）
 
 ## 特性
 
@@ -3224,6 +3224,9 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 | `save_model(model, path, task=None, optimizer=None, quiet=False, loss=None, loss_kwargs=None)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态，传 `loss=` / `loss_kwargs=` 时记下损失配置；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上；会保存 `groups`（分组/深度卷积可原样加载，没有该字段的旧存档按 1 处理） |
+| `export_onnx_mlp(model, path=None)` | 把 `MLP` 导出为 ONNX（手写 protobuf 子集：`Gemm`(transB=1) + 单目激活）；返回 bytes，传 `path` 时同时写文件 |
+| `onnx_mlp_to_dict(data)` | 解析导出的 ONNX ModelProto，返回 `{ir_version, opset, producer, graph}` 嵌套 dict |
+| `onnx_mlp_forward(data, rows)` | 在纯 Python 里执行导出的图（无 `onnxruntime` 依赖），返回每行输出 |
 | `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
 | `Lookahead(optimizer, k=6, alpha=0.5)` | 包在任意优化器外面：每 `k` 步把快权重与慢权重按 `alpha` 混合再同步；`state_dict()` 含内层状态与慢权重 |
 | `EMA(model, decay=0.999, warmup=0)` | 权重指数移动平均：`update()` 累积、`shadow()` 取快照、`apply_to(model)` 写回；`warmup>0` 时用 `(1+t)/(10+t)` 做有效衰减 |
@@ -3293,6 +3296,25 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 > 旧文件不含逐层 `activation` 时，输出层回退优先级为：显式参数 > 文件里的 `task`
 > （`classification` 用 softmax）> `linear`。既不传参数、文件里也没有 `task` 的旧分类器
 > 会被当成回归模型，请显式传 `default_output_activation='softmax'`。
+
+#### 导出到 ONNX
+
+`MLP` 可以导出成 ONNX 文本协议（二进制 protobuf）文件，方便交给其它运行时做推理校验：
+
+```python
+model = AI.MLP([3, 8, 2], ["relu", "softmax"])
+data = AI.export_onnx_mlp(model, "mlp.onnx")   # 返回 bytes，同时写文件
+graph = AI.onnx_mlp_to_dict(data)
+rows = AI.onnx_mlp_forward(data, [[0.1, 0.2, 0.3]])   # 纯 Python 执行导出图
+```
+
+边界与口径：
+
+- 只支持 `MLP`：每层一个 `Gemm`（`transB=1`，权重形状 `[fan_out, fan_in]`）+ 一个激活节点；激活限
+  `linear` / `relu` / `leaky_relu` / `tanh` / `sigmoid` / `softmax`，`gelu` / `silu` / `mish` / `elu` / `selu`
+  会直接报错。
+- protobuf 编码是手写的子集（`ir_version=8`、`opset=13`），只覆盖本模块会生成的字段；不是通用 ONNX 库。
+- 导出图里的 batch 维写成 `dim_param="batch"`，执行器按传入行数工作；导出与执行都没有调用 `onnxruntime`。
 
 ### 多任务权重
 
@@ -3635,7 +3657,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2039 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2044 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3838,6 +3860,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDimReductionSelection` | `PCA` 的秩一数据（`explained_variance_ratio_`=1、成分方向、均值点投到原点、k=1/k=2 往返）与白化后方差为 1、`TSNE` 让三类点的簇内平均距离小于簇间（1.2K 量级 vs 12 量级）且同种子可复现、`SMOTE` 补到4:4 且合成点落在少数类线段上、`ADASYN` 的加权与 `weights_`、`VarianceThreshold` 的方差值与去常量列、`SelectKBest` 的 F=8 与 pearson=2/√5、`RFE` 保留唯一有效列、`L1Selector` 保信号列压正交列，以及各类坏形状/非法超参 |
 | `TestAudioMetrics` | STOI 对加噪等级的单调性、极性反转与长度裁剪、PESQ 单调性与 [1,4.5] 边界、两项指标的非法输入 |
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
+| `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
@@ -3954,7 +3977,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2039 个单元测试
+├── test_ai.py       # 2044 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
