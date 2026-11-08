@@ -799,12 +799,13 @@ W0 + W1 + W3 + W9 + W13 + W2 的部分 = 约 8–10 个会话，就能让这个�
 
 按「先补最常用的」排序，每项都走 7.2 的六步：
 
-- [ ] **AdamW**（C 目前只有 Adam / SGD / SGDMomentum / RMSprop）
-- [ ] Lion / Adafactor
-- [ ] WarmupLR / ReduceLROnPlateau（C 只有 Step / Exponential / Cosine）
-- [ ] RMSNorm
-- [ ] `silu` / `mish` / `elu` / `selu`（扩 `act_apply` 枚举）与 GELU 版 FFN
-- [ ] 损失枚举补齐：先核对 `LossKind` 现有成员，再补 focal / bce / bce_with_logits / huber
+- [x] **AdamW**（`adamw_reference.json` + `tests/compare_adamw`：48 个数组里 44 个逐位，其余 4 个是 `pow(0.9,k)`/`pow(0.999,k)` 的 1 ULP，参考 JSON 已标 `tol=1e-12` + `note`）
+- [x] Lion / Adafactor（`lion_reference.json` 4 用例 32 数组、`adafactor_reference.json` 5 用例 50 数组，**全部 0.000e+00**）
+- [x] WarmupLR / ReduceLROnPlateau（`sched_extra_reference.json`，104 项逐位）
+- [x] RMSNorm（`rmsnorm_reference.json`，36 数组 153 值逐位）
+- [x] `silu` / `mish` / `elu` / `selu`（扩 `act_apply` 枚举；`activations_reference.json`，silu 全逐位，其余在 `z=-1e-8` 或 `log1p`/`tanh` 上按实测标 `tol=1e-12`）
+- [ ] GELU 版 FFN（C 的 `FeedForward` 目前只走 ReLU）
+- [x] 损失枚举补齐：focal / bce / bce_with_logits / huber（`losses.c`；`loss_reference.json` + `tests/compare_loss`：24 用例 48 个标量/数组里 47 个逐位，唯一差异是 `pow(0.6,3.0)` 的 1 ULP；`LossKind` 2→6，训练与验证共用一个 `trainer_loss_apply`，`tests/test_loss.c` 验集成）
 - [ ] 指标模块：accuracy / precision / recall / f1 / confusion_matrix / mae / rmse / mape / top-k / roc_auc
 - [ ] `Conv2d` 的 `groups` / `dilation`；`Conv1d` / `ConvTranspose2d`
 - [ ] `BatchNorm2d` / `GroupNorm` / `InstanceNorm` / `DropPath`
