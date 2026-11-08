@@ -8411,7 +8411,7 @@ class TestDDPM:
 
 
 # ============================================================================
-#  W0：训练基础设施（seed / 推理辅助 / 诊断 / 回调 / 续训 / layer_grad_norm / mixup）
+#  训练基础设施（seed / 推理辅助 / 诊断 / 回调 / 续训 / layer_grad_norm / mixup）
 # ============================================================================
 
 _DATA2 = [([0.0, 0.0], 0), ([0.0, 1.0], 0), ([1.0, 0.0], 0), ([1.0, 1.0], 1)]
@@ -14882,7 +14882,7 @@ class TestGraphLayers:
 
 
 # ============================================================================
-#  W6-B: GAT / APPNP / JKNet
+#  GAT / APPNP / JKNet
 # ============================================================================
 
 class TestGATLayer:
@@ -15124,7 +15124,7 @@ class TestJKNet:
 
 
 # ============================================================================
-#  W6-C: MPNN / GCNII / 图池化
+#  MPNN / GCNII / 图池化
 # ============================================================================
 
 class TestMPNNLayer:
@@ -15386,7 +15386,7 @@ class TestGraphPooling:
 
 
 # ============================================================================
-#  W7-A: 提示微调 / 序列打包 / 前缀缓存
+#  提示微调 / 序列打包 / 前缀缓存
 # ============================================================================
 
 class TestPromptTuning:
@@ -15580,7 +15580,7 @@ class TestPackingAndPrefixCache:
 
 
 # ============================================================
-#  W7-B：DoRA / AdaLoRA / 采样扩展
+#  DoRA / AdaLoRA / 采样扩展
 # ============================================================
 
 def _w7b_layer(seed=7):
@@ -15860,7 +15860,7 @@ class TestSamplingExtras:
 
 
 # ============================================================
-#  W7-C：约束解码 + 投机解码接受判定
+#  约束解码 + 投机解码接受判定
 # ============================================================
 
 class TestConstrainedDecoding:
@@ -15964,7 +15964,7 @@ class TestSpeculativeAccept:
 
 
 # ====  ======================================================================
-#   连续批处理调度器（W7-D）
+#   连续批处理调度器
 # ============================================================================
 
 class TestContinuousBatcher:
@@ -16057,7 +16057,7 @@ class TestContinuousBatcher:
 
 
 # ====  ======================================================================
-#   Tail-free 采样 + PagedAttention 块表（W7-E）
+#   Tail-free 采样 + PagedAttention 块表
 # ============================================================================
 
 class TestTailFreeFilter:
@@ -16171,7 +16171,7 @@ class TestPagedKVCache:
 
 
 # ====  ======================================================================
-#   扩散采样与预测参数化（W8-A）
+#   扩散采样与预测参数化
 # ============================================================================
 
 class TestDDIMSampling:
@@ -17023,7 +17023,7 @@ def _w9_close(a, b, tol=1e-12):
 
 
 class TestClassicOptimizers:
-    """W9-A：AdaGrad / AdaDelta / Nadam / RAdam"""
+    """AdaGrad / AdaDelta / Nadam / RAdam"""
 
     @staticmethod
     def _model(seed=0, sizes=(2, 3, 2)):
@@ -17255,7 +17255,7 @@ class TestClassicOptimizers:
 
 
 # ============================================================================
-#  W9-B：层粒度优化器（LARS / LAMB / Ranger）
+#  层粒度优化器（LARS / LAMB / Ranger）
 # ============================================================================
 
 class TestLayerwiseOptimizers:
@@ -17493,7 +17493,7 @@ class TestLayerwiseOptimizers:
             assert last < first, (name, first, last)
 
 
-# ==== W9-C：SGDW / Nesterov / Lookahead / EMA / SWA ====
+# ==== SGDW / Nesterov / Lookahead / EMA / SWA ====
 class TestSGDWFamily:
     X = [1.0, -0.5, 0.25]
     Y = [0.3, -0.7]
@@ -17723,7 +17723,7 @@ class TestEMASWACallbacks:
 
 
 # ============================================================================
-#  W9-D：学习率调度器族（LambdaLR / Multiplicative / MultiStep / 余弦重启 /
+#  学习率调度器族（LambdaLR / Multiplicative / MultiStep / 余弦重启 /
 #        CyclicLR / OneCycleLR / InverseSqrt / Noam / Polynomial / WSD /
 #        ChainedScheduler / SequentialLR）
 # ============================================================================
@@ -17919,7 +17919,7 @@ class TestSchedulerFamily:
                     s.step(bad)
 
     def test_existing_schedulers_unchanged(self):
-        """回归锁：W9-D 不应改动旧调度器的数值行为。"""
+        """回归锁：不应改动旧调度器的数值行为。"""
         o = self._Opt(0.1)
         s = AI.StepLR(o, step_size=2, gamma=0.5)
         seq = [self._at(s, e) for e in range(1, 6)]
@@ -17967,7 +17967,7 @@ class TestSchedulerFamily:
 
 
 # ============================================================================
-#  W9-E：进阶优化器（Adan / Prodigy / CAME）
+#  进阶优化器（Adan / Prodigy / CAME）
 # ============================================================================
 
 class TestAdvancedOptimizers:
@@ -18127,7 +18127,7 @@ class TestAdvancedOptimizers:
 
 
 class TestAdvancedOptimizers2:
-    """W9-E2：Shampoo / Sophia / L-BFGS 的闭式解、退化分支与状态往返"""
+    """Shampoo / Sophia / L-BFGS 的闭式解、退化分支与状态往返"""
 
     X = [1.0, -0.5, 0.25]
     Y = [0.3, -0.7]
@@ -18335,7 +18335,7 @@ class TestAdvancedOptimizers2:
 
 
 class TestDropoutVariants:
-    """W10-A：SpatialDropout1d/2d、AlphaDropout、GaussianDropout、R-Drop"""
+    """SpatialDropout1d/2d、AlphaDropout、GaussianDropout、R-Drop"""
 
     SEQ = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
     IMG = [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]
@@ -18461,7 +18461,7 @@ class TestDropoutVariants:
 
 
 # ============================================================================
-#  W10-B：结构化正则（DropBlock2d / DropConnect）
+#  结构化正则（DropBlock2d / DropConnect）
 # ============================================================================
 
 class TestStructuredRegularization:
@@ -18606,7 +18606,7 @@ class TestStructuredRegularization:
 
 
 # ============================================================================
-#  W10-C：对抗训练（FGSM / PGD / TRADES / MART / SMART / fit(adv_eps)）
+#  对抗训练（FGSM / PGD / TRADES / MART / SMART / fit(adv_eps)）
 # ============================================================================
 
 class TestAdversarialTraining:
@@ -18768,7 +18768,7 @@ class TestAdversarialTraining:
 
 
 # ============================================================================
-#  W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#  噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
 # ============================================================================
 
 class TestNoiseCurriculumEnsemble:
@@ -18912,7 +18912,7 @@ class TestNoiseCurriculumEnsemble:
 
 
 # ============================================================================
-#  W10-E：半监督（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#  半监督（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
 # ============================================================================
 
 class TestSemiSupervised:
@@ -19072,7 +19072,7 @@ class TestSemiSupervised:
 
 
 class TestCheckpointMixedPrecision:
-    """W10-F：梯度检查点与混合精度模拟"""
+    """梯度检查点与混合精度模拟"""
 
     @staticmethod
     def _net():
@@ -19179,7 +19179,7 @@ class TestCheckpointMixedPrecision:
 
 
 class TestDataPipeline:
-    """W11-A：Dataset / Sampler / 长度分桶 / 预处理缓存"""
+    """Dataset / Sampler / 长度分桶 / 预处理缓存"""
 
     def test_dataset_abstraction(self):
         for call in (lambda: len(AI.Dataset()), lambda: AI.Dataset()[0]):
@@ -19307,7 +19307,7 @@ class TestDataPipeline:
 
 
 class TestEncoders:
-    """W11-B：六种编码器"""
+    """六种编码器"""
 
     def test_label_encoder(self):
         le = AI.LabelEncoder().fit(["b", "a", "c", "a"])
@@ -19395,7 +19395,7 @@ class TestEncoders:
 
 
 class TestImageAugmentation:
-    """W11-C：图像增强管道"""
+    """图像增强管道"""
 
     def test_resize_bilinear(self):
         up = AI._resize_bilinear([[[0.0, 10.0], [20.0, 30.0]]], 3, 3)
@@ -19523,7 +19523,7 @@ class TestImageAugmentation:
 
 
 class TestSplitExtensions:
-    """W11-D：GroupKFold / 时间序列切分 / Purged K-Fold"""
+    """GroupKFold / 时间序列切分 / Purged K-Fold"""
 
     def test_group_k_fold(self):
         groups = ["a", "a", "a", "b", "b", "c", "d", "d", "e", "f"]
@@ -19609,7 +19609,7 @@ class TestSplitExtensions:
 
 
 class TestScalerFamily:
-    """W11-E：Robust / MaxAbs / QuantileTransformer / PowerTransformer"""
+    """Robust / MaxAbs / QuantileTransformer / PowerTransformer"""
 
     def test_robust_scaler(self):
         x = [[1.0], [2.0], [3.0], [4.0], [100.0]]
@@ -19718,7 +19718,7 @@ class TestScalerFamily:
                 obj.fit([["a"]])
 
 class TestImputers:
-    """W11-F：Simple / KNN / Iterative 缺失值填补"""
+    """Simple / KNN / Iterative 缺失值填补"""
 
     def test_simple_mean_transform(self):
         x = [[1.0, 10.0], [3.0, None], [None, 30.0]]
@@ -19836,7 +19836,7 @@ class TestImputers:
         assert abs(coef[0] - 2.0 * std[0]) < 1e-6
         assert abs(yb - 5.0) < 1e-12
 class TestDimReductionSelection:
-    """W11-G：PCA / t-SNE / SMOTE·ADASYN / 特征选择"""
+    """PCA / t-SNE / SMOTE·ADASYN / 特征选择"""
 
     def test_pca_rank_one(self):
         line = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]]
@@ -20044,7 +20044,7 @@ class TestDimReductionSelection:
 
 
 class TestTextAudioAugmentation:
-    """W11-H 文本增强（同义词 / EDA）与音频增强（概念）。"""
+    """文本增强（同义词 / EDA）与音频增强（概念）。"""
 
     def test_synonym_replace_probability_and_validity(self):
         syn = {"a": ["a1", "a2"], "b": ["b1"], "z": []}
@@ -20160,7 +20160,7 @@ class TestTextAudioAugmentation:
             AI.audio_add_noise(["a"], 10.0)
 
 class TestSpecialTokensAndBatching:
-    """W12-A：SpecialTokens 统一管理 + pad / truncate / mask / 批量分词。"""
+    """SpecialTokens 统一管理 + pad / truncate / mask / 批量分词。"""
 
     def test_special_tokens_defaults_and_lookup(self):
         st = AI.SpecialTokens.defaults()
@@ -20277,7 +20277,7 @@ class TestSpecialTokensAndBatching:
             AI.tokenize_batch(object(), ["a"])
 
 class TestTokenizers:
-    """W12-B：Whitespace / Word / Regex / SentencePiece（简化版）。"""
+    """Whitespace / Word / Regex / SentencePiece（简化版）。"""
 
     def test_whitespace_tokenizer(self):
         tok = AI.WhitespaceTokenizer().fit(["a b c", "a b"], min_frequency=1)
@@ -20420,7 +20420,7 @@ class TestTokenizers:
             AI.SentencePieceTokenizer().train(["abc"], vocab_size=1.5)
 
 class TestRegressionMetricsExtra:
-    """W13-A：MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Pinball。"""
+    """MedAE / MSLE / RMSLE / ExplainedVariance / AdjustedR² / Pinball。"""
 
     def test_median_absolute_error(self):
         assert AI.median_absolute_error([1, 2, 3], [1, 2, 3]) == 0.0
@@ -21183,7 +21183,7 @@ class TestImageQualityMetrics:
             AI.inception_score([[0.0, 0.0]])
 
 class TestConsistencyFairness:
-    """W13-K：一致性与公平性指标。"""
+    """一致性与公平性指标。"""
 
     @staticmethod
     def _fleiss_classic():
@@ -21305,7 +21305,7 @@ class TestConsistencyFairness:
                                            ["a", "a", "b", "b"])
 
 class TestAttribution:
-    """W14-A：输入归因（Saliency / Grad×Input / SmoothGrad / IG / DeepLIFT）。"""
+    """输入归因（Saliency / Grad×Input / SmoothGrad / IG / DeepLIFT）。"""
 
     @staticmethod
     def _linear():
@@ -21413,7 +21413,7 @@ class TestAttribution:
         assert AI.saliency_map(wrapper, [2.0, 5.0]) == [0.0, 1.0]
 
 class TestAttentionAttribution:
-    """W14-B：注意力 Rollout / Flow。"""
+    """注意力 Rollout / Flow。"""
 
     IDENT = [[1.0, 0.0], [0.0, 1.0]]
     UNIFORM = [[0.5, 0.5], [0.5, 0.5]]
@@ -21502,7 +21502,7 @@ import pytest
 
 
 class TestPermutationFeatureMaps:
-    """W14-C：置换重要性 + 特征图 ASCII 渲染。"""
+    """置换重要性 + 特征图 ASCII 渲染。"""
 
     @staticmethod
     def _model():
@@ -21624,7 +21624,7 @@ import pytest
 
 
 class TestCAM:
-    """W14-D：GradCAM / GradCAM++ / LayerCAM / ScoreCAM。"""
+    """GradCAM / GradCAM++ / LayerCAM / ScoreCAM。"""
 
     X = [[[1.0, 2.0, 3.0],
           [4.0, 5.0, 6.0],
@@ -21777,7 +21777,7 @@ class _Two:
 
 
 class TestShapLimeAnchors:
-    """W14-E：KernelSHAP / LIME / Anchors / 嵌入可视化。"""
+    """KernelSHAP / LIME / Anchors / 嵌入可视化。"""
 
     W = [2.0, -3.0, 0.5]
     X = [1.0, 2.0, -1.0]
@@ -21896,7 +21896,7 @@ class TestShapLimeAnchors:
 
 
 class TestExplanationExtras:
-    """W14-F：TCAV / 激活最大化 / 网络解剖 / 原型 / 反事实 / 影响分数。"""
+    """TCAV / 激活最大化 / 网络解剖 / 原型 / 反事实 / 影响分数。"""
 
     @staticmethod
     def _identity_net():
@@ -22022,7 +22022,7 @@ class TestExplanationExtras:
 
 
 class TestStructuredPruning:
-    """W15-A：通道 / 头 / 层的结构化剪枝与稀疏度统计。"""
+    """通道 / 头 / 层的结构化剪枝与稀疏度统计。"""
 
     @staticmethod
     def _net():
@@ -22119,7 +22119,7 @@ class TestStructuredPruning:
 
 
 class TestQuantization:
-    """W15-B：PTQ / QAT 伪量化 / SmoothQuant 缩放。"""
+    """PTQ / QAT 伪量化 / SmoothQuant 缩放。"""
 
     def test_fake_quantize_grid_and_peak(self):
         out = AI.fake_quantize([0.0, 1.0], bits=8)
@@ -22225,7 +22225,7 @@ class TestQuantization:
 
 
 class TestEnsembles:
-    """W15-C：Voting / Bagging / Stacking / AdaBoostStumps。"""
+    """Voting / Bagging / Stacking / AdaBoostStumps。"""
 
     class _Fixed:
         def __init__(self, out):
@@ -22376,7 +22376,7 @@ class TestEnsembles:
 
 
 class TestPackingAndSpeculative:
-    """W15-D：批内打包 + 投机解码集成。"""
+    """批内打包 + 投机解码集成。"""
 
     def test_pack_decode_batch(self):
         packed = AI.pack_decode_batch([[1, 2, 3], [4, 5]], pad_id=0)
@@ -22443,7 +22443,7 @@ class TestPackingAndSpeculative:
 
 
 class TestContrastiveLearning:
-    """W16-A：对比学习损失（SimCLR / MoCo / BYOL / Barlow / VICReg / SwAV / DINO）。"""
+    """对比学习损失（SimCLR / MoCo / BYOL / Barlow / VICReg / SwAV / DINO）。"""
 
     _Z1 = [[0.4, -0.2, 0.7], [-0.5, 0.9, 0.1], [0.3, 0.3, -0.8]]
     _Z2 = [[0.2, 0.5, -0.6], [0.8, -0.1, 0.4], [-0.4, 0.2, 0.9]]
@@ -22553,7 +22553,7 @@ class TestContrastiveLearning:
         with pytest.raises(ValueError):
             AI.update_dino_center(center, self._Z2, 1.5)
 class TestMaskedVisionModeling:
-    """W16-B：视觉掩码建模（patchify / random_masking / block_mask / 三种损失）。"""
+    """视觉掩码建模（patchify / random_masking / block_mask / 三种损失）。"""
 
     IMG = [
         [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0],
@@ -22654,7 +22654,7 @@ class TestMaskedVisionModeling:
         with pytest.raises(ValueError):
             AI.beit_loss(logits, [0, 0], [0])
 class TestMultimodal:
-    """W16-C：CLIP 双塔（相似度 / 对称 InfoNCE / 检索准确率 / 投影头）+ 跨模态融合块。"""
+    """CLIP 双塔（相似度 / 对称 InfoNCE / 检索准确率 / 投影头）+ 跨模态融合块。"""
 
     IMG = [[1.0, 0.0], [0.0, 1.0]]
     TXT = [[2.0, 0.0], [0.0, 3.0]]
@@ -22799,7 +22799,7 @@ class TestMultimodal:
         b2.zero_grad()
         assert all(v == 0.0 for row in b2.attn.grads["W_q"] for v in row)
 class TestPredictiveSelfSupervision:
-    """W16-D：预测式自监督（Rotation 旋转预测 + Jigsaw 拼图预测）。"""
+    """预测式自监督（Rotation 旋转预测 + Jigsaw 拼图预测）。"""
 
     IMG = [
         [[1.0, 2.0], [3.0, 4.0]],
@@ -22886,7 +22886,7 @@ class TestPredictiveSelfSupervision:
         with pytest.raises(ValueError):
             AI.linear_probe_accuracy([[1.0, None]], [0])
 class TestRLEnvironments:
-    """W16-E：内置环境（GridWorld / CartPole）+ 回报与 rollout 工具。"""
+    """内置环境（GridWorld / CartPole）+ 回报与 rollout 工具。"""
 
     def test_gridworld_basics(self):
         env = AI.GridWorld(height=3, width=3, start=(0, 0), goal=(2, 2), max_steps=10)
@@ -22991,7 +22991,7 @@ class TestRLEnvironments:
             AI.rollout(env, lambda s: 1, 0)
 
 class TestDQNFamily:
-    """W16-F：经验回放 / DQN 目标 / Huber TD / Dueling 聚合 / DQNAgent"""
+    """经验回放 / DQN 目标 / Huber TD / Dueling 聚合 / DQNAgent"""
 
     def test_replay_buffer_fifo(self):
         buf = AI.ReplayBuffer(capacity=3, seed=1)
@@ -23146,7 +23146,7 @@ class TestDQNFamily:
             AI.DQNNetwork(2, 2).copy_from(AI.DQNNetwork(3, 2))
 
 class TestPolicyGradient:
-    """W16-F2：REINFORCE / A2C(GAE) / PPO 的策略梯度与裁剪"""
+    """REINFORCE / A2C(GAE) / PPO 的策略梯度与裁剪"""
 
     def test_policy_gradient_loss(self):
         logits = [1.0, 0.0, -1.0]
@@ -23286,7 +23286,7 @@ class TestPolicyGradient:
             AI.PPOAgent(2, 2, epochs=0)
 
 class TestRLInfrastructure:
-    """W16-G：ε 衰减 / ε-greedy / UCB / Thompson / Bradley-Terry 奖励 / RLHF KL"""
+    """ε 衰减 / ε-greedy / UCB / Thompson / Bradley-Terry 奖励 / RLHF KL"""
 
     def test_epsilon_schedule(self):
         assert AI.epsilon_schedule(0, 1.0, 0.05, 100) == 1.0
@@ -23380,7 +23380,7 @@ class TestRLInfrastructure:
 
 
 class TestMetaLearning:
-    """W16-H：MAML / Reptile / ProtoNet / Matching Networks。"""
+    """MAML / Reptile / ProtoNet / Matching Networks。"""
 
     @staticmethod
     def _flat(mlp):
@@ -23562,7 +23562,7 @@ class TestMetaLearning:
 
 
 class TestFederatedLearning:
-    """W16-I：FedAvg / FedProx / FedBN / 参数摊平。"""
+    """FedAvg / FedProx / FedBN / 参数摊平。"""
 
     def test_named_params_roundtrip(self):
         AI.set_seed(21)
@@ -23697,7 +23697,7 @@ class TestFederatedLearning:
 
 
 class TestTimeSeriesModels:
-    """W17-A：TCN / Informer 稀疏注意力 / Autoformer 分解 / PatchTST。"""
+    """TCN / Informer 稀疏注意力 / Autoformer 分解 / PatchTST。"""
 
     def test_causal_conv_closed_form(self):
         conv = AI._CausalConv1d(1, 1, kernel_size=2, dilation=1, seed=7)
@@ -23878,7 +23878,7 @@ class TestTimeSeriesModels:
 
 
 class TestRecommenders:
-    """W17-B-1：矩阵分解 / NCF / Wide&Deep。"""
+    """矩阵分解 / NCF / Wide&Deep。"""
 
     def test_matrix_factorization_converges(self):
         true_p = [[1.0, 0.5], [0.2, -1.5], [-0.8, 0.3]]
@@ -24056,7 +24056,7 @@ class TestRecommenders:
 
 
 class TestDeepFMAndDIN:
-    """W17-B-2：DeepFM（FM 二阶交叉）与 DIN（注意力池化）。"""
+    """DeepFM（FM 二阶交叉）与 DIN（注意力池化）。"""
 
     def test_deepfm_logit_and_param_count(self):
         model = AI.DeepFM(num_fields=3, num_factors=2, hidden=(4,), seed=9)
@@ -24254,7 +24254,7 @@ class TestDeepFMAndDIN:
             din.apply_grads(grads, lr=-1.0)
 
 class TestStyleTransfer:
-    """W17-C-1：Gram 矩阵 / 特征提取器反传 / 神经风格迁移。"""
+    """Gram 矩阵 / 特征提取器反传 / 神经风格迁移。"""
 
     def _img(self):
         return [[[0.5, 0.2, 0.1], [0.3, 0.7, 0.4], [0.9, 0.6, 0.8]]]
@@ -24419,7 +24419,7 @@ class TestStyleTransfer:
 
 
 class TestSuperResolutionDenoising:
-    """W17-C-2：SRCNN 式超分与 DnCNN 式残差去噪。"""
+    """SRCNN 式超分与 DnCNN 式残差去噪。"""
 
     @staticmethod
     def _const(c, h, w, v):
@@ -24596,7 +24596,7 @@ class TestSuperResolutionDenoising:
 
 
 class TestVectorRetrieval:
-    """W17-D：暴力 / IVF / 单层 NSW 三种向量检索。"""
+    """暴力 / IVF / 单层 NSW 三种向量检索。"""
 
     @staticmethod
     def _data():
@@ -24713,7 +24713,7 @@ class TestVectorRetrieval:
 
 
 class TestSpeechFrontendConformer:
-    """W17-E-1：Mel 滤波器 / MFCC / 简化 Conformer 块。"""
+    """Mel 滤波器 / MFCC / 简化 Conformer 块。"""
 
     def test_mel_scale_round_trip(self):
         import math
@@ -24833,7 +24833,7 @@ class TestSpeechFrontendConformer:
 
 
 class TestPointCloud:
-    """W17-E-2a：最远点采样 / Chamfer 距离 / 体素化 / 简化 PointNet。"""
+    """最远点采样 / Chamfer 距离 / 体素化 / 简化 PointNet。"""
 
     def _pts(self):
         return [[0.3, -0.2, 0.5], [1.0, 0.1, 0.4], [0.2, 1.0, 0.3],
@@ -24999,7 +24999,7 @@ class TestPointCloud:
 
 
 class TestVideoModels:
-    """W17-E-2b：简化 3D-CNN 与双流融合。"""
+    """简化 3D-CNN 与双流融合。"""
 
     def _clip(self, fill=0.1, c=1, t=4, h=4, w=4):
         return [[[[fill + 0.01 * (tt + hh + ww) for ww in range(w)]
@@ -25192,7 +25192,7 @@ class TestVideoModels:
 
 
 class TestOCRAndDetection:
-    """W17-E-3：简化 CRNN + CTC 贪心解码、YOLO 网格编解码 + NMS。"""
+    """简化 CRNN + CTC 贪心解码、YOLO 网格编解码 + NMS。"""
 
     def _img(self, fill=0.2, c=1, h=2, w=8):
         return [[[fill + 0.01 * (cc + hh + ww) for ww in range(w)]
@@ -25358,7 +25358,7 @@ class TestOCRAndDetection:
 
 
 class TestGradCheckAll:
-    """W18-A：`grad_check_all` 自动遍历 Layer 式子模块做局部梯度校验。"""
+    """`grad_check_all` 自动遍历 Layer 式子模块做局部梯度校验。"""
 
     def _net(self):
         AI.set_seed(7)
@@ -25487,7 +25487,7 @@ class TestGradCheckAll:
 
 
 class TestNumericalStability:
-    """W18-B：NaN/Inf 扫描、六类极端输入探针，以及本轮修掉的静默 NaN。"""
+    """NaN/Inf 扫描、六类极端输入探针，以及本轮修掉的静默 NaN。"""
 
     def test_numeric_scan(self):
         scan = AI.numeric_scan([1.0, [2, 3.5], {"a": float("nan")}, ("x", True)])
@@ -25615,7 +25615,7 @@ class TestNumericalStability:
             AI.stability_probe(lambda v: v, cases=[("", [1.0])])
 
 class TestBaselineSnapshot:
-    """W18-C：回归基线快照（固定 seed → JSON → CI 比对）。"""
+    """回归基线快照（固定 seed → JSON → CI 比对）。"""
 
     XS = [[0.25, -0.5, 0.75], [1.0, 0.0, -1.0], [-0.3, 0.3, 0.1]]
     GOLDEN = "7bbedc0d699d7127fd1b5f6ee023e1bf73afca311585f897853e607797140039"
@@ -25739,7 +25739,7 @@ def _w18d_rng(seed):
 
 
 class TestIntegrationTraining:
-    """W18-D：toy 数据集端到端训练，确认「能学会」而不只是「不报错」。"""
+    """toy 数据集端到端训练，确认「能学会」而不只是「不报错」。"""
 
     def test_xor_reaches_low_loss(self):
         xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
@@ -25809,7 +25809,7 @@ class TestIntegrationTraining:
 
 
 class TestDoctests:
-    """W18-D：docstring 里的示例必须一直可运行。"""
+    """docstring 里的示例必须一直可运行。"""
 
     def test_run_doctests_all_pass(self):
         result = AI.run_doctests()
@@ -25850,7 +25850,7 @@ class TestDoctests:
 
 
 class TestInvariants:
-    """W18-D：随机输入下的不变量（属性测试，固定种子可复现）。"""
+    """随机输入下的不变量（属性测试，固定种子可复现）。"""
 
     def test_softmax_is_distribution(self):
         for seed in range(10):
@@ -25987,7 +25987,7 @@ class TestInvariants:
             AI.check_shape_consistency(object(), xs)
 
 class TestExperimentTracking:
-    """W19-A：实验追踪（JSON）与模型元数据。"""
+    """实验追踪（JSON）与模型元数据。"""
 
     def _clock(self, box):
         return lambda: box[0]
@@ -26564,7 +26564,7 @@ class TestPrivacyAndMembership:
 
 
 class TestLotteryTicket:
-    """W20-B：迭代幅度剪枝 + 掩码内重初始化（彩票假说的工程件）"""
+    """迭代幅度剪枝 + 掩码内重初始化（彩票假说的工程件）"""
 
     @staticmethod
     def _model(seed=7, sizes=(3, 4, 2)):
@@ -26714,7 +26714,7 @@ class TestLotteryTicket:
 
 
 class TestMixtureOfDepths:
-    """W20-C：MoD 路由与 Early Exit"""
+    """MoD 路由与 Early Exit"""
 
     def test_route_capacity_and_order(self):
         route = AI.mix_of_depths_route([0.1, 0.9, 0.3, 0.8, 0.2], 0.4)
@@ -26822,7 +26822,7 @@ class TestMixtureOfDepths:
 
 
 class TestNeuroSymbolic:
-    """W20-D：规则约束的候选过滤（神经符号最小实现）"""
+    """规则约束的候选过滤（神经符号最小实现）"""
 
     def _rules(self):
         return AI.RuleSet([("no_repeat", AI.rule_no_repeat),
@@ -26948,7 +26948,7 @@ class TestNeuroSymbolic:
 
 
 class TestCaseStudies:
-    """W20-E：NTK / 双下降作为「已知边界」的可测量演示。"""
+    """NTK / 双下降作为「已知边界」的可测量演示。"""
 
     def _linear(self, w):
         random.seed(0)
@@ -27043,7 +27043,7 @@ class TestCaseStudies:
 
 
 class TestTrainAugment:
-    """W0 补完：`fit(train_augment=...)` 的批级增强回调。"""
+    """`fit(train_augment=...)` 的批级增强回调。"""
 
     def _data(self):
         return [[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]], [0.0, 1.0, 0.5, 0.5]
@@ -27140,7 +27140,7 @@ class TestTrainAugment:
 
 
 class TestDiffPool:
-    """W6 补完：`DiffPool` 软分配池化。"""
+    """`DiffPool` 软分配池化。"""
 
     def _graph(self):
         rng = random.Random(7)
@@ -27309,7 +27309,7 @@ class TestDiffPool:
 
 
 class TestSamplingSearch:
-    """对比搜索 / 多样束搜索（W7-D）"""
+    """对比搜索 / 多样束搜索"""
 
     def _lm(self):
         AI.set_seed(3)
@@ -27450,7 +27450,7 @@ class TestSamplingSearch:
 
 
 class TestGrammarConstrained:
-    """语法约束解码（W7-E：正则 NFA / CFG Earley / JSON）"""
+    """语法约束解码（正则 NFA / CFG Earley / JSON）"""
 
     def test_regex_nfa_step_and_accept(self):
         g = AI.RegexGrammar("a[bc]+d")
@@ -27573,7 +27573,7 @@ class TestGrammarConstrained:
 
 
 class TestSpeculativeDecoding:
-    """完整草稿-验证循环（W7-F）"""
+    """完整草稿-验证循环"""
 
     PROBS = [0.1, 0.2, 0.3, 0.25, 0.15]
 
@@ -27892,7 +27892,7 @@ class TestConvGANVariants:
 
 
 class TestScoreEBM:
-    """W8-B：Score-based（NCSN）/ SDE、EBM、Consistency、多尺度 Glow、PixelCNN、潜空间扩散。"""
+    """Score-based（NCSN）/ SDE、EBM、Consistency、多尺度 Glow、PixelCNN、潜空间扩散。"""
 
     def test_vp_ve_coefficients(self):
         import math

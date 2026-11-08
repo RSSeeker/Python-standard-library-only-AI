@@ -116,7 +116,7 @@ model2 = Model.load("model.json")
 | `resume_from` | 从 checkpoint JSON 恢复权重与优化器状态（`epochs=0` 即“只恢复不训练”）；层数或形状不符直接报错 |
 | `mixup_alpha` | >0 时对每个 batch 做 Mixup（Beta(α, α) 混合样本与软标签）；只支持分类任务 + 索引型损失，默认 0 关闭 |
 | `record_layer_norms` | 记录每层梯度范数到 `history['layer_grad_norm']`；只记录、不影响训练数值 |
-| `train_augment` | 批级增强回调 `fn(xs, ys) -> (xs, ys)`，每个 batch 在 Mixup / 对抗攻击**之前**调用一次；样本数必须不变，默认 None（关闭时数值与旧版逐位相同）。用来接 W11-C 的图像增强管道与 `augment_cutout` |
+| `train_augment` | 批级增强回调 `fn(xs, ys) -> (xs, ys)`，每个 batch 在 Mixup / 对抗攻击**之前**调用一次；样本数必须不变，默认 None（关闭时数值与旧版逐位相同）。用来接 图像增强管道与 `augment_cutout` |
 
 训练结束后 `model.history` 里有三个键：`train_loss`、`val_loss`、`grad_norm`（`record_layer_norms=True` 时多一个 `layer_grad_norm`，每轮一个逐层列表）
 （每轮平均梯度范数，裁剪前；用来判断训练是否发散）。
@@ -226,7 +226,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 > 加载时再传 `restore_optimizer=True`。不恢复动量的话「加载后继续训练」不等于「不中断地训练」——
 > 前几步的更新幅度会偏大（实测 2.4e-02 量级差异）；恢复后可达**逐位续训**（见下方「断点续训」）。
 
-### 对抗训练（W10-C）
+### 对抗训练
 
 攻击与鲁棒正则都是**批级**接口（签名里要模型本身），因此不能塞进 `Model(loss_fn=)`：
 
@@ -247,7 +247,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 诚实边界：TRADES 的攻击目标应当是最大化 KL，而 `pgd_examples` 用的是任务损失
 （PGD-AT 的写法），两者不等价；SMART 只实现输出项；FreeLB 只做扰动累积。
 
-### 梯度检查点与混合精度模拟（W10-F）
+### 梯度检查点与混合精度模拟
 
 | 函数 | 说明 |
 |---|---|
@@ -265,7 +265,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 `loss scaling` 的意义可以实测出来：`fp16` 的最小次正规约 `5.96e-8`，梯度 `1e-9` 直接
 舍入就是 0；乘 8192 后落在 `8.19e-6`，舍回后仍是 `1.0e-9` 量级（`9.968e-10`）。
 
-### 半监督与一致性正则（W10-E）
+### 半监督与一致性正则
 
 | 函数 / 类 | 说明 |
 |---|---|
@@ -294,7 +294,7 @@ for (gw, gb), (uw, ub) in zip(grads, unsup_grads):  # 手动累加时注意形�
 这些是**批级**接口（签名里要模型），不能直接传给 `Model(loss_fn=)`；`fit` 目前没有
 半监督开关，需要自己在训练循环里把两份梯度加起来（与 `ohem_loss` 同类限制）。
 
-### 训练正则与集成（W10-D）
+### 训练正则与集成
 
 | 函数 / 类 | 说明 |
 |---|---|
@@ -705,11 +705,11 @@ m = AI.Seq2SeqLM.load("s2s.json")
 |------|------|
 | `Adam` | Adam（默认） |
 | `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
-| `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套（W9-A）；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
-| `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套（W9-B）：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
-| `Adan` / `Prodigy` / `CAME` | 进阶三件套（W9-E）：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
-| `Shampoo` / `Sophia` / `LBFGS` | 二阶近似三件套（W9-E）：Shampoo 用 `L=GGᵀ`/`R=GᵀG` 的 `L^{-1/4} G R^{-1/4}` 预条件（`max(fan_out,fan_in) > max_dim` 的层退化为逐元素 Adam）；Sophia 用 `clip(m / max(ρh, ε), ±1)`（`h` 来自 `hessian_diags` / `hessian_fn` / `g²` 三者之一，**不是真 Hessian**）；L-BFGS 是逐层分块的两循环递归、无 line search，`lr` 要比 SGD 小一个量级 |
-| `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族（W9-C）：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
+| `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
+| `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
+| `Adan` / `Prodigy` / `CAME` | 进阶三件套：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
+| `Shampoo` / `Sophia` / `LBFGS` | 二阶近似三件套：Shampoo 用 `L=GGᵀ`/`R=GᵀG` 的 `L^{-1/4} G R^{-1/4}` 预条件（`max(fan_out,fan_in) > max_dim` 的层退化为逐元素 Adam）；Sophia 用 `clip(m / max(ρh, ε), ±1)`（`h` 来自 `hessian_diags` / `hessian_fn` / `g²` 三者之一，**不是真 Hessian**）；L-BFGS 是逐层分块的两循环递归、无 line search，`lr` 要比 SGD 小一个量级 |
+| `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
@@ -840,7 +840,7 @@ AI.sequence_accuracy(preds, targets)      # 整条序列全对才算对
 > 指标全部是**纯标准库实现**，输入会做防御性校验（空列表、长度不符、负类别索引、
 > 非有限数值都直接报 `ValueError`，不会静默给出 `nan`）。
 
-### 数据管道（W11-A）
+### 数据管道
 
 Dataset 抽象、Sampler 体系、长度分桶与预处理缓存。它们都只吃「list + 下标」，
 不依赖 numpy，也不需要把数据转成张量。
@@ -881,7 +881,7 @@ ids, hit = cache.get({"vocab": 8000}, lambda: [encode(line) for line in lines])
 诚实说明：`LazyDataset` 的淘汰是 FIFO 而不是 LRU（不引第三方库，避免维护链表）；
 `PreprocessCache` 用 JSON 存结果，只适合能 JSON 序列化的中间产物。
 
-### 编码器（W11-B）
+### 编码器
 
 类别特征编码，全部只吃 list：`fit` 记住映射、`transform` 应用、能往返的还提供
 `inverse_transform`；未见类别的处理方式按编码器语义各自定义（见下表）。
@@ -908,7 +908,7 @@ x_num = te.transform(test_rows)              # 数值列，可直接喂模型
 整数或 0/1 浮点。所有编码器都对空输入、行宽不一致、非二值 `y`、非法超参报
 `ValueError` / `TypeError`。
 
-### 降维 · 不平衡采样 · 特征选择（W11-G）
+### 降维 · 不平衡采样 · 特征选择
 
 **降维**
 
@@ -952,7 +952,7 @@ x_sel = sel.transform(x_train)
   需要自己先编码成有意义的一维欧氏空间。
 - `RFE` 内部用的是岭回归系数而不是任意 sklearn 估计器；`SelectKBest` 只这两种打分函数。
 
-### 缺失值填补（W11-F）
+### 缺失值填补
 
 三个填补器，输入是允许 `None` 的二维 list（`None` 表示缺失），输出新的二维 list：
 
@@ -982,7 +982,7 @@ x_filled = iter_imp.transform(train_x)
 - 三个类都只认 `None` 作缺失标记；`float('nan')` 会被当成普通数字参与计算（要处理 NaN
   请先自己换成 `None`）。
 
-### Scaler 族（W11-E）
+### Scaler 族
 
 四个按列变换器，接口与既有 `StandardScaler` / `MinMaxScaler` 一致：
 `fit` / `transform` / `fit_transform` / `inverse_transform`，返回新的二维 list、不改入参。
@@ -1011,7 +1011,7 @@ x_norm = qt.transform(test_x)               # 近似标准正态
   不是闭式解；`method='box-cox'` 要求对应特征全为正，否则报 `ValueError`。
 - 四个类都不做缺失值处理（`None` / `NaN` 会直接报 `TypeError`）。
 
-### 切分扩展（W11-D）
+### 切分扩展
 
 三个纯索引切分器（返回下标列表，不复制数据），补上 `k_fold_indices` 覆盖不到的场景：
 
@@ -1033,7 +1033,7 @@ for tr, te in AI.time_series_split_indices(len(series), n_splits=4, gap=3):
 （`n_samples > n_splits*test_size + gap`）。三个函数都对非整数/布尔超参、
 `n_splits` 越界、清洗后训练集为空报 `ValueError` / `TypeError`。
 
-### 图像增强（W11-C）
+### 图像增强
 
 全部作用于 `(C, H, W)` 的嵌套 list（与卷积层的输入约定一致），返回新图、不改入参；
 每个类的构造参数里都可以给 `seed`，同一个实例连续调用会**继续抽随机**（每张图增强不同），
@@ -1062,7 +1062,7 @@ x = train_aug(image)          # (3, 32, 32)
 `GaussianBlur` 的 `sigma` 可以给数字（固定）或 `(low, high)`（每次抽样）。所有类都对
 空输入、行宽不一致、非数字像素、非法超参报 `ValueError` / `TypeError`。
 
-### 文本增强与音频增强（W11-H）
+### 文本增强与音频增强
 
 文本增强以 **token 列表**为单位（字符串或整数 token 均可），全部返回新列表、不改入参，
 `seed` 相同的两次调用逐位一致；音频部分只做**一维波形**上的概念性操作（本项目不含
@@ -1093,7 +1093,7 @@ noisy = AI.audio_add_noise([0.1, -0.2, 0.3], snr_db=20.0, seed=0)
 按 `alpha * 长度` 取整且至少 1 次（`alpha=0` 才关闭），因此短句上扰动比例会偏高；
 ③音频部分**不是**完整的增强库——没有重采样、变速、混响，也没有 WAV 读写。
 
-### 特殊 token 与批处理（W12-A）
+### 特殊 token 与批处理
 
 `SpecialTokens` 把 BOS / EOS / PAD / UNK / SEP / CLS / MASK 七个标记收在一处，只存
 **字符串**、不绑定词表（默认值与 `WordPieceTokenizer` 兼容，另加 `[BOS]`/`[EOS]` 给生成任务）。
@@ -1120,7 +1120,7 @@ batch = AI.batch_sequences(encoded, max_len=64, pad_value=ids)
 需要严格掩码时用 `batch_sequences`（它按截断后的真实长度生成，`lengths` 也一起返回）。
 所以两个都保留，并在各自 docstring 里写明差别，而不是让其中一个静默近似。
 
-### 分词器族（W12-B）
+### 分词器族
 
 四个分词器共享同一套接口：`fit(texts, min_frequency=1, max_size=None, vocab=None)`
 （`SentencePieceTokenizer` 用 `train(...)`）、`tokenize(text) -> list[str]`、
@@ -1150,7 +1150,7 @@ assert sp.decode(sp.encode("hello world")) == "hello world"
 **强制包含训练语料里的全部单字符**，因此常见字符都有回退路径；词表装不下字符会在
 `train` 阶段直接报 `ValueError`（而不是训练完才发现编码全变 `<unk>`）。
 
-### 评估指标扩展（W13-A：回归 + 效率）
+### 评估指标扩展（回归 + 效率）
 
 | 函数 | 定义 / 说明 |
 |---|---|
@@ -1178,7 +1178,7 @@ print(AI.inference_benchmark(model, x_sample, repeats=50, warmup=5))
 C 扩展；`params` 是 `weights`/`biases` 的标量总数，非 MLP 层记为 0。计时用
 `time.perf_counter`，`warmup` 次不计时，`batch_size=None` 时把 `x` 当单样本。
 
-### 评估指标扩展（W13-B：分类）
+### 评估指标扩展（分类）
 
 | 函数 | 定义 / 说明 |
 |---|---|
@@ -1203,7 +1203,7 @@ print(AI.brier_score([0, 1], [0.2, 0.8]))   # 0.0400
 
 `pr_auc_score` 用的是**阶梯式**平均精确率（与 sklearn `average_precision_score` 同口径），不是对 PR 曲线做梯形积分；后者在少数点上会高估。
 
-### 排序指标（W13-C）
+### 排序指标
 
 | 函数 | 定义 / 说明 |
 |---|---|
@@ -1228,7 +1228,7 @@ print(AI.coverage_at_k([[0.9, 0.1], [0.1, 0.9]], 1))  # 1.0
 口径说明：`k=None` 表示取全部文档；`k` 大于文档数时按文档数截断。P@k 的分母是 `min(k, n)`
 而不是固定 `k`，所以 3 个文档时 `k=10` 与 `k=3` 结果相同。
 
-### 分割指标（W13-D）
+### 分割指标
 
 标签图是「行列表」的二维整数图（`[[0, 0, 1], ...]`），预测图必须同形。
 
@@ -1255,7 +1255,7 @@ print(AI.hd95(gt, pred))             # 1.0
 （距离无定义）。`hd95` 用的是双向距离合并后取分位数，与 MONAI 的 `compute_hausdorff_distance(percent=95)`
 同口径但只做二维、不降采样。
 
-### 文本生成指标（W13-E）
+### 文本生成指标
 
 | 函数 | 定义 / 说明 |
 |---|---|
@@ -1281,7 +1281,7 @@ print(AI.cider_score("a b c d", ["a b c d"]))       # 10.0
 适合在同一组参考下比较多个候选。`corpus_bleu` 的 `smooth>0` 只对「该阶一个都没命中」生效，
 与 NLTK 的 `method0` 同思路但公式是 `smooth/(total+smooth)`。
 
-### 语音识别指标（W13-F）
+### 语音识别指标
 
 | 函数 | 定义 / 说明 |
 |---|---|
@@ -1300,7 +1300,7 @@ print(AI.slot_error_rate({"city": "北京"}, {"city": "上海"}))  # 1.0
 假设可以为空串（WER 会是 1.0）。SER 的分子把「多出来的槽位」也算错误，
 所以删词与加词都会让分数上升。
 
-### 聚类指标（W13-G）
+### 聚类指标
 
 | 函数 | 说明 |
 |---|---|
@@ -1326,7 +1326,7 @@ print(adjusted_rand_score(y, [7, 7, 3, 3]))  # 1.0（标签重命名不影响）
 - **AMI 在小样本上可以是负数**：`adjusted_mutual_info_score([0,0,1,1], [0,1,0,1])` 返回 `-0.5`，因为机会校正后的期望互信息高于 0，这比随机划分还差；NMI 同场景是 0。聚类数多于真实类数时（细分）AMI 会明显低于 NMI，这是 AMI 的预期行为。
 - **silhouette 需要 `2 <= k < n`**：全单点簇（k == n）没有簇内距离，直接报错而不是返回 1。
 
-### 校准指标（W13-H）
+### 校准指标
 
 | 函数 | 说明 |
 |---|---|
@@ -1352,7 +1352,7 @@ for row in reliability_diagram(y, p, n_bins=5):
 - ECE/MCE 只统计非空箱，所以输出恒为「有样本的箱」的加权或最大值；概率要求落在
   `[0,1]`（不做归一化，softmax 输出可直接传）。
 
-### 检测指标（W13-I）
+### 检测指标
 
 | 函数 | 说明 |
 |---|---|
@@ -1380,7 +1380,7 @@ print(average_recall(gt, pred))                  # 1.0
 - **简化边界**：不做 NMS、不支持旋转框 / 多边形 / 忽略区域；`mAP@[.5:.95]` 只是对
   10 个阈值各算一次 mAP 再平均（与 COCO 的 101 点插值不同，小样本上会有差异）。
 
-### 注意力 Rollout / Flow（W14-B）
+### 注意力 Rollout / Flow
 
 | 函数 | 说明 |
 |---|---|
@@ -1404,7 +1404,7 @@ print(attention_flow(maps))                  # 同一批图，按列归一
 - `discard_ratio` 按行丢掉最小的那一部分权重再重新归一化（Rollout 论文里的做法），
   用来观察「只看最强的几条连接」时的图。
 
-### 输入归因（W14-A）
+### 输入归因
 
 | 函数 | 说明 |
 |---|---|
@@ -1434,7 +1434,7 @@ print(deep_lift(net, [1.0, 2.0]))               # 同一差值的乘子分解
 - 归因值都是相对某个 `baseline`（默认全零）说的，换 baseline 结果会变，别把它当
   绝对贡献。
 
-### 一致性与公平性（W13-K）
+### 一致性与公平性
 
 | 函数 | 说明 |
 |---|---|
@@ -1464,7 +1464,7 @@ print(equal_opportunity_difference([1, 0, 1, 0], y_pred,
   `sensitive` 接受任意可哈希标量（`"male"`/0 都可以）；`equal_opportunity_difference`
   要求至少两个分组含正样本，否则抛 `ValueError` 而不是返回 0 假装均等。
 
-### 图像质量指标（W13-J）
+### 图像质量指标
 
 | 函数 | 说明 |
 |---|---|
@@ -1493,7 +1493,7 @@ print(inception_score([[1.0, 0.0], [0.0, 1.0]]))   # 2.0
   先降到 `max_dim` 以内）。FID 不做样本量校正，KID 是无偏估计、小样本可为负值。
 - **Inception Score 接受未归一化的概率行**（内部按行归一），但每个值必须在 `[0,1]`。
 
-### 特征重要性与特征图（W14-C）
+### 特征重要性与特征图
 
 | API | 说明 |
 | --- | --- |
@@ -1513,7 +1513,7 @@ print(feature_maps_ascii(conv_out, channels=[0]))  # 只看第 0 个通道
 - 打乱用的是本地 `random.Random(seed)`，不推进全局 RNG；同 seed 可复现。
 - `feature_maps_ascii` 与 `attention_ascii` 共用字符表，但**每个通道独立归一**——绝对值不可跨通道比较，只能看同一张图内部的相对分布。
 
-### 类激活图（W14-D）
+### 类激活图
 
 | API | 说明 |
 | --- | --- |
@@ -1534,7 +1534,7 @@ print(cam_ascii(heat, max_width=16))
 - ScoreCAM 需要 `C` 次额外前向（`n_masks` 可以只取前几个通道），纯 Python 下比 GradCAM 慢一个量级。
 - `relu=False` 保留负贡献；由于最后按最大值归一到 `[0,1]`，**全负的热图会被压成全零**——这是归一化的定义，不是丢数据。
 
-### 特征归因与嵌入可视化（W14-E）
+### 特征归因与嵌入可视化
 
 | API | 说明 |
 | --- | --- |
@@ -1558,7 +1558,7 @@ print(embedding_visualize(X, labels=y, method="tsne")["ascii"])
 - 二值掩码只有 `2^m` 种，`n_samples` 会被它截断（否则去重采样会死循环）——这是实现里的一处真 bug，已修并加了回归测试。
 - 模型输出多于 1 维时按 softmax 的类别概率当分数，`class_index=None` 锁到 argmax；单输出（回归）模型直接用输出值，且不接受 `class_index`。
 
-### 解释工具扩展（W14-F）
+### 解释工具扩展
 
 | 函数 | 说明 |
 |---|---|
@@ -1587,7 +1587,7 @@ print(cf['target'], cf['distance'])
 - `counterfactual_example` 用「目标类 one-hot 减原类 one-hot」的单次回传做梯度下降，不是 CEM 的对比解释，也没有 line search；距离由 `l2` 约束，不保证最小。
 - `influence_scores` 是一阶梯度余弦，不是「留一重训」的精确影响；只在 MSE、单输出、MLP 上有定义。
 
-### 结构化剪枝（W15-A）
+### 结构化剪枝
 
 | 函数 | 说明 |
 |---|---|
@@ -1611,7 +1611,7 @@ print(sparsity_report(net))
 - `prune_channels` / `prune_heads` 是**掩码式**置零（形状不变、下游不用改），不是删行重建；要真删通道得手工重建下游层的 `fan_in`。
 - `prune_layers` 会新建 `MLP`，只删中间层；删完前后维度对不上就抛 `ValueError`，不会悄悄改形状。
 
-### 量化与 SmoothQuant（W15-B）
+### 量化与 SmoothQuant
 
 | 函数 | 说明 |
 |---|---|
@@ -1638,7 +1638,7 @@ grads = qat_grads(net, xs, ys, bits=8)  # 直通估计梯度
 - GPTQ / AWQ 未实现；SmoothQuant 只提供缩放因子与权重列迁移，激活端除以 `s` 由调用方完成。
 - 特征蒸馏（hint layer）复用 W1-C 的 `hint_loss`，这里不重复实现。
 
-### 集成学习（W15-C）
+### 集成学习
 
 | API | 语义 |
 | --- | --- |
@@ -1664,7 +1664,7 @@ stack.predict([1.0, -1.0])
 3. `Bagging` 的子模型必须自带 `fit`；`Stacking` 只传 `epochs`，学习率通过
    `meta_model.optimizer.lr` 设置（`meta_lr` 会写进去）。
 
-### 批内打包与投机解码（W15-D）
+### 批内打包与投机解码
 
 | API | 语义 |
 | --- | --- |
@@ -1684,11 +1684,11 @@ stats["accept_rate"]   # 实测接受率
 2. 每轮验证都要对每个候选位置各跑一次前向（`gamma` 次），这是**教学实现**：
    真正省时间要靠一次前向算多个位置（本库没有这个 kernel），所以它演示的是
    接受/拒绝逻辑与统计口径，不是吞吐优化。
-3. 连续批处理见 W7 的 `ContinuousBatcher`，序列打包见 W7 的 `sequence_packing` /
-   `packed_causal_mask`，投机接受判定见 W7 的 `speculative_accept`；这一节只是把
+3. 连续批处理见 `ContinuousBatcher`，序列打包见 `sequence_packing` /
+   `packed_causal_mask`，投机接受判定见 `speculative_accept`；这一节只是把
    它们组装成可直接调用的入口。
 
-### 对比学习（W16-A）
+### 对比学习
 
 | API | 返回 | 说明 |
 | --- | --- | --- |
@@ -1712,7 +1712,7 @@ stats["accept_rate"]   # 实测接受率
 3. `sinkhorn` 用交替归一化，两个约束只能同时近似成立（最后一步是列归一化，
    所以列和精确、行和近似）。
 
-### 视觉掩码建模（W16-B）
+### 视觉掩码建模
 
 | API | 说明 |
 | --- | --- |
@@ -1733,7 +1733,7 @@ loss, grad = AI.mae_loss(recon, patches, masked)
 
 三条边界：`patchify` 只做展平切块，不做归一化；`mae_loss` 的梯度是针对 **重建输出** 的，不是参数梯度；`beit_loss` 需要外部先给每个 patch 的离散目标（dVAE token），本库不训练那个 tokenizer。
 
-### 多模态：CLIP 双塔与跨模态融合（W16-C）
+### 多模态：CLIP 双塔与跨模态融合
 
 | API | 说明 |
 | --- | --- |
@@ -1752,7 +1752,7 @@ print(AI.contrastive_retrieval_accuracy(img_emb, txt_emb))
 
 四条边界：`clip_loss` 是**批内**对比损失，正样本固定在对角线上（不读 label）；`CLIPProjector` 不内置编码器，只做投影 + 损失 + 梯度；`CrossModalBlock` 的归一化是固定 `gamma=1/beta=0` 的逐行 LayerNorm（无仿射参数）；memory 只有 1 行时 softmax 恒为 1，交叉注意力输出与 query 无关，`W_q` 的梯度恰为 0——这是数学结果，不是 bug。
 
-### 预测式自监督（W16-D）
+### 预测式自监督
 
 | API | 说明 |
 | --- | --- |
@@ -1773,7 +1773,7 @@ perms = AI.jigsaw_permutations(9, 8, seed=0) # 8 种固定排列当 8 分类
 
 三条边界：`rotate_image` 不做插值（只有 90 度的整数倍，像素严格搬移）；`jigsaw_permutations` 最多能给出 `n! - 1` 个不同排列，要不到那么多会明确报错而不是死循环；`linear_probe_accuracy` 只评估给定得分矩阵，不训练任何东西。
 
-### 内置强化学习环境（W16-E）
+### 内置强化学习环境
 
 | API | 说明 |
 | --- | --- |
@@ -1791,7 +1791,7 @@ print(env.render(), AI.discounted_returns(traj["rewards"], 0.9)[:3])
 
 三条边界：`GridWorld` 是**确定性**环境（没有随机转移，随机性只在重置 RNG 上）；`CartPole` 用显式欧拉步进，常数与 Gym 一致，但**不带**它的 seed 兼容保证；`rollout` 只在 `done` 时提前停，不做 `max_steps` 之外的截断判断。
 
-### DQN 族（W16-F）
+### DQN 族
 
 | API | 说明 |
 |-----|------|
@@ -1823,7 +1823,7 @@ print(agent.q_values(env.reset(seed=0)))
 
 四条边界：`DQNAgent` 是**价值侧**实现，不做 N-step 回报、不做优先采样、不做分布式 Q（Rainbow 只到 Double + Dueling 这一档）；`dueling_q_values` 的 `dv` / `da` 是「单个输出的雅可比」，用于手推梯度，不是反向传播接口；`train_step` 每次只更新一个 batch 且**不**自动 `sync_target` 之外的调度（`target_sync` 按步数硬同步，不是 Polyak 软更新）；`DQNNetwork` 的初始化走全局 `random` 的临时种子，同 `seed` 可复现。
 
-### 策略梯度与 PPO（W16-F2）
+### 策略梯度与 PPO
 
 | API | 说明 |
 |-----|------|
@@ -1848,7 +1848,7 @@ print(agent.policy.probs(env.reset(seed=0)))
 
 四条边界：只有离散动作（连续控制要另写高斯策略的 reparameterization，SAC/TD3/DDPG 尚未实现）；`ppo_loss` 对单样本生效，批量训练时按样本累加再平均；`PPOAgent.train` 每轮只采**一条**轨迹（不是并行环境，也没有 episode 级截断以外的 bootstrap）；`gae_advantages` 的 `values` 是「每个状态一个 V」，不倒推 `V(s_T)`，最后一步按 `done` 天然截断。
 
-### RL 基础设施与 RLHF 奖励（W16-G）
+### RL 基础设施与 RLHF 奖励
 
 | API | 说明 |
 |-----|------|
@@ -1875,7 +1875,7 @@ shaped = AI.rlhf_reward([1.0, 0.0], [-0.2, -1.0], [-0.2, -0.6], beta=0.5)
 
 三条边界：`bradley_terry_loss` 只算**成对**比较（批量就是逐对求均值），不建模平局；`rlhf_reward` 只做奖励塑形，**没有**封装完整的 PPO-RLHF 训练循环（策略 / 参考 / 奖励 / 价值四模型联动要自己拼，README 这段就是拼法）；`ucb1_action` 的 `total` 由 `counts` 求和得到，调用方不需要另外传步数。
 
-### 元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
+### 元学习（MAML / Reptile / ProtoNet / Matching Networks）
 
 | API | 说明 |
 | --- | --- |
@@ -1904,7 +1904,7 @@ loss, d_query = prototypical_loss(query_emb, query_labels, support_emb, support_
 - MAML / Reptile 的参数字典是**逐行原地写回**（保持层对象与优化器状态引用），所以 `maml_inner_step` 内部用 `finally` 恢复原参数，返回的是参数副本。
 - `matches_attention` 之类只做一次前向/相似度，不涉及反向；ProtoNet 的梯度只对**查询嵌入**给出，对支撑集/原型本身没有梯度。
 
-### 联邦学习（W16-I：FedAvg / FedProx / FedBN）
+### 联邦学习（FedAvg / FedProx / FedBN）
 
 | API | 说明 |
 | --- | --- |
@@ -1934,7 +1934,7 @@ shared_avg, privates = fedbn_average(updates)
 - `fedprox_penalty` 的梯度是对 `local` 的（`mu*(local-global)`），客户端把它加到自己的梯度上即可，本库不替你合并。
 - `fedbn_split` 按**键名前缀**区分私有参数，`fedbn_average` 只平均共享键；若所有键都是私有会直接报错，而不是静默返回空。
 
-### 时序模型（W17-A：TCN / Informer / Autoformer / PatchTST）
+### 时序模型（TCN / Informer / Autoformer / PatchTST）
 
 | API | 说明 |
 | --- | --- |
@@ -1964,7 +1964,7 @@ patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
 - `prob_sparse_attention` 是 Informer 的**简化前向近似**：只让稀疏度评分最高的 u 个查询看全部键，其余查询退化为值的均值，没有反向实现；`Autoformer` 的聚合同样是简化版（无 FFT、无频域）。
 - `PatchTSTEmbedding` 只做 patch 嵌入与 RevIN 归一化/反归一化，不含通道独立的多变量建模与预测头。
 
-### 推荐模型（W17-B-1：矩阵分解 / NCF / Wide&Deep）
+### 推荐模型（矩阵分解 / NCF / Wide&Deep）
 
 | API | 说明 |
 | --- | --- |
@@ -1997,9 +1997,9 @@ logit = wd.logits([[1.0, 0, 0, 0, 0, 0]], [[0.5, -0.2, 0.1, 0.3]])[0]
 - `WideAndDeep` 的宽侧吃稠密向量（本库没有稀疏特征/嵌入表），
   两侧只在 logit 处相加，没有联合训练技巧。
 - 三者都只做二分类/回归打分，不含负采样、召回评估与特征工程；
-  `DeepFM` / `DIN` 尚未实现（`ROADMAP.md` 的 W17-B-2）。
+  `DeepFM` / `DIN` 尚未实现（`ROADMAP.md` 中对应条目）。
 
-### 推荐模型（W17-B-2：DeepFM / DIN）
+### 推荐模型（DeepFM / DIN）
 
 | API | 说明 |
 | --- | --- |
@@ -2028,7 +2028,7 @@ grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
   只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
 - 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
 
-### 神经风格迁移（W17-C-1）
+### 神经风格迁移
 
 | 接口 | 说明 |
 |------|------|
@@ -2056,7 +2056,7 @@ print(out["losses"][0], "->", out["losses"][-1])
 - 梯度量级较大（`lr=1.0` 就会发散），默认 `lr=0.02`；`clamp=True` 时像素被裁到 `[0,1]`。
 - `FeatureExtractor.backward` 的 `layer_grads` 的键是**层号**（0 基），值是 `dL/d(该层 ReLU 后激活)`。
 
-### 超分与去噪（W17-C-2）
+### 超分与去噪
 
 | 接口 | 说明 |
 |------|------|
@@ -2090,7 +2090,7 @@ print(dn.denoise(noisy)[0][0])
   「噪声接近加性高斯」时语义清楚，其他退化（模糊、压缩伪影）没有承诺。
 - 训练量很小（几十到几百轮、几个 4×4 样本），收敛曲线是「损失下降」的证明，不是质量承诺。
 
-### 向量检索（W17-D）
+### 向量检索
 
 | 接口 | 说明 |
 |------|------|
@@ -2132,7 +2132,7 @@ print(AI.retrieval_recall(truth, [i for i, _ in nsw.search(q, k=5)]))
   在 18 个点/3 簇的构造数据上 recall@5 能到 1.0，但不要把它当生产级 ANN。
 - 三个索引都只支持「先批量 `add` 再查」，没有删除、没有持久化、没有多线程。
 
-### 语音前端与 Conformer（W17-E-1）
+### 语音前端与 Conformer
 
 | 接口 | 说明 |
 |------|------|
@@ -2167,7 +2167,7 @@ out = block.forward([[0.1 * t] * 4 for t in range(5)])
   卷积模块只有 depthwise 3×3 + SiLU；它的价值是「结构跑得通、形状与归一化可断言」，
   不是可训练的高性能 Conformer。
 
-### 点云（W17-E-2a）
+### 点云
 
 | 接口 | 说明 |
 |------|------|
@@ -2201,7 +2201,7 @@ dpoints = enc.backward([0.3, -0.2, 0.5, 0.1, -0.4])   # 逐点梯度
 - `voxelize_points` 在某一维跨度为 0（例如只有一个点）时按该维两侧各 0.5 撑开，
   否则格子索引会退化；越界的点被夹到边缘格子而不是丢弃。
 
-### 视频模型（W17-E-2b）
+### 视频模型
 
 | 接口 | 说明 |
 |------|------|
@@ -2231,7 +2231,7 @@ dsp, dtp = fuse.backward([0.4, -0.6])
 - 两个类的权重梯度都由自己累积（`Layer` 只返回梯度、不保存），
   `grads()` 在未反传过时返回 `None`，`zero_grad()` 把它清回 `None`。
 
-### OCR 与检测（W17-E-3）
+### OCR 与检测
 
 | 接口 | 说明 |
 |------|------|
@@ -2264,7 +2264,7 @@ keep = AI.nms([[0.0, 0.0, 1.0, 1.0], [0.05, 0.05, 0.95, 0.95]], [0.9, 0.8], 0.5)
 - **深度 / 姿态估计不做实现**：它们依赖大规模关键点数据集与数百 MB 的预训练骨干，本库没有可用的权重；与其放一个永远返回占位值的空壳，不如在这里说明取舍。
   返回 `(cx, cy, w, h)`——两者不要混用。
 
-### 全模块梯度自检（W18-A）
+### 全模块梯度自检
 
 | 接口 | 说明 |
 |------|------|
@@ -2302,7 +2302,7 @@ dout = U(-1, 1)^len(y)         gw, gb, _ = layer.backward(dout)
 - `zeros` 沿用 `grad_check` 的口径：解析与数值都 < 1e-8 的标量不参与相对误差
   （ReLU 死单元、softmax 前的平移不变偏置都会出现这种参数）。
 
-### 数值稳定性检测（W18-B）
+### 数值稳定性检测
 
 | 接口 | 说明 |
 |------|------|
@@ -2342,7 +2342,7 @@ print([(c["name"], c["outcome"]) for c in rep["cases"]])
   IEEE 结果，且已有测试锁定该行为。
 - 只覆盖数值叶子，不检查字符串/None 语义，也不做「接近零就报错」这类量纲判断。
 
-### 回归基线快照（W18-C）
+### 回归基线快照
 
 | API | 说明 |
 | --- | --- |
@@ -2371,7 +2371,7 @@ print(AI.snapshot_digest(snap))
 - 快照不覆盖 BN/Dropout 的随机状态，也不检查层间接口约定——那两条分别由 `grad_check_all`
   和集成测试负责。
 
-### 集成测试 / doctest / 属性测试（W18-D）
+### 集成测试 / doctest / 属性测试
 
 | API | 说明 |
 | --- | --- |
@@ -2396,7 +2396,7 @@ print(AI.snapshot_digest(snap))
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
-### 规则约束解码（W20-D：神经符号的最小实现）
+### 规则约束解码（神经符号的最小实现）
 
 | API | 语义 |
 |-----|------|
@@ -2421,7 +2421,7 @@ print(result["tokens"], rules.check(result["tokens"])["ok"])
   而不是让下游 softmax 变成 NaN；
 - `constrained_generate` 的 `max_len` 只算**新生成**的 token，`seed_token` 是额外的前缀。
 
-### MoD 路由与早退（W20-C：动态计算分配）
+### MoD 路由与早退（动态计算分配）
 
 | API | 语义 |
 |-----|------|
@@ -2446,7 +2446,7 @@ print(early["exit_layer"], early_exit_savings(early["exit_layer"], 3)["savings"]
 - `early_exit` 只做决策，不做前向——它接受「每层每个样本的类别概率」，
   所以能配任何分层的模型；概率和必须为 1（容差 1e-6），不做静默重新归一化。
 
-### 彩票假说（W20-B：迭代幅度剪枝 + 掩码内重初始化）
+### 彩票假说（迭代幅度剪枝 + 掩码内重初始化）
 
 | API | 语义 |
 |-----|------|
@@ -2473,7 +2473,7 @@ print([(h["round"], round(h["keep_ratio"], 3), h["score"]) for h in history])
 - 循环里的 `train_fn` / `score_fn` 由调用方给，本函数不碰 `Model.fit` 的任何参数，
   这样它既能用于全量重训，也能用于只评估。
 
-### 隐私保护与成员推断（W20-A）
+### 隐私保护与成员推断
 
 | API | 说明 |
 | --- | --- |
@@ -2503,7 +2503,7 @@ print(AI.membership_inference_attack(member, other))            # auc 越接近 
 成员推断同理：损失阈值攻击的 AUC 只说明「这个模型有没有明显的过拟合信号」，
 不构成严格的隐私证明。
 
-### 配置 / 日志 / 内存 / 注册表（W19-C）
+### 配置 / 日志 / 内存 / 注册表
 
 | API | 说明 |
 | --- | --- |
@@ -2536,7 +2536,7 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
   所以注册表里的文件和手动 `model.save()` 的格式完全一致。
 
-### 命令行入口（W19-B）
+### 命令行入口
 
 `ai_cli.py` 是仓库里唯一新增的可执行脚本，五个子命令都只依赖 `argparse` 与 `json`：
 
@@ -2563,7 +2563,7 @@ python ai_cli.py eval    --model model.json --data test.json
 - `export` 写出 `{"format": "ai-export-1", "model": {...}, "metadata": {...}}`，
   其中 `metadata` 就是 `model_metadata` 的返回值（含 `param_count` / `git_hash` / `created_at`）。
 
-### 实验追踪与模型元数据（W19-A）
+### 实验追踪与模型元数据
 
 | API | 说明 |
 | --- | --- |
@@ -2594,7 +2594,7 @@ AI.save_model_metadata("model.json", AI.model_metadata(model, metrics={"acc": 0.
 - `git_hash` 依赖外部 `git`：没有 git、不是仓库、超时，一律返回 `None`——元数据不该让训练失败。
 - 这里只做「记录」，不做可视化/对比面板；`summarize_experiments` 返回的就是排序后的普通列表。
 
-### 研究前沿案例：NTK / 双下降 / grokking（W20-E）
+### 研究前沿案例：NTK / 双下降 / grokking
 
 这三个现象在本库里的定位是「已知边界」——能测量、能解释，但不假装能复现论文级实验。
 
@@ -2629,7 +2629,7 @@ train_mse 9.1e-01 5.4e-01 4.1e-01 9.7e-02 6.4e-21 6.1e-23 5.9e-25 1.2e-25
 `(ΦΦᵀ + λI)α = y`——`p << n` 时 `ΦΦᵀ` 只有 `p` 个非零特征值，`ridge=1e-10` 会把对偶解放大到
 1e7 量级（实测 `dims=4` 时 `test_mse=7.9e7`），把双下降的峰彻底盖住。
 
-### 图池化（W6 补完：DiffPool）
+### 图池化（DiffPool）
 
 | API | 说明 |
 | --- | --- |
@@ -2651,7 +2651,7 @@ dX = pool.backward(dxp, dap)          # 所有节点都拿到梯度
 - 软分配是**逐节点** softmax，`n_clusters` 不宜大于节点数（大于时部分簇拿不到质量，
   `X'` 会出现全零行，但不报错——这是定义决定的，不是 bug）。
 
-### 对比搜索与多样束搜索（W7-D）
+### 对比搜索与多样束搜索
 
 | API | 作用 |
 | --- | --- |
@@ -2678,7 +2678,7 @@ print(res["sequences"])
 3. **多样束的惩罚是「同一步里重复 token」**，不是「整条序列相似」。因此它只保证同一父节点下的扩展不会塌到同一个 token，不保证两条 beam 全程不同；想要更强的多样性要配合长度惩罚或分组（DBS 原文的多组版本）。
 4. **`eos_id` 命中即收尾**，该序列进入 `finished` 后不再扩展；所有 beam 都收尾时搜索提前结束。
 
-### 语法约束解码（W7-E）
+### 语法约束解码
 
 | API | 作用 |
 | --- | --- |
@@ -2706,7 +2706,7 @@ print(r.accepts(["a", "b", "d"]), r.allowed(["a", "b"], ["b", "c", "d"]))
 3. **JSON 文法只约束结构**：字符串/数字用 `STR` / `NUM` 类别终结符表示（或直接传带引号/数字文本的 token），真正的语义由 `json.loads` 在收尾时校验；它不检查「键是否在 schema 里」——那需要 JSON Schema 层，本库未实现。
 4. **语法与 token 粒度的错配**：词表里的多字符 token 只有在 NFA/Earley 能整段消化时才放行；字符级文法配 BPE 词表时会出现「语法允许但没有任何 token 可接」的空集，`grammar_pick` 会显式报错而不是静默产出非法串。
 
-### 完整草稿-验证循环（W7-F）
+### 完整草稿-验证循环
 
 | 函数 | 语义要点 |
 |---|---|
@@ -2735,7 +2735,7 @@ print(out["ids"], out["stats"]["accept_rate"])
 - **`target_calls` 才是真正省下的量**。`draft_calls` 每个候选都要算一次，所以草稿比目标便宜才有收益；`tokens_per_target_call` 小于 1 时这轮投机是亏的。
 - **Medusa / EAGLE 只解释机制、不实现**。Medusa 需要额外训练多个预测头并做树形验证，EAGLE 需要特征级草稿与对齐训练；本库没有这些权重，故只在本节说明差异，不提供空壳接口。
 
-### GAN 变体族（W8-A）
+### GAN 变体族
 
 | API | 说明 |
 |-----|------|
@@ -2764,7 +2764,7 @@ print(g.out_shape(), g.param_count(), score, gp["penalty"])
 - **`wgan_gp_penalty` 会污染判别器的梯度缓冲**（它内部对输入做一次反向）。调用前后都要 `discriminator.zero_grad()`，否则下一次 `sgd_step` 会把罚项梯度一起用上。
 - **判别器的 `base` 必须等于输入边长**（`base=8` 配 8×8），否则卷积栈压不到 1×1，最后报 `Layer.forward: 输入长度 ... 与本层 fan_in ... 不一致`。
 
-### Score-based / SDE / 多尺度 Glow（W8-B）
+### Score-based / SDE / 多尺度 Glow
 
 | API | 说明 |
 |-----|------|
@@ -2818,7 +2818,7 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 | `save_model(model, path, task=None, optimizer=None, quiet=False, loss=None, loss_kwargs=None)` | MLP 的 JSON 持久化；传 `optimizer=` 时一并写入动量状态，传 `loss=` / `loss_kwargs=` 时记下损失配置；旧格式（无逐层 activation）可用 `default_output_activation='softmax'` 还原分类头 |
 | `CausalLM.save(path, include_optimizer=False)` / `CausalLM.load(path, restore_optimizer=False)` | 语言模型的 JSON 存档与恢复（`Seq2SeqLM` 同名方法） |
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上；会保存 `groups`（分组/深度卷积可原样加载，没有该字段的旧存档按 1 处理） |
-| `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；W9-A 的四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
+| `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
 | `Lookahead(optimizer, k=6, alpha=0.5)` | 包在任意优化器外面：每 `k` 步把快权重与慢权重按 `alpha` 混合再同步；`state_dict()` 含内层状态与慢权重 |
 | `EMA(model, decay=0.999, warmup=0)` | 权重指数移动平均：`update()` 累积、`shadow()` 取快照、`apply_to(model)` 写回；`warmup>0` 时用 `(1+t)/(10+t)` 做有效衰减 |
 | `SWA(model)` | 简单权重平均（Stochastic Weight Averaging）：`update()` 增量求均值、`average()` / `apply_to()`，`state_dict()` 可存档 |
@@ -2972,7 +2972,7 @@ print(pair[0] == wp.cls_id, pair[-1] == wp.sep_id)
 与 BPE 的分工：BPE 字节级、**永不产生 `[UNK]`**，适合从零训练语言模型；
 WordPiece 有可读词表与特殊标记，适合接 BERT 式双向编码器与 `MaskedLM`。
 
-## 训练基础设施（W0）
+## 训练基础设施
 
 ```python
 AI.set_seed(42)
@@ -3420,9 +3420,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMultimodal` | CLIP 相似度/损失手算、两侧梯度对中心差分（<1e-6）、检索准确率、投影头 30 步 SGD 降 loss、跨模态融合块两侧梯度对中心差分（<1e-5）、单 key 时 `W_q` 梯度为 0 |
 | `TestPredictiveSelfSupervision` | 旋转标签分布与复现、四次旋转的像素位置与 `k` 取模、非方图限制、Jigsaw 排列合法性、线性头与交叉熵、线性探针命中率 |
 | `TestRLEnvironments` | GridWorld 移动/撞墙/目标奖励/步数截断/障碍与坐标校验、渲染字符、CartPole 状态范围与物理独立重算（1e-12）、折现回报手算、rollout 长度与提前终止 |
-| `TestDQNFamily` | W16-F：回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
-| `TestPolicyGradient` | W16-F2：策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
-| `TestRLInfrastructure` | W16-G：ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
+| `TestDQNFamily` | 回放池 FIFO、DQN/Double 目标、Huber TD、Dueling 聚合、赌博机学习 |
+| `TestPolicyGradient` | 策略梯度/熵/价值损失的对拍、GAE、PPO 裁剪、GridWorld 上训练 |
+| `TestRLInfrastructure` | ε 衰减单调性、UCB/Thompson 选臂、Bradley-Terry 梯度、RLHF 奖励塑形 |
 | `TestMetaLearning` | MAML 内/外循环、Reptile 均值更新、ProtoNet 梯度、Matching 注意力 |
 | `TestFederatedLearning` | 参数摊平往返、FedAvg 加权平均、FedProx 梯度、FedBN 拆分与聚合 |
 | `TestTimeSeriesModels` | 因果卷积闭式与反向、TCN 梯度与因果性、Informer 稀疏注意力、Autoformer 分解、PatchTST 嵌入 |

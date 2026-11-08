@@ -34,9 +34,9 @@
 #   1. Layer & MLP
 #   2. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
 #   3. CNN: Conv2d / MaxPool2d / Flatten
-#   4. 领域应用 W7-F：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
-#   5. W8-A：GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
-#   6. W8-B：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#   4. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#   5. GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
+#   6. Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 #   7. Regularization: Dropout / BatchNorm1d / LayerNorm
 #   8. RNN / LSTM
 #   9. Matrix helpers (用于 Transformer)
@@ -46,55 +46,55 @@
 #  13. Loss Functions
 #  14. Optimizer: Adam
 #  15. More Optimizers: SGD / SGD+Momentum / RMSprop
-#  16. SGDW / Nesterov / Lookahead / SWA / EMA（W9-C）
-#  17. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam（W9-A）
-#  18. Layer-wise Optimizers: LARS / LAMB / Ranger（W9-B）
-#  19. Advanced Optimizers: Adan / Prodigy / CAME（W9-E）
+#  16. SGDW / Nesterov / Lookahead / SWA / EMA
+#  17. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#  18. Layer-wise Optimizers: LARS / LAMB / Ranger
+#  19. Advanced Optimizers: Adan / Prodigy / CAME
 #  20. Gradient Clipping / LR Scheduler
 #  21. Data Utilities
-#  22. W11-A：Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#  22. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
 #  23. Text Processing（分词与文本工具）
 #  24. Trainer
 #  25. 评估指标（分类 / 回归 / 序列 / 生成）
 #  26. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
 #  27. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
 #  28. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#  29. 多模态：CLIP 双塔 + 跨模态融合（W16-C）
-#  30. 自监督：预测式任务（W16-D：Rotation / Jigsaw）
-#  31. RL 算法（W16-F：DQN 族）
-#  32. RL 基础设施（W16-G：探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#  33. RL 策略侧（W16-F2：REINFORCE / A2C(GAE) / PPO）
-#  34. 领域应用 W17-A：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
-#  35. W18-A：全模块梯度自检（grad_check_all）
-#  36. W18-B：数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#  37. 研究前沿 W20-E：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#  38. 研究前沿 W20-D：神经符号（规则约束的候选过滤）
-#  39. 研究前沿 W20-C：Mixture-of-Depths 路由与 Early Exit
-#  40. 研究前沿 W20-B：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#  41. 研究前沿 W20-A：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#  42. 工程化收尾 W19-C：配置文件 / 日志 / 内存监控 / 模型注册表
-#  43. 领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
-#  44. 领域应用 W17-E-2b：视频（3D-CNN / Two-Stream 融合）
-#  45. 领域应用 W17-E-2a：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#  46. 领域应用 W17-E-1：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#  47. 领域应用 W17-D：向量检索（暴力 / IVF / 单层 NSW 图）
-#  48. 领域应用 W17-C-2：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#  49. 领域应用 W17-C-1：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#  50. 领域应用 W17-B-2：DeepFM / DIN
-#  51. 领域应用 W17-B：推荐（矩阵分解 / NCF / Wide&Deep）
-#  52. 联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
-#  53. 元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
-#  54. RL 环境（W16-E：GridWorld / CartPole）
-#  55. 自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
-#  56. 自监督：对比学习（W16-A：SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#  57. 推理与部署：批内打包与投机解码（W15-D）
-#  58. 推理与部署：集成学习（W15-C：Voting / Bagging / Stacking / AdaBoost）
-#  59. 推理与部署：量化（W15-B：PTQ / QAT / SmoothQuant）
-#  60. 推理与部署：结构化剪枝（W15-A：通道 / 头 / 层）
-#  61. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响（W14-F）
-#  62. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors（W14-E）
-#  63. 可解释性：注意力 Rollout / Flow（W14-B）
-#  64. 可解释性：输入归因（W14-A）
+#  29. 多模态：CLIP 双塔 + 跨模态融合
+#  30. 自监督：预测式任务（Rotation / Jigsaw）
+#  31. RL 算法（DQN 族）
+#  32. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#  33. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#  34. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#  35. 全模块梯度自检（grad_check_all）
+#  36. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#  37. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#  38. 研究前沿：神经符号（规则约束的候选过滤）
+#  39. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#  40. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#  41. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#  42. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#  43. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#  44. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#  45. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#  46. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#  47. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
+#  48. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#  49. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#  50. 领域应用：DeepFM / DIN
+#  51. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#  52. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#  53. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#  54. RL 环境（GridWorld / CartPole）
+#  55. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#  56. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#  57. 推理与部署：批内打包与投机解码
+#  58. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#  59. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#  60. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#  61. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#  62. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#  63. 可解释性：注意力 Rollout / Flow
+#  64. 可解释性：输入归因
 #  65. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
 #  66. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
 #  67. 模型保存 / 加载 (JSON)
@@ -102,10 +102,10 @@
 #  69. PyTorch 数值对齐对比
 #  70. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
 #  71. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  72. W10-F：梯度检查点（activation checkpointing）与混合精度模拟
-#  73. W10-E：半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#  74. W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#  75. W10-C：对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#  72. 梯度检查点（activation checkpointing）与混合精度模拟
+#  73. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#  74. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#  75. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
 #  76. 生成模型：VAE / GAN / DDPM
 #  77. Main: 回归 + 分类 + CNN 完整示例
 
@@ -9199,7 +9199,7 @@ def diverse_beam_generate(model, prompt_ids, num_beams: int = 4, num_return: int
                                eos_id=eos_id)
 
 
-#  领域应用 W7-E：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
+#  领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
 # =====================================================================
 
 def _w7e_char_predicate(spec):
@@ -9738,7 +9738,7 @@ def grammar_generate(grammar, logits_fn, vocabulary, max_len=16, stop=None):
 
 
 # ============================================================================
-#  领域应用 W7-F：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#  领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
 # ============================================================================
 
 def _w7f_ids(ids, who):
@@ -9798,7 +9798,7 @@ def speculative_decode(draft_probs_fn, target_probs_fn, prompt_ids,
     再用 ``speculative_accept`` 做拒绝采样：接受前 k 个，第一个被拒位置用残差
     ``max(0, p_target - p_draft)`` 重采样。
 
-    与 ``speculative_generate``（W15-D，要求草稿模型有 ``generate``）的区别：
+    与 ``speculative_generate``（要求草稿模型有 ``generate``）的区别：
     这里只要求两个纯回调，因此可以拿任意合成分布做端到端校验，也不依赖模型类。
 
     返回 ``{"ids", "stats"}``；``stats`` 含 ``rounds`` / ``proposed`` /
@@ -9940,7 +9940,7 @@ def target_probs(model):
 
 
 # ============================================================================
-#  W8-A：GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 /
+#  GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 /
 #        Pix2Pix / Progressive Growing）
 # ============================================================================
 #  诚实边界（同时写在 README 与各 docstring 里）：
@@ -10554,7 +10554,7 @@ def pix2pix_g_loss(fake_scores, fake_image, real_image, lambda_l1=100.0):
     return bce + float(lambda_l1) * l1
 
 # =============================================================================
-#  研究前沿 W8-B：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 # =============================================================================
 #  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要
 #  额外训练一个网络就能验证数学：探针里用高斯数据的**闭式 score** 做端到端
@@ -14683,7 +14683,7 @@ def _reject_nan_row(v, who):
 def _softmax_row(v):
     """对一维列表做 softmax（整行都是 -inf 时返回全 0，避免 exp(-inf-(-inf))=NaN）
 
-    数值边界（W18-B）：含 NaN 抛 ValueError；含 +inf 时把概率均分给所有 +inf 项
+    数值边界：含 NaN 抛 ValueError；含 +inf 时把概率均分给所有 +inf 项
     （否则 exp(inf-inf)=NaN）；整行 -inf 返回全 0。
     """
     _reject_nan_row(v, "_softmax_row")
@@ -19614,7 +19614,7 @@ def _adam_apply(param, grad, m, v, t, lr, b1=0.9, b2=0.999, eps=1e-8):
 def _log_softmax_row(v):
     """对一维列表做 log-softmax（数值稳定版，供束搜索累加对数概率用）
 
-    数值边界（W18-B）：含 NaN 抛 ValueError；含 +inf 时 +inf 项得 -log(个数)、
+    数值边界：含 NaN 抛 ValueError；含 +inf 时 +inf 项得 -log(个数)、
     其余得 -inf；整行 -inf 返回全 -inf。
     """
     _reject_nan_row(v, "_log_softmax_row")
@@ -21746,7 +21746,7 @@ def lr_finder(model, data=None, x=None, y=None, start_lr: float = 1e-5,
 def _numeric_pair(pred, target, who):
     """把 (pred, target) 规范成等长 float 列表；target 允许标量（只能配单输出）
 
-    W18-B 起拒绝 NaN 输入：NaN 会让损失静默变成 nan（而且它还会被 ReLU 这类
+    本函数拒绝 NaN 输入：NaN 会让损失静默变成 nan（而且它还会被 ReLU 这类
     `x if x > 0 else 0` 的写法吞掉，看起来「一切正常」）。±Inf 仍按 IEEE 语义放行——
     溢出成 inf 是可见的，而 NaN 会无声扩散。
     """
@@ -22343,7 +22343,7 @@ def mse_loss(pred: List[float], target):
             f"请对齐维度（单输出回归请传 y=[value]，多输出请传 y=[v1, v2, ...]）"
         )
     n = len(pred)
-    # W18-B：NaN 输入显式报错（±Inf 放行，平方后溢出成 inf 是可见的 IEEE 行为）
+    # NaN 输入显式报错（±Inf 放行，平方后溢出成 inf 是可见的 IEEE 行为）
     for i in range(n):
         if float(pred[i]) != float(pred[i]):
             raise ValueError("mse_loss: pred 第 %d 个值是 NaN" % i)
@@ -22380,7 +22380,7 @@ def cross_entropy_loss(pred: List[float], target_idx, label_smoothing: float = 0
         if len(target_idx) != len(pred):
             raise ValueError(
                 f"cross_entropy_loss: target 长度 {len(target_idx)} != pred 长度 {len(pred)}，"
-                f"请对齐维度（原先 zip 会静默截断）"
+                f"请对齐维度"
             )
         if any(float(t) < 0.0 for t in target_idx):
             raise ValueError("cross_entropy_loss: 目标向量不能含负值")
@@ -22447,7 +22447,7 @@ def _cross_entropy_smoothed(pred, target, smoothing, eps):
         if len(target) != k:
             raise ValueError(
                 f"cross_entropy_loss: target 长度 {len(target)} != pred 长度 {k}，"
-                f"请对齐维度（原先 zip 会静默截断）"
+                f"请对齐维度"
             )
         if any(float(t) < 0.0 for t in target):
             raise ValueError("cross_entropy_loss: 目标向量不能含负值")
@@ -23096,7 +23096,7 @@ class RMSprop:
 
 
 # ============================================================================
-#  SGDW / Nesterov / Lookahead / SWA / EMA（W9-C）
+#  SGDW / Nesterov / Lookahead / SWA / EMA
 #
 #  前两个是「改更新式」，后三个是「在优化器之外维护一份权重」：
 #  Lookahead 包住任意优化器（需要 .step/.model），SWA / EMA 各自维护影子权重，
@@ -23525,11 +23525,11 @@ class Adafactor:
 
 
 # ============================================================================
-#  More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam（W9-A）
+#  More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
 # ============================================================================
 
 def _w9_check(who, lr, betas=(), eps=None):
-    """W9 优化器的公共参数校验（不接 bool，不接 nan/inf）"""
+    """优化器的公共参数校验（不接 bool，不接 nan/inf）"""
     if not _is_num(lr) or lr < 0:
         raise ValueError(f"{who}: lr 必须是非负有限数字，收到 {lr!r}")
     for name, b in betas:
@@ -23591,7 +23591,7 @@ def _w9_check_state(st, layer, kind, who):
 
 
 class _StatefulOptimizer:
-    """带「每参数独立状态」的优化器基类（W9-A 引入）
+    """带「每参数独立状态」的优化器基类
 
     Adam 一族把两个矩直接存在 layer 上（`m_w`/`v_w`/`m_b`/`v_b`），够用且能随
     `_optimizer_state` 一起存档。AdaGrad / AdaDelta 这类每个参数要 1–2 个**额外**
@@ -23860,11 +23860,11 @@ class RAdam(_StatefulOptimizer):
 
 
 # ============================================================================
-#  Layer-wise Optimizers: LARS / LAMB / Ranger（W9-B）
+#  Layer-wise Optimizers: LARS / LAMB / Ranger
 # ============================================================================
 
 def _w9b_check(who, name, value, minimum=None):
-    """W9-B 用的标量校验：有限数字，可选下界（bool 不算数字）"""
+    """标量校验：有限数字，可选下界（bool 不算数字）"""
     if not _is_num(value):
         raise ValueError(f"{who}: {name} 必须是有限数字，收到 {value!r}")
     if minimum is not None and value < minimum:
@@ -23883,7 +23883,7 @@ def _w9b_sqsum(obj):
 
 
 class _LayerwiseOptimizer:
-    """按「整层」决定步长的优化器基类（W9-B）
+    """按「整层」决定步长的优化器基类
 
     与 `_StatefulOptimizer` 的区别：LARS / LAMB 要先看这一层的权重范数与梯度
     范数，才能算出「信任比」，所以不能逐标量独立更新。状态同样存在优化器实例
@@ -24220,7 +24220,7 @@ class Ranger(_LayerwiseOptimizer):
 
 
 # ============================================================================
-#  Advanced Optimizers: Adan / Prodigy / CAME（W9-E）
+#  Advanced Optimizers: Adan / Prodigy / CAME
 # ============================================================================
 
 
@@ -24572,7 +24572,7 @@ class CAME(_LayerwiseOptimizer):
 
 
 
-# ==== 进阶优化器（W9-E2）：Shampoo / Sophia / L-BFGS ====
+# ==== 进阶优化器：Shampoo / Sophia / L-BFGS ====
 #
 # 这三个都需要「整层」的信息（矩阵逆根 / Hessian 对角 / 历史位移对），
 # 因此同样挂在 `_LayerwiseOptimizer` 上；只支持二维 `Layer` 权重。
@@ -25109,7 +25109,7 @@ def clip_grad_by_value(all_grads, clip_val: float):
             gb[j] = max(-clip_val, min(clip_val, gb[j]))
 
 
-# ==== 学习率调度器族（W9-D） ====
+# ==== 学习率调度器族 ====
 # 约定：epoch 从 1 开始（`Model.fit` 就是这么调的）；`step(epoch)` 直接赋值
 # `optimizer.lr`，因此调度器之间可以互相嵌套（`ChainedScheduler` / `SequentialLR`）。
 
@@ -26270,7 +26270,7 @@ def split_data(data, val_ratio: float = 0.2, test_ratio: float = 0.1, seed: int 
 
 
 # ============================================================================
-#  W11-A：Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#  Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
 # ============================================================================
 
 class Dataset:
@@ -26676,7 +26676,7 @@ class PreprocessCache:
 
 # ============================================================================
 #  ======================================================================
-#  W11-C：图像增强管道（Compose / RandomCrop / RandomResizedCrop /
+#  图像增强管道（Compose / RandomCrop / RandomResizedCrop /
 #          RandomRotation / ColorJitter / GaussianBlur / Normalize）
 #  ======================================================================
 
@@ -27077,7 +27077,7 @@ class Normalize:
         ]
 
 
-#  W11-B：编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+#  编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
 # ============================================================================
 
 def _w11b_check_rows(x, who):
@@ -27515,7 +27515,7 @@ def k_fold_indices(n_samples: int, n_splits: int = 5, shuffle: bool = True,
 
 
 #  ======================================================================
-#  W11-D：切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#  切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
 #  ======================================================================
 
 def _w11d_int(value, who, name, minimum=None):
@@ -27782,7 +27782,7 @@ class MinMaxScaler:
 
 
 #  ======================================================================
-#  W11-H：文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#  文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
 #  ======================================================================
 
 def _w11h_tokens(tokens, who):
@@ -28028,7 +28028,7 @@ def audio_polarity_invert(waveform):
     return [-v for v in _w11h_wave(waveform, "audio_polarity_invert")]
 
 #  ======================================================================
-#  W11-G：降维 / 不平衡采样 / 特征选择
+#  降维 / 不平衡采样 / 特征选择
 #  ======================================================================
 
 def _w11g_matrix(x, who):
@@ -28741,7 +28741,7 @@ class L1Selector:
         return list(self.support_)
 
 #  ======================================================================
-#  W11-F：缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#  缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
 #  ======================================================================
 
 def _w11f_matrix(x, who):
@@ -29053,7 +29053,7 @@ class IterativeImputer:
         return self.fit(x).transform(x)
 
 #  ======================================================================
-#  W11-E：Scaler 族（RobustScaler / MaxAbsScaler /
+#  Scaler 族（RobustScaler / MaxAbsScaler /
 #          QuantileTransformer / PowerTransformer）
 #  ======================================================================
 
@@ -29701,7 +29701,7 @@ class BytePairTokenizer:
 
 
 #  ======================================================================
-#  W12-A：特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#  特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
 #  ======================================================================
 
 class SpecialTokens:
@@ -29911,7 +29911,7 @@ def tokenize_batch(tokenizer, texts, max_len=None, pad_value=0, truncate="post",
 
 
 #  ======================================================================
-#  W12-B：分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#  分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
 #  ======================================================================
 
 def _w12b_text(text, who):
@@ -31318,7 +31318,7 @@ def _cf_matrix(ratings, who, allow_none):
 # ============================================================================
 # ============================================================================
 # ============================================================================
-#  多模态：CLIP 双塔 + 跨模态融合（W16-C）
+#  多模态：CLIP 双塔 + 跨模态融合
 # ============================================================================
 
 def _cm_rows(x, who, width=None):
@@ -31630,7 +31630,7 @@ class CrossModalBlock:
         return d_memory, d_text
 
 # ============================================================================
-#  自监督：预测式任务（W16-D：Rotation / Jigsaw）
+#  自监督：预测式任务（Rotation / Jigsaw）
 # ============================================================================
 
 def rotation_targets(num_samples, seed=None):
@@ -31808,7 +31808,7 @@ def linear_probe_accuracy(scores, labels):
     return hit / len(scores)
 
 # ============================================================================
-#  RL 算法（W16-F：DQN 族）
+#  RL 算法（DQN 族）
 # ============================================================================
 
 class ReplayBuffer:
@@ -32158,7 +32158,7 @@ class DQNAgent:
         return self.online.param_count() + self.target.param_count()
 
 # ============================================================================
-#  RL 基础设施（W16-G：探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#  RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
 # ============================================================================
 
 def epsilon_schedule(step, start=1.0, end=0.05, decay_steps=1000, kind="linear"):
@@ -32340,7 +32340,7 @@ def rlhf_reward(rewards, logps, ref_logps, beta=0.1):
     return out
 
 # ============================================================================
-#  RL 策略侧（W16-F2：REINFORCE / A2C(GAE) / PPO）
+#  RL 策略侧（REINFORCE / A2C(GAE) / PPO）
 # ============================================================================
 
 def _rl_softmax(logits):
@@ -32749,7 +32749,7 @@ class PPOAgent:
         return self.policy.param_count() + self.value.param_count()
 
 # ============================================================================
-#  领域应用 W17-A：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 
 def _w17_pad_left(x, pad):
@@ -33129,7 +33129,7 @@ class PatchTSTEmbedding:
         return self.d_model * self.patch_len + self.d_model
 
 # ============================================================================
-#  W18-A：全模块梯度自检（grad_check_all）
+#  全模块梯度自检（grad_check_all）
 # ============================================================================
 
 _W18A_SKIP_TYPES = (str, bytes, int, float, bool, dict, set, type(None))
@@ -33308,7 +33308,7 @@ def grad_check_all(module, eps: float = 1e-6, tol: float = 1e-5,
 
 
 # ============================================================================
-#  W18-B：数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#  数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
 # ============================================================================
 
 _W18B_OK_EXCEPTIONS = (ValueError, TypeError, OverflowError,
@@ -33369,7 +33369,7 @@ def assert_all_finite(label, value):
 
 
 def stability_cases(size: int = 3):
-    """六类极端输入（与 ROADMAP 的 W18-B 一一对应）：巨大 / 极小 / NaN / Inf / 全零 / 空。"""
+    """六类极端输入：巨大 / 极小 / NaN / Inf / 全零 / 空。"""
     if isinstance(size, bool) or not isinstance(size, int):
         raise TypeError("stability_cases: size 必须是整数")
     if size <= 0:
@@ -33460,7 +33460,7 @@ def _w18b_user_why():
 
 
 # ============================================================================
-#  研究前沿 W20-E：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#  研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
 # ============================================================================
 
 def _w20e_net(model):
@@ -33629,7 +33629,7 @@ def double_descent_curve(n_samples=30, dims=(4, 8, 16, 24, 30, 40, 60, 120),
             "peak_dim": out_dims[peak_index]}
 
 # ============================================================================
-#  研究前沿 W20-D：神经符号（规则约束的候选过滤）
+#  研究前沿：神经符号（规则约束的候选过滤）
 # ============================================================================
 
 def _w20d_sequence(values, what):
@@ -33809,7 +33809,7 @@ def constrained_generate(step_fn, rules, max_len=8, vocab_size=None, seed_token=
     return {"tokens": tokens, "logits": trace, "steps": len(trace)}
 
 # ============================================================================
-#  研究前沿 W20-C：Mixture-of-Depths 路由与 Early Exit
+#  研究前沿：Mixture-of-Depths 路由与 Early Exit
 # ============================================================================
 
 def _w20c_numbers(values, what):
@@ -33947,7 +33947,7 @@ def early_exit_savings(exit_layers, n_layers):
             "n_layers": n_layers}
 
 # ============================================================================
-#  研究前沿 W20-B：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#  研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
 # ============================================================================
 
 def _w20b_net(model):
@@ -34161,7 +34161,7 @@ def ticket_smaller_than(model_a, model_b, keep_ratio=0.5):
             "ratio": (count_a / count_b) if count_b else 0.0}
 
 # ============================================================================
-#  研究前沿 W20-A：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#  研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
 # ============================================================================
 
 def squeeze_grads(grads):
@@ -34399,7 +34399,7 @@ def membership_defense_delta(member_losses, nonmember_losses):
     }
 
 # ============================================================================
-#  工程化收尾 W19-C：配置文件 / 日志 / 内存监控 / 模型注册表
+#  工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
 # ============================================================================
 
 _W19C_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -34949,7 +34949,7 @@ def _w19c_metric_map(metrics, what):
         out[key] = value
     return out
 
-# ==== W19-A：实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据 ====
+# ==== 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据 ====
 
 def git_hash(directory=None):
     """尽力取当前 git HEAD；取不到返回 None（不是所有环境都有 git 或仓库）。
@@ -35209,7 +35209,7 @@ def load_model_metadata(path):
     return meta
 
 
-# ==== W18-C：回归基线快照（固定 seed 下数值存 JSON，CI 比对） ====
+# ==== 回归基线快照（固定 seed 下数值存 JSON，CI 比对） ====
 
 _W18C_FORMAT = 1
 
@@ -35416,7 +35416,7 @@ def baseline_model(layer_sizes=(3, 4, 2), seed=12345,
     return MLP(list(layer_sizes), activations=list(activations))
 
 
-# ==== W18-D：集成测试 / doctest / 属性测试的运行时支撑 ====
+# ==== 集成测试 / doctest / 属性测试的运行时支撑 ====
 
 def run_doctests(module=None, verbose=False, optionflags=None, require_examples=True):
     """运行 docstring 里的 `>>>` 示例，返回 `{"attempted", "failed", "failures"}`。
@@ -35510,7 +35510,7 @@ def check_shape_consistency(model, x):
     return out, info
 
 # ======================================================================
-#  领域应用 W17-E-3：OCR（CRNN 简化）与检测（YOLO 简化）
+#  领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
 # ======================================================================
 
 
@@ -35797,7 +35797,7 @@ def nms(boxes, scores, iou_threshold=0.5):
 
 
 # ======================================================================
-#  领域应用 W17-E-2b：视频（3D-CNN / Two-Stream 融合）
+#  领域应用：视频（3D-CNN / Two-Stream 融合）
 # ======================================================================
 
 
@@ -36089,7 +36089,7 @@ class TwoStreamFusion:
 
 
 # ======================================================================
-#  领域应用 W17-E-2a：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#  领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
 # ======================================================================
 
 
@@ -36351,7 +36351,7 @@ class PointNetEncoder:
 
 
 # ========================================================================
-#  领域应用 W17-E-1：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#  领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
 # ========================================================================
 
 
@@ -36632,7 +36632,7 @@ class ConformerBlock:
         return [self.norm_out.forward(row) for row in x]
 
 # ========================================================================
-#  领域应用 W17-D：向量检索（暴力 / IVF / 单层 NSW 图）
+#  领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
 # ========================================================================
 
 
@@ -36987,7 +36987,7 @@ def retrieval_recall(truth, got):
     return hits / float(len(truth))
 
 # ========================================================================
-#  领域应用 W17-C-2：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#  领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
 # ========================================================================
 
 
@@ -37330,7 +37330,7 @@ class DnCNN:
         return history
 
 # ======================================================================
-#  领域应用 W17-C-1：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#  领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
 # ======================================================================
 
 
@@ -37605,7 +37605,7 @@ def style_transfer(content, style, extractor=None, steps=50, lr=0.02,
     }
 
 # ======================================================================
-#  领域应用 W17-B-2：DeepFM / DIN
+#  领域应用：DeepFM / DIN
 # ======================================================================
 
 
@@ -38045,7 +38045,7 @@ class DIN:
 
 
 # ======================================================================
-#  领域应用 W17-B：推荐（矩阵分解 / NCF / Wide&Deep）
+#  领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
 # ======================================================================
 
 
@@ -38533,7 +38533,7 @@ class WideAndDeep:
 
 
 # ============================================================================
-#  联邦学习（W16-I：FedAvg / FedProx / FedBN / 参数摊平）
+#  联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
 # ============================================================================
 
 def _fed_check_updates(updates, who):
@@ -38716,7 +38716,7 @@ def load_named_params(model, params):
         layer.biases[:] = [float(v) for v in bvec]
 
 # ============================================================================
-#  元学习（W16-H：MAML / Reptile / ProtoNet / Matching Networks）
+#  元学习（MAML / Reptile / ProtoNet / Matching Networks）
 # ============================================================================
 
 def _meta_mlp(model, who):
@@ -39075,7 +39075,7 @@ def matching_logits(query, support, support_labels, num_classes):
     return out
 
 # ============================================================================
-#  RL 环境（W16-E：GridWorld / CartPole）
+#  RL 环境（GridWorld / CartPole）
 # ============================================================================
 
 class GridWorld:
@@ -39329,7 +39329,7 @@ def rollout(env, policy, max_steps=None):
             "rewards": rewards, "dones": dones}
 
 # ============================================================================
-#  自监督：视觉掩码建模（W16-B：MAE / SimMIM / BeiT）
+#  自监督：视觉掩码建模（MAE / SimMIM / BeiT）
 # ============================================================================
 
 def patchify(image, patch_size):
@@ -39555,7 +39555,7 @@ def beit_loss(logits, targets, masked):
     return total / len(masked), grad
 
 # ============================================================================
-#  自监督：对比学习（W16-A：SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#  自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
 # ============================================================================
 
 def _ct_rows(z, who):
@@ -39957,7 +39957,7 @@ def update_dino_center(center, teacher_logits, momentum=0.9):
             for j in range(len(mean))]
 
 # ============================================================================
-#  推理与部署：批内打包与投机解码（W15-D）
+#  推理与部署：批内打包与投机解码
 # ============================================================================
 
 def pack_decode_batch(sequences, pad_id=0):
@@ -40057,7 +40057,7 @@ def speculative_generate(draft, target, prompt_ids, max_new_tokens=16, gamma=4,
     return ids, stats
 
 # ============================================================================
-#  推理与部署：集成学习（W15-C：Voting / Bagging / Stacking / AdaBoost）
+#  推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
 # ============================================================================
 
 def _w15c_models(models, who):
@@ -40353,7 +40353,7 @@ class AdaBoostStumps:
         return self.predict_proba(x)
 
 # ============================================================================
-#  推理与部署：量化（W15-B：PTQ / QAT / SmoothQuant）
+#  推理与部署：量化（PTQ / QAT / SmoothQuant）
 # ============================================================================
 
 def _w15_flat_numbers(value, who="_w15_flat_numbers"):
@@ -40567,7 +40567,7 @@ def smooth_quant_apply(layer, scales):
 
 
 # ============================================================================
-#  推理与部署：结构化剪枝（W15-A：通道 / 头 / 层）
+#  推理与部署：结构化剪枝（通道 / 头 / 层）
 # ============================================================================
 
 def _w15_rows(value):
@@ -40790,7 +40790,7 @@ def sparsity_report(model):
 
 
 # ============================================================================
-#  可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响（W14-F）
+#  可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
 # ============================================================================
 
 def _w14f_modules(model):
@@ -41265,7 +41265,7 @@ def influence_scores(model, x, y, train_x, train_y):
 
 
 # ============================================================================
-#  可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors（W14-E）
+#  可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
 # ============================================================================
 
 def _w14e_net(model):
@@ -41751,7 +41751,7 @@ def embedding_visualize(data, labels=None, method="tsne", seed=42,
         "ascii": scatter_ascii(pts, labels=labels, width=width, height=height),
     }
 
-#  可解释性：CAM 系列（W14-D：GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#  可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
 # ============================================================================
 
 def _cam_modules(model):
@@ -42076,7 +42076,7 @@ def cam_ascii(heatmap, max_width=24):
     """把 [0,1] 热图渲染成 ASCII（复用 ``feature_maps_ascii`` 的字符表）。"""
     return feature_maps_ascii([heatmap], max_width=max_width)
 
-#  可解释性：置换重要性 / 特征图字符画（W14-C）
+#  可解释性：置换重要性 / 特征图字符画
 # ============================================================================
 
 def _w14c_rows(x, who):
@@ -42257,7 +42257,7 @@ def feature_maps_ascii(maps, channels=None, max_width=24, max_channels=8):
     return "\n".join(lines)
 
 # ============================================================================
-#  可解释性：注意力 Rollout / Flow（W14-B）
+#  可解释性：注意力 Rollout / Flow
 # ============================================================================
 
 def _w14b_mul(a, b):
@@ -42412,7 +42412,7 @@ def attention_flow(attentions, head_fusion="mean", discard_ratio=0.0):
     return flow
 
 # ============================================================================
-#  可解释性：输入归因（W14-A）
+#  可解释性：输入归因
 # ============================================================================
 
 def _attr_x(x, who):
@@ -46572,7 +46572,7 @@ def _mlp_backward(model: 'MLP', loss_grad: list) -> list:
 
 
 # ============================================================================
-#  W10-F：梯度检查点（activation checkpointing）与混合精度模拟
+#  梯度检查点（activation checkpointing）与混合精度模拟
 # ============================================================================
 
 def _w10f_segments(n_layers, segments):
@@ -46765,7 +46765,7 @@ def mixed_precision_grads(model, xs, ys, scale=1024.0, dtype="fp16"):
 
 
 # ============================================================================
-#  W10-E：半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#  半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
 # ============================================================================
 
 def softmax_rows(logits):
@@ -47308,7 +47308,7 @@ def mean_teacher_regularizer(student, teacher, xs, kind="mse"):
 
 
 # ============================================================================
-#  W10-D：噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#  噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
 # ============================================================================
 
 def _noise_check(sigma, who):
@@ -47562,7 +47562,7 @@ class SnapshotCallback(Callback):
 
 
 # ============================================================================
-#  W10-C：对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#  对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
 # ============================================================================
 
 def _adv_check(eps, alpha, steps, clip_low, clip_high):
@@ -48290,7 +48290,7 @@ class Model:
                 每个 batch 在 mixup / 对抗攻击**之前**调用一次，输入输出都是
                 「批内样本列表 + 标签列表」，样本数必须保持不变。默认 None
                 （关闭），关闭时数值与旧版完全一致。
-                用途：W11-C 的 `Compose`/`RandomCrop`/`ColorJitter` 等图像增强、
+                用途：`Compose`/`RandomCrop`/`ColorJitter` 等图像增强、
                 `augment_cutout`、或自定义的「x 加噪」——它们都是逐样本变换，
                 先增强再混合才符合 CutMix/Cutout 的语义（早先只接 mixup 的顺序
                 问题在这里解决）。
