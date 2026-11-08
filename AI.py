@@ -50741,6 +50741,243 @@ def meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5):
     return f_mean * (1.0 - penalty)
 
 
+# ============================================================================
+#  文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+# ============================================================================
+
+
+def _mt_norm(token):
+    return str(token).lower()
+
+
+def _mt_stem(token):
+    """教学版英文词干：剥离常见后缀（不是完整 Porter）。"""
+    w = _mt_norm(token)
+    for suf in ("ing", "edly", "ed", "es", "s", "ly", "er", "est"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            return w[:-len(suf)]
+    return w
+
+
+def _mt_synonym_table(synonyms):
+    """把 dict 或「同义词组列表」规范成 token -> 同义词集合 的表。"""
+    table = {}
+    if synonyms is None:
+        return table
+    if isinstance(synonyms, dict):
+        groups = []
+        for key, vals in synonyms.items():
+            group = {_mt_norm(key)}
+            for v in vals:
+                group.add(_mt_norm(v))
+            groups.append(group)
+        for group in groups:
+            for t in group:
+                table[t] = group
+        return table
+    if isinstance(synonyms, (list, tuple)):
+        for group in synonyms:
+            g = {_mt_norm(t) for t in group}
+            for t in g:
+                table[t] = g
+        return table
+    raise ValueError("meteor_score_full: synonyms 必须是 dict、列表或 None")
+
+
+def _mt_align(p_tokens, r_tokens, table, use_stem=True):
+    """贪心对齐：先精确、再词干、最后同义词；返回 [(i, j), ...]。"""
+    used = set()
+    pairs = []
+    remaining = []
+    for i, p in enumerate(p_tokens):
+        hit = None
+        for j, r in enumerate(r_tokens):
+            if j in used:
+                continue
+            if _mt_norm(p) == _mt_norm(r):
+                hit = j
+                break
+        if hit is None:
+            remaining.append(i)
+        else:
+            used.add(hit)
+            pairs.append((i, hit))
+    if use_stem:
+        for i in remaining:
+            hit = None
+            for j, r in enumerate(r_tokens):
+                if j in used:
+                    continue
+                if _mt_stem(p_tokens[i]) == _mt_stem(r):
+                    hit = j
+                    break
+            if hit is not None:
+                used.add(hit)
+                pairs.append((i, hit))
+        remaining = [i for i in remaining if all(i != p[0] for p in pairs)]
+    if table:
+        for i in remaining:
+            group = table.get(_mt_norm(p_tokens[i]))
+            if not group:
+                continue
+            hit = None
+            for j, r in enumerate(r_tokens):
+                if j in used:
+                    continue
+                if _mt_norm(r) in group:
+                    hit = j
+                    break
+            if hit is not None:
+                used.add(hit)
+                pairs.append((i, hit))
+    pairs.sort()
+    return pairs
+
+
+def _mt_chunks(pairs):
+    """匹配对在候选与参考中同时连续才算同一个 chunk。"""
+    chunks = 0
+    prev_i = prev_j = None
+    for i, j in pairs:
+        if prev_i is None or i != prev_i + 1 or j != prev_j + 1:
+            chunks += 1
+        prev_i, prev_j = i, j
+    return chunks
+
+
+def meteor_score_full(pred, ref, alpha=0.9, beta=3.0, gamma=0.5,
+                      synonyms=None, use_stem=True):
+    """METEOR（完整版教学实现）：精确/词干/同义词匹配 + 片段惩罚。
+
+    与 ``meteor_score`` 的区别：支持词干匹配与外部同义词表，片段数按
+    「候选与参考中的匹配位置同时连续」计算（原版 METEOR 的 chunk 定义）。
+    """
+    who = "meteor_score_full"
+    for name, v in (("alpha", alpha), ("beta", beta), ("gamma", gamma)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{who}: {name} 必须是数字，收到 {v!r}")
+        if v < 0.0:
+            raise ValueError(f"{who}: {name} 必须是非负数，收到 {v}")
+    if alpha > 1.0:
+        raise ValueError(f"{who}: alpha 必须在 [0, 1]，收到 {alpha}")
+    if not isinstance(use_stem, bool):
+        raise ValueError(f"{who}: use_stem 必须是 bool")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    table = _mt_synonym_table(synonyms)
+    pairs = _mt_align(p_tokens, r_tokens, table, use_stem)
+    matched = len(pairs)
+    if matched == 0:
+        return 0.0
+    precision = matched / float(len(p_tokens))
+    recall = matched / float(len(r_tokens))
+    f_mean = (precision * recall) / (alpha * precision + (1.0 - alpha) * recall)
+    chunks = _mt_chunks(pairs)
+    penalty = gamma * ((chunks / float(matched)) ** beta)
+    score = f_mean * (1.0 - penalty)
+    return max(0.0, score)
+
+
+def chrf_score(pred, ref, max_n=6, beta=2.0):
+    """chrF：字符 n-gram（1..max_n）的 F-beta 平均。"""
+    who = "chrf_score"
+    if isinstance(max_n, bool) or not isinstance(max_n, int) or max_n < 1:
+        raise ValueError(f"{who}: max_n 必须是 >=1 的整数，收到 {max_n!r}")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or beta <= 0:
+        raise ValueError(f"{who}: beta 必须是正数，收到 {beta!r}")
+    if isinstance(pred, str):
+        p_text = " ".join(pred.lower().split())
+    elif isinstance(pred, (list, tuple)):
+        p_text = " ".join(str(t).lower() for t in pred)
+    else:
+        raise ValueError(f"{who}: pred 必须是字符串或 token 列表")
+    if isinstance(ref, str):
+        r_text = " ".join(ref.lower().split())
+    elif isinstance(ref, (list, tuple)):
+        r_text = " ".join(str(t).lower() for t in ref)
+    else:
+        raise ValueError(f"{who}: ref 必须是字符串或 token 列表")
+    if not p_text or not r_text:
+        return 0.0
+    b2 = float(beta) * float(beta)
+    total = 0.0
+    used = 0
+    for n in range(1, max_n + 1):
+        p_grams = [p_text[i:i + n] for i in range(len(p_text) - n + 1)]
+        r_grams = [r_text[i:i + n] for i in range(len(r_text) - n + 1)]
+        if not p_grams or not r_grams:
+            continue
+        remain = {}
+        for g in r_grams:
+            remain[g] = remain.get(g, 0) + 1
+        overlap = 0
+        for g in p_grams:
+            c = remain.get(g, 0)
+            if c > 0:
+                remain[g] = c - 1
+                overlap += 1
+        precision = overlap / float(len(p_grams))
+        recall = overlap / float(len(r_grams))
+        if precision + recall <= 0.0:
+            continue
+        total += ((1.0 + b2) * precision * recall) / (b2 * precision + recall)
+        used += 1
+    if used == 0:
+        return 0.0
+    return total / float(used)
+
+
+def _mt_length_ratio(p_tokens, r_tokens):
+    if not p_tokens and not r_tokens:
+        return 1.0
+    return min(len(p_tokens), len(r_tokens)) / float(max(len(p_tokens), len(r_tokens)))
+
+
+def bleurt_lite(pred, ref, embed_fn, idf=None, length_penalty=0.1):
+    """BLEURT 的轻量代理（无预训练权重）：BERTScore-F + 长度惩罚。
+
+    用 ``embed_fn`` 做词级嵌入、BERTScore 的 F_beta（beta=1）作为语义覆盖，
+    再乘 ``1 - length_penalty*(1-min/max)``。分数在 [0, 1]，不是原版 BLEURT
+    的 [-2.5, 1] 标度，仅用于排序/教学。
+    """
+    who = "bleurt_lite"
+    if isinstance(length_penalty, bool) or not isinstance(length_penalty, (int, float)):
+        raise ValueError(f"{who}: length_penalty 必须是数字")
+    if not (0.0 <= float(length_penalty) <= 1.0):
+        raise ValueError(f"{who}: length_penalty 必须在 [0, 1]")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    bs = bert_score(p_tokens, r_tokens, embed_fn, idf=idf, beta=1.0)
+    ratio = _mt_length_ratio(p_tokens, r_tokens)
+    score = bs["f_beta"] * (1.0 - float(length_penalty) * (1.0 - ratio))
+    return max(0.0, min(1.0, score))
+
+
+def comet_lite(pred, ref, embed_fn, idf=None, length_penalty=0.1):
+    """COMET 的轻量代理（无预训练权重）：偏召回的 BERTScore-F + 长度惩罚。
+
+    与 ``bleurt_lite`` 的区别：用 beta=2 的 F 分数（更看重参考的覆盖/完整性），
+    再按长度差异惩罚；分数在 [0, 1]，仅用于排序/教学。
+    """
+    who = "comet_lite"
+    if isinstance(length_penalty, bool) or not isinstance(length_penalty, (int, float)):
+        raise ValueError(f"{who}: length_penalty 必须是数字")
+    if not (0.0 <= float(length_penalty) <= 1.0):
+        raise ValueError(f"{who}: length_penalty 必须在 [0, 1]")
+    p_tokens = _as_tokens(pred, who + ".pred")
+    r_tokens = _as_tokens(ref, who + ".ref")
+    if not p_tokens or not r_tokens:
+        return 0.0
+    bs = bert_score(p_tokens, r_tokens, embed_fn, idf=idf, beta=2.0)
+    ratio = _mt_length_ratio(p_tokens, r_tokens)
+    score = bs["f_beta"] * (1.0 - float(length_penalty) * (1.0 - ratio))
+    return max(0.0, min(1.0, score))
+
+
 def _bs_tokens(text, who):
     """bert_score 的输入规整：字符串按空白切，列表按元素转字符串。"""
     if isinstance(text, str):

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2024 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2029 项）
 
 ## 特性
 
@@ -1405,6 +1405,10 @@ print(AI.hd95(gt, pred))             # 1.0
 | `rouge_w(pred, ref, beta=1.0)` | ROUGE-W 的 F 值（加权 LCS：连续匹配越长权重越高，`f(l)=l^2` 的近似 DP，`sqrt(W)` 归一化） |
 | `meteor_score(pred, ref, alpha=0.9, beta=3.0, gamma=0.5)` | METEOR 简化版：精确匹配 + 片段（chunk）惩罚，无词干/同义词表 |
 | `bert_score(pred, ref, embed_fn, idf=None, beta=1.0)` | BERTScore：用外部嵌入对 token 做贪心最大余弦匹配，可选 IDF 加权，返回 P/R/F_beta（不内置预训练模型，嵌入由调用方提供） |
+| `meteor_score_full(pred, ref, alpha=0.9, beta=3.0, gamma=0.5, synonyms=None, use_stem=True)` | METEOR 完整版：精确 / 词干 / 同义词匹配，chunk 按候选与参考中匹配位置同时连续计算 |
+| `chrf_score(pred, ref, max_n=6, beta=2.0)` | chrF：字符 n-gram（1..max_n）的 F-beta 平均，对形态变化更稳 |
+| `bleurt_lite(pred, ref, embed_fn, idf=None, length_penalty=0.1)` | BLEURT 轻量代理：BERTScore-F（β=1）+ 长度惩罚，分数 [0,1]（无预训练权重，仅排序/教学） |
+| `comet_lite(pred, ref, embed_fn, idf=None, length_penalty=0.1)` | COMET 轻量代理：偏召回的 BERTScore-F（β=2）+ 长度惩罚，分数 [0,1]（无预训练权重） |
 | `cider_score(candidate, references, n=4)` | CIDEr 简化版：1..n gram 的 TF-IDF 余弦平均 × 10 |
 | `self_bleu(candidates, max_n=4)` | 每个候选以其余候选为参考算 BLEU 再平均；越高说明生成越不多样 |
 
@@ -3607,7 +3611,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2024 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2029 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3686,6 +3690,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrackingAndSurfaceMetrics` | ASSD/NSD/Surface Dice 的手算值与边界情形；MOTA/MOTP/IDF1 的手算值、完美匹配、id 互换（全局 IDF1 不降）与跨帧合并 id、非法输入 |
 | `TestHpoSearch` | TPE 在二次目标/混合空间上的收敛与最大化模式、同 seed 可复现、非法空间/参数；successive halving 的轮次/预算/评估次数、最大化模式与非法输入 |
 | `TestBertScoreAndSvd` | BERTScore 的贪心匹配手算值、IDF 与 β 公式、非法输入；SVD 对角矩阵、秩 1 重建、3×2 的 √70、非法矩阵/rank，以及全秩与截断重建的一致性 |
+| `TestTextMetricsExt` | METEOR 完整版的词干/同义词匹配与 chunk 惩罚、chrF 的 n-gram 平均、BLEURT/COMET 代理的单调性、各指标非法输入 |
 | `TestConvNeXtNetwork` | ConvNeXt 前向形状/参数量、反向输入梯度与卷积梯度非零、小样本 `fit` 收敛、5 类非法输入 |
 | `TestYarnMscale` | YaRN mscale 公式与默认 1.0 不变性、显式覆盖与 6 类非法值、缩放后前向/反向可用、增量前向与整段前向逐位一致 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
@@ -3923,7 +3928,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2024 个单元测试
+├── test_ai.py       # 2029 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

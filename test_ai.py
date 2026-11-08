@@ -31142,3 +31142,73 @@ class TestE3NN:
         _e3_raises(lambda: model.fit(_e3_graphs(), epochs=0, lr=0.1))
         _e3_raises(lambda: model.fit(_e3_graphs(), epochs=2, lr=0.0))
         _e3_raises(lambda: model.loss_and_backward([[0.1, 0.2]], [[0.0, 0.0, 0.0]], "x"))
+
+
+def _tm_embed(token):
+    vec = [0.0] * 26
+    for ch in str(token).lower():
+        if "a" <= ch <= "z":
+            vec[ord(ch) - 97] += 1.0
+    return vec
+
+
+def _tm_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestTextMetricsExt:
+    def test_meteor_full_stem_and_synonym(self):
+        assert AI.meteor_score_full("a b c d e", "a b c d e") > 0.99
+        stem = AI.meteor_score_full("running dogs", "runs dog")
+        nostem = AI.meteor_score_full("running dogs", "runs dog", use_stem=False)
+        assert stem > nostem
+        assert stem > 0.2
+        syn = AI.meteor_score_full(
+            "car fast", "automobile quick",
+            synonyms={"car": ["automobile"], "fast": ["quick"]})
+        plain = AI.meteor_score_full("car fast", "automobile quick")
+        assert syn > 0.8
+        assert plain < syn
+
+    def test_meteor_full_chunk_penalty(self):
+        ordered = AI.meteor_score_full("a b c d", "a b c d")
+        interleaved = AI.meteor_score_full("a c b d", "a b c d")
+        shuffled = AI.meteor_score_full("c a d b", "a b c d")
+        assert ordered > interleaved
+        assert ordered > shuffled
+        assert interleaved > 0.0
+
+    def test_chrf_score(self):
+        assert AI.chrf_score("hello world", "hello world") == 1.0
+        partial = AI.chrf_score("hello world", "hello there")
+        assert 0.0 < partial < 1.0
+        assert AI.chrf_score("hello", "") == 0.0
+        order = AI.chrf_score("a b c", ["a", "b", "c"])
+        assert order > 0.9
+
+    def test_bleurt_and_comet_lite(self):
+        same = AI.bleurt_lite("the cat sat", "the cat sat", _tm_embed)
+        other = AI.bleurt_lite("the cat sat", "zzz qqq xxx", _tm_embed)
+        assert 0.0 <= other < same <= 1.0
+        same_c = AI.comet_lite("the cat sat", "the cat sat", _tm_embed)
+        other_c = AI.comet_lite("the cat sat", "zzz qqq xxx", _tm_embed)
+        assert 0.0 <= other_c < same_c <= 1.0
+        short = AI.bleurt_lite("cat", "the cat sat", _tm_embed)
+        assert short < same
+
+    def test_metric_invalid_inputs(self):
+        _tm_raises(lambda: AI.meteor_score_full("a", "a", alpha=1.5))
+        _tm_raises(lambda: AI.meteor_score_full("a", "a", beta=-1.0))
+        _tm_raises(lambda: AI.meteor_score_full("a", "a", use_stem="yes"))
+        _tm_raises(lambda: AI.meteor_score_full("a", "a", synonyms=42))
+        _tm_raises(lambda: AI.chrf_score("a", "a", max_n=0))
+        _tm_raises(lambda: AI.chrf_score("a", "a", beta=0.0))
+        _tm_raises(lambda: AI.chrf_score(1, "a"))
+        _tm_raises(lambda: AI.bleurt_lite("a", "a", _tm_embed, length_penalty=1.5))
+        _tm_raises(lambda: AI.comet_lite("a", "a", _tm_embed, length_penalty=-0.1))
