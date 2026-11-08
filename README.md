@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1907 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1912 项）
 
 ## 特性
 
@@ -456,6 +456,9 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
 | `LoRA(layer, rank=4, alpha=None)` | 低秩适配：冻结原层，只训 `A (rank, in)` / `B (out, rank)`；`B` 初始为 0（包装后行为不变）；`merge()` 把 `scaling·BA` 折进原层权重 |
 | `IA3(layer, init=1.0)` | IA³ 适配器：冻结原层，只训每个输出通道的缩放标量 `y = v ⊙ Layer(x)`；`v` 初始全 1（包装后行为不变），`params()`/`zero_grad()` 与 LoRA 同构，`trainable_param_count()` 只有输出通道数 |
+| `QLoRA(layer, rank=4, alpha=None, bits=4)` | 量化基座 + LoRA：先用 `fake_quantize` 把冻结基座权重做对称伪量化（`bits` 2..16），再挂 LoRA 适配器；`B` 初始为 0 时输出与量化后基座逐位相等；`merge()` 把适配器折回量化基座；`trainable_param_count()` 只统计适配器参数 |
+| `VeRA(layer, rank=4, alpha=None, seed=None)` | 共享冻结随机投影 + 可训练逐秩缩放：`A`/`B` 随机生成后冻结，只训 `d`（`rank` 个标量），`y = Layer(x) + scaling·B(d ⊙ Ax)`；`merge()` 可折回原层 |
+| `ReFT(layer, rank=2, alpha=None, seed=None)` | 低秩表示干预：`P` 冻结随机投影（`rank×fan_out`），只训 `W`（`rank×fan_out`）与 `b`（`rank`），`y = Layer(x) + scaling·Pᵀ(W·Layer(x)+b)`；包装任意 `Layer`，不做 merge |
 | `DoRALinear(layer, rank=4, alpha=None)` | DoRA：权重拆成「幅度 `m` × 方向 `V`」，LoRA 只改方向（`W' = m·Weff/‖Weff‖`），`V`/`m` 也可训；`B=0` 时与原层逐位一致，`merge()` 折回原层 |
 | `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `|A_r|·|B_:,r|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
@@ -3359,7 +3362,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1907 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1912 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3430,6 +3433,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestT5AndBertModels` | T5 forward/param_count=6040/编码器与解码器相对偏置梯度非零/fit 降 loss/非法输入；BERT MLM+NSP forward、loss 下降、mask 标签与 NSP 非法输入 |
 | `TestBootstrapCohensTemperature` | bootstrap CI 包含均值/自定义统计量/非法参数；Cohen's d 已知值、相同与零方差；温度缩放的欠自信锐化、过自信平滑、对称样本平坦与非法输入 |
 | `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
+| `TestPEFTAdapters` | QLoRA 与量化基座逐位等价、冻结基座、`merge()` 前后输出不变；VeRA 初始等基座、`d` 中心差分、`merge()` 等价、参数量；ReFT 初始等基座、`W`/`b` 中心差分、参数量；三者非法输入（类型/rank/alpha/bits/未 forward 调 backward） |
 | `TestConvNeXtNetwork` | ConvNeXt 前向形状/参数量、反向输入梯度与卷积梯度非零、小样本 `fit` 收敛、5 类非法输入 |
 | `TestYarnMscale` | YaRN mscale 公式与默认 1.0 不变性、显式覆盖与 6 类非法值、缩放后前向/反向可用、增量前向与整段前向逐位一致 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
@@ -3653,7 +3657,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1907 个单元测试
+├── test_ai.py       # 1912 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

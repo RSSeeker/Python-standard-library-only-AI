@@ -711,6 +711,7 @@
 - [x] 清单驱动的低成本小件：ROUGE-S / ROUGE-W（`rouge_s` / `rouge_w`）与 IA³ 适配器（`IA3`，冻结原层只训输出通道缩放）；测试 `TestRougeExtraAndIA3` 12 例
 
 - [x] 统计/校准小件：`bootstrap_ci`（百分位 bootstrap）、`cohens_d`、`temperature_scale`（NLL 网格 + 三分细化）；测试 `TestBootstrapCohensTemperature` 9 例
+- [x] PEFT 高级适配器：QLoRA（4-bit 伪量化基座 + LoRA）、VeRA（冻结随机投影 + 逐秩标量缩放）、ReFT（低秩表示干预）；测试 `TestPEFTAdapters` 5 例
 - [x] 高级评估小件：`fit_mahalanobis` / `mahalanobis_distance` / `mahalanobis_scores` / `ood_mahalanobis_auroc`（马氏距离 OOD）、`conformal_quantile` / `conformal_prediction_sets` / `conformal_coverage` / `average_conformal_set_size`（split-conformal）、`robust_accuracy` / `adversarial_success_rate`（鲁棒性）、`equalized_odds_difference` / `group_calibration_error`（公平性）；测试 `TestAdvancedMetrics` 7 例
 
 - [x] 完整 ConvNeXt（`ConvNeXt`：stem `Conv2d(k=2, s=2) → GELU` → 多个 `ConvNeXtBlock` stage +
@@ -733,7 +734,7 @@
   只训练编码器与重建头，重建头首次调用时创建、不计入 `param_count`）；
   测试 `TestViTEntryPoints` 4 例
 
-全量测试：1839 → 1907 passed（新增 68 例）。
+全量测试：1839 → 1912 passed（新增 73 例）。
 
 ---
 

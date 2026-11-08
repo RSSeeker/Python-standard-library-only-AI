@@ -21838,6 +21838,247 @@ class IA3:
         return self.layer.backward(d_base)[-1]
 
 
+class QLoRA:
+    """QLoRA：冻结的基座权重先做低比特伪量化，再训练 LoRA 适配器。
+
+    ``y = Q(W) x + scaling · B(A x)``，``Q`` 是 ``fake_quantize`` 的伪量化
+    反量化值（前向不需要额外解包）；``A/B`` 与 :class:`LoRA` 相同，``B`` 初始
+    为 0，因此训练开始时输出等于「量化后的基座」——与全精度基座的差距就是
+    量化误差。这是教学用的组合：把 4/8 bit 基座与低秩适配器接在一起，不真的
+    用 int4 压缩存储。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 4, alpha: float = None,
+                 bits: int = 4):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"QLoRA: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
+        _w15_check_bits(bits, "QLoRA")
+        self.bits = bits
+        self.adapter = LoRA(layer, rank, alpha)
+        self.layer = layer
+        self.fan_in = layer.fan_in
+        self.fan_out = layer.fan_out
+        # 基座权重低比特伪量化（冻结；写回反量化值，前向路径不变）
+        layer.weights = fake_quantize(layer.weights, bits=bits)
+        self.merged = False
+
+    def zero_grad(self):
+        """清零 LoRA 的 A/B 梯度。"""
+        self.adapter.zero_grad()
+
+    def params(self):
+        """返回 [(参数, 梯度)]，只含 LoRA 的 A/B。"""
+        return self.adapter.params()
+
+    def forward(self, x):
+        return self.adapter.forward(x)
+
+    def backward(self, delta_out):
+        return self.adapter.backward(delta_out)
+
+    def merge(self):
+        """把 LoRA 分支折进（已量化的）基座权重。"""
+        self.adapter.merge()
+        self.merged = True
+        return self
+
+    def trainable_param_count(self):
+        """可训练参数个数（只算 A/B）。"""
+        return self.adapter.trainable_param_count()
+
+    def total_param_count(self):
+        """总参数个数（量化基座 + LoRA 的 A/B）。"""
+        return self.fan_out * (self.fan_in + 1) + self.trainable_param_count()
+
+
+class VeRA:
+    """VeRA：冻结随机低秩投影，只训练缩放向量 ``d``。
+
+    ``y = Layer(x) + scaling · B (d ⊙ (A x))``；``A (rank×fan_in)`` 与
+    ``B (fan_out×rank)`` 随机初始化后冻结，``d`` 初始为 0，因此训练开始时
+    与基座逐位一致。可训练参数只有 ``rank`` 个，比 LoRA 更省；``merge()``
+    可以把低秩增量折进权重。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 4, alpha: float = None,
+                 seed=None):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"VeRA: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            raise ValueError(f"VeRA: rank 必须是正整数，收到 {rank!r}")
+        self.layer = layer
+        self.rank = rank
+        self.alpha = float(rank if alpha is None else alpha)
+        if not self.alpha > 0.0:
+            raise ValueError(f"VeRA: alpha 必须 > 0，收到 {alpha!r}")
+        self.scaling = self.alpha / rank
+        self.fan_in = layer.fan_in
+        self.fan_out = layer.fan_out
+        rng = random.Random(seed)
+        std_a = 1.0 / math.sqrt(self.fan_in)
+        self.A = [[rng.gauss(0.0, std_a) for _ in range(self.fan_in)]
+                  for _ in range(self.rank)]
+        std_b = 1.0 / math.sqrt(float(self.rank))
+        self.B = [[rng.gauss(0.0, std_b) for _ in range(self.rank)]
+                  for _ in range(self.fan_out)]
+        # d 初始为 0：训练开始时适配分支输出为 0，与基座逐位一致
+        self.d = [0.0] * self.rank
+        self.grad_d = [0.0] * self.rank
+        self.merged = False
+        self.x = None
+        self.h = None
+
+    def zero_grad(self):
+        """清零 d 的梯度。"""
+        self.grad_d = [0.0] * self.rank
+
+    def params(self):
+        """返回 [(d, grad_d)]，可直接喂给优化器。"""
+        return [(self.d, self.grad_d)]
+
+    def forward(self, x):
+        if self.merged:
+            return self.layer.forward(x)
+        base = self.layer.forward(x)
+        self.x = list(x)
+        self.h = [sum(map(_mul, row, x)) for row in self.A]
+        hd = [self.d[r] * self.h[r] for r in range(self.rank)]
+        delta = [sum(self.B[j][r] * hd[r] for r in range(self.rank))
+                 for j in range(self.fan_out)]
+        return [base[j] + self.scaling * delta[j]
+                for j in range(self.fan_out)]
+
+    def backward(self, delta_out):
+        """返回 dx；基座梯度被丢弃（冻结）。"""
+        if self.merged:
+            return self.layer.backward(delta_out)[-1]
+        if self.h is None:
+            raise RuntimeError("VeRA.backward: 必须先调用 forward()")
+        dx_base = self.layer.backward(delta_out)[-1]
+        dh = [0.0] * self.rank
+        for r in range(self.rank):
+            acc = 0.0
+            for j in range(self.fan_out):
+                acc += self.B[j][r] * delta_out[j]
+            dh[r] = self.scaling * acc
+        for r in range(self.rank):
+            self.grad_d[r] += self.h[r] * dh[r]
+        dx = list(dx_base)
+        for i in range(self.fan_in):
+            acc = 0.0
+            for r in range(self.rank):
+                acc += self.A[r][i] * self.d[r] * dh[r]
+            dx[i] += acc
+        return dx
+
+    def merge(self):
+        """把低秩增量折进基座权重。"""
+        if self.merged:
+            return self
+        W = self.layer.weights
+        for j in range(self.fan_out):
+            for i in range(self.fan_in):
+                acc = 0.0
+                for r in range(self.rank):
+                    acc += self.B[j][r] * self.d[r] * self.A[r][i]
+                W[j][i] += self.scaling * acc
+        self.d = [0.0] * self.rank
+        self.merged = True
+        return self
+
+    def trainable_param_count(self):
+        """可训练参数个数（rank 个缩放标量）。"""
+        return self.rank
+
+    def total_param_count(self):
+        """总参数个数（基座 + 冻结投影 + 缩放向量）。"""
+        return (self.fan_out * (self.fan_in + 1) + self.rank
+                + self.rank * self.fan_in + self.fan_out * self.rank)
+
+
+class ReFT:
+    """ReFT / LoReFT 风格：冻结原层，只做低秩表示干预。
+
+    ``y = Layer(x) + scaling · Pᵀ (W·Layer(x) + b)``，``P (rank×fan_out)``
+    固定随机投影，``W (rank×fan_out)`` 与 ``b (rank)`` 可训练且初始为 0
+    （训练开始时与基座逐位一致）。干预在层输出上而不是权重上，不能折进权重。
+    """
+
+    def __init__(self, layer: Layer, rank: int = 2, alpha: float = None,
+                 seed=None):
+        if not isinstance(layer, Layer):
+            raise TypeError(
+                f"ReFT: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            raise ValueError(f"ReFT: rank 必须是正整数，收到 {rank!r}")
+        self.layer = layer
+        self.rank = rank
+        self.alpha = float(rank if alpha is None else alpha)
+        if not self.alpha > 0.0:
+            raise ValueError(f"ReFT: alpha 必须 > 0，收到 {alpha!r}")
+        self.scaling = self.alpha / rank
+        self.fan_out = layer.fan_out
+        rng = random.Random(seed)
+        self.P = [[rng.gauss(0.0, 1.0 / math.sqrt(float(self.fan_out)))
+                   for _ in range(self.fan_out)] for _ in range(self.rank)]
+        self.W = [[0.0] * self.fan_out for _ in range(self.rank)]
+        self.b = [0.0] * self.rank
+        self.grad_W = [[0.0] * self.fan_out for _ in range(self.rank)]
+        self.grad_b = [0.0] * self.rank
+        self.base = None
+        self.z = None
+
+    def zero_grad(self):
+        """清零 W / b 的梯度。"""
+        self.grad_W = [[0.0] * self.fan_out for _ in range(self.rank)]
+        self.grad_b = [0.0] * self.rank
+
+    def params(self):
+        """返回 [(W, grad_W), (b, grad_b)]。"""
+        return [(self.W, self.grad_W), (self.b, self.grad_b)]
+
+    def forward(self, x):
+        base = self.layer.forward(x)
+        self.base = list(base)
+        self.z = [sum(self.W[r][j] * base[j] for j in range(self.fan_out))
+                  + self.b[r] for r in range(self.rank)]
+        delta = [sum(self.P[r][j] * self.z[r] for r in range(self.rank))
+                 for j in range(self.fan_out)]
+        return [base[j] + self.scaling * delta[j]
+                for j in range(self.fan_out)]
+
+    def backward(self, delta_out):
+        """返回 dx；基座梯度被丢弃（冻结）。"""
+        if self.base is None:
+            raise RuntimeError("ReFT.backward: 必须先调用 forward()")
+        dz = [0.0] * self.rank
+        for r in range(self.rank):
+            acc = 0.0
+            for j in range(self.fan_out):
+                acc += self.P[r][j] * delta_out[j]
+            dz[r] = self.scaling * acc
+        for r in range(self.rank):
+            self.grad_b[r] += dz[r]
+            for j in range(self.fan_out):
+                self.grad_W[r][j] += dz[r] * self.base[j]
+        d_base = list(delta_out)
+        for j in range(self.fan_out):
+            for r in range(self.rank):
+                d_base[j] += self.W[r][j] * dz[r]
+        return self.layer.backward(d_base)[-1]
+
+    def trainable_param_count(self):
+        """可训练参数个数（W 与 b）。"""
+        return self.rank * self.fan_out + self.rank
+
+    def total_param_count(self):
+        """总参数个数（基座 + 固定投影 + W/b）。"""
+        return (self.fan_out * (self.layer.fan_in + 1)
+                + self.rank * self.fan_out * 2 + self.rank)
+
+
 def _copy_attn_maps(heads, who):
     """把 MHA 缓存的每头权重整理成纯 float 的嵌套列表，并做形状自检。"""
     if heads is None:

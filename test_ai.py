@@ -28959,3 +28959,126 @@ class TestAdvancedMetrics:
             AI.group_calibration_error(yt, yp, ["a"] * 4)
         with pytest.raises(ValueError):
             AI.group_calibration_error(yt, yp[:3], sg)
+
+
+class TestPEFTAdapters:
+    def _layer(self, fan_in=3, fan_out=2):
+        layer = AI.Layer(fan_in, fan_out, "linear")
+        layer.weights = [[0.1 * (j + 1) + 0.01 * i for i in range(fan_in)]
+                         for j in range(fan_out)]
+        layer.biases = [0.01 * j for j in range(fan_out)]
+        return layer
+
+    def test_qloRA_matches_quantized_base(self):
+        x = [0.5, -0.2, 0.3]
+        layer = self._layer()
+        w_before = [row[:] for row in layer.weights]
+        q = AI.QLoRA(layer, rank=2, bits=4)
+        assert q.bits == 4
+        assert layer.weights == AI.fake_quantize(w_before, bits=4)
+        assert q.trainable_param_count() == 2 * 3 + 2 * 2
+        assert q.total_param_count() == 2 * 4 + q.trainable_param_count()
+        # B 初始为 0：输出等于量化后的基座
+        ref = AI.Layer(3, 2, "linear")
+        ref.weights = [row[:] for row in layer.weights]
+        ref.biases = list(layer.biases)
+        assert q.forward(x) == ref.forward(x)
+
+    def test_qloRA_frozen_base_and_merge(self):
+        x = [0.5, -0.2, 0.3]
+        layer = self._layer()
+        q = AI.QLoRA(layer, rank=2)
+        w_quant = [row[:] for row in layer.weights]
+        q.forward(x)
+        q.zero_grad()
+        q.backward([0.3, -0.2])
+        assert layer.weights == w_quant
+        # 手动把 B 调离 0，验证 merge 真的折进权重且等价
+        q.adapter.B[0][0] = 0.5
+        y_before = q.forward(x)
+        q.merge()
+        assert layer.weights != w_quant
+        assert all(abs(a - b) < 1e-12 for a, b in zip(y_before, q.forward(x)))
+
+    def test_veRA_equivalence_grad_and_merge(self):
+        x = [0.5, -0.2, 0.3]
+        c = [0.7, -0.4]
+        eps = 1e-6
+        layer = self._layer()
+        vera = AI.VeRA(layer, rank=2, seed=7)
+        assert vera.trainable_param_count() == 2
+        assert vera.total_param_count() == 2 * 4 + 2 + 2 * 3 + 2 * 2
+        assert vera.forward(x) == layer.forward(x)
+        vera.zero_grad()
+        vera.forward(x)
+        vera.backward(c)
+        for r in range(2):
+            old = vera.d[r]
+
+            def f(val, r=r):
+                vera.d[r] = val
+                y = vera.forward(x)
+                return sum(y[j] * c[j] for j in range(2))
+
+            num = (f(old + eps) - f(old - eps)) / (2 * eps)
+            vera.d[r] = old
+            assert abs(vera.grad_d[r] - num) < 1e-6
+        y_before = vera.forward(x)
+        vera.merge()
+        assert all(abs(a - b) < 1e-12 for a, b in zip(y_before, vera.forward(x)))
+
+    def test_reFT_equivalence_and_grad(self):
+        x = [0.5, -0.2, 0.3]
+        c = [0.7, -0.4]
+        eps = 1e-6
+        layer = self._layer()
+        reft = AI.ReFT(layer, rank=2, seed=3)
+        assert reft.trainable_param_count() == 2 * 2 + 2
+        assert reft.total_param_count() == 2 * 4 + 2 * 2 * 2 + 2
+        assert reft.forward(x) == layer.forward(x)
+        reft.zero_grad()
+        reft.forward(x)
+        reft.backward(c)
+        for r in range(2):
+            for j in range(2):
+                old = reft.W[r][j]
+
+                def f(val, r=r, j=j):
+                    reft.W[r][j] = val
+                    y = reft.forward(x)
+                    return sum(y[k] * c[k] for k in range(2))
+
+                num = (f(old + eps) - f(old - eps)) / (2 * eps)
+                reft.W[r][j] = old
+                assert abs(reft.grad_W[r][j] - num) < 1e-6
+            old_b = reft.b[r]
+
+            def fb(val, r=r):
+                reft.b[r] = val
+                y = reft.forward(x)
+                return sum(y[k] * c[k] for k in range(2))
+
+            num_b = (fb(old_b + eps) - fb(old_b - eps)) / (2 * eps)
+            reft.b[r] = old_b
+            assert abs(reft.grad_b[r] - num_b) < 1e-6
+
+    def test_peft_invalid_inputs(self):
+        layer = self._layer()
+        with pytest.raises(TypeError):
+            AI.QLoRA("not a layer")
+        with pytest.raises(ValueError):
+            AI.QLoRA(layer, rank=0)
+        with pytest.raises(ValueError):
+            AI.QLoRA(layer, bits=1)
+        with pytest.raises(ValueError):
+            AI.VeRA(layer, rank=-1)
+        with pytest.raises(ValueError):
+            AI.VeRA(layer, alpha=0.0)
+        with pytest.raises(ValueError):
+            AI.ReFT(layer, rank=0)
+        v = AI.VeRA(self._layer(), rank=2)
+        with pytest.raises(RuntimeError):
+            v.backward([1.0, 1.0])
+        r = AI.ReFT(self._layer(), rank=2)
+        with pytest.raises(RuntimeError):
+            r.backward([1.0, 1.0])
