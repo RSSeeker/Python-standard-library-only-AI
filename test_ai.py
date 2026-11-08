@@ -29544,3 +29544,134 @@ class TestDatasetVersion:
         path.write_text('{"x": 2}', encoding="utf-8")
         with pytest.raises(ValueError):
             AI.load_dataset_version(str(tmp_path), info["version"])
+
+
+class _ContinuousEnv:
+    def __init__(self, target=0.4):
+        self.target = target
+        self.t = 0
+
+    def reset(self):
+        self.t = 0
+        return [0.0]
+
+    def step(self, action):
+        reward = -(action[0] - self.target) ** 2
+        self.t += 1
+        return [0.0], reward, self.t >= 8, {}
+
+
+class TestContinuousRL:
+    def test_continuous_replay_buffer(self):
+        buf = AI.ContinuousReplayBuffer(capacity=3, seed=1)
+        for i in range(4):
+            buf.add([i], [0.1 * i], -float(i), [i + 1], False)
+        assert len(buf) == 3
+        states, actions, rewards, next_states, dones = buf.sample(2)
+        assert len(states) == len(actions) == len(rewards) == 2
+        assert all(isinstance(a, list) and len(a) == 1 for a in actions)
+        with pytest.raises(ValueError):
+            buf.add([0], [None], 0.0, [0], False)
+        with pytest.raises(ValueError):
+            buf.add([0], [float("nan")], 0.0, [0], False)
+        with pytest.raises(ValueError):
+            buf.add([0], [0.1], "bad", [0], False)
+        with pytest.raises(ValueError):
+            buf.sample(10)
+
+    def test_actor_and_critic_shapes(self):
+        actor = AI.DeterministicPolicyNetwork(2, 3, hidden=(8,), action_scale=2.0, seed=1)
+        a = actor.act([0.1, -0.2])
+        assert len(a) == 3 and all(-2.0 <= v <= 2.0 for v in a)
+        noisy = actor.act_noisy([0.1, -0.2], noise_std=0.5, seed=7)
+        assert all(-2.0 <= v <= 2.0 for v in noisy)
+        with pytest.raises(RuntimeError):
+            AI.DeterministicPolicyNetwork(2, 1, seed=1).gradients([0.1])
+        grads = actor.gradients([0.1, 0.2, -0.3])
+        assert len(grads) == 2
+        critic = AI.ContinuousQNetwork(2, 3, hidden=(8,), seed=1)
+        q, cgrads, dstate, daction = critic.q_grads([0.1, 0.2], [0.3, 0.4, 0.5], 1.0)
+        assert isinstance(q, float) and len(dstate) == 2 and len(daction) == 3
+        assert len(cgrads) == 2
+
+    def test_mlp_backward_with_input_numeric(self):
+        mlp = AI.MLP([2, 3, 1], activations=["relu", "linear"])
+        mlp.forward([0.3, -0.7])
+        grads, dinput = AI._mlp_backward_with_input(mlp, [1.0])
+        assert len(dinput) == 2
+        eps = 1e-6
+        for k in range(2):
+            base = [0.3, -0.7]
+            plus = list(base)
+            minus = list(base)
+            plus[k] += eps
+            minus[k] -= eps
+            fd = (mlp.forward(plus)[0] - mlp.forward(minus)[0]) / (2 * eps)
+            assert abs(fd - dinput[k]) < 1e-4
+
+    def test_ddpg_learns(self):
+        agent = AI.DDPGAgent(1, 1, hidden=(16, 16), actor_lr=0.02,
+                             critic_lr=0.02, gamma=0.9, tau=0.02,
+                             batch_size=16, seed=1)
+        env = _ContinuousEnv()
+        initial = abs(agent.actor.act([0.0])[0] - 0.4)
+        returns = agent.train(env, episodes=25, noise_std=0.2)
+        final = abs(agent.actor.act([0.0])[0] - 0.4)
+        assert final < initial
+        assert final < 0.15
+        assert sum(returns[-5:]) / 5.0 > sum(returns[:5]) / 5.0 + 0.2
+
+    def test_td3_learns(self):
+        agent = AI.TD3Agent(1, 1, hidden=(16, 16), actor_lr=0.05,
+                            critic_lr=0.05, gamma=0.9, tau=0.02,
+                            batch_size=16, seed=1)
+        env = _ContinuousEnv()
+        returns = agent.train(env, episodes=40, noise_std=0.1)
+        final = abs(agent.actor.act([0.0])[0] - 0.4)
+        assert final < 0.15
+        assert sum(returns[-5:]) / 5.0 > sum(returns[:5]) / 5.0 + 0.2
+
+    def test_ddpg_update_and_targets(self):
+        agent = AI.DDPGAgent(2, 1, hidden=(8,), batch_size=4, seed=5)
+        for src, dst in ((agent.actor_target, agent.actor),
+                         (agent.critic_target, agent.critic)):
+            for dl, sl in zip(dst.model.layers, src.model.layers):
+                assert dl.weights == sl.weights
+                assert dl.biases == sl.biases
+        with pytest.raises(ValueError):
+            agent.update()
+        for _ in range(8):
+            agent.remember([0.0, 0.0], [0.1], -0.1, [0.0, 0.0], False)
+        losses = agent.update()
+        assert set(losses) == {"critic_loss", "actor_loss"}
+        assert all(isinstance(v, float) and math.isfinite(v) for v in losses.values())
+        assert agent.updates == 1
+
+    def test_ddpg_invalid(self):
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(0, 1)
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(1, 0)
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(1, 1, actor_lr=0.0)
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(1, 1, gamma=1.5)
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(1, 1, tau=0.0)
+        with pytest.raises(ValueError):
+            AI.DDPGAgent(1, 1, batch_size=0)
+        agent = AI.DDPGAgent(1, 1, seed=1)
+        with pytest.raises(ValueError):
+            agent.update()
+
+    def test_td3_counts_and_invalid(self):
+        ddpg = AI.DDPGAgent(2, 2, hidden=(8,), seed=1)
+        td3 = AI.TD3Agent(2, 2, hidden=(8,), seed=1)
+        assert td3.param_count() == (td3.actor.param_count()
+                                     + td3.critic.param_count()
+                                     + td3.critic2.param_count())
+        assert td3.param_count() > ddpg.param_count()
+        with pytest.raises(ValueError):
+            AI.TD3Agent(1, 1, policy_delay=0)
+        with pytest.raises(ValueError):
+            AI.TD3Agent(1, 1, target_noise=-0.1)

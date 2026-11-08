@@ -34077,6 +34077,494 @@ class PPOAgent:
         """策略网络 + 价值网络的参数总数。"""
         return self.policy.param_count() + self.value.param_count()
 
+def _mlp_backward_with_input(model: 'MLP', loss_grad: list):
+    """对 MLP 反向，返回 (每层 (grad_w, grad_b), 输入梯度)。"""
+    delta = [float(v) for v in loss_grad]
+    grads = []
+    for i in range(len(model.layers) - 1, -1, -1):
+        gw, gb, delta = model.layers[i].backward(delta)
+        grads.append((gw, gb))
+    grads.reverse()
+    return grads, delta
+
+
+def _mlp_zero_grads(model: 'MLP') -> list:
+    """按模型层结构分配零梯度容器。"""
+    return [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+            for layer in model.layers]
+
+
+def _mlp_acc_bias(model: 'MLP') -> list:
+    return [[0.0] * layer.fan_out for layer in model.layers]
+
+
+def _mlp_accumulate(acc_w, acc_b, grads):
+    """把一批 (grad_w, grad_b) 累加进容器（调用方自行除以 batch）。"""
+    for li, (gw, gb) in enumerate(grads):
+        aw = acc_w[li]
+        ab = acc_b[li]
+        for j in range(len(gw)):
+            row = aw[j]
+            gj = gw[j]
+            for k in range(len(gj)):
+                row[k] += gj[k]
+            ab[j] += gb[j]
+
+
+def _soft_update(target, source, tau):
+    """目标网络软更新：param = (1-tau)*target + tau*source。"""
+    for dl, sl in zip(target.model.layers, source.model.layers):
+        for j in range(len(dl.weights)):
+            dw, sw = dl.weights[j], sl.weights[j]
+            for i in range(len(dw)):
+                dw[i] = (1.0 - tau) * dw[i] + tau * sw[i]
+            dl.biases[j] = (1.0 - tau) * dl.biases[j] + tau * sl.biases[j]
+
+
+class ContinuousReplayBuffer:
+    """连续动作经验回放：action 是 float 列表（与 ReplayBuffer 的整数动作区分）。"""
+
+    def __init__(self, capacity=10000, seed=None):
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError(
+                f"ContinuousReplayBuffer: capacity 必须是 >=1 的整数，收到 {capacity!r}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(
+                f"ContinuousReplayBuffer: seed 必须是 int 或 None，收到 {seed!r}")
+        self.capacity = capacity
+        self.buffer = []
+        self.rng = random.Random(seed)
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def add(self, state, action, reward, next_state, done):
+        """写入一步经验；action 必须是有限 float 列表。"""
+        if not isinstance(state, (list, tuple)) or not state:
+            raise ValueError("ContinuousReplayBuffer.add: state 必须是非空列表")
+        if not isinstance(next_state, (list, tuple)) or not next_state:
+            raise ValueError(
+                "ContinuousReplayBuffer.add: next_state 必须是非空列表")
+        if not isinstance(action, (list, tuple)) or not action:
+            raise ValueError(
+                "ContinuousReplayBuffer.add: action 必须是非空 float 列表")
+        acts = []
+        for v in action:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"ContinuousReplayBuffer.add: action 元素必须是数字，收到 {v!r}")
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(
+                    f"ContinuousReplayBuffer.add: action 元素必须是有限数，收到 {v!r}")
+            acts.append(fv)
+        if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+            raise ValueError(
+                f"ContinuousReplayBuffer.add: reward 必须是数字，收到 {reward!r}")
+        self.buffer.append(([float(v) for v in state], acts, float(reward),
+                            [float(v) for v in next_state], bool(done)))
+        if len(self.buffer) > self.capacity:
+            del self.buffer[0]
+
+    def sample(self, batch_size):
+        """随机采样，返回 (states, actions, rewards, next_states, dones)。"""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+                or batch_size < 1:
+            raise ValueError(
+                f"ContinuousReplayBuffer.sample: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        if len(self.buffer) < batch_size:
+            raise ValueError(
+                f"ContinuousReplayBuffer.sample: 经验不足（已有 {len(self.buffer)}，"
+                f"需要 {batch_size}）")
+        picks = self.rng.sample(range(len(self.buffer)), batch_size)
+        batch = [self.buffer[i] for i in picks]
+        return ([b[0] for b in batch], [b[1] for b in batch],
+                [b[2] for b in batch], [b[3] for b in batch],
+                [b[4] for b in batch])
+
+    def clear(self):
+        """清空回放池。"""
+        self.buffer = []
+
+
+class DeterministicPolicyNetwork:
+    """确定性策略：MLP(state -> tanh 挤压的 action)，按 action_scale 缩放。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64),
+                 action_scale=1.0, seed=None):
+        for name, v in (("state_dim", state_dim), ("action_dim", action_dim)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(
+                    f"DeterministicPolicyNetwork: {name} 必须是 >=1 的整数，收到 {v!r}")
+        if isinstance(action_scale, bool) or not isinstance(action_scale, (int, float)) \
+                or action_scale <= 0.0:
+            raise ValueError(
+                f"DeterministicPolicyNetwork: action_scale 必须是 >0 的数字，收到 {action_scale!r}")
+        sizes = [state_dim] + list(hidden) + [action_dim]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.model = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.action_scale = float(action_scale)
+        self.sizes = sizes
+        self._z = None
+
+    def raw(self, state):
+        """未挤压的 actor 输出。"""
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(
+                f"DeterministicPolicyNetwork.raw: state 长度必须是 {self.state_dim}")
+        return self.model.forward([float(v) for v in state])
+
+    def act(self, state):
+        """确定性动作（已乘 action_scale）。"""
+        z = self.raw(state)
+        self._z = z
+        return [self.action_scale * math.tanh(v) for v in z]
+
+    def act_noisy(self, state, noise_std=0.1, seed=None):
+        """加高斯探索噪声并截断到 [-scale, scale]。"""
+        if isinstance(noise_std, bool) or not isinstance(noise_std, (int, float)) \
+                or noise_std < 0.0:
+            raise ValueError(
+                f"DeterministicPolicyNetwork.act_noisy: noise_std 必须是非负数字，收到 {noise_std!r}")
+        rng = random.Random(seed) if seed is not None else random
+        action = self.act(state)
+        scale = self.action_scale
+        out = []
+        for v in action:
+            n = rng.gauss(0.0, float(noise_std)) if noise_std > 0.0 else 0.0
+            out.append(min(scale, max(-scale, v + n)))
+        return out
+
+    def gradients(self, daction):
+        """把 dL/d(缩放后动作) 反传到参数（tanh 导数含在内部）。"""
+        if self._z is None:
+            raise RuntimeError(
+                "DeterministicPolicyNetwork.gradients: 必须先调用 act()")
+        if len(daction) != len(self._z):
+            raise ValueError(
+                f"DeterministicPolicyNetwork.gradients: 梯度长度必须是 {len(self._z)}")
+        dpre = []
+        for da, z in zip(daction, self._z):
+            t = math.tanh(z)
+            dpre.append(float(da) * self.action_scale * (1.0 - t * t))
+        return _mlp_backward(self.model, dpre)
+
+    def copy_from(self, other):
+        """复制同形状策略的权重。"""
+        if not isinstance(other, DeterministicPolicyNetwork) or other.sizes != self.sizes:
+            raise ValueError(
+                "DeterministicPolicyNetwork.copy_from: 只接受同形状的网络")
+        for dst, src in zip(self.model.layers, other.model.layers):
+            for j in range(len(dst.weights)):
+                dst.weights[j][:] = src.weights[j]
+            dst.biases[:] = src.biases
+
+    def param_count(self):
+        """可训练标量个数。"""
+        return sum(layer.fan_out * layer.fan_in + layer.fan_out
+                   for layer in self.model.layers)
+
+
+class ContinuousQNetwork:
+    """连续动作 Q 网络：Q(s, a) = MLP([s, a] -> hidden -> 1)。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64), seed=None):
+        for name, v in (("state_dim", state_dim), ("action_dim", action_dim)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(
+                    f"ContinuousQNetwork: {name} 必须是 >=1 的整数，收到 {v!r}")
+        sizes = [state_dim + action_dim] + list(hidden) + [1]
+        acts = ["relu"] * len(hidden) + ["linear"]
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.model = MLP(sizes, activations=acts)
+        finally:
+            random.setstate(state)
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.sizes = sizes
+
+    def q(self, state, action):
+        """单个 (s, a) 的 Q 值。"""
+        if not isinstance(state, (list, tuple)) or len(state) != self.state_dim:
+            raise ValueError(
+                f"ContinuousQNetwork.q: state 长度必须是 {self.state_dim}")
+        if not isinstance(action, (list, tuple)) or len(action) != self.action_dim:
+            raise ValueError(
+                f"ContinuousQNetwork.q: action 长度必须是 {self.action_dim}")
+        inp = [float(v) for v in state] + [float(v) for v in action]
+        return self.model.forward(inp)[0]
+
+    def q_grads(self, state, action, dq):
+        """返回 (Q, 参数梯度, dQ/dstate, dQ/daction)。"""
+        if isinstance(dq, bool) or not isinstance(dq, (int, float)):
+            raise ValueError(
+                f"ContinuousQNetwork.q_grads: dq 必须是数字，收到 {dq!r}")
+        q = self.q(state, action)
+        grads, dinput = _mlp_backward_with_input(self.model, [float(dq)])
+        return q, grads, dinput[:self.state_dim], dinput[self.state_dim:]
+
+    def copy_from(self, other):
+        """复制同形状 Q 网络的权重。"""
+        if not isinstance(other, ContinuousQNetwork) or other.sizes != self.sizes:
+            raise ValueError("ContinuousQNetwork.copy_from: 只接受同形状的网络")
+        for dst, src in zip(self.model.layers, other.model.layers):
+            for j in range(len(dst.weights)):
+                dst.weights[j][:] = src.weights[j]
+            dst.biases[:] = src.biases
+
+    def param_count(self):
+        """可训练标量个数。"""
+        return sum(layer.fan_out * layer.fan_in + layer.fan_out
+                   for layer in self.model.layers)
+
+
+class DDPGAgent:
+    """DDPG：确定性 actor + 单 Q critic + 目标网络软更新。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64), actor_lr=1e-3,
+                 critic_lr=1e-3, gamma=0.99, tau=0.005, action_scale=1.0,
+                 buffer_capacity=10000, batch_size=32, seed=None):
+        for name, v in (("actor_lr", actor_lr), ("critic_lr", critic_lr)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0.0:
+                raise ValueError(
+                    f"DDPGAgent: {name} 必须 >0，收到 {v!r}")
+        if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) \
+                or not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"DDPGAgent: gamma 必须在 [0,1]，收到 {gamma!r}")
+        if isinstance(tau, bool) or not isinstance(tau, (int, float)) \
+                or not 0.0 < tau <= 1.0:
+            raise ValueError(f"DDPGAgent: tau 必须在 (0,1]，收到 {tau!r}")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+                or batch_size < 1:
+            raise ValueError(
+                f"DDPGAgent: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = float(gamma)
+        self.tau = float(tau)
+        self.batch_size = batch_size
+        self.action_scale = float(action_scale)
+        self.actor = DeterministicPolicyNetwork(
+            state_dim, action_dim, hidden, action_scale, seed=seed)
+        self.actor_target = DeterministicPolicyNetwork(
+            state_dim, action_dim, hidden, action_scale, seed=None)
+        self.actor_target.copy_from(self.actor)
+        self.critic = ContinuousQNetwork(state_dim, action_dim, hidden, seed=seed)
+        self.critic_target = ContinuousQNetwork(
+            state_dim, action_dim, hidden, seed=None)
+        self.critic_target.copy_from(self.critic)
+        self.actor_opt = Adam(self.actor.model, lr=float(actor_lr))
+        self.critic_opt = Adam(self.critic.model, lr=float(critic_lr))
+        self.buffer = ContinuousReplayBuffer(buffer_capacity, seed=seed)
+        self.rng = random.Random(seed)
+        self.updates = 0
+
+    def act(self, state, noise_std=0.1):
+        """带探索噪声的动作。"""
+        return self.actor.act_noisy(state, noise_std, self.rng.randrange(1 << 30))
+
+    def remember(self, state, action, reward, next_state, done):
+        """写入一条经验。"""
+        self.buffer.add(state, action, reward, next_state, done)
+
+    def _target_action(self, next_state):
+        return self.actor_target.act(next_state)
+
+    def update(self, batch_size=None):
+        """从回放池取一个 batch，更新 critic 与 actor，返回损失字典。"""
+        bs = self.batch_size if batch_size is None else batch_size
+        states, actions, rewards, next_states, dones = self.buffer.sample(bs)
+        acc_w = _mlp_zero_grads(self.critic.model)
+        acc_b = _mlp_acc_bias(self.critic.model)
+        aacc_w = _mlp_zero_grads(self.actor.model)
+        aacc_b = _mlp_acc_bias(self.actor.model)
+        td_total = 0.0
+        act_loss_total = 0.0
+        inv = 1.0 / bs
+        for i in range(bs):
+            if dones[i]:
+                target = rewards[i]
+            else:
+                target = rewards[i] + self.gamma * self.critic_target.q(
+                    next_states[i], self._target_action(next_states[i]))
+            q = self.critic.q(states[i], actions[i])
+            _q, cgrads, _dstate, _daction = self.critic.q_grads(
+                states[i], actions[i], q - target)
+            td_total += (q - target) ** 2
+            _mlp_accumulate(acc_w, acc_b, cgrads)
+            actor_action = self.actor.act(states[i])
+            _q, _cg, _ds, dq_da = self.critic.q_grads(states[i], actor_action, 1.0)
+            daction = [-v * inv for v in dq_da]
+            agrads = self.actor.gradients(daction)
+            act_loss_total += -_q
+            _mlp_accumulate(aacc_w, aacc_b, agrads)
+        avg_w = [[[v * inv for v in row] for row in layer] for layer in acc_w]
+        avg_b = [[v * inv for v in row] for row in acc_b]
+        self.critic_opt.step([(w, b) for w, b in zip(avg_w, avg_b)])
+        aavg_w = [[[v * inv for v in row] for row in layer] for layer in aacc_w]
+        aavg_b = [[v * inv for v in row] for row in aacc_b]
+        self.actor_opt.step([(w, b) for w, b in zip(aavg_w, aavg_b)])
+        _soft_update(self.actor_target, self.actor, self.tau)
+        _soft_update(self.critic_target, self.critic, self.tau)
+        self.updates += 1
+        return {"critic_loss": td_total * inv, "actor_loss": act_loss_total * inv}
+
+    def train(self, env, episodes=20, batch_size=None, noise_std=0.1,
+              max_steps=200, min_buffer=None):
+        """在连续动作环境上训练，返回每回合回报列表。"""
+        if not hasattr(env, "reset") or not hasattr(env, "step"):
+            raise ValueError("DDPGAgent.train: env 必须提供 reset()/step()")
+        if isinstance(episodes, bool) or not isinstance(episodes, int) \
+                or episodes < 1:
+            raise ValueError(
+                f"DDPGAgent.train: episodes 必须是 >=1 的整数，收到 {episodes!r}")
+        bs = self.batch_size if batch_size is None else batch_size
+        need = max(bs, 1 if min_buffer is None else min_buffer)
+        returns = []
+        for _ in range(episodes):
+            state = env.reset()
+            total = 0.0
+            steps = 0
+            while True:
+                action = self.act(state, noise_std)
+                out = env.step(action)
+                if not isinstance(out, (list, tuple)) or len(out) != 4:
+                    raise ValueError(
+                        "DDPGAgent.train: env.step 必须返回 (next_state, reward, done, info)")
+                next_state, reward, done, _info = out
+                self.remember(state, action, reward, next_state, done)
+                total += float(reward)
+                state = next_state
+                steps += 1
+                if len(self.buffer) >= need:
+                    self.update(bs)
+                if done or (max_steps is not None and steps >= max_steps):
+                    break
+            returns.append(total)
+        return returns
+
+    def param_count(self):
+        """actor + critic 参数量。"""
+        return self.actor.param_count() + self.critic.param_count()
+
+
+class TD3Agent(DDPGAgent):
+    """TD3：双 Q 取最小、目标策略平滑、延迟更新 actor。"""
+
+    def __init__(self, state_dim, action_dim, hidden=(64, 64), actor_lr=1e-3,
+                 critic_lr=1e-3, gamma=0.99, tau=0.005, action_scale=1.0,
+                 buffer_capacity=10000, batch_size=32, policy_delay=2,
+                 target_noise=0.2, noise_clip=0.5, seed=None):
+        super().__init__(state_dim, action_dim, hidden=hidden,
+                         actor_lr=actor_lr, critic_lr=critic_lr, gamma=gamma,
+                         tau=tau, action_scale=action_scale,
+                         buffer_capacity=buffer_capacity, batch_size=batch_size,
+                         seed=seed)
+        for name, v in (("policy_delay", policy_delay),):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(
+                    f"TD3Agent: {name} 必须是 >=1 的整数，收到 {v!r}")
+        for name, v in (("target_noise", target_noise), ("noise_clip", noise_clip)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0.0:
+                raise ValueError(
+                    f"TD3Agent: {name} 必须是非负数字，收到 {v!r}")
+        self.policy_delay = policy_delay
+        self.target_noise = float(target_noise)
+        self.noise_clip = float(noise_clip)
+        self.critic2 = ContinuousQNetwork(state_dim, action_dim, hidden, seed=None)
+        self.critic2.copy_from(self.critic)
+        self.critic2_target = ContinuousQNetwork(
+            state_dim, action_dim, hidden, seed=None)
+        self.critic2_target.copy_from(self.critic2)
+        self.critic2_opt = Adam(self.critic2.model, lr=float(critic_lr))
+
+    def _target_action(self, next_state):
+        action = self.actor_target.act(next_state)
+        scale = self.action_scale
+        out = []
+        for i, v in enumerate(action):
+            if self.target_noise > 0.0:
+                n = self.rng.gauss(0.0, self.target_noise)
+                n = min(self.noise_clip, max(-self.noise_clip, n))
+            else:
+                n = 0.0
+            out.append(min(scale, max(-scale, v + n)))
+        return out
+
+    def update(self, batch_size=None):
+        """TD3 更新：双 critic、延迟 actor、软更新两个目标 critic。"""
+        bs = self.batch_size if batch_size is None else batch_size
+        states, actions, rewards, next_states, dones = self.buffer.sample(bs)
+        inv = 1.0 / bs
+        acc1w = _mlp_zero_grads(self.critic.model)
+        acc1b = _mlp_acc_bias(self.critic.model)
+        acc2w = _mlp_zero_grads(self.critic2.model)
+        acc2b = _mlp_acc_bias(self.critic2.model)
+        aacc_w = _mlp_zero_grads(self.actor.model)
+        aacc_b = _mlp_acc_bias(self.actor.model)
+        q1_loss = 0.0
+        q2_loss = 0.0
+        actor_loss = 0.0
+        for i in range(bs):
+            if dones[i]:
+                target = rewards[i]
+            else:
+                t_act = self._target_action(next_states[i])
+                q1t = self.critic_target.q(next_states[i], t_act)
+                q2t = self.critic2_target.q(next_states[i], t_act)
+                target = rewards[i] + self.gamma * min(q1t, q2t)
+            q1 = self.critic.q(states[i], actions[i])
+            q2 = self.critic2.q(states[i], actions[i])
+            err1 = q1 - target
+            err2 = q2 - target
+            _q1, g1, _ds, _da = self.critic.q_grads(states[i], actions[i], err1)
+            _q2, g2, _ds2, _da2 = self.critic2.q_grads(states[i], actions[i], err2)
+            q1_loss += err1 ** 2
+            q2_loss += err2 ** 2
+            _mlp_accumulate(acc1w, acc1b, g1)
+            _mlp_accumulate(acc2w, acc2b, g2)
+            if self.updates % self.policy_delay == 0:
+                actor_action = self.actor.act(states[i])
+                _q, _cg, _ds3, dq_da = self.critic.q_grads(
+                    states[i], actor_action, 1.0)
+                daction = [-v * inv for v in dq_da]
+                agrads = self.actor.gradients(daction)
+                actor_loss += -_q
+                _mlp_accumulate(aacc_w, aacc_b, agrads)
+        avg_w = [[[v * inv for v in row] for row in layer] for layer in acc1w]
+        avg_b = [[v * inv for v in row] for row in acc1b]
+        self.critic_opt.step([(w, b) for w, b in zip(avg_w, avg_b)])
+        avg2_w = [[[v * inv for v in row] for row in layer] for layer in acc2w]
+        avg2_b = [[v * inv for v in row] for row in acc2b]
+        self.critic2_opt.step([(w, b) for w, b in zip(avg2_w, avg2_b)])
+        if self.updates % self.policy_delay == 0:
+            aavg_w = [[[v * inv for v in row] for row in layer] for layer in aacc_w]
+            aavg_b = [[v * inv for v in row] for row in aacc_b]
+            self.actor_opt.step([(w, b) for w, b in zip(aavg_w, aavg_b)])
+        _soft_update(self.actor_target, self.actor, self.tau)
+        _soft_update(self.critic_target, self.critic, self.tau)
+        _soft_update(self.critic2_target, self.critic2, self.tau)
+        self.updates += 1
+        return {"critic_loss": q1_loss * inv, "critic2_loss": q2_loss * inv,
+                "actor_loss": actor_loss * inv}
+
+    def param_count(self):
+        """actor + 双 critic 参数量。"""
+        return (self.actor.param_count() + self.critic.param_count()
+                + self.critic2.param_count())
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================

@@ -749,7 +749,11 @@
   DVC 风格对象库 + `versions.jsonl` manifest）；测试 `TestFlameGraphAndHtmlReport` 5 例、
   `TestDatasetVersion` 4 例
 
-全量测试：1839 → 1945 passed（新增 106 例）。
+- [x] 连续动作强化学习：`ContinuousReplayBuffer`、`DeterministicPolicyNetwork`、
+  `ContinuousQNetwork`、`DDPGAgent`、`TD3Agent`（双 Q 取最小、目标策略平滑、
+  延迟 actor 更新，目标网络软更新）；测试 `TestContinuousRL` 8 例
+
+全量测试：1839 → 1953 passed（新增 114 例）。
 
 ---
 
