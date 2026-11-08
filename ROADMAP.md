@@ -819,13 +819,22 @@ W0 + W1 + W3 + W9 + W13 + W2 的部分 = 约 8–10 个会话，就能让这个�
 页面是一个「单层因果 LM 教学页」，能同步的只有 LLM 相关能力：
 
 - 已同步：因果掩码、KV cache、`top_k`/`top_p`/`min_p`、五种惩罚、滑动窗口、`ALiBi`、
-  模型存档/加载、困惑度、输入校验（66→190 checks）
+  模型存档/加载、困惑度、输入校验（66→303 checks）
 - 已同步（W7 跟做）：典型/eta/top-a/tail-free/mirostat 采样（`8c1db27`，过滤器顺序写死、
   留空时与旧路径逐位一致）、词表级 JSON 约束解码（`6039413`，等价于 `json_grammar()` 的
   允许集合，15 个前缀的黄金值 + 300 次随机行走无非法 token）、前缀 KV 缓存数据结构与
-  ASCII 可视化（`285bcfb`，纯数据结构，未接进生成循环）
-- 仍未同步：`contrastive_search`（页面没有多候选束）、正则/完整 JSON Schema 约束解码
-  （只做了「JSON 单词法」这一层）、Prompt cache 的端到端复用（页面每步整段重算）
+  ASCII 可视化（`285bcfb`）
+- 已同步（W8 收尾，`a44ea2f`，303 checks）：
+  - `contrastive_search`：按候选各自的隐状态与历史隐状态的最大余弦相似度做退化惩罚，
+    `score=(1−α)·p − α·reward`；`top_k`/`alpha` 两端、前向次数（1+步数×top_k）、
+    `top_k=1` 退化与错误路径均有断言
+  - 字符级语法约束解码：自写正则（Thompson NFA）+ Earley CFG + 字符级完整 JSON 文法
+    （对象/数组/字符串转义/数字整数小数指数/true/false/null，紧凑形式），接进生成循环
+    （不允许字符 logit 置 `-Infinity` 后走原有惩罚与采样路径）；**不含 JSON Schema 校验**
+    ——与 Python 侧边界一致（`README.md:2701` 明说「那需要 JSON Schema 层，本库未实现」），
+    键去重/数字范围等语义由 `JSON.parse` 收尾
+  - Prompt cache 端到端复用：`llmForwardStep` 单 token 增量前向 + `llmGenerateCached`
+    预填充/增量生成，与整段重算逐位一致；窗口滑动时重建缓存（输出 `rebuilds` 统计）
 - 不同步：网络层扩展、图 / RL / 多模态、数据管道（页面没有「数据集」概念）
 
 ### 7.6 成本影响
