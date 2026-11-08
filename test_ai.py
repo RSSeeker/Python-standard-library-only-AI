@@ -31212,3 +31212,80 @@ class TestTextMetricsExt:
         _tm_raises(lambda: AI.chrf_score(1, "a"))
         _tm_raises(lambda: AI.bleurt_lite("a", "a", _tm_embed, length_penalty=1.5))
         _tm_raises(lambda: AI.comet_lite("a", "a", _tm_embed, length_penalty=-0.1))
+
+
+def _audio_signal(n=1600, seed=42, amp=0.3):
+    import random as _random
+    rng = _random.Random(seed)
+    return [rng.gauss(0.0, amp) for _ in range(n)]
+
+
+def _audio_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestAudioMetrics:
+    def test_stoi_monotonic(self):
+        clean = _audio_signal()
+        n20 = AI.audio_add_noise(clean, 20, seed=1)
+        n10 = AI.audio_add_noise(clean, 10, seed=1)
+        n0 = AI.audio_add_noise(clean, 0, seed=1)
+        assert AI.stoi_score(clean, clean) == 1.0
+        s20 = AI.stoi_score(clean, n20)
+        s10 = AI.stoi_score(clean, n10)
+        s0 = AI.stoi_score(clean, n0)
+        assert 0.0 <= s0 < s10 < s20 <= 1.0
+        assert s20 > 0.9
+        unrelated = _audio_signal(seed=7)
+        assert AI.stoi_score(clean, unrelated) < 0.4
+
+    def test_stoi_polarity_and_trim(self):
+        clean = _audio_signal()
+        inverted = AI.audio_polarity_invert(clean)
+        assert AI.stoi_score(clean, inverted) == 1.0
+        longer = list(clean) + _audio_signal(n=200, seed=9)
+        assert AI.stoi_score(clean, longer) == 1.0
+
+    def test_pesq_monotonic_bounds(self):
+        clean = _audio_signal()
+        n20 = AI.audio_add_noise(clean, 20, seed=1)
+        n10 = AI.audio_add_noise(clean, 10, seed=1)
+        n0 = AI.audio_add_noise(clean, 0, seed=1)
+        assert AI.pesq_score(clean, clean) == 4.5
+        p20 = AI.pesq_score(clean, n20)
+        p10 = AI.pesq_score(clean, n10)
+        p0 = AI.pesq_score(clean, n0)
+        assert 1.0 <= p0 < p10 < p20 <= 4.5
+        unrelated = _audio_signal(seed=7)
+        assert AI.pesq_score(clean, unrelated) < p0
+
+    def test_stoi_invalid_inputs(self):
+        clean = _audio_signal()
+        _audio_raises(lambda: AI.stoi_score("abc", clean))
+        _audio_raises(lambda: AI.stoi_score([], clean))
+        _audio_raises(lambda: AI.stoi_score(clean[:100], clean[:100]))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, frame_length=16))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, hop_length=0))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, hop_length=300, frame_length=256))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, n_bands=0))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, fmin=-1.0))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, fmax=9000.0))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, sample_rate=0))
+        _audio_raises(lambda: AI.stoi_score(clean, clean, eps=0.0))
+        _audio_raises(lambda: AI.stoi_score([1.0, "x"] * 200, clean), exc=TypeError)
+
+    def test_pesq_invalid_inputs(self):
+        clean = _audio_signal()
+        _audio_raises(lambda: AI.pesq_score("abc", clean))
+        _audio_raises(lambda: AI.pesq_score([], clean))
+        _audio_raises(lambda: AI.pesq_score(clean[:100], clean[:100]))
+        _audio_raises(lambda: AI.pesq_score(clean, clean, frame_length=16))
+        _audio_raises(lambda: AI.pesq_score(clean, clean, n_bands=0))
+        _audio_raises(lambda: AI.pesq_score(clean, clean, fmax=0.0))
+        _audio_raises(lambda: AI.pesq_score([1.0, None] * 200, clean), exc=TypeError)

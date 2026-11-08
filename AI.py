@@ -28870,6 +28870,170 @@ def audio_polarity_invert(waveform):
     """极性反转（相位取反），用于测试模型对绝对相位的敏感性。"""
     return [-v for v in _w11h_wave(waveform, "audio_polarity_invert")]
 
+"""音频质量指标：STOI（可懂度）与 PESQ 轻量代理。
+
+两者都只依赖本库的朴素 DFT / 梅尔滤波器组，不下载任何模型：
+- `stoi_score` 是短时客观可懂度的简化版：按帧做频带能量包络归一化后在频带间求相关。
+- `pesq_score` 是感知语音质量评分的轻量代理：对数频带谱失真映射到 [1.0, 4.5]，
+  没有 PESQ 的时域对齐、心理声学模型和真实 MOS 标定，只能用于相对比较。
+"""
+
+
+def _au_trim_pair(clean, degraded, who, frame_length):
+    a = _w11h_wave(clean, who + " clean")
+    b = _w11h_wave(degraded, who + " degraded")
+    n = min(len(a), len(b))
+    if n < frame_length:
+        raise ValueError(
+            "%s: 两条波形对齐后的长度 %d 少于帧长 %d" % (who, n, frame_length))
+    return a[:n], b[:n]
+
+
+def _au_band_energies(frames, sample_rate, frame_length, n_bands, fmin, fmax):
+    filters = mel_filterbank(sample_rate, frame_length, n_bands, fmin, fmax)
+    out = []
+    for fr in frames:
+        mean = sum(fr) / len(fr)
+        centered = [v - mean for v in fr]
+        power = dft_power(centered)
+        row = []
+        for m in range(n_bands):
+            acc = 0.0
+            for i in range(len(power)):
+                acc += filters[m][i] * power[i] * power[i]
+            row.append(math.sqrt(acc))
+        out.append(row)
+    return out
+
+
+def _au_check_params(who, sample_rate, frame_length, hop_length, n_bands, fmin, fmax):
+    if isinstance(frame_length, bool) or not isinstance(frame_length, int):
+        raise TypeError("%s: frame_length 必须是整数" % who)
+    if frame_length < 32:
+        raise ValueError("%s: frame_length 必须 >= 32" % who)
+    _w17e_pos_int(hop_length, who, "hop_length")
+    if hop_length > frame_length:
+        raise ValueError("%s: hop_length 不能大于 frame_length" % who)
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
+        raise TypeError("%s: sample_rate 必须是整数" % who)
+    if sample_rate <= 0:
+        raise ValueError("%s: sample_rate 必须为正" % who)
+    _w17e_pos_int(n_bands, who, "n_bands")
+    if n_bands > frame_length // 2 + 1:
+        raise ValueError("%s: n_bands 不能超过频点数 %d" % (who, frame_length // 2 + 1))
+    for name, val in (("fmin", fmin), ("fmax", fmax)):
+        if val is None:
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise TypeError("%s: %s 必须是数字或 None" % (who, name))
+        if not math.isfinite(val):
+            raise ValueError("%s: %s 必须是有限数字" % (who, name))
+    lo = 0.0 if fmin is None else float(fmin)
+    hi = sample_rate / 2.0 if fmax is None else float(fmax)
+    if lo < 0.0:
+        raise ValueError("%s: fmin 不能为负" % who)
+    if hi <= lo:
+        raise ValueError("%s: fmax 必须大于 fmin" % who)
+    if hi > sample_rate / 2.0 + 1e-9:
+        raise ValueError("%s: fmax 不能超过奈奎斯特频率" % who)
+
+
+def stoi_score(clean, degraded, sample_rate=16000, frame_length=256,
+               hop_length=128, n_bands=8, fmin=0.0, fmax=None, eps=1e-12):
+    """短时客观可懂度（STOI）简化版，返回 [0, 1]（1 = 完全相同）。
+
+    做法：两条波形按 `frame_length`/`hop_length` 切帧 → 去除每帧均值后做 DFT →
+    用梅尔滤波器组合成 `n_bands` 个频带能量 → 逐频带在时间轴上做零均值单位方差
+    归一化并裁剪到 [-3, 3] → 逐频带求相关系数 → 对所有有效频带取平均。
+    与标准 STOI 的差异：没有 1/3 倍频程重叠频带、没有静音帧扣除、没有最终映射。
+    """
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+        raise ValueError("stoi_score: eps 必须是正数")
+    _au_check_params("stoi_score", sample_rate, frame_length, hop_length,
+                     n_bands, fmin, fmax)
+    a, b = _au_trim_pair(clean, degraded, "stoi_score", frame_length)
+    fa = frame_signal(a, frame_length, hop_length, pad=False)
+    fb = frame_signal(b, frame_length, hop_length, pad=False)
+    ea = _au_band_energies(fa, sample_rate, frame_length, n_bands, fmin, fmax)
+    eb = _au_band_energies(fb, sample_rate, frame_length, n_bands, fmin, fmax)
+    t_frames = len(ea)
+    if t_frames < 2:
+        raise ValueError("stoi_score: 帧数 %d 太少（至少 2 帧）" % t_frames)
+    mean_ea = [sum(ea[t][m] for t in range(t_frames)) / t_frames for m in range(n_bands)]
+    peak = max(mean_ea) if mean_ea else 0.0
+    corrs = []
+    for m in range(n_bands):
+        if peak > 0.0 and mean_ea[m] < 1e-3 * peak:
+            continue  # 该频带在干净信号里基本是静音，包络相关只会反映噪声
+        xc = [ea[t][m] for t in range(t_frames)]
+        xd = [eb[t][m] for t in range(t_frames)]
+        mc = sum(xc) / t_frames
+        md = sum(xd) / t_frames
+        vc = sum((v - mc) ** 2 for v in xc) / t_frames
+        vd = sum((v - md) ** 2 for v in xd) / t_frames
+        if vc <= eps or vd <= eps:
+            continue
+        sc = math.sqrt(vc)
+        sd = math.sqrt(vd)
+        nc = [max(-3.0, min(3.0, (v - mc) / sc)) for v in xc]
+        nd = [max(-3.0, min(3.0, (v - md) / sd)) for v in xd]
+        num = sum(nc[i] * nd[i] for i in range(t_frames))
+        den = math.sqrt(sum(v * v for v in nc) * sum(v * v for v in nd))
+        if den <= eps:
+            continue
+        corr = num / den
+        corrs.append(max(-1.0, min(1.0, corr)))
+    if not corrs:
+        return 1.0 if a == b else 0.0
+    return max(0.0, min(1.0, sum(corrs) / len(corrs)))
+
+
+def pesq_score(clean, degraded, sample_rate=16000, frame_length=256,
+               hop_length=128, n_bands=16, fmin=0.0, fmax=None, eps=1e-10):
+    """PESQ 轻量代理，返回 [1.0, 4.5]（4.5 = 完全相同，越大越好）。
+
+    做法：切帧 → 每帧频带能量取对数 → 对每帧求 `mean((log Ec - log Ed)^2)` →
+    对所有帧平均得到谱失真 `dist` → `score = 4.5 - 2.5*min(1, sqrt(dist))`。
+    没有时域对齐、心理声学模型与真实 MOS 标定，仅用于同一对信号下的相对比较。
+    """
+    _au_check_params("pesq_score", sample_rate, frame_length, hop_length,
+                     n_bands, fmin, fmax)
+    a, b = _au_trim_pair(clean, degraded, "pesq_score", frame_length)
+    fa = frame_signal(a, frame_length, hop_length, pad=False)
+    fb = frame_signal(b, frame_length, hop_length, pad=False)
+    ea = _au_band_energies(fa, sample_rate, frame_length, n_bands, fmin, fmax)
+    eb = _au_band_energies(fb, sample_rate, frame_length, n_bands, fmin, fmax)
+    t_frames = len(ea)
+    mean_ea = [sum(ea[t][m] for t in range(t_frames)) / t_frames for m in range(n_bands)]
+    peak = max(mean_ea) if mean_ea else 0.0
+    active = [m for m in range(n_bands) if peak > 0.0 and mean_ea[m] >= 1e-3 * peak]
+    if not active:
+        return 4.5
+    total = 0.0
+    for t in range(t_frames):
+        row = 0.0
+        for m in active:
+            lc = math.log(ea[t][m] + eps)
+            ld = math.log(eb[t][m] + eps)
+            row += (lc - ld) ** 2
+        total += row / len(active)
+    count = t_frames
+    dist = total / count
+    env_a = [sum(ea[t][m] for m in active) for t in range(t_frames)]
+    env_b = [sum(eb[t][m] for m in active) for t in range(t_frames)]
+    ma = sum(env_a) / t_frames
+    mb = sum(env_b) / t_frames
+    va = sum((v - ma) ** 2 for v in env_a) / t_frames
+    vb = sum((v - mb) ** 2 for v in env_b) / t_frames
+    if va <= eps or vb <= eps:
+        env_corr = 1.0 if env_a == env_b else 0.0
+    else:
+        num = sum((env_a[i] - ma) * (env_b[i] - mb) for i in range(t_frames))
+        env_corr = num / math.sqrt(va * vb * t_frames * t_frames)
+        env_corr = max(-1.0, min(1.0, env_corr))
+    score = 4.5 - 2.5 * min(1.0, math.sqrt(dist)) - 1.5 * (1.0 - env_corr)
+    return max(1.0, min(4.5, score))
+
 #  ======================================================================
 #  降维 / 不平衡采样 / 特征选择
 #  ======================================================================

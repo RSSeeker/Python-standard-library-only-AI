@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2029 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2034 项）
 
 ## 特性
 
@@ -1199,6 +1199,18 @@ noisy = AI.audio_add_noise([0.1, -0.2, 0.3], snr_db=20.0, seed=0)
 三条诚实边界：①同义词表由调用方提供，库内**不带**词表；②`eda_augment` 的每个操作次数
 按 `alpha * 长度` 取整且至少 1 次（`alpha=0` 才关闭），因此短句上扰动比例会偏高；
 ③音频部分**不是**完整的增强库——没有重采样、变速、混响，也没有 WAV 读写。
+
+#### 音频质量指标（STOI / PESQ 轻量代理）
+
+在合成数据上评估失真/增强对可懂度与质量的影响，不依赖任何外部模型或 WAV 文件：
+
+| 函数 | 说明 |
+|---|---|
+| `stoi_score(clean, degraded, sample_rate=16000, frame_length=256, hop_length=128, n_bands=8, fmin=0.0, fmax=None, eps=1e-12)` | STOI 简化版，返回 `[0, 1]`（1 = 完全相同）：分帧去均值、梅尔频带能量、逐频带包络归一化后求相关再平均 |
+| `pesq_score(clean, degraded, sample_rate=16000, frame_length=256, hop_length=128, n_bands=16, fmin=0.0, fmax=None, eps=1e-10)` | PESQ 轻量代理，返回 `[1.0, 4.5]`（4.5 = 完全相同）：频带对数谱失真 + 帧总能量包络相关，映射到近似 MOS 区间 |
+
+两条边界：①两者都假设输入是语音类非平稳信号，对纯稳态单音或整段静音估计不稳定；
+②`pesq_score` 没有 PESQ 的时域对齐与心理声学模型，只能用于相对比较，不能当作真实 MOS。
 
 ### 特殊 token 与批处理
 
@@ -3611,7 +3623,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2029 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2034 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3812,6 +3824,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestScalerFamily` | `RobustScaler` 的中位数/IQR 闭式值与「不中心化/不缩放」开关、`MaxAbsScaler` 列最大绝对值、`QuantileTransformer` 的参考分位数与插值（整数点 k/9、中点 0.5、越界夹取）与正态模式往返、Yeo-Johnson 的 8×5 个 (λ, x) 格点往返、`PowerTransformer` 的标准化后均值/方差与两种 method 的往返、四类未 fit/坏形状/非数字报错 |
 | `TestImputers` | 三种填补器的闭式值：`SimpleImputer` 的 mean/median/most_frequent/constant 与全缺失列填 0、`KNNImputer` 的 k=1/k=2 与 distance 权重（0.5）与无共享列回退、`IterativeImputer` 对 `y=2x` 与多列缺失的恢复、观测值不被改写、`n_iter_` 与提前停止、列主元消元的 2×2 精确解与奇异返回 None，以及三类坏形状/非法超参报错 |
 | `TestDimReductionSelection` | `PCA` 的秩一数据（`explained_variance_ratio_`=1、成分方向、均值点投到原点、k=1/k=2 往返）与白化后方差为 1、`TSNE` 让三类点的簇内平均距离小于簇间（1.2K 量级 vs 12 量级）且同种子可复现、`SMOTE` 补到4:4 且合成点落在少数类线段上、`ADASYN` 的加权与 `weights_`、`VarianceThreshold` 的方差值与去常量列、`SelectKBest` 的 F=8 与 pearson=2/√5、`RFE` 保留唯一有效列、`L1Selector` 保信号列压正交列，以及各类坏形状/非法超参 |
+| `TestAudioMetrics` | STOI 对加噪等级的单调性、极性反转与长度裁剪、PESQ 单调性与 [1,4.5] 边界、两项指标的非法输入 |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
 | `TestSpecialTokensAndBatching` | `SpecialTokens` 的默认值/顺序/`id_of` 两种词表/非法字段与重复、`truncate` 两侧、`pad_sequences` 的 pre/post 补齐与 `max_len` 截断、`attention_mask` 按值、`batch_sequences` 的 `lengths` 与 pre/post 掩码以及「pad 值同时是真实 token」的歧义对照、`tokenize_batch` 对哑分词器与真实 `WordPieceTokenizer` 的端到端形状 |
 | `TestTokenizers` | `Whitespace` 的词表顺序/`pad_id`/未知词/标点保留/`lower`、`Word` 的标点成 token 与 `split_punct=False`、`RegexTokenizer` 的自定义正则与四类非法 pattern、`SentencePiece` 的 `[PAD]`/`<unk>` 固定 id、词表上限、往返、子词确实被用到、`max_piece_len` 约束、未登录字符退 `<unk>`、多点空格归一化、中文单字、与 `tokenize_batch` 的协作，以及 30 类非法构造/未 fit/越界 id |
@@ -3928,7 +3941,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2029 个单元测试
+├── test_ai.py       # 2034 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
