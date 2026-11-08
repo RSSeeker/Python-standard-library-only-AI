@@ -30618,3 +30618,106 @@ class TestXLSTM:
         _xlstm_raises(lambda: AI.XLSTMBlock(4, d_ff=0))
         blk = AI.XLSTMBlock(4, d_ff=8, seed=1)
         _xlstm_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
+
+
+import pytest
+
+
+def _deberta_block_loss(blk, x, w):
+    out = blk.forward(x)
+    return sum(out[t][i] * w[t][i] for t in range(len(x)) for i in range(len(x[0])))
+
+
+def _deberta_fd(blk, x, w, get, setv, analytic, h=1e-5):
+    old = get()
+    setv(old + h)
+    lp = _deberta_block_loss(blk, x, w)
+    setv(old - h)
+    lm = _deberta_block_loss(blk, x, w)
+    setv(old)
+    fd = (lp - lm) / (2.0 * h)
+    return abs(fd - analytic) / max(1.0, abs(fd), abs(analytic))
+
+
+class TestDeBERTa:
+    def test_block_forward_and_param_count(self):
+        import random
+        rng = random.Random(3)
+        blk = AI.DeBERTaBlock(4, d_ff=8, max_rel=4, seed=2)
+        x = [[rng.gauss(0.0, 0.4) for _ in range(4)] for _ in range(3)]
+        out = blk.forward(x)
+        assert len(out) == 3 and len(out[0]) == 4
+        assert blk.param_count() == 244
+
+    def test_block_numerical_gradients(self):
+        import random
+        rng = random.Random(11)
+        blk = AI.DeBERTaBlock(4, d_ff=8, max_rel=4, seed=2)
+        x = [[rng.gauss(0.0, 0.5) for _ in range(4)] for _ in range(4)]
+        w = [[rng.gauss(0.0, 1.0) for _ in range(4)] for _ in range(4)]
+        blk.zero_grad()
+        _deberta_block_loss(blk, x, w)
+        blk.backward(w)
+        cases = [
+            (lambda: blk.Wq.weights[1][2],
+             lambda v: blk.Wq.weights[1].__setitem__(2, v), blk.grad_Wq[0][1][2]),
+            (lambda: blk.Wk.weights[0][3],
+             lambda v: blk.Wk.weights[0].__setitem__(3, v), blk.grad_Wk[0][0][3]),
+            (lambda: blk.Wv.weights[2][1],
+             lambda v: blk.Wv.weights[2].__setitem__(1, v), blk.grad_Wv[0][2][1]),
+            (lambda: blk.Wo.weights[1][0],
+             lambda v: blk.Wo.weights[1].__setitem__(0, v), blk.grad_Wo[0][1][0]),
+            (lambda: blk.W1.weights[0][2],
+             lambda v: blk.W1.weights[0].__setitem__(2, v), blk.grad_W1[0][0][2]),
+            (lambda: blk.W2.weights[3][0],
+             lambda v: blk.W2.weights[3].__setitem__(0, v), blk.grad_W2[0][3][0]),
+            (lambda: blk.Rk[2][1],
+             lambda v: blk.Rk[2].__setitem__(1, v), blk.grad_Rk[2][1]),
+            (lambda: blk.Rq[1][3],
+             lambda v: blk.Rq[1].__setitem__(3, v), blk.grad_Rq[1][3]),
+            (lambda: blk.ln1.gamma[1],
+             lambda v: blk.ln1.gamma.__setitem__(1, v), blk.norm_grads["ln1"][0][1]),
+        ]
+        for get, setv, analytic in cases:
+            assert _deberta_fd(blk, x, w, get, setv, analytic) < 1e-4
+
+    def test_model_forward_fit_generate(self):
+        m = AI.DeBERTaModel(vocab_size=6, d_model=8, num_layers=1, max_len=8,
+                            max_rel=4, seed=1)
+        assert m.param_count() == 1134
+        logits = m.forward([0, 1, 2])
+        assert len(logits) == 3 and len(logits[0]) == 6
+        seqs = [[0, 1, 2, 3, 4, 1], [1, 2, 3, 4, 5, 0], [2, 3, 4, 5, 0, 1]]
+        hist = m.fit(seqs, epochs=40, lr=0.05, shuffle=True, seed=3)
+        assert hist[-1] < hist[0] * 0.5
+        g1 = m.generate([0, 1], max_new_tokens=3, temperature=0.8, top_k=3, seed=4)
+        g2 = m.generate([0, 1], max_new_tokens=3, temperature=0.8, top_k=3, seed=4)
+        assert g1 == g2 and len(g1) == 5
+
+    def test_model_invalid_inputs(self):
+        m = AI.DeBERTaModel(vocab_size=6, d_model=8, num_layers=1, max_len=8,
+                            max_rel=4, seed=1)
+        for bad in ([], [0] * 9, [6], [-1], [1.5]):
+            _deberta_raises(lambda: m.forward(bad))
+        for bad_kw in (dict(vocab_size=0), dict(vocab_size=6, d_model=0),
+                       dict(vocab_size=6, num_layers=0), dict(vocab_size=6, max_len=0),
+                       dict(vocab_size=6, max_rel=0), dict(vocab_size=6, d_ff=0)):
+            _deberta_raises(lambda: AI.DeBERTaModel(**bad_kw))
+        _deberta_raises(lambda: m.fit([], epochs=1))
+        _deberta_raises(lambda: m.fit([[0, 1]], epochs=0))
+        _deberta_raises(lambda: m.fit([[0, 1]], epochs=1, lr=-0.1))
+        _deberta_raises(lambda: m.generate([0, 1], max_new_tokens=-1))
+        _deberta_raises(lambda: m.generate([0, 1], temperature=0.0))
+        _deberta_raises(lambda: m.generate([0, 1], top_k=0))
+
+    def test_block_invalid_inputs(self):
+        _deberta_raises(lambda: AI.DeBERTaBlock(0))
+        _deberta_raises(lambda: AI.DeBERTaBlock(4, max_rel=0))
+        _deberta_raises(lambda: AI.DeBERTaBlock(4, d_ff=0))
+        blk = AI.DeBERTaBlock(4, d_ff=8, max_rel=4, seed=2)
+        _deberta_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
+
+
+def _deberta_raises(fn, exc=ValueError):
+    with pytest.raises(exc):
+        fn()

@@ -37346,6 +37346,389 @@ class XLSTMModel:
                     break
             out.append(pick)
         return out
+
+# ============================================================================
+#  DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+# ============================================================================
+
+
+class DeBERTaBlock:
+    """单头解耦注意力 block（教学简化版，docstring 注明与正式 DeBERTa 的差异）。
+
+    注意力分数（因果，j <= t）：
+        s(t, j) = scale · ( q_t·k_j + q_t·Rk[d] + k_j·Rq[d] ),  d = t - j
+    其中 Rk 为 content-to-position 的相对位置表，Rq 为 position-to-content 表，
+    d 截断到 [0, max_rel]。相对位置只建模「过去的距离」，与因果掩码一致。
+    正式 DeBERTa 为多头、带位置到内容和内容到位置两套投影；本实现为单头、
+    每距离共享一个向量，便于教学与数值校验。
+    """
+
+    def __init__(self, d_model, d_ff=None, max_rel=16, eps=1e-5, seed=None):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"DeBERTaBlock: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(max_rel, int) or isinstance(max_rel, bool) or max_rel < 1:
+            raise ValueError(f"DeBERTaBlock: max_rel 必须是正整数，收到 {max_rel!r}")
+        self.d_model = d_model
+        self.d_ff = 4 * d_model if d_ff is None else d_ff
+        if not isinstance(self.d_ff, int) or isinstance(self.d_ff, bool) or self.d_ff < 1:
+            raise ValueError(f"DeBERTaBlock: d_ff 必须是正整数，收到 {d_ff!r}")
+        self.max_rel = max_rel
+        self.n_rel = 2 * max_rel + 1
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.ln1 = LayerNorm(d_model, eps=eps)
+            self.Wq = Layer(d_model, d_model, "linear")
+            self.Wk = Layer(d_model, d_model, "linear")
+            self.Wv = Layer(d_model, d_model, "linear")
+            self.Wo = Layer(d_model, d_model, "linear")
+            std = math.sqrt(2.0 / d_model)
+            self.Rk = [[random.gauss(0.0, std) for _ in range(d_model)]
+                       for _ in range(self.n_rel)]
+            self.Rq = [[random.gauss(0.0, std) for _ in range(d_model)]
+                       for _ in range(self.n_rel)]
+            self.ln2 = LayerNorm(d_model, eps=eps)
+            self.W1 = Layer(d_model, self.d_ff, "relu")
+            self.W2 = Layer(self.d_ff, d_model, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.grad_Wq = None
+        self.grad_Wk = None
+        self.grad_Wv = None
+        self.grad_Wo = None
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self.grad_Rk = [[0.0] * self.d_model for _ in range(self.n_rel)]
+        self.grad_Rq = [[0.0] * self.d_model for _ in range(self.n_rel)]
+        self.norm_grads = {"ln1": None, "ln2": None}
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _bucket(self, delta):
+        if delta > self.max_rel:
+            delta = self.max_rel
+        return delta
+
+    def forward(self, x):
+        T = len(x)
+        d = self.d_model
+        scale = 1.0 / math.sqrt(d)
+        h1, c1 = _norm_rows_forward(self.ln1, x)
+        q, cq = _dense_rows_forward(self.Wq, h1)
+        k, ck = _dense_rows_forward(self.Wk, h1)
+        v, cv = _dense_rows_forward(self.Wv, h1)
+        attn = [[0.0] * T for _ in range(T)]
+        for t in range(T):
+            row = [0.0] * T
+            q_t = q[t]
+            for j in range(t + 1):
+                delta = self._bucket(t - j)
+                rk = self.Rk[delta]
+                rq = self.Rq[delta]
+                k_j = k[j]
+                cc = sum(q_t[i] * k_j[i] for i in range(d))
+                cp = sum(q_t[i] * rk[i] for i in range(d))
+                pc = sum(k_j[i] * rq[i] for i in range(d))
+                row[j] = scale * (cc + cp + pc)
+            for j in range(t + 1, T):
+                row[j] = -1e30
+            attn[t] = _softmax_row(row)
+        v_mix = [[sum(attn[t][j] * v[j][i] for j in range(t + 1))
+                  for i in range(d)] for t in range(T)]
+        o_rows, co = _dense_rows_forward(self.Wo, v_mix)
+        x1 = [[x[t][j] + o_rows[t][j] for j in range(d)] for t in range(T)]
+        h2, c2 = _norm_rows_forward(self.ln2, x1)
+        a2, ca2 = _dense_rows_forward(self.W1, h2)
+        ffn, cf2 = _dense_rows_forward(self.W2, a2)
+        out = [[x1[t][j] + ffn[t][j] for j in range(d)] for t in range(T)]
+        self._cache = {"x": x, "h1": h1, "c1": c1, "q": q, "k": k, "v": v,
+                       "cq": cq, "ck": ck, "cv": cv, "attn": attn,
+                       "v_mix": v_mix, "co": co, "x1": x1, "c2": c2,
+                       "ca2": ca2, "cf2": cf2}
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("DeBERTaBlock.backward: 必须先调用 forward()")
+        c = self._cache
+        T = len(dout)
+        d = self.d_model
+        scale = 1.0 / math.sqrt(d)
+
+        gW2, gb2, d_a2 = _dense_rows_backward(self.W2, c["cf2"], dout)
+        self.grad_W2 = (gW2, gb2)
+        gW1, gb1, d_h2 = _dense_rows_backward(self.W1, c["ca2"], d_a2)
+        self.grad_W1 = (gW1, gb1)
+        g_ln2, b_ln2, d_x1_ln = _norm_rows_backward(self.ln2, c["c2"], d_h2)
+        self.norm_grads["ln2"] = (g_ln2, b_ln2)
+        d_x1 = [[dout[t][j] + d_x1_ln[t][j] for j in range(d)]
+                for t in range(T)]
+
+        gWo, gbo, d_vmix = _dense_rows_backward(self.Wo, c["co"], d_x1)
+        self.grad_Wo = (gWo, gbo)
+
+        attn = c["attn"]
+        v = c["v"]
+        q = c["q"]
+        k = c["k"]
+        dv = [[0.0] * d for _ in range(T)]
+        dq = [[0.0] * d for _ in range(T)]
+        dk = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            d_out = d_vmix[t]
+            d_attn_row = [0.0] * T
+            for j in range(t + 1):
+                d_attn_row[j] = sum(d_out[i] * v[j][i] for i in range(d))
+                for i in range(d):
+                    dv[j][i] += attn[t][j] * d_out[i]
+            dot = sum(attn[t][j] * d_attn_row[j] for j in range(t + 1))
+            q_t = q[t]
+            for j in range(t + 1):
+                ds = attn[t][j] * (d_attn_row[j] - dot)
+                delta = self._bucket(t - j)
+                rk = self.Rk[delta]
+                rq = self.Rq[delta]
+                k_j = k[j]
+                for i in range(d):
+                    dq[t][i] += ds * scale * (k_j[i] + rk[i])
+                    dk[j][i] += ds * scale * (q_t[i] + rq[i])
+                    self.grad_Rk[delta][i] += ds * scale * q_t[i]
+                    self.grad_Rq[delta][i] += ds * scale * k_j[i]
+
+        gWq, gbq, d_h1a = _dense_rows_backward(self.Wq, c["cq"], dq)
+        gWk, gbk, d_h1b = _dense_rows_backward(self.Wk, c["ck"], dk)
+        gWv, gbv, d_h1c = _dense_rows_backward(self.Wv, c["cv"], dv)
+        self.grad_Wq = (gWq, gbq)
+        self.grad_Wk = (gWk, gbk)
+        self.grad_Wv = (gWv, gbv)
+        d_h1 = [[d_h1a[t][i] + d_h1b[t][i] + d_h1c[t][i] for i in range(d)]
+                for t in range(T)]
+        g_ln1, b_ln1, d_x_ln = _norm_rows_backward(self.ln1, c["c1"], d_h1)
+        self.norm_grads["ln1"] = (g_ln1, b_ln1)
+        return [[d_x1[t][j] + d_x_ln[t][j] for j in range(d)]
+                for t in range(T)]
+
+    def sgd_step(self, lr):
+        for layer, grads in ((self.Wq, self.grad_Wq), (self.Wk, self.grad_Wk),
+                             (self.Wv, self.grad_Wv), (self.Wo, self.grad_Wo),
+                             (self.W1, self.grad_W1), (self.W2, self.grad_W2)):
+            if grads is not None:
+                _dense_apply_sgd(layer, grads, lr)
+        for name, norm in (("ln1", self.ln1), ("ln2", self.ln2)):
+            grads = self.norm_grads[name]
+            if grads is not None:
+                _norm_apply_sgd(norm, grads, lr)
+        for b in range(self.n_rel):
+            for i in range(self.d_model):
+                self.Rk[b][i] -= lr * self.grad_Rk[b][i]
+                self.Rq[b][i] -= lr * self.grad_Rq[b][i]
+
+    def param_count(self):
+        return (4 * _dense_param_count(self.Wq) + _dense_param_count(self.W1)
+                + _dense_param_count(self.W2)
+                + _norm_param_count(self.ln1) + _norm_param_count(self.ln2)
+                + 2 * self.n_rel * self.d_model)
+
+
+class DeBERTaModel:
+    """DeBERTa 语言模型：Embedding → N×DeBERTaBlock → LayerNorm → 词表头"""
+
+    def __init__(self, vocab_size, d_model=32, d_ff=None, num_layers=2,
+                 max_len=64, max_rel=16, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"DeBERTaModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"DeBERTaModel: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"DeBERTaModel: num_layers 必须是正整数，收到 {num_layers!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"DeBERTaModel: max_len 必须 >= 1，收到 {max_len!r}")
+        if d_ff is not None and (not isinstance(d_ff, int)
+                                 or isinstance(d_ff, bool) or d_ff < 1):
+            raise ValueError(f"DeBERTaModel: d_ff 必须是正整数或 None，收到 {d_ff!r}")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        self.max_rel = max_rel
+        std = math.sqrt(2.0 / d_model)
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self._emb = [[random.gauss(0.0, std) for _ in range(d_model)]
+                         for _ in range(vocab_size)]
+        finally:
+            random.setstate(state)
+        self._emb_grad = [[0.0] * d_model for _ in range(vocab_size)]
+        self._last_ids = []
+        self.blocks = [DeBERTaBlock(d_model, d_ff, max_rel=max_rel,
+                                    seed=None if seed is None else seed + i)
+                       for i in range(num_layers)]
+        self.ln_out = LayerNorm(d_model)
+        self.W_out = Layer(d_model, vocab_size, "linear")
+
+    def zero_grad(self):
+        for b in self.blocks:
+            b.zero_grad()
+        self.grad_W_out = None
+        self.grad_ln_out = None
+        for i in range(self.vocab_size):
+            for j in range(self.d_model):
+                self._emb_grad[i][j] = 0.0
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def _check_ids(self, ids):
+        ids = _check_token_ids(ids, self.vocab_size, "DeBERTaModel")
+        if not ids:
+            raise ValueError("DeBERTaModel: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"DeBERTaModel: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        return ids
+
+    def _embed(self, ids):
+        self._last_ids = ids
+        return [list(self._emb[i]) for i in ids]
+
+    def forward(self, ids):
+        ids = self._check_ids(ids)
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, _ = _norm_rows_forward(self.ln_out, x)
+        logits, _ = _dense_rows_forward(self.W_out, h)
+        return logits
+
+    def _run_loss_and_backward(self, ids, targets):
+        ids = self._check_ids(ids)
+        T = len(ids)
+        n_pred = T - 1
+        x = self._embed(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        h, c = _norm_rows_forward(self.ln_out, x)
+        logits, head_cache = _dense_rows_forward(self.W_out, h)
+        loss = 0.0
+        dlogits = [[0.0] * self.vocab_size for _ in range(T)]
+        for t in range(n_pred):
+            target = targets[t]
+            probs = _softmax_row(logits[t])
+            loss += -math.log(probs[target] if probs[target] > 1e-12 else 1e-12)
+            drow = dlogits[t]
+            for v in range(self.vocab_size):
+                drow[v] = probs[v] / n_pred
+            drow[target] -= 1.0 / n_pred
+        gW, gb, d_h = _dense_rows_backward(self.W_out, head_cache, dlogits)
+        self.grad_W_out = (gW, gb)
+        g_ln, b_ln, d_x = _norm_rows_backward(self.ln_out, c, d_h)
+        self.grad_ln_out = (g_ln, b_ln)
+        for block in reversed(self.blocks):
+            d_x = block.backward(d_x)
+        for t, i in enumerate(self._last_ids):
+            for j in range(self.d_model):
+                self._emb_grad[i][j] += d_x[t][j]
+        return loss / n_pred
+
+    def sgd_step(self, lr):
+        for block in self.blocks:
+            block.sgd_step(lr)
+        if self.grad_W_out is not None:
+            _dense_apply_sgd(self.W_out, self.grad_W_out, lr)
+        if self.grad_ln_out is not None:
+            _norm_apply_sgd(self.ln_out, self.grad_ln_out, lr)
+        for i in range(self.vocab_size):
+            for j in range(self.d_model):
+                self._emb[i][j] -= lr * self._emb_grad[i][j]
+
+    def param_count(self):
+        total = self.vocab_size * self.d_model
+        for block in self.blocks:
+            total += block.param_count()
+        total += _norm_param_count(self.ln_out)
+        total += _dense_param_count(self.W_out)
+        return total
+
+    def fit(self, sequences, epochs=10, lr=0.01, shuffle=True, seed=None,
+            verbose=False):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("DeBERTaModel.fit: sequences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"DeBERTaModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or lr <= 0.0:
+            raise ValueError(f"DeBERTaModel.fit: lr 必须是正有限数，收到 {lr!r}")
+        rng = random.Random(seed)
+        history = []
+        for ep in range(epochs):
+            order = list(range(len(sequences)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                seq = self._check_ids(list(sequences[idx]))
+                if len(seq) < 2:
+                    raise ValueError("DeBERTaModel.fit: 每条序列至少需要 2 个 token")
+                self.zero_grad()
+                total += self._run_loss_and_backward(seq, seq[1:])
+                self.sgd_step(lr)
+            avg = total / len(sequences)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+    def generate(self, prompt_ids, max_new_tokens=8, temperature=1.0,
+                 top_k=None, seed=None):
+        ids = self._check_ids(list(prompt_ids))
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+                or max_new_tokens < 0:
+            raise ValueError(
+                f"DeBERTaModel.generate: max_new_tokens 必须是非负整数，收到 {max_new_tokens!r}")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not math.isfinite(float(temperature)) or temperature <= 0.0:
+            raise ValueError(
+                f"DeBERTaModel.generate: temperature 必须是正有限数，收到 {temperature!r}")
+        if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool)
+                                  or top_k < 1):
+            raise ValueError(
+                f"DeBERTaModel.generate: top_k 必须是正整数或 None，收到 {top_k!r}")
+        rng = random.Random(seed)
+        out = list(ids)
+        for _ in range(max_new_tokens):
+            ctx = out[-self.max_len:] if len(out) > self.max_len else out
+            logits = self.forward(ctx)
+            probs = _softmax_row([v / temperature for v in logits[-1]])
+            if top_k is not None:
+                order = sorted(range(len(probs)), key=lambda i: probs[i],
+                               reverse=True)[:top_k]
+                keep = set(order)
+                probs = [p if i in keep else 0.0 for i, p in enumerate(probs)]
+                s = sum(probs)
+                probs = [p / s for p in probs]
+            r = rng.random()
+            acc = 0.0
+            pick = len(probs) - 1
+            for i, p in enumerate(probs):
+                acc += p
+                if r <= acc:
+                    pick = i
+                    break
+            out.append(pick)
+        return out
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 
