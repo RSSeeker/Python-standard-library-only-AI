@@ -30974,3 +30974,171 @@ class TestOfflineRL:
         _offline_rl_raises(lambda: s.update([state0], [0], [1.0], [state0], [True, True]))
         _offline_rl_raises(lambda: s.fit(AI.ReplayBuffer(capacity=4), steps=2, batch_size=2))
         _offline_rl_raises(lambda: s.fit(AI.ReplayBuffer(capacity=4), steps=0, batch_size=2))
+
+
+import math
+
+
+def _e3_rot_z(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+
+
+def _e3_mat_vec(m, v):
+    return [sum(m[r][c] * v[c] for c in range(3)) for r in range(3)]
+
+
+def _e3_loss(layer, h, x, a_mat, b_mat):
+    h_out, x_out = layer.forward(h, x)
+    total = sum(h_out[i][k] * a_mat[i][k]
+                for i in range(len(h)) for k in range(len(a_mat[0])))
+    total += sum(x_out[i][k] * b_mat[i][k]
+                 for i in range(len(x)) for k in range(3))
+    return total
+
+
+def _e3_fd(layer, h, x, a_mat, b_mat, grad_getter, param_getter,
+           param_setter, eps=1e-5):
+    layer.zero_grad()
+    layer.forward(h, x)
+    layer.backward(a_mat, b_mat)
+    analytic = grad_getter()
+    p0 = param_getter()
+    param_setter(p0 + eps)
+    lp = _e3_loss(layer, h, x, a_mat, b_mat)
+    param_setter(p0 - eps)
+    lm = _e3_loss(layer, h, x, a_mat, b_mat)
+    param_setter(p0)
+    numerical = (lp - lm) / (2.0 * eps)
+    return abs(analytic - numerical) / max(1.0, abs(analytic), abs(numerical))
+
+
+def _e3_graphs():
+    import random
+
+    rng = random.Random(0)
+    graphs = []
+    for _ in range(4):
+        h = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(4)]
+        x = [[rng.uniform(-1, 1) for _ in range(3)] for _ in range(4)]
+        target = sum(math.dist(x[i], x[j])
+                     for i in range(4) for j in range(i + 1, 4))
+        graphs.append((h, x, target))
+    return graphs
+
+
+def _e3_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestE3NN:
+    def test_layer_forward_and_param_count(self):
+        layer = AI.EGNNLayer(2, 4, seed=1)
+        assert layer.param_count() == 87
+        h = [[0.5, -0.2], [1.0, 0.3], [-0.4, 0.8], [0.1, 0.0]]
+        x = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.2], [0.0, 1.0, -0.1], [0.5, 0.5, 0.4]]
+        h_out, x_out = layer.forward(h, x)
+        assert len(h_out) == 4 and len(h_out[0]) == 2
+        assert len(x_out) == 4 and len(x_out[0]) == 3
+        assert h_out != h or x_out != x
+
+    def test_layer_equivariance_and_permutation(self):
+        h = [[0.5, -0.2], [1.0, 0.3], [-0.4, 0.8], [0.1, 0.0]]
+        x = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.2], [0.0, 1.0, -0.1], [0.5, 0.5, 0.4]]
+        layer = AI.EGNNLayer(2, 4, seed=1)
+        h1, x1 = layer.forward(h, x)
+        rot = _e3_rot_z(0.7)
+        shift = [0.3, -0.2, 0.5]
+        x_rot = [[_e3_mat_vec(rot, x[i])[k] + shift[k] for k in range(3)]
+                 for i in range(4)]
+        h2, x2 = layer.forward(h, x_rot)
+        for i in range(4):
+            for k in range(2):
+                assert abs(h1[i][k] - h2[i][k]) < 1e-9
+            for k in range(3):
+                expect = _e3_mat_vec(rot, x1[i])[k] + shift[k]
+                assert abs(x2[i][k] - expect) < 1e-9
+        perm = [2, 0, 3, 1]
+        h3, x3 = layer.forward([h[p] for p in perm], [x[p] for p in perm])
+        for i in range(4):
+            for k in range(2):
+                assert abs(h3[i][k] - h1[perm[i]][k]) < 1e-9
+            for k in range(3):
+                assert abs(x3[i][k] - x1[perm[i]][k]) < 1e-9
+
+    def test_layer_numerical_gradients(self):
+        h = [[0.5, -0.2], [1.0, 0.3], [-0.4, 0.8], [0.1, 0.0]]
+        x = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.2], [0.0, 1.0, -0.1], [0.5, 0.5, 0.4]]
+        a_mat = [[0.3, -0.7], [0.2, 0.5], [-0.4, 0.1], [0.6, 0.2]]
+        b_mat = [[0.1, -0.2, 0.3], [0.4, 0.0, -0.1], [-0.3, 0.2, 0.5], [0.2, -0.4, 0.1]]
+        layer = AI.EGNNLayer(2, 4, seed=2)
+        rel = _e3_fd(layer, h, x, a_mat, b_mat,
+                     lambda: layer.grad_phi_e[0][0][0][0],
+                     lambda: layer.phi_e.layers[0].weights[0][0],
+                     lambda v: layer.phi_e.layers[0].weights[0].__setitem__(0, v))
+        assert rel < 1e-6
+        rel = _e3_fd(layer, h, x, a_mat, b_mat,
+                     lambda: layer.grad_phi_x[0][0][0][0],
+                     lambda: layer.phi_x.layers[0].weights[0][0],
+                     lambda v: layer.phi_x.layers[0].weights[0].__setitem__(0, v))
+        assert rel < 1e-6
+        rel = _e3_fd(layer, h, x, a_mat, b_mat,
+                     lambda: layer.grad_phi_h[0][0][0][0],
+                     lambda: layer.phi_h.layers[0].weights[0][0],
+                     lambda v: layer.phi_h.layers[0].weights[0].__setitem__(0, v))
+        assert rel < 1e-6
+        layer.zero_grad()
+        layer.forward(h, x)
+        _, dx = layer.backward(a_mat, b_mat)
+        analytic = dx[0][0]
+        old = x[0][0]
+        x[0][0] = old + 1e-5
+        lp = _e3_loss(layer, h, x, a_mat, b_mat)
+        x[0][0] = old - 1e-5
+        lm = _e3_loss(layer, h, x, a_mat, b_mat)
+        x[0][0] = old
+        numerical = (lp - lm) / 2e-5
+        assert abs(analytic - numerical) / max(1.0, abs(analytic)) < 1e-6
+
+    def test_model_forward_fit_and_invariance(self):
+        graphs = _e3_graphs()
+        model = AI.EGNNModel(2, num_layers=1, d_ff=4, seed=3)
+        assert model.param_count() == 104
+        h0, x0, scalar0 = model.forward(graphs[0][0], graphs[0][1])
+        assert len(h0) == 4 and len(x0) == 4
+        hist = model.fit(graphs, epochs=60, lr=0.05, seed=4)
+        assert hist[-1] < hist[0] * 0.6
+        rot = _e3_rot_z(0.4)
+        shift = [0.1, 0.2, -0.3]
+        h = graphs[0][0]
+        x = graphs[0][1]
+        x_rot = [[_e3_mat_vec(rot, x[i])[k] + shift[k] for k in range(3)]
+                 for i in range(4)]
+        _, _, scalar1 = model.forward(h, x)
+        _, _, scalar2 = model.forward(h, x_rot)
+        assert abs(scalar1 - scalar2) < 1e-9
+
+    def test_invalid_inputs(self):
+        _e3_raises(lambda: AI.EGNNLayer(0, 4))
+        _e3_raises(lambda: AI.EGNNLayer(2, 0))
+        _e3_raises(lambda: AI.EGNNLayer(2, 4, seed="x"))
+        _e3_raises(lambda: AI.EGNNModel(0))
+        _e3_raises(lambda: AI.EGNNModel(2, num_layers=0))
+        layer = AI.EGNNLayer(2, 4)
+        _e3_raises(lambda: layer.forward([], [[0.0, 0.0, 0.0]]))
+        _e3_raises(lambda: layer.forward([[0.1]], [[0.0, 0.0, 0.0]]))
+        _e3_raises(lambda: layer.forward([[0.1, 0.2]], [[0.0, 0.0]]))
+        _e3_raises(lambda: layer.forward([[0.1, 0.2]], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]))
+        _e3_raises(lambda: layer.backward([[0.1, 0.2]], [[0.0, 0.0, 0.0]]),
+                   RuntimeError)
+        model = AI.EGNNModel(2, num_layers=1, d_ff=4, seed=1)
+        _e3_raises(lambda: model.fit([], epochs=2, lr=0.1))
+        _e3_raises(lambda: model.fit(_e3_graphs(), epochs=0, lr=0.1))
+        _e3_raises(lambda: model.fit(_e3_graphs(), epochs=2, lr=0.0))
+        _e3_raises(lambda: model.loss_and_backward([[0.1, 0.2]], [[0.0, 0.0, 0.0]], "x"))

@@ -38470,6 +38470,357 @@ class CQLAgent:
         return (self.q.param_count() + self.q_target.param_count()
                 + self.policy.param_count())
 
+# ============================================================================
+#  E(3) 等变图神经网络（EGNN，教学版）
+# ============================================================================
+#  说明：
+#  - 输入是一张全连接图：节点特征 h（N×d，平移/旋转不变）与坐标 x（N×3，
+#    平移/旋转等变）。
+#  - 每条边 (i, j) 的特征是 [h_i, h_j, ||x_i - x_j||²]（距离平方，旋转不变），
+#    经 phi_e 得到边消息 e_ij；phi_x(e_ij) 给出坐标更新系数 w_ij；
+#    phi_h([h_i, Σ_j e_ij]) 给出节点特征更新。
+#  - 坐标更新 x_i' = x_i + Σ_j w_ij·(x_i - x_j) 对旋转/平移严格等变，
+#    节点特征 h_i' = h_i + phi_h([h_i, m_i]) 对旋转/平移严格不变。
+#  - 反向传播手写：对 phi_e / phi_x / phi_h 用行级工具反传，同时给出
+#    dh / dx，用于梯度校验与训练。
+
+
+def _e3_mlp_forward(model, rows):
+    """按行前向 MLP，返回 (输出行, 每层 cache)。"""
+    acts = [list(row) for row in rows]
+    caches = []
+    for layer in model.layers:
+        acts, cache = _dense_rows_forward(layer, acts)
+        caches.append(cache)
+    return acts, caches
+
+
+def _e3_mlp_backward(model, caches, drows):
+    """按行反向 MLP，返回 (每层 (grad_w, grad_b), 输入行梯度)。"""
+    d_rows = drows
+    grads = [None] * len(model.layers)
+    for idx in range(len(model.layers) - 1, -1, -1):
+        gw, gb, d_rows = _dense_rows_backward(
+            model.layers[idx], caches[idx], d_rows)
+        grads[idx] = (gw, gb)
+    return grads, d_rows
+
+
+def _e3_zeros_like(model):
+    out = []
+    for layer in model.layers:
+        out.append(([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                    [0.0] * layer.fan_out))
+    return out
+
+
+def _e3_accumulate(acc, grads):
+    for li, (gw, gb) in enumerate(grads):
+        acc_w, acc_b = acc[li]
+        for j in range(len(gw)):
+            row = acc_w[j]
+            for k in range(len(gw[j])):
+                row[k] += gw[j][k]
+            acc_b[j] += gb[j]
+
+
+def _e3_average(acc, n):
+    inv = 1.0 / n
+    return [([[v * inv for v in row] for row in gw],
+             [v * inv for v in gb]) for gw, gb in acc]
+
+
+def _e3_apply_sgd(model, grads, lr):
+    for layer, (gw, gb) in zip(model.layers, grads):
+        for j in range(layer.fan_out):
+            w = layer.weights[j]
+            g = gw[j]
+            for i in range(layer.fan_in):
+                w[i] -= lr * g[i]
+            layer.biases[j] -= lr * gb[j]
+
+
+def _e3_param_count(model):
+    return sum(layer.fan_in * layer.fan_out + layer.fan_out
+               for layer in model.layers)
+
+
+def _e3_check_matrix(rows, name, width=None):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"{name} 必须是非空行列表")
+    out = []
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or not r:
+            raise ValueError(f"{name} 的每一行必须是非空列表")
+        row = []
+        for v in r:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{name} 的元素必须是数字，收到 {v!r}")
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"{name} 的元素必须是有限数，收到 {v!r}")
+            row.append(fv)
+        if width is not None and len(row) != width:
+            raise ValueError(f"{name} 的列数必须是 {width}，收到 {len(row)}")
+        out.append(row)
+    return out
+
+
+def _e3_make_mlp(sizes, activations, seed):
+    """构造 MLP；给定 seed 时临时替换全局 random 状态，构造后恢复。"""
+    if seed is None:
+        return MLP(sizes, activations)
+    state = random.getstate()
+    random.seed(seed)
+    try:
+        return MLP(sizes, activations)
+    finally:
+        random.setstate(state)
+
+
+class EGNNLayer:
+    """一层 E(3) 等变图卷积（全连接图）。"""
+
+    def __init__(self, d_model, d_ff=None, seed=None):
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"EGNNLayer: d_model 必须是 >=1 的整数，收到 {d_model!r}")
+        if d_ff is None:
+            d_ff = 2 * d_model
+        if isinstance(d_ff, bool) or not isinstance(d_ff, int) or d_ff < 1:
+            raise ValueError(f"EGNNLayer: d_ff 必须是 >=1 的整数，收到 {d_ff!r}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"EGNNLayer: seed 必须是 int 或 None，收到 {seed!r}")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        # 三张 MLP：边消息、坐标系数、节点更新
+        self.phi_e = _e3_make_mlp([2 * d_model + 1, d_ff, d_ff],
+                                  ["relu"] * 2, seed)
+        self.phi_x = _e3_make_mlp([d_ff, 1], ["linear"], seed)
+        self.phi_h = _e3_make_mlp([d_model + d_ff, d_ff, d_model],
+                                  ["relu"] * 2, seed)
+        self.grad_phi_e = _e3_zeros_like(self.phi_e)
+        self.grad_phi_x = _e3_zeros_like(self.phi_x)
+        self.grad_phi_h = _e3_zeros_like(self.phi_h)
+        self._cache = None
+
+    @staticmethod
+    def _d2(xi, xj):
+        return ((xi[0] - xj[0]) ** 2 + (xi[1] - xj[1]) ** 2
+                + (xi[2] - xj[2]) ** 2)
+
+    def forward(self, h, x):
+        """h: N×d 节点特征；x: N×3 坐标。返回 (h', x')。"""
+        h = _e3_check_matrix(h, "EGNNLayer.forward: h", self.d_model)
+        x = _e3_check_matrix(x, "EGNNLayer.forward: x", 3)
+        n = len(h)
+        if len(x) != n:
+            raise ValueError("EGNNLayer.forward: h 与 x 的节点数必须一致")
+        pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
+        edge_rows = []
+        d2s = []
+        for (i, j) in pairs:
+            d2 = self._d2(x[i], x[j])
+            d2s.append(d2)
+            edge_rows.append(h[i] + h[j] + [d2])
+        if edge_rows:
+            e_rows, e_caches = _e3_mlp_forward(self.phi_e, edge_rows)
+            w_rows, w_caches = _e3_mlp_forward(self.phi_x, e_rows)
+        else:
+            e_rows, e_caches = [], []
+            w_rows, w_caches = [], []
+        m = [[0.0] * self.d_ff for _ in range(n)]
+        for p, (i, j) in enumerate(pairs):
+            for k in range(self.d_ff):
+                m[i][k] += e_rows[p][k]
+        node_rows = [h[i] + m[i] for i in range(n)]
+        if node_rows:
+            dh_rows, h_caches = _e3_mlp_forward(self.phi_h, node_rows)
+        else:
+            dh_rows, h_caches = [], []
+        h_new = [[h[i][k] + dh_rows[i][k] for k in range(self.d_model)]
+                 for i in range(n)]
+        x_new = [[x[i][k] for k in range(3)] for i in range(n)]
+        for p, (i, j) in enumerate(pairs):
+            w = w_rows[p][0]
+            for k in range(3):
+                x_new[i][k] += w * (x[i][k] - x[j][k])
+        self._cache = {
+            "h": h, "x": x, "pairs": pairs, "d2s": d2s,
+            "e_rows": e_rows, "e_caches": e_caches,
+            "w_rows": w_rows, "w_caches": w_caches,
+            "m": m, "h_caches": h_caches, "dh_rows": dh_rows,
+            "n": n,
+        }
+        return h_new, x_new
+
+    def backward(self, dh_new, dx_new):
+        """给定输出梯度，回传并累积三张 MLP 的梯度；返回 (dh, dx)。"""
+        c = self._cache
+        if c is None:
+            raise RuntimeError("EGNNLayer.backward: 必须先调用 forward")
+        n = c["n"]
+        pairs = c["pairs"]
+        h, x = c["h"], c["x"]
+        dh_new = _e3_check_matrix(dh_new, "EGNNLayer.backward: dh", self.d_model)
+        dx_new = _e3_check_matrix(dx_new, "EGNNLayer.backward: dx", 3)
+        if len(dh_new) != n or len(dx_new) != n:
+            raise ValueError("EGNNLayer.backward: 梯度节点数必须与 forward 一致")
+
+        dh = [list(dh_new[i]) for i in range(n)]
+        dx = [list(dx_new[i]) for i in range(n)]
+
+        # 1) phi_h 反传：node_in = [h_i, m_i]（h 维 d_model，m 维 d_ff）
+        d_h_delta_rows = [list(dh_new[i]) for i in range(n)]
+        if n:
+            h_grads, d_in = _e3_mlp_backward(
+                self.phi_h, c["h_caches"], d_h_delta_rows)
+            _e3_accumulate(self.grad_phi_h, h_grads)
+            for i in range(n):
+                for k in range(self.d_model):
+                    dh[i][k] += d_in[i][k]
+            de_rows = [list(d_in[i][self.d_model:]) for i in range(n)]
+        else:
+            de_rows = []
+        # m_i = Σ_j e_ij，故 de_ij = dm_i
+        de_pair = [list(de_rows[i]) for (i, j) in pairs]
+
+        # 2) phi_x 反传：w_ij 只影响 x_new[i]
+        d_w_rows = [[0.0] for _ in pairs]
+        for p, (i, j) in enumerate(pairs):
+            w = c["w_rows"][p][0]
+            for k in range(3):
+                dx[i][k] += dx_new[i][k] * w
+                dx[j][k] -= dx_new[i][k] * w
+                d_w_rows[p][0] += (x[i][k] - x[j][k]) * dx_new[i][k]
+        if pairs:
+            x_grads, d_e_from_x = _e3_mlp_backward(
+                self.phi_x, c["w_caches"], d_w_rows)
+            _e3_accumulate(self.grad_phi_x, x_grads)
+            for p in range(len(pairs)):
+                for k in range(self.d_ff):
+                    de_pair[p][k] += d_e_from_x[p][k]
+
+        # 3) phi_e 反传：edge_in = [h_i, h_j, d2]
+        if pairs:
+            e_grads, d_edge_in = _e3_mlp_backward(
+                self.phi_e, c["e_caches"], de_pair)
+            _e3_accumulate(self.grad_phi_e, e_grads)
+            for p, (i, j) in enumerate(pairs):
+                for k in range(self.d_model):
+                    dh[i][k] += d_edge_in[p][k]
+                    dh[j][k] += d_edge_in[p][self.d_model + k]
+                dd2 = d_edge_in[p][2 * self.d_model]
+                for k in range(3):
+                    diff = x[i][k] - x[j][k]
+                    dx[i][k] += 2.0 * dd2 * diff
+                    dx[j][k] -= 2.0 * dd2 * diff
+        return dh, dx
+
+    def zero_grad(self):
+        self.grad_phi_e = _e3_zeros_like(self.phi_e)
+        self.grad_phi_x = _e3_zeros_like(self.phi_x)
+        self.grad_phi_h = _e3_zeros_like(self.phi_h)
+
+    def sgd_step(self, lr):
+        _e3_apply_sgd(self.phi_e, self.grad_phi_e, lr)
+        _e3_apply_sgd(self.phi_x, self.grad_phi_x, lr)
+        _e3_apply_sgd(self.phi_h, self.grad_phi_h, lr)
+
+    def param_count(self):
+        return (_e3_param_count(self.phi_e) + _e3_param_count(self.phi_x)
+                + _e3_param_count(self.phi_h))
+
+
+class EGNNModel:
+    """多层 EGNN + 均值池化读出（标量输出，E(3) 不变）。"""
+
+    def __init__(self, d_model, num_layers=1, d_ff=None, seed=None):
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"EGNNModel: d_model 必须是 >=1 的整数，收到 {d_model!r}")
+        if isinstance(num_layers, bool) or not isinstance(num_layers, int) or num_layers < 1:
+            raise ValueError(
+                f"EGNNModel: num_layers 必须是 >=1 的整数，收到 {num_layers!r}")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.layers = [EGNNLayer(d_model, d_ff, seed=seed)
+                       for _ in range(num_layers)]
+        self.readout = _e3_make_mlp([d_model, d_ff or 2 * d_model, 1],
+                                    ["relu", "linear"], seed)
+        self.grad_readout = _e3_zeros_like(self.readout)
+        self._cache = None
+
+    def _forward_readout(self, h, x):
+        h_cur, x_cur = h, x
+        for layer in self.layers:
+            h_cur, x_cur = layer.forward(h_cur, x_cur)
+        n = len(h_cur)
+        mean = [sum(h_cur[i][k] for i in range(n)) / n
+                for k in range(self.d_model)]
+        out, cache = _e3_mlp_forward(self.readout, [mean])
+        self._cache = {"h": h_cur, "x": x_cur, "cache": cache, "mean": mean}
+        return h_cur, x_cur, out[0][0]
+
+    def forward(self, h, x):
+        """返回 (h', x', scalar)；scalar 对旋转/平移不变。"""
+        h_out, x_out, scalar = self._forward_readout(h, x)
+        return h_out, x_out, scalar
+
+    def loss_and_backward(self, h, x, target):
+        """MSE(scalar, target) 并对整个网络反向，返回损失。"""
+        if isinstance(target, bool) or not isinstance(target, (int, float)):
+            raise ValueError(f"EGNNModel: target 必须是数字，收到 {target!r}")
+        if not math.isfinite(float(target)):
+            raise ValueError("EGNNModel: target 必须是有限数")
+        h_out, x_out, scalar = self._forward_readout(h, x)
+        diff = scalar - float(target)
+        loss = diff * diff
+        d_out = [[2.0 * diff]]
+        r_grads, d_mean = _e3_mlp_backward(self.readout, self._cache["cache"], d_out)
+        _e3_accumulate(self.grad_readout, r_grads)
+        n = len(h_out)
+        dh = [[d_mean[0][k] / n for k in range(self.d_model)] for _ in range(n)]
+        dx = [[0.0, 0.0, 0.0] for _ in range(n)]
+        for layer in reversed(self.layers):
+            dh, dx = layer.backward(dh, dx)
+        return loss
+
+    def zero_grad(self):
+        for layer in self.layers:
+            layer.zero_grad()
+        self.grad_readout = _e3_zeros_like(self.readout)
+
+    def sgd_step(self, lr):
+        for layer in self.layers:
+            layer.sgd_step(lr)
+        _e3_apply_sgd(self.readout, self.grad_readout, lr)
+
+    def param_count(self):
+        return sum(layer.param_count() for layer in self.layers) \
+            + _e3_param_count(self.readout)
+
+    def fit(self, graphs, epochs=50, lr=0.05, shuffle=True, seed=None):
+        """graphs: [(h, x, target), ...] 的小批量全批训练，返回每轮平均损失。"""
+        if not isinstance(graphs, (list, tuple)) or not graphs:
+            raise ValueError("EGNNModel.fit: graphs 必须是非空列表")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"EGNNModel.fit: epochs 必须是 >=1 的整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError(f"EGNNModel.fit: lr 必须是正数，收到 {lr!r}")
+        rng = random.Random(seed)
+        order = list(range(len(graphs)))
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            total = 0.0
+            if shuffle:
+                rng.shuffle(order)
+            for idx in order:
+                h, x, target = graphs[idx]
+                total += self.loss_and_backward(h, x, target)
+            self.sgd_step(lr / len(graphs))
+            history.append(total / len(graphs))
+        return history
+
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 
