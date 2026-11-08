@@ -15813,7 +15813,10 @@ class MoE:
         yield "b_gate", self.b_gate
 
     def param_count(self):
-        per = sum(len(row) for row in self.experts[0].W1) * self.d_model
+        # W1 是 (d_ff, d_model)：行数 d_ff 才是参数行数。旧写法把
+        # sum(len(row) for row in W1)（= d_ff * d_model）又乘了一次 d_model，
+        # 把 W1 的参数量放大 d_model 倍（d_model=4, d_ff=6 时 405 -> 189）。
+        per = len(self.experts[0].W1) * self.d_model
         per += len(self.experts[0].b1)
         per += self.d_model * len(self.experts[0].W2[0])
         per += len(self.experts[0].b2)

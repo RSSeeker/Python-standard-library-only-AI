@@ -8097,7 +8097,9 @@ class TestMoE:
         xs = [[0.5, -0.2, 0.1, 0.3], [0.1, 0.4, -0.3, 0.2]]
         out = moe.forward(xs)
         assert len(out) == 2 and all(len(r) == 4 for r in out)
-        assert moe.param_count() == 405
+        # 每个专家 6*4 + 6 + 4*6 + 4 = 58；3 个专家 + 门控 3*4 + 3 = 189
+        # （旧期望 405 来自 param_count 把 W1 的行长又乘了一次 d_model）
+        assert moe.param_count() == 189
         assert all(len(r) == 2 for r in moe.routes)
         assert all(abs(sum(w for _e, w in r) - 1.0) < 1e-12 for r in moe.routes)
         for bad in ({"d_model": 0}, {"d_ff": 0}, {"num_experts": 0},
