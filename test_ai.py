@@ -28789,3 +28789,82 @@ class TestSwinMaskAndPatchMerging:
         assert len(m.forward(img)) == 3
         dx = m.backward([1.0, -0.5, 0.25])
         assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
+
+
+class TestViTEntryPoints:
+    """ViT 的两个入口：fit（分类微调）与 pretrain（MAE-lite 掩码重建）"""
+
+    def _model(self):
+        return AI.ViT(in_channels=1, image_size=8, patch_size=4, d_model=8,
+                      num_heads=2, d_ff=16, num_layers=1, num_classes=2)
+
+    def _imgs(self, n=4):
+        imgs = []
+        for k in range(n):
+            img = []
+            for a in range(8):
+                row = []
+                for b in range(8):
+                    row.append(0.4 * ((a + b) % 3) + 0.15 * k)
+                img.append(row)
+            imgs.append([img])
+        return imgs
+
+    def _raises(self, fn, exc):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def test_finetune_reduces_loss(self):
+        model = self._model()
+        losses = model.fit(self._imgs(), [0, 1, 0, 1], epochs=25, lr=0.02,
+                           seed=1)
+        assert len(losses) == 25
+        assert losses[-1] < losses[0] * 0.5
+
+    def test_pretrain_reduces_recon_loss(self):
+        model = self._model()
+        before = model.param_count()
+        w_q = model.encoder.layers[0].self_attn.W_q[0][0]
+        patch_w = model.patch_embed.conv.weights[0][0][0][0]
+        imgs = [[[[0.1 * a + 0.05 * b for b in range(8)] for a in range(8)]]
+                for _ in range(3)]
+        losses = model.pretrain(imgs, epochs=30, lr=0.02, mask_ratio=0.5,
+                                seed=2)
+        assert len(losses) == 30
+        assert losses[-1] < losses[0]
+        assert hasattr(model, "_mae_dec1") and hasattr(model, "_mae_dec2")
+        assert len(model._mae_dec1.weights) == 16
+        assert len(model._mae_dec1.weights[0]) == 8
+        assert len(model._mae_dec2.weights) == 16
+        assert len(model._mae_dec2.weights[0]) == 16
+        # 只训练编码器与重建头：编码器权重变化，patch 卷积不动
+        assert model.encoder.layers[0].self_attn.W_q[0][0] != w_q
+        assert model.patch_embed.conv.weights[0][0][0][0] == patch_w
+        assert model.param_count() == before
+
+    def test_finetune_invalid_inputs(self):
+        model = self._model()
+        imgs = self._imgs()
+        assert self._raises(lambda: model.fit([], []), ValueError)
+        assert self._raises(lambda: model.fit(imgs, [0, 1]), ValueError)
+        assert self._raises(lambda: model.fit(imgs, [0, 1, 0, 2]), ValueError)
+        assert self._raises(lambda: model.fit(imgs, [0, 1, 0, 1], epochs=0),
+                            ValueError)
+        assert self._raises(lambda: model.fit(imgs, [0, 1, 0, 1], lr=-0.1),
+                            ValueError)
+
+    def test_pretrain_invalid_inputs(self):
+        model = self._model()
+        imgs = self._imgs()
+        assert self._raises(lambda: model.pretrain([]), ValueError)
+        assert self._raises(lambda: model.pretrain(imgs, mask_ratio=0.0),
+                            ValueError)
+        assert self._raises(lambda: model.pretrain(imgs, mask_ratio=1.0),
+                            ValueError)
+        assert self._raises(lambda: model.pretrain(imgs, epochs=0), ValueError)
+        assert self._raises(lambda: model.pretrain(imgs, lr=-0.1), ValueError)

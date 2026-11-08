@@ -726,7 +726,13 @@
   线性降到 `2C`）；`SwinTransformer` 新增 `depths` 参数，多 stage 时自动在 stage 间
   插入 `PatchMerging`（层级式 Swin）；测试 `TestSwinMaskAndPatchMerging` 6 例
 
-全量测试：1839 → 1896 passed（新增 57 例）。
+- [x] ViT 预训练 / 微调入口：`ViT.fit(images, labels, epochs, lr)` 分类微调；
+  `ViT.pretrain(images, epochs, lr, mask_ratio=0.5)` 简化 MAE 掩码 patch 重建
+  （CLS + 可见 patch 过编码器，重建头以 CLS + 被遮 patch 位置为输入回归像素；
+  只训练编码器与重建头，重建头首次调用时创建、不计入 `param_count`）；
+  测试 `TestViTEntryPoints` 4 例
+
+全量测试：1839 → 1900 passed（新增 61 例）。
 
 ---
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1896 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1900 项）
 
 ## 特性
 
@@ -156,7 +156,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `PatchEmbedding(in_channels, patch_size, d_model)` | ViT 的第一步：用 `kernel=stride=patch_size` 的卷积把 `(C,H,W)` 切成不重叠 patch，摊平成 `gh*gw` 个 token（行优先）；`backward` 把 token 梯度还原成特征图再回传 |
 | `AttentionPooling(d_model)` | 注意力池化：可学习查询向量给每个 token 打分 `softmax(q·x/√d)`，加权求和成一个向量；权重由内容决定，能学会"只看重要补丁" |
 | `UNet(in_channels=1, num_classes=2, base_channels=4, use_bn=False)` | U-Net：2 级下采样 + 瓶颈 + 2 级上采样，每级把上采样结果与同级编码特征**按通道拼接**；`use_bn=True` 时每个卷积后接 `BatchNorm2d`（`train()`/`eval()` 切换）；输入 `(C,H,W)` 要求 H、W 能被 4 整除；`sgd_step`/`adam_step` 可用 |
-| `ViT(in_channels=3, image_size=8, patch_size=4, d_model=16, num_heads=4, d_ff=32, num_layers=2, num_classes=10)` | 视觉 Transformer：`PatchEmbedding` 切 patch → 可学习 `CLS` + 位置编码 → `TransformerEncoder` → 取 `CLS` 过 `LayerNorm` → 线性分类头；`image_size` 支持 int 或 `(H,W)` 且必须能被 `patch_size` 整除；梯度**累加**（与编码器一致），更新前先 `zero_grad()`，`sgd_step(lr)` 一步 SGD |
+| `ViT(in_channels=3, image_size=8, patch_size=4, d_model=16, num_heads=4, d_ff=32, num_layers=2, num_classes=10)` | 视觉 Transformer：`PatchEmbedding` 切 patch → 可学习 `CLS` + 位置编码 → `TransformerEncoder` → 取 `CLS` 过 `LayerNorm` → 线性分类头；`image_size` 支持 int 或 `(H,W)` 且必须能被 `patch_size` 整除；梯度**累加**（与编码器一致），更新前先 `zero_grad()`，`sgd_step(lr)` 一步 SGD。另有两个入口：`fit(images, labels, epochs, lr)` 分类微调；`pretrain(images, epochs, lr, mask_ratio=0.5)` 简化 MAE 掩码 patch 重建（重建头首次调用时创建，只更新编码器与重建头，不计入 `param_count`） |
 | `FPN(in_channels_list, out_channels=8, smooth=True)` | 特征金字塔：每级先过 1x1 横向卷积压到统一通道，再从最粗一级往上 `P_i = lateral_i + upsample2x(P_{i+1})`，每级过 3x3 平滑卷积（`smooth=False` 可关）。要求相邻特征尺寸严格 2 倍关系；`backward` 返回与输入等长的梯度列表 |
 | `SegNet(in_channels=1, num_classes=2, base_channels=4)` | 2 级编码-解码分割网络：编码 `Conv+ReLU+MaxPool`，解码用**池化索引**（`MaxPool2d.mask` 的 argmax 位置）把值放回原位置再卷积，不做跳跃拼接；要求输入 `H`、`W` 能被 4 整除 |
 | `MLPMixer(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, token_hidden=32, channel_hidden=32, num_classes=10)` | MLP-Mixer：每个 block 先做 **token 混合**（转置后逐通道跑同一个 MLP），再做**通道混合**（逐 token 跑 MLP），两段都是 pre-LN 残差；输出对 token 取均值池化。逐行批量前向/反向（cache 按行保存，不会互相覆盖），`backward` 梯度累加、`sgd_step`/`adam_step` 都有 |
@@ -3330,7 +3330,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1896 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1900 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3452,6 +3452,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHighway` | 闭式解、`param_count = d²+3d`、`dx`/`wg`/`w` 中心差分、`sgd_step`/`adam_step` 真改参数、4 类非法输入 |
 | `TestUNet` | 输出形状与参数量、`dx` 中心差分（无 BN / 有 BN 推理模式）、编码/转置卷积/BN 三组参数梯度中心差分、Adam 40 步 MSE 降到 1/3 以下、7 类非法输入 |
 | `TestViT` | patch 化与 `CLS`/位置编码拼接、`param_count`、`dx` 与 `CLS`/`pos`/head/`LayerNorm` 四组梯度中心差分、梯度累加与 `zero_grad` 语义、2 类小任务训练收敛并全对、9 类非法输入 |
+| `TestViTEntryPoints` | `fit` 微调 loss 下降；`pretrain` 掩码重建 loss 下降、只更新编码器/重建头（patch 卷积不动）、`param_count` 不变；两个入口的非法输入 |
 | `TestFPN` | 三级输出尺寸与参数量、`smooth=False` 分支、逐级 `dx` 与横向/平滑卷积 `grad_w` 中心差分、`sgd_step`/`adam_step`、6 类非法输入 |
 | `TestSegNet` | 输出形状与参数量、`dx` 与 `conv1` 梯度中心差分、`pool0.mask` 逐窗口等于 argmax 且 `_unpool2` 只在选中位置取值、40 步 Adam loss 降到 1/3 以下、8 类非法输入 |
 | `TestMLPMixer` | 形状与参数量 891、`dx` 与 block 内 `t1/t2/c1/c2` 四组权重梯度中心差分、head 与 block 内 LayerNorm 梯度中心差分、两次 `backward` 线性累加且 `zero_grad` 清空、120 步 Adam 收敛且 4 张图全对、9 类非法输入 |
@@ -3622,7 +3623,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1896 个单元测试
+├── test_ai.py       # 1900 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

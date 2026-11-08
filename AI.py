@@ -6053,6 +6053,140 @@ class ViT:
             for j in range(self.d_model):
                 row[j] -= lr * grow[j]
 
+    def fit(self, images, labels, epochs=30, lr=0.01, shuffle=True, seed=None,
+            verbose=False):
+        """微调入口：在（可选的）预训练权重上做图像分类训练。
+
+        逐样本 forward → cross_entropy → backward → SGD；返回每个 epoch 的
+        平均 loss（列表）。`shuffle=True` 时每个 epoch 打乱样本顺序。
+        """
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("ViT.fit: images 必须是非空列表")
+        if not isinstance(labels, (list, tuple)) or len(labels) != len(images):
+            raise ValueError(
+                f"ViT.fit: labels 长度 {len(labels)} 与 images 长度 {len(images)} 不一致")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"ViT.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ViT.fit: lr 必须是非负数，收到 {lr!r}")
+        for y in labels:
+            if isinstance(y, bool) or not isinstance(y, int) \
+                    or not 0 <= y < self.num_classes:
+                raise ValueError(
+                    f"ViT.fit: 标签必须是 [0, {self.num_classes}) 内的整数，收到 {y!r}")
+        rng = random.Random(seed)
+        order = list(range(len(images)))
+        losses = []
+        for epoch in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                self.zero_grad()
+                logits = self.forward(images[i])
+                loss, grads = cross_entropy_loss(logits, int(labels[i]))
+                total += loss
+                self.backward(grads)
+                self.sgd_step(lr)
+            losses.append(total / len(images))
+            if verbose:
+                print(f"  [ViT 微调] epoch {epoch + 1}/{epochs} "
+                      f"loss {losses[-1]:.6f}")
+        return losses
+
+    def pretrain(self, images, epochs=30, lr=0.01, mask_ratio=0.5, seed=None,
+                 verbose=False):
+        """预训练入口：简化的 MAE 式掩码 patch 重建。
+
+        每张图随机遮住 `mask_ratio` 比例的 patch，编码器只看 CLS + 可见 patch；
+        重建头（首次调用时创建）以 CLS 表示 + 被遮 patch 的位置编码为输入，
+        回归被遮 patch 的像素。只训练编码器与重建头，不更新 patch 卷积 / 分类头。
+        返回每个 epoch 的平均重建 loss（MSE）。
+        """
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("ViT.pretrain: images 必须是非空列表")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(
+                f"ViT.pretrain: epochs 必须是正整数，收到 {epochs!r}")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ViT.pretrain: lr 必须是非负数，收到 {lr!r}")
+        if isinstance(mask_ratio, bool) \
+                or not isinstance(mask_ratio, (int, float)) \
+                or not 0.0 < float(mask_ratio) < 1.0:
+            raise ValueError(
+                f"ViT.pretrain: mask_ratio 必须在 (0,1) 之间，收到 {mask_ratio!r}")
+        if self.num_patches < 2:
+            raise ValueError("ViT.pretrain: 至少需要 2 个 patch 才能做掩码重建")
+        ps = self.patch_size
+        c = self.in_channels
+        patch_dim = c * ps * ps
+        if not hasattr(self, "_mae_dec1"):
+            self._mae_dec1 = Layer(self.d_model, 2 * self.d_model, "gelu")
+            self._mae_dec2 = Layer(2 * self.d_model, patch_dim, "linear")
+        dec1 = self._mae_dec1
+        dec2 = self._mae_dec2
+        rng = random.Random(seed)
+        n_mask = max(1, int(round(self.num_patches * float(mask_ratio))))
+        n_mask = min(n_mask, self.num_patches - 1)
+        losses = []
+        for epoch in range(epochs):
+            total = 0.0
+            for img in images:
+                targets = []
+                for r in range(self.grid[0]):
+                    for cc in range(self.grid[1]):
+                        vec = []
+                        for ch in range(c):
+                            for a in range(ps):
+                                vec.extend(
+                                    img[ch][r * ps + a][cc * ps:(cc + 1) * ps])
+                        targets.append(vec)
+                patches = self.patch_embed.forward(img)
+                order = list(range(self.num_patches))
+                rng.shuffle(order)
+                masked = sorted(order[:n_mask])
+                visible = sorted(order[n_mask:])
+                seq = [list(self.cls)]
+                for i in visible:
+                    seq.append([patches[i][j] + self.pos[i + 1][j]
+                                for j in range(self.d_model)])
+                self.zero_grad()
+                enc = self.encoder.forward(seq)
+                latent = enc[0]
+                dec_inputs = []
+                for t in masked:
+                    dec_inputs.append(
+                        [latent[j] + self.pos[t + 1][j]
+                         for j in range(self.d_model)])
+                h1, cache1 = _dense_rows_forward(dec1, dec_inputs)
+                preds, cache2 = _dense_rows_forward(dec2, h1)
+                d_preds = []
+                loss = 0.0
+                for idx, t in enumerate(masked):
+                    tgt = targets[t]
+                    diff = [preds[idx][j] - tgt[j] for j in range(patch_dim)]
+                    loss += sum(v * v for v in diff)
+                    d_preds.append(
+                        [2.0 * diff[j] / (patch_dim * n_mask)
+                         for j in range(patch_dim)])
+                loss /= (patch_dim * n_mask)
+                gw2, gb2, d_h1 = _dense_rows_backward(dec2, cache2, d_preds)
+                gw1, gb1, d_latent = _dense_rows_backward(dec1, cache1, d_h1)
+                d_latent_total = [sum(d_latent[k][j] for k in range(n_mask))
+                                  for j in range(self.d_model)]
+                dseq = [[0.0] * self.d_model for _ in range(len(seq))]
+                dseq[0] = d_latent_total
+                self.encoder.backward(dseq)
+                self.encoder.sgd_step(lr)
+                _dense_apply_sgd(dec1, (gw1, gb1), lr)
+                _dense_apply_sgd(dec2, (gw2, gb2), lr)
+                total += loss
+            losses.append(total / len(images))
+            if verbose:
+                print(f"  [ViT 预训练] epoch {epoch + 1}/{epochs} "
+                      f"recon {losses[-1]:.6f}")
+        return losses
+
 
 class UNet:
     """U-Net（简化版，2 级下采样）：编码 → 瓶颈 → 解码 + 跳跃连接
