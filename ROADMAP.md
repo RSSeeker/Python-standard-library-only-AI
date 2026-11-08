@@ -719,7 +719,14 @@
   `mscale = 0.1*ln(rope_factor)+1` 乘到 softmax 分数，反向同步乘；默认 1.0 与旧版逐位
   一致，显式 `yarn_mscale=` 可覆盖）；测试 `TestYarnMscale` 5 例
 
-全量测试：1839 → 1890 passed（新增 51 例）。
+- [x] Swin 的 attention mask：移位窗口按原始窗口归属生成 0/-inf 加性 mask
+  （`_win_attention_masks`），`_win_attn_forward` 支持可选 mask；`SwinBlock` 在
+  `shift>0` 时自动启用，跨窗口 token 不再互相关注
+- [x] Swin 的 patch merging：`PatchMerging`（2×2 相邻 token 拼接 → `LayerNorm(4C)` →
+  线性降到 `2C`）；`SwinTransformer` 新增 `depths` 参数，多 stage 时自动在 stage 间
+  插入 `PatchMerging`（层级式 Swin）；测试 `TestSwinMaskAndPatchMerging` 6 例
+
+全量测试：1839 → 1896 passed（新增 57 例）。
 
 ---
 

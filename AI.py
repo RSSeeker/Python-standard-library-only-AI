@@ -6947,16 +6947,46 @@ def _win_partition(gh, gw, ws, shift):
     return perm, windows
 
 
-def _win_attn_forward(q, k, v, windows, num_heads, d_model):
+def _win_attention_masks(gh, gw, ws, perm, windows):
+    """按原始窗口归属生成每个窗口的加性 attention mask（0 / -inf）。
+
+    `perm[pos]` 是 rolled 网格第 pos 个位置对应的原始下标；原始下标属于哪个
+    原始窗口由 `(row // ws, col // ws)` 决定。同一原始窗口内的 token 可以互相关注，
+    不同原始窗口之间被 mask 掉（避免移位窗口把跨边界的 token 混进来）。
+    """
+    n_win_cols = gw // ws
+    regions = []
+    for pos in range(gh * gw):
+        orig = perm[pos]
+        orow, ocol = divmod(orig, gw)
+        regions.append((orow // ws) * n_win_cols + (ocol // ws))
+    masks = []
+    for idx in windows:
+        n = len(idx)
+        row = []
+        for i in range(n):
+            ri = regions[idx[i]]
+            row.append([0.0 if ri == regions[idx[j]] else -math.inf
+                        for j in range(n)])
+        masks.append(row)
+    return masks
+
+
+def _win_attn_forward(q, k, v, windows, num_heads, d_model, masks=None):
     """窗口内的缩放点积注意力；q/k/v 已按 rolled 顺序给好。
 
-    返回 (ctx, cache)；cache 存每个窗口的 softmax 概率，反向直接用。
+    `masks` 为 None 或与 windows 等长的列表，每项是 n×n 的加性 mask
+    （0 或 -inf），softmax 前加到 logits 上。返回 (ctx, cache)；
+    cache 存每个窗口的 softmax 概率（被 mask 的位置概率恰为 0），反向直接用。
     """
     dk = d_model // num_heads
     scale = 1.0 / math.sqrt(dk)
+    if masks is not None and len(masks) != len(windows):
+        raise ValueError(
+            f"_win_attn_forward: masks 长度 {len(masks)} 与窗口数 {len(windows)} 不一致")
     ctx = [[0.0] * d_model for _ in range(len(q))]
     cache = []
-    for idx in windows:
+    for wi, idx in enumerate(windows):
         n = len(idx)
         probs_win = []
         for hh in range(num_heads):
@@ -6964,10 +6994,14 @@ def _win_attn_forward(q, k, v, windows, num_heads, d_model):
             for i in range(n):
                 ii = idx[i]
                 qi = q[ii][lo:lo + dk]
+                row_mask = masks[wi][i] if masks is not None else None
                 logits = []
                 for j in range(n):
                     kj = k[idx[j]][lo:lo + dk]
-                    logits.append(sum(map(_mul, qi, kj)) * scale)
+                    t = sum(map(_mul, qi, kj)) * scale
+                    if row_mask is not None:
+                        t += row_mask[j]
+                    logits.append(t)
                 mx = max(logits)
                 ex = [math.exp(t - mx) for t in logits]
                 s = sum(ex)
@@ -7073,13 +7107,15 @@ class SwinBlock:
             raise ValueError(
                 f"SwinBlock.forward: 网格 {(gh, gw)} 必须能被 window_size={ws} 整除")
         perm, windows = _win_partition(gh, gw, ws, self.shift)
+        masks = (_win_attention_masks(gh, gw, ws, perm, windows)
+                 if self.shift else None)
         rolled = [tokens[i] for i in perm]
         a, ln1_cache = _norm_rows_forward(self.ln1, rolled)
         q, qc = _dense_rows_forward(self.q, a)
         k, kc = _dense_rows_forward(self.k, a)
         v, vc = _dense_rows_forward(self.v, a)
         ctx, attn_cache = _win_attn_forward(q, k, v, windows, self.num_heads,
-                                            self.d_model)
+                                            self.d_model, masks)
         o, oc = _dense_rows_forward(self.o, ctx)
         merged = [[rolled[t][c] + o[t][c] for c in range(self.d_model)]
                   for t in range(len(rolled))]
@@ -7164,16 +7200,119 @@ class SwinBlock:
         _norm_apply_adam(self.ln2, self.norm_grads["ln2"], lr, beta1, beta2, eps)
 
 
-class SwinTransformer:
-    """简化版 Swin：PatchEmbedding → 交替（普通 / 移位）窗口块 → 全局均值池化 → 线性头
+class PatchMerging:
+    """Swin 的 patch merging：2×2 邻块拼接 → LayerNorm → 线性降到一半通道
 
-    **简化点**（与论文的差异，见 README）：单 stage、无 patch merging；
-    移位窗口用循环 roll 实现且**不加 attention mask**，所以跨窗口边界的信息会混进来。
+    forward 输入 tokens（长度 gh*gw、维度 C），把 2×2 邻块拼成 4C 维，再线性
+    降到 2C；输出网格 (gh/2, gw/2)。backward 反推回原 tokens。
+    """
+
+    def __init__(self, in_channels, eps=1e-5):
+        if isinstance(in_channels, bool) or not isinstance(in_channels, int) \
+                or in_channels < 1:
+            raise ValueError(
+                f"PatchMerging: in_channels 必须是正整数，收到 {in_channels!r}")
+        self.in_channels = in_channels
+        self.out_channels = 2 * in_channels
+        self.norm = LayerNorm(4 * in_channels, eps)
+        self.reduction = Layer(4 * in_channels, 2 * in_channels, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        d = 4 * self.in_channels
+        self.norm_grads = ([0.0] * d, [0.0] * d)
+        self.reduction_grads = _layer_zero_grads(self.reduction)
+
+    def forward(self, tokens, gh, gw):
+        if not isinstance(gh, int) or not isinstance(gw, int) or gh < 1 or gw < 1:
+            raise ValueError(f"PatchMerging.forward: 网格 ({gh!r}, {gw!r}) 非法")
+        if len(tokens) != gh * gw:
+            raise ValueError(
+                f"PatchMerging.forward: token 数 {len(tokens)} 与网格 "
+                f"{(gh, gw)} 不一致")
+        for t in tokens:
+            if len(t) != self.in_channels:
+                raise ValueError(
+                    f"PatchMerging.forward: token 维度 {len(t)} 与 "
+                    f"in_channels={self.in_channels} 不一致")
+        if gh % 2 or gw % 2:
+            raise ValueError(
+                f"PatchMerging.forward: 网格 {(gh, gw)} 必须都是偶数才能 2×2 合并")
+        c = self.in_channels
+        rows = []
+        for r in range(gh // 2):
+            for cc in range(gw // 2):
+                base = (2 * r) * gw + 2 * cc
+                idx4 = [base, base + 1, base + gw, base + gw + 1]
+                rows.append([v for i in idx4 for v in tokens[i]])
+        normed, norm_cache = _norm_rows_forward(self.norm, rows)
+        out, dense_cache = _dense_rows_forward(self.reduction, normed)
+        self._cache = (tokens, gh, gw, norm_cache, dense_cache)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("PatchMerging.backward: 必须先调用 forward()")
+        tokens, gh, gw, norm_cache, dense_cache = self._cache
+        if len(dout) != (gh // 2) * (gw // 2):
+            raise ValueError(
+                f"PatchMerging.backward: 梯度 token 数 {len(dout)} 与输出网格 "
+                f"{(gh // 2, gw // 2)} 不一致")
+        gw_, gb_, d_normed = _dense_rows_backward(self.reduction, dense_cache, dout)
+        _layer_add_grads(self.reduction_grads, (gw_, gb_))
+        ggn, gbn, d_rows = _norm_rows_backward(self.norm, norm_cache, d_normed)
+        for c in range(4 * self.in_channels):
+            self.norm_grads[0][c] += ggn[c]
+            self.norm_grads[1][c] += gbn[c]
+        c = self.in_channels
+        d_tokens = [[0.0] * c for _ in range(len(tokens))]
+        oi = 0
+        for r in range(gh // 2):
+            for cc in range(gw // 2):
+                base = (2 * r) * gw + 2 * cc
+                idx4 = [base, base + 1, base + gw, base + gw + 1]
+                drow = d_rows[oi]
+                for k, ti in enumerate(idx4):
+                    dt = d_tokens[ti]
+                    for ch in range(c):
+                        dt[ch] += drow[k * c + ch]
+                oi += 1
+        return d_tokens
+
+    def param_count(self):
+        return (_norm_param_count(self.norm)
+                + _dense_param_count(self.reduction))
+
+    def train(self):
+        pass
+
+    def eval(self):
+        pass
+
+    def sgd_step(self, lr):
+        _norm_apply_sgd(self.norm, self.norm_grads, lr)
+        _dense_apply_sgd(self.reduction, self.reduction_grads, lr)
+
+    def adam_step(self, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
+        _dense_apply_adam(self.reduction, self.reduction_grads, lr,
+                          beta1, beta2, eps)
+
+
+class SwinTransformer:
+    """Swin Transformer：PatchEmbedding → 多 stage 窗口注意力 → 池化 → 线性头
+
+    - 每个 stage 交替「普通窗口 / 移位窗口」块（`shift = window_size // 2`）；
+    - 移位窗口注意力按原始窗口归属加 attention mask（`_win_attention_masks`），
+      避免跨窗口信息混入；
+    - `depths` 给出多个 stage 的深度时，stage 之间用 `PatchMerging` 做 2×2
+      下采样并把通道翻倍（层级式 Swin）；只给一个深度时就是单 stage 版本。
     """
 
     def __init__(self, in_channels=3, image_size=8, patch_size=4, d_model=16,
                  num_heads=4, d_ff=32, num_layers=2, window_size=2,
-                 num_classes=10, eps=1e-5):
+                 num_classes=10, eps=1e-5, depths=None):
         for name, v in (("in_channels", in_channels), ("patch_size", patch_size),
                         ("d_model", d_model), ("num_heads", num_heads),
                         ("d_ff", d_ff), ("num_layers", num_layers),
@@ -7182,6 +7321,17 @@ class SwinTransformer:
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise ValueError(
                     f"SwinTransformer: {name} 必须是正整数，收到 {v!r}")
+        if depths is None:
+            depths = (num_layers,)
+        else:
+            if not isinstance(depths, (tuple, list)) or not depths:
+                raise ValueError(
+                    f"SwinTransformer: depths 必须是非空 tuple/list，收到 {depths!r}")
+            for v in depths:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                    raise ValueError(
+                        f"SwinTransformer: depths 的元素必须是正整数，收到 {v!r}")
+            depths = tuple(depths)
         if isinstance(image_size, int):
             size = (image_size, image_size)
         else:
@@ -7209,23 +7359,51 @@ class SwinTransformer:
         self.num_layers = num_layers
         self.window_size = window_size
         self.num_classes = num_classes
+        self.depths = depths
         self.grid = (gh, gw)
+        self.stage_grids = []
+        self.stages = []
+        self.merges = []
+        grid = (gh, gw)
+        dim = d_model
+        for si, depth in enumerate(depths):
+            if grid[0] % window_size or grid[1] % window_size:
+                raise ValueError(
+                    f"SwinTransformer: 第 {si} 个 stage 的网格 {grid} 必须能被 "
+                    f"window_size={window_size} 整除")
+            self.stage_grids.append(grid)
+            blocks = []
+            for i in range(depth):
+                shift = 0 if i % 2 == 0 else window_size // 2
+                blocks.append(
+                    SwinBlock(dim, num_heads, d_ff, window_size, shift, eps))
+            self.stages.append(blocks)
+            if si < len(depths) - 1:
+                if grid[0] % 2 or grid[1] % 2:
+                    raise ValueError(
+                        f"SwinTransformer: 第 {si} 个 stage 的网格 {grid} 必须"
+                        f"都是偶数才能做 patch merging")
+                self.merges.append(PatchMerging(dim, eps))
+                grid = (grid[0] // 2, grid[1] // 2)
+                dim *= 2
+        self.d_model_final = dim
         self.patch_embed = PatchEmbedding(in_channels, patch_size, d_model)
-        self.blocks = []
-        for i in range(num_layers):
-            shift = 0 if i % 2 == 0 else window_size // 2
-            self.blocks.append(
-                SwinBlock(d_model, num_heads, d_ff, window_size, shift, eps))
-        self.norm = LayerNorm(d_model, eps)
-        self.head = Layer(d_model, num_classes, "linear")
+        self.norm = LayerNorm(dim, eps)
+        self.head = Layer(dim, num_classes, "linear")
+        # 兼容旧接口：blocks 指第一个 stage 的块
+        self.blocks = self.stages[0]
         self._cache = None
         self.zero_grad()
 
     def zero_grad(self):
-        self.norm_grads = ([0.0] * self.d_model, [0.0] * self.d_model)
+        self.norm_grads = ([0.0] * self.d_model_final,
+                           [0.0] * self.d_model_final)
         self.head_grads = _layer_zero_grads(self.head)
-        for blk in self.blocks:
-            blk.zero_grad()
+        for blocks in self.stages:
+            for blk in blocks:
+                blk.zero_grad()
+        for mg in self.merges:
+            mg.zero_grad()
         self.patch_embed.zero_grad()
 
     def forward(self, x):
@@ -7238,13 +7416,16 @@ class SwinTransformer:
                 f"SwinTransformer.forward: 输入尺寸 {(len(x[0]), len(x[0][0]))} "
                 f"与 image_size={self.image_size} 不符")
         tokens = self.patch_embed.forward(x)
-        gh, gw = self.grid
-        for blk in self.blocks:
-            tokens = blk.forward(tokens, gh, gw)
+        for si, blocks in enumerate(self.stages):
+            gh, gw = self.stage_grids[si]
+            for blk in blocks:
+                tokens = blk.forward(tokens, gh, gw)
+            if si < len(self.merges):
+                tokens = self.merges[si].forward(tokens, gh, gw)
         normed, norm_cache = _norm_rows_forward(self.norm, tokens)
         n = len(normed)
         pooled = [sum(normed[t][c] for t in range(n)) / n
-                  for c in range(self.d_model)]
+                  for c in range(self.d_model_final)]
         logits = self.head.forward(pooled)
         self._cache = (tokens, n, norm_cache)
         return logits
@@ -7259,23 +7440,28 @@ class SwinTransformer:
         tokens, n, norm_cache = self._cache
         gw, gb, dpooled = self.head.backward(dlogits)
         _layer_add_grads(self.head_grads, (gw, gb))
-        dnormed = [[dpooled[c] / n for c in range(self.d_model)]
+        dnormed = [[dpooled[c] / n for c in range(self.d_model_final)]
                    for _ in range(n)]
         ggn, gbn, dtokens = _norm_rows_backward(self.norm, norm_cache, dnormed)
-        for c in range(self.d_model):
+        for c in range(self.d_model_final):
             self.norm_grads[0][c] += ggn[c]
             self.norm_grads[1][c] += gbn[c]
-        gh, gw = self.grid
-        for blk in reversed(self.blocks):
-            dtokens = blk.backward(dtokens)
+        for si in reversed(range(len(self.stages))):
+            for blk in reversed(self.stages[si]):
+                dtokens = blk.backward(dtokens)
+            if si > 0:
+                dtokens = self.merges[si - 1].backward(dtokens)
         return self.patch_embed.backward(dtokens)
 
     def param_count(self):
         total = (self.patch_embed.param_count()
                  + _dense_param_count(self.head)
                  + _norm_param_count(self.norm))
-        for blk in self.blocks:
-            total += blk.param_count()
+        for mg in self.merges:
+            total += mg.param_count()
+        for blocks in self.stages:
+            for blk in blocks:
+                total += blk.param_count()
         return total
 
     def train(self):
@@ -7288,8 +7474,11 @@ class SwinTransformer:
         if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
             raise ValueError(f"SwinTransformer.sgd_step: lr 必须是非负数，收到 {lr!r}")
         self.patch_embed.sgd_step(lr)
-        for blk in self.blocks:
-            blk.sgd_step(lr)
+        for blocks in self.stages:
+            for blk in blocks:
+                blk.sgd_step(lr)
+        for mg in self.merges:
+            mg.sgd_step(lr)
         _dense_apply_sgd(self.head, self.head_grads, lr)
         _norm_apply_sgd(self.norm, self.norm_grads, lr)
 
@@ -7297,8 +7486,11 @@ class SwinTransformer:
         if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
             raise ValueError(f"SwinTransformer.adam_step: lr 必须是非负数，收到 {lr!r}")
         self.patch_embed.adam_step(lr, beta1, beta2, eps)
-        for blk in self.blocks:
-            blk.adam_step(lr, beta1, beta2, eps)
+        for blocks in self.stages:
+            for blk in blocks:
+                blk.adam_step(lr, beta1, beta2, eps)
+        for mg in self.merges:
+            mg.adam_step(lr, beta1, beta2, eps)
         _dense_apply_adam(self.head, self.head_grads, lr, beta1, beta2, eps)
         _norm_apply_adam(self.norm, self.norm_grads, lr, beta1, beta2, eps)
 

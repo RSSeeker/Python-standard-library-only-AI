@@ -28659,3 +28659,133 @@ class TestYarnMscale:
         for t in range(len(seq)):
             row = m.forward_step(seq[t], cache)
             assert max(abs(a - b) for a, b in zip(row, full[t])) < 1e-9
+
+
+class TestSwinMaskAndPatchMerging:
+    """Swin 的 attention mask（移位窗口）与 patch merging（层级下采样）"""
+
+    def _raises(self, fn, exc):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def test_attention_masks_structure(self):
+        perm, windows = AI._win_partition(4, 4, 2, 1)
+        masks = AI._win_attention_masks(4, 4, 2, perm, windows)
+        assert len(masks) == len(windows) == 4
+        for m in masks:
+            assert len(m) == 4 and all(len(r) == 4 for r in m)
+            for i, row in enumerate(m):
+                assert row[i] == 0.0
+                for v in row:
+                    assert v in (0.0, -math.inf)
+        # 窗口 0 的 4 个 rolled 位置分别来自 4 个不同原始窗口 → 除对角外全被 mask
+        assert masks[0][0][1] == -math.inf
+        assert masks[0][1][0] == -math.inf
+        n_inf = sum(1 for m in masks for r in m for v in r if v == -math.inf)
+        assert n_inf == 4 * 12
+
+    def test_shifted_block_mask_isolates_windows(self):
+        random.seed(0)
+        blk = AI.SwinBlock(4, 2, 8, 2, shift=1)
+        tokens = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(16)]
+        out = blk.forward(tokens, 4, 4)
+        assert len(out) == 16 and len(out[0]) == 4
+        dx = blk.backward([[0.1] * 4 for _ in range(16)])
+        assert len(dx) == 16 and len(dx[0]) == 4
+        assert all(abs(v) < 1e9 for r in dx for v in r)
+        tokens2 = [r[:] for r in tokens]
+        tokens2[0] = [v + 0.3 for v in tokens2[0]]
+        out2 = blk.forward(tokens2, 4, 4)
+        # token 0（原 (0,0)，区域 0）与 token 15（原 (3,3)，区域 3）不同原始窗口，
+        # 移位窗口里同处一个 rolled 窗口但被 mask 隔开 → token 15 的输出不受影响
+        assert out2[15] == out[15]
+        assert out2[0] != out[0]
+
+    def test_patch_merging_forward_backward(self):
+        random.seed(1)
+        pm = AI.PatchMerging(4)
+        tokens = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(16)]
+        merged = pm.forward(tokens, 4, 4)
+        assert len(merged) == 4 and len(merged[0]) == 8
+        assert pm.param_count() == 32 + (8 * 16 + 8)
+        dmerge = [[0.0] * 8 for _ in range(4)]
+        dmerge[0] = [0.3] * 8
+        dt = pm.backward(dmerge)
+        assert len(dt) == 16 and len(dt[0]) == 4
+        assert all(abs(v) < 1e9 for r in dt for v in r)
+        # reduction 权重的解析梯度 vs 中心差分
+        pm.zero_grad()
+        pm.forward(tokens, 4, 4)
+        pm.backward(dmerge)
+        eps = 1e-5
+        w = pm.reduction.weights[1][2]
+        old = w
+        pm.reduction.weights[1][2] = old + eps
+        lp = sum(c * v for c, v in zip([0.3] * 8, pm.forward(tokens, 4, 4)[0]))
+        pm.reduction.weights[1][2] = old - eps
+        lm = sum(c * v for c, v in zip([0.3] * 8, pm.forward(tokens, 4, 4)[0]))
+        pm.reduction.weights[1][2] = old
+        num = (lp - lm) / (2 * eps)
+        ana = pm.reduction_grads[0][1][2]
+        assert abs(ana - num) < 1e-5
+
+    def test_patch_merging_invalid_inputs(self):
+        assert self._raises(lambda: AI.PatchMerging(0), ValueError)
+        pm = AI.PatchMerging(4)
+        tokens = [[0.0] * 4 for _ in range(9)]
+        assert self._raises(lambda: pm.forward(tokens, 3, 3), ValueError)
+        assert self._raises(lambda: pm.forward([[0.0] * 3] * 16, 4, 4), ValueError)
+        assert self._raises(lambda: pm.forward(tokens, 4, 4), ValueError)
+        assert self._raises(lambda: pm.backward([[0.0] * 8] * 4), RuntimeError)
+
+    def test_hierarchical_swin(self):
+        random.seed(2)
+        h = AI.SwinTransformer(in_channels=1, image_size=16, patch_size=4,
+                               d_model=4, num_heads=2, d_ff=8, num_layers=1,
+                               window_size=2, num_classes=3, depths=(1, 1))
+        assert h.stage_grids == [(4, 4), (2, 2)]
+        assert len(h.merges) == 1 and len(h.stages) == 2
+        img = [[[0.1 * a - 0.2 * b for b in range(16)] for a in range(16)]]
+        logits = h.forward(img)
+        assert len(logits) == 3
+        assert h.param_count() > 0
+        dx = h.backward([1.0, -0.5, 0.25])
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 16, 16)
+        # 输入梯度中心差分
+        coef = [1.0, -0.5, 0.25]
+        eps = 1e-5
+        img2 = [r[:] for r in img[0]]
+        h.zero_grad()
+        h.forward(img)
+        dx = h.backward(coef)
+        oldv = img2[3][5]
+        img2[3][5] = oldv + eps
+        lp = sum(c * o for c, o in zip(coef, h.forward([img2])))
+        img2[3][5] = oldv - eps
+        lm = sum(c * o for c, o in zip(coef, h.forward([img2])))
+        img2[3][5] = oldv
+        num = (lp - lm) / (2 * eps)
+        ana = dx[0][3][5]
+        assert abs(ana - num) / max(1.0, abs(num), abs(ana)) < 1e-5
+        # 3 个 stage 在 4×4 网格上不够分 → 构造期报错
+        assert self._raises(
+            lambda: AI.SwinTransformer(in_channels=1, image_size=16,
+                                       patch_size=4, d_model=4, num_heads=2,
+                                       d_ff=8, window_size=2, depths=(1, 1, 1)),
+            ValueError)
+
+    def test_default_swin_compat(self):
+        m = AI.SwinTransformer(in_channels=1, image_size=8, patch_size=4,
+                               d_model=8, num_heads=2, d_ff=12, num_layers=2,
+                               window_size=2, num_classes=3)
+        assert m.param_count() == 1243
+        assert m.blocks is m.stages[0] and len(m.merges) == 0
+        img = [[[0.1 * a - 0.05 * b for b in range(8)] for a in range(8)]]
+        assert len(m.forward(img)) == 3
+        dx = m.backward([1.0, -0.5, 0.25])
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (1, 8, 8)
