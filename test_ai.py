@@ -31289,3 +31289,87 @@ class TestAudioMetrics:
         _audio_raises(lambda: AI.pesq_score(clean, clean, n_bands=0))
         _audio_raises(lambda: AI.pesq_score(clean, clean, fmax=0.0))
         _audio_raises(lambda: AI.pesq_score([1.0, None] * 200, clean), exc=TypeError)
+
+
+def _vis_img(seed=1, h=8, w=8, c=1):
+    import random as _random
+    rng = _random.Random(seed)
+    return [[[rng.random() for _ in range(w)] for _ in range(h)] for _ in range(c)]
+
+
+def _vis_noise(img, scale, seed):
+    import random as _random
+    rng = _random.Random(seed)
+    return [[[v + scale * rng.gauss(0.0, 1.0) for v in row] for row in ch] for ch in img]
+
+
+def _vis_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # noqa: BLE001
+        raise AssertionError("抛出了非预期异常: %r" % (other,))
+    raise AssertionError("预期抛出 %s，但没有报错" % exc.__name__)
+
+
+class TestVisualMetrics:
+    def test_lpips_monotonic(self):
+        base = _vis_img(1)
+        assert AI.lpips_lite(base, base) == 0.0
+        mild = _vis_noise(base, 0.05, 3)
+        strong = _vis_noise(base, 0.4, 3)
+        quite_different = _vis_img(9)
+        d_mild = AI.lpips_lite(base, mild)
+        d_strong = AI.lpips_lite(base, strong)
+        assert 0.0 < d_mild < d_strong
+        assert AI.lpips_lite(base, quite_different) > d_mild
+
+    def test_lpips_multichannel_and_weights(self):
+        rgb_a = _vis_img(2, c=3)
+        rgb_b = _vis_img(3, c=3)
+        assert AI.lpips_lite(rgb_a, rgb_a) == 0.0
+        assert AI.lpips_lite(rgb_a, rgb_b) > 0.0
+        d_default = AI.lpips_lite(rgb_a, rgb_b)
+        d_custom = AI.lpips_lite(rgb_a, rgb_b, scales=(1, 2), weights=(0.75, 0.25))
+        assert d_custom != d_default
+
+    def test_fvd_lite(self):
+        frames = [_vis_img(100 + i) for i in range(6)]
+        other = [_vis_img(200 + i) for i in range(6)]
+        assert AI.fvd_lite(frames, frames) == 0.0
+        assert AI.fvd_lite(frames, other) > 0.0
+        # 自定义 embed_fn：每帧均值作为 1 维特征（需要至少 2 帧）
+        def mean_embed(frame):
+            vals = [v for ch in frame for row in ch for v in row]
+            return [sum(vals) / len(vals)]
+
+        assert AI.fvd_lite(frames, frames, embed_fn=mean_embed) == 0.0
+        assert AI.fvd_lite(frames, other, embed_fn=mean_embed) >= 0.0
+
+    def test_lpips_invalid_inputs(self):
+        good = _vis_img(1)
+        _vis_raises(lambda: AI.lpips_lite("bad", good))
+        _vis_raises(lambda: AI.lpips_lite([], good))
+        _vis_raises(lambda: AI.lpips_lite([[[]]], good))
+        ragged = [[[1.0, 2.0], [3.0]]]
+        _vis_raises(lambda: AI.lpips_lite(ragged, ragged))
+        _vis_raises(lambda: AI.lpips_lite(good, _vis_img(2, h=4)))
+        _vis_raises(lambda: AI.lpips_lite(good, good, scales=()))
+        _vis_raises(lambda: AI.lpips_lite(good, good, scales=(0,)))
+        _vis_raises(lambda: AI.lpips_lite(good, good, scales=(1, 2), weights=(1.0,)))
+        _vis_raises(lambda: AI.lpips_lite(good, good, scales=(1, 2), weights=(0.0, 0.0)))
+        _vis_raises(lambda: AI.lpips_lite([[[True]]], [[[1.0]]]), exc=TypeError)
+        _vis_raises(lambda: AI.lpips_lite([[[float("inf")]]], [[[1.0]]]))
+
+    def test_fvd_invalid_inputs(self):
+        frames = [_vis_img(100 + i) for i in range(3)]
+        _vis_raises(lambda: AI.fvd_lite("bad", frames))
+        _vis_raises(lambda: AI.fvd_lite([], frames))
+        _vis_raises(lambda: AI.fvd_lite(frames[:1], frames))
+        _vis_raises(lambda: AI.fvd_lite(frames, frames[:1]))
+        _vis_raises(lambda: AI.fvd_lite(frames, frames, embed_fn=42), exc=TypeError)
+        _vis_raises(lambda: AI.fvd_lite(frames, [[[[1.0]]]] * 3))
+        bad_dim = [[[1.0], [2.0]], [[1.0], [2.0]]]
+        _vis_raises(lambda: AI.fvd_lite(frames, bad_dim, embed_fn=lambda f: [1.0] if len(f[0]) == 1 else [1.0, 2.0]))
+        _vis_raises(lambda: AI.fvd_lite(frames, frames, embed_fn=lambda f: "xy"))

@@ -775,6 +775,8 @@
   （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
   `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
 
+- [x] 感知/视频指标：`lpips_lite`（多尺度池化 + 灰度/梯度特征距离，0 = 相同）、
+  `fvd_lite`（帧特征对角协方差的 Fréchet 距离，0 = 相同）；测试 `TestVisualMetrics` 5 例
 - [x] 音频质量指标：`stoi_score`（STOI 简化版：分帧 + 梅尔频带能量 + 包络相关）、
   `pesq_score`（PESQ 轻量代理：频带对数谱失真 + 帧能量包络相关映射到 [1,4.5]）；测试 `TestAudioMetrics` 5 例
 - [x] 文本指标扩展：`meteor_score_full`（精确/词干/同义词匹配 + 双序列连续 chunk 惩罚）、
@@ -801,7 +803,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2034 passed（新增 195 例）。
+全量测试：1839 → 2039 passed（新增 200 例）。
 
 ---
 

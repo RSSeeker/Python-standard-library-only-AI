@@ -29034,6 +29034,203 @@ def pesq_score(clean, degraded, sample_rate=16000, frame_length=256,
     score = 4.5 - 2.5 * min(1.0, math.sqrt(dist)) - 1.5 * (1.0 - env_corr)
     return max(1.0, min(4.5, score))
 
+"""感知 / 视频分布指标：LPIPS 与 FVD 的轻量代理。
+
+两者都不依赖预训练权重：
+- `lpips_lite`：多尺度下采样 + 局部梯度（相当于固定卷积特征），比较归一化后的
+  特征距离；值越小越相似，完全相同为 0。
+- `fvd_lite`：把每一帧压成低维表征，再算两组帧表征的 Fréchet 距离（用对角协方差
+  近似，避免小样本下协方差奇异）；值越小分布越接近，完全相同的两组为 0。
+"""
+
+
+def _pm_image(img, who):
+    if not isinstance(img, (list, tuple)) or not img:
+        raise ValueError("%s: 图像必须是非空的 (C,H,W) 列表" % who)
+    channels = []
+    for ch in img:
+        if not isinstance(ch, (list, tuple)) or not ch:
+            raise ValueError("%s: 每个通道必须是非空的二维列表" % who)
+        rows = []
+        width = None
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError("%s: 每行必须是非空列表" % who)
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError("%s: 同一通道内行宽必须一致" % who)
+            vals = []
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise TypeError("%s: 像素必须是数字" % who)
+                if not math.isfinite(v):
+                    raise ValueError("%s: 像素必须是有限数字" % who)
+                vals.append(float(v))
+            rows.append(vals)
+        channels.append(rows)
+    height = len(channels[0])
+    for ch in channels:
+        if len(ch) != height:
+            raise ValueError("%s: 各通道高度必须一致" % who)
+        if len(ch[0]) != len(channels[0][0]):
+            raise ValueError("%s: 各通道宽度必须一致" % who)
+    return channels
+
+
+def _pm_gray(img):
+    c = len(img)
+    h = len(img[0])
+    w = len(img[0][0])
+    out = []
+    for r in range(h):
+        row = []
+        for col in range(w):
+            row.append(sum(img[k][r][col] for k in range(c)) / c)
+        out.append(row)
+    return out
+
+
+def _pm_pool(gray, scale):
+    h = len(gray)
+    w = len(gray[0])
+    if scale <= 1:
+        return [list(row) for row in gray]
+    oh = h // scale
+    ow = w // scale
+    if oh < 1 or ow < 1:
+        raise ValueError("lpips_lite: 图像尺寸太小，无法在 scale=%d 下池化" % scale)
+    out = []
+    for r in range(oh):
+        row = []
+        for c in range(ow):
+            acc = 0.0
+            for dr in range(scale):
+                for dc in range(scale):
+                    acc += gray[r * scale + dr][c * scale + dc]
+            row.append(acc / (scale * scale))
+        out.append(row)
+    return out
+
+
+def _pm_gradient_feature(gray):
+    h = len(gray)
+    w = len(gray[0])
+    feats = []
+    for r in range(h):
+        for c in range(w):
+            gx = gray[r][c + 1] - gray[r][c] if c + 1 < w else 0.0
+            gy = gray[r + 1][c] - gray[r][c] if r + 1 < h else 0.0
+            feats.append(gray[r][c])
+            feats.append(gx)
+            feats.append(gy)
+    return feats
+
+
+def _pm_unit(vec, eps=1e-12):
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm <= eps:
+        return [0.0] * len(vec)
+    return [v / norm for v in vec]
+
+
+def lpips_lite(img_a, img_b, scales=(1, 2, 4), weights=None, eps=1e-8):
+    """LPIPS 轻量代理（越小越相似，相同图像为 0）。
+
+    特征 = 每个尺度下「平均池化后的灰度图 + 水平/垂直梯度」，特征向量逐尺度做
+    单位化后计算均方误差；默认各尺度等权。没有预训练 VGG/AlexNet 权重，
+    适合做相对比较（例如比较不同失真强度），不代表真实人类感知分数。
+    """
+    if not isinstance(scales, (list, tuple)) or not scales:
+        raise ValueError("lpips_lite: scales 必须是非空列表")
+    for s in scales:
+        if isinstance(s, bool) or not isinstance(s, int) or s < 1:
+            raise ValueError("lpips_lite: scales 中的每个值必须是 >=1 的整数")
+    a = _pm_image(img_a, "lpips_lite")
+    b = _pm_image(img_b, "lpips_lite")
+    if len(a) != len(b) or len(a[0]) != len(b[0]) or len(a[0][0]) != len(b[0][0]):
+        raise ValueError("lpips_lite: 两张图像的形状必须一致")
+    ga = _pm_gray(a)
+    gb = _pm_gray(b)
+    if weights is None:
+        w = [1.0 / len(scales)] * len(scales)
+    else:
+        if not isinstance(weights, (list, tuple)) or len(weights) != len(scales):
+            raise ValueError("lpips_lite: weights 长度必须与 scales 一致")
+        for v in weights:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                raise ValueError("lpips_lite: weights 必须是非负数字")
+        tot = sum(float(v) for v in weights)
+        if tot <= 0.0:
+            raise ValueError("lpips_lite: weights 之和必须为正")
+        w = [float(v) / tot for v in weights]
+    total = 0.0
+    for idx, scale in enumerate(scales):
+        fa = _pm_unit(_pm_gradient_feature(_pm_pool(ga, scale)), eps)
+        fb = _pm_unit(_pm_gradient_feature(_pm_pool(gb, scale)), eps)
+        dim = len(fa)
+        mse = sum((fa[i] - fb[i]) ** 2 for i in range(dim)) / dim
+        total += w[idx] * math.sqrt(mse)
+    return total
+
+
+def _fvd_embed_frame(frame):
+    gray = _pm_gray(frame)
+    return _pm_unit(_pm_gradient_feature(_pm_pool(gray, 2)))
+
+
+def fvd_lite(frames_a, frames_b, embed_fn=None, eps=1e-10):
+    """FVD 轻量代理（越小分布越接近，完全相同为 0）。
+
+    `embed_fn(frame)` 把单帧 (C,H,W) 映射为特征向量；默认用 1/2 池化后的梯度特征。
+    用对角协方差近似 Fréchet 距离：
+    `sqrt(||μa-μb||² + Σ_i (σa_i - σb_i)²)`，不需要矩阵平方根，小样本也稳定。
+    不是真正的 FVD（没有 I3D 视频特征，也没有完整协方差），只用于相对比较。
+    """
+    if not isinstance(frames_a, (list, tuple)) or not frames_a:
+        raise ValueError("fvd_lite: frames_a 必须是非空帧列表")
+    if not isinstance(frames_b, (list, tuple)) or not frames_b:
+        raise ValueError("fvd_lite: frames_b 必须是非空帧列表")
+    if embed_fn is None:
+        embed_fn = _fvd_embed_frame
+    elif not callable(embed_fn):
+        raise TypeError("fvd_lite: embed_fn 必须可调用")
+
+    def _features(frames, who):
+        out = []
+        for i, fr in enumerate(frames):
+            f = embed_fn(fr)
+            if not isinstance(f, (list, tuple)) or not f:
+                raise ValueError("%s: 第 %d 帧的特征必须是非空列表" % (who, i))
+            vec = []
+            for v in f:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise TypeError("%s: 特征必须是数字" % who)
+                if not math.isfinite(v):
+                    raise ValueError("%s: 特征必须是有限数字" % who)
+                vec.append(float(v))
+            out.append(vec)
+        if len(out) < 2:
+            raise ValueError("%s: 至少需要 2 帧才能估计分布" % who)
+        dim = len(out[0])
+        for vec in out:
+            if len(vec) != dim:
+                raise ValueError("%s: 所有帧的特征维度必须一致" % who)
+        return out
+
+    fa = _features(frames_a, "fvd_lite frames_a")
+    fb = _features(frames_b, "fvd_lite frames_b")
+    if len(fa[0]) != len(fb[0]):
+        raise ValueError("fvd_lite: 两组帧的特征维度必须一致")
+    dim = len(fa[0])
+    mu_a = [sum(fa[t][i] for t in range(len(fa))) / len(fa) for i in range(dim)]
+    mu_b = [sum(fb[t][i] for t in range(len(fb))) / len(fb) for i in range(dim)]
+    var_a = [sum((fa[t][i] - mu_a[i]) ** 2 for t in range(len(fa))) / len(fa) for i in range(dim)]
+    var_b = [sum((fb[t][i] - mu_b[i]) ** 2 for t in range(len(fb))) / len(fb) for i in range(dim)]
+    mean_term = sum((mu_a[i] - mu_b[i]) ** 2 for i in range(dim))
+    var_term = sum((math.sqrt(var_a[i] + eps) - math.sqrt(var_b[i] + eps)) ** 2 for i in range(dim))
+    return math.sqrt(max(0.0, mean_term + var_term))
+
 #  ======================================================================
 #  降维 / 不平衡采样 / 特征选择
 #  ======================================================================
