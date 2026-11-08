@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1912 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1917 项）
 
 ## 特性
 
@@ -1348,6 +1348,9 @@ print(AI.coverage_at_k([[0.9, 0.1], [0.1, 0.9]], 1))  # 1.0
 | `frequency_weighted_iou(...)` | 按真实像素频率加权的 IoU，权重只在联合集非空的类上归一化 |
 | `boundary_f1(y_true, y_pred, tolerance=2.0, ignore_index=None)` | 边界 F1：预测边界点在 `tolerance` 像素内命中真实边界的 P/R 调和均值 |
 | `hd95(y_true, y_pred, ignore_index=None)` | 双向最近距离合并后的第 95 百分位（像素单位） |
+| `assd_score(y_true, y_pred, ignore_index=None)` | ASSD：两组边界像素双向最近邻距离的平均（平均对称表面距离，像素单位；一侧无边界抛 `ValueError`） |
+| `nsd_score(y_true, y_pred, tolerance=1.0, ignore_index=None)` | NSD：两组边界像素在 `tolerance` 内互相命中的比例平均（归一化表面距离；两侧都无边界返回 1.0，一侧无边界返回 0.0） |
+| `surface_dice(y_true, y_pred, tolerance=1.0, ignore_index=None)` | Surface Dice：`nsd_score` 的别名 |
 
 ```python
 gt = [[0, 0, 1, 1] for _ in range(4)]
@@ -1498,6 +1501,7 @@ conformal 是 split-conformal，`q` 由校准集分数用 `conformal_quantile` �
 | `mean_average_precision(gt, preds, iou_threshold=0.5)` | 多类 mAP（各类 AP 的宏平均） |
 | `mean_average_precision_range(gt, preds, thresholds=None)` | mAP@[.5:.95]，默认 10 档 |
 | `average_recall(gt, preds, iou_threshold=0.5, max_dets=100)` | AR（按 max_dets 截断） |
+| `mota_motp_idf1(gt_frames, pred_frames, iou_threshold=0.5)` | MOTA/MOTP/IDF1：逐帧 IoU 贪心匹配，帧内 `{'boxes','ids'}`；MOTA = 1-(FN+FP+IDSW)/GT，MOTP = 匹配框平均 IoU，IDF1 用 gt/pred id 共现矩阵贪心二分匹配（全局 id 对应） |
 
 ```python
 gt = [{"boxes": [[0, 0, 10, 10]], "labels": [0]}]
@@ -3362,7 +3366,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1912 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1917 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3434,6 +3438,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestBootstrapCohensTemperature` | bootstrap CI 包含均值/自定义统计量/非法参数；Cohen's d 已知值、相同与零方差；温度缩放的欠自信锐化、过自信平滑、对称样本平坦与非法输入 |
 | `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
 | `TestPEFTAdapters` | QLoRA 与量化基座逐位等价、冻结基座、`merge()` 前后输出不变；VeRA 初始等基座、`d` 中心差分、`merge()` 等价、参数量；ReFT 初始等基座、`W`/`b` 中心差分、参数量；三者非法输入（类型/rank/alpha/bits/未 forward 调 backward） |
+| `TestTrackingAndSurfaceMetrics` | ASSD/NSD/Surface Dice 的手算值与边界情形；MOTA/MOTP/IDF1 的手算值、完美匹配、id 互换（全局 IDF1 不降）与跨帧合并 id、非法输入 |
 | `TestConvNeXtNetwork` | ConvNeXt 前向形状/参数量、反向输入梯度与卷积梯度非零、小样本 `fit` 收敛、5 类非法输入 |
 | `TestYarnMscale` | YaRN mscale 公式与默认 1.0 不变性、显式覆盖与 6 类非法值、缩放后前向/反向可用、增量前向与整段前向逐位一致 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
@@ -3657,7 +3662,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1912 个单元测试
+├── test_ai.py       # 1917 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

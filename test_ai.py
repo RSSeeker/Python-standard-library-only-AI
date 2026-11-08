@@ -29082,3 +29082,91 @@ class TestPEFTAdapters:
         r = AI.ReFT(self._layer(), rank=2)
         with pytest.raises(RuntimeError):
             r.backward([1.0, 1.0])
+
+
+class TestTrackingAndSurfaceMetrics:
+    def test_assd_nsd_hand_computed(self):
+        true = [[1, 1, 0],
+                [1, 1, 0],
+                [0, 0, 0]]
+        pred = [[0, 1, 1],
+                [0, 1, 1],
+                [0, 0, 0]]
+        assert abs(AI.assd_score(true, pred) - 2.0 / 7.0) < 1e-12
+        assert abs(AI.nsd_score(true, pred, tolerance=0.5) - 5.0 / 7.0) < 1e-12
+        assert AI.nsd_score(true, pred, tolerance=1.0) == 1.0
+        assert AI.surface_dice(true, pred, tolerance=1.0) == AI.nsd_score(
+            true, pred, tolerance=1.0)
+        same = [row[:] for row in true]
+        assert AI.assd_score(true, same) == 0.0
+        assert AI.nsd_score(true, same) == 1.0
+
+    def test_assd_nsd_edges(self):
+        empty = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+        pred = [[1, 0, 0], [0, 0, 0], [0, 0, 0]]
+        assert AI.assd_score(empty, empty) == 0.0
+        assert AI.nsd_score(empty, empty) == 1.0
+        with pytest.raises(ValueError):
+            AI.assd_score(empty, pred)
+        assert AI.nsd_score(empty, pred) == 0.0
+        for bad in (True, "1.0", -0.5):
+            with pytest.raises(ValueError):
+                AI.nsd_score(pred, pred, tolerance=bad)
+
+    def test_mota_motp_idf1_known_case(self):
+        gt_frames = [
+            {"boxes": [[0, 0, 2, 2], [10, 10, 12, 12]], "ids": [1, 2]},
+            {"boxes": [[0, 0, 2, 2]], "ids": [1]},
+            {"boxes": [[0, 0, 2, 2], [5, 5, 7, 7]], "ids": [1, 2]},
+        ]
+        pred_frames = [
+            {"boxes": [[0, 0, 2, 2], [10, 10, 12, 12]], "ids": [1, 2]},
+            {"boxes": [[0, 0, 2, 2]], "ids": [3]},
+            {"boxes": [[50, 50, 52, 52]], "ids": [3]},
+        ]
+        res = AI.mota_motp_idf1(gt_frames, pred_frames)
+        assert abs(res["mota"] - 0.2) < 1e-12
+        assert res["motp"] == 1.0
+        assert abs(res["idf1"] - 4.0 / 9.0) < 1e-12
+        assert (res["idtp"], res["idfp"], res["idfn"], res["idswitches"]) == (2, 2, 3, 1)
+        assert (res["gt"], res["pred"]) == (5, 4)
+
+    def test_mot_perfect_and_switched_ids(self):
+        gt = [{"boxes": [[0, 0, 2, 2], [10, 10, 12, 12]], "ids": [1, 2]}]
+        pred = [{"boxes": [[0, 0, 2, 2], [10, 10, 12, 12]], "ids": [1, 2]}]
+        res = AI.mota_motp_idf1(gt, pred)
+        assert res["mota"] == 1.0 and res["motp"] == 1.0 and res["idf1"] == 1.0
+        pred_swapped = [{"boxes": [[0, 0, 2, 2], [10, 10, 12, 12]], "ids": [2, 1]}]
+        res = AI.mota_motp_idf1(gt, pred_swapped)
+        assert res["mota"] == 0.0
+        assert res["idswitches"] == 2
+        # IDF1 是全局二分匹配：两个 id 整体互换仍可一一对应，IDF1 仍为 1
+        assert res["idf1"] == 1.0
+        # 两个 gt 轨迹被压成同一个 pred id 时 IDF1 才下降
+        gt_frames = [{"boxes": [[0, 0, 2, 2]], "ids": [1]},
+                     {"boxes": [[10, 10, 12, 12]], "ids": [2]}]
+        pred_frames = [{"boxes": [[0, 0, 2, 2]], "ids": [1]},
+                       {"boxes": [[10, 10, 12, 12]], "ids": [1]}]
+        res = AI.mota_motp_idf1(gt_frames, pred_frames)
+        assert abs(res["idf1"] - 0.5) < 1e-12
+
+    def test_mot_invalid_inputs(self):
+        gt = [{"boxes": [[0, 0, 2, 2]], "ids": [1]}]
+        pred = [{"boxes": [[0, 0, 2, 2]], "ids": [1]}]
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1([], [])
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1(gt, [])
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1(["bad"], pred)
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1([{"boxes": [[0, 0, 2, 2]], "ids": [True]}], pred)
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1([{"boxes": [[0, 0, 2, 2]], "ids": ["1"]}], pred)
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1(
+                [{"boxes": [[0, 0, 2, 2], [0, 0, 1, 1]], "ids": [1, 1]}], pred)
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1(gt, pred, iou_threshold=1.5)
+        with pytest.raises(ValueError):
+            AI.mota_motp_idf1([{"boxes": [], "ids": []}], [{"boxes": [], "ids": []}])

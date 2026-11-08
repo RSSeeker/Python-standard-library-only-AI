@@ -45974,6 +45974,146 @@ def hd95(y_true, y_pred, ignore_index=None):
     return dists[idx]
 
 
+def assd_score(y_true, y_pred, ignore_index=None):
+    """ASSD：两组边界像素双向最近邻距离的平均（平均对称表面距离，像素单位）。"""
+    who = "assd_score"
+    rows_t, rows_p, ignore_index = _seg_maps(y_true, y_pred, who, ignore_index)
+    gt = _seg_boundary(rows_t, ignore_index)
+    pd = _seg_boundary(rows_p, ignore_index)
+    if not gt and not pd:
+        return 0.0
+    if not gt or not pd:
+        raise ValueError(f"{who}: 一侧没有任何边界像素，ASSD 无定义")
+    total = sum(_seg_min_dist(q, pd) for q in gt)
+    total += sum(_seg_min_dist(q, gt) for q in pd)
+    return total / float(len(gt) + len(pd))
+
+
+def nsd_score(y_true, y_pred, tolerance=1.0, ignore_index=None):
+    """NSD：两组边界像素在 tolerance 内互相命中的比例平均（归一化表面距离）。"""
+    who = "nsd_score"
+    rows_t, rows_p, ignore_index = _seg_maps(y_true, y_pred, who, ignore_index)
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError(f"{who}: tolerance 必须是数字")
+    tolerance = float(tolerance)
+    if tolerance < 0.0 or tolerance != tolerance:
+        raise ValueError(f"{who}: tolerance 必须是有限的非负数，收到 {tolerance}")
+    gt = _seg_boundary(rows_t, ignore_index)
+    pd = _seg_boundary(rows_p, ignore_index)
+    if not gt and not pd:
+        return 1.0
+    if not gt or not pd:
+        return 0.0
+    hit_t = sum(1 for q in pd if _seg_min_dist(q, gt) <= tolerance)
+    hit_p = sum(1 for q in gt if _seg_min_dist(q, pd) <= tolerance)
+    return 0.5 * (hit_t / float(len(pd)) + hit_p / float(len(gt)))
+
+
+def surface_dice(y_true, y_pred, tolerance=1.0, ignore_index=None):
+    """Surface Dice：NSD 的别名（边界命中率平均，常与 HD95/ASSD 一起报告）。"""
+    return nsd_score(y_true, y_pred, tolerance=tolerance, ignore_index=ignore_index)
+
+
+def _mot_frame(item, who, tag):
+    if not isinstance(item, dict):
+        raise ValueError(f"{who}: {tag} 必须是 {{'boxes','ids'}} 字典")
+    boxes = item.get("boxes", [])
+    ids = item.get("ids", [])
+    if not isinstance(boxes, (list, tuple)) or not isinstance(ids, (list, tuple)):
+        raise ValueError(f"{who}: {tag} 的 boxes/ids 必须是列表")
+    if len(boxes) != len(ids):
+        raise ValueError(f"{who}: {tag} 的 boxes 有 {len(boxes)} 个、ids 有 {len(ids)} 个")
+    out_boxes = [_det_box(b, who, f"{tag}.boxes[{j}]") for j, b in enumerate(boxes)]
+    out_ids = []
+    for j, v in enumerate(ids):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"{who}: {tag}.ids[{j}] 必须是整数轨迹 id")
+        out_ids.append(v)
+    if len(set(out_ids)) != len(out_ids):
+        raise ValueError(f"{who}: {tag} 的轨迹 id 有重复")
+    return out_boxes, out_ids
+
+
+def mota_motp_idf1(gt_frames, pred_frames, iou_threshold=0.5):
+    """MOTA / MOTP / IDF1：多目标跟踪的关联指标。
+
+    每帧的 gt 是 ``{'boxes': [...], 'ids': [...]}``，pred 同形（pred 可另带
+    ``scores``，本函数不使用）。按 IoU 贪心逐帧匹配（同帧内不重复用框），
+    MOTA = 1 - (FN+FP+IDSW)/GT，MOTP = 已匹配框的平均 IoU，
+    IDF1 用「gt id × pred id」共现矩阵的贪心二分匹配求 IDTP 后
+    2·IDTP/(2·IDTP+IDFP+IDFN)。
+    """
+    who = "mota_motp_idf1"
+    if not isinstance(gt_frames, (list, tuple)) or not isinstance(pred_frames, (list, tuple)):
+        raise ValueError(f"{who}: gt_frames/pred_frames 必须都是列表")
+    if len(gt_frames) != len(pred_frames):
+        raise ValueError(f"{who}: 帧数不一致（{len(gt_frames)} vs {len(pred_frames)}）")
+    if not gt_frames:
+        raise ValueError(f"{who}: 至少要有一帧")
+    thr = _det_check_iou(iou_threshold, who)
+    n_gt = 0
+    n_pred = 0
+    n_fn = 0
+    n_fp = 0
+    n_match = 0
+    n_idsw = 0
+    iou_sum = 0.0
+    pair_counts = {}
+    for f, (gt, pred) in enumerate(zip(gt_frames, pred_frames)):
+        gb, gid = _mot_frame(gt, who, f"gt_frames[{f}]")
+        pb, pid = _mot_frame(pred, who, f"pred_frames[{f}]")
+        n_gt += len(gb)
+        n_pred += len(pb)
+        pairs = []
+        for i in range(len(gb)):
+            for j in range(len(pb)):
+                iou = box_iou(gb[i], pb[j])
+                if iou >= thr:
+                    pairs.append((iou, i, j))
+        pairs.sort(key=lambda t: (-t[0], t[1], t[2]))
+        used_g, used_p = set(), set()
+        for iou, i, j in pairs:
+            if i in used_g or j in used_p:
+                continue
+            used_g.add(i)
+            used_p.add(j)
+            n_match += 1
+            iou_sum += iou
+            if gid[i] != pid[j]:
+                n_idsw += 1
+            key = (gid[i], pid[j])
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+        n_fn += len(gb) - len(used_g)
+        n_fp += len(pb) - len(used_p)
+    if n_gt == 0:
+        raise ValueError(f"{who}: 没有任何真实框，MOTA/IDF1 无定义")
+    mota = 1.0 - (n_fn + n_fp + n_idsw) / float(n_gt)
+    motp = (iou_sum / n_match) if n_match else 0.0
+    idtp = 0
+    used_gt, used_pd = set(), set()
+    for (g, p), cnt in sorted(pair_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if g in used_gt or p in used_pd:
+            continue
+        used_gt.add(g)
+        used_pd.add(p)
+        idtp += cnt
+    idfp = n_pred - idtp
+    idfn = n_gt - idtp
+    denom = 2 * idtp + idfp + idfn
+    idf1 = (2.0 * idtp / float(denom)) if denom else 0.0
+    return {
+        "mota": mota,
+        "motp": motp,
+        "idf1": idf1,
+        "idtp": idtp,
+        "idfp": idfp,
+        "idfn": idfn,
+        "idswitches": n_idsw,
+        "gt": n_gt,
+        "pred": n_pred,
+    }
+
+
 def precision_at_k(y_relevance, y_score, k=None):
     """P@k：前 k 个里相关文档所占比例（分母是 min(k, 文档数)）。"""
     who = "precision_at_k"
