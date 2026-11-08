@@ -297,9 +297,16 @@ class Layer:
         return [e / sum_exp for e in exp_z]
 
     def _softmax_deriv(self, z):
-        # 注意：这里返回 [1.0] 是简化处理，仅在与 cross_entropy_loss 配合时正确。
-        # cross_entropy_loss 已直接返回 softmax+CE 的联合梯度 (pred - one_hot)，
-        # 无需再乘 softmax 的 Jacobian。若搭配 mse_loss 使用 softmax，梯度会错误。
+        """softmax 的「联合梯度约定」占位：恒返回 1，不乘 Jacobian。
+
+        cross_entropy_loss / focal_loss 已直接返回 softmax+CE（或 focal）的联合梯度
+        (pred - one_hot)，因此 softmax 层反向时不需要再乘 softmax 的 Jacobian。
+        这个约定只对「输出层 softmax + 联合梯度损失」成立；把 softmax 放到隐藏层、
+        或搭配 mse 等逐元素损失时，梯度会静默错误。对应防线：
+        MLP 构造时拒绝隐藏层 softmax；Model 构造时拒绝 softmax + mse，并兜底拦截
+        隐藏层 softmax。确实需要 softmax Jacobian 的场景请在自定义训练循环里
+        显式实现，不要依赖这个类。
+        """
         return [1.0] * len(z)
 
 # ============================================================================
@@ -794,6 +801,18 @@ class MLP:
                 f"MLP: 需要 {len(layer_sizes) - 1} 个激活函数（层数 = 维度数-1），"
                 f"收到 {len(activations)} 个"
             )
+
+        # 隐藏层 softmax 会在反向时静默算错：Layer._softmax_deriv 恒返回 1，
+        # 只在「输出层 softmax + 联合梯度损失（CE / focal）」下成立。放在隐藏层
+        # 或搭配 mse 等逐元素损失时梯度不自洽（有限差分相对误差可达 100%），
+        # 因此在构造时就拒绝，而不是等训练时训歪。
+        for i, name in enumerate(activations[:-1]):
+            if name == "softmax":
+                raise ValueError(
+                    f"MLP: 第 {i + 1} 层是隐藏层却使用 softmax 激活——"
+                    "softmax 只能作为最后一层（输出层），并搭配 cross_entropy / focal "
+                    "等联合梯度损失；隐藏层请改用 relu / leaky_relu / tanh 等。"
+                )
 
         self.layers = []
         for i in range(1, len(layer_sizes)):
@@ -21842,6 +21861,9 @@ def ldam_loss(logits, target_idx, class_counts, max_m: float = 0.5, s: float = 3
     `s` 是 logit 缩放（论文取 30），`max_m` 是最大间隔。**输入必须是 logits**，
     因此输出层要用 `linear`（配 softmax 会在构造时被拒绝）。返回 (loss, grad)，
     grad 相对 logits，可直接经 linear 层反传。
+
+    放进 `Model(loss_fn='ldam')` 时必须用 `loss_kwargs={'class_counts': [...]}`
+    提供每类样本数（该信息无法从 pred/target 推断）。
     """
     V = len(logits)
     counts = _class_counts_vector(class_counts, V, "ldam_loss")
@@ -21905,6 +21927,10 @@ def distill_loss(student_logits, teacher_logits, T: float = 2.0):
 
     `teacher_logits` 直接作为 `Model(loss_fn='distill')` 的 target 传入即可；
     学生的输出层必须是 `linear`（本函数吃 logits，不吃概率）。
+
+    注意 `Model.fit` 的 target 契约：每个样本的 target 必须是长度等于输出维度的
+    teacher logits 向量；传普通类别索引（标量/长度 1）会在第一批就报错，请改用
+    `loss_fn='cross_entropy'` 或自定义训练循环。
     """
     if not isinstance(T, (int, float)) or isinstance(T, bool) or not (T > 0.0):
         raise ValueError(f"distill_loss: T 必须是 > 0 的数字，收到 {T!r}")
@@ -47712,7 +47738,9 @@ class Model:
     }
 
     # 目标按「类别索引」解释的损失（其余按数值向量解释）
-    _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal', 'class_balanced', 'ldam')
+    # 注意：ldam 虽然也吃类别索引，但它额外需要 class_counts，无法走这里统一的
+    # 索引包装（见 __init__ 里的 ldam 分支），因此不放进本元组。
+    _INDEX_LOSSES = ('cross_entropy', 'ce', 'focal', 'class_balanced')
     # 目标按数值向量解释的损失（标量会被包成 [target]）
     _NUMERIC_LOSSES = ('mse', 'bce', 'bce_with_logits', 'huber', 'distill', 'smooth_l1',
                        'l1', 'log_cosh', 'quantile')
@@ -47721,13 +47749,17 @@ class Model:
                  opt_kwargs=None, task='auto', loss_kwargs=None):
         """
         model:       MLP 实例（必传）
-        loss_fn:     'mse' / 'cross_entropy' / 'ce' / 'focal' / 'bce' /
-                     'bce_with_logits' / 'huber' / callable(pred, target) -> (loss, grad)
+        loss_fn:     'mse' / 'cross_entropy' / 'ce' / 'focal' / 'class_balanced' /
+                     'ldam' / 'bce' / 'bce_with_logits' / 'huber' / 'smooth_l1' /
+                     'l1' / 'log_cosh' / 'quantile' / 'distill' /
+                     callable(pred, target) -> (loss, grad)
                      （kl_divergence 不在此列：它要求 pred 是概率分布，而 softmax 层的
                      反向是 softmax+CE 的联合梯度，非 CE 损失叠在 softmax 上梯度不自洽；
                      需要 KL 时请手动调用 AI.kl_divergence 并自己反传）
+                     'ldam' 需要 loss_kwargs={'class_counts': [...]}；
+                     'distill' 的 target 必须是 teacher logits 向量（长度 = 输出维度）。
         loss_kwargs: dict，传给损失函数的额外参数（如交叉熵的 label_smoothing、
-                     focal 的 gamma/alpha、huber 的 delta）
+                     focal 的 gamma/alpha、huber 的 delta、ldam 的 class_counts）
         optimizer:   'adam' / 'sgd' / 'sgd_momentum' / 'rmsprop' / 优化器实例
         lr:          学习率（optimizer 为字符串时生效）
         opt_kwargs:  dict，传给优化器构造函数的额外参数（如 weight_decay）
@@ -47737,6 +47769,21 @@ class Model:
             raise TypeError(f"model 必须是 MLP 实例，当前类型: {type(model).__name__}")
         if len(model.layers) == 0:
             raise ValueError("Model: model 至少要有 1 层（MLP 的层数 = 维度数-1）")
+
+        # 隐藏层 softmax 兜底拦截：MLP 构造时已拒绝，这里再拦一层，
+        # 防止手工拼装 / 反序列化出的模型绕过构造校验后静默训歪。
+        for i, layer in enumerate(model.layers[:-1]):
+            act = getattr(layer, "activation_name", None)
+            if act is None:
+                act_fn = getattr(layer, "act_fn", None)
+                if act_fn is not None and act_fn == getattr(layer, "_softmax", None):
+                    act = "softmax"
+            if act == "softmax":
+                raise ValueError(
+                    f"Model: 第 {i + 1} 层是隐藏层却使用 softmax 激活——"
+                    "softmax 只能作为输出层，并搭配 cross_entropy / focal 等"
+                    "联合梯度损失；隐藏层请改用 relu / leaky_relu / tanh 等。"
+                )
 
         self.model = model
         self.lr = lr
@@ -47836,9 +47883,38 @@ class Model:
                 return self.loss_fn(pred, idx, **kw)
 
             self._loss = _wrap_index_loss
+        elif self._loss_name == 'ldam':
+            # LDAM 的目标也是类别索引，但 class_counts（每个类的训练样本数）
+            # 无法从 pred/target 推断，必须由调用方显式提供，因此在构造时就校验。
+            if 'class_counts' not in kw:
+                raise ValueError(
+                    "loss_fn='ldam' 需要 loss_kwargs={'class_counts': [...]}"
+                    "（每个类别的训练样本数）：ldam_loss 用类频率计算间隔，"
+                    "无法从 pred/target 推断。"
+                )
+
+            def _wrap_ldam_loss(pred, target):
+                # target 保持调用方传入的类别索引（ldam_loss 自己会校验合法性）
+                return self.loss_fn(pred, target, **kw)
+
+            self._loss = _wrap_ldam_loss
         elif self._loss_name in self._NUMERIC_LOSSES:
-            def _wrap_numeric_loss(pred, target):
-                return self.loss_fn(pred, _as_numeric_target(target), **kw)
+            if self._loss_name == 'distill':
+                # distill 的 target 契约与普通数值损失不同：它必须是 teacher logits
+                # 向量（长度 = 输出维度），而不是类别索引。在这里提前拦截并给出
+                # 可操作的报错，避免到 loss 内部才暴露「长度 1 != pred 长度 C」。
+                def _wrap_numeric_loss(pred, target):
+                    vec = _as_numeric_target(target)
+                    if len(vec) != len(pred):
+                        raise ValueError(
+                            "loss_fn='distill' 的 target 必须是 teacher logits 向量"
+                            f"（长度 = 模型输出维度 {len(pred)}），收到长度 {len(vec)}；"
+                            "普通类别标签请改用 loss_fn='cross_entropy'。"
+                        )
+                    return self.loss_fn(pred, vec, **kw)
+            else:
+                def _wrap_numeric_loss(pred, target):
+                    return self.loss_fn(pred, _as_numeric_target(target), **kw)
             self._loss = _wrap_numeric_loss
         else:
             if kw:

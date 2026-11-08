@@ -133,6 +133,15 @@ class TestMLP:
         out = model.forward([0.5, 0.1, -0.2])
         assert sum(out) == pytest.approx(1.0, abs=1e-6)
 
+    def test_mlp_rejects_hidden_softmax(self):
+        """隐藏层 softmax 必须被拒绝：_softmax_deriv 恒返回 1，只在输出层+CE 成立"""
+        with pytest.raises(ValueError):
+            MLP([3, 4, 2], activations=["softmax", "linear"])
+        with pytest.raises(ValueError):
+            MLP([3, 4, 2], activations=["softmax", "softmax"])
+        # 末层 softmax 仍允许（配合 CE / 手工联合梯度）
+        MLP([3, 2], activations=["softmax"])
+
     def test_mlp_repr(self):
         model = MLP([3, 4, 1])
         assert "MLP" in repr(model)
@@ -8825,7 +8834,8 @@ class TestImbalanceLosses:
         assert AI.Model._LOSS_MAP["class_balanced"] is AI.class_balanced_loss
         assert AI.Model._LOSS_MAP["ldam"] is AI.ldam_loss
         assert "class_balanced" in AI.Model._INDEX_LOSSES
-        assert "ldam" in AI.Model._INDEX_LOSSES
+        # ldam 需要 class_counts 走专用分支，不再参与统一的索引目标包装
+        assert "ldam" not in AI.Model._INDEX_LOSSES
 
         random.seed(7)
         mlp = AI.MLP([4, 6, 3], activations=["relu", "softmax"])
@@ -8836,10 +8846,25 @@ class TestImbalanceLosses:
         losses = [v for _, v in model.history["train_loss"]]
         assert losses[-1] < losses[0]
 
-        bad = AI.MLP([3, 4, 3], activations=["relu", "softmax"])
+        # LDAM：必须 linear 输出 + loss_kwargs 提供 class_counts，否则构造期报错
         with pytest.raises(ValueError):
-            AI.Model(bad, loss_fn="ldam", task="classification",
+            AI.Model(AI.MLP([3, 4, 3], activations=["relu", "linear"]),
+                     loss_fn="ldam", task="classification")
+        with pytest.raises(ValueError):
+            AI.Model(AI.MLP([3, 4, 3], activations=["relu", "softmax"]),
+                     loss_fn="ldam", task="classification",
                      loss_kwargs={"class_counts": [10.0, 10.0, 10.0]})
+        ldam_model = AI.Model(
+            AI.MLP([4, 6, 3], activations=["relu", "linear"]),
+            loss_fn="ldam", task="classification",
+            loss_kwargs={"class_counts": [12.0, 10.0, 8.0]})
+        random.seed(11)
+        ldam_data = [([random.random() for _ in range(4)], random.randrange(3))
+                     for _ in range(30)]
+        ldam_model.fit(data=ldam_data, epochs=10, batch_size=8, verbose=False, seed=2)
+        ldam_losses = [v for _, v in ldam_model.history["train_loss"]]
+        assert ldam_losses[-1] < ldam_losses[0]
+
         bad2 = AI.MLP([3, 4, 3], activations=["relu", "linear"])
         with pytest.raises(ValueError):
             AI.Model(bad2, loss_fn="class_balanced", task="classification",
@@ -8939,6 +8964,26 @@ class TestDistillAndHint:
         bad = AI.MLP([4, 8, 3], activations=["relu", "softmax"])
         with pytest.raises(ValueError):
             AI.Model(bad, loss_fn="distill", task="classification")
+
+    def test_distill_rejects_class_index_target(self):
+        """distill 的 target 必须是 teacher logits 向量；类别索引在第一批就应报错"""
+        mlp = AI.MLP([4, 8, 3], activations=["relu", "linear"])
+        model = AI.Model(mlp, loss_fn="distill", task="classification", lr=0.02)
+        # 标量类别索引 / 长度 1 的索引列表都会被提前拒绝（而不是在 loss 内部）
+        with pytest.raises(ValueError, match="teacher logits"):
+            model._loss([0.1, -0.2, 0.3], 0)
+        with pytest.raises(ValueError, match="teacher logits"):
+            model._loss([0.1, -0.2, 0.3], [2])
+        # 合法的 teacher logits 向量可正常返回 (loss, grad)
+        loss, grad = model._loss([0.1, -0.2, 0.3], [1.5, -0.5, 0.2])
+        assert loss >= 0.0 and len(grad) == 3
+
+    def test_model_rejects_bypassed_hidden_softmax(self):
+        """手工把隐藏层 activation_name 改成 softmax 后，Model 兜底拦截"""
+        mlp = AI.MLP([3, 4, 2], activations=["relu", "softmax"])
+        mlp.layers[0].activation_name = "softmax"
+        with pytest.raises(ValueError, match="隐藏层"):
+            AI.Model(mlp, loss_fn="cross_entropy", task="classification")
 
 
 # ============================================================================
