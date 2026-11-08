@@ -808,7 +808,7 @@ W0 + W1 + W3 + W9 + W13 + W2 的部分 = 约 8–10 个会话，就能让这个�
 - [x] 损失枚举补齐：focal / bce / bce_with_logits / huber（`losses.c`；`loss_reference.json` + `tests/compare_loss`：24 用例 48 个标量/数组里 47 个逐位，唯一差异是 `pow(0.6,3.0)` 的 1 ULP；`LossKind` 2→6，训练与验证共用一个 `trainer_loss_apply`，`tests/test_loss.c` 验集成）
 - [x] 指标模块：`confusion_matrix` / `accuracy_score` / `precision_recall_f1`（macro·micro·weighted·none 四种口径 + per-class 明细）/ `matthews_corrcoef` / `top_k_accuracy` / `roc_auc_score` / `mean_absolute_error` / `root_mean_squared_error` / `mean_absolute_percentage_error` / `r2_score`（`metrics.c`；`metrics_reference.json` 32 用例 141 项检查**全部逐位相同、容差 0**，`tests/test_metrics.c` 另有 50 项独立自测。回归四项里 mae/rmse 用 Neumaier 对齐 Python 的 `sum()`，mape/r2 保持朴素 `+=`，两种累加不能互换）
 - [x] `Conv2d` 的 `groups` / `dilation`——已完成：`conv2d_create_ex`，6 种配置 30 项逐位相同（分组 / 深度 / 膨胀 / 叠加），`tests/test_conv.c` 另加 4 组逐参数差分；`Conv1d` / `ConvTranspose2d`；`Conv1d` / `ConvTranspose2d`——已完成：`conv1d_create` / `convt2d_create`，5 + 5 种配置共 70 项逐位相同（forward / dx / grad_w / grad_b），`tests/test_conv.c` 另加 8 组逐参数差分与 vtable 一致性校验
-- [ ] `BatchNorm2d` / `GroupNorm` / `InstanceNorm` / `DropPath`
+- [x] `BatchNorm2d` / `GroupNorm` / `InstanceNorm` / `DropPath`——已完成：`bn2d_create` / `gn_create` / `inorm_create` / `droppath_create`（+ `set_training` / `set_params` / `set_keep` / `set_seed`），C 侧 `compare_norm` 由 22 项扩到 50 项、**全部 0.000e+00**（BN2d 训练 6 项 + 推理 5 项含「推理不更新 running」、GroupNorm 4 项、InstanceNorm 4 项、DropPath 3 情形 × 3 项）；`tests/test_norm.c` 另加 5 组自测（BN2d/GroupNorm 逐参数中心差分误差 ≤3.4e-10、推理闭式 1.1e-16、DropPath 恒等）
 - [ ] Mixup / CutMix / Cutout / RandAugment（纯张量运算，A 档）
 - [ ] MoE / 序列标注头 / 多标签头（B 档）
 - [ ] BPE / WordPiece 分词器（B 档）
