@@ -771,7 +771,11 @@
   与 `PINN1D`（一维 Poisson、试函数 `x(1-x)·NN(x)` 吸收零边界、中心差分残差）；测试
   `TestNeuralODEAndPINN` 6 例
 
-全量测试：1839 → 1978 passed（新增 139 例）。
+- [x] 分布式训练模拟：`fsdp_shard_flat`/`fsdp_all_gather`/`zero_optimizer_step`/`fsdp_reduce_scatter`
+  （FSDP 分片与 ZeRO-1 更新）、`tensor_parallel_linear_forward`（列/行并行线性层前向）、
+  `sequence_parallel_layer_norm`（序列并行 LayerNorm）；测试 `TestParallelTrainingUtils` 6 例
+
+全量测试：1839 → 1984 passed（新增 145 例）。
 
 ---
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1978 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1984 项）
 
 ## 特性
 
@@ -2041,6 +2041,24 @@ pinn.predict(0.5)   # ≈ 0.125
 
 边界：`NeuralODE` 只用 Euler 积分器（无自适应步长、无连续伴随），只对终态做监督；`PINN1D` 只处理一维、零边界与有限差分二阶导（`h` 默认 1e-3，残差梯度含 `1/h²` 因子，学习率需按 `h` 选择）。
 
+### 分布式训练模拟（FSDP / ZeRO / 张量并行 / 序列并行）
+
+| API | 说明 |
+|-----|------|
+| `fsdp_shard_flat(flat, world_size)` | 把扁平参数/梯度按 rank 连续切片（返回 `(start, end, shard)` 列表） |
+| `fsdp_all_gather(shards)` | 按 rank 顺序把分片拼回完整扁平参数 |
+| `zero_optimizer_step(flat_params, flat_grads, lr, world_size)` | 模拟 ZeRO-1：每个 rank 只更新自己分片再 all-gather，数值等价普通 SGD |
+| `fsdp_reduce_scatter(rank_grads, world_size)` | 模拟 FSDP reduce-scatter：各 rank 的完整梯度先求平均、再按住分片 |
+| `tensor_parallel_linear_forward(weight, bias, x, world_size, mode='column')` | Megatron 式列/行并行线性层前向，数值与稠密前向一致 |
+| `sequence_parallel_layer_norm(x_seq, eps=1e-5)` | 序列并行 LayerNorm：每个 token 独立归一化，按序列切分不改变结果 |
+
+```python
+updated, ranges = AI.zero_optimizer_step(params, grads, lr=0.1, world_size=4)
+y, shards = AI.tensor_parallel_linear_forward(W, b, x, world_size=2, mode="column")
+```
+
+边界：这些是**教学用纯数值模拟**——不做真实通信/多进程/显存节省，只验证「分片-聚合后的数值与单机等价」；ZeRO 只模拟优化器状态分片（ZeRO-1），不含参数/梯度分片；张量并行只实现线性层前向对照，不含反向与通信 overlap。
+
 ### RL 基础设施与 RLHF 奖励
 
 | API | 说明 |
@@ -3424,7 +3442,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1978 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1984 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3456,6 +3474,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFlowMatching` | 直线路径与目标速度、时间编码、速度场输入梯度、三层参数梯度中心差分、训练收敛与两种采样器的确定性、优化器与 15 类非法输入 |
 | `TestDiffusionSamplers` | sigma 调度的端点/单调性、常数去噪器收敛、shrinkage 去噪器与解析解对比（步数越多越准）、一致性损失与采样、非法输入 |
 | `TestNeuralODEAndPINN` | ODE 终态收敛到 e^-1、输入/参数梯度中心差分、非法输入；PINN 解 Poisson `u(0.5)≈0.125` 且两端为 0、梯度中心差分、非法输入 |
+| `TestParallelTrainingUtils` | FSDP 分片/all-gather 往返、ZeRO-1 更新与普通 SGD 逐位一致、reduce-scatter 平均值、张量并行列/行前向与稠密一致、序列并行 LayerNorm 与全局一致、非法输入 |
 | `TestActNorm` | `data_init` 后首批输出零均值单位方差、逆变换与 `logdet`、`dx`/`g_b`/`g_log_s` 中心差分、优化器步与非法输入 |
 | `TestInvertibleLinear` | 逆变换精确、`logdet` 对数值 Jacobian、`dx` 与 `g_W`（含 `g_logdet·W^{-T}`）、无 logdet 项时 `g_W = g_y x^T`、奇异矩阵与优化器步 |
 | `TestRealNVP` | forward/inverse 互逆（dim 2–5）、掩码交替（偶数棋盘格 / 奇数半区）、解析 log-det vs 数值 Jacobian、输入与四组层参数梯度、nll 训练下降与采样确定性、非法输入 |
@@ -3731,7 +3750,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1978 个单元测试
+├── test_ai.py       # 1984 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

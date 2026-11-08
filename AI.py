@@ -35577,6 +35577,170 @@ class PINN1D:
         return losses
 
 
+def _parallel_check_flat(values, who):
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{who}: 需要一个非空的一维数值列表")
+    out = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{who}: 只支持有限数值，收到 {v!r}")
+        out.append(float(v))
+    return out
+
+
+def _parallel_check_world(world_size, who):
+    if isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1:
+        raise ValueError(f"{who}: world_size 必须是 >= 1 的整数，收到 {world_size!r}")
+    return world_size
+
+
+def _split_ranges(n, world_size, who):
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError(f"{who}: n 必须是非负整数，收到 {n!r}")
+    world_size = _parallel_check_world(world_size, who)
+    base = n // world_size
+    rem = n % world_size
+    ranges = []
+    start = 0
+    for rank in range(world_size):
+        size = base + (1 if rank < rem else 0)
+        ranges.append((start, start + size))
+        start += size
+    return ranges
+
+
+def fsdp_shard_flat(flat, world_size):
+    """把扁平参数/梯度列表按 rank 切成 world_size 个连续分片（模拟 FSDP 分片）。"""
+    flat = _parallel_check_flat(flat, "fsdp_shard_flat")
+    ranges = _split_ranges(len(flat), world_size, "fsdp_shard_flat")
+    return [(start, end, flat[start:end]) for start, end in ranges]
+
+
+def fsdp_all_gather(shards):
+    """把 fsdp_shard_flat 的分片按 rank 顺序拼回完整扁平参数。"""
+    if not shards:
+        raise ValueError("fsdp_all_gather: shards 不能为空")
+    ordered = sorted(shards, key=lambda item: item[0])
+    out = []
+    expect = 0
+    for start, end, values in ordered:
+        if not isinstance(start, int) or not isinstance(end, int) or start != expect or end < start:
+            raise ValueError("fsdp_all_gather: 分片区间必须从 0 起连续且不重叠")
+        if len(values) != end - start:
+            raise ValueError("fsdp_all_gather: 分片长度与区间不一致")
+        out.extend(values)
+        expect = end
+    return out
+
+
+def zero_optimizer_step(flat_params, flat_grads, lr, world_size):
+    """模拟 ZeRO-1/SGD：每个 rank 只对自己参数分片做更新，再 all-gather。
+
+    返回 (new_flat_params, shard_updates)，shard_updates 为每 rank 更新过的区间。
+    """
+    params = _parallel_check_flat(flat_params, "zero_optimizer_step")
+    grads = _parallel_check_flat(flat_grads, "zero_optimizer_step")
+    if len(params) != len(grads):
+        raise ValueError("zero_optimizer_step: flat_params 与 flat_grads 长度必须一致")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+        raise ValueError(f"zero_optimizer_step: lr 必须是非负数，收到 {lr!r}")
+    world_size = _parallel_check_world(world_size, "zero_optimizer_step")
+    shards = fsdp_shard_flat(params, world_size)
+    updated = list(params)
+    updates = []
+    for start, end, values in shards:
+        for i in range(start, end):
+            updated[i] = values[i - start] - lr * grads[i]
+        updates.append((start, end))
+    return fsdp_all_gather([(s, e, updated[s:e]) for s, e, _ in shards]), updates
+
+
+def fsdp_reduce_scatter(rank_grads, world_size):
+    """模拟 FSDP 的 reduce-scatter：各 rank 先对完整梯度求平均，再按住分片。
+
+    rank_grads 是每个 rank 的完整梯度列表（形状相同）；返回每 rank 的平均梯度分片。
+    """
+    if not isinstance(rank_grads, (list, tuple)) or not rank_grads:
+        raise ValueError("fsdp_reduce_scatter: rank_grads 不能为空")
+    world_size = _parallel_check_world(world_size, "fsdp_reduce_scatter")
+    if len(rank_grads) != world_size:
+        raise ValueError("fsdp_reduce_scatter: rank_grads 的数量必须等于 world_size")
+    n = len(rank_grads[0])
+    for g in rank_grads:
+        if len(g) != n:
+            raise ValueError("fsdp_reduce_scatter: 每个 rank 的梯度长度必须一致")
+    avg = [sum(g[i] for g in rank_grads) / world_size for i in range(n)]
+    shards = fsdp_shard_flat(avg, world_size)
+    return [(start, end, [avg[i] for i in range(start, end)]) for start, end, _ in shards]
+
+
+def tensor_parallel_linear_forward(weight, bias, x, world_size, mode="column"):
+    """模拟 Megatron 式张量并行线性层（不做反向，只对照前向数值）。
+
+    mode="column"：按输出维度切权重行/bias，各 rank 算一段输出再拼回；
+    mode="row"：按输入维度切权重列与 x，各 rank 算部分和，再相加（bias 只加一次）。
+    返回 (full_output, shard_outputs)。
+    """
+    if not isinstance(weight, (list, tuple)) or not weight:
+        raise ValueError("tensor_parallel_linear_forward: weight 不能为空")
+    rows = len(weight)
+    cols = len(weight[0])
+    if any((not isinstance(r, (list, tuple)) or len(r) != cols) for r in weight):
+        raise ValueError("tensor_parallel_linear_forward: weight 必须是矩形矩阵")
+    if not isinstance(x, (list, tuple)) or len(x) != cols:
+        raise ValueError("tensor_parallel_linear_forward: x 的长度必须等于 weight 列数")
+    if bias is not None and len(bias) != rows:
+        raise ValueError("tensor_parallel_linear_forward: bias 长度必须等于 weight 行数")
+    world_size = _parallel_check_world(world_size, "tensor_parallel_linear_forward")
+    if mode == "column":
+        ranges = _split_ranges(rows, world_size, "tensor_parallel_linear_forward")
+        outs = []
+        full = []
+        for start, end in ranges:
+            y = []
+            for r in range(start, end):
+                acc = sum(weight[r][c] * x[c] for c in range(cols))
+                if bias is not None:
+                    acc += bias[r]
+                y.append(acc)
+            outs.append(y)
+            full.extend(y)
+        return full, outs
+    if mode == "row":
+        ranges = _split_ranges(cols, world_size, "tensor_parallel_linear_forward")
+        partials = []
+        for start, end in ranges:
+            yshard = [0.0] * rows
+            for c in range(start, end):
+                xc = x[c]
+                for r in range(rows):
+                    yshard[r] += weight[r][c] * xc
+            partials.append(yshard)
+        full = [sum(p[r] for p in partials) for r in range(rows)]
+        if bias is not None:
+            full = [full[r] + bias[r] for r in range(rows)]
+        return full, partials
+    raise ValueError(f"tensor_parallel_linear_forward: mode 只支持 'column'/'row'，收到 {mode!r}")
+
+
+def sequence_parallel_layer_norm(x_seq, eps=1e-5):
+    """模拟序列并行下的 LayerNorm：token 沿序列维切给各 rank，逐 token 归一化后再拼回。"""
+    if not isinstance(x_seq, (list, tuple)) or not x_seq:
+        raise ValueError("sequence_parallel_layer_norm: x_seq 不能为空")
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(eps) or eps <= 0):
+        raise ValueError(f"sequence_parallel_layer_norm: eps 必须是正有限数，收到 {eps!r}")
+    full = []
+    for row in x_seq:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("sequence_parallel_layer_norm: 每行 token 必须是非空向量")
+        mu = sum(row) / len(row)
+        var = sum((v - mu) ** 2 for v in row) / len(row)
+        denom = math.sqrt(var + eps)
+        full.append([(v - mu) / denom for v in row])
+    return full
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================

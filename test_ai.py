@@ -30126,3 +30126,70 @@ class TestNeuralODEAndPINN:
             p.loss_and_backward([1.5], [-1.0])
         with pytest.raises(ValueError):
             p.sgd_step(-0.1)
+
+
+class TestParallelTrainingUtils:
+    def test_fsdp_shard_gather_roundtrip(self):
+        flat = [float(i) for i in range(5)]
+        shards = AI.fsdp_shard_flat(flat, 3)
+        assert [s[2] for s in shards] == [[0.0, 1.0], [2.0, 3.0], [4.0]]
+        assert [s[:2] for s in shards] == [(0, 2), (2, 4), (4, 5)]
+        assert AI.fsdp_all_gather(shards) == flat
+
+    def test_zero_optimizer_step_matches_sgd(self):
+        params = [1.0, 2.0, 3.0, 4.0, 5.0]
+        grads = [0.1, 0.2, 0.3, 0.4, 0.5]
+        updated, ranges = AI.zero_optimizer_step(params, grads, 0.1, 3)
+        expect = [params[i] - 0.1 * grads[i] for i in range(5)]
+        assert updated == expect
+        assert ranges == [(0, 2), (2, 4), (4, 5)]
+
+    def test_fsdp_reduce_scatter_average(self):
+        rank_grads = [[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]]
+        shards = AI.fsdp_reduce_scatter(rank_grads, 2)
+        assert [s[2] for s in shards] == [[2.0, 2.0], [2.0]]
+
+    def test_tensor_parallel_linear_matches_dense(self):
+        weight = [[1.0, 2.0], [3.0, 4.0]]
+        bias = [0.5, -0.5]
+        x = [1.0, 2.0]
+        expect = [1.0 * 1 + 2.0 * 2 + 0.5, 3.0 * 1 + 4.0 * 2 - 0.5]
+        col, col_shards = AI.tensor_parallel_linear_forward(weight, bias, x, 2, "column")
+        row, row_parts = AI.tensor_parallel_linear_forward(weight, bias, x, 2, "row")
+        assert col == expect and row == expect
+        assert col_shards == [[expect[0]], [expect[1]]]
+        assert len(row_parts) == 2
+
+    def test_sequence_parallel_layer_norm(self):
+        rows = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        out = AI.sequence_parallel_layer_norm(rows)
+        for i, row in enumerate(rows):
+            mu = sum(row) / 3
+            var = sum((v - mu) ** 2 for v in row) / 3
+            denom = math.sqrt(var + 1e-5)
+            expect = [(v - mu) / denom for v in row]
+            assert all(abs(out[i][j] - expect[j]) < 1e-12 for j in range(3))
+
+    def test_parallel_utils_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.fsdp_shard_flat([], 2)
+        with pytest.raises(ValueError):
+            AI.fsdp_shard_flat([1.0], 0)
+        with pytest.raises(ValueError):
+            AI.fsdp_all_gather([])
+        with pytest.raises(ValueError):
+            AI.fsdp_all_gather([(0, 2, [1.0])])
+        with pytest.raises(ValueError):
+            AI.zero_optimizer_step([1.0], [1.0, 2.0], 0.1, 1)
+        with pytest.raises(ValueError):
+            AI.zero_optimizer_step([1.0], [1.0], -0.1, 1)
+        with pytest.raises(ValueError):
+            AI.fsdp_reduce_scatter([[1.0]], 2)
+        with pytest.raises(ValueError):
+            AI.tensor_parallel_linear_forward([[1.0]], [1.0], [1.0], 1, "bad")
+        with pytest.raises(ValueError):
+            AI.tensor_parallel_linear_forward([[1.0], [2.0]], [1.0], [1.0], 1, "column")
+        with pytest.raises(ValueError):
+            AI.sequence_parallel_layer_norm([])
+        with pytest.raises(ValueError):
+            AI.sequence_parallel_layer_norm([[1.0, 2.0]], eps=0.0)
