@@ -28547,3 +28547,115 @@ class TestBootstrapCohensTemperature:
         with pytest.raises(ValueError):
             AI.temperature_scale([[0.0, 1.0]], [0], refine_steps=0)
 
+
+
+class TestConvNeXtNetwork:
+    """ConvNeXt 完整网络（Batch 1）。"""
+
+    @staticmethod
+    def _pattern(cls, size=4):
+        img = [[[0.0] * size for _ in range(size)] for _ in range(3)]
+        pos = [(0, 0), (0, 2), (2, 0)][cls]
+        for c in range(3):
+            for i in range(2):
+                for j in range(2):
+                    img[c][pos[0] + i][pos[1] + j] = 1.0 + 0.1 * c
+        return img
+
+    @staticmethod
+    def _net():
+        return AI.ConvNeXt(in_channels=3, num_classes=3,
+                           channel_plan=(4, 8), blocks_per_stage=(1, 1))
+
+    def test_forward_and_param_count(self):
+        net = self._net()
+        assert net.param_count() == 1539
+        logits = net.forward(self._pattern(0))
+        assert len(logits) == 3
+        assert all(isinstance(v, float) for v in logits)
+
+    def test_backward_shapes_and_grads(self):
+        net = self._net()
+        net.forward(self._pattern(1))
+        dx = net.backward([0.1, -0.2, 0.3])
+        assert (len(dx), len(dx[0]), len(dx[0][0])) == (3, 4, 4)
+        assert any(v != 0.0 for v in net.head.grad_b)
+        assert any(v != 0.0 for v in net.stem.grad_b)
+
+    def test_fit_converges(self):
+        imgs = [self._pattern(i % 3) for i in range(9)]
+        labels = [i % 3 for i in range(9)]
+        net = self._net()
+        hist = net.fit(imgs, labels, epochs=60, lr=0.02, seed=1)
+        assert hist[-1] < 0.2, hist[-1]
+        pred = [max(range(3), key=lambda k: net.forward(imgs[i])[k])
+                for i in range(9)]
+        assert pred == labels
+
+    def test_invalid_inputs(self):
+        net = self._net()
+        with pytest.raises(ValueError):
+            net.forward([[[0.0] * 4 for _ in range(4)]])
+        with pytest.raises(ValueError):
+            net.forward([[[0.0] * 5 for _ in range(5)] for _ in range(3)])
+        with pytest.raises(ValueError):
+            net.fit([], [])
+        with pytest.raises(ValueError):
+            net.fit([self._pattern(0)], [3])
+        with pytest.raises(ValueError):
+            net.sgd_step(-0.1)
+
+
+class TestYarnMscale:
+    """YaRN 注意力温度 mscale（Batch 1）。"""
+
+    @staticmethod
+    def _seq(n=4):
+        return [[0.05 * i + 0.01 * j for j in range(8)] for i in range(n)]
+
+    def test_default_formula_and_identity(self):
+        m = AI.MultiHeadAttention(8, 2, rope=True, rope_scaling='yarn',
+                                  rope_factor=8.0)
+        assert abs(m.yarn_mscale - (0.1 * math.log(8.0) + 1.0)) < 1e-12
+        plain = AI.MultiHeadAttention(8, 2)
+        assert plain.yarn_mscale == 1.0
+        out1 = plain.forward(self._seq())
+        out2 = plain.forward(self._seq())
+        assert out1 == out2
+
+    def test_mscale_affects_output(self):
+        m = AI.MultiHeadAttention(8, 2, rope=True, rope_scaling='yarn',
+                                  rope_factor=8.0)
+        out_yarn = m.forward(self._seq())
+        keep = m.yarn_mscale
+        m.yarn_mscale = 1.0
+        out_plain = m.forward(self._seq())
+        m.yarn_mscale = keep
+        assert out_yarn != out_plain
+        assert m.yarn_mscale > 1.0
+
+    def test_explicit_and_invalid(self):
+        m = AI.MultiHeadAttention(8, 2, yarn_mscale=2.5)
+        assert m.yarn_mscale == 2.5
+        for bad in (0.0, -1.0, float('nan'), float('inf'), 'x', True):
+            with pytest.raises(ValueError):
+                AI.MultiHeadAttention(8, 2, yarn_mscale=bad)
+
+    def test_forward_backward_with_mscale(self):
+        m = AI.MultiHeadAttention(8, 2, causal=True, rope=True,
+                                  rope_scaling='yarn', rope_factor=8.0)
+        out = m.forward(self._seq())
+        assert len(out) == 4
+        d = [[0.01 * (i + 1) for _ in range(8)] for i in range(4)]
+        dx = m.backward(d)
+        assert (len(dx), len(dx[0])) == (4, 8)
+        assert any(v != 0.0 for row in dx for v in row)
+
+    def test_forward_step_consistency(self):
+        m = AI.MultiHeadAttention(8, 2, causal=True)
+        seq = self._seq()
+        full = m.forward(seq)
+        cache = {}
+        for t in range(len(seq)):
+            row = m.forward_step(seq[t], cache)
+            assert max(abs(a - b) for a, b in zip(row, full[t])) < 1e-9

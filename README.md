@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1881 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1890 项）
 
 ## 特性
 
@@ -472,7 +472,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `WarmupLR(optimizer, warmup_epochs=5, start_factor=0.0, base_scheduler=None)` | 线性 warmup，到期后把控制权交给 `base_scheduler` |
 | `ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=0.0, mode='min')` | 指标停滞 `patience+1` 次就把 lr 乘 `factor`（可反复降档，与 PyTorch 一致）；`step()` 要传指标 |
 | `MultiHeadAttention(rope=True)` | RoPE（GPT-NeoX 版式：第 i 维配 i+d_k/2）；反向用逆旋转 |
-| `MultiHeadAttention(rope_scaling="yarn")` | RoPE 长度外推：`"linear"`（频率全除 factor）、`"ntk"`（改底数 `base·factor^(d_k/(d_k-2))`）、`"yarn"`（按旋转圈数做 linear/原样的 smoothstep 分段）；配套 `rope_factor` / `rope_original_max` / `rope_beta_fast` / `rope_beta_slow`，也可直接调 `rope_inv_freqs(d_k, base, scaling, factor, ...)` 拿频率表 |
+| `MultiHeadAttention(rope_scaling="yarn")` | RoPE 长度外推：`"linear"`（频率全除 factor）、`"ntk"`（改底数 `base·factor^(d_k/(d_k-2))`）、`"yarn"`（按旋转圈数做 linear/原样的 smoothstep 分段）；配套 `rope_factor` / `rope_original_max` / `rope_beta_fast` / `rope_beta_slow`，也可直接调 `rope_inv_freqs(d_k, base, scaling, factor, ...)` 拿频率表；`rope_scaling='yarn'` 时还会把注意力温度 `mscale = 0.1*ln(rope_factor)+1` 乘到 softmax 前的分数上（`yarn_mscale=` 可覆盖，默认 1.0 与旧版逐位一致） |
 | `MultiHeadAttention(window=N)` | 滑动窗口（Mistral 式局部因果）：只看最近 N 个位置，代价 O(T·window) |
 | `generate(..., top_p=0.9)` | nucleus 采样：按概率累加保留头部集合（与 `top_k` 可叠加；默认 1.0 不过滤） |
 | `generate(..., min_p=0.05)` | min-p 截尾：低于「最大概率 × min_p」的全丢掉（比 top_p 更稳；默认 0 关闭） |
@@ -637,6 +637,28 @@ bert.fit([([1, 2, 3, 4, 5], [1, 3], [2, 4], [0, 0, 0, 1, 1], 1)],
 `T5RelativeBias` 的分桶与 T5 论文一致（`t5_relative_buckets`，`bidirectional=False` 时只按距离分桶）；
 `MultiHeadAttention` 新增可选 `relative_bias` 参数，不传时行为与旧版逐位一致（回归测试覆盖）。
 `BertModel` 由调用方决定 mask 哪些位置，适合需要完全掌控 mask 策略的教学实验。
+
+
+### 组合模型（ConvNeXt）
+
+把 `ConvNeXtBlock` 拼成完整卷积网络：patchify stem → 多 stage 堆叠（stage 间 2×2 下采样）
+→ 全局平均池化 → 1×1 卷积分类头。数据布局仍是 channels-first `(C,H,W)`，训练协议与
+`ResNet` 一致（`forward` / `backward` / `adam_step` / `fit`）。
+
+```python
+net = ConvNeXt(in_channels=3, num_classes=10,
+               channel_plan=(8, 16, 32), blocks_per_stage=(1, 1, 1))
+hist = net.fit(images, labels, epochs=20, lr=1e-3)
+pred = [max(range(10), key=lambda v: net.forward(img)[v]) for img in images]
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `ConvNeXt(in_channels=3, num_classes=10, channel_plan=(8,16,32), blocks_per_stage=(1,1,1), kernel_size=7, expansion=4, eps=1e-6)` | stem `Conv2d(k=2, s=2) → GELU`；每个 stage 为 N 个 `ConvNeXtBlock`（7×7 depthwise + 跨通道 LayerNorm + 1×1 升/降维 + GELU + 残差），stage 间用 `Conv2d(k=2, s=2)` 下采样；末尾全局平均池化 + 1×1 卷积分类头。输入 H、W 必须能被 `2 ** len(channel_plan)` 整除；提供 `param_count` / `zero_grad` / `sgd_step` / `adam_step` / `train` / `eval` |
+
+**YaRN 注意力温度**：`MultiHeadAttention(rope_scaling="yarn")` 现在会把
+`mscale = 0.1*ln(rope_factor)+1` 乘到 softmax 前的分数上（反向同步乘），也可用
+`yarn_mscale=` 显式覆盖；默认 1.0 时数值与旧版逐位一致（回归测试覆盖）。
 
 ### 序列到序列（Encoder-Decoder）
 
@@ -3307,7 +3329,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1881 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1890 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3378,6 +3400,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestT5AndBertModels` | T5 forward/param_count=6040/编码器与解码器相对偏置梯度非零/fit 降 loss/非法输入；BERT MLM+NSP forward、loss 下降、mask 标签与 NSP 非法输入 |
 | `TestBootstrapCohensTemperature` | bootstrap CI 包含均值/自定义统计量/非法参数；Cohen's d 已知值、相同与零方差；温度缩放的欠自信锐化、过自信平滑、对称样本平坦与非法输入 |
 | `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
+| `TestConvNeXtNetwork` | ConvNeXt 前向形状/参数量、反向输入梯度与卷积梯度非零、小样本 `fit` 收敛、5 类非法输入 |
+| `TestYarnMscale` | YaRN mscale 公式与默认 1.0 不变性、显式覆盖与 6 类非法值、缩放后前向/反向可用、增量前向与整段前向逐位一致 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
 | `TestConstrainedDecoding` | token 掩码只留允许集合且概率和仍为 1 / 前缀约束的状态转移与 `eos_id` / 非前缀报错 / 与采样器叠加 / 非法输入 |
 | `TestSpeculativeAccept` | `draft==target` 全接受 / 拒绝后按残差重采样 / 接受率 ≈ Σmin(p,q) / 非法输入 |
@@ -3596,7 +3620,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1881 个单元测试
+├── test_ai.py       # 1890 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

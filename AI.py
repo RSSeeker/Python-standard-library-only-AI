@@ -28,7 +28,7 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 79 个顶层分节
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 80 个顶层分节
 # （920 个 def / 297 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
@@ -109,7 +109,8 @@
 #  76. 生成模型：VAE / GAN / DDPM
 #  77. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
 #  78. 组合模型：T5 / BERT（相对位置偏置 + MLM/NSP 双头）
-#  79. Main: 回归 + 分类 + CNN 完整示例
+#  79. 组合模型：ConvNeXt（ConvNeXtBlock stage 拼装 + 分类头）
+#  80. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -14924,8 +14925,9 @@ def rope_inv_freqs(d_k: int, base: float = 10000.0, scaling: str = None,
       （高频）用 linear 缩放，转得少的（低频）保持原样，中间用 smoothstep 混合。
       `beta_fast` / `beta_slow` 是两端的转折圈数。
 
-    YaRN 论文里的注意力温度 `mscale` 不在这里实现（需要同时改 softmax 温度），
-    docstring 注明即可。
+    YaRN 论文里的注意力温度 `mscale` 不在这里实现：本函数只负责频率，
+    `MultiHeadAttention` 在 `rope_scaling='yarn'` 时把 `mscale` 乘到 softmax
+    前的分数上。
     """
     if isinstance(d_k, bool) or not isinstance(d_k, int):
         raise ValueError(f"rope_inv_freqs: d_k 必须是正整数，收到 {d_k!r}")
@@ -15015,7 +15017,8 @@ class MultiHeadAttention:
                  window: int = None, num_kv_heads: int = None, alibi: bool = False,
                  rope_scaling: str = None, rope_factor: float = 8.0,
                  rope_original_max: int = 512, rope_beta_fast: float = 32.0,
-                 rope_beta_slow: float = 1.0, relative_bias=None):
+                 rope_beta_slow: float = 1.0, relative_bias=None,
+                 yarn_mscale: float = None):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -15048,7 +15051,9 @@ class MultiHeadAttention:
         `rope_factor` 是外推倍数（想从 512 撑到 4096 就是 8.0），
         `rope_original_max` 是预训练长度（YaRN 用它算每个维度的旋转圈数），
         `rope_beta_fast` / `rope_beta_slow` 是 YaRN 的转折圈数。
-        注意：这里**不实现** YaRN 的注意力温度 mscale。
+        `rope_scaling='yarn'` 时还会把 YaRN 的注意力温度
+        `mscale = 0.1*ln(rope_factor)+1` 乘到 softmax 前的分数上（可用
+        `yarn_mscale` 显式覆盖；默认 1.0 时数值与旧版逐位一致）。
         """
         if not (0.0 <= dropout < 1.0):
             raise ValueError(f"MultiHeadAttention: dropout 必须在 [0,1) 内，收到 {dropout!r}")
@@ -15111,6 +15116,18 @@ class MultiHeadAttention:
             self.d_k, self.rope_base, rope_scaling, rope_factor,
             rope_original_max, rope_beta_fast, rope_beta_slow,
         )
+        # YaRN 的注意力温度 mscale = 0.1*ln(factor)+1：乘在 softmax 前的分数上。
+        # 非 yarn 缩放默认 1.0（数值路径与旧版逐位一致）；显式传值则无条件生效。
+        if yarn_mscale is None:
+            yarn_mscale = (0.1 * math.log(self.rope_factor) + 1.0
+                           if self.rope_scaling == 'yarn' else 1.0)
+        if (isinstance(yarn_mscale, bool)
+                or not isinstance(yarn_mscale, (int, float))
+                or not math.isfinite(float(yarn_mscale))
+                or float(yarn_mscale) <= 0.0):
+            raise ValueError(
+                f"MultiHeadAttention: yarn_mscale 必须是正数，收到 {yarn_mscale!r}")
+        self.yarn_mscale = float(yarn_mscale)
         # ALiBi 的逐头斜率：2^(-8*(h+1)/num_heads)，与论文/CausalLM 实现一致
         self.alibi_slopes = [2.0 ** (-8.0 * (h + 1) / num_heads)
                              for h in range(num_heads)]
@@ -15233,7 +15250,8 @@ class MultiHeadAttention:
                 K[kv_head].append(kh)
                 V[kv_head].append(vh)
             keys = K[kv_head]
-            scores = [sum(map(_mul, qh, keys[j])) * scale for j in range(len(keys))]
+            scores = [sum(map(_mul, qh, keys[j])) * scale * self.yarn_mscale
+                      for j in range(len(keys))]
             if self.alibi:
                 slope = self.alibi_slopes[head]
                 for j in range(len(scores)):
@@ -15322,7 +15340,8 @@ class MultiHeadAttention:
 
             # scores = Q @ K^T / sqrt(d_k)  (seq_len, seq_len)
             k_t = _transpose(k_h)  # (d_k, seq_len)
-            scores = [[v * scale for v in row] for row in _matmul(q_h, k_t)]
+            scores = [[v * scale * self.yarn_mscale for v in row]
+                      for row in _matmul(q_h, k_t)]
 
             # ALiBi：按「距离」加线性偏置（常数，不参与求导）
             if self.alibi:
@@ -15461,7 +15480,8 @@ class MultiHeadAttention:
                 d_soft.append([row_a[j] * (row_d[j] - s) for j in range(seq_len)])
             if self.relative_bias is not None:
                 dbias.append(d_soft)
-            d_scores = [[v * scale for v in row] for row in d_soft]
+            d_scores = [[v * scale * self.yarn_mscale for v in row]
+                        for row in d_soft]
 
             # dQ = d_scores @ K  (seq_len, d_k)
             dQ = _matmul(d_scores, K_h)
@@ -52557,6 +52577,235 @@ class BertModel:
                                                 seg, nsp)
                 self.adam_step(lr)
             avg = total / len(items)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
+        return history
+
+
+class ConvNeXt:
+    """ConvNeXt（完整网络）：patchify stem -> 多 stage 堆叠 -> 全局池化 -> 分类头
+
+    结构（channels-first，输入 `(C,H,W)`）：
+
+        stem:  Conv2d(C -> c0, k=2, stride=2) -> GELU
+        stage: 每个 stage 由 `blocks_per_stage[i]` 个 `ConvNeXtBlock(c_i)` 组成；
+               stage 之间用 `Conv2d(c_i -> c_{i+1}, k=2, stride=2)` 下采样
+        head:  全局平均池化 -> `Conv2d(c_last -> num_classes, k=1)`
+
+    `forward` 返回长度 `num_classes` 的 logits；`backward(dlogits)` 返回输入梯度，
+    内部梯度就地累加（调用前先 `zero_grad()`）。输入 H、W 必须能被
+    `2 ** len(channel_plan)` 整除（stem 一次 + 每个 stage 之间一次下采样）。
+    """
+
+    def __init__(self, in_channels: int = 3, num_classes: int = 10,
+                 channel_plan=(8, 16, 32), blocks_per_stage=(1, 1, 1),
+                 kernel_size: int = 7, expansion: int = 4, eps: float = 1e-6):
+        for name, val in (("in_channels", in_channels),
+                          ("num_classes", num_classes)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(
+                    f"ConvNeXt: {name} 必须是 >=1 的整数，收到 {val!r}")
+        if (not isinstance(channel_plan, (tuple, list)) or not channel_plan
+                or any(isinstance(v, bool) or not isinstance(v, int) or v < 1
+                       for v in channel_plan)):
+            raise ValueError("ConvNeXt: channel_plan 必须是非空的 >=1 整数序列")
+        if (not isinstance(blocks_per_stage, (tuple, list))
+                or len(blocks_per_stage) != len(channel_plan)
+                or any(isinstance(v, bool) or not isinstance(v, int) or v < 1
+                       for v in blocks_per_stage)):
+            raise ValueError(
+                "ConvNeXt: blocks_per_stage 必须与 channel_plan 等长且全为正整数")
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.channel_plan = [int(v) for v in channel_plan]
+        self.blocks_per_stage = [int(v) for v in blocks_per_stage]
+        self.kernel_size = kernel_size
+        self.expansion = expansion
+        self.eps = eps
+        c0 = self.channel_plan[0]
+        self.stem = Conv2d(in_channels, c0, 2, stride=2)
+        self.blocks = []
+        for i, c in enumerate(self.channel_plan):
+            self.blocks.append([
+                ConvNeXtBlock(c, kernel_size, expansion, eps)
+                for _ in range(self.blocks_per_stage[i])
+            ])
+        self.downs = [
+            Conv2d(self.channel_plan[i], self.channel_plan[i + 1], 2, stride=2)
+            for i in range(len(self.channel_plan) - 1)
+        ]
+        self.head = Conv2d(self.channel_plan[-1], num_classes, 1)
+        self.training = True
+        self._cache = None
+
+    # ---------- 形状校验 ----------
+    def _check_image(self, x, who):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError(
+                f"ConvNeXt.{who}: 输入必须是 (C,H,W) 非空嵌套 list")
+        C = len(x)
+        if C != self.in_channels:
+            raise ValueError(
+                f"ConvNeXt.{who}: 输入通道数 {C} 与 in_channels="
+                f"{self.in_channels} 不符")
+        H = len(x[0]) if isinstance(x[0], (list, tuple)) else 0
+        if H < 1 or not isinstance(x[0][0], (list, tuple)) or not x[0][0]:
+            raise ValueError(f"ConvNeXt.{who}: 输入必须是 (C,H,W) 非空嵌套 list")
+        W = len(x[0][0])
+        for c in range(C):
+            ch = x[c]
+            if not isinstance(ch, (list, tuple)) or len(ch) != H:
+                raise ValueError(
+                    f"ConvNeXt.{who}: 第 {c} 个通道行数不一致（应为 {H}）")
+            for h in range(H):
+                row = ch[h]
+                if not isinstance(row, (list, tuple)) or len(row) != W:
+                    raise ValueError(
+                        f"ConvNeXt.{who}: 第 {c} 通道第 {h} 行长度不一致（应为 {W}）")
+        factor = 2 ** len(self.channel_plan)
+        if H % factor != 0 or W % factor != 0:
+            raise ValueError(
+                f"ConvNeXt.{who}: 输入 {H}x{W} 必须能被下采样倍数 {factor} 整除")
+        return H, W
+
+    # ---------- 前向 / 反向 ----------
+    def forward(self, x):
+        self._check_image(x, "forward")
+        s = self.stem.forward(x)
+        cur = [[[_gelu_scalar(v) for v in row] for row in ch] for ch in s]
+        for i in range(len(self.channel_plan)):
+            for block in self.blocks[i]:
+                cur = block.forward(cur)
+            if i < len(self.downs):
+                cur = self.downs[i].forward(cur)
+        Cf, Hf, Wf = len(cur), len(cur[0]), len(cur[0][0])
+        pooled = [sum(sum(row) for row in ch) / (Hf * Wf) for ch in cur]
+        head_in = [[[pooled[c]]] for c in range(Cf)]
+        out = self.head.forward(head_in)
+        self._cache = (s, (Hf, Wf))
+        return [out[c][0][0] for c in range(self.num_classes)]
+
+    def backward(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("ConvNeXt.backward: 必须先调用 forward()")
+        if len(dlogits) != self.num_classes:
+            raise ValueError(
+                f"ConvNeXt.backward: dlogits 长度 {len(dlogits)} 与 "
+                f"num_classes={self.num_classes} 不一致")
+        s, (Hf, Wf) = self._cache
+        dhead = [[[float(dlogits[c])]] for c in range(self.num_classes)]
+        dpool = self.head.backward(dhead)
+        C = len(dpool)
+        dcur = [[[dpool[c][0][0] / (Hf * Wf) for _ in range(Wf)]
+                 for _ in range(Hf)] for c in range(C)]
+        for i in range(len(self.channel_plan) - 1, -1, -1):
+            for block in reversed(self.blocks[i]):
+                dcur = block.backward(dcur)
+            if i > 0:
+                dcur = self.downs[i - 1].backward(dcur)
+        H = len(s[0])
+        W = len(s[0][0])
+        dstem = [[[dcur[c][h][w] * _dgelu_scalar(s[c][h][w])
+                   for w in range(W)] for h in range(H)]
+                  for c in range(len(dcur))]
+        return self.stem.backward(dstem)
+
+    # ---------- 参数 / 优化器 ----------
+    def zero_grad(self):
+        self.stem.zero_grad()
+        self.head.zero_grad()
+        for bl in self.blocks:
+            for block in bl:
+                block.zero_grad()
+        for down in self.downs:
+            down.zero_grad()
+
+    def param_count(self):
+        total = _conv_param_count(self.stem) + _conv_param_count(self.head)
+        for bl in self.blocks:
+            for block in bl:
+                total += block.param_count()
+        for down in self.downs:
+            total += _conv_param_count(down)
+        return total
+
+    def train(self):
+        self.training = True
+        for bl in self.blocks:
+            for block in bl:
+                block.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        for bl in self.blocks:
+            for block in bl:
+                block.eval()
+        return self
+
+    def _check_lr(self, lr, who):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(f"ConvNeXt.{who}: lr 必须是非负数，收到 {lr!r}")
+        return float(lr)
+
+    def sgd_step(self, lr):
+        lr = self._check_lr(lr, "sgd_step")
+        _conv_sgd(self.stem, lr)
+        _conv_sgd(self.head, lr)
+        for bl in self.blocks:
+            for block in bl:
+                block.sgd_step(lr)
+        for down in self.downs:
+            _conv_sgd(down, lr)
+
+    def adam_step(self, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        lr = self._check_lr(lr, "adam_step")
+        _conv_adam(self.stem, lr, beta1, beta2, eps)
+        _conv_adam(self.head, lr, beta1, beta2, eps)
+        for bl in self.blocks:
+            for block in bl:
+                block.adam_step(lr, beta1, beta2, eps)
+        for down in self.downs:
+            _conv_adam(down, lr, beta1, beta2, eps)
+
+    # ---------- 训练循环 ----------
+    def fit(self, images, labels, epochs=50, lr=1e-3, shuffle=True,
+            seed=None, verbose=False):
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("ConvNeXt.fit: images 不能为空")
+        if not isinstance(labels, (list, tuple)) or not labels:
+            raise ValueError("ConvNeXt.fit: labels 不能为空")
+        if len(images) != len(labels):
+            raise ValueError(
+                f"ConvNeXt.fit: images={len(images)} 与 labels={len(labels)} 数量不一致")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"ConvNeXt.fit: epochs 必须是 >=1 的整数，收到 {epochs!r}")
+        lr = self._check_lr(lr, "fit")
+        for img in images:
+            self._check_image(img, "fit")
+        for y in labels:
+            if isinstance(y, bool) or not isinstance(y, int) or not (0 <= y < self.num_classes):
+                raise ValueError(
+                    f"ConvNeXt.fit: 标签必须是 0..{self.num_classes - 1} 的整数，收到 {y!r}")
+        rng = random.Random(seed) if seed is not None else random
+        order = list(range(len(images)))
+        history = []
+        for ep in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                logits = self.forward(images[idx])
+                probs = _softmax_row(logits)
+                loss = -math.log(max(probs[labels[idx]], 1e-12))
+                dlogits = list(probs)
+                dlogits[labels[idx]] -= 1.0
+                self.backward(dlogits)
+                self.adam_step(lr)
+                total += loss
+            avg = total / len(images)
             history.append(avg)
             if verbose:
                 print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")

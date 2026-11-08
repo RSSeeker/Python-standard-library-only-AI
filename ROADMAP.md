@@ -174,7 +174,7 @@
 ### W5 注意力与位置编码（P1/P2）
 - [x] `MLA`（低秩 KV 压缩）由 `MLAttention` 承载（`T·d_c` 的 KV cache，见 W5 第 178 行）；`MQA` 是 `num_kv_heads=1` 特例，README 第 553–557 行写明
 - [x] `LearnedPositionalEncoding`（可学习位置编码表，`out=x+table`，`sgd_step`/`adam_step`，超长自动扩表）
-- [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（未实现 YaRN 的 mscale 温度，docstring 注明）
+- [x] RoPE 长度外推 `rope_inv_freqs`：`linear`（频率 /factor）、`ntk`（`base·factor^(d_k/(d_k-2))`）、`yarn`（按 `rotations=original_max·f/(2π)` 与 `beta_fast/beta_slow` 做 smoothstep 分段）；`MultiHeadAttention(rope_scaling=..., rope_factor=..., rope_original_max=...)` 接线，默认 None 与旧版逐位一致；缩放后 `W_q/W_k/W_v/W_o` 梯度与中心差分 ≤1e-6（YaRN 的 mscale 温度由 `MultiHeadAttention.yarn_mscale` 实现，见 W21）
 - [x] `MLAttention`（MLA 简化版：低秩 KV 潜在向量 `d_c`，KV cache 从 `T·2·H·d_k` 降到 `T·d_c`；
       T=4/H=2/d_k=4 时压缩 8 倍；五组权重与偏置梯度中心差分 ≤1e-5）**W5-B4**
 - [x] 位置编码剩余：T5 相对位置偏置、xPos —— `T5RelativeBias(num_heads, num_buckets=32, max_distance=128, bidirectional=True)`（`(num_buckets, num_heads)` 可学习表，`t5_relative_buckets` 按 T5 原公式：正负各占一半桶、每半区再分近端线性/远端对数）+ `xpos_factors(seq_len, d_k, base=10000.0, alpha=1.0, offset=0.0)`（位置衰减 `(t+1+offset)^(-alpha*theta_i)`，位置 0 归 1、`alpha=0` 等于关闭）。踩过的坑：①分桶若把远端也算进本半区低桶，会出现「距离 3 → 桶 3、距离 4 → 桶 0」的非单调，改成每半区再二分后单调；②`_la_apply_adam` 的签名是 `(param, grad, m, v, lr, c1, c2, beta1, beta2, eps)`，没有 `t` 参数
@@ -712,7 +712,14 @@
 
 - [x] 统计/校准小件：`bootstrap_ci`（百分位 bootstrap）、`cohens_d`、`temperature_scale`（NLL 网格 + 三分细化）；测试 `TestBootstrapCohensTemperature` 9 例
 
-全量测试：1839 → 1881 passed（新增 42 例）。
+- [x] 完整 ConvNeXt（`ConvNeXt`：stem `Conv2d(k=2, s=2) → GELU` → 多个 `ConvNeXtBlock` stage +
+  stage 间 2×2 下采样 → 全局平均池化 → 1×1 卷积分类头；`forward` / `backward` /
+  `adam_step` / `fit` / `param_count` / `train` / `eval`）；测试 `TestConvNeXtNetwork` 4 例
+- [x] YaRN 注意力温度 mscale（`MultiHeadAttention.yarn_mscale`：`rope_scaling='yarn'` 时
+  `mscale = 0.1*ln(rope_factor)+1` 乘到 softmax 分数，反向同步乘；默认 1.0 与旧版逐位
+  一致，显式 `yarn_mscale=` 可覆盖）；测试 `TestYarnMscale` 5 例
+
+全量测试：1839 → 1890 passed（新增 51 例）。
 
 ---
 
