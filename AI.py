@@ -31332,6 +31332,140 @@ def wilcoxon_signed_rank_test(x, y=None):
     return {"statistic": min(w_plus, total_rank - w_plus), "p_value": p_value, "n": n}
 
 
+def bootstrap_ci(values, statistic=None, n_boot=1000, level=0.95, seed=None):
+    """对样本做 bootstrap 置信区间（默认统计量：均值）。
+
+    ``statistic`` 接收一次重采样得到的列表并返回标量（如 ``max`` / 中位数函数）。
+    返回 ``(lo, hi)``，用百分位法：下界取 ``(1-level)/2`` 分位、上界取
+    ``(1+level)/2`` 分位。
+    """
+    who = "bootstrap_ci"
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{who}: values 必须是非空列表")
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError):
+        raise ValueError(f"{who}: values 必须是数字序列")
+    if statistic is None:
+        def statistic(sample):
+            return sum(sample) / len(sample)
+    elif not callable(statistic):
+        raise TypeError(f"{who}: statistic 必须是可调用对象或 None")
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise ValueError(f"{who}: n_boot 必须是 ≥1 的整数，收到 {n_boot!r}")
+    if isinstance(level, bool) or not isinstance(level, (int, float)) or not 0.0 < level < 1.0:
+        raise ValueError(f"{who}: level 必须在 (0,1) 内，收到 {level!r}")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError(f"{who}: seed 必须是整数或 None，收到 {seed!r}")
+    rng = random.Random(seed)
+    n = len(vals)
+    boots = []
+    for _ in range(n_boot):
+        sample = [vals[rng.randrange(n)] for _ in range(n)]
+        boots.append(statistic(sample))
+    boots.sort()
+    lo = max(0, int(math.floor((1.0 - level) / 2.0 * n_boot)))
+    hi = min(n_boot - 1, int(math.ceil((1.0 + level) / 2.0 * n_boot)) - 1)
+    return boots[lo], boots[hi]
+
+
+def cohens_d(x, y):
+    """Cohen's d 效应量（独立样本，合并标准差）。
+
+    ``d = (mean(x) - mean(y)) / pooled_sd``；两组方差都为 0 时返回 0.0。
+    常规口径：|d| < 0.2 微小、0.2~0.5 小、0.5~0.8 中、> 0.8 大。
+    """
+    who = "cohens_d"
+
+    def _vector(values, name):
+        if not isinstance(values, (list, tuple)) or len(values) < 2:
+            raise ValueError(f"{who}: {name} 必须是长度 ≥2 的列表")
+        try:
+            return [float(v) for v in values]
+        except (TypeError, ValueError):
+            raise ValueError(f"{who}: {name} 必须是数字序列")
+
+    xs = _vector(x, "x")
+    ys = _vector(y, "y")
+    n1 = len(xs)
+    n2 = len(ys)
+    m1 = sum(xs) / n1
+    m2 = sum(ys) / n2
+    v1 = sum((v - m1) ** 2 for v in xs) / (n1 - 1)
+    v2 = sum((v - m2) ** 2 for v in ys) / (n2 - 1)
+    pooled = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+    if pooled <= 0.0:
+        return 0.0
+    return (m1 - m2) / math.sqrt(pooled)
+
+
+def temperature_scale(logits, y_true, search_points=200, refine_steps=60):
+    """温度缩放校准：在验证集 logits 上拟合标量温度 T，使 NLL 最小。
+
+    返回 ``{"temperature": T, "nll": 校准后 NLL, "nll_before": T=1 时 NLL}``。
+    ``logits`` 是未 softmax 的分数行、``y_true`` 是类别下标；T<1 锐化、
+    T>1 平滑。先在 [0.05, 20] 的 log 网格上粗搜，再在最优格点邻域做
+    三分细化。
+    """
+    who = "temperature_scale"
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError(f"{who}: logits 必须是非空列表")
+    n = len(logits)
+    if not isinstance(y_true, (list, tuple)) or len(y_true) != n:
+        raise ValueError(f"{who}: y_true 长度必须等于 logits 行数")
+    rows = []
+    for i, row in enumerate(logits):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行 logits 必须是非空列表")
+        try:
+            rows.append([float(v) for v in row])
+        except (TypeError, ValueError):
+            raise ValueError(f"{who}: 第 {i} 行 logits 必须是数字序列")
+    c = len(rows[0])
+    for i, row in enumerate(rows):
+        if len(row) != c:
+            raise ValueError(f"{who}: 第 {i} 行 logits 长度 {len(row)} != {c}")
+    labels = []
+    for i, y in enumerate(y_true):
+        if isinstance(y, bool) or not isinstance(y, int) or not 0 <= y < c:
+            raise ValueError(f"{who}: 第 {i} 个标签必须是 [0,{c}) 的整数，收到 {y!r}")
+        labels.append(y)
+    if isinstance(search_points, bool) or not isinstance(search_points, int) or search_points < 3:
+        raise ValueError(f"{who}: search_points 必须是 ≥3 的整数")
+    if isinstance(refine_steps, bool) or not isinstance(refine_steps, int) or refine_steps < 1:
+        raise ValueError(f"{who}: refine_steps 必须是 ≥1 的整数")
+
+    def nll_at(t):
+        total = 0.0
+        for row, y in zip(rows, labels):
+            m = max(row)
+            ex = [math.exp((v - m) / t) for v in row]
+            total -= (row[y] - m) / t - math.log(sum(ex))
+        return total / n
+
+    best_t = 1.0
+    best = nll_at(1.0)
+    lo_t = math.log(0.05)
+    hi_t = math.log(20.0)
+    for k in range(search_points):
+        t = math.exp(lo_t + (hi_t - lo_t) * k / (search_points - 1))
+        v = nll_at(t)
+        if v < best:
+            best = v
+            best_t = t
+    lo = max(0.05, best_t / math.e)
+    hi = min(20.0, best_t * math.e)
+    for _ in range(refine_steps):
+        m1 = lo + (hi - lo) / 3.0
+        m2 = hi - (hi - lo) / 3.0
+        if nll_at(m1) <= nll_at(m2):
+            hi = m2
+        else:
+            lo = m1
+    t = 0.5 * (lo + hi)
+    return {"temperature": t, "nll": nll_at(t), "nll_before": nll_at(1.0)}
+
+
 def _regression_pairs(y_true, y_pred, who):
     """把回归目标转成一维浮点列表（支持标量列表或多输出逐维平均）。"""
     yt, yp = _metric_pairs(y_true, y_pred, who)

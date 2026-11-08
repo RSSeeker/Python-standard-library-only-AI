@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1872 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1881 项）
 
 ## 特性
 
@@ -1270,6 +1270,9 @@ print(AI.brier_score([0, 1], [0.2, 0.8]))   # 0.0400
 | `ood_detection_auroc(in_scores, ood_scores)` | ID=1 / OOD=0 的 ROC-AUC（复用 `roc_auc_score`） |
 | `mcnemar_test(y_true, y_pred_a, y_pred_b, exact=None)` | 配对 McNemar：返回 `statistic`/`p_value`/`n10`/`n01`/`discordant`；`exact=None` 时不和谐对 ≤25 用精确二项，否则用带连续性校正的卡方 |
 | `wilcoxon_signed_rank_test(x, y=None)` | Wilcoxon 符号秩检验（配对）：`min(W+, W−)` + 正态近似 p 值（含并列秩校正） |
+| `bootstrap_ci(values, statistic=None, n_boot=1000, level=0.95, seed=None)` | 百分位 bootstrap 置信区间（默认统计量：均值；`statistic` 可传 `max` 等可调用对象） |
+| `cohens_d(x, y)` | Cohen's d 效应量（独立样本、合并标准差；方差全 0 时返回 0.0） |
+| `temperature_scale(logits, y_true, search_points=200, refine_steps=60)` | 温度缩放校准：拟合使 NLL 最小的 T，返回 `{temperature, nll, nll_before}`（T<1 锐化、T>1 平滑） |
 
 ```python
 print(AI.multilabel_exact_match_ratio([[1, 0], [0, 1]], [[1, 0], [1, 0]]))  # 0.5
@@ -3304,7 +3307,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1872 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1881 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3373,6 +3376,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCompositeModels` | LLaMA 前向形状/参数量/fit 降 loss/generate/GQA/非法输入；ResNet 前向/参数量、`Bottleneck2d` stride=2 反向回归、100 轮拟合收敛（合成图案 6/6） |
 | `TestMultiLabelAndStatistics` | 多标签 Exact Match / Ranking Loss / LRAP 手算值；MSP / Energy / OOD AUROC；McNemar 精确与近似；Wilcoxon 对称与单侧 |
 | `TestT5AndBertModels` | T5 forward/param_count=6040/编码器与解码器相对偏置梯度非零/fit 降 loss/非法输入；BERT MLM+NSP forward、loss 下降、mask 标签与 NSP 非法输入 |
+| `TestBootstrapCohensTemperature` | bootstrap CI 包含均值/自定义统计量/非法参数；Cohen's d 已知值、相同与零方差；温度缩放的欠自信锐化、过自信平滑、对称样本平坦与非法输入 |
 | `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
 | `TestSamplingExtras` | typical 含 argmax 且累计 ≥ mass / top-a 与 eta 的单调性 / mirostat 的 mu 单调与熵上界 / `mu` 更新方向与下限 / 非法参数 |
 | `TestConstrainedDecoding` | token 掩码只留允许集合且概率和仍为 1 / 前缀约束的状态转移与 `eos_id` / 非前缀报错 / 与采样器叠加 / 非法输入 |
@@ -3592,7 +3596,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1872 个单元测试
+├── test_ai.py       # 1881 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

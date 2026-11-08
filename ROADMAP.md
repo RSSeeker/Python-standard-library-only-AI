@@ -710,7 +710,9 @@
 
 - [x] 清单驱动的低成本小件：ROUGE-S / ROUGE-W（`rouge_s` / `rouge_w`）与 IA³ 适配器（`IA3`，冻结原层只训输出通道缩放）；测试 `TestRougeExtraAndIA3` 12 例
 
-全量测试：1839 → 1872 passed（新增 33 例）。
+- [x] 统计/校准小件：`bootstrap_ci`（百分位 bootstrap）、`cohens_d`、`temperature_scale`（NLL 网格 + 三分细化）；测试 `TestBootstrapCohensTemperature` 9 例
+
+全量测试：1839 → 1881 passed（新增 42 例）。
 
 ---
 

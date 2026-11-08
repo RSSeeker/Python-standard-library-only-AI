@@ -28471,3 +28471,79 @@ class TestRougeExtraAndIA3:
         with pytest.raises(RuntimeError):
             adapter.backward([1.0, 1.0])
 
+
+
+class TestBootstrapCohensTemperature:
+    def test_bootstrap_ci_contains_mean(self):
+        lo, hi = AI.bootstrap_ci([1, 2, 3, 4, 5], seed=7, n_boot=400)
+        assert lo <= 3.0 <= hi
+        assert lo < hi
+
+    def test_bootstrap_ci_custom_statistic(self):
+        lo, hi = AI.bootstrap_ci([1, 2, 3, 4, 5], statistic=max, seed=3, n_boot=300)
+        assert 3.0 <= lo <= hi
+        assert hi == 5.0
+
+    def test_bootstrap_ci_errors(self):
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci([])
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci(["a"])
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci([1, 2], n_boot=0)
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci([1, 2], n_boot=True)
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci([1, 2], level=1.5)
+        with pytest.raises(ValueError):
+            AI.bootstrap_ci([1, 2], seed="x")
+        with pytest.raises(TypeError):
+            AI.bootstrap_ci([1, 2], statistic=3)
+
+    def test_cohens_d_known_values(self):
+        assert abs(AI.cohens_d([1, 2, 3], [2, 3, 4]) + 1.0) < 1e-12
+        assert abs(AI.cohens_d([2, 3, 4], [1, 2, 3]) - 1.0) < 1e-12
+        assert AI.cohens_d([1, 2, 3], [1, 2, 3]) == 0.0
+        assert AI.cohens_d([2, 2, 2], [5, 5, 5]) == 0.0
+
+    def test_cohens_d_errors(self):
+        with pytest.raises(ValueError):
+            AI.cohens_d([1], [1, 2])
+        with pytest.raises(ValueError):
+            AI.cohens_d([1, 2], [])
+        with pytest.raises(ValueError):
+            AI.cohens_d(["a", "b"], [1, 2])
+
+    def test_temperature_scale_underconfident(self):
+        res = AI.temperature_scale(
+            [[0.2, 0.0], [0.0, 0.2], [0.2, 0.0], [0.0, 0.2]], [0, 1, 0, 1])
+        assert res["temperature"] < 0.2
+        assert res["nll"] < res["nll_before"]
+
+    def test_temperature_scale_overconfident(self):
+        res = AI.temperature_scale([[3.0, -3.0], [3.0, -3.0]], [1, 1])
+        assert res["temperature"] > 1.0
+        assert res["nll"] < res["nll_before"]
+
+    def test_temperature_scale_symmetric_is_flat(self):
+        res = AI.temperature_scale([[0.0, 0.0], [0.0, 0.0]], [0, 1])
+        assert abs(res["nll"] - res["nll_before"]) < 1e-9
+
+    def test_temperature_scale_errors(self):
+        with pytest.raises(ValueError):
+            AI.temperature_scale([], [])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[]], [0])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0], [0.0]], [0, 0])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0]], [2])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0]], [True])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0]], [0, 1])
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0]], [0], search_points=2)
+        with pytest.raises(ValueError):
+            AI.temperature_scale([[0.0, 1.0]], [0], refine_steps=0)
+
