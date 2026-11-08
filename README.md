@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1825 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1836 项）
 
 ## 特性
 
@@ -2759,6 +2759,49 @@ print(g.out_shape(), g.param_count(), score, gp["penalty"])
 - **`wgan_gp_penalty` 会污染判别器的梯度缓冲**（它内部对输入做一次反向）。调用前后都要 `discriminator.zero_grad()`，否则下一次 `sgd_step` 会把罚项梯度一起用上。
 - **判别器的 `base` 必须等于输入边长**（`base=8` 配 8×8），否则卷积栈压不到 1×1，最后报 `Layer.forward: 输入长度 ... 与本层 fan_in ... 不一致`。
 
+### Score-based / SDE / 多尺度 Glow（W8-B）
+
+| API | 说明 |
+|-----|------|
+| `vp_beta(t, beta_min=0.1, beta_max=20.0)` / `vp_diffusion` / `vp_drift` / `vp_marginal_std` | VP-SDE 的线性 `β(t)`、`g(t)=√β`、漂移 `−½βx`、边缘标准差 `√(1−e^{−∫β})` |
+| `ve_sigma(t, sigma_min=0.01, sigma_max=50.0)` / `ve_diffusion` | VE-SDE 的对数插值 `σ(t)` 与 `g(t)=√(2σ²·log(σ_max/σ_min))` |
+| `reverse_sde_step(x, t, score, dt, noise=None, kind='ve')` / `probability_flow_step(...)` | 单步反向 SDE（`dx = f dt − g²∇log p dt + g√|dt| z`）与概率流 ODE（去掉噪声项）；`dt` 必须为负 |
+| `ncsn_loss(score_fn, xs, sigmas, seed=None)` | 去噪分数匹配的逐 σ 平均，返回 `(loss, info)`，`info["per_sigma"]` 分开给 |
+| `annealed_langevin_sample(score_fn, x0, sigmas, steps_per_sigma=10, epsilon=0.01, seed=None)` | 退火 Langevin 采样（每个 σ 走若干步，步长按 `ε·σ²/σ_last²` 缩放） |
+| `ebm_langevin(grad_energy, x0, steps, step_size, noise, seed=None)` | 能量模型的 Langevin 采样：`x ← x − η∇E + √(2η)·noise` |
+| `ebm_contrastive_divergence(energy_fn, grad_energy, x_data, steps, step_size, noise, seed=None)` | 对比散度：`E(data) − E(负样本)`；`info` 给 `mean_energy_data` / `mean_energy_negative` / `negative_samples` |
+| `consistency_model_loss(student, teacher, xs, t_high=0.8, t_low=0.2, sigma_data=0.5, seed=None)` / `consistency_sample(student, x_noisy, t)` | 一致性训练的最小形式：`x_t = x + t·σ_d·ε`，学生从 `t_low` 一步对齐教师在 `t_high` 的输出 |
+| `ComposedGlow(dim, hidden_dim, num_layers, blocks, seed)` / `MultiScaleGlow(dim, scales, ...)` | 把 `ActNorm` / `InvertibleLinear` / `RealNVP` 串成完整 Glow；多尺度版逐级减半，`log_prob` 可加 |
+| `pixelcnn_mask(kernel_size=3, kind='A'\|'B')` / `masked_conv2d(x, kernel, mask)` | PixelCNN 的因果卷积掩码（`A` 含中心共 5 项、`B` 不含共 4 项）与单通道掩码卷积（只验因果性，无参数） |
+| `wavenet_dilations(levels, kernel_size=2)` | WaveNet 的膨胀序列 `[1,2,4,…]` 与接受野 `1+(k−1)Σd` |
+| `latent_diffusion_shapes(image_shape, downsample=4)` / `latent_diffusion_pipeline(encode, decode, diffusion, image)` | 潜空间尺寸（整除）与「向量 → 潜向量 → 向量」的组装、压缩比 |
+
+```python
+import AI
+
+# 1) VP / VE 系数与单步反向
+print(AI.vp_beta(0.5), AI.ve_sigma(0.5), AI.vp_marginal_std(0.5))
+print(AI.reverse_sde_step([0.3, -0.7], 0.4, lambda v, t: [0.5, -1.5], -0.05,
+                          noise=[0.2, -0.4], kind="ve"))
+
+# 2) 去噪分数匹配（用真高斯 score 得到有限但非零的损失）
+score = lambda v, s: [-x / (1.0 + s * s) for x in v]
+print(AI.ncsn_loss(score, [[0.5, -0.3], [1.0, 0.2]], sigmas=(0.5, 0.2), seed=11)[0])
+
+# 3) 多尺度 Glow 的密度与往返
+glow = AI.MultiScaleGlow(8, scales=2, hidden_dim=8, num_layers=1, blocks=1, seed=3)
+x = [0.1, -0.2, 0.3, 0.0, 0.5, -0.6, 0.7, 0.8]
+zs, logdet = glow.forward(x)
+print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs), x)))
+```
+
+四条边界：
+
+- **只有 Glow 带手写反向**。Informer 的稀疏注意力、Autoformer 的分解/聚合、`ncsn_loss` / 一致性损失 / EBM 都是**前向或损失级**实现，不接入 `MLP` 的梯度链；docstring 里都写了。
+- **Informer / Autoformer 是投影而不是复现**：稀疏注意力按 `max(row)−mean(row)` 选 `u = max(1, factor·log T)` 个查询做完整 softmax、其余查询取 V 的均值；自相关聚合取 top-k 滞后做平移平均。复杂度真的降了，但精度不是论文数字。
+- **一致性损失省掉了 `c_skip/c_out` 与 `λ(t)` 加权**，所以「学生 == 教师」时损失**不为 0**（`x_hi` 与 `x_lo` 来自不同噪声尺度）；只有两个恒等常量函数才给出 0。
+- **`latent_diffusion_pipeline` 吃扁平向量**（`encode` / `decode` 都是「数值列表 → 数值列表」），验证的是形状记账与压缩比，不是卷积自编码器。
+
 ### 工具函数
 
 | 函数 | 说明 |
@@ -3175,7 +3218,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1825 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1836 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3448,6 +3491,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHooks` | 前向/反向 hook 都能看到该层张量、注销与 `clear_hooks` 生效、非法 index/不可调用报错、挂 hook 不改变训练数值（两个同权重模型逐位相同） |
 | `TestConvTranspose2d` | 输出尺寸公式与 `output_padding`、单点散布核、伴随恒等 `<Cx,y>==<x,C^T y>`、梯度 vs 数值、非法参数 |
 
+| `TestScoreEBM` | VP/VE 系数的闭式解与端点、反向 SDE / 概率流单步手算、`ncsn_loss` **复刻 rng 抽样顺序后逐位对照**且错 score 更大、退火 Langevin 的均值/方差落在区间、EBM 的 CD 分解与 Langevin 收缩、一致性损失的零函数为 0、`ComposedGlow` / `MultiScaleGlow` 往返与 `log_prob` 公式、PixelCNN 掩码权重和与因果性、WaveNet 膨胀与接受野、潜空间尺寸（整除）与管线往返、约 20 条非法参数 |
+
 CI（GitHub Actions）执行 flake8 + pytest。
 
 下一步的扩展计划（网络层 / 损失 / 优化器 / 数据管道 / 推理部署等 17 类，按 20 个波次排期）见 [ROADMAP.md](ROADMAP.md)。
@@ -3457,7 +3502,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1825 个单元测试
+├── test_ai.py       # 1836 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

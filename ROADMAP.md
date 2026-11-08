@@ -239,7 +239,12 @@
   - `nll = 0.5|y|² + 0.5d·log2π − logdet` ⇒ `dL/dlogdet = -1`，符号写反会让训练朝反方向走
 - [x] Glow 的两个可逆组件：`ActNorm(dim)`（`data_init` 按首批统计量初始化，`logdet=Σlog_s` 与输入无关）+ `InvertibleLinear(dim)`（`log|det J|=log|det W|` 精确，LU 部分主元求 det、高斯消元求逆，反向含 `g_logdet·W^{-T}` 项，实测 1e-5 内）
   - 踩坑：`ActNorm.g_log_s` 的符号（`dy/dlog_s = y` 不是 `-y`），中心差分立刻抓到（解析 -3.64 vs 数值 5.24）
-- [ ] 其它：Score-based（NCSN）/ SDE、Consistency Models、多尺度 Glow 组合（把上面两件与 RealNVP 耦合串成完整 Glow）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
+- [x] 其它：Score-based（NCSN）/ SDE、Consistency Models、多尺度 Glow 组合（把上面两件与 RealNVP 耦合串成完整 Glow）、PixelCNN·WaveNet（概念）、Latent Diffusion（概念）、EBM
+  - NCSN 的去噪分数匹配：真高斯 score 上损失**不为 0**（逐样本残差本来就非零），探针必须复刻 `random.Random(seed)` 的抽样顺序才谈得上逐位对照
+  - VP/VE 系数（`β(t)`、`g(t)`、`√(1−e^{−∫β})`）、反向 SDE 与概率流 ODE 的单步手算、退火 Langevin（`ε=0.005, steps=20` 时 mean −0.069 / var 1.250；`ε=0.02` 会发散）
+  - `MultiScaleGlow` 拼装 `ActNorm`/`InvertibleLinear`/`RealNVP`：往返 3.3e-16、`logdet=−1.756903`（`dim=8, scales=2, hidden=8, layers=1, blocks=1, seed=3`）；真 bug 是 `inverse` 的维度检查写成 `len(cur) != 2*len(part)`
+  - PixelCNN 掩码（`A` 权重和 5 / `B` 4）+ `masked_conv2d` 的因果性对照；WaveNet 膨胀与接受野公式
+  - 潜扩散的形状记账：`latent_diffusion_shapes` 整除、`latent_diffusion_pipeline` 吃扁平向量的压缩比
 
 ### W9 优化器与调度（§3/§4）
 - [x] `SGDW`（解耦 wd）/ Nesterov / `Lookahead`（外挂任意优化器）/ `SWA` / `EMA`

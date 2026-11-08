@@ -10478,6 +10478,693 @@ def pix2pix_g_loss(fake_scores, fake_image, real_image, lambda_l1=100.0):
     l1 /= (c * h * w)
     return bce + float(lambda_l1) * l1
 
+# =============================================================================
+#  研究前沿 W8-B：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+# =============================================================================
+#  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要
+#  额外训练一个网络就能验证数学：探针里用高斯数据的**闭式 score** 做端到端
+#  采样，与理论方差对照。真实训练时把 score_fn 换成 MLP(x, sigma) -> list 即可。
+
+
+def _w8b_vec(x, who):
+    """把 x 规范成「数字列表」，拒 bool/NaN/inf。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("%s: 需要非空的一维列表，收到 %r" % (who, type(x).__name__))
+    out = []
+    for i, v in enumerate(x):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("%s: 第 %d 个元素不是数字（%r）" % (who, i, v))
+        fv = float(v)
+        if fv != fv or fv in (float("inf"), float("-inf")):
+            raise ValueError("%s: 第 %d 个元素不是有限数（%r）" % (who, i, v))
+        out.append(fv)
+    return out
+
+
+def _w8b_scalar(v, who, minimum=None):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError("%s: 需要数字，收到 %r" % (who, type(v).__name__))
+    fv = float(v)
+    if fv != fv or fv in (float("inf"), float("-inf")):
+        raise ValueError("%s: 需要有限数，收到 %r" % (who, v))
+    if minimum is not None and fv < minimum:
+        raise ValueError("%s: 需要 >= %r，收到 %r" % (who, minimum, v))
+    return fv
+
+
+def _w8b_sigmas(sigmas, who="sigmas"):
+    """噪声等级序列：正数、严格递减（NCSN 的退火前提）。"""
+    if not isinstance(sigmas, (list, tuple)) or not sigmas:
+        raise ValueError("%s: 需要非空序列" % who)
+    out = [_w8b_scalar(s, "%s[%d]" % (who, i), minimum=0.0) for i, s in enumerate(sigmas)]
+    for i, s in enumerate(out):
+        if s <= 0.0:
+            raise ValueError("%s[%d] 必须 > 0（收到 %r）" % (who, i, sigmas[i]))
+    for i in range(1, len(out)):
+        if not out[i] < out[i - 1]:
+            raise ValueError("%s 必须严格递减（第 %d 项 %r 不小于前一项 %r）"
+                             % (who, i, out[i], out[i - 1]))
+    return out
+
+
+def _w8b_call_score(score_fn, x, sigma):
+    """调用 score 函数并校验形状与有限性。"""
+    if not callable(score_fn):
+        raise TypeError("score_fn 必须可调用，收到 %r" % type(score_fn).__name__)
+    out = score_fn(list(x), sigma)
+    vec = _w8b_vec(out, "score_fn 的返回值")
+    if len(vec) != len(x):
+        raise ValueError("score_fn 返回长度 %d 与输入长度 %d 不一致"
+                         % (len(vec), len(x)))
+    return vec
+
+
+# ---------------------------------------------------------------- 扩散系数 --
+def vp_beta(t, beta_min=0.1, beta_max=20.0):
+    """VP-SDE 的线性 beta 调度：beta(t) = beta_min + t (beta_max - beta_min)。"""
+    tt = _w8b_scalar(t, "t", minimum=0.0)
+    if tt > 1.0:
+        raise ValueError("t: 需要 0 <= t <= 1，收到 %r" % t)
+    bmin = _w8b_scalar(beta_min, "beta_min", minimum=0.0)
+    bmax = _w8b_scalar(beta_max, "beta_max", minimum=0.0)
+    if not bmax > bmin:
+        raise ValueError("beta_max 必须大于 beta_min（收到 %r / %r）" % (beta_max, beta_min))
+    return bmin + tt * (bmax - bmin)
+
+
+def vp_diffusion(t, beta_min=0.1, beta_max=20.0):
+    """VP-SDE 的扩散系数 g(t) = sqrt(beta(t))。"""
+    return math.sqrt(vp_beta(t, beta_min, beta_max))
+
+
+def vp_drift(x, t, beta_min=0.1, beta_max=20.0):
+    """VP-SDE 的漂移 f(x, t) = -0.5 beta(t) x。"""
+    vec = _w8b_vec(x, "vp_drift.x")
+    half_beta = 0.5 * vp_beta(t, beta_min, beta_max)
+    return [-half_beta * v for v in vec]
+
+
+def vp_marginal_std(t, beta_min=0.1, beta_max=20.0):
+    """VP-SDE 的边缘标准差：sqrt(1 - exp(-∫beta))，t=0 时为 0。"""
+    tt = _w8b_scalar(t, "t", minimum=0.0)
+    if tt > 1.0:
+        raise ValueError("t: 需要 0 <= t <= 1，收到 %r" % t)
+    bmin = _w8b_scalar(beta_min, "beta_min", minimum=0.0)
+    bmax = _w8b_scalar(beta_max, "beta_max", minimum=0.0)
+    # ∫_0^t beta(s) ds = bmin t + 0.5 (bmax - bmin) t^2
+    integral = bmin * tt + 0.5 * (bmax - bmin) * tt * tt
+    return math.sqrt(1.0 - math.exp(-integral))
+
+
+def ve_sigma(t, sigma_min=0.01, sigma_max=50.0):
+    """VE-SDE 的噪声尺度 sigma(t) = sigma_min (sigma_max/sigma_min)^t（几何插值）。"""
+    tt = _w8b_scalar(t, "t", minimum=0.0)
+    if tt > 1.0:
+        raise ValueError("t: 需要 0 <= t <= 1，收到 %r" % t)
+    smin = _w8b_scalar(sigma_min, "sigma_min", minimum=0.0)
+    smax = _w8b_scalar(sigma_max, "sigma_max", minimum=0.0)
+    if smin <= 0.0 or not smax > smin:
+        raise ValueError("需要 0 < sigma_min < sigma_max（收到 %r / %r）" % (sigma_min, sigma_max))
+    return smin * (smax / smin) ** tt
+
+
+def ve_diffusion(t, sigma_min=0.01, sigma_max=50.0):
+    """VE-SDE 的扩散系数 g(t) = sqrt(2 sigma(t) sigma'(t))。"""
+    tt = _w8b_scalar(t, "t", minimum=0.0)
+    sigma = ve_sigma(tt, sigma_min, sigma_max)
+    # sigma'(t) = sigma(t) * ln(smax/smin)
+    log_ratio = math.log(float(sigma_max) / float(sigma_min))
+    return math.sqrt(2.0 * sigma * sigma * log_ratio)
+
+
+# --------------------------------------------------------- 反向 SDE / ODE --
+def reverse_sde_step(x, t, score, dt, noise=None, kind="ve",
+                     beta_min=0.1, beta_max=20.0, sigma_min=0.01, sigma_max=50.0):
+    """反向 SDE 单步：dx = [f - g² score] dt + g sqrt(|dt|) z（dt 应为负）。
+
+    VP 用 `f(x,t) = -0.5 beta(t) x`；VE 的 f 是 0。返回新列表，不改入参。
+    """
+    vec = _w8b_vec(x, "reverse_sde_step.x")
+    d = _w8b_scalar(dt, "dt")
+    if d == 0.0:
+        raise ValueError("dt 不能为 0")
+    if d > 0.0:
+        raise ValueError("反向扩散的 dt 应为负（收到 %r）" % dt)
+    sc = _w8b_call_score(score, vec, t)
+    kind = str(kind).lower()
+    if kind == "vp":
+        f = vp_drift(vec, t, beta_min, beta_max)
+        g = vp_diffusion(t, beta_min, beta_max)
+    elif kind == "ve":
+        f = [0.0] * len(vec)
+        g = ve_diffusion(t, sigma_min, sigma_max)
+    else:
+        raise ValueError("kind: 只支持 'vp' 或 've'，收到 %r" % kind)
+    if noise is None:
+        noise_vec = [0.0] * len(vec)
+    else:
+        noise_vec = _w8b_vec(noise, "reverse_sde_step.noise")
+        if len(noise_vec) != len(vec):
+            raise ValueError("noise 长度 %d 与 x 长度 %d 不一致"
+                             % (len(noise_vec), len(vec)))
+    step = math.sqrt(abs(d))
+    out = []
+    for i, xi in enumerate(vec):
+        drift = f[i] - (g * g) * sc[i]
+        out.append(xi + drift * d + g * step * noise_vec[i])
+    return out
+
+
+def probability_flow_step(x, t, score, dt, kind="ve",
+                          beta_min=0.1, beta_max=20.0,
+                          sigma_min=0.01, sigma_max=50.0):
+    """概率流 ODE 单步（无噪声）：dx = [f - 0.5 g² score] dt。"""
+    vec = _w8b_vec(x, "probability_flow_step.x")
+    d = _w8b_scalar(dt, "dt")
+    sc = _w8b_call_score(score, vec, t)
+    kind = str(kind).lower()
+    if kind == "vp":
+        f = vp_drift(vec, t, beta_min, beta_max)
+        g = vp_diffusion(t, beta_min, beta_max)
+    elif kind == "ve":
+        f = [0.0] * len(vec)
+        g = ve_diffusion(t, sigma_min, sigma_max)
+    else:
+        raise ValueError("kind: 只支持 'vp' 或 've'，收到 %r" % kind)
+    out = []
+    for i, xi in enumerate(vec):
+        out.append(xi + (f[i] - 0.5 * (g * g) * sc[i]) * d)
+    return out
+
+
+# ----------------------------------------------------- NCSN（去噪分数匹配） --
+def ncsn_loss(score_fn, xs, sigmas=(1.0, 0.5, 0.2), seed=None):
+    """去噪分数匹配（NCSN）：每个噪声等级上回归 `-eps/sigma`。
+
+    `sigma^2 * || s(x + sigma eps, sigma) + eps/sigma ||^2 / 2`，对所有样本与
+    所有 sigma 取平均（各 sigma 的系数被 sigma^2 抵消，与论文的
+    `lambda(sigma) = sigma^2` 一致）。返回 `(loss, info)`，`info` 给出每个
+    sigma 上的分项损失，便于观察哪个噪声等级没学好。
+    """
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("xs: 需要非空样本列表")
+    if not callable(score_fn):
+        raise TypeError("score_fn 必须可调用，收到 %r" % type(score_fn).__name__)
+    levels = _w8b_sigmas(sigmas)
+    dim = None
+    rows = []
+    for i, x in enumerate(xs):
+        vec = _w8b_vec(x, "xs[%d]" % i)
+        if dim is None:
+            dim = len(vec)
+        elif len(vec) != dim:
+            raise ValueError("xs 各样本维度不一致（第 %d 个是 %d，应为 %d）"
+                             % (i, len(vec), dim))
+        rows.append(vec)
+    rng = random.Random(seed)
+    per_sigma = [0.0] * len(levels)
+    for li, sigma in enumerate(levels):
+        total = 0.0
+        for row in rows:
+            eps = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+            noisy = [row[i] + sigma * eps[i] for i in range(dim)]
+            sc = _w8b_call_score(score_fn, noisy, sigma)
+            acc = 0.0
+            for i in range(dim):
+                target = -eps[i] / sigma
+                diff = sc[i] - target
+                acc += diff * diff
+            total += 0.5 * (sigma * sigma) * acc
+        per_sigma[li] = total / len(rows)
+    loss = sum(per_sigma) / len(per_sigma)
+    return loss, {"sigmas": list(levels), "per_sigma": per_sigma,
+                  "n_samples": len(rows), "dim": dim}
+
+
+def annealed_langevin_sample(score_fn, x0, sigmas=(1.0, 0.5, 0.2, 0.1),
+                             steps_per_sigma=10, epsilon=0.01, seed=None):
+    """退火 Langevin 采样（NCSN 的采样器）。
+
+    在 sigma_i 上跑 `steps_per_sigma` 步：
+    `x += step * score(x, sigma_i) + sqrt(2 step) z`，其中
+    `step = epsilon * (sigma_i / sigma_last)^2`。返回最后一次迭代的样本。
+    """
+    vec = _w8b_vec(x0, "annealed_langevin_sample.x0")
+    levels = _w8b_sigmas(sigmas)
+    steps = _w8b_scalar(steps_per_sigma, "steps_per_sigma", minimum=1.0)
+    if int(steps) != steps:
+        raise ValueError("steps_per_sigma 需要整数，收到 %r" % steps_per_sigma)
+    eps = _w8b_scalar(epsilon, "epsilon", minimum=0.0)
+    if eps <= 0.0:
+        raise ValueError("epsilon 必须 > 0")
+    rng = random.Random(seed)
+    x = list(vec)
+    scale = eps / (levels[-1] * levels[-1])
+    for sigma in levels:
+        step = scale * sigma * sigma
+        for _ in range(int(steps)):
+            sc = _w8b_call_score(score_fn, x, sigma)
+            nxt = []
+            for i in range(len(x)):
+                z = rng.gauss(0.0, 1.0)
+                nxt.append(x[i] + step * sc[i] + math.sqrt(2.0 * step) * z)
+            x = nxt
+    return x
+
+
+# ---------------------------------------------------------------- EBM ------
+def ebm_langevin(grad_energy, x0, steps=20, step_size=0.01, noise=0.01, seed=None):
+    """能量模型的 Langevin 采样：`x -= step * gradE(x) + noise * z`。
+
+    注意这里的 `noise` 是**每次迭代的噪声幅度**（不是温度），与
+    `annealed_langevin_sample` 里的 `sqrt(2 step)` 口径不同，二者不混用。
+    """
+    vec = _w8b_vec(x0, "ebm_langevin.x0")
+    if not callable(grad_energy):
+        raise TypeError("grad_energy 必须可调用，收到 %r" % type(grad_energy).__name__)
+    n = _w8b_scalar(steps, "steps", minimum=1.0)
+    if int(n) != n:
+        raise ValueError("steps 需要整数，收到 %r" % steps)
+    step = _w8b_scalar(step_size, "step_size", minimum=0.0)
+    if step <= 0.0:
+        raise ValueError("step_size 必须 > 0")
+    sd = _w8b_scalar(noise, "noise", minimum=0.0)
+    rng = random.Random(seed)
+    x = list(vec)
+    for _ in range(int(n)):
+        g = _w8b_vec(grad_energy(list(x)), "grad_energy 的返回值")
+        if len(g) != len(x):
+            raise ValueError("grad_energy 返回长度 %d 与输入长度 %d 不一致"
+                             % (len(g), len(x)))
+        x = [x[i] - step * g[i] + sd * rng.gauss(0.0, 1.0) for i in range(len(x))]
+    return x
+
+
+def ebm_contrastive_divergence(energy_fn, grad_energy, x_data, steps=20,
+                               step_size=0.01, noise=0.01, seed=None):
+    """对比散度（CD-k）：`loss = mean E(x_data) - mean E(x_neg)`。
+
+    返回 `(loss, info)`，`info` 含负样本与两侧能量均值。这里是**标量损失**，
+    不含参数梯度——那是具体 EBM 实现（能量函数自己的 backward）的事，本库
+    不为它造一个空壳。`loss > 0` 表示数据能量高于负样本，是训练早期的常态。
+    """
+    if not callable(energy_fn) or not callable(grad_energy):
+        raise TypeError("energy_fn 与 grad_energy 都必须可调用")
+    if not isinstance(x_data, (list, tuple)) or not x_data:
+        raise ValueError("x_data: 需要非空样本列表")
+    pos = [_w8b_vec(x, "x_data[%d]" % i) for i, x in enumerate(x_data)]
+    dim = len(pos[0])
+    for i, row in enumerate(pos):
+        if len(row) != dim:
+            raise ValueError("x_data 各样本维度不一致（第 %d 个是 %d，应为 %d）"
+                             % (i, len(row), dim))
+    neg = []
+    for i, row in enumerate(pos):
+        neg.append(ebm_langevin(grad_energy, row, steps=steps, step_size=step_size,
+                                noise=noise, seed=None if seed is None else seed + i))
+    e_pos = []
+    for row in pos:
+        val = energy_fn(list(row))
+        e_pos.append(_w8b_scalar(val, "energy_fn 的返回值"))
+    e_neg = []
+    for row in neg:
+        val = energy_fn(list(row))
+        e_neg.append(_w8b_scalar(val, "energy_fn 的返回值"))
+    loss = sum(e_pos) / len(e_pos) - sum(e_neg) / len(e_neg)
+    return loss, {"mean_energy_data": sum(e_pos) / len(e_pos),
+                  "mean_energy_negative": sum(e_neg) / len(e_neg),
+                  "negative_samples": neg, "steps": int(steps)}
+
+
+# --------------------------------------------------------- 一致性模型 ------
+def _w8b_call_net(fn, x, t, who="net"):
+    if not callable(fn):
+        raise TypeError("%s 必须可调用，收到 %r" % (who, type(fn).__name__))
+    out = fn(list(x), t)
+    return _w8b_vec(out, "%s 的返回值" % who)
+
+
+def consistency_model_loss(student, teacher, xs, t_high=0.8, t_low=0.2,
+                     sigma_data=0.5, seed=None):
+    """一致性训练损失（简化版，无需 EDM 的完整前后向系数）。
+
+    `x_t = x + t * sigma_data * eps`，目标为 `teacher(x_{t_high}, t_high)`，
+    学生从 `x_{t_low}` 出发要一步回到同一个点：
+
+        `loss = mean || student(x_{t_low}, t_low) - teacher(x_{t_high}, t_high) ||^2`
+
+    `teacher` 通常是学生的 EMA 副本（用 `AI.EMA` 或自己维护）。返回
+    `(loss, info)`，`t_high > t_low` 必须成立。真实一致性模型还有
+    `c_skip/c_out` 与 `lambda(t)` 加权，这里刻意保留最小形式并写明差异。
+    """
+    hi = _w8b_scalar(t_high, "t_high", minimum=0.0)
+    lo = _w8b_scalar(t_low, "t_low", minimum=0.0)
+    if not hi > lo:
+        raise ValueError("需要 t_high > t_low（收到 %r / %r）" % (t_high, t_low))
+    sd = _w8b_scalar(sigma_data, "sigma_data", minimum=0.0)
+    if sd <= 0.0:
+        raise ValueError("sigma_data 必须 > 0")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("xs: 需要非空样本列表")
+    rows = [_w8b_vec(x, "xs[%d]" % i) for i, x in enumerate(xs)]
+    dim = len(rows[0])
+    for i, row in enumerate(rows):
+        if len(row) != dim:
+            raise ValueError("xs 各样本维度不一致（第 %d 个是 %d）" % (i, len(row)))
+    rng = random.Random(seed)
+    total = 0.0
+    for row in rows:
+        eps = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+        x_hi = [row[i] + hi * sd * eps[i] for i in range(dim)]
+        x_lo = [row[i] + lo * sd * eps[i] for i in range(dim)]
+        target = _w8b_call_net(teacher, x_hi, hi, "teacher")
+        pred = _w8b_call_net(student, x_lo, lo, "student")
+        acc = 0.0
+        for i in range(dim):
+            d = pred[i] - target[i]
+            acc += d * d
+        total += acc
+    return total / len(rows), {"t_high": hi, "t_low": lo, "n_samples": len(rows)}
+
+
+def consistency_sample(student, x_noisy, t=0.8):
+    """一致性模型的一步采样：`x0 = student(x_T, T)`（这就是它的卖点）。"""
+    return _w8b_call_net(student, x_noisy, t, "student")
+
+
+# ------------------------------------------------- 多尺度 Glow（组合） ------
+def _w8b_flow_det(blocks):
+    total = 0.0
+    for b in blocks:
+        total += _w8b_scalar(b.logdet(), "block.logdet()")
+    return total
+
+
+class ComposedGlow:
+    """单尺度 Glow：`ActNorm -> InvertibleLinear -> RealNVP(耦合)` 堆叠 `blocks` 次。
+
+    `forward(x)` 返回 `(z, logdet)`，`inverse(z)` 返回 `x`，
+    `log_prob(x)` 用高斯先验算真密度。`logdet` 是**逐块相加**——这正是
+    「组合多个可逆块」最容易写错的地方（漏掉某一项、或把 `logdet` 当成
+    与输入相关）。
+    """
+
+    def __init__(self, dim, hidden_dim=16, num_layers=2, blocks=2, seed=0):
+        d = int(_w8b_scalar(dim, "ComposedGlow.dim", minimum=1.0))
+        if d < 2:
+            raise ValueError("ComposedGlow.dim 需要 >= 2，收到 %r" % dim)
+        nb = int(_w8b_scalar(blocks, "ComposedGlow.blocks", minimum=1.0))
+        self.dim = d
+        self.blocks = []
+        for i in range(nb):
+            self.blocks.append(ActNorm(d))
+            self.blocks.append(InvertibleLinear(d, seed=int(seed) + 1000 * i + 1))
+            self.blocks.append(RealNVP(d, hidden_dim=hidden_dim,
+                                       num_layers=num_layers, seed=int(seed) + 7 * i))
+
+    def forward(self, x):
+        vec = _w8b_vec(x, "ComposedGlow.forward.x")
+        if len(vec) != self.dim:
+            raise ValueError("ComposedGlow.forward: 输入长度 %d 与 dim=%d 不一致"
+                             % (len(vec), self.dim))
+        cur = list(vec)
+        total = 0.0
+        for b in self.blocks:
+            out = b.forward(cur)
+            if isinstance(out, tuple):
+                cur, ld = out
+                total += float(ld)
+            else:
+                cur = out
+                total += float(b.logdet())
+        return cur, total
+
+    def inverse(self, z):
+        vec = _w8b_vec(z, "ComposedGlow.inverse.z")
+        if len(vec) != self.dim:
+            raise ValueError("ComposedGlow.inverse: 输入长度 %d 与 dim=%d 不一致"
+                             % (len(vec), self.dim))
+        cur = list(vec)
+        for b in reversed(self.blocks):
+            cur = b.inverse(cur)
+        return cur
+
+    def log_prob(self, x):
+        z, logdet = self.forward(x)
+        acc = 0.0
+        for v in z:
+            acc += v * v
+        # 标准高斯先验：-0.5|z|^2 - 0.5 d log(2pi) + logdet
+        return -0.5 * acc - 0.5 * self.dim * math.log(2.0 * math.pi) + logdet
+
+    def nll(self, x):
+        return -self.log_prob(x)
+
+    def sample(self, seed=None):
+        rng = random.Random(seed)
+        return self.inverse([rng.gauss(0.0, 1.0) for _ in range(self.dim)])
+
+    def param_count(self):
+        return sum(b.param_count() for b in self.blocks)
+
+
+class MultiScaleGlow:
+    """多尺度 Glow：每层「`ComposedGlow` → 通道对半拆 → 一半进潜变量」。
+
+    这是把多尺度结构从 Glow 论文里抽成可测形式的最小版本：`forward` 返回
+    `(z_list, logdet)`，`inverse` 用 `z_list` 重建输入，`log_prob` 是各尺度
+    密度之和。拆分的规则固定为「取前 `dim//2` 个元素进潜变量、其余继续流」，
+    不引入学习到的 split（那是 StyleGAN/Glow 的 `split` 层，需额外参数）。
+    """
+
+    def __init__(self, dim, scales=2, hidden_dim=16, num_layers=2, blocks=1, seed=0):
+        d = int(_w8b_scalar(dim, "MultiScaleGlow.dim", minimum=2.0))
+        sc = int(_w8b_scalar(scales, "MultiScaleGlow.scales", minimum=1.0))
+        if sc > 4:
+            raise ValueError("MultiScaleGlow.scales: 最多 4 层（每层减半），收到 %r" % scales)
+        cur = d
+        self.scales = []
+        dims = []
+        for i in range(sc):
+            if cur < 2:
+                raise ValueError("MultiScaleGlow: 第 %d 层的维度降到 %d，无法再拆半"
+                                 % (i + 1, cur))
+            self.scales.append(ComposedGlow(cur, hidden_dim=hidden_dim,
+                                            num_layers=num_layers, blocks=blocks,
+                                            seed=int(seed) + 31 * i))
+            dims.append(cur)
+            cur = cur // 2
+        self.dim = d
+        self.dims = dims
+        self.rest = cur
+        self.hidden = self.scales[-1]
+
+    def forward(self, x):
+        vec = _w8b_vec(x, "MultiScaleGlow.forward.x")
+        if len(vec) != self.dim:
+            raise ValueError("MultiScaleGlow.forward: 输入长度 %d 与 dim=%d 不一致"
+                             % (len(vec), self.dim))
+        cur = list(vec)
+        zs = []
+        total = 0.0
+        for i, flow in enumerate(self.scales):
+            cur, ld = flow.forward(cur)
+            total += ld
+            if i < len(self.scales) - 1:
+                half = len(cur) // 2
+                zs.append(cur[:half])
+                cur = cur[half:]
+        zs.append(cur)
+        return zs, total
+
+    def inverse(self, zs):
+        if not isinstance(zs, (list, tuple)) or not zs:
+            raise ValueError("MultiScaleGlow.inverse: 需要非空潜变量列表")
+        if len(zs) != len(self.scales):
+            raise ValueError("MultiScaleGlow.inverse: 需要 %d 个尺度，收到 %d"
+                             % (len(self.scales), len(zs)))
+        cur = _w8b_vec(zs[-1], "MultiScaleGlow.inverse 的最后一层")
+        for i in range(len(self.scales) - 1, -1, -1):
+            flow = self.scales[i]
+            if len(cur) != flow.dim:
+                raise ValueError("MultiScaleGlow.inverse: 第 %d 层需要 %d 维，收到 %d"
+                                 % (i + 1, flow.dim, len(cur)))
+            cur = flow.inverse(cur)
+            if i > 0:
+                part = _w8b_vec(zs[i - 1], "MultiScaleGlow.inverse 的第 %d 层" % i)
+                if len(part) + len(cur) != self.dims[i - 1]:
+                    raise ValueError("MultiScaleGlow.inverse: 第 %d 层潜变量 %d 维 + "
+                                     "重建的 %d 维 != 上一层 %d 维"
+                                     % (i, len(part), len(cur), self.dims[i - 1]))
+                cur = part + cur
+        return cur
+
+    def log_prob(self, x):
+        zs, logdet = self.forward(x)
+        acc = 0.0
+        total_dim = 0
+        for z in zs:
+            for v in z:
+                acc += v * v
+            total_dim += len(z)
+        return -0.5 * acc - 0.5 * total_dim * math.log(2.0 * math.pi) + logdet
+
+    def nll(self, x):
+        return -self.log_prob(x)
+
+    def sample(self, seed=None):
+        rng = random.Random(seed)
+        zs = []
+        for flow in self.scales:
+            if flow is not self.scales[-1]:
+                zs.append([rng.gauss(0.0, 1.0) for _ in range(flow.dim // 2)])
+            else:
+                zs.append([rng.gauss(0.0, 1.0) for _ in range(flow.dim)])
+        return self.inverse(zs)
+
+    def param_count(self):
+        return sum(flow.param_count() for flow in self.scales)
+
+
+# --------------------------------------------------- PixelCNN / WaveNet ----
+def pixelcnn_mask(kernel_size=3, kind="A"):
+    """PixelCNN 的掩码卷积核掩码（`kind='A'` 不遮中心，`'B'` 遮中心）。
+
+    返回 `kernel_size x kernel_size` 的 0/1 列表。约定：行索引 < 中心行时
+    整行可见；等于中心行时只看列 < 中心列（`'A'` 还包含中心本身）。
+    `'A'` 用于输入层（不能用当前像素预测自己），`'B'` 用于后续层。
+    """
+    k = int(_w8b_scalar(kernel_size, "kernel_size", minimum=1.0))
+    if k % 2 == 0:
+        raise ValueError("kernel_size 必须是奇数（收到 %r）" % kernel_size)
+    kind = str(kind).upper()
+    if kind not in ("A", "B"):
+        raise ValueError("kind: 只支持 'A' 或 'B'，收到 %r" % kind)
+    c = k // 2
+    mask = []
+    for i in range(k):
+        row = []
+        for j in range(k):
+            if i < c:
+                row.append(1)
+            elif i == c:
+                row.append(1 if (j < c or (kind == "A" and j == c)) else 0)
+            else:
+                row.append(0)
+        mask.append(row)
+    return mask
+
+
+def masked_conv2d(x, kernel, mask):
+    """单通道、stride=1、same padding 的掩码卷积（用于验证因果性）。
+
+    `x` 是 `H x W` 的二维列表，`kernel` 与 `mask` 都是 `k x k`。输出同尺寸；
+    越界位置按 0 处理。它不是训练用的层（没有参数梯度），只用来检查「输出
+    (i,j) 不依赖 (i,j) 之后的位置」这条因果性。
+    """
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("masked_conv2d.x: 需要非空二维列表")
+    h = len(x)
+    w = len(x[0]) if isinstance(x[0], (list, tuple)) else 0
+    if w == 0:
+        raise ValueError("masked_conv2d.x: 每行必须是非空列表")
+    grid = []
+    for i, row in enumerate(x):
+        if not isinstance(row, (list, tuple)) or len(row) != w:
+            raise ValueError("masked_conv2d.x: 第 %d 行长度与首行 %d 不一致" % (i, w))
+        grid.append([_w8b_scalar(v, "masked_conv2d.x[%d][%d]" % (i, j)) for j, v in enumerate(row)])
+    if not isinstance(kernel, (list, tuple)) or not kernel:
+        raise ValueError("masked_conv2d.kernel: 需要非空二维列表")
+    k = len(kernel)
+    for i, row in enumerate(kernel):
+        if not isinstance(row, (list, tuple)) or len(row) != k:
+            raise ValueError("masked_conv2d.kernel: 必须是 %d x %d 方阵" % (k, k))
+    if not isinstance(mask, (list, tuple)) or len(mask) != k:
+        raise ValueError("masked_conv2d.mask: 必须是 %d x %d" % (k, k))
+    for i, row in enumerate(mask):
+        if not isinstance(row, (list, tuple)) or len(row) != k:
+            raise ValueError("masked_conv2d.mask: 必须与 kernel 同形")
+    c = k // 2
+    out = []
+    for i in range(h):
+        row_out = []
+        for j in range(w):
+            acc = 0.0
+            for ki in range(k):
+                for kj in range(k):
+                    if not mask[ki][kj]:
+                        continue
+                    ii = i + ki - c
+                    jj = j + kj - c
+                    if 0 <= ii < h and 0 <= jj < w:
+                        acc += float(kernel[ki][kj]) * grid[ii][jj]
+            row_out.append(acc)
+        out.append(row_out)
+    return out
+
+
+def wavenet_dilations(levels=4, kernel_size=2):
+    """WaveNet 的膨胀序列 `1,2,4,...` 与感受到的接受野宽度。
+
+    返回 `(dilations, receptive_field)`；`receptive_field = 1 + (k-1)*sum(d)`。
+    """
+    n = int(_w8b_scalar(levels, "levels", minimum=1.0))
+    k = int(_w8b_scalar(kernel_size, "kernel_size", minimum=2.0))
+    d = [2 ** i for i in range(n)]
+    rf = 1 + (k - 1) * sum(d)
+    return d, rf
+
+
+# ------------------------------------------------------ 潜空间扩散（组合） --
+def latent_diffusion_shapes(image_shape, downsample=4):
+    """潜空间扩散的尺寸换算：`(C,H,W) -> (C, H//ds, W//ds)`。"""
+    if not isinstance(image_shape, (list, tuple)) or len(image_shape) != 3:
+        raise ValueError("image_shape: 需要 (C,H,W)，收到 %r" % (image_shape,))
+    c = int(_w8b_scalar(image_shape[0], "image_shape[0]", minimum=1.0))
+    h = int(_w8b_scalar(image_shape[1], "image_shape[1]", minimum=1.0))
+    w = int(_w8b_scalar(image_shape[2], "image_shape[2]", minimum=1.0))
+    ds = int(_w8b_scalar(downsample, "downsample", minimum=1.0))
+    ho = h // ds
+    wo = w // ds
+    if ho < 1 or wo < 1:
+        raise ValueError("downsample=%d 时潜空间尺寸为 %dx%d，至少要是 1x1" % (ds, ho, wo))
+    return (c, ho, wo)
+
+
+def latent_diffusion_pipeline(encode, decode, diffusion, image):
+    """潜空间扩散的组装：`encode -> diffusion -> decode`。
+
+    `encode(image)`/`decode(latent)`/`diffusion` 都要求可调用（`diffusion` 接收
+    潜变量并返回同形状的新潜变量，比如 `DDPM.sample` 的包装）。返回
+    `(reconstruction, info)`，`info` 给出潜空间形状与压缩比。
+    """
+    if not callable(encode) or not callable(decode) or not callable(diffusion):
+        raise TypeError("encode / decode / diffusion 都必须可调用")
+    if not isinstance(image, (list, tuple)) or not image:
+        raise ValueError("image: 需要非空样本列表")
+    latent = encode(list(image))
+    if isinstance(latent, tuple):
+        latent = latent[0]
+    latent = _w8b_vec(latent, "encode 的返回值")
+    new_latent = diffusion(list(latent))
+    if isinstance(new_latent, tuple):
+        new_latent = new_latent[0]
+    new_latent = _w8b_vec(new_latent, "diffusion 的返回值")
+    if len(new_latent) != len(latent):
+        raise ValueError("diffusion 改变了潜变量维度（%d -> %d）"
+                         % (len(latent), len(new_latent)))
+    rec = decode(list(new_latent))
+    if isinstance(rec, tuple):
+        rec = rec[0]
+    rec = _w8b_vec(rec, "decode 的返回值")
+    if len(rec) != len(image):
+        raise ValueError("decode 输出的维度 %d 与输入图像维度 %d 不一致"
+                         % (len(rec), len(image)))
+    n_img = len(image)
+    n_lat = len(latent)
+    return rec, {"latent_dim": n_lat, "image_dim": n_img,
+                 "compression": (float(n_img) / n_lat) if n_lat else float("inf")}
+
 class PromptTuning:
     """软提示（Prompt Tuning）：把 ``num_tokens`` 个可学习向量拼在序列前面
 

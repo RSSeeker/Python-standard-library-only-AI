@@ -27839,3 +27839,205 @@ class TestConvGANVariants:
             AI.adain_style([[[1.0, 2.0]]], [1.0])
         with pytest.raises(ValueError):
             AI.truncation_trick([1.0], [1.0, 2.0])
+
+
+class TestScoreEBM:
+    """W8-B：Score-based（NCSN）/ SDE、EBM、Consistency、多尺度 Glow、PixelCNN、潜空间扩散。"""
+
+    def test_vp_ve_coefficients(self):
+        import math
+        assert AI.vp_beta(0.0) == 0.1
+        assert AI.vp_beta(1.0) == 20.0
+        assert AI.vp_marginal_std(0.0) == 0.0
+        t = 0.37
+        assert abs(AI.vp_diffusion(t) - math.sqrt(AI.vp_beta(t))) < 1e-15
+        assert abs(AI.vp_marginal_std(t) - math.sqrt(1.0 - math.exp(-(0.1 * t + 0.5 * 19.9 * t * t)))) < 1e-15
+        assert AI.vp_marginal_std(0.2) < AI.vp_marginal_std(0.8)
+        d = AI.vp_drift([1.0, -2.0], t)
+        assert abs(d[0] - (-0.5 * AI.vp_beta(t))) < 1e-15
+        assert abs(d[1] - (0.5 * AI.vp_beta(t) * 2.0)) < 1e-15
+        assert AI.ve_sigma(0.0) == 0.01
+        assert AI.ve_sigma(1.0) == 50.0
+        assert abs(AI.ve_sigma(0.5) - math.sqrt(0.01 * 50.0)) < 1e-15
+        g = AI.ve_diffusion(0.5)
+        assert abs(g - math.sqrt(2.0 * AI.ve_sigma(0.5) ** 2 * math.log(5000.0))) < 1e-15
+
+    def test_reverse_sde_and_probability_flow(self):
+        import math
+        x0 = [0.3, -0.7]
+        score = [0.5, -1.5]
+        z = [0.2, -0.4]
+        t, dt = 0.4, -0.05
+        g = AI.ve_diffusion(t)
+        step = AI.reverse_sde_step(x0, t, lambda v, s: score, dt, noise=z, kind="ve")
+        for i in range(2):
+            want = x0[i] - g * g * score[i] * dt + g * math.sqrt(abs(dt)) * z[i]
+            assert abs(step[i] - want) < 1e-13
+        assert step is not x0
+        pf = AI.probability_flow_step(x0, t, lambda v, s: score, dt, kind="ve")
+        for i in range(2):
+            assert abs(pf[i] - (x0[i] - 0.5 * g * g * score[i] * dt)) < 1e-13
+        with pytest.raises(ValueError):
+            AI.reverse_sde_step(x0, t, lambda v, s: score, 0.05, kind="ve")
+        with pytest.raises(ValueError):
+            AI.reverse_sde_step(x0, t, lambda v, s: [0.1], dt, kind="ve")
+
+    def test_ncsn_loss_matches_manual(self):
+        import random
+        sigmas = (0.5, 0.2)
+        data = [[0.5, -0.3], [1.0, 0.2], [-0.4, 0.8]]
+        seed = 11
+
+        def exact_score(v, s):
+            return [-x / (1.0 + s * s) for x in v]
+
+        loss, info = AI.ncsn_loss(exact_score, data, sigmas=sigmas, seed=seed)
+        rng = random.Random(seed)
+        per = []
+        for s in sigmas:
+            acc = 0.0
+            for row in data:
+                eps = [rng.gauss(0.0, 1.0) for _ in range(len(row))]
+                xt = [row[i] + s * eps[i] for i in range(len(row))]
+                sc = exact_score(xt, s)
+                resid = [sc[i] + eps[i] / s for i in range(len(row))]
+                acc += 0.5 * s * s * sum(r * r for r in resid)
+            per.append(acc / len(data))
+        assert abs(loss - sum(per) / len(sigmas)) < 1e-12
+        assert len(info["per_sigma"]) == len(sigmas)
+        for i, v in enumerate(per):
+            assert abs(info["per_sigma"][i] - v) < 1e-12
+        bad, _ = AI.ncsn_loss(lambda v, s: [0.0 for _ in v], data, sigmas=sigmas, seed=seed)
+        assert bad > loss
+        with pytest.raises(ValueError):
+            AI.ncsn_loss(exact_score, [], seed=1)
+        with pytest.raises(ValueError):
+            AI.ncsn_loss(exact_score, data, sigmas=(0.2, 0.5), seed=1)
+
+    def test_annealed_langevin_converges(self):
+        def score(v, s):
+            return [-x / (1.0 + s * s) for x in v]
+
+        samples = [AI.annealed_langevin_sample(score, [3.0], sigmas=(1.0, 0.5, 0.2, 0.1, 0.05),
+                                               steps_per_sigma=20, epsilon=0.005, seed=k)[0]
+                   for k in range(200)]
+        mean = sum(samples) / len(samples)
+        var = sum((v - mean) ** 2 for v in samples) / len(samples)
+        assert abs(mean) < 0.25
+        assert 0.6 < var < 1.7
+        with pytest.raises(ValueError):
+            AI.annealed_langevin_sample(score, [], seed=1)
+
+    def test_ebm_contrastive_divergence_and_langevin(self):
+        def energy(v):
+            return 0.5 * (v[0] ** 2 + v[1] ** 2)
+
+        def grad(v):
+            return [v[0], v[1]]
+
+        cd, info = AI.ebm_contrastive_divergence(energy, grad, [[2.0, 2.0], [3.0, -1.0]],
+                                                 steps=30, step_size=0.01, noise=0.0, seed=1)
+        assert cd > 0.0
+        assert abs(cd - (info["mean_energy_data"] - info["mean_energy_negative"])) < 1e-12
+        out = AI.ebm_langevin(grad, [5.0, -5.0], steps=100, step_size=0.05, noise=0.0, seed=1)
+        assert abs(out[0]) < 0.1 and abs(out[1]) < 0.1
+        assert abs(out[0] + out[1]) < 1e-12
+        with pytest.raises((TypeError, ValueError)):
+            AI.ebm_langevin(grad, [1.0], steps=1.5, seed=1)
+
+    def test_consistency_model_loss(self):
+        def zero(v, t):
+            return [0.0 for _ in v]
+
+        assert AI.consistency_model_loss(zero, zero, [[0.5, -0.3]], seed=3)[0] == 0.0
+        small = lambda v, t: [0.1 * x for x in v]
+        assert AI.consistency_model_loss(small, small, [[0.5, -0.3]], seed=3)[0] > 0.0
+        _, info = AI.consistency_model_loss(small, small, [[0.5, -0.3], [1.0, 0.2]], seed=3)
+        assert info["t_high"] == 0.8 and info["t_low"] == 0.2 and info["n_samples"] == 2
+        with pytest.raises(ValueError):
+            AI.consistency_model_loss(small, small, [[0.5]], t_high=0.2, t_low=0.8, seed=1)
+        with pytest.raises(ValueError):
+            AI.consistency_model_loss(small, small, [], seed=1)
+
+    def test_composed_glow_log_prob(self):
+        import math
+        glow = AI.ComposedGlow(4, hidden_dim=8, num_layers=1, blocks=2, seed=3)
+        x = [0.1, -0.2, 0.3, 0.4]
+        z, logdet = glow.forward(x)
+        assert len(z) == 4
+        back = glow.inverse(z)
+        assert max(abs(a - b) for a, b in zip(back, x)) < 1e-10
+        lp = glow.log_prob(x)
+        want = -0.5 * sum(v * v for v in z) - 0.5 * 4 * math.log(2 * math.pi) + logdet
+        assert abs(lp - want) < 1e-12
+        assert abs(glow.nll(x) + lp) < 1e-12
+        assert len(glow.sample(seed=5)) == 4
+        assert glow.param_count() > 0
+
+    def test_multiscale_glow_roundtrip(self):
+        import math
+        glow = AI.MultiScaleGlow(8, scales=2, hidden_dim=8, num_layers=1, blocks=1, seed=3)
+        x = [0.1, -0.2, 0.3, 0.0, 0.5, -0.6, 0.7, 0.8]
+        zs, logdet = glow.forward(x)
+        assert [len(part) for part in zs] == [4, 4]
+        back = glow.inverse(zs)
+        assert max(abs(a - b) for a, b in zip(back, x)) < 1e-10
+        want = -0.5 * sum(sum(v * v for v in part) for part in zs) - 0.5 * 8 * math.log(2 * math.pi) + logdet
+        assert abs(glow.log_prob(x) - want) < 1e-12
+        assert len(glow.sample(seed=7)) == 8
+        with pytest.raises(ValueError):
+            glow.inverse([zs[0]])
+        with pytest.raises(ValueError):
+            AI.MultiScaleGlow(2, scales=2, hidden_dim=4, num_layers=1, blocks=1, seed=1)
+
+    def test_pixelcnn_mask_and_causality(self):
+        mask_a = AI.pixelcnn_mask(3, "A")
+        mask_b = AI.pixelcnn_mask(3, "B")
+        assert mask_a[1][1] == 1 and mask_b[1][1] == 0
+        assert sum(sum(r) for r in mask_a) == 5
+        assert sum(sum(r) for r in mask_b) == 4
+        with pytest.raises(ValueError):
+            AI.pixelcnn_mask(4, "A")
+        with pytest.raises(ValueError):
+            AI.pixelcnn_mask(3, "C")
+        img = [[0.0] * 4 for _ in range(4)]
+        img[2][2] = 1.0
+        kernel = [[1.0] * 3 for _ in range(3)]
+        base = AI.masked_conv2d(img, kernel, mask_a)
+        right = [row[:] for row in img]
+        right[2][3] = 5.0
+        assert AI.masked_conv2d(right, kernel, mask_a)[2][2] == base[2][2]
+        left = [row[:] for row in img]
+        left[2][1] = 5.0
+        assert AI.masked_conv2d(left, kernel, mask_a)[2][2] != base[2][2]
+        with pytest.raises(ValueError):
+            AI.masked_conv2d(img, kernel, [[1.0]])
+
+    def test_wavenet_dilations(self):
+        dil, rf = AI.wavenet_dilations(levels=3, kernel_size=2)
+        assert dil == [1, 2, 4]
+        assert rf == 8
+        dil2, rf2 = AI.wavenet_dilations(levels=4, kernel_size=3)
+        assert rf2 == 1 + (3 - 1) * sum(dil2)
+        with pytest.raises(ValueError):
+            AI.wavenet_dilations(levels=0, kernel_size=2)
+
+    def test_latent_diffusion_shapes_and_pipeline(self):
+        assert AI.latent_diffusion_shapes((3, 32, 32), downsample=4) == (3, 8, 8)
+        assert AI.latent_diffusion_shapes((1, 30, 30), downsample=4) == (1, 7, 7)
+        with pytest.raises(ValueError):
+            AI.latent_diffusion_shapes((3, 8, 8), downsample=16)
+        img = [0.1, 0.2, 0.3, 0.4]
+        ident = lambda v: list(v)
+        rec, info = AI.latent_diffusion_pipeline(ident, ident, ident, img)
+        assert max(abs(a - b) for a, b in zip(rec, img)) < 1e-12
+        assert info["latent_dim"] == 4 and info["compression"] == 1.0
+        pair = lambda v: [v[0] + v[1], v[2] + v[3]]
+        split = lambda z: [z[0] / 2.0, z[0] / 2.0, z[1] / 2.0, z[1] / 2.0]
+        rec2, info2 = AI.latent_diffusion_pipeline(pair, split, ident, img)
+        assert info2["latent_dim"] == 2 and info2["compression"] == 2.0
+        assert len(rec2) == 4
+        with pytest.raises(ValueError):
+            AI.latent_diffusion_pipeline(ident, ident, lambda v: v[:-1], img)
+        with pytest.raises(ValueError):
+            AI.latent_diffusion_pipeline(ident, ident, ident, [])
