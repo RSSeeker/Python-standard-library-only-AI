@@ -314,12 +314,16 @@
       - `MeanTeacher` + `mean_teacher_regularizer`：教师权重 EMA（`update`）、教师前向用「换入 → 前向 → 换回」实现；**真 bug**：`_swap_in` 原先用 `list(layer.weights)` 保存现场，行对象是同一份引用，换回时学生权重已被教师权重覆盖 —— 改成 `_semi_copy` 深拷贝后修复；
       - 探针 `probe_w10e.py` 全绿（闭式梯度 vs 有限差分：`mse` 1.0e-11、`kl` 4.6e-11），`TestSemiSupervised` 10 例，全库 1173 passed。
 - [x] 梯度检查点（activation checkpointing）、混合精度模拟（标注无真收益）
-  - `checkpoint_grads`：前向只留段边界、反向逐段重放；`segments=1/2/3` 与普通反传
-    逐位相同。诚实边界：本库本来就只缓存 O(层数) 份输入，**不会真省内存**。
+  - `checkpoint_grads(release=False)`：前向只留段边界、反向逐段重放；`segments=1/2/3`
+    与普通反传逐位相同。`release=True` 每段结束清掉段内层的 `input/z/a`，反向重放时
+    再重建 —— 峰值激活真正降到 O(段数) 份边界激活 + 当前段缓存（时间换空间）；
+    测试 `TestCheckpointReleaseAndFp8` 验证缓存被清空且梯度逐位一致。
   - `fp16_round` / `bf16_round`：IEEE 半精度（`struct` `'e'`）/ bfloat16 RNE 截断；
-    `|v| > 65504` 溢出为 `inf`，低于次正规归 0。
-  - `quantize_model`（原地舍入，幂等）、`mixed_precision_grads`（loss scaling 后
-    舍入再除回；实测 `1e-9` 的梯度不缩放会被舍成 0，`scale=8192` 时保住）。
+    `|v| > 65504` 溢出为 `inf`，低于次正规归 0。`fp8_round` 支持 E4M3（最大 448）
+    与 E5M2（最大 57344），超范围饱和、低于最小次正规归 0。
+  - `quantize_model`（原地舍入，幂等，支持 fp16 / bf16 / fp8_e4m3 / fp8_e5m2）、
+    `mixed_precision_grads`（loss scaling 后舍入再除回，同样支持 FP8；实测 `1e-9`
+    的梯度不缩放会被舍成 0，`scale=8192` 时保住）。
   - 混合精度**只模拟舍入**，不做半精度矩阵乘，因此没有真实加速。
 
 ### W11 数据管道（§7）
@@ -501,6 +505,8 @@
 ### W15 推理与部署（§11）
 - [x] 结构化剪枝：通道 / 头 / 层（现有 `prune_magnitude` 是非结构化）
   - `channel_scores` / `prune_channels`（掩码式置零，形状不变）/ `head_scores` / `prune_heads` / `prune_layers`（真删中间层）/ `sparsity_report`；
+  - `prune_channels_structured`：**真删输出通道**（裁本层权重行/偏置、下一层输入列，
+    更新 `fan_out`/`fan_in`/`layer_sizes`，参数量真实减少）；
   - 删层要求相邻维度兼容，否则直接 `ValueError`，不会悄悄改形状。
 - [x] 特征蒸馏（hint layer）；QAT（量化感知训练）；PTQ / GPTQ / AWQ / SmoothQuant（教学，标注 int8 未真存）
   - 特征蒸馏复用 W1-C 的 `hint_loss`；QAT 提供 `qat_grads`（直通估计，只给梯度）；
@@ -737,7 +743,7 @@
   只训练编码器与重建头，重建头首次调用时创建、不计入 `param_count`）；
   测试 `TestViTEntryPoints` 4 例
 
-全量测试：1839 → 1930 passed（新增 91 例）。
+全量测试：1839 → 1936 passed（新增 97 例）。
 
 ---
 

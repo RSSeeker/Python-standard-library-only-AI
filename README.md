@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1930 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1936 项）
 
 ## 特性
 
@@ -252,16 +252,18 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 | 函数 | 说明 |
 |---|---|
-| `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同** |
+| `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同**；`release=True` 时每段结束丢弃 `input/z/a`，真正把激活峰值压到 O(段数) |
 | `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`|v| > 65504` 返回 `inf`，低于次正规返回 0 |
 | `bf16_round(value)` | 舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even） |
-| `quantize_model(model, dtype='fp16'\|'bf16')` | 把权重与偏置**原地**舍入到低精度，用于模拟部署 |
-| `mixed_precision_grads(model, xs, ys, scale=1024.0, dtype='fp16')` | fp32 反传 → 梯度乘 `scale` → 舍入 → 除回，即 AMP 里 `GradScaler` 的做法 |
+| `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
+| `quantize_model(model, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | 把权重与偏置**原地**舍入到低精度，用于模拟部署 |
+| `mixed_precision_grads(model, xs, ys, scale=1024.0, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | fp32 反传 → 梯度乘 `scale` → 舍入 → 除回，即 AMP 里 `GradScaler` 的做法 |
 
-诚实说明两点：本库的 `Layer` 本来就只缓存最后一次前向的输入（O(层数) 份），所以
-`checkpoint_grads` **不会真的省内存**——它实现的是重放机制本身，并保证梯度与普通
-反传逐位一致，便于在缓存更重的模型上复用这套代码；混合精度部分**只模拟舍入**，
-不做半精度矩阵乘，因此速度不会变快。
+诚实说明三点：本库的 `Layer` 默认只缓存最后一次前向的输入（O(层数) 份），
+`checkpoint_grads(release=False)` 只实现重放机制本身、并不省内存；`release=True`
+会在每段前向结束后清掉段内层的 `input/z/a`，反向重放时再重建，因此峰值激活
+降到 O(段数) 份边界激活 + 当前段缓存——这是真正省内存的路径（仍用时间换空间）。
+混合精度部分**只模拟舍入**，不做半精度矩阵乘，因此速度不会变快。
 
 `loss scaling` 的意义可以实测出来：`fp16` 的最小次正规约 `5.96e-8`，梯度 `1e-9` 直接
 舍入就是 0；乘 8192 后落在 `8.19e-6`，舍回后仍是 `1.0e-9` 量级（`9.968e-10`）。
@@ -1737,22 +1739,24 @@ print(cf['target'], cf['distance'])
 |---|---|
 | `channel_scores(layer)` | 每个输出通道的权重绝对值之和（重要性分数） |
 | `prune_channels(model, layer_index, ratio=0.5, keep_at_least=1)` | 按分数置零最弱的输出通道（连偏置一起置零），返回 `{"pruned","kept","scores"}` |
+| `prune_channels_structured(model, layer_index, ratio=0.5, keep_at_least=1)` | **真正删除**最弱输出通道：裁掉本层权重行/偏置、下一层权重对应输入列，并更新 `fan_out`/`fan_in`/`layer_sizes`（参数量真实减少） |
 | `head_scores(attention, projection='q')` | 多头注意力每个头的权重绝对值之和（`q`/`k`/`v`/`o`） |
 | `prune_heads(attention, ratio=0.5, keep_at_least=1)` | 置零最弱的头（`W_q/W_k/W_v` 对应列与 `W_o` 对应行） |
 | `prune_layers(model, ratio=0.5, keep_at_least=2)` | 按层 L1 真正删除中间层，返回新的 `MLP`（原模型不动） |
 | `sparsity_report(model)` | 逐层统计权重零元素个数与比例 |
 
 ```python
-from AI import MLP, channel_scores, prune_channels, prune_layers, sparsity_report
+from AI import MLP, channel_scores, prune_channels, prune_channels_structured, prune_layers, sparsity_report
 
 net = MLP([64, 128, 10])
 print(channel_scores(net.layers[0])[:4])
 prune_channels(net, 0, ratio=0.3)      # 掩码式：形状不变
+prune_channels_structured(net, 0, ratio=0.3)  # 真删通道：形状变小、参数量减少
 small = prune_layers(net, ratio=0.0)   # 维度兼容时才真的删层
 print(sparsity_report(net))
 ```
 
-- `prune_channels` / `prune_heads` 是**掩码式**置零（形状不变、下游不用改），不是删行重建；要真删通道得手工重建下游层的 `fan_in`。
+- `prune_channels` / `prune_heads` 是**掩码式**置零（形状不变、下游不用改）；`prune_channels_structured` 才是真删通道（会裁掉下一层的输入列并更新 `fan_in`）。
 - `prune_layers` 会新建 `MLP`，只删中间层；删完前后维度对不上就抛 `ValueError`，不会悄悄改形状。
 
 ### 量化与 SmoothQuant
@@ -3371,7 +3375,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1930 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1936 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3545,6 +3549,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAdversarialTraining` | FGSM 闭式解、L∞ 球与取值裁剪、单步 PGD = FGSM、对抗样本抬高损失、TRADES/MART 的手算 KL、`adv_eps=0` 逐位不变、对抗训练能降 loss、4 类非法超参 |
 | `TestNoiseCurriculumEnsemble` | 权重/梯度/输入噪声的零均值零方差与可复现、`curriculum_fraction` 三种 schedule、采样器「只取最简比例」且同种子可复现、manifold mixup 端点与中点、快照集成的单快照=普通前向与无副作用、13 类非法参数 |
 | `TestSemiSupervised` | `softmax_rows` 与手算 softmax 一致、一致性损失的自身为 0/对称性/手算核对、`consistency_regularizer` 梯度对有限差分、VAT 扰动 L2 范数 = eps 与 `eps=0` 恒等、伪标签置信度过滤、`soft_target_ce` 与 CE 一致 + 梯度差分 + 零权重、FixMatch 置信度阈值 1.0 时损失 0、MixMatch 平均与锐化、MeanTeacher 的 EMA 与「教师前向不污染学生权重」、11 类非法参数 |
+| `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
@@ -3669,7 +3674,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1930 个单元测试
+├── test_ai.py       # 1936 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

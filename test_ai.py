@@ -29338,3 +29338,99 @@ class TestBertScoreAndSvd:
         for i in range(2):
             for j in range(2):
                 assert abs(full[i][j] - rank1[i][j]) < 1e-12
+
+
+class TestCheckpointReleaseAndFp8:
+    def _model(self):
+        return AI.Model(AI.MLP([3, 5, 2], ["relu", "linear"]), loss_fn="mse")
+
+    def test_checkpoint_release_matches_normal(self):
+        m = self._model()
+        xs = [[0.1, 0.2, 0.3], [0.4, -0.2, 0.0]]
+        ys = [[1.0, 0.0], [0.0, 1.0]]
+        l0, g0 = AI.checkpoint_grads(m, xs, ys, segments=2, release=False)
+        l1, g1 = AI.checkpoint_grads(m, xs, ys, segments=2, release=True)
+        assert l0 == l1
+        assert g0 == g1
+        l2, g2 = AI.checkpoint_grads(m, xs, ys, segments=2)
+        assert (l2, g2) == (l0, g0)
+
+    def test_checkpoint_release_frees_caches(self):
+        m = self._model()
+        xs = [[0.1, 0.2, 0.3], [0.4, -0.2, 0.0]]
+        ys = [[1.0, 0.0], [0.0, 1.0]]
+        AI.checkpoint_grads(m, xs, ys, segments=2, release=True)
+        for layer in m.model.layers:
+            assert layer.input is None
+            assert layer.a is None
+        AI.checkpoint_grads(m, xs, ys, segments=2, release=False)
+        assert any(layer.a is not None for layer in m.model.layers)
+
+    def test_prune_channels_structured(self):
+        mp = AI.MLP([4, 6, 3], ["relu", "linear"])
+        for j, row in enumerate(mp.layers[0].weights):
+            for i in range(len(row)):
+                row[i] = 0.5 + 0.1 * j
+        params_before = mp.param_count()
+        out = AI.prune_channels_structured(mp, 0, ratio=0.5, keep_at_least=2)
+        kept = out["kept"]
+        assert out["layers"] == (0, 1)
+        assert mp.layers[0].fan_out == len(kept)
+        assert mp.layers[1].fan_in == len(kept)
+        assert mp.layer_sizes == [4, len(kept), 3]
+        assert len(mp.layers[1].weights[0]) == len(kept)
+        assert mp.param_count() < params_before
+        y = mp.forward([0.1, 0.2, 0.3, 0.4])
+        assert len(y) == 3
+
+    def test_prune_channels_structured_invalid(self):
+        mp = AI.MLP([4, 6, 3], ["relu", "linear"])
+        with pytest.raises(ValueError):
+            AI.prune_channels_structured(mp, 1, ratio=0.5)
+        with pytest.raises(ValueError):
+            AI.prune_channels_structured(mp, 0, ratio=0.0)
+        with pytest.raises(ValueError):
+            AI.prune_channels_structured(mp, 0, ratio=0.5, keep_at_least=7)
+        with pytest.raises(ValueError):
+            AI.prune_channels_structured(object(), 0)
+        with pytest.raises(ValueError):
+            AI.prune_channels_structured(mp, -1)
+
+    def test_fp8_round_known_values(self):
+        assert AI.fp8_round(0.1) == 0.1015625
+        assert AI.fp8_round(448.0) == 448.0
+        assert AI.fp8_round(500.0) == 448.0
+        assert AI.fp8_round(-500.0) == -448.0
+        assert AI.fp8_round(0.0) == 0.0
+        assert AI.fp8_round(float("nan")) != AI.fp8_round(float("nan"))
+        assert AI.fp8_round(0.1, "e5m2") == 0.09375
+        assert AI.fp8_round(60000.0, "e5m2") == 57344.0
+        assert AI.fp8_round(2.0 ** -12) == 0.0
+        assert AI.fp8_round(2.0 ** -20, "e5m2") == 0.0
+        with pytest.raises(ValueError):
+            AI.fp8_round(1.0, "fp8_e3m4")
+
+    def test_fp8_quantize_and_mixed_precision(self):
+        mp = AI.MLP([3, 4, 2], ["relu", "linear"])
+        AI.quantize_model(mp, dtype="fp8_e4m3")
+        for row in mp.layers[0].weights:
+            for w in row:
+                assert AI.fp8_round(w, "e4m3") == w
+                assert abs(w) <= 448.0
+        m = AI.Model(AI.MLP([3, 4, 2], ["relu", "linear"]), loss_fn="mse")
+        xs = [[0.1, 0.2, 0.3], [0.4, -0.2, 0.0]]
+        ys = [[1.0, 0.0], [0.0, 1.0]]
+        _, g32 = AI.checkpoint_grads(m, xs, ys, segments=2)
+        _, g8 = AI.mixed_precision_grads(m, xs, ys, scale=64.0, dtype="fp8_e4m3")
+        for pair32, pair8 in zip(g32, g8):
+            for a, b in zip(pair32, pair8):
+                if a is None or b is None:
+                    continue
+                flat_a = [v for row in a for v in row] if isinstance(a, list) and a and isinstance(a[0], list) else list(a)
+                flat_b = [v for row in b for v in row] if isinstance(b, list) and b and isinstance(b[0], list) else list(b)
+                for va, vb in zip(flat_a, flat_b):
+                    assert abs(va - vb) <= 1e-1 + 1e-1 * abs(va)
+        with pytest.raises(ValueError):
+            AI.mixed_precision_grads(m, xs, ys, dtype="fp8_e3m4")
+        with pytest.raises(ValueError):
+            AI.quantize_model(mp, dtype="int8")

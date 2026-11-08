@@ -41820,6 +41820,70 @@ def prune_channels(model, layer_index, ratio=0.5, keep_at_least=1):
     return {"pruned": pruned, "kept": kept, "scores": scores}
 
 
+def prune_channels_structured(model, layer_index, ratio=0.5, keep_at_least=1):
+    """按通道重要性**真正删掉**输出通道（同时裁剪下一层的输入列）。
+
+    只支持相邻维度兼容的 MLP / 线性层（``layer.fan_out == next.fan_in``）；
+    与 ``prune_channels`` 的掩码式剪枝不同，本函数会物理删除权重行/列并更新
+    ``fan_out`` / ``fan_in`` / ``layer_sizes``，因此参数量会真实减少。
+    返回 ``{"pruned", "kept", "scores", "layers": (i, i+1)}``。
+    """
+    _w15_ratio(ratio, "prune_channels_structured")
+    if ratio <= 0.0:
+        raise ValueError("prune_channels_structured: ratio 必须 > 0（否则什么都不会删）")
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if layers is None:
+        raise ValueError("prune_channels_structured: 模型需要 layers 列表（MLP）")
+    layers = list(layers)
+    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
+        raise ValueError(
+            f"prune_channels_structured: layer_index 必须是整数，收到 {layer_index!r}"
+        )
+    if not (0 <= layer_index < len(layers) - 1):
+        raise ValueError(
+            f"prune_channels_structured: layer_index={layer_index} 必须是中间层"
+            f"（0 <= index < {len(layers) - 1}）"
+        )
+    cur, nxt = layers[layer_index], layers[layer_index + 1]
+    if not hasattr(cur, "weights") or not hasattr(nxt, "weights"):
+        raise ValueError("prune_channels_structured: 只支持带 weights 的线性层")
+    if getattr(cur, "fan_out", None) != getattr(nxt, "fan_in", None):
+        raise ValueError(
+            f"prune_channels_structured: 相邻维度不兼容"
+            f"（{getattr(cur, 'fan_out', None)} -> {getattr(nxt, 'fan_in', None)}）"
+        )
+    scores = channel_scores(cur)
+    if not isinstance(keep_at_least, int) or isinstance(keep_at_least, bool)             or keep_at_least < 1:
+        raise ValueError("prune_channels_structured: keep_at_least 必须是 >=1 的整数")
+    if keep_at_least > len(scores):
+        raise ValueError(
+            f"prune_channels_structured: keep_at_least={keep_at_least} 超过通道数 {len(scores)}"
+        )
+    pruned = _w15_pick(scores, ratio, "prune_channels_structured", keep_at_least)
+    keep = sorted(j for j in range(len(scores)) if j not in pruned)
+    if not keep:
+        raise ValueError("prune_channels_structured: keep_at_least 导致没有通道可留")
+    cur.weights = [cur.weights[j] for j in keep]
+    if hasattr(cur, "biases") and cur.biases:
+        cur.biases = [cur.biases[j] for j in keep]
+    nxt.weights = [[row[j] for j in keep] for row in nxt.weights]
+    cur.fan_out = len(keep)
+    nxt.fan_in = len(keep)
+    for obj in (cur, nxt):
+        for name in ("m_w", "v_w", "m_b", "v_b"):
+            if hasattr(obj, name):
+                setattr(obj, name, None)
+    if getattr(net, "layer_sizes", None):
+        net.layer_sizes = [layers[0].fan_in] + [layer.fan_out for layer in layers]
+    if hasattr(net, "_fhooks"):
+        net._fhooks = {}
+    if hasattr(net, "_bhooks"):
+        net._bhooks = {}
+    return {"pruned": pruned, "kept": keep, "scores": scores,
+            "layers": (layer_index, layer_index + 1)}
+
+
 def head_scores(attention, projection="q"):
     """多头注意力每个头的权重绝对值之和（``projection`` 取 ``q`` / ``k`` / ``v`` / ``o``）。"""
     if projection not in ("q", "k", "v", "o"):
@@ -48331,16 +48395,24 @@ def _w10f_segments(n_layers, segments):
     return bounds
 
 
-def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None):
+def _release_layer_cache(layer):
+    """丢弃层的标准前向缓存（梯度检查点 release=True 时真正释放中间激活）。"""
+    for name in ("input", "z", "a"):
+        if hasattr(layer, name):
+            setattr(layer, name, None)
+
+
+def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False):
     """用**梯度检查点**算一批样本的梯度，返回 ``(loss, grads)``
 
     做法：前向只保留每段**边界处**的激活（以 ``x`` 的形式），段内的中间激活丢掉；
     反向时逐段重放前向、重建该段的层缓存再反传。与 ``_mlp_backward`` 的差别只是
     「用时间换显存」。
 
-    诚实说明：本库的 ``Layer`` 把缓存挂在层对象上、每层只留最后一次前向的输入，
-    所以**真实内存并不会下降**（本来就只存 O(层数) 份输入）；这个函数实现的是
-    重放机制本身，并保证梯度与普通反传逐位一致，方便在更占内存的模型上复用。
+    ``release=True`` 时每段前向结束后调用 ``_release_layer_cache`` 丢掉段内层的
+    标准缓存（input/z/a），反向重放时再重建 —— 这样中间激活的峰值确实降到
+    O(段数) 份边界激活 + 当前段缓存，而不只是「重放机制本身」。默认 ``False``
+    保持旧行为（不额外清理）；两种模式梯度都应与普通反传逐位一致。
     ``loss_fn`` 省略时用 ``model._loss``。
     """
     net = getattr(model, "model", model)
@@ -48362,6 +48434,9 @@ def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None):
         for s, e in bounds:
             for i in range(s, e):
                 h = layers[i].forward(h)
+            if release:
+                for i in range(s, e):
+                    _release_layer_cache(layers[i])
         loss, grad = use(h, y)
         total += loss
         delta = list(grad)
@@ -48388,6 +48463,9 @@ def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None):
                     for j, v in enumerate(gb):
                         ab[j] += v
                 acc[i] = (aw, ab)
+            if release:
+                for i in range(s, e):
+                    _release_layer_cache(layers[i])
     n = float(len(xs))
     grads = []
     for gw, gb in acc:
@@ -48428,11 +48506,59 @@ def bf16_round(value):
     return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
+_FP8_FORMATS = {
+    "fp8_e4m3": (4, 3, -6, 8, 448.0),
+    "fp8_e5m2": (5, 2, -14, 15, 57344.0),
+}
+
+
+def fp8_round(value, fmt="e4m3"):
+    """把浮点数舍入到 FP8（E4M3 或 E5M2）能表示的最接近值（返回 float）。
+
+    E4M3：4 位指数 / 3 位尾数，最大有限值 448；E5M2：5 位指数 / 2 位尾数，
+    最大有限值 57344。超出最大值的数按饱和处理（FP8 没有 inf），
+    低于最小次正规的数舍入到 0；``fmt`` 也接受 ``fp8_e4m3`` / ``fp8_e5m2``。
+    """
+    if fmt == "e4m3":
+        fmt = "fp8_e4m3"
+    elif fmt == "e5m2":
+        fmt = "fp8_e5m2"
+    spec = _FP8_FORMATS.get(fmt)
+    if spec is None:
+        raise ValueError(
+            f"fp8_round: fmt 只能是 e4m3 / e5m2 / fp8_e4m3 / fp8_e5m2，收到 {fmt!r}"
+        )
+    _, mant_bits, emin, _emax, maxval = spec
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")) or v == 0.0:
+        return v
+    sign = -1.0 if v < 0.0 else 1.0
+    a = abs(v)
+    if a >= maxval:
+        return sign * maxval
+    if a < 2.0 ** emin:
+        step = 2.0 ** (emin - mant_bits)
+        return sign * round(a / step) * step
+    _, exp = math.frexp(a)
+    exp = exp - 1
+    step = 2.0 ** (exp - mant_bits)
+    q = round(a / step) * step
+    return sign * min(q, maxval)
+
+
 def quantize_model(model, dtype="fp16"):
-    """把模型权重与偏置**原地**舍入到 ``fp16`` / ``bf16`` 精度（模拟用）"""
-    if dtype not in ("fp16", "bf16"):
-        raise ValueError(f"quantize_model: dtype 只能是 'fp16' 或 'bf16'，收到 {dtype!r}")
-    fn = fp16_round if dtype == "fp16" else bf16_round
+    """把模型权重与偏置**原地**舍入到 ``fp16`` / ``bf16`` / FP8 精度（模拟用）"""
+    if dtype not in ("fp16", "bf16", "fp8_e4m3", "fp8_e5m2"):
+        raise ValueError(
+            "quantize_model: dtype 只能是 'fp16' / 'bf16' / 'fp8_e4m3' / 'fp8_e5m2'，"
+            f"收到 {dtype!r}"
+        )
+    if dtype == "fp16":
+        fn = fp16_round
+    elif dtype == "bf16":
+        fn = bf16_round
+    else:
+        fn = lambda v, _fmt=dtype: fp8_round(v, _fmt)
     net = getattr(model, "model", model)
     for layer in net.layers:
         if not hasattr(layer, "weights"):
@@ -48456,9 +48582,10 @@ def mixed_precision_grads(model, xs, ys, scale=1024.0, dtype="fp16"):
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) \
             or scale != scale or scale <= 0.0 or scale == float("inf"):
         raise ValueError(f"mixed_precision_grads: scale 必须是正的有限实数，收到 {scale!r}")
-    if dtype not in ("fp16", "bf16"):
+    if dtype not in ("fp16", "bf16", "fp8_e4m3", "fp8_e5m2"):
         raise ValueError(
-            f"mixed_precision_grads: dtype 只能是 'fp16' 或 'bf16'，收到 {dtype!r}"
+            "mixed_precision_grads: dtype 只能是 'fp16' / 'bf16' / 'fp8_e4m3' / "
+            f"'fp8_e5m2'，收到 {dtype!r}"
         )
     if not xs:
         raise ValueError("mixed_precision_grads: xs 不能为空")
@@ -48467,7 +48594,12 @@ def mixed_precision_grads(model, xs, ys, scale=1024.0, dtype="fp16"):
             f"mixed_precision_grads: xs 有 {len(xs)} 个，ys 有 {len(ys)} 个"
         )
     net = getattr(model, "model", model)
-    fn = fp16_round if dtype == "fp16" else bf16_round
+    if dtype == "fp16":
+        fn = fp16_round
+    elif dtype == "bf16":
+        fn = bf16_round
+    else:
+        fn = lambda v, _fmt=dtype: fp8_round(v, _fmt)
     acc = [(None, None) for _ in net.layers]
     total = 0.0
     for x, y in zip(xs, ys):
