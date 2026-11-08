@@ -28091,3 +28091,87 @@ class TestScoreEBM:
             AI.latent_diffusion_pipeline(ident, ident, lambda v: v[:-1], img)
         with pytest.raises(ValueError):
             AI.latent_diffusion_pipeline(ident, ident, ident, [])
+
+
+class TestCompositeModels:
+    """LLaMA / ResNet 组合模型：形状、训练收敛、GQA 与 stride>1 回归。"""
+
+    @staticmethod
+    def _llama(**overrides):
+        kwargs = dict(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                      num_layers=1, max_len=8, rope=True)
+        kwargs.update(overrides)
+        return AI.LlamaModel(**kwargs)
+
+    @staticmethod
+    def _pattern(cls):
+        """6x6 三通道图：类别决定 2x2 亮块的位置（避免 BN 把常量通道差异归一化掉）。"""
+        img = [[[0.0] * 6 for _ in range(6)] for _ in range(3)]
+        h0, w0 = ((1, 1), (3, 1), (1, 3))[cls]
+        for c in range(3):
+            for h in range(h0, h0 + 2):
+                for w in range(w0, w0 + 2):
+                    img[c][h][w] = 1.0 + 0.1 * c
+        return img
+
+    def test_llama_forward_and_param_count(self):
+        random.seed(7)
+        model = self._llama()
+        logits = model.forward([0, 1, 2, 3])
+        assert len(logits) == 4
+        assert all(len(row) == 5 for row in logits)
+        assert model.param_count() > 0
+
+    def test_llama_fit_reduces_loss_and_generate(self):
+        random.seed(7)
+        model = self._llama()
+        history = model.fit([[0, 1, 2, 3, 4, 1, 2]], epochs=40, lr=0.02, seed=1)
+        assert history[-1] < history[0]
+        out = model.generate([0, 1], max_new_tokens=4, temperature=0.7, seed=2)
+        assert len(out) == 6
+        assert all(0 <= token < 5 for token in out)
+
+    def test_llama_gqa_forward_backward(self):
+        random.seed(7)
+        model = self._llama(num_kv_heads=1)
+        loss = model.loss_and_backward([0, 1, 2, 3])
+        assert math.isfinite(loss) and loss > 0.0
+        assert len(model.forward([0, 1, 2])) == 3
+
+    def test_llama_invalid_inputs(self):
+        random.seed(7)
+        model = self._llama()
+        with pytest.raises(ValueError):
+            model.forward([])
+        with pytest.raises(ValueError):
+            model.forward(list(range(9)))
+        with pytest.raises(ValueError):
+            model.loss_and_backward([0, 1], targets=[0, 1])
+
+    def test_resnet_forward_and_param_count(self):
+        random.seed(3)
+        net = AI.ResNet(in_channels=3, num_classes=3, stem_channels=4,
+                        channel_plan=(4, 8), blocks_per_stage=(1, 1))
+        logits = net.logits(self._pattern(0))
+        assert len(logits) == 3
+        assert net.param_count() > 0
+
+    def test_resnet_stride_two_backward(self):
+        # 回归：Bottleneck2d 在 stride=2（stage 下采样）时按输出空间裁剪 conv1 梯度会越界。
+        random.seed(3)
+        net = AI.ResNet(in_channels=3, num_classes=3, stem_channels=4,
+                        channel_plan=(4, 8), blocks_per_stage=(1, 1))
+        loss = net.loss_and_backward(self._pattern(1), 1)
+        assert math.isfinite(loss) and loss > 0.0
+
+    def test_resnet_fit_converges(self):
+        random.seed(3)
+        net = AI.ResNet(in_channels=3, num_classes=3, stem_channels=4,
+                        channel_plan=(4, 8), blocks_per_stage=(1, 1))
+        images = [self._pattern(c) for c in (0, 1, 2, 0, 1, 2)]
+        labels = [0, 1, 2, 0, 1, 2]
+        history = net.fit(images, labels, epochs=100, lr=0.02, seed=0)
+        assert history[-1] < 0.2
+        net.eval()
+        preds = [max(range(3), key=lambda v: net.logits(img)[v]) for img in images]
+        assert preds == labels

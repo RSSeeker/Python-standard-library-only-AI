@@ -28,7 +28,7 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 77 个顶层分节
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 78 个顶层分节
 # （920 个 def / 297 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
@@ -107,7 +107,8 @@
 #  74. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
 #  75. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
 #  76. 生成模型：VAE / GAN / DDPM
-#  77. Main: 回归 + 分类 + CNN 完整示例
+#  77. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#  78. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -2616,8 +2617,11 @@ class Bottleneck2d:
             self.bn_grads["bn2_gamma"][c] += g2[c]
             self.bn_grads["bn2_beta"][c] += b2[c]
         dr1 = self.conv2.backward(dr2b)
-        dh1 = [[[dr1[c][h][w] if r1[c][h][w] > 0.0 else 0.0 for w in range(W)]
-                for h in range(H)] for c in range(self.mid)]
+        # conv1 的输出空间 = 本 block 的输入空间；stride>1 时它与输出空间 (H, W) 不同，
+        # 必须用 r1 自己的尺寸裁剪梯度（否则 stride=2 的 block 会越界）
+        H1, W1 = len(r1[0]), len(r1[0][0])
+        dh1 = [[[dr1[c][h][w] if r1[c][h][w] > 0.0 else 0.0 for w in range(W1)]
+                for h in range(H1)] for c in range(self.mid)]
         dxc, g1, b1 = self.bn1.backward(dh1)
         for c in range(self.mid):
             self.bn_grads["bn1_gamma"][c] += g1[c]
@@ -51064,6 +51068,640 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
               val_split=val_split, patience=patience, verbose=verbose,
               seed=seed)
     return model
+
+
+
+# ============================================================================
+#  组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+# ============================================================================
+# 这两类只做「拼装 + forward/backward 转发」，不重复实现任何子模块：
+# LlamaModel 组合 Embedding + LlamaBlock(RMSNorm/MultiHeadAttention/SwiGLU)，
+# ResNet 组合 Conv2d/BatchNorm2d/Bottleneck2d/AdaptiveAvgPool2d/Flatten。
+
+
+class LlamaBlock:
+    """LLaMA 解码器块（pre-norm）：
+
+        h1 = RMSNorm1(x)
+        x  = x + GQA_Attn(h1)      # 因果 + RoPE（可选）
+        h2 = RMSNorm2(x)
+        out = x + SwiGLU(h2)
+
+    归一化放在子层之前（pre-norm），归一化用 RMSNorm，FFN 用 SwiGLU——
+    与 `TransformerEncoderLayer`（post-norm + LayerNorm + ReLU-FFN）的区别就在这里。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+                 num_kv_heads: Optional[int] = None, dropout: float = 0.0,
+                 rope: bool = True):
+        for name, value in (("d_model", d_model), ("d_ff", d_ff)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"LlamaBlock: {name} 必须是正整数，收到 {value!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(f"LlamaBlock: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"LlamaBlock: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        self.d_model = d_model
+        self.attn = MultiHeadAttention(d_model, num_heads, dropout,
+                                       causal=True, rope=rope,
+                                       num_kv_heads=num_kv_heads)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_ff)
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        """重置子模块梯度与两个 RMSNorm 的 gamma 梯度"""
+        self.attn.zero_grad()
+        self.ffn.zero_grad()
+        self.grads = {
+            "ln1_gamma": [0.0] * self.d_model,
+            "ln2_gamma": [0.0] * self.d_model,
+        }
+
+    def train(self):
+        self.attn.train()
+        return self
+
+    def eval(self):
+        self.attn.eval()
+        return self
+
+    def forward(self, x_seq):
+        """x_seq: (T, d_model) → (T, d_model)"""
+        if not x_seq:
+            raise ValueError("LlamaBlock.forward: 输入序列为空")
+        d = self.d_model
+        if len(x_seq[0]) != d:
+            raise ValueError(
+                f"LlamaBlock.forward: 输入维度 {len(x_seq[0])} 与 d_model={d} 不一致")
+        seq = [list(row) for row in x_seq]
+        h1 = [self.ln1.forward(v) for v in seq]
+        attn_out = self.attn.forward(h1)
+        res1 = [[seq[t][j] + attn_out[t][j] for j in range(d)]
+                for t in range(len(seq))]
+        h2 = [self.ln2.forward(v) for v in res1]
+        ffn_out = self.ffn.forward(h2)
+        res2 = [[res1[t][j] + ffn_out[t][j] for j in range(d)]
+                for t in range(len(seq))]
+        self._cache = (seq, h1, res1, h2, res2)
+        return res2
+
+    def backward(self, dout_seq):
+        """dout_seq: (T, d_model) → dx: (T, d_model)"""
+        if self._cache is None:
+            raise RuntimeError("LlamaBlock.backward: 必须先调用 forward()")
+        seq, h1, res1, h2, res2 = self._cache
+        T, d = len(seq), self.d_model
+        if len(dout_seq) != T or any(len(row) != d for row in dout_seq):
+            raise ValueError("LlamaBlock.backward: dout 形状与 forward 输入不一致")
+
+        # ---- FFN 分支：out = res2 的直通 + SwiGLU(ln2(res1))
+        d_res1 = [list(row) for row in dout_seq]
+        d_h2 = self.ffn.backward(dout_seq)
+        g_ln2 = self.grads["ln2_gamma"]
+        for t in range(T):
+            self.ln2.forward(h2[t])          # 重放该 token 的缓存
+            gg, dx = self.ln2.backward(d_h2[t])
+            for j in range(d):
+                g_ln2[j] += gg[j]
+                d_res1[t][j] += dx[j]
+
+        # ---- 注意力分支：res1 的直通 + Attn(ln1(seq))
+        d_ln1_out = self.attn.backward(d_res1)
+        g_ln1 = self.grads["ln1_gamma"]
+        d_x = [list(row) for row in d_res1]
+        for t in range(T):
+            self.ln1.forward(h1[t])
+            gg, dx = self.ln1.backward(d_ln1_out[t])
+            for j in range(d):
+                g_ln1[j] += gg[j]
+                d_x[t][j] += dx[j]
+        return d_x
+
+
+class LlamaModel:
+    """完整 LLaMA 式因果语言模型（教学用组合类）
+
+    结构：Embedding → N × LlamaBlock → RMSNorm → 词表头（W_out / b_out）。
+    RoPE 由 `MultiHeadAttention(rope=True)` 提供，因此默认不叠加绝对位置编码
+    （与 Llama 一致）；GQA 通过 `num_kv_heads` 控制。
+
+    训练接口与 `CausalLM` 对齐：`loss_and_backward` 做 teacher-forcing 交叉熵，
+    `fit` / `generate` / `adam_step` 可直接用。参数更新由本类的 adam_step 统一处理。
+
+    用法::
+
+        lm = LlamaModel(vocab_size=8, d_model=16, num_heads=2, d_ff=32,
+                        num_layers=2, num_kv_heads=1, max_len=32)
+        lm.fit([[0, 1, 2, 3, 0, 1, 2, 3]], epochs=40, lr=0.01)
+        lm.generate([0, 1, 2], max_new_tokens=8)
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
+                 d_ff: int = 64, num_layers: int = 2, num_kv_heads: Optional[int] = None,
+                 max_len: int = 256, dropout: float = 0.0, rope: bool = True):
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 1:
+            raise ValueError(f"LlamaModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if isinstance(max_len, bool) or not isinstance(max_len, int) or max_len < 1:
+            raise ValueError(f"LlamaModel: max_len 必须 >= 1，收到 {max_len!r}")
+        if isinstance(num_layers, bool) or not isinstance(num_layers, int) or num_layers < 1:
+            raise ValueError(f"LlamaModel: num_layers 必须是正整数，收到 {num_layers!r}")
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"LlamaModel: d_model 必须是正整数，收到 {d_model!r}")
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads < 1:
+            raise ValueError(f"LlamaModel: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"LlamaModel: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.max_len = max_len
+        self.dropout = dropout
+        self.rope = bool(rope)
+
+        self.embedding = Embedding(vocab_size, d_model)
+        self.blocks = [
+            LlamaBlock(d_model, num_heads, d_ff, num_kv_heads=num_kv_heads,
+                       dropout=dropout, rope=self.rope)
+            for _ in range(num_layers)
+        ]
+        self.norm = RMSNorm(d_model)
+        std = math.sqrt(2.0 / d_model)
+        self.W_out = [[random.gauss(0.0, std) for _ in range(d_model)]
+                      for _ in range(vocab_size)]
+        self.b_out = [0.0] * vocab_size
+        self._adam_m = {}
+        self._adam_v = {}
+        self.step_count = 0
+        self._norm_in = None
+        self._norm_out = None
+        self.zero_grad()
+
+    # ---- 参数 / 梯度 --------------------------------------------------------
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        for block in self.blocks:
+            block.zero_grad()
+        self.grads = {
+            "norm_gamma": [0.0] * self.d_model,
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0] * self.vocab_size,
+        }
+
+    def _named_params(self):
+        """产出 (名字, 参数, 梯度)；名字用于跨步保持 Adam 的一阶/二阶矩"""
+        yield "emb.weight", self.embedding.weight, self.embedding.grad_weight
+        for li, block in enumerate(self.blocks):
+            attn = block.attn
+            for key in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"L{li}.attn.{key}", getattr(attn, key), attn.grads[key]
+            ffn = block.ffn
+            for key in ("W1", "b1", "Wg", "bg", "W2", "b2"):
+                yield f"L{li}.ffn.{key}", getattr(ffn, key), ffn.grads[key]
+            yield f"L{li}.ln1.gamma", block.ln1.gamma, block.grads["ln1_gamma"]
+            yield f"L{li}.ln2.gamma", block.ln2.gamma, block.grads["ln2_gamma"]
+        yield "norm.gamma", self.norm.gamma, self.grads["norm_gamma"]
+        yield "out.W", self.W_out, self.grads["W_out"]
+        yield "out.b", self.b_out, self.grads["b_out"]
+
+    def param_count(self):
+        def count(p):
+            if p and isinstance(p[0], (list, tuple)):
+                return sum(len(row) for row in p)
+            return len(p)
+        return sum(count(p) for _, p, _ in self._named_params())
+
+    def train(self):
+        for block in self.blocks:
+            block.train()
+        return self
+
+    def eval(self):
+        for block in self.blocks:
+            block.eval()
+        return self
+
+    # ---- 前向 / 反向 --------------------------------------------------------
+    def forward(self, ids):
+        """ids: List[int] → logits (T, vocab_size)（未 softmax）"""
+        if not ids:
+            raise ValueError("LlamaModel.forward: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"LlamaModel.forward: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        emb = self.embedding.forward(ids)
+        x = emb
+        for block in self.blocks:
+            x = block.forward(x)
+        self._norm_in = x
+        norm_out = [self.norm.forward(v) for v in x]
+        self._norm_out = norm_out
+        logits = _matmul(norm_out, _transpose(self.W_out))
+        for t in range(len(norm_out)):
+            row = logits[t]
+            for v in range(self.vocab_size):
+                row[v] += self.b_out[v]
+        return logits
+
+    def _backward_from_logits(self, dlogits):
+        """把 logits 的梯度传回所有参数（梯度累加到 self.grads / 子模块 grads）"""
+        if self._norm_out is None:
+            raise RuntimeError("LlamaModel._backward_from_logits: 必须先调用 forward()")
+        T = len(dlogits)
+        V = self.vocab_size
+        d = self.d_model
+        norm_out = self._norm_out
+
+        grad_W = [[sum(dlogits[t][v] * norm_out[t][j] for t in range(T))
+                   for j in range(d)] for v in range(V)]
+        grad_b = [sum(dlogits[t][v] for t in range(T)) for v in range(V)]
+        for v in range(V):
+            row = self.grads["W_out"][v]
+            for j in range(d):
+                row[j] += grad_W[v][j]
+            self.grads["b_out"][v] += grad_b[v]
+
+        d_norm = _matmul(dlogits, self.W_out)      # (T, d)
+        g_norm = self.grads["norm_gamma"]
+        d = []
+        for t in range(T):
+            self.norm.forward(self._norm_in[t])    # 重放该 token 的缓存
+            gg, dx = self.norm.backward(d_norm[t])
+            for j in range(self.d_model):
+                g_norm[j] += gg[j]
+            d.append(dx)
+
+        for block in reversed(self.blocks):
+            d = block.backward(d)
+        self.embedding.backward(d)
+
+    def loss_and_backward(self, ids, targets=None):
+        """teacher-forcing 交叉熵：位置 t 的 logits 预测 ids[t+1]
+
+        targets 省略时用 ids[1:]；给定 targets 时必须长度 = len(ids)-1。
+        返回平均 loss（对 T-1 个位置取平均），梯度已累积。
+        """
+        seq = list(ids)
+        if len(seq) < 2:
+            raise ValueError("LlamaModel.loss_and_backward: 序列至少需要 2 个 token")
+        if targets is None:
+            tgt = list(seq[1:])
+        else:
+            tgt = list(targets)
+            if len(tgt) != len(seq) - 1:
+                raise ValueError(
+                    f"LlamaModel.loss_and_backward: targets 长度 {len(tgt)} "
+                    f"应为 {len(seq) - 1}")
+        logits = self.forward(seq)
+        T = len(seq)
+        n = T - 1
+        V = self.vocab_size
+        loss = 0.0
+        dlogits = [[0.0] * V for _ in range(T)]
+        for t in range(n):
+            y = tgt[t]
+            if not isinstance(y, int) or isinstance(y, bool) or not 0 <= y < V:
+                raise ValueError(f"LlamaModel.loss_and_backward: 第 {t} 个 target {y!r} 越界")
+            p = _softmax_row(logits[t])
+            loss -= math.log(max(p[y], 1e-12))
+            scale = 1.0 / n
+            row = dlogits[t]
+            for v in range(V):
+                row[v] = (p[v] - (1.0 if v == y else 0.0)) * scale
+        loss /= n
+        self._backward_from_logits(dlogits)
+        return loss
+
+    def adam_step(self, lr: float):
+        """对全部参数做一次 Adam 更新（梯度已由 loss_and_backward 累积）"""
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"LlamaModel.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, sequences, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干条 token 序列上训练，返回每个 epoch 的平均 loss"""
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("LlamaModel.fit: sequences 必须是非空列表")
+        seqs = []
+        for i, s in enumerate(sequences):
+            if not isinstance(s, (list, tuple)) or len(s) < 2:
+                raise ValueError(f"LlamaModel.fit: 第 {i} 条序列至少需要 2 个 token")
+            if len(s) > self.max_len:
+                raise ValueError(
+                    f"LlamaModel.fit: 第 {i} 条序列长度 {len(s)} 超过 max_len={self.max_len}")
+            seqs.append(list(s))
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"LlamaModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        rng = random.Random(seed)
+        order = list(range(len(seqs)))
+        history = []
+        for ep in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(seqs[idx])
+                self.adam_step(lr)
+            avg = total / len(seqs)
+            history.append(avg)
+            if verbose:
+                print(f"  Llama epoch {ep + 1}/{epochs} | loss {avg:.4f}")
+        return history
+
+    def generate(self, prompt_ids, max_new_tokens: int = 16,
+                 temperature: float = 1.0, top_k: int = 0, seed=None):
+        """自回归生成（每步整段重算，未接 KV cache；教学用）"""
+        if not prompt_ids:
+            raise ValueError("LlamaModel.generate: prompt_ids 不能为空")
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+                or max_new_tokens < 0:
+            raise ValueError(
+                f"LlamaModel.generate: max_new_tokens 必须是非负整数，收到 {max_new_tokens!r}")
+        rng = random.Random(seed)
+        out = [int(x) for x in prompt_ids][-self.max_len:]
+        for _ in range(max_new_tokens):
+            ctx = out[-self.max_len:]
+            logits = self.forward(ctx)[-1]
+            out.append(self._sample(logits, temperature, top_k, rng))
+        return out
+
+    def _sample(self, logits, temperature, top_k, rng):
+        V = self.vocab_size
+        if temperature is None or temperature <= 0:
+            return max(range(V), key=lambda i: logits[i])
+        scaled = [v / temperature for v in logits]
+        if top_k and top_k > 0:
+            cand = sorted(range(V), key=lambda i: (-scaled[i], i))[:top_k]
+            row = [scaled[i] for i in cand]
+        else:
+            cand = list(range(V))
+            row = scaled
+        p = _softmax_row(row)
+        r = rng.random()
+        acc = 0.0
+        for tok, prob in zip(cand, p):
+            acc += prob
+            if r <= acc:
+                return tok
+        return cand[-1]
+
+
+class ResNet:
+    """完整 ResNet（CIFAR 风格）组合类：
+
+        stem: Conv2d(3×3) → BatchNorm2d → ReLU
+        stage: 若干 Bottleneck2d（每个 stage 的第一个用 stride=2 下采样）
+        head : AdaptiveAvgPool2d((1,1)) → Flatten → 全连接分类头
+
+    只支持单样本输入 (C, H, W)；批量训练由调用者循环（与 Conv2d 的约定一致）。
+    参数更新（Conv / BatchNorm / 分类头）由 `adam_step` 统一处理。
+    """
+
+    def __init__(self, in_channels: int = 3, num_classes: int = 10,
+                 stem_channels: int = 16, channel_plan=(16, 32, 64),
+                 blocks_per_stage=(2, 2, 2)):
+        for name, value in (("in_channels", in_channels), ("num_classes", num_classes),
+                            ("stem_channels", stem_channels)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"ResNet: {name} 必须是正整数，收到 {value!r}")
+        channel_plan = tuple(channel_plan)
+        blocks_per_stage = tuple(blocks_per_stage)
+        if not channel_plan or len(channel_plan) != len(blocks_per_stage):
+            raise ValueError(
+                "ResNet: channel_plan 与 blocks_per_stage 必须等长且非空")
+        for c, n in zip(channel_plan, blocks_per_stage):
+            if not isinstance(c, int) or isinstance(c, bool) or c < 1:
+                raise ValueError(f"ResNet: channel_plan 里的 {c!r} 必须是正整数")
+            if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+                raise ValueError(f"ResNet: blocks_per_stage 里的 {n!r} 必须是正整数")
+
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.stem_channels = stem_channels
+        self.stem = Conv2d(in_channels, stem_channels, 3, stride=1, padding=1)
+        self.stem_bn = BatchNorm2d(stem_channels)
+
+        self.stages = []
+        cin = stem_channels
+        for si, (c_out, n) in enumerate(zip(channel_plan, blocks_per_stage)):
+            blocks = []
+            for bi in range(n):
+                stride = 2 if (si > 0 and bi == 0) else 1
+                blocks.append(Bottleneck2d(cin if bi == 0 else c_out, c_out, stride))
+            self.stages.append(blocks)
+            cin = c_out
+        self.head_in = cin
+        self.pool = AdaptiveAvgPool2d((1, 1))
+        self.flatten = Flatten()
+
+        std = math.sqrt(2.0 / self.head_in)
+        self.W_out = [[random.gauss(0.0, std) for _ in range(self.head_in)]
+                      for _ in range(num_classes)]
+        self.b_out = [0.0] * num_classes
+        self._adam_m = {}
+        self._adam_v = {}
+        self.step_count = 0
+        self._cache = None
+        self.zero_grad()
+
+    # ---- 参数 / 梯度 --------------------------------------------------------
+    def zero_grad(self):
+        self.stem.zero_grad()
+        for stage in self.stages:
+            for block in stage:
+                block.zero_grad()
+        n_bn = len(self.stem_bn.gamma)
+        self.grads = {
+            "stem_bn_gamma": [0.0] * n_bn,
+            "stem_bn_beta": [0.0] * n_bn,
+            "W_out": [[0.0] * self.head_in for _ in range(self.num_classes)],
+            "b_out": [0.0] * self.num_classes,
+        }
+
+    def param_count(self):
+        total = _conv_param_count(self.stem) + 2 * len(self.stem_bn.gamma)
+        for stage in self.stages:
+            for block in stage:
+                total += block.param_count()
+        total += self.num_classes * self.head_in + self.num_classes
+        return total
+
+    def train(self):
+        self.stem_bn.train()
+        for stage in self.stages:
+            for block in stage:
+                block.train()
+        return self
+
+    def eval(self):
+        self.stem_bn.eval()
+        for stage in self.stages:
+            for block in stage:
+                block.eval()
+        return self
+
+    # ---- 前向 / 反向 --------------------------------------------------------
+    @staticmethod
+    def _relu3(x):
+        return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+    def _check_image(self, x, who):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError(f"{who}: 输入不能为空")
+        c = len(x)
+        if c != self.in_channels:
+            raise ValueError(f"{who}: 通道数 {c} != in_channels={self.in_channels}")
+        h = len(x[0])
+        if h < 1:
+            raise ValueError(f"{who}: H 不能为 0")
+        w = len(x[0][0])
+        if w < 1:
+            raise ValueError(f"{who}: W 不能为 0")
+        for ch in x:
+            if len(ch) != h or any(len(row) != w for row in ch):
+                raise ValueError(f"{who}: 各通道的 H/W 必须一致")
+        return c, h, w
+
+    def logits(self, x):
+        """x: (C, H, W) → logits (num_classes,)"""
+        self._check_image(x, "ResNet.forward")
+        stem_out = self.stem.forward(x)
+        bn_out = self.stem_bn.forward(stem_out)
+        act = self._relu3(bn_out)
+        h = act
+        for stage in self.stages:
+            for block in stage:
+                h = block.forward(h)
+        pooled = self.pool.forward(h)
+        flat = self.flatten.forward(pooled)
+        self._cache = (stem_out, bn_out, flat)
+        return [sum(map(_mul, self.W_out[v], flat)) + self.b_out[v]
+                for v in range(self.num_classes)]
+
+    def loss_and_backward(self, x, label: int):
+        """softmax 交叉熵；返回 loss，梯度已累积（分类头 / BN / Conv）"""
+        if not isinstance(label, int) or isinstance(label, bool) \
+                or not 0 <= label < self.num_classes:
+            raise ValueError(f"ResNet.loss_and_backward: label {label!r} 越界")
+        logits = self.logits(x)
+        p = _softmax_row(logits)
+        loss = -math.log(max(p[label], 1e-12))
+        dlogits = [p[v] - (1.0 if v == label else 0.0) for v in range(self.num_classes)]
+        stem_out, bn_out, flat = self._cache
+
+        for v in range(self.num_classes):
+            row = self.grads["W_out"][v]
+            for j in range(self.head_in):
+                row[j] += dlogits[v] * flat[j]
+            self.grads["b_out"][v] += dlogits[v]
+
+        d_flat = [sum(dlogits[v] * self.W_out[v][j] for v in range(self.num_classes))
+                  for j in range(self.head_in)]
+        dpool = self.flatten.backward(d_flat)       # (C, 1, 1)
+        dh = self.pool.backward(dpool)              # (C, H, W)
+        for stage in reversed(self.stages):
+            for block in reversed(stage):
+                dh = block.backward(dh)
+        # stem: BN → ReLU（用 BN 输出做 ReLU mask）
+        d_bn = [[[dh[c][h][w] if bn_out[c][h][w] > 0.0 else 0.0
+                  for w in range(len(dh[c][h]))]
+                 for h in range(len(dh[c]))] for c in range(len(dh))]
+        d_stem, g_bn, b_bn = self.stem_bn.backward(d_bn)
+        for c in range(len(g_bn)):
+            self.grads["stem_bn_gamma"][c] += g_bn[c]
+            self.grads["stem_bn_beta"][c] += b_bn[c]
+        self.stem.backward(d_stem)
+        return loss
+
+    def _adam_param(self, name, param, grad, t, lr):
+        m = self._adam_m.get(name)
+        v = self._adam_v.get(name)
+        if m is None:
+            m = _zeros_like(param)
+            v = _zeros_like(param)
+            self._adam_m[name] = m
+            self._adam_v[name] = v
+        _adam_apply(param, grad, m, v, t, lr)
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        """更新 Conv / BatchNorm / 分类头（梯度已由 loss_and_backward 累积）"""
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"ResNet.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.step_count += 1
+        t = self.step_count
+        _conv_adam(self.stem, lr, beta1, beta2, eps)
+        for stage in self.stages:
+            for block in stage:
+                block.adam_step(lr, beta1, beta2, eps)
+        self._adam_param("stem_bn.gamma", self.stem_bn.gamma,
+                         self.grads["stem_bn_gamma"], t, lr)
+        self._adam_param("stem_bn.beta", self.stem_bn.beta,
+                         self.grads["stem_bn_beta"], t, lr)
+        for si, stage in enumerate(self.stages):
+            for bi, block in enumerate(stage):
+                for tag, bn in (("bn1", block.bn1), ("bn2", block.bn2),
+                                ("bn3", block.bn3), ("short", block.short_bn)):
+                    if bn is None:
+                        continue
+                    self._adam_param(f"L{si}.{bi}.{tag}.gamma", bn.gamma,
+                                     block.bn_grads[tag + "_gamma"], t, lr)
+                    self._adam_param(f"L{si}.{bi}.{tag}.beta", bn.beta,
+                                     block.bn_grads[tag + "_beta"], t, lr)
+        self._adam_param("head.W", self.W_out, self.grads["W_out"], t, lr)
+        self._adam_param("head.b", self.b_out, self.grads["b_out"], t, lr)
+
+    def fit(self, images, labels, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干张 (C,H,W) 图像上训练分类头，返回每个 epoch 的平均 loss"""
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("ResNet.fit: images 必须是非空列表")
+        if not isinstance(labels, (list, tuple)) or len(labels) != len(images):
+            raise ValueError("ResNet.fit: labels 必须与 images 等长")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"ResNet.fit: epochs 必须是正整数，收到 {epochs!r}")
+        for i, img in enumerate(images):
+            self._check_image(img, f"ResNet.fit 第 {i} 张图")
+            lab = labels[i]
+            if not isinstance(lab, int) or isinstance(lab, bool) \
+                    or not 0 <= lab < self.num_classes:
+                raise ValueError(f"ResNet.fit: 第 {i} 个 label {lab!r} 越界")
+        rng = random.Random(seed)
+        order = list(range(len(images)))
+        history = []
+        for ep in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(images[idx], labels[idx])
+                self.adam_step(lr)
+            avg = total / len(images)
+            history.append(avg)
+            if verbose:
+                print(f"  ResNet epoch {ep + 1}/{epochs} | loss {avg:.4f}")
+        return history
 
 
 # ============================================================================

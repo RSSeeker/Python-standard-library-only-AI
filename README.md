@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1839 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1846 项）
 
 ## 特性
 
@@ -584,6 +584,32 @@ lm.fit(seqs, epochs=50, lr=3e-3, batch_size=2)             # 3 条 → 2 步/轮
 同理 `top_k` 必须是 `>= 0` 的整数（`0.5` 会被截成 0 → 候选集为空 → 采样恒取最后一类），
 token id 必须是 `[0, vocab)` 内的整数（负索引原来会被悄悄当成「最后一类」），
 logits 若出现 NaN/Inf 会直接报错而不是把 loss clamp 成 27.63。
+
+### 组合模型（LLaMA / ResNet）
+
+单件组件之上再提供两个「拼成完整网络」的组合类；训练/生成/参数更新复用同一套协议
+（`forward` / `loss_and_backward` / `adam_step` / `fit` / `train` / `eval`），不引入新的训练循环。
+
+```python
+lm = LlamaModel(vocab_size=64, d_model=64, num_heads=8, d_ff=128,
+                num_layers=2, num_kv_heads=2, max_len=128)
+lm.fit(seqs, epochs=50, lr=3e-3)                  # teacher-forcing 交叉熵
+out = lm.generate([1, 2, 3], max_new_tokens=16)   # 每步整段重算（教学用）
+
+net = ResNet(in_channels=3, num_classes=10)
+net.fit(images, labels, epochs=20, lr=1e-3)       # 单样本循环，与 Conv2d 约定一致
+pred = [max(range(10), key=lambda v: net.logits(img)[v]) for img in images]
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `LlamaBlock(d_model, num_heads, d_ff, num_kv_heads=None, dropout=0.0, rope=True)` | pre-norm：`x += Attn(RMSNorm(x))` → `x += SwiGLU(RMSNorm(x))`；复用 `MultiHeadAttention`（GQA / RoPE / 滑动窗口）与 `SwiGLU` |
+| `LlamaModel(vocab_size, d_model=32, num_heads=4, d_ff=64, num_layers=2, num_kv_heads=None, max_len=256, dropout=0.0, rope=True)` | Embedding → N×LlamaBlock → RMSNorm → LM 头；`fit` 做 teacher-forcing CE（位置 t 预测 `ids[t+1]`）；`generate` 支持温度 / top_k；另有 `param_count` / `zero_grad` / `adam_step` |
+| `ResNet(in_channels=3, num_classes=10, stem_channels=16, channel_plan=(16,32,64), blocks_per_stage=(2,2,2))` | stem `Conv2d → BatchNorm2d → ReLU`；每个 stage 用 `Bottleneck2d`（首块 stride=2 下采样，1×1 投影捷径），末尾 `AdaptiveAvgPool2d((1,1)) → Flatten → 分类头`；`logits` / `loss_and_backward` / `adam_step`（Conv 与 BN 分开更新）/ `fit` |
+
+`LlamaModel.generate` 不走 KV cache（每次整段重算，和 `CausalLM.generate` 的默认路径一致）；
+需要真正增量前向时用 `MultiHeadAttention.forward_step`。`Bottleneck2d` 在 stride=2 下的反向越界
+（旧实现按输出空间尺寸裁剪 conv1 梯度）已修复，并补了「stride=2 反向 + ResNet 收敛」两条回归测试。
 
 ### 序列到序列（Encoder-Decoder）
 
@@ -3223,7 +3249,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1839 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1846 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3507,7 +3533,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1839 个单元测试
+├── test_ai.py       # 1846 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

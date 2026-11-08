@@ -680,6 +680,30 @@
   - `constrained_generate` 是解码期过滤，不是可微符号层（docstring/README 写明）
 - [x] 文档化：NTK / 双下降 / grokking 作为「已知边界」——`empirical_ntk`（有限宽经验核，线性模型闭式 `xᵀx+1`）、`ntk_kernel_regression`（核视角闭式解，不等价于 SGD）、`double_descent_curve`（`p≈n` 处 test_mse 峰 11.94、`p>n` 二次下降到 0.48）；grokking 只解释机制不跑实验
 
+### W21 组合模型补齐（清单驱动）
+
+按「构件齐全、只差组合」的性价比排序：先把已验证的构件拼成完整网络，再补纯数学指标。
+所有组合类复用现有协议（`forward` / `loss_and_backward` / `adam_step` / `fit` /
+`train` / `eval`），不引入新的训练循环。
+
+- [x] `LlamaModel` / `LlamaBlock`：Embedding → N×(RMSNorm → GQA Attention → 残差 →
+  RMSNorm → SwiGLU → 残差) → RMSNorm → LM 头；复用 `MultiHeadAttention`（GQA / RoPE /
+  sliding window）、`RMSNorm`、`SwiGLU`、`Embedding`；`fit` 做 teacher-forcing CE
+  （位置 t 预测 `ids[t+1]`），`generate` 支持温度 / top_k，另有 `param_count` /
+  `zero_grad` / `adam_step`；测试 `TestCompositeModels` 4 例
+- [x] `ResNet`：stem `Conv2d → BatchNorm2d → ReLU`，stage 用 `Bottleneck2d`（每 stage 首块
+  stride=2，1×1 投影捷径），末尾 `AdaptiveAvgPool2d((1,1)) → Flatten → 分类头`；
+  `logits` / `loss_and_backward` / `adam_step`（Conv 与 BN 分开更新）/ `fit`；测试 3 例
+  （含 stride=2 反向与训练收敛）
+- [x] 修 `Bottleneck2d.backward` 在 stride=2 时按输出空间裁剪 conv1 梯度导致的越界
+  （ResNet 回归测试覆盖，旧实现遇到 stride>1 的 block 必崩）
+- [ ] 完整 BERT（MaskedLM + NSP）与完整 T5（Seq2SeqLM + `T5RelativeBias` 注入）
+- [ ] 多标签指标（Exact Match Ratio / Ranking Loss / LRAP）、OOD（MSP / Energy）、
+  McNemar / Wilcoxon（纯数学）
+- [ ] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合
+
+全量测试：1839 → 1846 passed（新增 7 例）。
+
 ---
 
 ## 5. 节奏与里程碑
