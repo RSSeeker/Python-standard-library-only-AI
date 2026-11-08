@@ -765,6 +765,11 @@ m = AI.Seq2SeqLM.load("s2s.json")
 `AI.kl_divergence` 并自己反传。
 
 配错「输出层激活 × 损失」会在 `Model(...)` 构造时直接抛 `ValueError`，而不是静默训歪。
+另外，`softmax` 只能作为输出层：`MLP(...)` / `Model(...)` 构造时都会拒绝隐藏层
+`softmax`（`Layer._softmax_deriv` 恒返回 1，只对「输出层 softmax + cross_entropy /
+focal 联合梯度」成立，放到隐藏层或搭配 `mse` 等逐元素损失会静默算错梯度）。
+`'ldam'` 是唯一需要 `loss_kwargs={'class_counts': [...]}` 的索引损失；`'distill'` 的
+target 必须是**教师 logits 向量**，传类别索引会在第一批就报错并提示改用 `cross_entropy`。
 
 `ohem_loss` 是**批级**接口（一次吃一批概率向量、返回整批梯度），不能塞进 `Model(loss_fn=...)`
 （那是逐样本调用约定）；类别不平衡的两个可选项已经接进映射表，用法：
