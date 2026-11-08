@@ -29170,3 +29170,90 @@ class TestTrackingAndSurfaceMetrics:
             AI.mota_motp_idf1(gt, pred, iou_threshold=1.5)
         with pytest.raises(ValueError):
             AI.mota_motp_idf1([{"boxes": [], "ids": []}], [{"boxes": [], "ids": []}])
+
+
+class TestHpoSearch:
+    def test_tpe_min_quadratic(self):
+        space = {"x": {"type": "float", "low": -1.0, "high": 1.0}}
+        res = AI.tpe_search(lambda p: (p["x"] - 0.2) ** 2, space,
+                            n_trials=24, n_startup=8, seed=1)
+        assert res["mode"] == "min"
+        assert res["n_trials"] == 24
+        assert len(res["trials"]) == 24
+        assert abs(res["best"]["x"] - 0.2) < 0.2
+        assert res["best_score"] < 0.04
+        assert res["best_score"] == min(t["score"] for t in res["trials"])
+
+    def test_tpe_mixed_space_deterministic(self):
+        space = {
+            "lr": {"type": "float", "low": 1e-4, "high": 1e-1, "log": True},
+            "depth": {"type": "int", "low": 1, "high": 4},
+            "act": {"type": "choice", "values": ["relu", "tanh"]},
+        }
+
+        def obj(p):
+            return (math.log10(p["lr"]) + 2.5) ** 2 + (p["depth"] - 2) ** 2 + (
+                0.5 if p["act"] == "tanh" else 0.0)
+
+        res1 = AI.tpe_search(obj, space, n_trials=30, n_startup=10, seed=7)
+        res2 = AI.tpe_search(obj, space, n_trials=30, n_startup=10, seed=7)
+        assert res1 == res2
+        assert set(res1["best"]) == {"lr", "depth", "act"}
+        assert res1["best"]["act"] in ("relu", "tanh")
+        assert 1 <= res1["best"]["depth"] <= 4
+        assert 1e-4 <= res1["best"]["lr"] <= 1e-1
+
+    def test_tpe_maximize(self):
+        space = {"x": {"type": "float", "low": -1.0, "high": 1.0}}
+        res = AI.tpe_search(lambda p: -(p["x"] - 0.8) ** 2, space,
+                            n_trials=20, n_startup=8, maximize=True, seed=3)
+        assert res["mode"] == "max"
+        assert abs(res["best"]["x"] - 0.8) < 0.3
+        assert res["best_score"] == max(t["score"] for t in res["trials"])
+
+    def test_tpe_invalid_inputs(self):
+        with pytest.raises(ValueError):
+            AI.tpe_search(1, {"x": {"type": "float", "low": 0, "high": 1}})
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0, {})
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0, {"x": {"type": "bool"}})
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0, {"x": {"type": "float", "low": 1, "high": 0}})
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0,
+                          {"x": {"type": "float", "low": 0, "high": 1, "log": True}})
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0,
+                          {"x": {"type": "float", "low": 0, "high": 1}}, n_trials=0)
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0,
+                          {"x": {"type": "float", "low": 0, "high": 1}},
+                          n_trials=5, n_startup=6)
+        with pytest.raises(ValueError):
+            AI.tpe_search(lambda p: 0.0,
+                          {"x": {"type": "float", "low": 0, "high": 1}}, gamma=1.0)
+
+    def test_successive_halving(self):
+        configs = [{"a": v} for v in range(12)]
+        res = AI.successive_halving(lambda c, b: (c["a"] - 7) ** 2, configs,
+                                    reduction=3, seed=1)
+        assert res["best"]["a"] == 7
+        assert [len(r["scores"]) for r in res["rounds"]] == [12, 4, 2]
+        assert [r["budget"] for r in res["rounds"]] == [1, 3, 9]
+        assert res["best_score"] == 0.0
+        res_max = AI.successive_halving(lambda c, b: -(c["a"] - 3) ** 2,
+                                        [{"a": v} for v in range(9)],
+                                        reduction=2, maximize=True)
+        assert res_max["mode"] == "max"
+        assert res_max["best"]["a"] == 3
+
+    def test_successive_halving_invalid(self):
+        with pytest.raises(ValueError):
+            AI.successive_halving(1, [{"a": 1}])
+        with pytest.raises(ValueError):
+            AI.successive_halving(lambda c, b: 0.0, [])
+        with pytest.raises(ValueError):
+            AI.successive_halving(lambda c, b: 0.0, ["x"])
+        with pytest.raises(ValueError):
+            AI.successive_halving(lambda c, b: 0.0, [{"a": 1}], reduction=1)

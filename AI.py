@@ -52530,6 +52530,275 @@ def hyperparameter_search(base_config, grid, data=None, x=None, y=None,
             "params_names": keys}
 
 
+def _hpo_check_space(space, who):
+    """校验 TPE 空间描述并归一化成内部结构。"""
+    if not isinstance(space, dict) or not space:
+        raise ValueError(f"{who}: space 必须是非空 dict")
+    specs = {}
+    for name, spec in space.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{who}: 参数名必须是非空字符串")
+        if not isinstance(spec, dict):
+            raise ValueError(f"{who}: space[{name!r}] 必须是 dict")
+        kind = spec.get("type")
+        if kind == "float":
+            low, high = spec.get("low"), spec.get("high")
+            for tag, v in (("low", low), ("high", high)):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"{who}: space[{name!r}].{tag} 必须是数字")
+                if v != v or v in (float("inf"), float("-inf")):
+                    raise ValueError(f"{who}: space[{name!r}].{tag} 必须是有限数")
+            if float(low) >= float(high):
+                raise ValueError(f"{who}: space[{name!r}] 的 low 必须小于 high")
+            is_log = bool(spec.get("log", False))
+            if is_log and float(low) <= 0.0:
+                raise ValueError(f"{who}: space[{name!r}] 取 log 时 low 必须 > 0")
+            specs[name] = {"type": "float", "low": float(low), "high": float(high),
+                           "log": is_log}
+        elif kind == "int":
+            low, high = spec.get("low"), spec.get("high")
+            for tag, v in (("low", low), ("high", high)):
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise ValueError(f"{who}: space[{name!r}].{tag} 必须是 int")
+            if int(low) >= int(high):
+                raise ValueError(f"{who}: space[{name!r}] 的 low 必须小于 high")
+            specs[name] = {"type": "int", "low": int(low), "high": int(high)}
+        elif kind == "choice":
+            values = spec.get("values")
+            if not isinstance(values, (list, tuple)) or not values:
+                raise ValueError(f"{who}: space[{name!r}].values 必须是非空列表")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{who}: space[{name!r}].values 不能有重复值")
+            specs[name] = {"type": "choice", "values": list(values)}
+        else:
+            raise ValueError(
+                f"{who}: space[{name!r}].type 只能是 float/int/choice，收到 {kind!r}")
+    return specs
+
+
+def _hpo_sample(specs, rng):
+    """从空间里随机采一组参数。"""
+    params = {}
+    for name, spec in specs.items():
+        if spec["type"] == "float":
+            if spec["log"]:
+                params[name] = math.exp(rng.uniform(math.log(spec["low"]),
+                                                    math.log(spec["high"])))
+            else:
+                params[name] = rng.uniform(spec["low"], spec["high"])
+        elif spec["type"] == "int":
+            params[name] = rng.randint(spec["low"], spec["high"])
+        else:
+            params[name] = rng.choice(spec["values"])
+    return params
+
+
+def _hpo_encode(specs, params):
+    """把参数编码成 [0,1] 数值向量 + 类别取值（供 TPE 密度估计）。"""
+    vec = []
+    cats = {}
+    for name, spec in specs.items():
+        value = params[name]
+        if spec["type"] == "float":
+            if spec["log"]:
+                lo, hi = math.log(spec["low"]), math.log(spec["high"])
+                vec.append((math.log(value) - lo) / (hi - lo))
+            else:
+                vec.append((value - spec["low"]) / (spec["high"] - spec["low"]))
+        elif spec["type"] == "int":
+            vec.append((value - spec["low"]) / float(spec["high"] - spec["low"]))
+        else:
+            cats[name] = value
+    return vec, cats
+
+
+def _hpo_gauss(x, mu, bw):
+    """一维高斯（截断由调用方处理），bw 是标准差。"""
+    z = (x - mu) / bw
+    return math.exp(-0.5 * z * z) / (bw * math.sqrt(2.0 * math.pi))
+
+
+def _hpo_cat_prob(spec, values, counts, value):
+    """类别参数的拉普拉斯平滑频率。"""
+    k = len(spec["values"])
+    return (counts.get(value, 0) + 1.0) / (sum(counts.values()) + k)
+
+
+def tpe_search(objective, space, n_trials=30, n_startup=10, gamma=0.25,
+               maximize=False, seed=None):
+    """TPE（Tree-structured Parzen Estimator）超参搜索。
+
+    space 的项是 {"type": "float", "low": .., "high": .., "log": bool}
+    / {"type": "int", "low": .., "high": ..} / {"type": "choice", "values": [...]}。
+    objective(params) -> float 的评分（默认越小越好，maximize=True 时越大越好）。
+    前 n_startup 次均匀随机；之后用「好组/差组」的截断高斯与类别频率构造
+    密度 l(x)/g(x)，在从好组派生的候选里挑 g/l 比值最大的点继续采样。
+    返回 {"best": {...}, "best_score": float, "trials": [{"params","score"}...],
+    "mode": "max"/"min", "n_trials": n}。
+    """
+    who = "tpe_search"
+    if not callable(objective):
+        raise ValueError(f"{who}: objective 必须可调用")
+    specs = _hpo_check_space(space, who)
+    for tag, v in (("n_trials", n_trials), ("n_startup", n_startup)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f"{who}: {tag} 必须是 >= 1 的 int")
+    if n_startup > n_trials:
+        raise ValueError(f"{who}: n_startup 不能大于 n_trials")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise ValueError(f"{who}: gamma 必须是数字")
+    gamma = float(gamma)
+    if not 0.0 < gamma < 1.0:
+        raise ValueError(f"{who}: gamma 必须在 (0, 1)")
+    if isinstance(seed, bool) or (seed is not None and not isinstance(seed, int)):
+        raise ValueError(f"{who}: seed 必须是 int 或 None")
+    rng = random.Random(seed) if seed is not None else random
+    sign = -1.0 if maximize else 1.0
+
+    trials = []
+    encoded = []
+    for _ in range(n_startup):
+        params = _hpo_sample(specs, rng)
+        score = float(objective(dict(params)))
+        trials.append({"params": params, "score": score})
+        encoded.append(_hpo_encode(specs, params))
+
+    n_dims = len(encoded[0][0]) if encoded else 0
+    while len(trials) < n_trials:
+        order = sorted(range(len(trials)),
+                       key=lambda i: sign * trials[i]["score"])
+        n_good = max(1, int(math.ceil(gamma * len(order))))
+        good_idx = order[:n_good]
+        bad_idx = order[n_good:]
+        if not bad_idx:
+            bad_idx = good_idx
+        good_vecs = [encoded[i][0] for i in good_idx]
+        bad_vecs = [encoded[i][0] for i in bad_idx]
+        bw = max(0.05, 1.0 / math.sqrt(len(good_idx) + 1))
+        cat_counts = {}
+        for name, spec in specs.items():
+            if spec["type"] != "choice":
+                continue
+            counts = {}
+            for i in good_idx:
+                value = encoded[i][1].get(name)
+                counts[value] = counts.get(value, 0) + 1
+            cat_counts[name] = counts
+        best_candidate = None
+        best_ratio = -1.0
+        num_names = [name for name, spec in specs.items() if spec["type"] != "choice"]
+        for _ in range(24):
+            pick = good_idx[rng.randrange(len(good_idx))]
+            position = good_idx.index(pick)
+            params = {}
+            for name, spec in specs.items():
+                if spec["type"] == "choice":
+                    counts = cat_counts[name]
+                    if rng.random() < 0.2:
+                        params[name] = rng.choice(spec["values"])
+                    else:
+                        weights = [_hpo_cat_prob(spec, spec["values"], counts, v)
+                                   for v in spec["values"]]
+                        total = sum(weights)
+                        r = rng.random() * total
+                        acc = 0.0
+                        for v, w in zip(spec["values"], weights):
+                            acc += w
+                            if r <= acc:
+                                params[name] = v
+                                break
+                        else:
+                            params[name] = spec["values"][-1]
+                    continue
+                d = num_names.index(name)
+                base = good_vecs[position][d]
+                v = rng.gauss(base, bw)
+                v = min(1.0, max(0.0, v))
+                if spec["type"] == "float":
+                    if spec["log"]:
+                        lo, hi = math.log(spec["low"]), math.log(spec["high"])
+                        params[name] = math.exp(lo + v * (hi - lo))
+                    else:
+                        params[name] = spec["low"] + v * (spec["high"] - spec["low"])
+                else:
+                    params[name] = int(round(spec["low"] + v * (spec["high"] - spec["low"])))
+            score = float(objective(dict(params)))
+            # EI（对数域，按 minimization 定义：好组密度大、差组密度小）
+            log_l = 0.0
+            log_g = 0.0
+            vec, catv = _hpo_encode(specs, params)
+            for d in range(len(vec)):
+                l_d = sum(_hpo_gauss(vec[d], g[d], bw) for g in good_vecs) / len(good_vecs)
+                g_d = sum(_hpo_gauss(vec[d], b[d], bw) for b in bad_vecs) / len(bad_vecs)
+                log_l += math.log(max(l_d, 1e-12))
+                log_g += math.log(max(g_d, 1e-12))
+            for name, spec in specs.items():
+                if spec["type"] != "choice":
+                    continue
+                counts_l = cat_counts[name]
+                counts_g = {}
+                for i in bad_idx:
+                    value = encoded[i][1].get(name)
+                    counts_g[value] = counts_g.get(value, 0) + 1
+                log_l += math.log(max(_hpo_cat_prob(spec, spec["values"], counts_l,
+                                                   catv[name]), 1e-12))
+                log_g += math.log(max(_hpo_cat_prob(spec, spec["values"], counts_g,
+                                                   catv[name]), 1e-12))
+            ratio = log_g - log_l
+            if ratio > best_ratio or best_candidate is None:
+                best_ratio = ratio
+                best_candidate = (params, score)
+        trials.append({"params": best_candidate[0], "score": best_candidate[1]})
+        encoded.append(_hpo_encode(specs, best_candidate[0]))
+    best = min(trials, key=lambda t: sign * t["score"])
+    return {"best": dict(best["params"]), "best_score": best["score"],
+            "trials": trials, "mode": "max" if maximize else "min",
+            "n_trials": n_trials}
+
+
+def successive_halving(objective, configs, reduction=3, maximize=False, seed=None):
+    """逐轮减半（Hyperband 的核心调度）：每轮按 budget 评估剩余配置，
+    只保留前 ceil(n/reduction) 名进入下一轮，budget 逐轮乘 reduction。
+
+    objective(config, budget) -> float。返回 {"best": ..., "best_score": ...,
+    "rounds": [{"budget": b, "scores": [{"params","score"}...]}...]}。
+    """
+    who = "successive_halving"
+    if not callable(objective):
+        raise ValueError(f"{who}: objective 必须可调用")
+    if not isinstance(configs, (list, tuple)) or not configs:
+        raise ValueError(f"{who}: configs 必须是非空列表")
+    if any(not isinstance(c, dict) for c in configs):
+        raise ValueError(f"{who}: configs 里每一项都必须是 dict")
+    if isinstance(reduction, bool) or not isinstance(reduction, int) or reduction < 2:
+        raise ValueError(f"{who}: reduction 必须是 >= 2 的 int")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError(f"{who}: seed 必须是 int 或 None")
+    sign = -1.0 if maximize else 1.0
+    survivors = [dict(c) for c in configs]
+    rounds = []
+    budget = 1
+    while True:
+        scored = []
+        for cfg in survivors:
+            score = float(objective(dict(cfg), budget))
+            scored.append({"params": dict(cfg), "score": score})
+        rounds.append({"budget": budget, "scores": scored})
+        if len(scored) <= 1:
+            break
+        scored.sort(key=lambda item: sign * item["score"])
+        keep = max(1, int(math.ceil(len(scored) / float(reduction))))
+        if keep <= 1:
+            break
+        survivors = [dict(item["params"]) for item in scored[:keep]]
+        budget *= reduction
+    all_scores = [item for rnd in rounds for item in rnd["scores"]]
+    best = min(all_scores, key=lambda item: sign * item["score"])
+    return {"best": dict(best["params"]), "best_score": best["score"],
+            "rounds": rounds,
+            "mode": "max" if maximize else "min"}
+
+
 def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
                 batch_size=32, lr=0.01, val_split=0.1, patience=30,
                 optimizer='adam', verbose=True, seed=None):
