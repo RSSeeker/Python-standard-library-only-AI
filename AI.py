@@ -37729,6 +37729,439 @@ class DeBERTaModel:
                     break
             out.append(pick)
         return out
+
+# ============================================================================
+#  DETR（DEtection TRansformer，简化版）
+# ============================================================================
+
+
+def _detr_log_softmax(row):
+    """一行 logits 的 log-softmax（数值稳定）。"""
+    m = max(row)
+    total = sum(math.exp(v - m) for v in row)
+    log_total = math.log(total) + m
+    return [v - log_total for v in row]
+
+
+def _detr_pos_2d(gh, gw, d_model):
+    """二维正弦位置编码：前一半通道编码列、后一半编码行。"""
+    if d_model % 4 != 0:
+        raise ValueError("DETR: d_model 必须是 4 的倍数，才能做二维正弦位置编码")
+    half = d_model // 2
+    quarter = half // 2
+    divs = [10000.0 ** (2.0 * i / quarter) for i in range(quarter)]
+    vecs = []
+    for r in range(gh):
+        for c in range(gw):
+            vec = []
+            for div in divs:
+                vec.append(math.sin(c / div))
+                vec.append(math.cos(c / div))
+            for div in divs:
+                vec.append(math.sin(r / div))
+                vec.append(math.cos(r / div))
+            vecs.append(vec)
+    return vecs
+
+
+def _detr_hungarian(cost):
+    """暴力匈牙利匹配（query 数很少时够用）。
+
+    返回 [(query_index, target_index), ...]，每个 target 恰好匹配一个 query。
+    """
+    qn = len(cost)
+    tn = len(cost[0]) if qn else 0
+    if qn == 0 or tn == 0:
+        return []
+    if tn > qn:
+        raise ValueError(
+            f"DETR 匹配: target 数 {tn} 多于 query 数 {qn}（每个 target 必须匹配一个 query）"
+        )
+    best = None
+    best_pairs = None
+    # 从 qn 个 query 中选 tn 个并排列（tn 通常 1~4，qn 也小）
+    for perm in itertools.permutations(range(qn), tn):
+        total = sum(cost[perm[g]][g] for g in range(tn))
+        if best is None or total < best:
+            best = total
+            best_pairs = [(perm[g], g) for g in range(tn)]
+    return best_pairs
+
+
+class DETR:
+    """简化版 DETR：小 CNN backbone + Transformer encoder-decoder + 集合预测头。"""
+
+    def __init__(self, in_channels: int = 3, num_classes: int = 10,
+                 image_size: int = 8, d_model: int = 32,
+                 num_heads: int = 4, d_ff: int = 64,
+                 num_layers: int = 1, num_queries: int = 100,
+                 seed=None):
+        if not isinstance(in_channels, int) or in_channels <= 0:
+            raise ValueError("DETR: in_channels 必须是正整数")
+        if not isinstance(num_classes, int) or num_classes <= 0:
+            raise ValueError("DETR: num_classes 必须是正整数")
+        if not isinstance(image_size, int) or image_size <= 0:
+            raise ValueError("DETR: image_size 必须是正整数")
+        if image_size % 4 != 0:
+            raise ValueError("DETR: image_size 必须能被 4 整除（backbone 有两次 stride=2）")
+        for name, value in (("d_model", d_model), ("num_heads", num_heads),
+                            ("d_ff", d_ff), ("num_layers", num_layers),
+                            ("num_queries", num_queries)):
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"DETR: {name} 必须是正整数")
+        if d_model % 4 != 0:
+            raise ValueError("DETR: d_model 必须是 4 的倍数（二维位置编码）")
+        if d_model % num_heads != 0:
+            raise ValueError("DETR: d_model 必须能被 num_heads 整除")
+
+        if seed is not None:
+            random.seed(seed)
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.image_size = image_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.num_queries = num_queries
+        self.grid_h = image_size // 4
+        self.grid_w = image_size // 4
+        self.seq_len = self.grid_h * self.grid_w
+
+        hidden = max(4, d_model // 2)
+        self.conv1 = Conv2d(in_channels, hidden, 3, stride=2, padding=1)
+        self.conv2 = Conv2d(hidden, d_model, 3, stride=2, padding=1)
+
+        self.pos2d = _detr_pos_2d(self.grid_h, self.grid_w, d_model)
+
+        self.encoder = TransformerEncoder(
+            d_model, num_heads, d_ff, num_layers, dropout=0.0, causal=False)
+        self.decoder = TransformerDecoder(
+            d_model, num_heads, d_ff, num_layers, dropout=0.0, causal=False)
+
+        std = math.sqrt(2.0 / d_model)
+        self.queries = [[random.gauss(0.0, std) for _ in range(d_model)]
+                        for _ in range(num_queries)]
+        self.query_pos = [[0.0] * d_model for _ in range(num_queries)]
+        self.grad_queries = [[0.0] * d_model for _ in range(num_queries)]
+        self.grad_query_pos = [[0.0] * d_model for _ in range(num_queries)]
+
+        self.cls_head = Layer(d_model, num_classes + 1, "linear")
+        self.box_head = Layer(d_model, 4, "linear")
+        self.grad_cls_head = None
+        self.grad_box_head = None
+
+        self._cache = None
+
+    # ---------- 基础工具 ----------
+
+    def _zero_grads(self):
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        self.encoder.zero_grad()
+        self.decoder.zero_grad()
+        self.grad_queries = [[0.0] * self.d_model for _ in range(self.num_queries)]
+        self.grad_query_pos = [[0.0] * self.d_model for _ in range(self.num_queries)]
+        self.grad_cls_head = None
+        self.grad_box_head = None
+
+    def _check_image(self, image):
+        if not isinstance(image, (list, tuple)) or len(image) != self.in_channels:
+            raise ValueError(
+                f"DETR: 图像必须是 {self.in_channels} 通道的 (C,H,W) 列表")
+        h, w = len(image[0]), len(image[0][0])
+        if h != self.image_size or w != self.image_size:
+            raise ValueError(
+                f"DETR: 图像尺寸必须是 {self.image_size}×{self.image_size}，"
+                f"收到 {h}×{w}")
+        for c in range(self.in_channels):
+            if len(image[c]) != h:
+                raise ValueError("DETR: 图像通道高度不一致")
+            for row in image[c]:
+                if len(row) != w:
+                    raise ValueError("DETR: 图像行宽度不一致")
+                for v in row:
+                    if not isinstance(v, (int, float)) or isinstance(v, bool):
+                        raise ValueError("DETR: 图像像素必须是数字")
+
+    def _check_targets(self, targets):
+        if not self.in_channels:
+            raise ValueError("DETR: 未初始化")
+        if not isinstance(targets, (list, tuple)):
+            raise ValueError("DETR: targets 必须是 [(label, [cx,cy,w,h]), ...] 列表")
+        out = []
+        for item in targets:
+            if not isinstance(item, (list, tuple)):
+                raise ValueError("DETR: 每个 target 必须是 (label, [cx,cy,w,h])")
+            if len(item) != 2:
+                raise ValueError("DETR: target 必须是 (label, box) 二元组")
+            label, box = item
+            if not isinstance(label, int) or isinstance(label, bool):
+                raise ValueError(f"DETR: target label 必须是 int，收到 {label!r}")
+            if label < 0 or label >= self.num_classes:
+                raise ValueError(
+                    f"DETR: target label 必须在 [0,{self.num_classes})，收到 {label}")
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                raise ValueError("DETR: target box 必须是 [cx,cy,w,h] 四元组")
+            vals = []
+            for v in box:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+                    raise ValueError("DETR: target box 必须是有限数字")
+                vals.append(float(v))
+            cx, cy, bw, bh = vals
+            if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+                raise ValueError("DETR: target 中心点必须在 [0,1]")
+            if bw <= 0.0 or bh <= 0.0:
+                raise ValueError("DETR: target 宽高必须为正")
+            if cx - bw / 2 < -1e-9 or cx + bw / 2 > 1.0 + 1e-9:
+                raise ValueError("DETR: target 框越出图像边界")
+            if cy - bh / 2 < -1e-9 or cy + bh / 2 > 1.0 + 1e-9:
+                raise ValueError("DETR: target 框越出图像边界")
+            out.append((label, [cx, cy, bw, bh]))
+        return out
+
+    @staticmethod
+    def _sigmoid(v):
+        if v >= 0:
+            return 1.0 / (1.0 + math.exp(-v))
+        e = math.exp(v)
+        return e / (1.0 + e)
+
+    @staticmethod
+    def _l1_box(pred, target):
+        return sum(abs(pred[i] - target[i]) for i in range(4))
+
+    # ---------- 前向 ----------
+
+    def _forward_single(self, image):
+        """单张图前向，返回 cache（供损失与反向使用）。"""
+        self._check_image(image)
+        out1 = self.conv1.forward(image)
+        mask1 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch]
+                 for ch in out1]
+        a1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out1]
+        out2 = self.conv2.forward(a1)
+        mask2 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch]
+                 for ch in out2]
+        a2 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out2]
+
+        tokens = []
+        for r in range(self.grid_h):
+            for c in range(self.grid_w):
+                tokens.append([a2[k][r][c] for k in range(self.d_model)])
+        mem_in = [[tokens[t][k] + self.pos2d[t][k] for k in range(self.d_model)]
+                  for t in range(self.seq_len)]
+        memory = self.encoder.forward(mem_in)
+
+        q_in = [[self.queries[i][k] + self.query_pos[i][k]
+                 for k in range(self.d_model)] for i in range(self.num_queries)]
+        dec_out = self.decoder.forward(q_in, memory)
+
+        cls_logits, cls_cache = _dense_rows_forward(self.cls_head, dec_out)
+        box_raw, box_cache = _dense_rows_forward(self.box_head, dec_out)
+        probs = []
+        boxes = []
+        for i in range(self.num_queries):
+            row = [self._sigmoid(v) for v in box_raw[i]]
+            boxes.append(row)
+            probs.append([math.exp(v) for v in _detr_log_softmax(cls_logits[i])])
+        cache = {
+            "image": image, "out1": out1, "mask1": mask1,
+            "out2": out2, "mask2": mask2,
+            "tokens": tokens, "mem_in": mem_in, "memory": memory,
+            "q_in": q_in, "dec_out": dec_out,
+            "cls_logits": cls_logits, "cls_cache": cls_cache,
+            "box_raw": box_raw, "box_cache": box_cache,
+            "boxes": boxes, "probs": probs,
+        }
+        self._cache = cache
+        return cache
+
+    def forward(self, images):
+        """前向若干图像，返回每张图的 {probs, boxes}。"""
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("DETR.forward: images 必须是非空列表")
+        out = []
+        for image in images:
+            cache = self._forward_single(image)
+            out.append({"probs": cache["probs"], "boxes": cache["boxes"]})
+        return out
+
+    # ---------- 损失与反向 ----------
+
+    def _loss_and_grads_single(self, image, targets):
+        """单图前向 + 匈牙利匹配 + 损失，反传并累积梯度；返回 (loss, 匹配信息)。"""
+        targets = self._check_targets(targets)
+        cache = self._forward_single(image)
+        nq = self.num_queries
+        nc = self.num_classes
+        cls_logits = cache["cls_logits"]
+        log_probs = [_detr_log_softmax(row) for row in cls_logits]
+        probs = [[math.exp(v) for v in row] for row in log_probs]
+        boxes = cache["boxes"]
+
+        # 匹配代价：目标类 NLL + L1 框距离
+        cost = [[0.0] * len(targets) for _ in range(nq)]
+        for i in range(nq):
+            for g, (label, box) in enumerate(targets):
+                cost[i][g] = -log_probs[i][label] + self._l1_box(boxes[i], box)
+        pairs = _detr_hungarian(cost) if targets else []
+        matched_query = {qi: ti for qi, ti in pairs}
+
+        cls_loss = 0.0
+        d_cls = [[0.0] * (nc + 1) for _ in range(nq)]
+        for i in range(nq):
+            if i in matched_query:
+                g = matched_query[i]
+                label = targets[g][0]
+                cls_loss += -log_probs[i][label]
+                for c in range(nc + 1):
+                    d_cls[i][c] = probs[i][c]
+                d_cls[i][label] -= 1.0
+            else:
+                cls_loss += -log_probs[i][nc]
+                for c in range(nc + 1):
+                    d_cls[i][c] = probs[i][c]
+                d_cls[i][nc] -= 1.0
+        cls_loss /= nq
+        for i in range(nq):
+            for c in range(nc + 1):
+                d_cls[i][c] /= nq
+
+        box_loss = 0.0
+        d_box_raw = [[0.0] * 4 for _ in range(nq)]
+        if pairs:
+            for i, g in pairs:
+                label, target_box = targets[g]
+                box_loss += self._l1_box(boxes[i], target_box)
+            box_loss = 5.0 * box_loss / len(pairs)
+            for i, g in pairs:
+                target_box = targets[g][1]
+                raw = cache["box_raw"][i]
+                for k in range(4):
+                    sig = boxes[i][k]
+                    diff = 1.0 if boxes[i][k] > target_box[k] else -1.0
+                    if abs(boxes[i][k] - target_box[k]) <= 1e-12:
+                        diff = 0.0
+                    d_box_raw[i][k] = (5.0 / len(pairs)) * diff * sig * (1.0 - sig)
+
+        loss = cls_loss + box_loss
+
+        gw_cls, gb_cls, dx_cls = _dense_rows_backward(
+            self.cls_head, cache["cls_cache"], d_cls)
+        gw_box, gb_box, dx_box = _dense_rows_backward(
+            self.box_head, cache["box_cache"], d_box_raw)
+
+        if self.grad_cls_head is None:
+            self.grad_cls_head = (gw_cls, gb_cls)
+            self.grad_box_head = (gw_box, gb_box)
+        else:
+            for i in range(len(gw_cls)):
+                for j in range(len(gw_cls[i])):
+                    self.grad_cls_head[0][i][j] += gw_cls[i][j]
+                self.grad_cls_head[1][i] += gb_cls[i]
+            for i in range(len(gw_box)):
+                for j in range(len(gw_box[i])):
+                    self.grad_box_head[0][i][j] += gw_box[i][j]
+                self.grad_box_head[1][i] += gb_box[i]
+
+        d_out = [[dx_cls[i][k] + dx_box[i][k] for k in range(self.d_model)]
+                 for i in range(nq)]
+        d_q, d_memory = self.decoder.backward(d_out)
+        d_mem_in = self.encoder.backward(d_memory)
+
+        for i in range(nq):
+            for k in range(self.d_model):
+                self.grad_queries[i][k] += d_q[i][k]
+                self.grad_query_pos[i][k] += d_q[i][k]
+
+        d_tokens = d_mem_in  # pos2d 是常量
+        d_grid = [[[0.0] * self.grid_w for _ in range(self.grid_h)]
+                  for _ in range(self.d_model)]
+        for t in range(self.seq_len):
+            r, c = divmod(t, self.grid_w)
+            for k in range(self.d_model):
+                d_grid[k][r][c] = d_tokens[t][k]
+        d_a1 = self.conv2.backward(
+            [[[d_grid[k][r][c] * cache["mask2"][k][r][c]
+               for c in range(self.grid_w)] for r in range(self.grid_h)]
+             for k in range(self.d_model)])
+        d_img = self.conv1.backward(
+            [[[d_a1[k][r][c] * cache["mask1"][k][r][c]
+               for c in range(len(d_a1[0][0]))] for r in range(len(d_a1[0]))]
+             for k in range(len(d_a1))])
+        return loss, {"pairs": pairs, "boxes": boxes, "probs": probs,
+                      "d_img": d_img}
+
+    def loss_and_backward(self, images, targets):
+        """批量损失并累积梯度；返回 {"loss","pairs"}。"""
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("DETR.loss_and_backward: images 必须是非空列表")
+        if not isinstance(targets, (list, tuple)) or len(targets) != len(images):
+            raise ValueError("DETR.loss_and_backward: targets 必须与 images 等长")
+        total = 0.0
+        all_pairs = []
+        for image, tgt in zip(images, targets):
+            loss, info = self._loss_and_grads_single(image, tgt)
+            total += loss
+            all_pairs.append(info["pairs"])
+        total /= len(images)
+        return {"loss": total, "pairs": all_pairs}
+
+    # ---------- 训练 ----------
+
+    def _sgd_step(self, lr):
+        _conv_sgd(self.conv1, lr)
+        _conv_sgd(self.conv2, lr)
+        self.encoder.sgd_step(lr)
+        self.decoder.sgd_step(lr)
+        _dense_apply_sgd(self.cls_head, self.grad_cls_head, lr)
+        _dense_apply_sgd(self.box_head, self.grad_box_head, lr)
+        for i in range(self.num_queries):
+            for k in range(self.d_model):
+                self.queries[i][k] -= lr * self.grad_queries[i][k]
+                self.query_pos[i][k] -= lr * self.grad_query_pos[i][k]
+
+    def fit(self, images, targets, epochs=30, lr=0.01, shuffle=True, seed=None):
+        """小批量单样本训练；返回每 epoch 平均损失列表。"""
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("DETR.fit: images 必须是非空列表")
+        if not isinstance(targets, (list, tuple)) or len(targets) != len(images):
+            raise ValueError("DETR.fit: targets 必须与 images 等长")
+        if not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("DETR.fit: epochs 必须是正整数")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0:
+            raise ValueError("DETR.fit: lr 必须是正数")
+        rng = random.Random(seed)
+        order = list(range(len(images)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self._zero_grads()
+                out = self.loss_and_backward([images[idx]], [targets[idx]])
+                total += out["loss"]
+                self._sgd_step(lr)
+            history.append(total / len(images))
+        return history
+
+    def predict(self, images):
+        """返回每张图 query 的类别概率与框（不做 NMS）。"""
+        return self.forward(images)
+
+    def param_count(self):
+        d = self.d_model
+        ff = self.d_ff
+        enc_layer = 4 * d * d + 9 * d + 2 * d * ff + ff
+        dec_layer = 8 * d * d + 15 * d + 2 * d * ff + ff
+        total = (_conv_param_count(self.conv1) + _conv_param_count(self.conv2)
+                 + self.num_layers * (enc_layer + dec_layer)
+                 + _dense_param_count(self.cls_head)
+                 + _dense_param_count(self.box_head)
+                 + 2 * self.num_queries * d)
+        return total
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 

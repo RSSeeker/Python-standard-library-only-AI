@@ -30721,3 +30721,155 @@ class TestDeBERTa:
 def _deberta_raises(fn, exc=ValueError):
     with pytest.raises(exc):
         fn()
+
+
+"""DETR tests (Batch 22)."""
+
+import random
+
+
+def _detr_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _detr_make_img(block_r=4, block_c=4, size=8):
+    img = [[[0.0] * size for _ in range(size)]]
+    for r in range(block_r - 1, block_r + 1):
+        for c in range(block_c - 1, block_c + 1):
+            img[0][r][c] = 1.0
+    return img
+
+
+def _detr_fd(m, img, targets, grad_getter, param_getter, param_setter, h=1e-5):
+    m._zero_grads()
+    m.loss_and_backward([img], [targets])
+    analytic = grad_getter()
+
+    p0 = param_getter()
+    param_setter(p0 + h)
+    lp = m.loss_and_backward([img], [targets])["loss"]
+    param_setter(p0 - h)
+    lm = m.loss_and_backward([img], [targets])["loss"]
+    param_setter(p0)
+
+    fd = (lp - lm) / (2.0 * h)
+    denom = max(1e-12, abs(fd), abs(analytic))
+    return abs(fd - analytic) / denom
+
+
+class TestDETR:
+    def test_forward_and_param_count(self):
+        m = AI.DETR(in_channels=1, num_classes=3, image_size=8, d_model=8,
+                    num_heads=2, d_ff=16, num_layers=1, num_queries=4, seed=1)
+        assert m.param_count() == 1976
+        img = _detr_make_img()
+        outs = m.forward([img])
+        assert len(outs) == 1
+        probs, boxes = outs[0]["probs"], outs[0]["boxes"]
+        assert len(probs) == 4 and len(probs[0]) == 4
+        assert len(boxes) == 4 and len(boxes[0]) == 4
+        for row in boxes:
+            for v in row:
+                assert 0.0 < v < 1.0
+        both = m.forward([img, img])
+        assert len(both) == 2
+
+    def test_backward_gradients_finite_difference(self):
+        m = AI.DETR(in_channels=1, num_classes=3, image_size=8, d_model=8,
+                    num_heads=2, d_ff=16, num_layers=1, num_queries=2, seed=3)
+        img = _detr_make_img()
+        tgt = [(0, [0.5, 0.5, 0.25, 0.25])]
+        rels = [
+            _detr_fd(m, img, tgt,
+                     lambda: m.conv1.grad_w[0][0][1][1],
+                     lambda: m.conv1.weights[0][0][1][1],
+                     lambda v: m.conv1.weights[0][0][1].__setitem__(1, v)),
+            _detr_fd(m, img, tgt,
+                     lambda: m.grad_cls_head[0][0][0],
+                     lambda: m.cls_head.weights[0][0],
+                     lambda v: m.cls_head.weights[0].__setitem__(0, v)),
+            _detr_fd(m, img, tgt,
+                     lambda: m.grad_box_head[0][0][0],
+                     lambda: m.box_head.weights[0][0],
+                     lambda v: m.box_head.weights[0].__setitem__(0, v)),
+            _detr_fd(m, img, tgt,
+                     lambda: m.grad_queries[0][0],
+                     lambda: m.queries[0][0],
+                     lambda v: m.queries[0].__setitem__(0, v)),
+        ]
+        assert max(rels) < 1e-5
+
+    def test_loss_matching_and_step(self):
+        m = AI.DETR(in_channels=1, num_classes=3, image_size=8, d_model=8,
+                    num_heads=2, d_ff=16, num_layers=1, num_queries=4, seed=1)
+        img = _detr_make_img()
+        res = m.loss_and_backward([img], [[(0, [0.5, 0.5, 0.25, 0.25])]])
+        assert res["loss"] > 0.0
+        assert len(res["pairs"]) == 1
+        assert len(res["pairs"][0]) == 1
+        m._sgd_step(0.01)
+        pred = m.predict([img])
+        assert len(pred) == 1
+        assert AI._detr_hungarian([[0.1, 9.0], [9.0, 0.1]]) == [(0, 0), (1, 1)]
+        assert AI._detr_hungarian([[0.1, 0.2], [0.3, 0.4]]) == [(0, 0), (1, 1)]
+        assert AI._detr_hungarian([[0.1], [0.2], [0.3]]) == [(0, 0)]
+        assert _detr_raises(
+            lambda: AI._detr_hungarian([[0.1, 0.2, 0.3]]), ValueError)
+
+    def test_fit_converges_on_synthetic(self):
+        imgs, tgts = [], []
+        for r, c in [(2, 2), (2, 5), (5, 2), (5, 5)]:
+            imgs.append(_detr_make_img(r, c))
+            tgts.append([(0, [(c + 1) / 8.0, (r + 1) / 8.0, 0.25, 0.25])])
+        m = AI.DETR(in_channels=1, num_classes=2, image_size=8, d_model=8,
+                    num_heads=2, d_ff=16, num_layers=1, num_queries=2, seed=1)
+        hist = m.fit(imgs, tgts, epochs=30, lr=0.05, seed=1)
+        assert len(hist) == 30
+        assert hist[-1] < hist[0]
+
+    def test_invalid_inputs(self):
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=1, num_classes=3, image_size=10))
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=1, num_classes=3, image_size=8,
+                            d_model=6, num_heads=2))
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=1, num_classes=3, image_size=8,
+                            d_model=8, num_heads=3))
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=1, num_classes=3, image_size=8,
+                            num_queries=0))
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=0, num_classes=3, image_size=8))
+        assert _detr_raises(
+            lambda: AI.DETR(in_channels=1, num_classes=0, image_size=8))
+
+        m = AI.DETR(in_channels=1, num_classes=3, image_size=8, d_model=8,
+                    num_heads=2, d_ff=16, num_layers=1, num_queries=2, seed=1)
+        img = _detr_make_img()
+        assert _detr_raises(lambda: m.forward([]))
+        assert _detr_raises(lambda: m.forward([[img]]))
+        assert _detr_raises(
+            lambda: m.loss_and_backward([img], [[(3, [0.5, 0.5, 0.25, 0.25])]]))
+        assert _detr_raises(
+            lambda: m.loss_and_backward([img], [[(0, [0.5, 0.5])]]))
+        assert _detr_raises(
+            lambda: m.loss_and_backward([img], [[(0, [0.5, 0.5, -0.1, 0.2])]]))
+        assert _detr_raises(
+            lambda: m.loss_and_backward([img], [[(0, [0.95, 0.5, 0.5, 0.5])]]))
+        assert _detr_raises(
+            lambda: m.loss_and_backward([img], [[(0, [0.5, 0.5, 0.2, 0.2]),
+                                                 (0, [0.2, 0.2, 0.2, 0.2]),
+                                                 (0, [0.3, 0.3, 0.2, 0.2])]]))
+        assert _detr_raises(
+            lambda: m.fit([img], [], epochs=2, lr=0.05))
+        assert _detr_raises(
+            lambda: m.fit([img], [[(0, [0.5, 0.5, 0.2, 0.2])]], epochs=0, lr=0.05))
+        assert _detr_raises(
+            lambda: m.fit([img], [[(0, [0.5, 0.5, 0.2, 0.2])]], epochs=2, lr=-0.1))

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2010 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2015 项）
 
 ## 特性
 
@@ -2044,6 +2044,26 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### DETR（检测 Transformer）
+
+```python
+detr = AI.DETR(in_channels=1, num_classes=3, image_size=8, d_model=16,
+               num_heads=2, d_ff=32, num_layers=1, num_queries=4, seed=0)
+outs = detr.forward([image])            # [{"probs": [...], "boxes": [...]}]
+losses = detr.fit(images, targets, epochs=50, lr=0.05, seed=0)
+preds = detr.predict([image])
+```
+
+| API | 说明 |
+| --- | --- |
+| `DETR(in_channels=3, num_classes=10, image_size=8, d_model=32, num_heads=4, d_ff=64, num_layers=1, num_queries=100, seed=None)` | 简化 DETR：两层 stride-2 CNN backbone → 展平成 token → Transformer encoder → 可学习 query + decoder → 分类/框两个线性头 |
+| `forward(images)` | 返回每张图的 `{"probs": (num_queries, C+1), "boxes": (num_queries, 4)}`，框是归一化 `(cx,cy,w,h)` |
+| `loss_and_backward(images, targets)` | 逐图暴力匈牙利匹配 + 分类交叉熵 + 5×L1 框损失，反向传播并累积梯度 |
+| `fit(images, targets, epochs, lr, shuffle, seed)` / `predict(images)` | 训练/推理（单样本 SGD） |
+| `param_count()` | 参数量（含 queries/query_pos 与两个头） |
+
+边界：backbone 只有两层 stride-2 卷积（`image_size` 必须被 4 整除）；位置编码是固定二维正弦；匹配用 `itertools.permutations` 暴力搜索，`num_queries` 大时不可用；没有 NMS、多尺度特征和 anchor。
+
 ### DeBERTa（解耦注意力）
 
 `DeBERTaBlock` 把注意力分数拆成三部分：内容-内容、内容-位置、位置-内容——每个相对距离
@@ -3550,7 +3570,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2010 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2015 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3738,6 +3758,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRetNet` | retention 前向对 naive 递推、`RetNetBlock` 前向/参数量/`Wq`/`W1`/`ln1` 梯度有限差分、`RetNetModel` 拟合/生成/参数与非法输入 |
 | `TestXLSTM` | `XLSTMBlock` 前向/参数量、`W1`/`W2`/`Wg`/`Wo`/`ln1` 梯度有限差分、`XLSTMModel` 拟合/生成/参数与非法输入 |
 | `TestDeBERTa` | `DeBERTaBlock` 前向/参数量、`Wq`/`Wk`/`Wv`/`Wo`/`W1`/`W2`、`Rk`/`Rq` 与 `ln1` 的梯度有限差分、`DeBERTaModel` 拟合/生成/参数与非法输入 |
+| `TestDETR` | 小合成图上前向/参数量、conv1/两个头/queries 梯度有限差分、匈牙利匹配、30 epochs 拟合 loss 下降与非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
@@ -3863,7 +3884,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2010 个单元测试
+├── test_ai.py       # 2015 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
