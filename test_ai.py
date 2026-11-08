@@ -28251,3 +28251,85 @@ class TestMultiLabelAndStatistics:
             AI.wilcoxon_signed_rank_test([1, 2, 3], [1, 2, 3])
         with pytest.raises(ValueError):
             AI.wilcoxon_signed_rank_test([1, 2], [1])
+
+
+class TestT5AndBertModels:
+    """组合模型：T5（相对位置偏置）与 BERT（MLM + NSP）"""
+
+    @staticmethod
+    def _t5():
+        return AI.T5Model(src_vocab=8, tgt_vocab=8, d_model=16, num_heads=2,
+                          d_ff=32, num_layers=1, max_len=32, dropout=0.0,
+                          num_buckets=16)
+
+    @staticmethod
+    def _bert():
+        return AI.BertModel(vocab_size=12, d_model=16, num_heads=2, d_ff=32,
+                            num_layers=1, max_len=16, dropout=0.0)
+
+    def test_t5_forward_and_param_count(self):
+        m = self._t5()
+        assert m.param_count() == 6040
+        logits = m.forward([1, 2, 3], [m.bos_id, 4])
+        assert len(logits) == 2
+        assert len(logits[0]) == 8
+
+    def test_t5_relative_bias_receives_gradient(self):
+        m = self._t5()
+        m.zero_grad()
+        loss = m._loss_and_backward([1, 2, 3], [4, 5, 6])
+        assert loss > 0.0
+        total = sum(abs(x) for row in m.enc_bias[0].grad_table for x in row)
+        assert total > 0.0
+        total = sum(abs(x) for row in m.dec_bias[0].grad_table for x in row)
+        assert total > 0.0
+
+    def test_t5_fit_reduces_loss(self):
+        m = self._t5()
+        hist = m.fit([([1, 2, 3], [4, 5, 6])], epochs=30, lr=0.02, seed=1)
+        assert len(hist) == 30
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_t5_invalid_inputs(self):
+        m = self._t5()
+        with pytest.raises(ValueError):
+            m.forward([], [1])
+        with pytest.raises(ValueError):
+            m.forward([99], [1])
+        with pytest.raises(ValueError):
+            AI.T5Model(src_vocab=8, tgt_vocab=8, num_layers=0)
+
+    def test_bert_forward_and_heads(self):
+        b = self._bert()
+        h = b.forward([1, 2, 3], segment_ids=[0, 0, 1])
+        assert len(h) == 3
+        assert len(h[0]) == 16
+        mlm = b.masked_lm_logits([0, 2])
+        assert len(mlm) == 2
+        assert len(mlm[0]) == 12
+        nsp = b.nsp_logits()
+        assert len(nsp) == 2
+        assert b.param_count() > 0
+
+    def test_bert_fit_reduces_loss(self):
+        b = self._bert()
+        samples = [
+            ([1, 2, 3, 4, 5], [1, 3], [2, 4], [0, 0, 0, 1, 1], 1),
+            ([6, 7, 8, 9, 5], [1, 3], [7, 9], [0, 0, 0, 1, 1], 0),
+        ]
+        hist = b.fit(samples, epochs=40, lr=0.05, seed=2)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_bert_invalid_inputs(self):
+        b = self._bert()
+        with pytest.raises(ValueError):
+            b.forward([])
+        with pytest.raises(ValueError):
+            b.forward(list(range(17)))
+        with pytest.raises(ValueError):
+            b.loss_and_backward([1, 2], [5], [99])
+        with pytest.raises(ValueError):
+            b.loss_and_backward([1, 2], [0], [0], nsp_label=2)
+        with pytest.raises(ValueError):
+            b.forward([1, 2], segment_ids=[0])

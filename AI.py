@@ -28,7 +28,7 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 78 个顶层分节
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 79 个顶层分节
 # （920 个 def / 297 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
@@ -108,7 +108,8 @@
 #  75. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
 #  76. 生成模型：VAE / GAN / DDPM
 #  77. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#  78. Main: 回归 + 分类 + CNN 完整示例
+#  78. 组合模型：T5 / BERT（相对位置偏置 + MLM/NSP 双头）
+#  79. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -15014,7 +15015,7 @@ class MultiHeadAttention:
                  window: int = None, num_kv_heads: int = None, alibi: bool = False,
                  rope_scaling: str = None, rope_factor: float = 8.0,
                  rope_original_max: int = 512, rope_beta_fast: float = 32.0,
-                 rope_beta_slow: float = 1.0):
+                 rope_beta_slow: float = 1.0, relative_bias=None):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -15068,6 +15069,7 @@ class MultiHeadAttention:
                 raise ValueError(f"MultiHeadAttention: window 必须 >= 1，收到 {window!r}")
             self.window = window
         self.alibi = bool(alibi)
+        self.relative_bias = relative_bias   # 可选：T5RelativeBias 实例
         self.training = True
         self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
         # 每次 forward 重建；反向只读这几个列表
@@ -15147,6 +15149,8 @@ class MultiHeadAttention:
             "W_v": zeros_2d(kv, d), "b_v": [0.0] * kv,
             "W_o": zeros_2d(d, d), "b_o": [0.0] * d,
         }
+        if self.relative_bias is not None:
+            self.relative_bias.zero_grad()
 
     def _init_adam(self):
         d = self.d_model
@@ -15210,6 +15214,9 @@ class MultiHeadAttention:
         V = cache.setdefault("V", [[] for _ in range(n_kv)])
         scale = 1.0 / math.sqrt(d_k)
         concat = [0.0] * d
+        # 增量前向只需要 query 位置 pos 的那一行相对偏置桶
+        rel_bias = (self.relative_bias.forward(pos + 1, klen=pos + 1)
+                    if self.relative_bias is not None else None)
         for head in range(h):
             off = head * d_k
             # GQA：每 kv_group 个 Q 头共享一组 K/V（cache 也按 kv 头存）
@@ -15231,6 +15238,10 @@ class MultiHeadAttention:
                 slope = self.alibi_slopes[head]
                 for j in range(len(scores)):
                     scores[j] += slope * (pos - j)
+            if rel_bias is not None:
+                brow = rel_bias[head][pos]
+                for j in range(len(scores)):
+                    scores[j] += brow[j]
             if self.window is not None:
                 # 增量前向只有「过去 + 自己」，窗口外的更早位置要屏蔽（与 forward 一致）
                 for j in range(max(0, pos - self.window + 1)):
@@ -15302,6 +15313,10 @@ class MultiHeadAttention:
         self.head_out = []
         self.concat = [[0.0] * self.d_model for _ in range(self.seq_len)]
 
+        # T5 式相对位置偏置：整段前向一次算好 (num_heads, T, T)，各头共用。
+        self._rel_bias = (self.relative_bias.forward(self.seq_len)
+                          if self.relative_bias is not None else None)
+
         for head in range(h):
             q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
 
@@ -15317,6 +15332,16 @@ class MultiHeadAttention:
                     for j in range(self.seq_len):
                         if j <= t:
                             row[j] += slope * (t - j)
+
+            # T5 式可学习相对位置偏置：加在 softmax 前的分数上；
+            # 被掩码的列稍后会被置 -inf（softmax 权重为 0，梯度也自动为 0）。
+            if self._rel_bias is not None:
+                brow = self._rel_bias[head]
+                for t in range(self.seq_len):
+                    row = scores[t]
+                    bt = brow[t]
+                    for j in range(self.seq_len):
+                        row[j] += bt[j]
 
             # 因果掩码：位置 t 只能看到 j <= t。屏蔽位置置 -inf，
             # softmax 后权重恰为 0；反向的 d_scores = attn * (...) 在那些位置
@@ -15402,6 +15427,7 @@ class MultiHeadAttention:
 
         # 3. 各头分别反向传播
         dQ_list, dK_list, dV_list = [], [], []
+        dbias = [] if self.relative_bias is not None else None
         for head in range(h):
             attn = self.attn_weights[head]          # 干净权重（softmax 输出）
             attn_used = self.attn_dropped[head]     # 实际参与 attn@V 的权重
@@ -15425,12 +15451,17 @@ class MultiHeadAttention:
 
             # softmax backward: d_scores[t][j] = attn[t][j] * (d_attn[t][j] - sum_i attn[t][i] * d_attn[t][i])
             # 行内点积只依赖 t，必须提到 j 循环外面（原来每个 (t, j) 都重算一遍 → O(seq²) 冗余）
+            # softmax 反向：d_soft 是对 softmax 输入（叠加了偏置的分数）的梯度，
+            # 相对偏置表的梯度正是 d_soft；对 QK^T 的梯度还要再乘 1/sqrt(d_k)。
             scale = 1.0 / math.sqrt(d_k)
-            d_scores = []
+            d_soft = []
             for t in range(seq_len):
                 row_a, row_d = attn[t], d_attn[t]
                 s = sum(map(_mul, row_a, row_d))
-                d_scores.append([row_a[j] * (row_d[j] - s) * scale for j in range(seq_len)])
+                d_soft.append([row_a[j] * (row_d[j] - s) for j in range(seq_len)])
+            if self.relative_bias is not None:
+                dbias.append(d_soft)
+            d_scores = [[v * scale for v in row] for row in d_soft]
 
             # dQ = d_scores @ K  (seq_len, d_k)
             dQ = _matmul(d_scores, K_h)
@@ -15446,6 +15477,9 @@ class MultiHeadAttention:
             dQ_list.append(dQ)
             dK_list.append(dK)
             dV_list.append(dV)
+
+        if self.relative_bias is not None:
+            self.relative_bias.backward(dbias)
 
         # 4. 拼接各头的 dQ, dK, dV → (seq_len, d_model)
         kv = self.kv_dim
@@ -51933,6 +51967,329 @@ class ResNet:
             history.append(avg)
             if verbose:
                 print(f"  ResNet epoch {ep + 1}/{epochs} | loss {avg:.4f}")
+        return history
+
+
+class T5Model(Seq2SeqLM):
+    """T5 式编码器-解码器：自注意力注入可学习相对位置偏置（T5RelativeBias）
+
+    与 Seq2SeqLM 的唯一区别是每层自注意力额外带一个相对位置偏置表：
+    encoder 用双向桶（bidirectional=True），decoder 用因果桶
+    （bidirectional=False）；交叉注意力与 T5 论文一致，不加相对偏置。
+    其余前向、训练、评估、生成逻辑全部复用 Seq2SeqLM。
+
+    用法::
+
+        model = T5Model(src_vocab=10, tgt_vocab=10, d_model=16, num_heads=2)
+        model.fit([([1, 2, 3], [4, 5, 6])], epochs=20, lr=0.01)
+    """
+
+    def __init__(self, src_vocab: int, tgt_vocab: int, d_model: int = 32,
+                 num_heads: int = 4, d_ff: int = 64, num_layers: int = 2,
+                 max_len: int = 64, dropout: float = 0.0,
+                 num_buckets: int = 32, max_distance: int = 128):
+        # 先占位，父类 __init__ 末尾会调用 zero_grad（基类版本，不碰这两个列表）
+        self.enc_bias = []
+        self.dec_bias = []
+        super().__init__(src_vocab, tgt_vocab, d_model=d_model,
+                         num_heads=num_heads, d_ff=d_ff, num_layers=num_layers,
+                         max_len=max_len, dropout=dropout)
+        for layer in self.encoder.layers:
+            op = T5RelativeBias(num_heads, num_buckets, max_distance,
+                                bidirectional=True)
+            layer.self_attn.relative_bias = op
+            self.enc_bias.append(op)
+        for layer in self.decoder.layers:
+            op = T5RelativeBias(num_heads, num_buckets, max_distance,
+                                bidirectional=False)
+            layer.self_attn.relative_bias = op
+            self.dec_bias.append(op)
+        self.zero_grad()
+
+    def _named_params(self):
+        """父类参数 + 各层相对偏置表（每桶一行作为 1D 参数参与 Adam）"""
+        for item in super()._named_params():
+            yield item
+        for tag, ops in (("enc", self.enc_bias), ("dec", self.dec_bias)):
+            for li, op in enumerate(ops):
+                for b in range(op.num_buckets):
+                    yield (f"{tag}.L{li}.t5_bias.b{b}",
+                           op.table[b], op.grad_table[b])
+
+    def param_count(self):
+        """参数总数（标量个数；父类实现已遍历本类的 _named_params，含相对偏置表）"""
+        return super().param_count()
+
+
+class BertModel:
+    """BERT 式掩码语言模型：MLM + NSP 双头
+
+    结构::
+
+        token_embedding + seg_embedding → PositionalEncoding → TransformerEncoder ─┬→ MLM 头（全词表）
+                                                                                   └→ NSP 头（取 [CLS] 位置）
+
+    与 MaskedLM 的区别：这里同时训练 NSP（下一句预测），并且由调用者完全掌控
+    哪些位置被 mask（便于教学和可控实验）。训练样本是五元组::
+
+        (input_ids, mask_positions, mask_labels, segment_ids, nsp_label)
+
+    - ``mask_positions``：被 mask 的位置下标列表（MLM 只在这些位置算损失）
+    - ``mask_labels``：与之一一对应的正确 token id
+    - ``segment_ids``：与 input_ids 等长的 0/1 列表（句 A / 句 B），None 视为全 0
+    - ``nsp_label``：0 或 1；None 表示这条样本不计算 NSP 损失
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
+                 d_ff: int = 64, num_layers: int = 2, max_len: int = 64,
+                 dropout: float = 0.0):
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) \
+                or vocab_size < 1:
+            raise ValueError(f"BertModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        self.step_count = 0
+        self._adam_m = {}
+        self._adam_v = {}
+
+        self.token_embedding = Embedding(vocab_size, d_model)
+        self.seg_embedding = Embedding(2, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
+                                          dropout)
+
+        std = math.sqrt(2.0 / d_model)
+        self.W_mlm = [[random.gauss(0, std) for _ in range(d_model)]
+                      for _ in range(vocab_size)]
+        self.b_mlm = [0.0] * vocab_size
+        self.W_nsp = [[random.gauss(0, std) for _ in range(d_model)]
+                      for _ in range(2)]
+        self.b_nsp = [0.0] * 2
+
+        self.zero_grad()
+        self.h = None            # 最近一次前向的编码器输出（反向要用）
+        self._seg_ids = None     # 最近一次前向的 segment ids（反向要用）
+
+    def train(self):
+        """训练模式：编码器 Dropout 生效"""
+        self.encoder.train()
+        return self
+
+    def eval(self):
+        """推理模式：关闭 Dropout"""
+        self.encoder.eval()
+        return self
+
+    def zero_grad(self):
+        """清零全部梯度（两个 embedding、编码器、MLM/NSP 头）"""
+        self.token_embedding.zero_grad()
+        self.seg_embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.grads = {
+            "W_mlm": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_mlm": [0.0] * self.vocab_size,
+            "W_nsp": [[0.0] * self.d_model for _ in range(2)],
+            "b_nsp": [0.0] * 2,
+        }
+
+    def _named_params(self):
+        """产出 (名字, 参数, 梯度)；名字保证 Adam 的矩跨步稳定"""
+        yield ("tok_emb.weight", self.token_embedding.weight,
+               self.token_embedding.grad_weight)
+        yield ("seg_emb.weight", self.seg_embedding.weight,
+               self.seg_embedding.grad_weight)
+        for li, layer in enumerate(self.encoder.layers):
+            attn = layer.self_attn
+            for k in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield (f"enc.L{li}.attn.{k}", getattr(attn, k), attn.grads[k])
+            ffn = layer.ffn
+            for k in ("W1", "b1", "W2", "b2"):
+                yield (f"enc.L{li}.ffn.{k}", getattr(ffn, k), ffn.grads[k])
+            for ln in ("ln1", "ln2"):
+                mod = getattr(layer, ln)
+                yield (f"enc.L{li}.{ln}.gamma", mod.gamma,
+                       layer.grads[ln + "_gamma"])
+                yield (f"enc.L{li}.{ln}.beta", mod.beta,
+                       layer.grads[ln + "_beta"])
+        yield ("mlm.W", self.W_mlm, self.grads["W_mlm"])
+        yield ("mlm.b", self.b_mlm, self.grads["b_mlm"])
+        yield ("nsp.W", self.W_nsp, self.grads["W_nsp"])
+        yield ("nsp.b", self.b_nsp, self.grads["b_nsp"])
+
+    def param_count(self):
+        """参数总数（标量个数）"""
+        return sum(len(p) if not isinstance(p[0], list) else
+                   sum(len(r) for r in p)
+                   for _, p, _ in self._named_params())
+
+    def forward(self, input_ids, segment_ids=None):
+        """返回编码器输出 hidden (T, d_model)；segment_ids 长度须与输入一致"""
+        if not input_ids:
+            raise ValueError("BertModel.forward: input_ids 不能为空")
+        if len(input_ids) > self.max_len:
+            raise ValueError(
+                f"BertModel.forward: 序列长度 {len(input_ids)} 超过 max_len={self.max_len}")
+        ids = _check_token_ids(input_ids, self.vocab_size, "BertModel.forward")
+        if segment_ids is None:
+            seg = [0] * len(ids)
+        else:
+            if len(segment_ids) != len(ids):
+                raise ValueError(
+                    "BertModel.forward: segment_ids 长度必须与 input_ids 一致")
+            seg = []
+            for s in segment_ids:
+                if isinstance(s, bool) or not isinstance(s, int) or s not in (0, 1):
+                    raise ValueError(
+                        f"BertModel.forward: segment id 只能是 0/1，收到 {s!r}")
+                seg.append(s)
+        tok = self.token_embedding.forward(ids)
+        segv = self.seg_embedding.forward(seg)
+        emb = [[tok[t][j] + segv[t][j] for j in range(self.d_model)]
+               for t in range(len(ids))]
+        x = self.pos.forward(emb)
+        self.h = self.encoder.forward(x)
+        self._seg_ids = list(seg)
+        return self.h
+
+    def masked_lm_logits(self, positions=None):
+        """返回 MLM 头 logits：positions=None 时对全部位置，否则只取指定位置"""
+        if self.h is None:
+            raise RuntimeError("BertModel.masked_lm_logits: 需要先 forward")
+        if positions is None:
+            positions = list(range(len(self.h)))
+        out = []
+        for pos in positions:
+            if isinstance(pos, bool) or not isinstance(pos, int) \
+                    or not 0 <= pos < len(self.h):
+                raise ValueError(
+                    f"BertModel.masked_lm_logits: 位置 {pos!r} 越界")
+            hv = self.h[pos]
+            out.append([sum(map(_mul, self.W_mlm[v], hv)) + self.b_mlm[v]
+                        for v in range(self.vocab_size)])
+        return out
+
+    def nsp_logits(self):
+        """返回 NSP 头 logits（长度 2，输入是 [CLS] 位置的隐状态）"""
+        if self.h is None:
+            raise RuntimeError("BertModel.nsp_logits: 需要先 forward")
+        hv = self.h[0]
+        return [sum(map(_mul, self.W_nsp[v], hv)) + self.b_nsp[v]
+                for v in range(2)]
+
+    def loss_and_backward(self, input_ids, mask_positions, mask_labels,
+                          segment_ids=None, nsp_label=None,
+                          lm_weight: float = 1.0, nsp_weight: float = 1.0):
+        """一次前向 + MLM/NSP 联合损失反向，返回 loss（标量）"""
+        if lm_weight < 0.0 or nsp_weight < 0.0:
+            raise ValueError("BertModel.loss_and_backward: 权重必须是非负数")
+        h = self.forward(input_ids, segment_ids)
+        d_h = [[0.0] * self.d_model for _ in range(len(h))]
+        loss = 0.0
+
+        # ---- MLM：只在给定位置算交叉熵 ----
+        mask_positions = list(mask_positions or [])
+        mask_labels = list(mask_labels or [])
+        if len(mask_positions) != len(mask_labels):
+            raise ValueError(
+                "BertModel.loss_and_backward: mask_positions 与 mask_labels 长度不一致")
+        for pos, label in zip(mask_positions, mask_labels):
+            if isinstance(pos, bool) or not isinstance(pos, int) \
+                    or not 0 <= pos < len(h):
+                raise ValueError(
+                    f"BertModel.loss_and_backward: mask 位置 {pos!r} 越界")
+            if isinstance(label, bool) or not isinstance(label, int) \
+                    or not 0 <= label < self.vocab_size:
+                raise ValueError(
+                    f"BertModel.loss_and_backward: mask 标签 {label!r} 越界")
+            hv = h[pos]
+            logits = [sum(map(_mul, self.W_mlm[v], hv)) + self.b_mlm[v]
+                      for v in range(self.vocab_size)]
+            probs = _softmax_row(logits)
+            loss += -math.log(max(probs[label], 1e-12)) * lm_weight
+            didx = [probs[v] - (1.0 if v == label else 0.0)
+                    for v in range(self.vocab_size)]
+            for v in range(self.vocab_size):
+                dv = didx[v]
+                if dv == 0.0:
+                    continue
+                wrow = self.W_mlm[v]
+                grad_row = self.grads["W_mlm"][v]
+                dvw = dv * lm_weight
+                for j in range(self.d_model):
+                    grad_row[j] += dvw * hv[j]
+                    d_h[pos][j] += dvw * wrow[j]
+                self.grads["b_mlm"][v] += dvw
+
+        # ---- NSP：取第 0 个位置（[CLS]）的二分类 ----
+        if nsp_label is not None:
+            if isinstance(nsp_label, bool) or not isinstance(nsp_label, int) \
+                    or nsp_label not in (0, 1):
+                raise ValueError(
+                    f"BertModel.loss_and_backward: nsp_label 只能是 0/1，收到 {nsp_label!r}")
+            hv = h[0]
+            logits = self.nsp_logits()
+            probs = _softmax_row(logits)
+            loss += -math.log(max(probs[nsp_label], 1e-12)) * nsp_weight
+            for v in range(2):
+                dv = (probs[v] - (1.0 if v == nsp_label else 0.0)) * nsp_weight
+                if dv == 0.0:
+                    continue
+                wrow = self.W_nsp[v]
+                grad_row = self.grads["W_nsp"][v]
+                for j in range(self.d_model):
+                    grad_row[j] += dv * hv[j]
+                    d_h[0][j] += dv * wrow[j]
+                self.grads["b_nsp"][v] += dv
+
+        # ---- 反向穿过编码器与 embedding ----
+        d_enc = self.encoder.backward(d_h)
+        self.token_embedding.backward(d_enc)
+        self.seg_embedding.backward(d_enc)
+        return loss
+
+    def adam_step(self, lr: float):
+        """对全部参数做一次 Adam 更新（梯度由 loss_and_backward 累积）"""
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0.0:
+            raise ValueError(f"BertModel.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, samples, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False):
+        """在若干五元组样本上训练，返回每个 epoch 的平均 loss"""
+        items = list(samples)
+        if not items:
+            raise ValueError("BertModel.fit: samples 不能为空")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 0:
+            raise ValueError(f"BertModel.fit: epochs 不能为负，收到 {epochs!r}")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        self.train()
+        for ep in range(epochs):
+            order = list(range(len(items)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                ids, positions, labels, seg, nsp = items[idx]
+                self.zero_grad()
+                total += self.loss_and_backward(ids, positions, labels,
+                                                seg, nsp)
+                self.adam_step(lr)
+            avg = total / len(items)
+            history.append(avg)
+            if verbose:
+                print(f"epoch {ep + 1}/{epochs} loss={avg:.4f}")
         return history
 
 

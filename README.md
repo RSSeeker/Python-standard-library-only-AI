@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1853 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（1860 项）
 
 ## 特性
 
@@ -610,6 +610,32 @@ pred = [max(range(10), key=lambda v: net.logits(img)[v]) for img in images]
 `LlamaModel.generate` 不走 KV cache（每次整段重算，和 `CausalLM.generate` 的默认路径一致）；
 需要真正增量前向时用 `MultiHeadAttention.forward_step`。`Bottleneck2d` 在 stride=2 下的反向越界
 （旧实现按输出空间尺寸裁剪 conv1 梯度）已修复，并补了「stride=2 反向 + ResNet 收敛」两条回归测试。
+
+### 组合模型（T5 / BERT）
+
+在 LLaMA / ResNet 之外再补两个主流范式：T5 式编码器-解码器（自注意力带可学习相对位置偏置）
+和 BERT 式掩码语言模型（MLM + NSP 双头）。
+
+```python
+t5 = T5Model(src_vocab=16, tgt_vocab=16, d_model=32, num_heads=4, num_layers=2,
+             max_len=32, num_buckets=32)
+t5.fit([([1, 2, 3], [4, 5, 6])], epochs=40, lr=0.01)
+print(t5.evaluate([([1, 2, 3], [4, 5, 6])]))
+
+bert = BertModel(vocab_size=32, d_model=32, num_heads=4, num_layers=2, max_len=32)
+# 样本 = (input_ids, 被 mask 的位置, 正确 token, segment_ids, nsp_label)
+bert.fit([([1, 2, 3, 4, 5], [1, 3], [2, 4], [0, 0, 0, 1, 1], 1)],
+         epochs=30, lr=3e-3)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `T5Model(src_vocab, tgt_vocab, d_model=32, num_heads=4, d_ff=64, num_layers=2, max_len=64, dropout=0.0, num_buckets=32, max_distance=128)` | 继承 `Seq2SeqLM`；每层自注意力额外挂 `T5RelativeBias`（encoder 双向桶、decoder 因果桶；交叉注意力不加），前向在 softmax 前加偏置、反向把 `d_soft` 累加进偏置表；`fit` / `evaluate` / `generate` / `param_count` 全部复用父类 |
+| `BertModel(vocab_size, d_model=32, num_heads=4, d_ff=64, num_layers=2, max_len=64, dropout=0.0)` | token + segment Embedding → PositionalEncoding → `TransformerEncoder`；MLM 头（全词表）+ NSP 头（取 [CLS] 位置）；`forward` / `masked_lm_logits` / `nsp_logits` / `loss_and_backward` / `adam_step` / `fit` |
+
+`T5RelativeBias` 的分桶与 T5 论文一致（`t5_relative_buckets`，`bidirectional=False` 时只按距离分桶）；
+`MultiHeadAttention` 新增可选 `relative_bias` 参数，不传时行为与旧版逐位一致（回归测试覆盖）。
+`BertModel` 由调用方决定 mask 哪些位置，适合需要完全掌控 mask 策略的教学实验。
 
 ### 序列到序列（Encoder-Decoder）
 
@@ -3275,7 +3301,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-1853 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+1860 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -3559,7 +3585,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 1853 个单元测试
+├── test_ai.py       # 1860 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

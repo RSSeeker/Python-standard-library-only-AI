@@ -697,7 +697,10 @@
   （含 stride=2 反向与训练收敛）
 - [x] 修 `Bottleneck2d.backward` 在 stride=2 时按输出空间裁剪 conv1 梯度导致的越界
   （ResNet 回归测试覆盖，旧实现遇到 stride>1 的 block 必崩）
-- [ ] 完整 BERT（MaskedLM + NSP）与完整 T5（Seq2SeqLM + `T5RelativeBias` 注入）
+- [x] 完整 BERT（`BertModel`：token + segment Embedding → `TransformerEncoder` →
+  MLM 头 + NSP 头；`fit` 样本为五元组，mask 位置由调用方控制）与完整 T5
+  （`T5Model(Seq2SeqLM)`：encoder 双向 / decoder 因果的 `T5RelativeBias` 注入自注意力；
+  `MultiHeadAttention` 新增可选 `relative_bias`，不传时与旧版逐位一致）；测试 `TestT5AndBertModels` 7 例
 - [x] 多标签指标（Exact Match Ratio / Ranking Loss / LRAP）、OOD（MSP / Energy）、
   McNemar / Wilcoxon（纯数学）：`multilabel_exact_match_ratio` /
   `multilabel_ranking_loss` / `label_ranking_average_precision` / `msp_score` /
@@ -705,7 +708,7 @@
   测试 `TestMultiLabelAndStatistics` 7 例（含精确二项 p 值、并列秩校正与错误路径）
 - [ ] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合
 
-全量测试：1839 → 1853 passed（新增 14 例）。
+全量测试：1839 → 1860 passed（新增 21 例）。
 
 ---
 
