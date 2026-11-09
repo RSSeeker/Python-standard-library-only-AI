@@ -11492,6 +11492,176 @@ def fit_cyclegan(g_ab, g_ba, d_a, d_b, pairs, steps=30,
             lr_g=lr_g, lr_d=lr_d))
     return history
 
+"""Progressive growing 生成器：逐阶段追加 ConvTranspose2d 分支 + 淡入混合。"""
+
+
+def _pg_upsample_grad(dout, h, w):
+    """最近邻 2×2 上采样的反向：把 2×2 块求和回低分辨率。"""
+    c = len(dout)
+    out = [[[0.0 for _ in range(w)] for _ in range(h)] for _ in range(c)]
+    for k in range(c):
+        for i in range(h):
+            for j in range(w):
+                out[k][i][j] = (dout[k][2 * i][2 * j] + dout[k][2 * i][2 * j + 1]
+                                + dout[k][2 * i + 1][2 * j] + dout[k][2 * i + 1][2 * j + 1])
+    return out
+
+
+def _pg_channels(channels, name):
+    if not isinstance(channels, (list, tuple)) or not channels:
+        raise ValueError(f"{name}: channels 不能为空")
+    out = []
+    for c in channels:
+        if isinstance(c, bool) or not isinstance(c, int) or c < 1:
+            raise ValueError(f"{name}: channels 里必须是正整数，收到 {c!r}")
+        out.append(c)
+    return tuple(out)
+
+
+def _pg_scale(dout, factor):
+    return [[[factor * v for v in row] for row in ch] for ch in dout]
+
+
+class ProgressiveGenerator:
+    """ProGAN 风格的逐阶段增长生成器。
+
+    阶段 0 把潜码线性映射到 `(c0, base, base)` 特征，并用 1×1 卷积得到低分辨率 RGB；
+    每调用一次 `grow()` 追加一组「ConvTranspose2d(×2) + ReLU + 1×1 RGB 头」。
+    `forward(z, alpha)` 的 `alpha` 只影响最后一阶段：`alpha=1` 为完整新分辨率，
+    `alpha<1` 时按 `fade_in(上一阶段 RGB, 新阶段 RGB, alpha)` 平滑过渡。
+    """
+
+    def __init__(self, latent_dim=8, channels=(8, 4), base=2, out_channels=1, seed=None):
+        self.name = "ProgressiveGenerator"
+        if isinstance(latent_dim, bool) or not isinstance(latent_dim, int) or latent_dim < 1:
+            raise ValueError(f"{self.name}: latent_dim 必须是正整数")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 1:
+            raise ValueError(f"{self.name}: base 必须是正整数")
+        if isinstance(out_channels, bool) or not isinstance(out_channels, int) or out_channels < 1:
+            raise ValueError(f"{self.name}: out_channels 必须是正整数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError(f"{self.name}: seed 必须是整数或 None")
+        self.latent_dim = latent_dim
+        self.channels = _pg_channels(channels, self.name)
+        self.base = base
+        self.out_channels = out_channels
+        prev = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.fc = Layer(self.latent_dim, self.channels[0] * base * base, activation="relu")
+            self.convs = [ConvTranspose2d(self.channels[i - 1], self.channels[i], 4,
+                                          stride=2, padding=1)
+                          for i in range(1, len(self.channels))]
+            self.rgb_heads = [Conv2d(c, out_channels, 1) for c in self.channels]
+        finally:
+            if seed is not None:
+                random.setstate(prev)
+        self._cache = None
+
+    # ---------- 形状 / 增长 ----------
+
+    def out_shape(self):
+        side = self.base * (2 ** (len(self.channels) - 1))
+        return (self.out_channels, side, side)
+
+    def grow(self):
+        """追加一个阶段：分辨率翻倍，通道数沿用当前最后一阶。"""
+        last = self.channels[-1]
+        self.convs.append(ConvTranspose2d(last, last, 4, stride=2, padding=1))
+        self.rgb_heads.append(Conv2d(last, self.out_channels, 1))
+        self.channels = self.channels + (last,)
+        return self.out_shape()
+
+    # ---------- 前向 / 反向 ----------
+
+    def forward(self, z, alpha=1.0):
+        if not isinstance(z, (list, tuple)) or len(z) != self.latent_dim:
+            raise ValueError(f"{self.name}.forward: z 维度应为 {self.latent_dim}")
+        for v in z:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{self.name}.forward: z 里必须是数字")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"{self.name}.forward: alpha 必须在 [0, 1]")
+        h = self.fc.forward(list(z))
+        x = _w8a_unflat(h, (self.channels[0], self.base, self.base))
+        rgb_prev = self.rgb_heads[0].forward(x)
+        masks, rgbs = [], [rgb_prev]
+        for i, conv in enumerate(self.convs, start=1):
+            x = conv.forward(x)
+            x, m = _w8a_relu(x)
+            masks.append(m)
+            rgb = self.rgb_heads[i].forward(x)
+            rgbs.append(rgb)
+        a = float(alpha)
+        if a < 1.0 and len(self.convs) >= 1:
+            blended = fade_in(rgbs[-2], rgbs[-1], a)
+        else:
+            blended = rgbs[-1]
+        image = _w8a_tanh(blended)
+        self._cache = {"masks": masks, "image": image, "alpha": a}
+        return image
+
+    def backward(self, dout, alpha=None):
+        if self._cache is None:
+            raise RuntimeError(f"{self.name}.backward: 先调用 forward")
+        cache = self._cache
+        if alpha is None:
+            alpha = cache["alpha"]
+        a = float(alpha)
+        if isinstance(a, bool) or not isinstance(a, (int, float)) or not (0.0 <= a <= 1.0):
+            raise ValueError(f"{self.name}.backward: alpha 必须在 [0, 1]")
+        image = cache["image"]
+        d_blend = [[[(1.0 - v * v) * float(g) for v, g in zip(ch, gch)]
+                    for ch, gch in zip(row, grow)] for row, grow in zip(image, dout)]
+        n = len(self.convs)
+        if a < 1.0 and n >= 1:
+            d_high = _pg_scale(d_blend, a)
+            d_prev = _pg_upsample_grad(_pg_scale(d_blend, 1.0 - a),
+                                       len(cache["masks"][0][0]) if False else self.base * (2 ** (n - 1)),
+                                       self.base * (2 ** (n - 1)))
+        else:
+            d_high = d_blend
+            d_prev = None
+
+        grad = self.rgb_heads[-1].backward(d_high)
+        d_x_prev = None
+        if d_prev is not None:
+            low = self.base * (2 ** (n - 1))
+            d_x_prev = self.rgb_heads[-2].backward(d_prev)
+
+        for j in range(n - 1, -1, -1):
+            grad = _w8a_mask_grad(grad, cache["masks"][j])
+            grad = self.convs[j].backward(grad)
+            if j == n - 1 and d_x_prev is not None:
+                for k in range(len(grad)):
+                    for r in range(len(grad[k])):
+                        for c in range(len(grad[k][r])):
+                            grad[k][r][c] += d_x_prev[k][r][c]
+
+        gw, gb, dz = self.fc.backward(_w8a_flat(grad))
+        _w8a_accum_layer(self.fc, gw, gb)
+        return dz
+
+    # ---------- 参数 ----------
+
+    def layers(self):
+        return [self.fc] + list(self.convs) + list(self.rgb_heads)
+
+    def zero_grad(self):
+        for layer in self.layers():
+            _w8a_zero_grad_layer(layer)
+
+    def param_count(self):
+        return sum(_w8a_layer_params(layer) for layer in self.layers())
+
+    def sgd_step(self, lr):
+        for layer in self.layers():
+            if isinstance(layer, Layer):
+                _w8a_sgd_layer(layer, lr)
+            else:
+                _p2p_sgd_layer(layer, lr)
+
 #  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
 # =============================================================================
 #  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要

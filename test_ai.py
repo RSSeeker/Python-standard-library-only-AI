@@ -31927,3 +31927,142 @@ class TestGanPenalties:
         _gp_raises(lambda: AI.r2_diagnostics(d, real, real, alpha=1.5))
         _gp_raises(lambda: AI.r2_diagnostics(d, real, _gp_const(0.0, size=4)))
         _gp_raises(lambda: AI.gan_penalty_diagnostics(object(), real, real), TypeError)
+
+
+import random
+
+
+def _pg_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _pg_make_w(shape):
+    c, h, w = shape
+    return [[[random.Random(17 + i * 31 + j * 7).uniform(-1.0, 1.0)
+              for j in range(w)] for i in range(h)] for _ in range(c)]
+
+
+def _pg_loss_and_grads(g, z, w, alpha):
+    g.zero_grad()
+    y = g.forward(z, alpha=alpha)
+    g.backward(w, alpha=alpha)
+    return sum(y[k][i][j] * w[k][i][j]
+               for k in range(len(y)) for i in range(len(y[0])) for j in range(len(y[0][0])))
+
+
+def _pg_fd(g, z, w, alpha, getter, setter, grad_getter, h=1e-5):
+    p0 = getter()
+    _pg_loss_and_grads(g, z, w, alpha)
+    analytic = grad_getter()
+    setter(p0 + h)
+    lp = _pg_loss_and_grads(g, z, w, alpha)
+    setter(p0 - h)
+    lm = _pg_loss_and_grads(g, z, w, alpha)
+    setter(p0)
+    val = (lp - lm) / (2.0 * h)
+    denom = max(1e-9, abs(val) + abs(analytic))
+    return abs(val - analytic) / denom, val, analytic
+
+
+class TestProgressiveGenerator:
+    def test_forward_grow_shapes_and_params(self):
+        g = AI.ProgressiveGenerator(latent_dim=8, channels=(8, 4), base=2, seed=3)
+        assert g.out_shape() == (1, 4, 4)
+        assert g.param_count() == 818
+        z = [0.1 * (i + 1) for i in range(8)]
+        y = g.forward(z, alpha=1.0)
+        assert len(y) == 1 and len(y[0]) == 4 and len(y[0][0]) == 4
+        y_fade = g.forward(z, alpha=0.3)
+        assert len(y_fade[0]) == 4 and len(y_fade[0][0]) == 4
+        assert g.grow() == (1, 8, 8)
+        assert g.param_count() == 1083
+        y2 = g.forward(z, alpha=0.6)
+        assert len(y2[0]) == 8 and len(y2[0][0]) == 8
+        assert g.grow() == (1, 16, 16)
+
+    def test_gradients_fade_path(self):
+        g = AI.ProgressiveGenerator(latent_dim=8, channels=(8, 4), base=2, seed=3)
+        z = [0.1 * (i + 1) for i in range(8)]
+        w = _pg_make_w(g.out_shape())
+        rels = []
+        rels.append(_pg_fd(g, z, w, 0.4,
+                           lambda: g.rgb_heads[1].weights[0][0][0][0],
+                           lambda v: g.rgb_heads[1].weights[0][0][0][0].__class__ and
+                           g.rgb_heads[1].weights[0][0][0].__setitem__(0, v),
+                           lambda: g.rgb_heads[1].grad_w[0][0][0][0])[0])
+        rels.append(_pg_fd(g, z, w, 0.4,
+                           lambda: g.rgb_heads[0].weights[0][0][0][0],
+                           lambda v: g.rgb_heads[0].weights[0][0][0].__setitem__(0, v),
+                           lambda: g.rgb_heads[0].grad_w[0][0][0][0])[0])
+        rels.append(_pg_fd(g, z, w, 0.4,
+                           lambda: g.fc.weights[0][0],
+                           lambda v: g.fc.weights[0].__setitem__(0, v),
+                           lambda: g.fc.grad_w[0][0])[0])
+        assert max(rels) < 1e-4
+
+    def test_gradients_alpha_one_and_grow(self):
+        g = AI.ProgressiveGenerator(latent_dim=8, channels=(8, 4), base=2, seed=3)
+        z = [0.1 * (i + 1) for i in range(8)]
+        w = _pg_make_w(g.out_shape())
+        rels = []
+        for (ci, co, kh, kw) in ((0, 0, 1, 3), (0, 0, 0, 0), (1, 0, 2, 2)):
+            rels.append(_pg_fd(
+                g, z, w, 1.0,
+                lambda ci=ci, co=co, kh=kh, kw=kw: g.convs[0].weights[ci][co][kh][kw],
+                lambda v, ci=ci, co=co, kh=kh, kw=kw: g.convs[0].weights[ci][co][kh].__setitem__(kw, v),
+                lambda ci=ci, co=co, kh=kh, kw=kw: g.convs[0].grad_w[ci][co][kh][kw])[0])
+        assert max(rels) < 1e-4
+
+        g2 = AI.ProgressiveGenerator(latent_dim=8, channels=(8, 4), base=2, seed=4)
+        g2.grow()
+        w2 = _pg_make_w(g2.out_shape())
+        rels2 = []
+        for (ci, co, kh, kw) in ((0, 0, 0, 0), (0, 0, 1, 2)):
+            rels2.append(_pg_fd(
+                g2, z, w2, 0.6,
+                lambda ci=ci, co=co, kh=kh, kw=kw: g2.convs[1].weights[ci][co][kh][kw],
+                lambda v, ci=ci, co=co, kh=kh, kw=kw: g2.convs[1].weights[ci][co][kh].__setitem__(kw, v),
+                lambda ci=ci, co=co, kh=kh, kw=kw: g2.convs[1].grad_w[ci][co][kh][kw])[0])
+        assert max(rels2) < 1e-4
+
+    def test_training_reduces_loss(self):
+        g = AI.ProgressiveGenerator(latent_dim=8, channels=(8, 4), base=2, seed=5)
+        z = [0.05 * (i + 1) for i in range(8)]
+        target = [[[0.5] * 4 for _ in range(4)]]
+        first, last = None, None
+        for _ in range(40):
+            g.zero_grad()
+            y = g.forward(z, alpha=0.5)
+            loss = sum((y[k][i][j] - target[k][i][j]) ** 2
+                       for k in range(1) for i in range(4) for j in range(4)) / 16.0
+            d = [[[2.0 * (y[k][i][j] - target[k][i][j]) / 16.0
+                   for j in range(4)] for i in range(4)] for k in range(1)]
+            g.backward(d, alpha=0.5)
+            g.sgd_step(0.05)
+            if first is None:
+                first = loss
+            last = loss
+        assert last < first / 2.0
+
+    def test_invalid_inputs(self):
+        z = [0.1] * 8
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(latent_dim=0))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(latent_dim=True))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(channels=()))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(channels=(0, 4)))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(base=0))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(out_channels=0))
+        assert _pg_raises(lambda: AI.ProgressiveGenerator(seed="x"), (ValueError, TypeError))
+        g = AI.ProgressiveGenerator(seed=1)
+        assert _pg_raises(lambda: g.forward([0.1] * 7))
+        assert _pg_raises(lambda: g.forward([0.1] * 7 + ["x"]))
+        assert _pg_raises(lambda: g.forward(z, alpha=-0.1))
+        assert _pg_raises(lambda: g.forward(z, alpha=1.1))
+        assert _pg_raises(lambda: g.forward(z, alpha=True))
+        assert _pg_raises(lambda: g.backward([[[1.0] * 4] * 4]), RuntimeError)
+        g.forward(z, alpha=0.5)
+        assert _pg_raises(lambda: g.backward([[[1.0] * 4] * 4], alpha=2.0))
