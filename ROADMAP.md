@@ -714,7 +714,9 @@
   `multilabel_ranking_loss` / `label_ranking_average_precision` / `msp_score` /
   `energy_score` / `ood_detection_auroc` / `mcnemar_test` / `wilcoxon_signed_rank_test`；
   测试 `TestMultiLabelAndStatistics` 7 例（含精确二项 p 值、并列秩校正与错误路径）
-- [ ] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合
+- [x] P1 研究前沿：Mamba / xLSTM / RetNet、SAC / TD3、TPE、BERTScore、QLoRA 组合——均已
+  在后续批次独立落地（Mamba S6 与 MambaBlock、RWKV / RetNet、xLSTM sLSTM、SAC 与
+  DDPG/TD3、`tpe_search` / `successive_halving`、`bert_score`、QLoRA/VeRA/ReFT）
 
 - [x] 清单驱动的低成本小件：ROUGE-S / ROUGE-W（`rouge_s` / `rouge_w`）与 IA³ 适配器（`IA3`，冻结原层只训输出通道缩放）；测试 `TestRougeExtraAndIA3` 12 例
 
