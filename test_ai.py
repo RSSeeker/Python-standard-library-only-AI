@@ -32066,3 +32066,156 @@ class TestProgressiveGenerator:
         assert _pg_raises(lambda: g.backward([[[1.0] * 4] * 4]), RuntimeError)
         g.forward(z, alpha=0.5)
         assert _pg_raises(lambda: g.backward([[[1.0] * 4] * 4], alpha=2.0))
+
+
+# -*- coding: utf-8 -*-
+"""Batch 35 tests: TTS-lite (TextToMel + Griffin-Lim + mel_to_linear)."""
+import math
+import random
+
+
+def _tts_raises(fn, exc=ValueError, who="tts"):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"{who}: 期望 {exc.__name__}，但没有抛异常")
+
+
+def _tts_target(ids, durations):
+    target = []
+    for idx, d in zip(ids, durations):
+        row = [float(idx) / 6.0, 1.0 if idx == 2 else 0.0, 0.5]
+        for _ in range(d):
+            target.append(row)
+    return target
+
+
+def _tts_fd2(model, ids, durations, target, grad_getter, param_getter,
+             param_setter, h=1e-5, tag=""):
+    model.zero_grad()
+    model.loss_and_backward(ids, durations, target)
+    analytic = grad_getter()
+    p0 = param_getter()
+    param_setter(p0 + h)
+    lp = model.loss_and_backward(ids, durations, target)
+    param_setter(p0 - h)
+    lm = model.loss_and_backward(ids, durations, target)
+    param_setter(p0)
+    fd_val = (lp - lm) / (2.0 * h)
+    rel = abs(analytic - fd_val) / max(1.0, abs(analytic), abs(fd_val))
+    assert rel < 5e-3, f"{tag} rel={rel}"
+    return rel
+
+
+def _tts_samples():
+    samples = []
+    for k in range(8):
+        ids_k = [k % 6, (k + 2) % 6, 3]
+        durs = [1 + (k % 2), 2, 1]
+        tgt = []
+        for idx, d in zip(ids_k, durs):
+            row = [float(idx) / 6.0, 1.0 if idx == 3 else 0.0, 0.2]
+            for _ in range(d):
+                tgt.append(row)
+        samples.append((ids_k, durs, tgt))
+    return samples
+
+
+class TestTTS:
+    def test_text_to_mel_forward_and_params(self):
+        model = AI.TextToMel(6, d_model=4, n_mels=3, seed=1)
+        assert model.param_count() == 143
+        mel = model.forward([2, 0, 3], [2, 1, 2])
+        assert len(mel) == 5
+        assert all(len(row) == 3 for row in mel)
+
+        # 不同时长只改变总帧数，不改变通道数
+        mel2 = model.forward([1, 5], [3, 1])
+        assert len(mel2) == 4 and len(mel2[0]) == 3
+
+        _tts_raises(lambda: model.forward([], []))
+        _tts_raises(lambda: model.forward([0, 1], [1]))
+        _tts_raises(lambda: model.forward([0], [0]))
+        _tts_raises(lambda: model.forward([0], [1.5]))
+        _tts_raises(lambda: model.forward([6], [1]))
+        _tts_raises(lambda: AI.TextToMel(6, kernel_size=4))
+        _tts_raises(lambda: AI.TextToMel(6, d_model=0))
+
+    def test_text_to_mel_numerical_gradients(self):
+        ids, durations = [2, 0, 3], [2, 1, 2]
+        target = _tts_target(ids, durations)
+        m = AI.TextToMel(6, d_model=4, n_mels=3, seed=1)
+        _tts_fd2(m, ids, durations, target,
+                 lambda: m.conv1.grad_w[0][0][1], lambda: m.conv1.weights[0][0][1],
+                 lambda v: m.conv1.weights[0][0].__setitem__(1, v), tag="conv1")
+        _tts_fd2(m, ids, durations, target,
+                 lambda: m.conv2.grad_w[2][1][0], lambda: m.conv2.weights[2][1][0],
+                 lambda v: m.conv2.weights[2][1].__setitem__(0, v), tag="conv2")
+        _tts_fd2(m, ids, durations, target,
+                 lambda: m.grad_out[0][1][2], lambda: m.out.weights[1][2],
+                 lambda v: m.out.weights[1].__setitem__(2, v), tag="out")
+        _tts_fd2(m, ids, durations, target,
+                 lambda: m.embedding.grad_weight[2][1],
+                 lambda: m.embedding.weight[2][1],
+                 lambda v: m.embedding.weight[2].__setitem__(1, v), tag="emb")
+
+    def test_text_to_mel_fit(self):
+        m = AI.TextToMel(6, d_model=8, n_mels=3, seed=2)
+        history = m.fit(_tts_samples(), epochs=40, lr=0.05, seed=1)
+        assert history[0]["loss"] > history[-1]["loss"] * 2.0
+        _tts_raises(lambda: m.fit([], epochs=1))
+        _tts_raises(lambda: m.fit(_tts_samples(), epochs=0))
+        _tts_raises(lambda: m.fit(_tts_samples(), epochs=1, lr=-0.1))
+
+    def test_griffin_lim(self):
+        n_fft, hop = 64, 16
+        wave = [math.sin(2 * math.pi * 0.11 * t)
+                + 0.5 * math.sin(2 * math.pi * 0.23 * t) for t in range(200)]
+        win = AI._tts_hann(n_fft)
+        mag, _ = AI._tts_mag_frames(wave, n_fft, hop, win)
+        rec = AI.griffin_lim(mag, n_fft=n_fft, hop_length=hop,
+                             iterations=60, seed=0)
+        mag2, _ = AI._tts_mag_frames(rec, n_fft, hop, win)
+        num = sum((x - y) ** 2 for a, b in zip(mag, mag2) for x, y in zip(a, b))
+        den = sum(x * x for a in mag for x in a)
+        assert math.sqrt(num / den) < 0.45
+
+        # 迭代更多应不差于更少
+        rec1 = AI.griffin_lim(mag, n_fft=n_fft, hop_length=hop,
+                              iterations=1, seed=0)
+        mag1, _ = AI._tts_mag_frames(rec1, n_fft, hop, win)
+        num1 = sum((x - y) ** 2 for a, b in zip(mag, mag1) for x, y in zip(a, b))
+        assert math.sqrt(num / den) <= math.sqrt(num1 / den)
+
+        _tts_raises(lambda: AI.griffin_lim([]))
+        _tts_raises(lambda: AI.griffin_lim([[1.0, -1.0]]))
+        _tts_raises(lambda: AI.griffin_lim([[1.0, 2.0, 3.0]],
+                                           n_fft=8))
+        bad = [[1.0, 2.0, 3.0], [1.0]]
+        _tts_raises(lambda: AI.griffin_lim(bad))
+        _tts_raises(lambda: AI.griffin_lim([[1.0, 2.0, 3.0]],
+                                           hop_length=0))
+
+    def test_mel_to_linear_and_pipeline(self):
+        fb = AI.mel_filterbank(sample_rate=16000, n_fft=32, n_mels=8)
+        rng = random.Random(3)
+        lin_true = [[rng.uniform(0.0, 1.0) for _ in range(17)] for _ in range(3)]
+        mel = [[sum(fb[i][j] * lin_true[t][j] for j in range(17))
+                for i in range(8)] for t in range(3)]
+        lin_rec = AI.mel_to_linear(mel, fb)
+        mel_rec = [[sum(fb[i][j] * lin_rec[t][j] for j in range(17))
+                    for i in range(8)] for t in range(3)]
+        max_err = max(abs(mel_rec[t][i] - mel[t][i])
+                      for t in range(3) for i in range(8))
+        assert max_err < 1e-6
+        assert all(v >= 0.0 for row in lin_rec for v in row)
+
+        model = AI.TextToMel(6, d_model=4, n_mels=8, seed=3)
+        wav = AI.tts_synthesize(model, [1, 2], [2, 1], fb,
+                                n_fft=32, hop_length=8, iterations=5, seed=0)
+        assert len(wav) > 32
+        assert all(math.isfinite(v) for v in wav)
+
+        _tts_raises(lambda: AI.mel_to_linear([], fb))
+        _tts_raises(lambda: AI.mel_to_linear([[0.0] * 7], fb))

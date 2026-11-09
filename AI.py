@@ -44201,6 +44201,425 @@ class ConformerBlock:
         return [self.norm_out.forward(row) for row in x]
 
 # ========================================================================
+# -*- coding: utf-8 -*-
+"""TTS 轻量实现：FastSpeech 式声学模型 + Griffin-Lim 声码器。
+
+依赖主文件中的 Embedding / Conv1d / Layer / _dense_rows_forward /
+_dense_rows_backward / _dense_param_count / _dense_apply_sgd / _conv_param_count /
+_conv_sgd / mel_filterbank / frame_signal。
+"""
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+
+def _tts_check_pos_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} 必须是 >= {minimum} 的整数，收到 {value!r}")
+    return value
+
+
+def _tts_hann(n):
+    """长度 n 的 Hann 窗"""
+    if n == 1:
+        return [1.0]
+    return [0.5 - 0.5 * math.cos(2.0 * math.pi * i / (n - 1)) for i in range(n)]
+
+
+def _tts_dft_half(frame):
+    """实信号帧的 DFT 前半谱 [(re, im) ...]（长度 N//2+1）"""
+    n = len(frame)
+    out = []
+    for k in range(n // 2 + 1):
+        re = 0.0
+        im = 0.0
+        for t, v in enumerate(frame):
+            ang = 2.0 * math.pi * k * t / n
+            re += v * math.cos(ang)
+            im -= v * math.sin(ang)
+        out.append((re, im))
+    return out
+
+
+def _tts_idft_real(mag, phase):
+    """由幅度与相位还原实信号帧（长度 N = 2*(len(mag)-1)）"""
+    half = len(mag)
+    n = 2 * (half - 1)
+    xr = [0.0] * n
+    xi = [0.0] * n
+    for k in range(half):
+        xr[k] = mag[k] * math.cos(phase[k])
+        xi[k] = mag[k] * math.sin(phase[k])
+    for k in range(1, n - half + 1):
+        xr[n - k] = xr[k]
+        xi[n - k] = -xi[k]
+    out = [0.0] * n
+    for t in range(n):
+        total = 0.0
+        for k in range(n):
+            ang = 2.0 * math.pi * k * t / n
+            total += xr[k] * math.cos(ang) - xi[k] * math.sin(ang)
+        out[t] = total / n
+    return out
+
+
+def _tts_mag_frames(wave, n_fft, hop_length, window):
+    """波形 → 幅度谱 (T, N//2+1) 与相位 (T, N//2+1)"""
+    if len(wave) < n_fft:
+        raise ValueError(
+            f"TTS: 波形长度 {len(wave)} 小于 n_fft={n_fft}，无法分帧")
+    n_frames = 1 + (len(wave) - n_fft) // hop_length
+    mags = []
+    phases = []
+    for t in range(n_frames):
+        start = t * hop_length
+        seg = [wave[start + i] * window[i] for i in range(n_fft)]
+        spec = _tts_dft_half(seg)
+        mags.append([math.hypot(re, im) for re, im in spec])
+        phases.append([math.atan2(im, re) for re, im in spec])
+    return mags, phases
+
+
+# ---------------------------------------------------------------------------
+# Griffin-Lim 声码器
+# ---------------------------------------------------------------------------
+
+def griffin_lim(magnitude, n_fft=None, hop_length=None, iterations=60,
+                seed=0, window=None):
+    """由幅度谱 + 迭代相位估计还原波形（Griffin-Lim）。
+
+    magnitude: (T, n_bins) 非负幅度谱；n_fft 默认 2*(n_bins-1)；
+    返回一维波形（长度约 (T-1)*hop + n_fft，已按窗平方和归一化）。
+    """
+    if not isinstance(magnitude, (list, tuple)) or not magnitude:
+        raise ValueError("griffin_lim: magnitude 必须是非空的二维列表")
+    n_bins = len(magnitude[0])
+    if n_bins < 2:
+        raise ValueError("griffin_lim: 每个帧至少需要 2 个频点")
+    for t, row in enumerate(magnitude):
+        if not isinstance(row, (list, tuple)) or len(row) != n_bins:
+            raise ValueError(f"griffin_lim: 第 {t} 帧长度不一致")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"griffin_lim: 幅度必须是非负有限数字，收到 {v!r}")
+    n = 2 * (n_bins - 1) if n_fft is None else n_fft
+    if n != 2 * (n_bins - 1):
+        raise ValueError(
+            f"griffin_lim: n_fft={n} 与频点数 {n_bins} 不匹配"
+            f"（应为 {2 * (n_bins - 1)}）")
+    if hop_length is None:
+        hop_length = max(1, n // 4)
+    _tts_check_pos_int(hop_length, "griffin_lim: hop_length")
+    _tts_check_pos_int(iterations, "griffin_lim: iterations")
+    win = _tts_hann(n) if window is None else list(window)
+    if len(win) != n:
+        raise ValueError(f"griffin_lim: window 长度 {len(win)} != n_fft={n}")
+
+    rng = random.Random(seed)
+    n_frames = len(magnitude)
+    phase = [[rng.uniform(-math.pi, math.pi) for _ in range(n_bins)]
+             for _ in range(n_frames)]
+    out_len = (n_frames - 1) * hop_length + n
+    y = [0.0] * out_len
+    for _ in range(iterations):
+        acc = [0.0] * out_len
+        norm = [0.0] * out_len
+        for t in range(n_frames):
+            seg = _tts_idft_real(magnitude[t], phase[t])
+            start = t * hop_length
+            for i in range(n):
+                w = win[i]
+                acc[start + i] += seg[i] * w
+                norm[start + i] += w * w
+        y = [acc[i] / norm[i] if norm[i] > 1e-12 else 0.0
+             for i in range(out_len)]
+        mags, phases = _tts_mag_frames(y, n, hop_length, win)
+        phase = phases
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Mel → 线性幅度（最小二乘）
+# ---------------------------------------------------------------------------
+
+def _tts_solve(a, b):
+    """高斯消元解 a·x=b（a 为方阵）；奇异时抛 ValueError"""
+    n = len(a)
+    m = [list(a[i]) + [b[i]] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-12:
+            raise ValueError("mel_to_linear: 线性方程组奇异")
+        m[col], m[pivot] = m[pivot], m[col]
+        pv = m[col][col]
+        for j in range(col, n + 1):
+            m[col][j] /= pv
+        for r in range(n):
+            if r == col:
+                continue
+            factor = m[r][col]
+            if factor == 0.0:
+                continue
+            for j in range(col, n + 1):
+                m[r][j] -= factor * m[col][j]
+    return [m[i][n] for i in range(n)]
+
+
+def mel_to_linear(mel, mel_fb, eps=1e-10):
+    """Mel 谱 → 线性幅度谱（最小二乘 + 负值截零）。
+
+    mel: (T, n_mels)；mel_fb: (n_mels, n_bins)；返回 (T, n_bins)。
+    """
+    if not isinstance(mel, (list, tuple)) or not mel:
+        raise ValueError("mel_to_linear: mel 必须是非空的二维列表")
+    n_mels = len(mel_fb)
+    n_bins = len(mel_fb[0])
+    if len(mel[0]) != n_mels:
+        raise ValueError(
+            f"mel_to_linear: mel 的通道数 {len(mel[0])} != n_mels={n_mels}")
+    fb = [[float(v) for v in row] for row in mel_fb]
+    fb_t = _transpose(fb)
+    gram = _matmul(fb, fb_t)
+    for i in range(n_mels):
+        gram[i][i] += eps
+    out = []
+    for row in mel:
+        if len(row) != n_mels:
+            raise ValueError("mel_to_linear: 各帧长度不一致")
+        x = _tts_solve(gram, [float(v) for v in row])
+        lin = [max(0.0, v) for v in [sum(fb_t[j][i] * x[i]
+                                          for i in range(n_mels))
+                                     for j in range(n_bins)]]
+        out.append(lin)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# FastSpeech 式声学模型（文本 → Mel，时长外部给定）
+# ---------------------------------------------------------------------------
+
+class TextToMel:
+    """字符/词 id + 时长 → Mel 谱（非自回归，FastSpeech 简化版）。"""
+
+    def __init__(self, vocab_size, d_model=16, n_mels=8, kernel_size=3, seed=None):
+        _tts_check_pos_int(vocab_size, "TextToMel: vocab_size")
+        _tts_check_pos_int(d_model, "TextToMel: d_model")
+        _tts_check_pos_int(n_mels, "TextToMel: n_mels")
+        _tts_check_pos_int(kernel_size, "TextToMel: kernel_size")
+        if kernel_size % 2 != 1:
+            raise ValueError(
+                f"TextToMel: kernel_size 必须是奇数（same padding），收到 {kernel_size}")
+        if seed is not None:
+            _tts_check_pos_int(seed, "TextToMel: seed", minimum=0)
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            self.embedding = Embedding(vocab_size, d_model)
+            self.conv1 = Conv1d(d_model, d_model, kernel_size,
+                                padding=kernel_size // 2)
+            self.conv2 = Conv1d(d_model, d_model, kernel_size,
+                                padding=kernel_size // 2)
+            self.out = Layer(d_model, n_mels, "linear")
+        finally:
+            random.setstate(state)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_mels = n_mels
+        self.kernel_size = kernel_size
+        self.grad_out = None
+        self._cache = None
+
+    # ---- 参数与更新 ----
+    def _zero_grads(self):
+        self.embedding.zero_grad()
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        self.grad_out = None
+
+    def zero_grad(self):
+        self._zero_grads()
+
+    def param_count(self):
+        return (self.vocab_size * self.d_model
+                + _conv_param_count(self.conv1)
+                + _conv_param_count(self.conv2)
+                + _dense_param_count(self.out))
+
+    def sgd_step(self, lr):
+        self.embedding.sgd_step(lr)
+        _conv_sgd(self.conv1, lr)
+        _conv_sgd(self.conv2, lr)
+        if self.grad_out is None:
+            return
+        _dense_apply_sgd(self.out, self.grad_out, lr)
+        self.grad_out = None
+
+    # ---- 校验 ----
+    def _check_ids(self, ids):
+        if not isinstance(ids, (list, tuple)) or not ids:
+            raise ValueError("TextToMel: ids 必须是非空列表")
+        out = []
+        for t, idx in enumerate(ids):
+            if isinstance(idx, bool) or not isinstance(idx, int) \
+                    or not 0 <= idx < self.vocab_size:
+                raise ValueError(
+                    f"TextToMel: 第 {t} 个 id {idx!r} 越界"
+                    f"（词表大小 {self.vocab_size}）")
+            out.append(idx)
+        return out
+
+    def _check_durations(self, ids, durations):
+        if not isinstance(durations, (list, tuple)) or len(durations) != len(ids):
+            raise ValueError(
+                f"TextToMel: 时长长度 {len(durations) if isinstance(durations, (list, tuple)) else '?'}"
+                f" 必须等于 id 数 {len(ids)}")
+        out = []
+        for t, d in enumerate(durations):
+            if isinstance(d, bool) or not isinstance(d, int) or d < 1:
+                raise ValueError(
+                    f"TextToMel: 第 {t} 个时长必须是正整数，收到 {d!r}")
+            out.append(d)
+        return out
+
+    @staticmethod
+    def _relu_masks(x):
+        return [[1.0 if v > 0.0 else 0.0 for v in row] for row in x]
+
+    @staticmethod
+    def _relu(x):
+        return [[v if v > 0.0 else 0.0 for v in row] for row in x]
+
+    @staticmethod
+    def _transpose(m):
+        return [list(col) for col in zip(*m)]
+
+    # ---- 前向 ----
+    def forward(self, ids, durations):
+        ids = self._check_ids(ids)
+        durations = self._check_durations(ids, durations)
+        rows = self.embedding.forward(ids)          # (T, d)
+        expanded = []
+        for row, d in zip(rows, durations):
+            for _ in range(d):
+                expanded.append(list(row))
+        frames = self._transpose(expanded)          # (d, T_total)
+        c1 = self.conv1.forward(frames)
+        m1 = self._relu_masks(c1)
+        a1 = self._relu(c1)
+        c2 = self.conv2.forward(a1)
+        m2 = self._relu_masks(c2)
+        a2 = self._relu(c2)
+        rows2 = self._transpose(a2)                 # (T_total, d)
+        mel, out_cache = _dense_rows_forward(self.out, rows2)
+        self._cache = {
+            "ids": ids,
+            "durations": durations,
+            "expanded": expanded,
+            "m1": m1,
+            "m2": m2,
+            "out_cache": out_cache,
+        }
+        return mel
+
+    # ---- 反向 ----
+    def backward(self, dmel):
+        if self._cache is None:
+            raise RuntimeError("TextToMel.backward: 请先调用 forward")
+        cache = self._cache
+        gw, gb, d_rows2 = _dense_rows_backward(
+            self.out, cache["out_cache"], dmel)
+        self.grad_out = (gw, gb)
+        d_a2 = self._transpose(d_rows2)             # (d, T_total)
+        d_c2 = [[d_a2[i][t] * cache["m2"][i][t]
+                 for t in range(len(d_a2[0]))] for i in range(len(d_a2))]
+        d_a1 = self.conv2.backward(d_c2)
+        d_c1 = [[d_a1[i][t] * cache["m1"][i][t]
+                 for t in range(len(d_a1[0]))] for i in range(len(d_a1))]
+        d_frames = self.conv1.backward(d_c1)        # (d, T_total)
+        d_expanded = self._transpose(d_frames)      # (T_total, d)
+        token_grads = []
+        pos = 0
+        for d in cache["durations"]:
+            merged = [0.0] * self.d_model
+            for _ in range(d):
+                row = d_expanded[pos]
+                for j in range(self.d_model):
+                    merged[j] += row[j]
+                pos += 1
+            token_grads.append(merged)
+        self.embedding.backward(token_grads)
+        self._cache = None
+        return None
+
+    # ---- 训练 ----
+    def loss_and_backward(self, ids, durations, target_mel):
+        pred = self.forward(ids, durations)
+        if not isinstance(target_mel, (list, tuple)) or \
+                len(target_mel) != len(pred):
+            raise ValueError(
+                f"TextToMel: target_mel 帧数必须为 {len(pred)}")
+        loss = 0.0
+        numel = 0
+        dmel = []
+        for t, row in enumerate(target_mel):
+            if not isinstance(row, (list, tuple)) or len(row) != self.n_mels:
+                raise ValueError(
+                    f"TextToMel: 第 {t} 帧目标必须长 {self.n_mels}")
+            drow = []
+            for j, v in enumerate(row):
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(v):
+                    raise ValueError(
+                        f"TextToMel: 目标必须是有限数字，收到 {v!r}")
+                diff = pred[t][j] - float(v)
+                loss += diff * diff
+                drow.append(2.0 * diff)
+                numel += 1
+            dmel.append(drow)
+        loss /= numel
+        for t in range(len(dmel)):
+            for j in range(self.n_mels):
+                dmel[t][j] /= numel
+        self.backward(dmel)
+        return loss
+
+    def fit(self, samples, epochs=20, lr=0.01, shuffle=False, seed=None):
+        _tts_check_pos_int(epochs, "TextToMel.fit: epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not lr > 0.0:
+            raise ValueError(f"TextToMel.fit: lr 必须 > 0，收到 {lr!r}")
+        if not isinstance(samples, (list, tuple)) or not samples:
+            raise ValueError("TextToMel.fit: samples 必须是非空列表")
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(samples)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                ids, durations, target = samples[i]
+                self._zero_grads()
+                total += self.loss_and_backward(ids, durations, target)
+                self.sgd_step(lr)
+            history.append({"loss": total / len(samples)})
+        return history
+
+
+def tts_synthesize(model, ids, durations, mel_fb, n_fft=None,
+                   hop_length=None, iterations=60, seed=0):
+    """文本 → Mel → 线性幅度 → 波形 的端到端小管线"""
+    mel = model.forward(ids, durations)
+    linear = mel_to_linear(mel, mel_fb)
+    if n_fft is None:
+        n_fft = 2 * (len(linear[0]) - 1)
+    return griffin_lim(linear, n_fft=n_fft, hop_length=hop_length,
+                       iterations=iterations, seed=seed)
+
 #  领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
 # ========================================================================
 

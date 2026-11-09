@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2072 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2077 项）
 
 ## 特性
 
@@ -2571,6 +2571,36 @@ out = block.forward([[0.1 * t] * 4 for t in range(5)])
   卷积模块只有 depthwise 3×3 + SiLU；它的价值是「结构跑得通、形状与归一化可断言」，
   不是可训练的高性能 Conformer。
 
+### 语音合成（TextToMel + Griffin-Lim）
+
+`TextToMel` 是 FastSpeech 式的非自回归声学模型小实现：字符嵌入 → 两层 `Conv1d` → 线性
+Mel 头；每个 token 的时长由外部给出（不做时长预测），按 `durations` 重复该 token 的特征
+完成长度调节。`griffin_lim` 用迭代相位估计把幅度谱还原成波形，`mel_to_linear` 用最小二乘
+把 Mel 谱近似回线性幅度，`tts_synthesize` 串起「文本 → Mel → 波形」的小管线。
+
+```python
+model = AI.TextToMel(vocab_size=16, d_model=8, n_mels=8, seed=1)
+mel = model.forward([2, 5, 1], [2, 1, 3])          # 6 帧 × 8 Mel
+fb = AI.mel_filterbank(sample_rate=16000, n_fft=32, n_mels=8)
+wav = AI.tts_synthesize(model, [2, 5, 1], [2, 1, 3], fb,
+                        n_fft=32, hop_length=8, iterations=60)
+```
+
+| API | 语义要点 |
+|---|---|
+| `TextToMel(vocab_size, d_model=16, n_mels=8, kernel_size=3, seed=None)` | 嵌入 + 两层 same-padding `Conv1d` + 线性 Mel 头；`forward(ids, durations)` → `(T_total, n_mels)`；`loss_and_backward(ids, durations, target_mel)`（MSE）与 `fit(samples, epochs, lr, seed=None)`；`param_count()`、`sgd_step(lr)` |
+| `griffin_lim(magnitude, n_fft=None, hop_length=None, iterations=60, seed=0)` | 幅度谱 `(T, n_bins)` → 波形：Hann 窗、重叠相加、每轮用重建波形的 STFT 相位替换；`n_fft=2*(n_bins-1)` |
+| `mel_to_linear(mel, mel_fb)` | 逐帧解 `(fb·fbᵀ + εI)x = mel`，再 `fbᵀx` 并截负；返回 `(T, n_bins)` 幅度 |
+| `tts_synthesize(model, ids, durations, mel_fb, n_fft=None, hop_length=None, iterations=60, seed=0)` | 文本 → Mel → 线性幅度 → Griffin-Lim 波形的端到端小管线 |
+
+边界与口径：
+
+- **不做时长预测**：`durations` 由调用方给出（字符级时长），长度调节是确定性的重复。
+- 声学模型只用卷积，不含注意力、音高/能量预测、stop token 或自回归解码；`fit` 拟合给定的
+  目标 Mel，不保证语音可懂度。
+- `griffin_lim` 与 `mel_to_linear` 都是**近似**：前者只保证幅度谱一致性，后者是带非负截断的
+  最小二乘，相位与原始波形不可恢复。
+
 ### 点云
 
 | 接口 | 说明 |
@@ -3803,7 +3833,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2072 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2077 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4011,6 +4041,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
 | `TestProgressiveGenerator` | 生成器默认与 `grow()` 后形状/参数量 818/1083、淡入路径与 alpha=1 权重有限差分、grow 后新阶段权重有限差分、40 步 MSE 重建损失减半、非法输入与未 forward 先 backward |
+| `TestTTS` | `TextToMel` 前向形状与参数 143、时长展开、Conv1d/输出头/嵌入权重有限差分、40 步 fit 损失减半、`griffin_lim` 幅度谱收敛与迭代单调、`mel_to_linear` Mel 域重构误差 <1e-6 与非负、端到端管线波形长度，以及各类非法输入 |
 | `TestStyleGAN` | 生成器前向形状/参数 685/同 z 可复现、conv1/style1/style2/mapping 权重有限差分、不同 z 输出不同与 average_w/truncate、30 步 SGD 使重建损失减半、非法输入与未 forward 先 backward |
 | `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
@@ -4129,7 +4160,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2072 个单元测试
+├── test_ai.py       # 2077 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
