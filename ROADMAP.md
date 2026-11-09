@@ -602,6 +602,7 @@
 - [x] 语音 Conformer（简化）/ Mel 滤波器；3D PointNet（简化）；视频 3D-CNN / Two-Stream；OCR CRNN；检测 YOLO（简化）；深度/姿态估计（概念）
   - 语音前端已完成：`mel_filterbank` / `frame_signal` / `dft_power`（朴素 DFT）/ `log_mel_spectrogram` / `dct_matrix` / `mfcc`；`ConformerBlock` 只做前向，无 GLU / 相对位置 / 手写反向；探针 34 项
   - 语音合成（TTS）已完成：`TextToMel`（FastSpeech 式非自回归：嵌入 + 两层 Conv1d + 线性 Mel 头，时长外部给定做长度调节，手写反向）、`griffin_lim`（幅度谱迭代相位重建）、`mel_to_linear`（最小二乘 Mel→线性幅度）、`tts_synthesize` 端到端小管线；测试 `TestTTS` 5 例
+  - 语音识别解码已完成：`ctc_prefix_beam_search`（Graves 前缀 beam，p_b/p_nb 两套前缀概率；可选 `lm(prefix)` 浅融合与 `length_penalty`）与 `ctc_beam_decode`（logits 包装）；测试 `TestCTCBeamSearch` 5 例
   - 点云已完成：`farthest_point_indices` / `chamfer_distance` / `voxelize_points` / `PointNetEncoder`（逐点 MLP + 最大池化，只做编码，无 T-Net、无分类头）；探针 24 项
   - 视频已完成：`Video3DCNN`（Conv3d/ReLU/MaxPool3d 串成可反传整网 + 全局平均池化 + Layer 分类）、`TwoStreamFusion`（两路特征各投影后拼接分类，**不含光流**）；探针 17 项
   - OCR / YOLO 已完成：`CRNN`（卷积 + 逐列分类，**省略循环层**）、`ctc_greedy_decode`、`yolo_grid_targets` / `yolo_decode` / `nms`；探针 30 项
@@ -833,7 +834,7 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 
-全量测试：1839 → 2077 passed（新增 238 例）。
+全量测试：1839 → 2082 passed（新增 243 例）。
 
 ---
 

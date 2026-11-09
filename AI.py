@@ -43251,6 +43251,151 @@ def ctc_greedy_decode(logits, blank=0):
     return out
 
 
+# -*- coding: utf-8 -*-
+"""ASR 解码：CTC 前缀 beam search（可选字符级 LM 浅融合）。"""
+
+
+def _asr_lse(a, b):
+    """两个 log 概率的 log-sum-exp（允许 -inf）"""
+    if a == float("-inf"):
+        return b
+    if b == float("-inf"):
+        return a
+    m = a if a > b else b
+    return m + math.log(math.exp(a - m) + math.exp(b - m))
+
+
+def _asr_log_softmax(row):
+    m = max(row)
+    shifted = [v - m for v in row]
+    lse = math.log(sum(math.exp(v) for v in shifted))
+    return [v - lse for v in shifted]
+
+
+def _asr_check_log_probs(log_probs, blank, who):
+    if not isinstance(log_probs, (list, tuple)) or not log_probs:
+        raise ValueError(f"{who}: log_probs 必须是非空二维列表")
+    width = None
+    for t, row in enumerate(log_probs):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {t} 步必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 第 {t} 步宽度与首步不一致")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not (math.isfinite(v) or v == float("-inf")):
+                raise ValueError(
+                    f"{who}: log 概率必须是有限数字或 -inf，收到 {v!r}")
+    if isinstance(blank, bool) or not isinstance(blank, int) \
+            or not 0 <= blank < width:
+        raise ValueError(f"{who}: blank 必须是 [0, {width}) 的整数，收到 {blank!r}")
+    return width
+
+
+def ctc_prefix_beam_search(log_probs, blank=0, beam_width=8, lm=None,
+                           lm_weight=0.5, length_penalty=0.0):
+    """CTC 前缀 beam search（Graves 的 p_b / p_nb 合并算法）。
+
+    log_probs: (T, K) 已取 log 的逐帧概率；blank 为空白类别。
+    lm: 可选 `lm(prefix_list) -> log 概率`（越大越好）；lm_weight 为融合权重。
+    length_penalty: 每 token 加分的长度惩罚（>0 偏向长句）。
+    返回 `{"tokens", "score", "ctc_score", "lm_score", "beams"}`，
+    其中 score = ctc_score + lm_weight*lm_score + length_penalty*len(tokens)。
+    """
+    who = "ctc_prefix_beam_search"
+    K = _asr_check_log_probs(log_probs, blank, who)
+    if isinstance(beam_width, bool) or not isinstance(beam_width, int) \
+            or beam_width < 1:
+        raise ValueError(f"{who}: beam_width 必须是 >=1 的整数，收到 {beam_width!r}")
+    if lm is not None and not callable(lm):
+        raise ValueError(f"{who}: lm 必须是可调用对象或 None")
+    for name, v in (("lm_weight", lm_weight), ("length_penalty", length_penalty)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            raise ValueError(f"{who}: {name} 必须是有限数字，收到 {v!r}")
+
+    NEG = float("-inf")
+    beams = {(): (0.0, NEG)}  # prefix -> (p_blank_end, p_nonblank_end)
+    for t, row in enumerate(log_probs):
+        next_beams = {}
+
+        def merge(prefix, p_b, p_nb):
+            cur_b, cur_nb = next_beams.get(prefix, (NEG, NEG))
+            next_beams[prefix] = (_asr_lse(cur_b, p_b),
+                                  _asr_lse(cur_nb, p_nb))
+
+        for prefix, (p_b, p_nb) in beams.items():
+            p_total = _asr_lse(p_b, p_nb)
+            for k in range(K):
+                lp = row[k]
+                if lp == NEG:
+                    continue
+                if k == blank:
+                    merge(prefix, p_total + lp, NEG)
+                    continue
+                last = prefix[-1] if prefix else None
+                if prefix and k == last:
+                    # 同字符重复：从 blank 端可扩展出新前缀，从非 blank 端保持原前缀
+                    merge(prefix, NEG, p_nb + lp)
+                    merge(prefix + (k,), NEG, p_b + lp)
+                else:
+                    merge(prefix + (k,), NEG, p_total + lp)
+        if not next_beams:
+            break
+        ranked = sorted(next_beams.items(),
+                        key=lambda kv: _asr_lse(kv[1][0], kv[1][1]),
+                        reverse=True)
+        beams = dict(ranked[:beam_width])
+
+    if not beams:
+        return {"tokens": [], "score": 0.0, "ctc_score": 0.0,
+                "lm_score": 0.0, "beams": []}
+
+    scored = []
+    for prefix, (p_b, p_nb) in beams.items():
+        ctc = _asr_lse(p_b, p_nb)
+        lm_score = 0.0
+        if lm is not None:
+            lm_score = float(lm(list(prefix)))
+            if not math.isfinite(lm_score):
+                raise ValueError(
+                    f"{who}: lm 返回了非有限值 {lm_score!r}")
+        total = ctc + lm_weight * lm_score + length_penalty * len(prefix)
+        scored.append((total, prefix, ctc, lm_score))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_total, best_prefix, best_ctc, best_lm = scored[0]
+    return {
+        "tokens": list(best_prefix),
+        "score": best_total,
+        "ctc_score": best_ctc,
+        "lm_score": best_lm,
+        "beams": [{"tokens": list(p), "score": s, "ctc_score": c,
+                   "lm_score": l} for s, p, c, l in scored],
+    }
+
+
+def ctc_beam_decode(logits, blank=0, beam_width=8, lm=None,
+                    lm_weight=0.5, length_penalty=0.0):
+    """对未归一化的 logits 做 log_softmax 后跑 CTC 前缀 beam search。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("ctc_beam_decode: logits 必须是非空二维列表")
+    log_probs = []
+    for t, row in enumerate(logits):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"ctc_beam_decode: 第 {t} 步必须是非空列表")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError(
+                    f"ctc_beam_decode: logits 必须是有限数字，收到 {v!r}")
+        log_probs.append(_asr_log_softmax([float(v) for v in row]))
+    return ctc_prefix_beam_search(log_probs, blank=blank,
+                                  beam_width=beam_width, lm=lm,
+                                  lm_weight=lm_weight,
+                                  length_penalty=length_penalty)
+
 def yolo_grid_targets(boxes, labels, grid=4, num_classes=1):
     """把归一化框 `(cx, cy, w, h)` 编码成 YOLO 风格网格目标。
 

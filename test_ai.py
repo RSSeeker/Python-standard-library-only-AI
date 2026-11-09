@@ -32219,3 +32219,134 @@ class TestTTS:
 
         _tts_raises(lambda: AI.mel_to_linear([], fb))
         _tts_raises(lambda: AI.mel_to_linear([[0.0] * 7], fb))
+
+
+# -*- coding: utf-8 -*-
+"""Batch 36 tests: CTC prefix beam search (ASR decoding)."""
+import itertools
+import math
+import random
+
+
+def _asr_raises(fn, exc=ValueError, who="asr"):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"{who}: 期望 {exc.__name__}，但没有抛异常")
+
+
+def _asr_collapse(path, blank):
+    out = []
+    prev = None
+    for k in path:
+        if k != prev and k != blank:
+            out.append(k)
+        prev = k
+    return tuple(out)
+
+
+def _asr_bruteforce(log_probs, blank):
+    T = len(log_probs)
+    K = len(log_probs[0])
+    total = {}
+    for path in itertools.product(range(K), repeat=T):
+        p = sum(log_probs[t][path[t]] for t in range(T))
+        lab = _asr_collapse(path, blank)
+        cur = total.get(lab)
+        if cur is None:
+            total[lab] = p
+        else:
+            m = max(cur, p)
+            total[lab] = m + math.log(math.exp(cur - m) + math.exp(p - m))
+    return max(total.items(), key=lambda kv: kv[1])
+
+
+class TestCTCBeamSearch:
+    def test_bruteforce_equivalence(self):
+        rng = random.Random(7)
+        for _ in range(4):
+            T = rng.randint(1, 4)
+            K = rng.randint(2, 4)
+            blank = rng.randrange(K)
+            logits = [[rng.uniform(-1.5, 1.5) for _ in range(K)]
+                      for _ in range(T)]
+            log_probs = [AI._asr_log_softmax(row) for row in logits]
+            best_lab, best_p = _asr_bruteforce(log_probs, blank)
+            res = AI.ctc_prefix_beam_search(log_probs, blank=blank,
+                                            beam_width=256)
+            assert tuple(res["tokens"]) == best_lab
+            assert abs(res["ctc_score"] - best_p) < 1e-9
+
+        # 贪心是 beam 的下界
+        log_probs = [AI._asr_log_softmax([0.1, 0.9]),
+                     AI._asr_log_softmax([0.9, 0.1]),
+                     AI._asr_log_softmax([0.2, 0.8])]
+        greedy = AI.ctc_greedy_decode(
+            [[math.exp(v) for v in row] for row in log_probs], blank=0)
+        best_p = _asr_bruteforce(log_probs, 0)[1]
+        greedy_p = -math.inf
+        for path in itertools.product(range(2), repeat=3):
+            if _asr_collapse(path, 0) == tuple(greedy):
+                p = sum(log_probs[t][path[t]] for t in range(3))
+                greedy_p = max(greedy_p, p)
+        assert greedy_p <= best_p + 1e-9
+        res = AI.ctc_prefix_beam_search(log_probs, blank=0, beam_width=8)
+        assert res["ctc_score"] >= greedy_p - 1e-9
+
+    def test_blank_and_repeat_collapsing(self):
+        # 连续同字符：CTC 合并成一个
+        lp = [[-0.1, -3.0], [-0.1, -3.0]]
+        assert AI.ctc_prefix_beam_search(lp, blank=1)["tokens"] == [0]
+        # 中间夹 blank：两个相同字符都保留
+        lp = [[-0.1, -3.0], [-3.0, -0.1], [-0.1, -3.0]]
+        assert AI.ctc_prefix_beam_search(lp, blank=1)["tokens"] == [0, 0]
+        # 全 blank：空输出
+        lp = [[-0.01, -5.0], [-0.01, -5.0]]
+        res = AI.ctc_prefix_beam_search(lp, blank=0)
+        assert res["tokens"] == []
+        assert res["score"] == res["ctc_score"]
+
+    def test_lm_fusion_and_length_penalty(self):
+        lp = [AI._asr_log_softmax([0.0, 0.35, 0.30])]
+        plain = AI.ctc_prefix_beam_search(lp, blank=0, beam_width=8)
+        with_lm = AI.ctc_prefix_beam_search(
+            lp, blank=0, beam_width=8,
+            lm=lambda prefix: 5.0 if prefix == [2] else 0.0,
+            lm_weight=1.0)
+        assert plain["tokens"] == [1]
+        assert with_lm["tokens"] == [2]
+        assert abs(with_lm["score"] - (with_lm["ctc_score"] + 5.0)) < 1e-9
+
+        # length_penalty 按 token 数加分（这里只验证公式一致性）
+        penal = AI.ctc_prefix_beam_search(lp, blank=0, beam_width=8,
+                                          length_penalty=2.0)
+        assert abs(penal["score"]
+                   - (penal["ctc_score"] + 2.0 * len(penal["tokens"]))) < 1e-9
+
+    def test_decode_wrapper(self):
+        logits = [[0.2, 1.1, -0.4], [-0.3, 0.4, 0.9]]
+        lp = [AI._asr_log_softmax(row) for row in logits]
+        a = AI.ctc_beam_decode(logits, blank=0, beam_width=8)
+        b = AI.ctc_prefix_beam_search(lp, blank=0, beam_width=8)
+        assert a["tokens"] == b["tokens"]
+        assert abs(a["ctc_score"] - b["ctc_score"]) < 1e-12
+
+        # 峰值分布下 beam 与贪心一致
+        peaked = [[0.0, 5.0, 0.0], [5.0, 0.0, 0.0], [0.0, 5.0, 0.0]]
+        assert AI.ctc_beam_decode(peaked, blank=0)["tokens"] == \
+            AI.ctc_greedy_decode(peaked, blank=0)
+
+    def test_invalid_inputs(self):
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([]))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0, 1.0]], blank=2))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0, 1.0]],
+                                                      beam_width=0))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0, 1.0]], lm=3))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0, 1.0]],
+                                                      lm_weight=float("nan")))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0, 1.0]],
+                                                      length_penalty=float("inf")))
+        _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0], [1.0, 2.0]]))
+        _asr_raises(lambda: AI.ctc_beam_decode([[0.0, float("nan")]]))
+        _asr_raises(lambda: AI.ctc_beam_decode([[0.0, 1.0], [0.0]]))

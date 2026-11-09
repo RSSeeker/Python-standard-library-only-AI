@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2077 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2082 项）
 
 ## 特性
 
@@ -2571,6 +2571,34 @@ out = block.forward([[0.1 * t] * 4 for t in range(5)])
   卷积模块只有 depthwise 3×3 + SiLU；它的价值是「结构跑得通、形状与归一化可断言」，
   不是可训练的高性能 Conformer。
 
+### 语音识别解码（CTC 前缀 beam search）
+
+`ctc_prefix_beam_search` 是 Graves 的 CTC 前缀 beam search：同时维护「以 blank 结尾」与
+「以非 blank 结尾」两套前缀概率，避免贪心路径把「同字符重复」与「中间夹 blank」混为一谈；
+`ctc_beam_decode` 只是先把 logits 做 log_softmax 再调用它。
+
+```python
+res = AI.ctc_beam_decode(logits, blank=0, beam_width=8)
+print(res["tokens"], res["ctc_score"])
+
+# 字符级 LM 浅融合：lm(prefix) 返回 log 概率，越大越好
+res = AI.ctc_beam_decode(logits, blank=0, lm=my_lm, lm_weight=0.5,
+                         length_penalty=0.0)
+```
+
+| API | 语义要点 |
+|---|---|
+| `ctc_prefix_beam_search(log_probs, blank=0, beam_width=8, lm=None, lm_weight=0.5, length_penalty=0.0)` | `log_probs` 为 `(T, K)` log 概率；返回 `{"tokens", "score", "ctc_score", "lm_score", "beams"}`，其中 `score = ctc_score + lm_weight*lm_score + length_penalty*len(tokens)` |
+| `ctc_beam_decode(logits, blank=0, beam_width=8, lm=None, lm_weight=0.5, length_penalty=0.0)` | 先逐帧 log_softmax，再跑前缀 beam search；参数与返回结构同上 |
+
+边界与口径：
+
+- 每步保留的是**前缀**（`beam_width` 个），不是路径；`beam_width` 足够大时与穷举所有路径的
+  CTC 最优标签一致（测试里用小词表穷举对拍）。
+- `lm` 是「前缀 → log 概率」的普通回调，本库不内置 n-gram；`lm_weight` 是非线性浅融合，
+  **不参与 beam 剪枝**（剪枝按 CTC 概率），LM 只能在已保留的候选里重排。
+- 不做词级词典/前缀树约束，也没有 WFST 解码器。
+
 ### 语音合成（TextToMel + Griffin-Lim）
 
 `TextToMel` 是 FastSpeech 式的非自回归声学模型小实现：字符嵌入 → 两层 `Conv1d` → 线性
@@ -3833,7 +3861,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2077 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2082 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4042,6 +4070,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
 | `TestProgressiveGenerator` | 生成器默认与 `grow()` 后形状/参数量 818/1083、淡入路径与 alpha=1 权重有限差分、grow 后新阶段权重有限差分、40 步 MSE 重建损失减半、非法输入与未 forward 先 backward |
 | `TestTTS` | `TextToMel` 前向形状与参数 143、时长展开、Conv1d/输出头/嵌入权重有限差分、40 步 fit 损失减半、`griffin_lim` 幅度谱收敛与迭代单调、`mel_to_linear` Mel 域重构误差 <1e-6 与非负、端到端管线波形长度，以及各类非法输入 |
+| `TestCTCBeamSearch` | 小词表穷举对拍（标签与 CTC log 概率一致）、贪心是 beam 下界、连续同字符合并与夹 blank 保留、全 blank 空输出、LM 浅融合与 length_penalty 公式、`ctc_beam_decode` 与 log_softmax 后直接调前缀搜索一致、非法输入 |
 | `TestStyleGAN` | 生成器前向形状/参数 685/同 z 可复现、conv1/style1/style2/mapping 权重有限差分、不同 z 输出不同与 average_w/truncate、30 步 SGD 使重建损失减半、非法输入与未 forward 先 backward |
 | `TestPix2Pix` | 生成器/判别器形状与参数量、生成器编码/解码层权重有限差分、判别器卷积层有限差分、30 步训练 g_loss 明显下降、非法输入与未 forward 先 backward |
 | `TestTextAudioAugmentation` | 同义词替换的 `p=0`/`p=1` 与未登录 token、插入后长度与同义词来源、交换的多集不变、删除与 `token_dropout` 永不空、EDA 的 `num_aug`/词表闭包/同种子复现/`p_rd=1` 仍非空、`audio_gain` 的 6 dB 与极性、`audio_add_noise` 的实测 SNR（10±0.5 dB）与全零波形、平移/限幅闭式值，以及 11 类非法输入 |
@@ -4160,7 +4189,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2077 个单元测试
+├── test_ai.py       # 2082 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
