@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2181 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2188 项）
 
 ## 特性
 
@@ -2259,6 +2259,30 @@ print(dist, st["deg"], model.predict(xs, edges))
 
 - 边界：`edges` 是无权无向边列表，邻接视为常量；度与最短路径桶按 `max_degree` / `max_path` 截断；注意力用多头拼接后线性投影；输出是图级标量回归（非节点级/边级）；全批量 SGD，无 dropout。
 
+### Titans 神经记忆（TitansMemory / TitansSequenceMemory）
+
+`TitansMemory` 把长期记忆实现为一个小的 `MLP([d_model, hidden, d_model])`：
+读操作直接前向，写操作对 MSE 做一步梯度下降，并用梯度范数（surprise）调节步长、
+做梯度裁剪与一阶动量更新。`TitansSequenceMemory` 在此基础上逐 token「读记忆 → 用下一
+token 写入」，用于序列记忆实验。
+
+```python
+mem = TitansMemory(d_model=3, hidden=8, lr=0.05, seed=1)
+mem.update([[1.0, 0.0, 0.0]], [[2.0, 0.0, 0.0]])   # 写一次
+print(mem.read([1.0, 0.0, 0.0]))                 # 读回预测
+seq = TitansSequenceMemory(d_model=3, hidden=8, lr=0.05, seed=1)
+losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
+```
+
+| API | 说明 |
+| --- | --- |
+| `TitansMemory(d_model, hidden=32, lr=0.01, momentum=0.9, max_grad_norm=1.0)` | 神经记忆的读/写/拟合；`update(keys, values)` 返回 `{loss, surprise, lr}` |
+| `TitansSequenceMemory(d_model, hidden=32, lr=0.05)` | 逐 token 读记忆并用下一 token 更新；`process(sequence, update=True)`、`fit(sequence, epochs)` |
+
+边界：不实现 Titans 的注意力-记忆混合层、遗忘门与分块并行训练；记忆更新只做
+一阶动量的普通梯度下降，test-time 更新不参与外层反向传播；`process(update=False)`
+只读不写。
+
 ### 优势归一化与推理采样工具（GRPO / Best-of-N / Self-Consistency / 拒绝采样）
 
 这些工具补在 PPO 之后不依赖单独的反向逻辑：先按组把奖励变成相对优势，再把逐步损失交给 `ppo_loss`；推理侧提供无梯度、无模型的投票/挑选/过滤工具。
@@ -4169,7 +4193,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2181 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2188 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4378,6 +4402,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGraphormer` | 最短路径与度/路径桶、前向与参数、偏置表/权重有限差分、fit 降 loss、非法输入 |
 | `TestMamba2Block` | 前向/参数、`A_log`/`D`/`dt_bias`/各投影权重有限差分、非法输入 |
 | `TestMamba2Model` | 语言模型前向/损失/参数、fit 降 loss、序列与 vocab 越界等非法输入 |
+| `TestTitansMemory` | 读/参数计数、update 降低 MSE 与计数、fit 降 loss、state 与非法输入 |
+| `TestTitansSequenceMemory` | 逐 token 读写、process(update=False) 不改记忆、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4525,7 +4551,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2181 个单元测试
+├── test_ai.py       # 2188 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

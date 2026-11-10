@@ -34301,3 +34301,103 @@ class TestMamba2Model:
         _p16_raises(lambda: m.fit([]))
         _p16_raises(lambda: m.fit([[0, 1]], epochs=0))
         _p16_raises(lambda: m.sgd_step(-1.0))
+
+
+import math
+
+import AI
+
+
+def _p17_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+_KEYS = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+         [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]]
+_VALS = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0],
+         [0.0, 0.0, 2.0], [2.0, 2.0, 0.0]]
+
+
+class TestTitansMemory:
+    def test_read_and_param_count(self):
+        m = AI.TitansMemory(3, hidden=8, lr=0.05, seed=1)
+        assert m.param_count() == 59
+        out = m.read([1.0, 0.0, 0.0])
+        assert len(out) == 3 and all(math.isfinite(v) for v in out)
+        batch = m.read_batch(_KEYS)
+        assert len(batch) == 4 and all(len(r) == 3 for r in batch)
+        mse = m.mse(_KEYS, _VALS)
+        assert isinstance(mse, float) and mse > 0.0
+
+    def test_update_reduces_error(self):
+        m = AI.TitansMemory(3, hidden=8, lr=0.05, seed=1)
+        before = m.mse(_KEYS, _VALS)
+        info = m.update(_KEYS, _VALS)
+        assert set(info) == {"loss", "surprise", "lr"}
+        assert info["surprise"] > 0.0 and info["lr"] > 0.0
+        after = m.mse(_KEYS, _VALS)
+        assert after < before
+        for _ in range(20):
+            m.update(_KEYS, _VALS)
+        assert m.mse(_KEYS, _VALS) < 0.5 * before
+        assert m.updates == 21
+
+    def test_fit_reduces_loss(self):
+        m = AI.TitansMemory(3, hidden=8, lr=0.05, seed=1)
+        hist = m.fit(_KEYS, _VALS, epochs=50, seed=2)
+        assert len(hist) == 50
+        assert hist[-1] < hist[0]
+        assert hist[-1] < 0.05 * hist[0]
+
+    def test_state_and_invalid_inputs(self):
+        m = AI.TitansMemory(3, hidden=8, lr=0.05, seed=1)
+        m.update(_KEYS[:1], _VALS[:1])
+        st = m.state()
+        assert st["updates"] == 1
+        assert len(st["vel_w"]) == 2 and len(st["vel_b"]) == 2
+        _p17_raises(lambda: AI.TitansMemory(0))
+        _p17_raises(lambda: AI.TitansMemory(3, hidden=0))
+        _p17_raises(lambda: AI.TitansMemory(3, lr=-0.1))
+        _p17_raises(lambda: AI.TitansMemory(3, momentum=1.0))
+        _p17_raises(lambda: AI.TitansMemory(3, max_grad_norm=-1.0))
+        _p17_raises(lambda: m.read([0.1, 0.2]))
+        _p17_raises(lambda: m.read([0.1, 0.2, float("nan")]))
+        _p17_raises(lambda: m.read_batch([]))
+        _p17_raises(lambda: m.mse([], []))
+        _p17_raises(lambda: m.update([], []))
+        _p17_raises(lambda: m.update(_KEYS, _VALS[:2]))
+        _p17_raises(lambda: m.update(_KEYS, _VALS, lr=-1.0))
+        _p17_raises(lambda: m.fit(_KEYS, _VALS, epochs=0))
+        _p17_raises(lambda: m.fit([], []))
+
+
+class TestTitansSequenceMemory:
+    def test_process_and_fit(self):
+        seq = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+               [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
+        sm = AI.TitansSequenceMemory(3, hidden=8, lr=0.05, seed=1)
+        assert sm.param_count() == 59
+        preds = sm.process(seq)
+        assert len(preds) == 4 and all(len(r) == 3 for r in preds)
+        hist = sm.fit(seq, epochs=10, seed=2)
+        assert len(hist) == 10
+        assert hist[-1] < hist[0]
+
+    def test_update_false_keeps_memory(self):
+        seq = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        sm = AI.TitansSequenceMemory(3, hidden=8, lr=0.05, seed=1)
+        before = sm.memory.mse([seq[0]], [seq[1]])
+        sm.process(seq, update=False)
+        assert sm.memory.mse([seq[0]], [seq[1]]) == before
+        assert sm.memory.updates == 0
+
+    def test_invalid_inputs(self):
+        sm = AI.TitansSequenceMemory(3, hidden=8, lr=0.05, seed=1)
+        _p17_raises(lambda: sm.process([]))
+        _p17_raises(lambda: sm.process([[0.1, 0.2]]))
+        _p17_raises(lambda: sm.fit([]))
+        _p17_raises(lambda: sm.fit([[1.0, 0.0, 0.0]], epochs=0))

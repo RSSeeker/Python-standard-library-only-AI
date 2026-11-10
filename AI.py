@@ -3044,6 +3044,229 @@ class Graphormer:
                 + sum(layer.param_count() for layer in self.layers)
                 + 2 * self.d_model + self.d_model + 1)
 
+class TitansMemory:
+    """Titans 的长期神经记忆（简化版 test-time 记忆模块）。
+
+    记忆是一个小 MLP ``M: R^d -> R^d``。读操作 ``read(key) = M(key)``；
+    写操作对 MSE 做一步梯度下降，用梯度范数（"surprise"）调节步长：
+    ``lr_eff = lr * clamp(surprise, 0.1, 10)``。带一阶动量，可选梯度裁剪。
+
+    边界：不实现 Titans 的注意力-记忆混合层、遗忘门与分块并行训练；
+    记忆更新是普通 SGD（不是论文的动量+权重衰减组合），也没有对
+    更新过程做高阶求导（test-time 学习本身不参与外层的反向传播）。
+    """
+
+    def __init__(self, d_model, hidden=32, lr=0.01, momentum=0.9,
+                 max_grad_norm=1.0, seed=None):
+        for name, val in (("d_model", d_model), ("hidden", hidden)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"TitansMemory: {name} 必须是正整数，收到 {val!r}")
+        for name, val in (("lr", lr), ("momentum", momentum),
+                          ("max_grad_norm", max_grad_norm)):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                    or not math.isfinite(val) or val < 0:
+                raise ValueError(
+                    f"TitansMemory: {name} 必须是非负有限数字，收到 {val!r}")
+        if momentum >= 1.0:
+            raise ValueError("TitansMemory: momentum 必须小于 1")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("TitansMemory: seed 必须是整数或 None")
+        self.d_model = d_model
+        self.hidden = hidden
+        self.lr = float(lr)
+        self.momentum = float(momentum)
+        self.max_grad_norm = float(max_grad_norm)
+        self.memory = MLP([d_model, hidden, d_model], ["relu", "linear"])
+        if seed is not None:
+            rng = random.Random(seed)
+            for layer in self.memory.layers:
+                for row in layer.weights:
+                    for j in range(len(row)):
+                        row[j] = rng.gauss(0.0, math.sqrt(2.0 / layer.fan_in))
+                for j in range(layer.fan_out):
+                    layer.biases[j] = 0.0
+        self._vel_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                       for layer in self.memory.layers]
+        self._vel_b = [[0.0] * layer.fan_out for layer in self.memory.layers]
+        self.updates = 0
+
+    # ---------- 基础 ----------
+    def _check_vec(self, v, who):
+        if not isinstance(v, (list, tuple)) or len(v) != self.d_model:
+            raise ValueError(f"{who}: 必须是长度 {self.d_model} 的列表")
+        out = []
+        for x in v:
+            if isinstance(x, bool) or not isinstance(x, (int, float)) \
+                    or not math.isfinite(x):
+                raise ValueError(f"{who}: 必须只包含有限数字")
+            out.append(float(x))
+        return out
+
+    def _check_pairs(self, keys, values, who):
+        if not isinstance(keys, (list, tuple)) or not isinstance(values, (list, tuple)):
+            raise ValueError(f"{who}: keys 与 values 必须是列表")
+        if len(keys) != len(values) or not keys:
+            raise ValueError(f"{who}: keys 与 values 必须非空且等长")
+        return ([self._check_vec(k, who) for k in keys],
+                [self._check_vec(v, who) for v in values])
+
+    def read(self, key):
+        key = self._check_vec(key, "TitansMemory.read")
+        return self.memory.forward(key)
+
+    def read_batch(self, keys):
+        if not isinstance(keys, (list, tuple)) or not keys:
+            raise ValueError("TitansMemory.read_batch: keys 必须非空")
+        return [self.read(k) for k in keys]
+
+    def mse(self, keys, values):
+        ks, vs = self._check_pairs(keys, values, "TitansMemory.mse")
+        total = 0.0
+        for k, v in zip(ks, vs):
+            pred = self.memory.forward(k)
+            for i in range(self.d_model):
+                d = pred[i] - v[i]
+                total += d * d
+        return total / (len(ks) * self.d_model)
+
+    # ---------- 记忆写入 ----------
+    def _pair_grads(self, key, value):
+        pred = self.memory.forward(key)
+        err = [pred[i] - value[i] for i in range(self.d_model)]
+        loss = sum(e * e for e in err) / self.d_model
+        # dL/dpred = 2*err/d_model
+        grads = _mlp_backward(self.memory, [2.0 * e / self.d_model for e in err])
+        return loss, grads
+
+    def update(self, keys, values, lr=None):
+        """对给定键值对做一步带动量/自适应步长的梯度下降，返回指标。"""
+        ks, vs = self._check_pairs(keys, values, "TitansMemory.update")
+        if lr is None:
+            base_lr = self.lr
+        else:
+            if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                    or not math.isfinite(lr) or lr < 0:
+                raise ValueError("TitansMemory.update: lr 必须是非负有限数字")
+            base_lr = float(lr)
+        total_loss = 0.0
+        surprise = 0.0
+        for k, v in zip(ks, vs):
+            loss, grads = self._pair_grads(k, v)
+            total_loss += loss
+            sq = 0.0
+            for gw, gb in grads:
+                for row in gw:
+                    for g in row:
+                        sq += g * g
+                for g in gb:
+                    sq += g * g
+            surprise += math.sqrt(sq / max(1, len(ks)))
+        surprise /= len(ks)
+        if self.max_grad_norm > 0.0 and surprise > 0.0:
+            clip = min(1.0, self.max_grad_norm / surprise)
+        else:
+            clip = 1.0
+        lr_eff = base_lr * max(0.1, min(10.0, surprise)) if surprise > 0.0 else base_lr
+        # 累积所有样本的梯度后统一更新（等价于 batch 平均）
+        acc = None
+        for k, v in zip(ks, vs):
+            _, grads = self._pair_grads(k, v)
+            if acc is None:
+                acc = [([row[:] for row in gw], gb[:]) for gw, gb in grads]
+            else:
+                for (aw, ab), (gw, gb) in zip(acc, grads):
+                    for i in range(len(gw)):
+                        for j in range(len(gw[i])):
+                            aw[i][j] += gw[i][j]
+                    for i in range(len(gb)):
+                        ab[i] += gb[i]
+        for li, (layer, (gw, gb)) in enumerate(zip(self.memory.layers, acc)):
+            inv = 1.0 / len(ks)
+            for i in range(layer.fan_out):
+                for j in range(layer.fan_in):
+                    g = gw[i][j] * inv * clip
+                    self._vel_w[li][i][j] = (self.momentum * self._vel_w[li][i][j]
+                                             + g)
+                    layer.weights[i][j] -= lr_eff * self._vel_w[li][i][j]
+                gbias = gb[i] * inv * clip
+                self._vel_b[li][i] = self.momentum * self._vel_b[li][i] + gbias
+                layer.biases[i] -= lr_eff * self._vel_b[li][i]
+        self.updates += 1
+        return {"loss": total_loss / len(ks), "surprise": surprise,
+                "lr": lr_eff}
+
+    def fit(self, keys, values, epochs=10, lr=None, shuffle=True, seed=None,
+            verbose=False):
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError("TitansMemory.fit: epochs 必须是正整数")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("TitansMemory.fit: seed 必须是整数或 None")
+        if not isinstance(keys, (list, tuple)) or not keys:
+            raise ValueError("TitansMemory.fit: keys 必须非空")
+        rng = random.Random(seed)
+        idx = list(range(len(keys)))
+        losses = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(idx)
+            total = 0.0
+            for i in idx:
+                info = self.update([keys[i]], [values[i]], lr=lr)
+                total += info["loss"]
+            losses.append(total / len(idx))
+        return losses
+
+    def param_count(self) -> int:
+        return self.memory.param_count()
+
+    def state(self):
+        return {"updates": self.updates,
+                "vel_w": [[row[:] for row in mat] for mat in self._vel_w],
+                "vel_b": [row[:] for row in self._vel_b]}
+
+
+class TitansSequenceMemory:
+    """用 TitansMemory 做「边读边写」的序列记忆：每个 token 读记忆、再用它更新记忆。"""
+
+    def __init__(self, d_model, hidden=32, lr=0.05, momentum=0.9, seed=None):
+        self.memory = TitansMemory(d_model, hidden, lr=lr, momentum=momentum,
+                                   seed=seed)
+        self.d_model = d_model
+
+    def process(self, sequence, update=True, lr=None):
+        if not isinstance(sequence, (list, tuple)) or not sequence:
+            raise ValueError("TitansSequenceMemory.process: sequence 必须非空")
+        preds = []
+        for t, row in enumerate(sequence):
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(
+                    f"TitansSequenceMemory.process: 第 {t} 行长度应为 {self.d_model}")
+            preds.append(self.memory.read(list(row)))
+            if update and t + 1 < len(sequence):
+                nxt = sequence[t + 1]
+                self.memory.update([row], [nxt], lr=lr)
+        return preds
+
+    def fit(self, sequence, epochs=10, lr=None, seed=None):
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError("TitansSequenceMemory.fit: epochs 必须是正整数")
+        losses = []
+        for _ in range(epochs):
+            preds = self.process(sequence, lr=lr)
+            n = max(1, len(sequence) - 1)
+            total = 0.0
+            for t in range(n):
+                for i in range(self.d_model):
+                    d = preds[t][i] - sequence[t + 1][i]
+                    total += d * d
+            losses.append(total / (n * self.d_model))
+        return losses
+
+    def param_count(self) -> int:
+        return self.memory.param_count()
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
