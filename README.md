@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2170 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2175 项）
 
 ## 特性
 
@@ -2236,6 +2236,29 @@ model.fit(graphs, epochs=50, lr=0.05)   # graphs: [(h, x, target), ...]
 
 四条边界：全连接图（每对节点都连边），复杂度 O(N²·d)；坐标严格等变、节点特征严格不变，但只支持 3 维坐标；单头、无边门控/注意力，`phi_x` 只输出一个标量系数；读出是均值池化 + MLP，只做图级标量回归，不做节点级预测。
 
+### 图 Transformer（Graphormer）
+
+```python
+from AI import Graphormer, graph_shortest_paths, graphormer_structure
+
+edges = [(0, 1), (1, 2), (2, 3)]
+dist = graph_shortest_paths(4, edges)
+st = graphormer_structure(4, edges, max_degree=8, max_path=4)
+
+model = Graphormer(in_features=2, d_model=16, num_heads=2, d_ff=32,
+                   num_layers=1, max_degree=8, max_path=4, seed=0)
+print(dist, st["deg"], model.predict(xs, edges))
+```
+
+| API | 说明 |
+| --- | --- |
+| `graph_shortest_paths(num_nodes, edges)` | BFS 全源最短路径，返回 `dist[i][j]`；不可达为 -1 |
+| `graphormer_structure(num_nodes, edges, max_degree=8, max_path=4)` | 返回 `{'deg': 度桶, 'sp': 最短路径桶（0 同点、1..max_path、max_path+1 不可达）, 'dist'}` |
+| `GraphormerLayer(d_model, num_heads, d_ff, max_degree=8, max_path=4, eps=1e-5, seed=None)` | pre-LN 残差：注意力分数 `q·k/√d + sp_bias[h][sp] + deg_bias[h][deg_i][deg_j]`，两张偏置表可学习；手写注意力/FFN/LN 反向，`zero_grad`/`sgd_step`/`param_count` |
+| `Graphormer(in_features, d_model=16, num_heads=2, d_ff=32, num_layers=1, max_degree=8, max_path=4, seed=None)` | `W_in` + 可学习度嵌入 → N 层 → LN → 均值池化 → 单输出线性头；`forward` / `loss_and_backward`（MSE）/ `fit(graphs, epochs, lr)` / `predict` / `param_count`，`graphs=[{'xs','edges','y'}]` |
+
+- 边界：`edges` 是无权无向边列表，邻接视为常量；度与最短路径桶按 `max_degree` / `max_path` 截断；注意力用多头拼接后线性投影；输出是图级标量回归（非节点级/边级）；全批量 SGD，无 dropout。
+
 ### 优势归一化与推理采样工具（GRPO / Best-of-N / Self-Consistency / 拒绝采样）
 
 这些工具补在 PPO 之后不依赖单独的反向逻辑：先按组把奖励变成相对优势，再把逐步损失交给 `ppo_loss`；推理侧提供无梯度、无模型的投票/挑选/过滤工具。
@@ -4127,7 +4150,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2170 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2175 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4333,6 +4356,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDraftTree` | 共享前缀 trie 的 parents/tokens/leaves/paths、单序列与重复序列、非法序列 |
 | `TestTreeAttention` | 祖先可见性偏置与布尔掩码一致、链式树、非法 parents/neg_inf |
 | `TestSAE` | 前向/参数、四项梯度有限差分、fit 降 loss 与 L1 分解、特征稀疏统计、非法输入 |
+| `TestGraphormer` | 最短路径与度/路径桶、前向与参数、偏置表/权重有限差分、fit 降 loss、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4480,7 +4504,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2170 个单元测试
+├── test_ai.py       # 2175 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

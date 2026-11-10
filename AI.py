@@ -2507,6 +2507,543 @@ class SAE:
                 'dead_features': sum(1 for c in counts if c == 0),
                 'mean_active': sum(counts) / (n * self.d_hidden)}
 
+def _gm_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError('Graphormer: %s 必须是正整数，收到 %r' % (name, value))
+    return value
+
+
+def _gm_check_num(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value):
+        raise ValueError('Graphormer: %s 必须是有限数字' % name)
+    return float(value)
+
+
+def _gm_check_nodes(xs):
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError('Graphormer: 节点特征必须是非空列表')
+    out = []
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError('Graphormer: 每个节点特征必须是非空列表')
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError('Graphormer: 节点特征必须只包含有限数字')
+            vals.append(float(v))
+        out.append(vals)
+    width = len(out[0])
+    if any(len(row) != width for row in out):
+        raise ValueError('Graphormer: 所有节点特征维度必须一致')
+    return out
+
+
+def _gm_check_edges(edges, num_nodes):
+    if not isinstance(edges, (list, tuple)):
+        raise ValueError('Graphormer: edges 必须是 (i, j) 列表')
+    out = []
+    for edge in edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+            raise ValueError('Graphormer: 每条边必须是 (i, j) 二元组')
+        i, j = edge
+        for v in (i, j):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValueError('Graphormer: 边端点必须是整数')
+            if not (0 <= v < num_nodes):
+                raise ValueError('Graphormer: 边端点超出节点数范围')
+        if i == j:
+            raise ValueError('Graphormer: 不允许自环边')
+        out.append((int(i), int(j)))
+    return out
+
+
+def graph_shortest_paths(num_nodes, edges):
+    """无向无权图的最短路径长度矩阵：`dist[i][j]`，不可达为 -1。"""
+    _gm_check_pos_int(num_nodes, 'num_nodes')
+    es = _gm_check_edges(edges, num_nodes)
+    adj = [[] for _ in range(num_nodes)]
+    for i, j in es:
+        adj[i].append(j)
+        adj[j].append(i)
+    dist = [[-1] * num_nodes for _ in range(num_nodes)]
+    for src in range(num_nodes):
+        dist[src][src] = 0
+        queue = [src]
+        head = 0
+        while head < len(queue):
+            u = queue[head]
+            head += 1
+            for v in adj[u]:
+                if dist[src][v] < 0:
+                    dist[src][v] = dist[src][u] + 1
+                    queue.append(v)
+    return dist
+
+
+def graphormer_structure(num_nodes, edges, max_degree=8, max_path=4):
+    """Graphormer 的结构编码：
+
+    - `deg`：每个节点度数的截断桶号（0..max_degree）
+    - `sp`：节点对最短路径桶号（0 表示同一节点，1..max_path 表示距离，
+      max_path+1 表示不可达）
+    """
+    _gm_check_pos_int(max_degree, 'max_degree')
+    _gm_check_pos_int(max_path, 'max_path')
+    dist = graph_shortest_paths(num_nodes, edges)
+    deg = [0] * num_nodes
+    for i in range(num_nodes):
+        deg[i] = sum(1 for j in range(num_nodes) if dist[i][j] == 1)
+    deg_bucket = [min(d, max_degree) for d in deg]
+    sp = [[0] * num_nodes for _ in range(num_nodes)]
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            d = dist[i][j]
+            if i == j:
+                sp[i][j] = 0
+            elif d < 0:
+                sp[i][j] = max_path + 1
+            else:
+                sp[i][j] = min(d, max_path)
+    return {'deg': deg_bucket, 'sp': sp, 'dist': dist}
+
+
+class GraphormerLayer:
+    """Graphormer 单层：结构偏置自注意力 + FFN（均为 pre-LN 残差）。
+
+    注意力分数 = `q·k/sqrt(d)` + `sp_bias[h][sp_bucket(i,j)]` +
+    `deg_bias[h][deg_i][deg_j]`；两个偏置表都是可学习标量。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff, max_degree=8, max_path=4,
+                 eps=1e-5, seed=None):
+        _gm_check_pos_int(d_model, 'd_model')
+        _gm_check_pos_int(num_heads, 'num_heads')
+        _gm_check_pos_int(d_ff, 'd_ff')
+        if d_model % num_heads != 0:
+            raise ValueError('GraphormerLayer: d_model 必须被 num_heads 整除')
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        self.max_degree = max_degree
+        self.max_path = max_path
+        rng = random.Random(seed)
+        scale = 1.0 / math.sqrt(d_model)
+        self.ln1 = LayerNorm(d_model, eps=eps)
+        self.Wq = Layer(d_model, d_model, 'linear')
+        self.Wk = Layer(d_model, d_model, 'linear')
+        self.Wv = Layer(d_model, d_model, 'linear')
+        self.Wo = Layer(d_model, d_model, 'linear')
+        self.sp_bias = [[0.0] * (max_path + 2) for _ in range(num_heads)]
+        self.deg_bias = [[[0.0] * (max_degree + 1) for _ in range(max_degree + 1)]
+                         for _ in range(num_heads)]
+        # 小随机初始化，避免一开始所有分数完全相同
+        for h in range(num_heads):
+            for k in range(max_path + 2):
+                self.sp_bias[h][k] = rng.gauss(0.0, 0.02)
+            for a in range(max_degree + 1):
+                for b in range(max_degree + 1):
+                    self.deg_bias[h][a][b] = rng.gauss(0.0, 0.02)
+        self.ln2 = LayerNorm(d_model, eps=eps)
+        self.W1 = Layer(d_model, d_ff, 'relu')
+        self.W2 = Layer(d_ff, d_model, 'linear')
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_Wq = [[0.0] * self.d_model for _ in range(self.d_model)]
+        self.grad_bq = [0.0] * self.d_model
+        self.grad_Wk = [[0.0] * self.d_model for _ in range(self.d_model)]
+        self.grad_bk = [0.0] * self.d_model
+        self.grad_Wv = [[0.0] * self.d_model for _ in range(self.d_model)]
+        self.grad_bv = [0.0] * self.d_model
+        self.grad_Wo = [[0.0] * self.d_model for _ in range(self.d_model)]
+        self.grad_bo = [0.0] * self.d_model
+        self.grad_sp = [[0.0] * (self.max_path + 2) for _ in range(self.num_heads)]
+        self.grad_deg = [[[0.0] * (self.max_degree + 1)
+                          for _ in range(self.max_degree + 1)]
+                         for _ in range(self.num_heads)]
+        self.grad_ln1g = [0.0] * self.d_model
+        self.grad_ln1b = [0.0] * self.d_model
+        self.grad_ln2g = [0.0] * self.d_model
+        self.grad_ln2b = [0.0] * self.d_model
+        self.grad_W1 = [[0.0] * self.d_model for _ in range(self.W1.fan_out)]
+        self.grad_b1 = [0.0] * self.W1.fan_out
+        self.grad_W2 = [[0.0] * self.W2.fan_in for _ in range(self.W2.fan_out)]
+        self.grad_b2 = [0.0] * self.W2.fan_out
+
+    # ---------- 前向 ----------
+    def forward(self, rows, deg, sp):
+        n = len(rows)
+        d = self.d_model
+        h, c_ln1 = _norm_rows_forward(self.ln1, rows)
+        q, cq = _dense_rows_forward(self.Wq, h)
+        k, ck = _dense_rows_forward(self.Wk, h)
+        v, cv = _dense_rows_forward(self.Wv, h)
+        heads = self.num_heads
+        dh = self.d_head
+        concat = [[0.0] * d for _ in range(n)]
+        attn_rows = []
+        scores_rows = []
+        for head in range(heads):
+            off = head * dh
+            attn = []
+            scores = []
+            for t in range(n):
+                row = [0.0] * n
+                for j in range(n):
+                    dot = 0.0
+                    for c in range(dh):
+                        dot += q[t][off + c] * k[j][off + c]
+                    dot = dot / math.sqrt(dh)
+                    dot += self.sp_bias[head][sp[t][j]]
+                    dot += self.deg_bias[head][deg[t]][deg[j]]
+                    row[j] = dot
+                scores.append(row)
+                m = max(row)
+                ex = [math.exp(x - m) for x in row]
+                s = sum(ex)
+                attn.append([e / s for e in ex])
+            attn_rows.append(attn)
+            scores_rows.append(scores)
+            for t in range(n):
+                out = [0.0] * dh
+                for j in range(n):
+                    a = attn[t][j]
+                    if a == 0.0:
+                        continue
+                    for c in range(dh):
+                        out[c] += a * v[j][off + c]
+                concat[t][off:off + dh] = out
+        mixed, cm = _dense_rows_forward(self.Wo, concat)
+        res1 = [[rows[t][c] + mixed[t][c] for c in range(d)] for t in range(n)]
+        h2, c_ln2 = _norm_rows_forward(self.ln2, res1)
+        mid, c1 = _dense_rows_forward(self.W1, h2)
+        ffn, c2 = _dense_rows_forward(self.W2, mid)
+        out_rows = [[res1[t][c] + ffn[t][c] for c in range(d)] for t in range(n)]
+        self._cache = {
+            'rows': [list(r) for r in rows], 'ln1': c_ln1, 'q': q, 'cq': cq,
+            'k': k, 'ck': ck, 'v': v, 'cv': cv, 'attn': attn_rows,
+            'scores': scores_rows, 'concat': concat, 'cm': cm,
+            'res1': res1, 'ln2': c_ln2, 'mid': mid, 'c1': c1, 'c2': c2,
+            'deg': deg, 'sp': sp,
+        }
+        return out_rows
+
+    # ---------- 反向 ----------
+    def backward(self, dout_rows):
+        if getattr(self, '_cache', None) is None:
+            raise RuntimeError('GraphormerLayer.backward: 必须先调用 forward()')
+        cache = self._cache
+        n = len(cache['rows'])
+        d = self.d_model
+        dh = self.d_head
+        heads = self.num_heads
+        # FFN 分支
+        d_ffn = [list(row) for row in dout_rows]
+        gW2, gb2, d_mid = _dense_rows_backward(self.W2, cache['c2'], d_ffn)
+        for i in range(len(gW2)):
+            for j in range(len(gW2[0])):
+                self.grad_W2[i][j] += gW2[i][j]
+        for i in range(len(gb2)):
+            self.grad_b2[i] += gb2[i]
+        # relu 门
+        d_z = [
+            [d_mid[t][c] if cache['mid'][t][c] > 0.0 else 0.0
+             for c in range(self.W1.fan_out)]
+            for t in range(n)
+        ]
+        gW1, gb1, d_h2 = _dense_rows_backward(self.W1, cache['c1'], d_z)
+        for i in range(len(gW1)):
+            for j in range(len(gW1[0])):
+                self.grad_W1[i][j] += gW1[i][j]
+        for i in range(len(gb1)):
+            self.grad_b1[i] += gb1[i]
+        g_ln2g, g_ln2b, d_res1 = _norm_rows_backward(self.ln2, cache['ln2'], d_h2)
+        for j in range(d):
+            self.grad_ln2g[j] += g_ln2g[j]
+            self.grad_ln2b[j] += g_ln2b[j]
+        # 注意力分支残差
+        d_res1 = [[d_res1[t][c] + dout_rows[t][c] for c in range(d)]
+                  for t in range(n)]
+        # Wo 反向
+        gWo, gbo, d_concat = _dense_rows_backward(self.Wo, cache['cm'], d_res1)
+        for i in range(d):
+            for j in range(d):
+                self.grad_Wo[i][j] += gWo[i][j]
+            self.grad_bo[i] += gbo[i]
+        d_q = [[0.0] * d for _ in range(n)]
+        d_k = [[0.0] * d for _ in range(n)]
+        d_v = [[0.0] * d for _ in range(n)]
+        for head in range(heads):
+            off = head * dh
+            attn = cache['attn'][head]
+            scores = cache['scores'][head]
+            for t in range(n):
+                d_head = d_concat[t][off:off + dh]
+                dot = 0.0
+                for j in range(n):
+                    a = attn[t][j]
+                    if a == 0.0:
+                        continue
+                    for cc in range(dh):
+                        dot += a * d_head[cc] * cache['v'][j][off + cc]
+                for j in range(n):
+                    a = attn[t][j]
+                    if a == 0.0:
+                        continue
+                    ds = a * (sum((d_head[cc] * cache['v'][j][off + cc]
+                                   for cc in range(dh)), 0.0) - dot)
+                    self.grad_sp[head][cache['sp'][t][j]] += ds
+                    self.grad_deg[head][cache['deg'][t]][cache['deg'][j]] += ds
+                    ds_scale = ds / math.sqrt(dh)
+                    for cc in range(dh):
+                        d_q[t][off + cc] += ds_scale * cache['k'][j][off + cc]
+                        d_k[j][off + cc] += ds_scale * cache['q'][t][off + cc]
+                        d_v[j][off + cc] += a * d_head[cc]
+        gWq, gbq, d_norm1_q = _dense_rows_backward(self.Wq, cache['cq'], d_q)
+        gWk, gbk, d_norm1_k = _dense_rows_backward(self.Wk, cache['ck'], d_k)
+        gWv, gbv, d_norm1_v = _dense_rows_backward(self.Wv, cache['cv'], d_v)
+        for i in range(d):
+            for j in range(d):
+                self.grad_Wq[i][j] += gWq[i][j]
+                self.grad_Wk[i][j] += gWk[i][j]
+                self.grad_Wv[i][j] += gWv[i][j]
+            self.grad_bq[i] += gbq[i]
+            self.grad_bk[i] += gbk[i]
+            self.grad_bv[i] += gbv[i]
+        d_h = [[d_norm1_q[t][c] + d_norm1_k[t][c] + d_norm1_v[t][c]
+                for c in range(d)] for t in range(n)]
+        g_ln1g, g_ln1b, d_rows = _norm_rows_backward(self.ln1, cache['ln1'], d_h)
+        for j in range(d):
+            self.grad_ln1g[j] += g_ln1g[j]
+            self.grad_ln1b[j] += g_ln1b[j]
+        return [[d_rows[t][c] + d_res1[t][c] for c in range(d)]
+                for t in range(n)]
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('GraphormerLayer.sgd_step: lr 必须是正有限数字')
+        self.ln1.gamma = [g - lr * gg for g, gg in zip(self.ln1.gamma, self.grad_ln1g)]
+        self.ln1.beta = [b - lr * gb for b, gb in zip(self.ln1.beta, self.grad_ln1b)]
+        self.ln2.gamma = [g - lr * gg for g, gg in zip(self.ln2.gamma, self.grad_ln2g)]
+        self.ln2.beta = [b - lr * gb for b, gb in zip(self.ln2.beta, self.grad_ln2b)]
+        for i in range(self.d_model):
+            for j in range(self.d_model):
+                self.Wq.weights[i][j] -= lr * self.grad_Wq[i][j]
+                self.Wk.weights[i][j] -= lr * self.grad_Wk[i][j]
+                self.Wv.weights[i][j] -= lr * self.grad_Wv[i][j]
+                self.Wo.weights[i][j] -= lr * self.grad_Wo[i][j]
+            self.Wq.biases[i] -= lr * self.grad_bq[i]
+            self.Wk.biases[i] -= lr * self.grad_bk[i]
+            self.Wv.biases[i] -= lr * self.grad_bv[i]
+            self.Wo.biases[i] -= lr * self.grad_bo[i]
+        for i in range(self.W1.fan_out):
+            for j in range(self.d_model):
+                self.W1.weights[i][j] -= lr * self.grad_W1[i][j]
+            self.W1.biases[i] -= lr * self.grad_b1[i]
+        for i in range(self.d_model):
+            for j in range(self.W1.fan_out):
+                self.W2.weights[i][j] -= lr * self.grad_W2[i][j]
+            self.W2.biases[i] -= lr * self.grad_b2[i]
+        for h in range(self.num_heads):
+            for k in range(self.max_path + 2):
+                self.sp_bias[h][k] -= lr * self.grad_sp[h][k]
+            for a in range(self.max_degree + 1):
+                for b in range(self.max_degree + 1):
+                    self.deg_bias[h][a][b] -= lr * self.grad_deg[h][a][b]
+        self.zero_grad()
+
+    def param_count(self):
+        d = self.d_model
+        return (4 * (d * d + d)
+                + (self.W1.fan_out * d + self.W1.fan_out)
+                + (self.W2.fan_out * self.W2.fan_in + self.W2.fan_out)
+                + 4 * d
+                + (self.max_path + 2) * self.num_heads
+                + (self.max_degree + 1) ** 2 * self.num_heads)
+
+
+class Graphormer:
+    """Graphormer 简化实现：节点特征 + 图结构（度/最短路径）→ 图级回归。
+
+    - 输入节点特征 `xs`（n×in_features）与边 `edges`；
+    - 节点嵌入 = `W_in x` + 可学习度嵌入；经过若干 `GraphormerLayer`；
+    - 对节点输出取均值，接线性头得到标量预测；
+    - 损失为 MSE，`fit` 用全批量 SGD。
+    """
+
+    def __init__(self, in_features, d_model=16, num_heads=2, d_ff=32,
+                 num_layers=1, max_degree=8, max_path=4, seed=None):
+        _gm_check_pos_int(in_features, 'in_features')
+        _gm_check_pos_int(d_model, 'd_model')
+        _gm_check_pos_int(num_heads, 'num_heads')
+        _gm_check_pos_int(d_ff, 'd_ff')
+        _gm_check_pos_int(num_layers, 'num_layers')
+        _gm_check_pos_int(max_degree, 'max_degree')
+        _gm_check_pos_int(max_path, 'max_path')
+        if d_model % num_heads != 0:
+            raise ValueError('Graphormer: d_model 必须被 num_heads 整除')
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError('Graphormer: seed 必须是整数或 None')
+        self.in_features = in_features
+        self.d_model = d_model
+        self.max_degree = max_degree
+        self.max_path = max_path
+        rng = random.Random(seed)
+        self.W_in = Layer(in_features, d_model, 'linear')
+        self.degree_emb = [[rng.gauss(0.0, 0.02) for _ in range(d_model)]
+                           for _ in range(max_degree + 1)]
+        self.layers = [GraphormerLayer(d_model, num_heads, d_ff,
+                                       max_degree=max_degree,
+                                       max_path=max_path, seed=seed)
+                       for _ in range(num_layers)]
+        self.ln_out = LayerNorm(d_model)
+        self.head = Layer(d_model, 1, 'linear')
+        self.grad_W_in = [[0.0] * in_features for _ in range(d_model)]
+        self.grad_b_in = [0.0] * d_model
+        self.grad_degree_emb = [[0.0] * d_model for _ in range(max_degree + 1)]
+        self.grad_ln_outg = [0.0] * d_model
+        self.grad_ln_outb = [0.0] * d_model
+        self.grad_head = [[0.0] * d_model for _ in range(1)]
+        self.grad_head_b = [0.0]
+
+    def zero_grad(self):
+        self.grad_W_in = [[0.0] * self.in_features for _ in range(self.d_model)]
+        self.grad_b_in = [0.0] * self.d_model
+        self.grad_degree_emb = [[0.0] * self.d_model
+                                for _ in range(self.max_degree + 1)]
+        self.grad_ln_outg = [0.0] * self.d_model
+        self.grad_ln_outb = [0.0] * self.d_model
+        self.grad_head = [[0.0] * self.d_model]
+        self.grad_head_b = [0.0]
+        for layer in self.layers:
+            layer.zero_grad()
+
+    def _embed(self, xs, edges):
+        nodes = _gm_check_nodes(xs)
+        es = _gm_check_edges(edges, len(nodes))
+        if len(nodes[0]) != self.in_features:
+            raise ValueError('Graphormer: 节点特征维度与 in_features 不一致')
+        struct = graphormer_structure(len(nodes), es,
+                                      max_degree=self.max_degree,
+                                      max_path=self.max_path)
+        h, cache_in = _dense_rows_forward(self.W_in, nodes)
+        for i in range(len(nodes)):
+            bucket = struct['deg'][i]
+            emb = self.degree_emb[bucket]
+            h[i] = [h[i][c] + emb[c] for c in range(self.d_model)]
+        return nodes, struct, h, cache_in
+
+    def forward(self, xs, edges):
+        nodes, struct, h, cache_in = self._embed(xs, edges)
+        for layer in self.layers:
+            h = layer.forward(h, struct['deg'], struct['sp'])
+        h_out, c_ln = _norm_rows_forward(self.ln_out, h)
+        pooled = [sum(h_out[t][c] for t in range(len(h))) / len(h)
+                  for c in range(self.d_model)]
+        logits = [sum(self.head.weights[0][c] * pooled[c]
+                      for c in range(self.d_model)) + self.head.biases[0]]
+        self._cache = {'nodes': nodes, 'struct': struct, 'h': h,
+                       'cache_in': cache_in, 'ln_out': c_ln,
+                       'pooled': pooled, 'h_out': h_out,
+                       'pre_head': [pooled]}
+        return logits
+
+    def loss_and_backward(self, xs, edges, target):
+        target = _gm_check_num(target, 'target')
+        pred = self.forward(xs, edges)[0]
+        diff = pred - target
+        loss = diff * diff
+        d_pred = 2.0 * diff
+        c = self._cache
+        d_pooled = [self.head.weights[0][c2] * d_pred
+                    for c2 in range(self.d_model)]
+        for c2 in range(self.d_model):
+            self.grad_head[0][c2] += c['pooled'][c2] * d_pred
+        self.grad_head_b[0] += d_pred
+        n = len(c['h'])
+        g_lnog = [0.0] * self.d_model
+        g_lnob = [0.0] * self.d_model
+        d_h = []
+        for t in range(n):
+            g, b, drow = _norm_rows_backward(self.ln_out, [c['ln_out'][t]],
+                                             [d_pooled])
+            for c2 in range(self.d_model):
+                g_lnog[c2] += g[c2] / n
+                g_lnob[c2] += b[c2] / n
+            d_h.append([drow[0][c2] / n for c2 in range(self.d_model)])
+        for c2 in range(self.d_model):
+            self.grad_ln_outg[c2] += g_lnog[c2]
+            self.grad_ln_outb[c2] += g_lnob[c2]
+        # 逐层反向（倒序）
+        for layer in reversed(self.layers):
+            d_h = layer.backward(d_h)
+        # 输入嵌入反向：W_in + 度嵌入
+        gW, gb, d_nodes = _dense_rows_backward(self.W_in, c['cache_in'], d_h)
+        for i in range(self.d_model):
+            for j in range(self.in_features):
+                self.grad_W_in[i][j] += gW[i][j]
+            self.grad_b_in[i] += gb[i]
+        for i in range(n):
+            bucket = c['struct']['deg'][i]
+            for c2 in range(self.d_model):
+                self.grad_degree_emb[bucket][c2] += d_h[i][c2]
+        return {'loss': loss, 'pred': pred, 'target': target}
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('Graphormer.sgd_step: lr 必须是正有限数字')
+        for i in range(self.d_model):
+            for j in range(self.in_features):
+                self.W_in.weights[i][j] -= lr * self.grad_W_in[i][j]
+            self.W_in.biases[i] -= lr * self.grad_b_in[i]
+        for b in range(self.max_degree + 1):
+            for c in range(self.d_model):
+                self.degree_emb[b][c] -= lr * self.grad_degree_emb[b][c]
+        for c in range(self.d_model):
+            self.ln_out.gamma[c] -= lr * self.grad_ln_outg[c]
+            self.ln_out.beta[c] -= lr * self.grad_ln_outb[c]
+            self.head.weights[0][c] -= lr * self.grad_head[0][c]
+        self.head.biases[0] -= lr * self.grad_head_b[0]
+        for layer in self.layers:
+            layer.sgd_step(lr)
+        self.zero_grad()
+
+    def fit(self, graphs, epochs=100, lr=0.01, seed=None):
+        if not isinstance(graphs, (list, tuple)) or not graphs:
+            raise ValueError('Graphormer.fit: graphs 必须是非空列表')
+        _gm_check_pos_int(epochs, 'epochs')
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('Graphormer.fit: lr 必须是正有限数字')
+        rng = random.Random(seed)
+        hist = []
+        for _ in range(epochs):
+            order = list(range(len(graphs)))
+            rng.shuffle(order)
+            self.zero_grad()
+            total = 0.0
+            for idx in order:
+                g = graphs[idx]
+                info = self.loss_and_backward(g['xs'], g['edges'], g['y'])
+                total += info['loss']
+            self.sgd_step(lr)
+            hist.append(total / len(graphs))
+        return hist
+
+    def predict(self, xs, edges):
+        return self.forward(xs, edges)[0]
+
+    def param_count(self):
+        return (self.W_in.fan_in * self.W_in.fan_out + self.W_in.fan_out
+                + (self.max_degree + 1) * self.d_model
+                + sum(layer.param_count() for layer in self.layers)
+                + 2 * self.d_model + self.d_model + 1)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

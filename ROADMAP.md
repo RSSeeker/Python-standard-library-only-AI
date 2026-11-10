@@ -849,8 +849,9 @@
 - [x] 推理服务工具：`PrefixCacheStore`（跨请求前缀缓存 + LRU）、`make_needle_haystack`（长上下文探针）、`llm_judge_prompt`/`parse_judge_verdict`/`judge_agreement`（LLM-as-judge 模板与一致率）；`TestPrefixCacheStore`/`TestNeedleHaystack`/`TestLLMJudge` 共 5 例。
 - [x] 树状注意力（投机解码多分支验证）：`build_draft_tree`（前缀共享 trie）、`tree_attention_bias`/`tree_attention_mask`（仅祖先可见）；`TestDraftTree` 3 例、`TestTreeAttention` 3 例。
 - [x] 稀疏自编码器（SAE）：`SAE`（`f=relu(W_enc x+b_enc)`、`x_hat=W_dec f+b_dec`，重建 MSE + `l1_coeff*mean(|f|)` 稀疏损失，全批量 SGD，`feature_stats` 统计 dead feature）；`TestSAE` 5 例。
+- [x] 图 Transformer（Graphormer）：`graph_shortest_paths`（BFS 全源最短路）、`graphormer_structure`（度桶与最短路径桶）、`GraphormerLayer`（`sp_bias` + `deg_bias` 注意力偏置）、`Graphormer`（可学习度嵌入 + 均值池化图级回归）；`TestGraphormer` 5 例。
 
-全量测试：1839 → 2170 passed（新增 331 例）。
+全量测试：1839 → 2175 passed（新增 336 例）。
 
 ---
 

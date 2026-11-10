@@ -34079,3 +34079,113 @@ class TestSAE:
         _p14_raises(lambda: m.fit(_p14_samples(), lr=0.0))
         _p14_raises(lambda: m.sgd_step(0.0))
         _p14_raises(lambda: m.feature_stats([]))
+
+
+import math
+
+import AI
+
+
+def _p15_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+_XS4 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]]
+_EDGES4 = [(0, 1), (1, 2), (2, 3)]
+
+
+class TestGraphormer:
+    def test_shortest_paths_and_structure(self):
+        dist = AI.graph_shortest_paths(4, _EDGES4)
+        assert dist == [[0, 1, 2, 3], [1, 0, 1, 2],
+                        [2, 1, 0, 1], [3, 2, 1, 0]]
+        st = AI.graphormer_structure(4, _EDGES4, max_degree=3, max_path=2)
+        assert st["deg"] == [1, 2, 2, 1]
+        assert st["sp"][0] == [0, 1, 2, 2]
+        assert st["sp"][3] == [2, 2, 1, 0]
+        st2 = AI.graphormer_structure(3, [(0, 1)], max_degree=2, max_path=2)
+        assert st2["deg"] == [1, 1, 0]
+        assert st2["sp"][0][2] == 3
+
+    def test_forward_and_param_count(self):
+        m = AI.Graphormer(2, d_model=4, num_heads=2, d_ff=8, num_layers=1,
+                          max_degree=3, max_path=2, seed=1)
+        assert m.param_count() == 253
+        pred = m.forward(_XS4, _EDGES4)
+        assert len(pred) == 1
+        assert isinstance(pred[0], float) and math.isfinite(pred[0])
+        assert m.predict(_XS4, _EDGES4) == pred[0]
+
+    def test_numerical_gradients(self):
+        m = AI.Graphormer(2, d_model=4, num_heads=2, d_ff=8, num_layers=1,
+                          max_degree=3, max_path=2, seed=1)
+        h = 1e-6
+
+        def loss():
+            m.zero_grad()
+            return m.loss_and_backward(_XS4, _EDGES4, 2.0)["loss"]
+
+        def check(tag, getter, setter, getgrad):
+            m.zero_grad()
+            m.loss_and_backward(_XS4, _EDGES4, 2.0)
+            ana = getgrad()
+            old = getter()
+            setter(old + h)
+            lp = loss()
+            setter(old - h)
+            lm = loss()
+            setter(old)
+            num = (lp - lm) / (2.0 * h)
+            assert abs(ana - num) < 1e-5, (tag, ana, num)
+
+        check("W_in", lambda: m.W_in.weights[0][0],
+              lambda v: m.W_in.weights[0].__setitem__(0, v),
+              lambda: m.grad_W_in[0][0])
+        check("Wq", lambda: m.layers[0].Wq.weights[0][0],
+              lambda v: m.layers[0].Wq.weights[0].__setitem__(0, v),
+              lambda: m.layers[0].grad_Wq[0][0])
+        check("sp_bias", lambda: m.layers[0].sp_bias[0][2],
+              lambda v: m.layers[0].sp_bias[0].__setitem__(2, v),
+              lambda: m.layers[0].grad_sp[0][2])
+        check("deg_bias", lambda: m.layers[0].deg_bias[0][1][2],
+              lambda v: m.layers[0].deg_bias[0][1].__setitem__(2, v),
+              lambda: m.layers[0].grad_deg[0][1][2])
+
+    def test_fit_reduces_loss(self):
+        m = AI.Graphormer(2, d_model=4, num_heads=2, d_ff=8, num_layers=1,
+                          max_degree=3, max_path=2, seed=1)
+        graphs = [
+            {"xs": _XS4, "edges": _EDGES4, "y": 1.0},
+            {"xs": [[0.2, 0.1], [0.3, 0.9], [0.7, 0.4],
+                    [0.1, 0.6], [0.5, 0.5]],
+             "edges": [(0, 1), (0, 2), (1, 3), (2, 4), (3, 4)], "y": 3.0},
+        ]
+        hist = m.fit(graphs, epochs=40, lr=0.05, seed=1)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0]
+        assert hist[-1] < 0.9 * hist[0]
+
+    def test_invalid_inputs(self):
+        m = AI.Graphormer(2, d_model=4, num_heads=2, d_ff=8, num_layers=1,
+                          max_degree=3, max_path=2, seed=1)
+        _p15_raises(lambda: AI.Graphormer(0))
+        _p15_raises(lambda: AI.Graphormer(2, d_model=4, num_heads=3))
+        _p15_raises(lambda: AI.Graphormer(2, d_model=4, d_ff=0))
+        _p15_raises(lambda: AI.Graphormer(2, max_degree=0))
+        _p15_raises(lambda: AI.Graphormer(2, max_path=0))
+        _p15_raises(lambda: m.forward([], _EDGES4))
+        _p15_raises(lambda: m.forward(_XS4, [(0, 1), (1, 4)]))
+        _p15_raises(lambda: m.forward(_XS4, [(0, 1, 2)]))
+        _p15_raises(lambda: m.forward(_XS4, [(0, 0)]))
+        _p15_raises(lambda: m.loss_and_backward(_XS4, _EDGES4, float("nan")))
+        _p15_raises(lambda: m.fit([], epochs=10))
+        _p15_raises(lambda: m.fit([{"xs": _XS4, "edges": _EDGES4, "y": 1.0}],
+                                  epochs=0))
+        _p15_raises(lambda: m.sgd_step(0.0))
+        _p15_raises(lambda: AI.graph_shortest_paths(0, []))
+        _p15_raises(lambda: AI.graphormer_structure(3, [(0, 1)],
+                                                    max_degree=0))
