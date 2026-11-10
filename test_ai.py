@@ -32560,3 +32560,170 @@ class TestMoEAuxLoss:
         _p1_raises(lambda: moe.aux_loss(-0.1))
         _p1_raises(lambda: moe.load_balancing_loss(True))
         _p1_raises(lambda: moe.load_balancing_loss(float("inf")))
+
+
+"""P2 单元测试：GRPO 族工具（组相对优势 / GRPO 损失 / Best-of-N / 自洽性 / 拒绝采样）。"""
+
+import math
+
+import AI
+
+
+class TestGRPO:
+    def test_group_relative_advantages_normalize(self):
+        adv = AI.group_relative_advantages([1.0, 2.0, 3.0, 4.0], group_size=2)
+        assert adv == [-0.9999999800000003, 0.9999999800000003,
+                       -0.9999999800000003, 0.9999999800000003]
+        one = AI.group_relative_advantages([0.5, 1.5, 2.5])
+        assert abs(sum(one)) < 1e-9
+        var = sum(v * v for v in one) / len(one)
+        assert abs(var - 1.0) < 1e-7
+        raw = AI.group_relative_advantages([1.0, 3.0], group_size=2,
+                                           normalize=False)
+        assert raw == [-1.0, 1.0]
+
+    def test_group_relative_advantages_groups_and_errors(self):
+        multi = AI.group_relative_advantages([0.0, 1.0, 10.0, 20.0],
+                                             group_size=2)
+        assert multi[0] < 0 < multi[1] and multi[2] < 0 < multi[3]
+        assert abs(multi[0] + multi[1]) < 1e-6
+        try:
+            AI.group_relative_advantages()
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError("空参数未报错")
+        for rewards, kwargs in (([1.0], {"eps": -1e-9}),
+                                ([1.0], {"eps": "0.1"}),
+                                ([1.0, 2.0, 3.0], {"group_size": 2}),
+                                ([1.0], {"group_size": 0}),
+                                (["a"], {}),
+                                ([float("nan")], {})):
+            try:
+                AI.group_relative_advantages(rewards, **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"未报错: {rewards!r} {kwargs!r}")
+
+    def test_grpo_losses_matches_ppo_loss(self):
+        logits_seq = [[1.0, -1.0, 0.5], [0.2, 0.1, -0.3]]
+        old = [math.log(0.2), math.log(0.4)]
+        actions = [0, 1]
+        adv = [1.0, -0.5]
+        loss, grads, infos = AI.grpo_losses(
+            logits_seq, old, actions, adv, clip_ratio=0.2,
+            entropy_coef=0.0, normalize_by_length=False)
+        manual = 0.0
+        for t in range(2):
+            l_t, _, _ = AI.ppo_loss(logits_seq[t], old[t], actions[t], adv[t],
+                                    clip_ratio=0.2, entropy_coef=0.0)
+            manual += l_t
+        assert abs(loss - manual) < 1e-12
+        l0, g0, _ = AI.ppo_loss(logits_seq[0], old[0], actions[0], adv[0],
+                                clip_ratio=0.2, entropy_coef=0.0)
+        for a, b in zip(grads[0], g0):
+            assert abs(a - b) < 1e-12
+        assert len(grads) == len(infos) == 2
+        loss_n, grads_n, _ = AI.grpo_losses(
+            logits_seq, old, actions, adv, clip_ratio=0.2,
+            entropy_coef=0.0, normalize_by_length=True)
+        assert abs(loss_n - manual / 2.0) < 1e-12
+        assert abs(grads_n[0][0] - g0[0] / 2.0) < 1e-12
+
+    def test_grpo_losses_errors(self):
+        good = [[0.1, -0.2]]
+        cases = (
+            ([], [0.0], [0], [1.0], 0.2),
+            (good, [], [0], [1.0], 0.2),
+            (good, [0.0], [0, 1], [1.0], 0.2),
+            (good, [0.0], [0], [1.0, 2.0], 0.2),
+            (good, [0.0], [5], [1.0], 0.2),
+            (good, [0.0], [0], [1.0], 1.5),
+            (good, [0.0], [0], [1.0], 0.2),
+        )
+        for i, (logits_seq, old, actions, adv, clip) in enumerate(cases):
+            if i == len(cases) - 1:
+                kwargs = {"normalize_by_length": "yes"}
+            else:
+                kwargs = {"clip_ratio": clip, "normalize_by_length": False}
+            try:
+                AI.grpo_losses(logits_seq, old, actions, adv, **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f"未报错 #{i}: {logits_seq!r} {old!r} {actions!r} "
+                    f"{adv!r} {kwargs!r}")
+
+
+class TestBestOfN:
+    def test_best_of_n_selects_max_and_tie(self):
+        out = AI.best_of_n(["a", "b", "c"], [0.1, 0.9, 0.5])
+        assert out["best"] == "b" and out["index"] == 1
+        assert out["reward"] == 0.9 and out["scores"] == [0.1, 0.9, 0.5]
+        tie = AI.best_of_n(["a", "b"], [0.5, 0.5])
+        assert tie["index"] == 0 and tie["reward"] == 0.5
+        neg = AI.best_of_n(["x", "y"], [-2.0, -1.0])
+        assert neg["index"] == 1 and neg["reward"] == -1.0
+
+    def test_best_of_n_invalid(self):
+        for samples, rewards in (([], []), (["a"], [0.1, 0.2]),
+                                 (["a"], ["bad"]), (["a"], [float("nan")]),
+                                 (["a", "b"], [True, 0.5])):
+            try:
+                AI.best_of_n(samples, rewards)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"未报错: {samples!r} {rewards!r}")
+
+
+class TestSelfConsistency:
+    def test_majority_and_tie(self):
+        best, tally, conf = AI.self_consistency([2, 2, 1, 2])
+        assert best == 2 and conf == 0.75 and tally[2] == 3
+        tie, _, conf_tie = AI.self_consistency(["x", "y"])
+        assert tie == "x" and conf_tie == 0.5
+
+    def test_normalize_and_errors(self):
+        best, _, _ = AI.self_consistency(
+            ["A", "a", "b"], normalize=lambda s: s.lower())
+        assert best == "A"
+        for samples, normalize in (([], None), ([[1], [2]], None),
+                                   (["a"], 42)):
+            try:
+                AI.self_consistency(samples, normalize=normalize)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"未报错: {samples!r} {normalize!r}")
+
+
+class TestRejectionSampling:
+    def test_threshold_and_top_ratio(self):
+        kept, idx = AI.rejection_sampling_filter(
+            ["a", "b", "c", "d"], [0.1, 0.9, 0.5, 0.7], threshold=0.5)
+        assert kept == ["b", "c", "d"] and idx == [1, 2, 3]
+        kept2, idx2 = AI.rejection_sampling_filter(
+            ["a", "b", "c", "d"], [0.1, 0.9, 0.5, 0.7], top_ratio=0.5)
+        assert idx2 == [1, 3] and kept2 == ["b", "d"]
+        kept3, idx3 = AI.rejection_sampling_filter(
+            ["a"], [-1.0], threshold=0.0)
+        assert kept3 == [] and idx3 == []
+
+    def test_invalid_params(self):
+        for samples, rewards, kwargs in (
+                (["a"], [0.5], {"threshold": 0.5, "top_ratio": 0.5}),
+                (["a"], [0.5], {}),
+                (["a"], [0.5], {"top_ratio": 0.0}),
+                (["a"], [0.5], {"top_ratio": 1.5}),
+                (["a"], [0.5], {"threshold": float("nan")}),
+                ([], [], {"threshold": 0.0}),
+                (["a", "b"], [0.5], {"threshold": 0.0})):
+            try:
+                AI.rejection_sampling_filter(samples, rewards, **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"未报错: {samples!r} {kwargs!r}")

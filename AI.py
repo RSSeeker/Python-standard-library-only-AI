@@ -35280,6 +35280,209 @@ class ValueNetwork:
                    for layer in self.model.layers)
 
 
+def group_relative_advantages(rewards, group_size=None, eps=1e-8, normalize=True):
+    """组内相对优势（GRPO 的核心一步），返回与 rewards 等长的列表。
+
+    ``normalize=True`` 时对每个组做 ``(r - mean) / (std + eps)``（std 用总体方差，
+    即除以组内样本数）；``normalize=False`` 时只减组均值。``group_size`` 为 ``None``
+    表示所有奖励同属一组，否则按 ``group_size`` 切分，且长度必须整除。
+    """
+    if not isinstance(rewards, (list, tuple)) or not rewards:
+        raise ValueError("group_relative_advantages: rewards 必须是非空列表")
+    vals = []
+    for i, r in enumerate(rewards):
+        if isinstance(r, bool) or not isinstance(r, (int, float)):
+            raise ValueError(
+                f"group_relative_advantages: rewards[{i}] 必须是数字，收到 {r!r}")
+        if not math.isfinite(r):
+            raise ValueError(
+                f"group_relative_advantages: rewards[{i}] 必须是有限数字")
+        vals.append(float(r))
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps < 0.0:
+        raise ValueError(
+            f"group_relative_advantages: eps 必须 >= 0，收到 {eps!r}")
+    n_total = len(vals)
+    if group_size is None:
+        size = n_total
+        n_groups = 1
+    else:
+        if isinstance(group_size, bool) or not isinstance(group_size, int) \
+                or group_size <= 0:
+            raise ValueError(
+                f"group_relative_advantages: group_size 必须是正整数，收到 {group_size!r}")
+        if n_total % group_size != 0:
+            raise ValueError(
+                f"group_relative_advantages: 奖励数 {n_total} 不能被组大小 "
+                f"{group_size} 整除")
+        size = group_size
+        n_groups = n_total // size
+    out = [0.0] * n_total
+    for g in range(n_groups):
+        lo = g * size
+        hi = lo + size
+        chunk = vals[lo:hi]
+        mean = sum(chunk) / size
+        centered = [v - mean for v in chunk]
+        if normalize:
+            if size <= 1:
+                std = 0.0
+            else:
+                var = sum(c * c for c in centered) / size
+                std = _math_sqrt(var) if var > 0.0 else 0.0
+            scale = std + float(eps)
+            out[lo:hi] = [c / scale for c in centered]
+        else:
+            out[lo:hi] = centered
+    return out
+
+
+def grpo_losses(logits_seq, old_logps, actions, advantages, clip_ratio=0.2,
+                entropy_coef=0.0, normalize_by_length=True):
+    """GRPO 的逐步 PPO 裁剪损失，返回 ``(loss, dlogits_seq, infos)``。
+
+    对每个决策步调用 ``ppo_loss``（ratio 裁剪 + 可选熵正则），再把逐步损失
+    平均（``normalize_by_length=True``）或求和。``advantages`` 一般由
+    :func:`group_relative_advantages` 得到。
+    """
+    if not isinstance(logits_seq, (list, tuple)) or not logits_seq:
+        raise ValueError("grpo_losses: logits_seq 必须是非空列表")
+    n = len(logits_seq)
+    if not isinstance(old_logps, (list, tuple)) or len(old_logps) != n:
+        raise ValueError("grpo_losses: old_logps 必须与 logits_seq 等长")
+    if not isinstance(actions, (list, tuple)) or len(actions) != n:
+        raise ValueError("grpo_losses: actions 必须与 logits_seq 等长")
+    if not isinstance(advantages, (list, tuple)) or len(advantages) != n:
+        raise ValueError("grpo_losses: advantages 必须与 logits_seq 等长")
+    if normalize_by_length not in (True, False):
+        raise ValueError("grpo_losses: normalize_by_length 必须是布尔值")
+    total_loss = 0.0
+    grads = []
+    infos = []
+    for t in range(n):
+        loss_t, grad_t, info_t = ppo_loss(
+            logits_seq[t], old_logps[t], actions[t], advantages[t],
+            clip_ratio=clip_ratio, entropy_coef=entropy_coef)
+        total_loss += loss_t
+        grads.append(grad_t)
+        infos.append(info_t)
+    scale = float(n) if normalize_by_length else 1.0
+    return total_loss / scale, [[v / scale for v in row] for row in grads], infos
+
+
+def self_consistency(samples, normalize=None):
+    """自洽性投票：返回 ``(best, tally, confidence)``。
+
+    ``normalize`` 可给一个把样本映射为可哈希键的函数；票数相同时取最先出现的键
+    （按首次出现顺序稳定比较），无样本时报错。
+    """
+    if not isinstance(samples, (list, tuple)) or not samples:
+        raise ValueError("self_consistency: samples 必须是非空列表")
+    if normalize is not None and not callable(normalize):
+        raise ValueError("self_consistency: normalize 必须可调用或为 None")
+    tally = {}
+    order = []
+    for i, s in enumerate(samples):
+        key = normalize(s) if normalize is not None else s
+        try:
+            hash(key)
+        except TypeError:
+            raise ValueError(
+                f"self_consistency: samples[{i}] 规范化后不可哈希（{key!r}）")
+        if key not in tally:
+            tally[key] = 0
+            order.append(key)
+        tally[key] += 1
+    best_key = None
+    best_count = -1
+    for key in order:
+        if tally[key] > best_count:
+            best_key = key
+            best_count = tally[key]
+    # 返回原始样本：取第一个规范化后等于 best_key 的样本
+    best = None
+    for s in samples:
+        key = normalize(s) if normalize is not None else s
+        if key == best_key:
+            best = s
+            break
+    confidence = best_count / len(samples)
+    return best, tally, confidence
+
+
+def best_of_n(samples, rewards):
+    """Best-of-N：在给定样本与奖励中取奖励最高者，返回字典。
+
+    字段：``best``、``index``、``reward``、``scores``。奖励必须与样本等长且有限；
+    并列时取第一个最大值（下标最小）。
+    """
+    if not isinstance(samples, (list, tuple)) or not samples:
+        raise ValueError("best_of_n: samples 必须是非空列表")
+    if not isinstance(rewards, (list, tuple)) or len(rewards) != len(samples):
+        raise ValueError("best_of_n: rewards 必须与 samples 等长")
+    vals = []
+    for i, r in enumerate(rewards):
+        if isinstance(r, bool) or not isinstance(r, (int, float)):
+            raise ValueError(f"best_of_n: rewards[{i}] 必须是数字，收到 {r!r}")
+        if not math.isfinite(r):
+            raise ValueError(f"best_of_n: rewards[{i}] 必须是有限数字")
+        vals.append(float(r))
+    best_index = 0
+    best_reward = vals[0]
+    for i in range(1, len(vals)):
+        if vals[i] > best_reward:
+            best_reward = vals[i]
+            best_index = i
+    return {
+        "best": samples[best_index],
+        "index": best_index,
+        "reward": best_reward,
+        "scores": vals,
+    }
+
+
+def rejection_sampling_filter(samples, rewards, threshold=None, top_ratio=None):
+    """RFT / 拒绝采样过滤：按奖励阈值或保留比例筛选样本。
+
+    ``threshold`` 与 ``top_ratio`` 二选一；``threshold`` 保留 ``reward >= threshold``
+    的样本，``top_ratio`` 保留奖励最高的 ``max(1, round(n*top_ratio))`` 个。
+    返回 ``(kept_samples, kept_indices)``；全被过滤时返回空列表。
+    """
+    if not isinstance(samples, (list, tuple)) or not samples:
+        raise ValueError("rejection_sampling_filter: samples 必须是非空列表")
+    if not isinstance(rewards, (list, tuple)) or len(rewards) != len(samples):
+        raise ValueError(
+            "rejection_sampling_filter: rewards 必须与 samples 等长")
+    vals = []
+    for i, r in enumerate(rewards):
+        if isinstance(r, bool) or not isinstance(r, (int, float)) \
+                or not math.isfinite(r):
+            raise ValueError(
+                f"rejection_sampling_filter: rewards[{i}] 必须是有限数字")
+        vals.append(float(r))
+    if threshold is not None and top_ratio is not None:
+        raise ValueError(
+            "rejection_sampling_filter: threshold 与 top_ratio 只能给一个")
+    if threshold is None and top_ratio is None:
+        raise ValueError(
+            "rejection_sampling_filter: 必须给 threshold 或 top_ratio")
+    if threshold is not None:
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) \
+                or not math.isfinite(threshold):
+            raise ValueError(
+                f"rejection_sampling_filter: threshold 必须是有限数字，收到 {threshold!r}")
+        kept = [i for i, v in enumerate(vals) if v >= float(threshold)]
+    else:
+        if isinstance(top_ratio, bool) or not isinstance(top_ratio, (int, float)) \
+                or not (0.0 < top_ratio <= 1.0):
+            raise ValueError(
+                f"rejection_sampling_filter: top_ratio 必须在 (0,1] 内，"
+                f"收到 {top_ratio!r}")
+        k = max(1, int(round(len(vals) * float(top_ratio))))
+        order = sorted(range(len(vals)), key=lambda i: (-vals[i], i))
+        kept = sorted(order[:k])
+    kept_samples = [samples[i] for i in kept]
+    return kept_samples, kept
+
 class PPOAgent:
     """PPO（裁剪目标 + GAE + 熵正则）的离散动作实现。
 

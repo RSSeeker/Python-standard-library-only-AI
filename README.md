@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2093 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2103 项）
 
 ## 特性
 
@@ -2116,6 +2116,33 @@ model.fit(graphs, epochs=50, lr=0.05)   # graphs: [(h, x, target), ...]
 
 四条边界：全连接图（每对节点都连边），复杂度 O(N²·d)；坐标严格等变、节点特征严格不变，但只支持 3 维坐标；单头、无边门控/注意力，`phi_x` 只输出一个标量系数；读出是均值池化 + MLP，只做图级标量回归，不做节点级预测。
 
+### 优势归一化与推理采样工具（GRPO / Best-of-N / Self-Consistency / 拒绝采样）
+
+这些工具补在 PPO 之后不依赖单独的反向逻辑：先按组把奖励变成相对优势，再把逐步损失交给 `ppo_loss`；推理侧提供无梯度、无模型的投票/挑选/过滤工具。
+
+| API | 说明 |
+| --- | --- |
+| `group_relative_advantages(rewards, group_size=None, eps=1e-8, normalize=True)` | GRPO 组相对优势：每组 `(r-mean)/(std+eps)`（`normalize=False` 只减均值） |
+| `grpo_losses(logits_seq, old_logps, actions, advantages, clip_ratio=0.2, entropy_coef=0.0, normalize_by_length=True)` | 逐步调用 `ppo_loss`，返回 `(loss, dlogits_seq, infos)`，可按长度平均 |
+| `best_of_n(samples, rewards)` | 在 N 个候选中取奖励最高者，返回 `{"best","index","reward","scores"}` |
+| `self_consistency(samples, normalize=None)` | 多数投票：返回 `(best, tally, confidence)`，相同票数取首次出现顺序 |
+| `rejection_sampling_filter(samples, rewards, threshold=None, top_ratio=None)` | RFT / 拒绝采样过滤，返回 `(kept_samples, kept_indices)` |
+
+示例：
+
+```python
+adv = AI.group_relative_advantages([1.0, 2.0, 3.0, 4.0], group_size=2)
+loss, dlogits, infos = AI.grpo_losses(
+    [[1.0, -1.0], [0.2, -0.1]], [math.log(0.5), math.log(0.5)],
+    [0, 1], adv[:2], clip_ratio=0.2)
+best = AI.best_of_n(["A", "B", "C"], [0.1, 0.9, 0.5])   # best["best"] == "B"
+vote, tally, conf = AI.self_consistency([1, 2, 2, 3, 2])  # vote == 2, conf == 0.6
+kept, idx = AI.rejection_sampling_filter(
+    ["a", "b", "c"], [0.1, 0.9, 0.5], top_ratio=0.5)      # idx == [1]
+```
+
+边界：GRPO 只做「组内优势 + 裁剪损失」，不含参考模型的 KL 项、不做序列级长度归一化的额外处理；`grpo_losses` 的 `dlogits` 需要调用方按策略网络/语言模型手工回传；Best-of-N、Self-Consistency、拒绝采样只作用于已采样结果（奖励函数由调用方提供）。
+
 ### 离线强化学习（IQL / CQL）
 
 | API | 说明 |
@@ -3907,7 +3934,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2093 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2103 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4105,6 +4132,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
 | `TestMoEAuxLoss` | 手工公式对照、均匀路由下等于 coefficient、塌缩路由大于 `coefficient·E`、未 forward 与非法系数 |
+| `TestGRPO` | 组相对优势归一化/多组独立/非法参数；`grpo_losses` 与 `ppo_loss` 手工累加及长度归一化一致 |
+| `TestBestOfN` | 取最大奖励、并列取最小下标、非法输入 |
+| `TestSelfConsistency` | 多数投票、并列、`normalize` 规范化、空/不可哈希输入 |
+| `TestRejectionSampling` | 阈值过滤、`top_ratio` 保留、空结果与非法参数 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4239,7 +4270,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2093 个单元测试
+├── test_ai.py       # 2103 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

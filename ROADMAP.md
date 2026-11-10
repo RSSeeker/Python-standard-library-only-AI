@@ -836,8 +836,9 @@
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
 - [x] 训练小件补充：`WeightStandardization`（沿 fan_in 行标准化，反向精确公式）、`NF4_LEVELS` / `nf4_quantize` / `nf4_dequantize` / `nf4_fake_quantize`（QLoRA 分位点量化）、`double_quantize` / `double_dequantize`（absmax 缩放因子再量化）、`GradScaler`（动态 loss scaling）与 `MoE.load_balancing_loss`（Switch 负载均衡辅助损失）；测试 `TestWeightStandardization` / `TestNF4Quant` / `TestGradScaler` / `TestMoEAuxLoss` 共 11 例
+- [x] GRPO 族工具：`group_relative_advantages`（组内归一化）、`grpo_losses`（逐步 PPO 裁剪 + 长度归一化）、`best_of_n`、`self_consistency`、`rejection_sampling_filter`；`TestGRPO` / `TestBestOfN` / `TestSelfConsistency` / `TestRejectionSampling` 共 10 例。
 
-全量测试：1839 → 2093 passed（新增 254 例）。
+全量测试：1839 → 2103 passed（新增 264 例）。
 
 ---
 
