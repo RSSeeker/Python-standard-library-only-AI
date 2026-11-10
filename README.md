@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2194 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2201 项）
 
 ## 特性
 
@@ -2259,6 +2259,29 @@ print(dist, st["deg"], model.predict(xs, edges))
 
 - 边界：`edges` 是无权无向边列表，邻接视为常量；度与最短路径桶按 `max_degree` / `max_path` 截断；注意力用多头拼接后线性投影；输出是图级标量回归（非节点级/边级）；全批量 SGD，无 dropout。
 
+### DINOv2 自蒸馏训练（DINOv2Trainer）
+
+DINOv2 是教师-学生自蒸馏：同一批图生成两组随机裁剪视图，学生看一组、教师看另一组
+（交叉视图），用 `dinov2_loss` 做带温度 sharpening 与中心化的软目标交叉熵；学生做
+SGD，教师参数 EMA，教师输出中心按动量更新。
+
+```python
+trainer = DINOv2Trainer(in_channels=2, image_size=8, patch_size=4,
+                        d_model=8, proj_dim=4)
+loss = trainer.train_step(images, lr=0.02)["loss"]
+history = trainer.fit(images, epochs=10, lr=0.02, seed=1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `dinov2_loss(student_logits, teacher_logits, center=None, temp_s=0.1, temp_t=0.04)` | 返回 `(loss, dstudent)`；软目标交叉熵 + 教师 sharpening/中心化 |
+| `make_dino_views(images, num_views=2, scale_range=(0.5,1.0), seed=None)` | 随机裁剪 + 水平翻转的多视图 |
+| `DINOv2Trainer(...)` | 学生/教师 ViT 自蒸馏；`train_step`、`fit`、`param_count` |
+
+边界：这是教学版 DINOv2——只做全局视图级自蒸馏（没有 patch-level loss/局部 crop）、
+学生/教师头直接用 ViT 的线性投影头（不是 3 层 MLP）、教师 EMA 与中心更新是简化实现，
+不包含 KoLeo/IBOT 等正则项。
+
 ### VMamba（2D 选择性扫描）
 
 `VMambaBlock` 把 Mamba 的选择性扫描推广到二维网格：沿行优先、行逆序、列优先、
@@ -4217,7 +4240,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2194 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2201 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4430,6 +4453,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTitansSequenceMemory` | 逐 token 读写、process(update=False) 不改记忆、非法输入 |
 | `TestVMambaBlock` | 前向形状/参数、四项中心差分、SGD 更新、非法输入 |
 | `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
+| `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4577,7 +4601,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2194 个单元测试
+├── test_ai.py       # 2201 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

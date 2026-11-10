@@ -34505,3 +34505,103 @@ class TestVMamba:
         _p18_raises(lambda: model.forward([]))
         _p18_raises(lambda: model.forward([[[[0.0] * 8] * 8]]))
         _p18_raises(lambda: model.forward([[[[float("nan")] * 8] * 8] for _ in range(2)]))
+
+
+import math
+import random
+
+import AI
+
+
+def _p19_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p19_img(ch=2, size=8, value=0.5):
+    return [[[value] * size for _ in range(size)] for _ in range(ch)]
+
+
+class TestDINOv2Loss:
+    def test_loss_and_gradient(self):
+        rng = random.Random(3)
+        s = [[rng.gauss(0.0, 1.0) for _ in range(4)] for _ in range(2)]
+        t = [[rng.gauss(0.0, 1.0) for _ in range(4)] for _ in range(2)]
+        center = [0.1, -0.2, 0.0, 0.3]
+        loss, d = AI.dinov2_loss(s, t, center)
+        assert isinstance(loss, float) and loss > 0.0
+        h = 1e-6
+        for i in range(2):
+            for j in range(4):
+                sp = [row[:] for row in s]
+                sm = [row[:] for row in s]
+                sp[i][j] += h
+                sm[i][j] -= h
+                num = (AI.dinov2_loss(sp, t, center)[0]
+                       - AI.dinov2_loss(sm, t, center)[0]) / (2 * h)
+                if abs(num) < 1e-6 and abs(d[i][j]) < 1e-6:
+                    continue
+                assert abs(num - d[i][j]) < 1e-3 * max(1.0, abs(num)), (i, j, num, d[i][j])
+
+    def test_uniform_loss(self):
+        s = [[0.0, 0.0, 0.0, 0.0]]
+        t = [[0.0, 0.0, 0.0, 0.0]]
+        loss, d = AI.dinov2_loss(s, t, [0.0] * 4)
+        assert abs(loss - math.log(4)) < 1e-9
+        assert all(abs(v) < 1e-12 for v in d[0])
+
+    def test_invalid_inputs(self):
+        _p19_raises(lambda: AI.dinov2_loss([], [[0.0]]))
+        _p19_raises(lambda: AI.dinov2_loss([[0.0, 1.0]], [[0.0]]))
+        _p19_raises(lambda: AI.dinov2_loss([[0.0]], [[0.0]], [0.0, 1.0]))
+        _p19_raises(lambda: AI.dinov2_loss([[0.0]], [[0.0]], None, temp_s=0.0))
+        _p19_raises(lambda: AI.dinov2_loss([[0.0]], [[0.0]], None, temp_t=-1.0))
+
+
+class TestDINOv2Views:
+    def test_views_shape_and_determinism(self):
+        images = [_p19_img(), _p19_img(value=0.2)]
+        views = AI.make_dino_views(images, num_views=2, seed=5)
+        assert len(views) == 2 and len(views[0]) == 2
+        assert len(views[0][0]) == 2
+        assert len(views[0][0][0]) == 8
+        assert len(views[0][0][0][0]) == 8
+        again = AI.make_dino_views(images, num_views=2, seed=5)
+        assert views == again
+
+    def test_invalid_inputs(self):
+        images = [_p19_img()]
+        _p19_raises(lambda: AI.make_dino_views([]))
+        _p19_raises(lambda: AI.make_dino_views(images, num_views=1))
+        _p19_raises(lambda: AI.make_dino_views(images, scale_range=(0.9, 0.5)))
+
+
+class TestDINOv2Trainer:
+    def test_train_step_and_fit(self):
+        images = [_p19_img(), _p19_img(value=0.2)]
+        tr = AI.DINOv2Trainer(in_channels=2, image_size=8, patch_size=4,
+                              d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                              proj_dim=4)
+        assert tr.param_count() == 964
+        w_before = tr.student.head.weights[0][0]
+        t_before = tr.teacher.head.weights[0][0]
+        info = tr.train_step(images, lr=0.02, num_views=2)
+        assert set(info) == {"loss", "center"}
+        assert isinstance(info["loss"], float) and math.isfinite(info["loss"])
+        assert tr.student.head.weights[0][0] != w_before
+        assert tr.teacher.head.weights[0][0] != t_before
+        hist = tr.fit(images, epochs=3, lr=0.02, seed=2)
+        assert len(hist) == 3 and all(math.isfinite(v) for v in hist)
+
+    def test_invalid_inputs(self):
+        images = [_p19_img()]
+        _p19_raises(lambda: AI.DINOv2Trainer(teacher_momentum=1.5))
+        _p19_raises(lambda: AI.DINOv2Trainer(center_momentum=-0.1))
+        tr = AI.DINOv2Trainer(in_channels=2, image_size=8, patch_size=4,
+                              d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                              proj_dim=4)
+        _p19_raises(lambda: tr.train_step(images, lr=0.0))
+        _p19_raises(lambda: tr.fit(images, epochs=0))

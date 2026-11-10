@@ -3604,6 +3604,226 @@ class VMamba:
         total += _norm_param_count(self.ln_out)
         return total
 
+def _d19_check_rows(rows, name):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"DINOv2: {name} 必须是非空二维列表")
+    out = []
+    width = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"DINOv2: {name} 必须是非空二维列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"DINOv2: {name} 各行长度必须一致")
+        out.append([float(v) for v in row])
+    return out
+
+
+def _d19_softmax_temp(rows, temp, center=None):
+    rows = _d19_check_rows(rows, "logits")
+    if isinstance(temp, bool) or not isinstance(temp, (int, float)) \
+            or not math.isfinite(temp) or temp <= 0.0:
+        raise ValueError("DINOv2: temperature 必须是正数")
+    if center is not None:
+        if not isinstance(center, (list, tuple)) or len(center) != len(rows[0]):
+            raise ValueError("DINOv2: center 长度必须等于输出维度")
+        center = [float(v) for v in center]
+    out = []
+    for row in rows:
+        vals = [(row[j] - (center[j] if center is not None else 0.0)) / temp
+                for j in range(len(row))]
+        mx = max(vals)
+        e = [math.exp(v - mx) for v in vals]
+        z = sum(e)
+        out.append([v / z for v in e])
+    return out
+
+
+def dinov2_loss(student_logits, teacher_logits, center=None, temp_s=0.1,
+                temp_t=0.04):
+    """DINOv2 的交叉视图自蒸馏损失，返回 (loss, dstudent_logits)。
+
+    教师在温度 ``temp_t`` 下 sharpening 并减去中心 ``center``，学生用 ``temp_s``；
+    对每个样本做软目标交叉熵。梯度只回传给学生的 logits：
+    ``dL/ds = (softmax_s - p_teacher) / N``。
+    """
+    s = _d19_check_rows(student_logits, "student_logits")
+    t = _d19_check_rows(teacher_logits, "teacher_logits")
+    if len(s) != len(t) or len(s[0]) != len(t[0]):
+        raise ValueError("DINOv2: 学生与教师的 logits 形状必须一致")
+    ps = _d19_softmax_temp(s, temp_s)
+    pt = _d19_softmax_temp(t, temp_t, center)
+    n = len(s)
+    loss = 0.0
+    dstudent = []
+    for i in range(n):
+        drow = []
+        for j in range(len(s[i])):
+            if pt[i][j] > 0.0:
+                loss += -pt[i][j] * math.log(max(ps[i][j], 1e-12))
+            drow.append((ps[i][j] - pt[i][j]) / (n * temp_s))
+        dstudent.append(drow)
+    return loss / n, dstudent
+
+
+def _d19_blend_values(src, dst, momentum):
+    if isinstance(src, list):
+        for i in range(len(src)):
+            if isinstance(src[i], list):
+                _d19_blend_values(src[i], dst[i], momentum)
+            else:
+                dst[i] = momentum * dst[i] + (1.0 - momentum) * src[i]
+        return
+    raise ValueError("DINOv2: 参数必须是嵌套列表")
+
+
+def _d19_ema_params(student, teacher, momentum):
+    for (name, src), (_, dst) in zip(student._layer_params(), teacher._layer_params()):
+        if name == "head.w" or name == "head.b":
+            _d19_blend_values(src, dst, momentum)
+        else:
+            _d19_blend_values(src, dst, momentum)
+    # patch_embed 的卷积参数单独处理
+    _d19_blend_values(student.patch_embed.conv.weights,
+                      teacher.patch_embed.conv.weights, momentum)
+    _d19_blend_values(student.patch_embed.conv.biases,
+                      teacher.patch_embed.conv.biases, momentum)
+
+
+def _d19_crop(img, out_size, scale, rng):
+    c = len(img)
+    h = len(img[0])
+    w = len(img[0][0])
+    side = max(2, int(round(out_size * math.sqrt(scale))))
+    side = min(side, h, w)
+    top = rng.randint(0, h - side)
+    left = rng.randint(0, w - side)
+    out = []
+    for ch in range(c):
+        rows = []
+        for r in range(out_size):
+            src_r = top + min(side - 1, int(r * side / out_size))
+            row = []
+            for col in range(out_size):
+                src_c = left + min(side - 1, int(col * side / out_size))
+                row.append(img[ch][src_r][src_c])
+            rows.append(row)
+        out.append(rows)
+    return out
+
+
+def make_dino_views(images, num_views=2, scale_range=(0.5, 1.0), seed=None):
+    """对每张图生成 ``num_views`` 个随机裁剪 + 随机水平翻转的视图。
+
+    返回 ``views[view_index][image_index]``（同一视图序号下所有图尺寸一致）。
+    """
+    if not isinstance(images, (list, tuple)) or not images:
+        raise ValueError("DINOv2: images 必须是非空列表")
+    if isinstance(num_views, bool) or not isinstance(num_views, int) or num_views < 2:
+        raise ValueError("DINOv2: num_views 必须是 >=2 的整数")
+    if (not isinstance(scale_range, (tuple, list)) or len(scale_range) != 2
+            or not (0.0 < float(scale_range[0]) <= float(scale_range[1]) <= 1.0)):
+        raise ValueError("DINOv2: scale_range 必须是 (lo, hi) 且 0<lo<=hi<=1")
+    size = len(images[0][0])
+    rng = random.Random(seed)
+    views = [[] for _ in range(num_views)]
+    for img in images:
+        for vi in range(num_views):
+            scale = rng.uniform(float(scale_range[0]), float(scale_range[1]))
+            cropped = _d19_crop(img, size, scale, rng)
+            if rng.random() < 0.5:
+                cropped = [list(reversed(ch)) for ch in cropped]
+            views[vi].append(cropped)
+    return views
+
+
+class DINOv2Trainer:
+    """简化的 DINOv2 自蒸馏训练器：学生/教师 ViT + EMA + 中心更新。
+
+    学生与教师都是 ``ViT``（输出维度 ``proj_dim``）；每步对同一批图生成两组视图，
+    学生看一组、教师看另一组（交叉视图），用 ``dinov2_loss`` 蒸馏；学生做 SGD，
+    教师参数按 ``teacher_momentum`` 做 EMA，教师输出中心按 ``center_momentum`` 更新。
+    """
+
+    def __init__(self, in_channels=3, image_size=8, patch_size=4, d_model=16,
+                 num_heads=2, d_ff=32, num_layers=1, proj_dim=16,
+                 teacher_momentum=0.99, center_momentum=0.9, seed=1):
+        self.in_channels = in_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.proj_dim = proj_dim
+        self.teacher_momentum = float(teacher_momentum)
+        self.center_momentum = float(center_momentum)
+        if not (0.0 <= self.teacher_momentum <= 1.0):
+            raise ValueError("DINOv2: teacher_momentum 必须在 [0,1]")
+        if not (0.0 <= self.center_momentum <= 1.0):
+            raise ValueError("DINOv2: center_momentum 必须在 [0,1]")
+        args = (in_channels, image_size, patch_size, d_model, num_heads,
+                d_ff, num_layers, proj_dim)
+        self.student = ViT(*args)
+        self.teacher = ViT(*args)
+        self.teacher.eval()
+        _d19_ema_params(self.student, self.teacher, 0.0)
+        self.center = [0.0] * proj_dim
+
+    def _forward_logits(self, net, views):
+        logits = []
+        for view in views:
+            logits.append(net.forward(view))
+        return logits
+
+    def train_step(self, images, lr=0.01, num_views=2, temp_s=0.1,
+                   temp_t=0.04, views=None):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError("DINOv2: lr 必须为正数")
+        views = views if views is not None else make_dino_views(images, num_views)
+        if len(views) != num_views:
+            raise ValueError("DINOv2: views 数量与 num_views 不一致")
+        n = len(images)
+        self.student.zero_grad()
+        total = 0.0
+        pairs = 0
+        teacher_sums = [0.0] * self.proj_dim
+        teacher_count = 0
+        for i in range(n):
+            s_logits = [self.student.forward(views[vi][i]) for vi in range(num_views)]
+            t_logits = [self.teacher.forward(views[vi][i]) for vi in range(num_views)]
+            for si in range(num_views):
+                for ti in range(num_views):
+                    if si == ti:
+                        continue
+                    pair_loss, dlogits = dinov2_loss(
+                        [s_logits[si]], [t_logits[ti]], self.center, temp_s, temp_t)
+                    total += pair_loss
+                    pairs += 1
+                    self.student.backward(dlogits[0])
+            for vi in range(num_views):
+                for j in range(self.proj_dim):
+                    teacher_sums[j] += t_logits[vi][j]
+                teacher_count += 1
+        self.student.sgd_step(lr)
+        _d19_ema_params(self.student, self.teacher, self.teacher_momentum)
+        mean_teacher = [v / teacher_count for v in teacher_sums]
+        self.center = update_dino_center(self.center, [mean_teacher],
+                                         self.center_momentum)
+        return {"loss": total / max(1, pairs), "center": list(self.center)}
+
+    def fit(self, images, epochs=20, lr=0.01, num_views=2, seed=None,
+            verbose=False):
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("DINOv2: epochs 必须是正整数")
+        history = []
+        for epoch in range(epochs):
+            views = make_dino_views(images, num_views,
+                                    seed=None if seed is None else seed + epoch)
+            info = self.train_step(images, lr=lr, num_views=num_views, views=views)
+            history.append(info["loss"])
+        return history
+
+    def param_count(self):
+        return self.student.param_count()
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
