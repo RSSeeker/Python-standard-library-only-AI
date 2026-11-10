@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2082 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2093 项）
 
 ## 特性
 
@@ -207,6 +207,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `ScaleNorm(num_features, eps=1e-6)` | 尺度归一化：只有标量 `g`，`y = g·x/(‖x‖/√d+eps)`（整向量缩放，不是逐特征归一化） |
 | `WeightNorm(layer)` | 权重归一化：`w = g ⊙ v/‖v‖_row`，把权重的尺度与方向解耦；反向精确传到 `v`/`g`/`b`（含 `dv` 里的解耦项） |
 | `SpectralNorm(layer, power_iter=1)` | 谱归一化：`w = v/σ(v)`，σ 用幂迭代估计；默认把 σ 视为常量（`freeze_sigma()` 可冻结以获得严格端到端梯度） |
+| `WeightStandardization(layer, eps=1e-5)` | 权重标准化（WS）：沿 fan_in 把每行权重变成零均值、单位方差 `v = (W - mean_row W)/std_row W`；前向用 `v` 计算、反向精确传回原始 `W` 与 `b`（`dW = (G - mean_row G - v·mean_row(G⊙v))/σ`），不引入额外参数；常见组合为 WS-GN，用于小 batch 的 CNN / 全连接网络 |
 | `SwitchNorm(channels, eps=1e-5)` | Switchable Norm：instance / batch / layer 三种统计量按 `softmax(logits)` 软加权（本实现 instance 与 batch 同源，权重合并）；`logits` 也可学 |
 | `FRN(channels, eps=1e-6, tau=0.0)` | Filter Response Normalization：跨通道求 ν²、无 batch 依赖（batch=1 可用），后接可学习阈值的 TLU |
 | `PReLU(num_features, init=0.25)` | 参数化 ReLU：逐特征可学习斜率，负分支才累计 `da` |
@@ -258,6 +259,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
 | `quantize_model(model, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | 把权重与偏置**原地**舍入到低精度，用于模拟部署 |
 | `mixed_precision_grads(model, xs, ys, scale=1024.0, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | fp32 反传 → 梯度乘 `scale` → 舍入 → 除回，即 AMP 里 `GradScaler` 的做法 |
+| `GradScaler(init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000)` | 动态 loss scaling：`scale_loss` 放大损失、`unscale` 检非有限值并除回、`update` 在溢出时退半、连续 `growth_interval` 步正常后翻倍；`state_dict`/`load_state_dict` 保存状态 |
 
 诚实说明三点：本库的 `Layer` 默认只缓存最后一次前向的输入（O(层数) 份），
 `checkpoint_grads(release=False)` 只实现重放机制本身、并不省内存；`release=True`
@@ -267,6 +269,38 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 
 `loss scaling` 的意义可以实测出来：`fp16` 的最小次正规约 `5.96e-8`，梯度 `1e-9` 直接
 舍入就是 0；乘 8192 后落在 `8.19e-6`，舍回后仍是 `1.0e-9` 量级（`9.968e-10`）。
+
+### 权重标准化、NF4、动态 GradScaler 与 MoE 负载均衡
+
+上面几张表里的四个训练小件在实现上互相独立，都是纯 Python 数值逻辑：
+
+```python
+ws = AI.WeightStandardization(AI.Layer(8, 4, "relu"))
+q = AI.nf4_quantize(ws.w, block_size=16)          # {"codes","scales","block_size","length"}
+dq = AI.nf4_dequantize(q)
+dq2 = AI.nf4_fake_quantize_double(ws.w, block_size=16, outer_block_size=16)
+
+scaler = AI.GradScaler(init_scale=1024.0, growth_interval=10)
+scaled_loss = scaler.scale_loss(loss)
+scaler.unscale(grads)                              # 返回除回后的梯度，并记录是否出现 inf/nan
+should_step = scaler.update()
+
+moe = AI.MoE(d_model=16, d_ff=32, num_experts=4, top_k=2)
+moe.forward(hidden)
+aux = moe.load_balancing_loss(coefficient=0.01)   # L_aux = coef·E·Σ f_i·P_i
+```
+
+四条边界：
+
+- `WeightStandardization` 包装任意带 `weights/biases/act_fn/act_deriv` 的层（`Layer` / `Linear`），
+  前向临时换用标准化权重、之后恢复，不会永久改写内层；反向的 `dW` 含均值与协方差项，数值已验证到中心差分。
+- `nf4_*` 只做查表与分块缩放，不做矩阵乘加速；NF4 的误差优势来自高斯权重与分位点匹配，
+  对均匀分布数据不一定优于 4-bit 均匀量化。`double_*` 只压缩 absmax 缩放因子本身。
+- `GradScaler` 是**状态机**：`update()` 在 `growth_interval` 次正常更新后翻倍，检测到 inf/nan 后退半；
+  它不负责把缩放因子传给优化器，调用方应只在实际更新成功后调用 `update()`。
+- `MoE.load_balancing_loss` 返回标量损失，用 `moe._gate_all_probs`（forward 缓存的全专家概率）
+  与 top-k 路由计数计算 `f_i`/`P_i`；当前框架的路由梯度只回传选中专家，这个辅助损失用于监控
+  或与外部训练循环组合，尚未接入路由网络的梯度（Switch Transformer 的 aux loss 训练需要对应反向）。
 
 ### 半监督与一致性正则
 
@@ -1823,6 +1857,13 @@ print(sparsity_report(net))
 | `qat_grads(model, xs, ys, bits=8)` | QAT 的直通估计梯度：在伪量化权重上前向反传，返回各层平均梯度 |
 | `smooth_quant_scale(activation_peak, weight_peak, alpha=0.5)` | SmoothQuant 缩放因子 `s = max|x|^α / max|w|^(1-α)` |
 | `smooth_quant_apply(layer, scales)` | 把缩放折进权重列（`W[:, j] *= s_j`），激活端需自行除以 `s_j` |
+| `NF4_LEVELS` | QLoRA 的 16 个 4-bit 正态分位点（从 −1 到 1，非均匀间隔） |
+| `nf4_quantize(value, block_size=64)` | 按 absmax 分块做 NF4 量化，返回 `{"codes", "scales", "block_size", "length"}` |
+| `nf4_dequantize(state)` | 由 `nf4_quantize` 的编码与缩放恢复浮点值（结构同入参） |
+| `nf4_fake_quantize(value, block_size=64)` | NF4 量化再反量化的伪量化，结构不变，可直接前向 |
+| `double_quantize(scales, block_size=256)` | 双重量化：把 NF4 的 absmax 缩放因子再用 8-bit 对称量化 |
+| `double_dequantize(state)` | 恢复双重量化后的缩放因子 |
+| `nf4_fake_quantize_double(value, block_size=64, outer_block_size=256)` | NF4 + 双重量化的完整伪量化 |
 
 ```python
 from AI import MLP, quantize_weights, quantization_error, qat_grads
@@ -3697,6 +3738,11 @@ moe.adam_step(lr=1e-3)
 批量矩阵化。token 数不多时很快，超长序列会比稠密 FFN 慢；真实实现需要更复杂的
 分组矩阵乘法。
 
+训练时可调用 `moe.load_balancing_loss(coefficient=0.01)` 计算 Switch Transformer 的
+负载均衡辅助损失 `L_aux = coefficient · E · Σ_i f_i · P_i`（`f_i` 为路由计数比例、
+`P_i` 为全专家门概率均值）；均匀路由时它等于 `coefficient`，全部 token 挤到少数专家时会接近
+`coefficient · E`。该值用于监控与外部损失组合，路由梯度只回传被选中的专家。
+
 ## 生成模型：VAE / GAN / DDPM
 
 三个生成模型都只用标准库实现，可单独训练并采样：
@@ -3861,7 +3907,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2082 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2093 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4055,6 +4101,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestE3NN` | 旋转/平移等变与置换等变、`phi_e`/`phi_x`/`phi_h` 与坐标梯度有限差分、模型参数量 104、距离和拟合下降、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
+| `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
+| `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
+| `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
+| `TestMoEAuxLoss` | 手工公式对照、均匀路由下等于 coefficient、塌缩路由大于 `coefficient·E`、未 forward 与非法系数 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4189,7 +4239,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2082 个单元测试
+├── test_ai.py       # 2093 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

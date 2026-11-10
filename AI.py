@@ -15240,6 +15240,162 @@ class WeightNorm:
         self.zero_grad()
 
 
+class WeightStandardization:
+    """权重标准化（Qiao et al. 2019）：沿 fan_in 把每行权重变成零均值、单位方差。
+
+        Ws[i][j] = (W[i][j] - mean_j W[i][j]) / std_j W[i][j]
+
+    包装带 ``weights`` / ``biases`` / ``act_fn`` / ``act_deriv`` 的内层
+    （:class:`Layer` / ``Linear``）。前向用标准化后的权重，反向**精确**传回
+    原始 ``W``、``b``（不把标准化视作常量）：
+
+        v[i][j] = (W[i][j] - mu[i]) / sigma[i]
+        dW[i][j] = (1 / sigma[i]) * (G[i][j] - mean_j G[i]
+                                    - v[i][j] * mean_j (G[i] * v[i]))
+
+    其中 ``G`` 是损失对标准化权重的梯度。与 :class:`WeightNorm` 的区别：
+    参数仍是 ``W``（没有额外的缩放向量 ``g``），归一化沿 fan_in 而不是整行
+    范数；实践里常与 GroupNorm 组合成 WS-GN，用于小 batch 的卷积 / 全连接网络。
+    """
+
+    def __init__(self, layer, eps: float = 1e-5):
+        for attr in ("weights", "biases", "act_fn", "act_deriv"):
+            if not hasattr(layer, attr):
+                raise TypeError(
+                    f"WeightStandardization: 内层必须提供 {attr!r}"
+                    f"（Layer / Linear 都满足），收到 {type(layer).__name__}"
+                )
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) \
+                or not math.isfinite(float(eps)) or eps <= 0.0:
+            raise ValueError(
+                f"WeightStandardization: eps 必须是正的有限实数，收到 {eps!r}")
+        self.inner = layer
+        self.fan_out = len(layer.weights)
+        self.fan_in = len(layer.weights[0]) if self.fan_out else 0
+        if self.fan_out < 1 or self.fan_in < 1:
+            raise ValueError("WeightStandardization: 内层权重不能是空矩阵")
+        self.eps = float(eps)
+        self.w = [list(row) for row in layer.weights]
+        self.b = list(layer.biases)
+        self._ws = None
+        self._mu = None
+        self._sigma = None
+        self.grad_w = None
+        self.grad_b = None
+        self.m_w = _zeros_like(self.w)
+        self.v_w = _zeros_like(self.w)
+        self.m_b = [0.0] * self.fan_out
+        self.v_b = [0.0] * self.fan_out
+        self._adam_t = 0
+        self.zero_grad()
+
+    def _effective(self):
+        mu = []
+        sigma = []
+        ws = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        for i in range(self.fan_out):
+            row = self.w[i]
+            m = sum(row) / float(self.fan_in)
+            var = sum((v - m) * (v - m) for v in row) / float(self.fan_in)
+            sd = math.sqrt(var) if var > self.eps * self.eps else self.eps
+            mu.append(m)
+            sigma.append(sd)
+            for j in range(self.fan_in):
+                ws[i][j] = (row[j] - m) / sd
+        return ws, mu, sigma
+
+    def forward(self, x):
+        if len(x) != self.fan_in:
+            raise ValueError(
+                f"WeightStandardization.forward: 输入维度 {len(x)} 与 "
+                f"fan_in={self.fan_in} 不一致"
+            )
+        ws, mu, sigma = self._effective()
+        self._ws, self._mu, self._sigma = ws, mu, sigma
+        saved = self.inner.weights
+        saved_b = self.inner.biases
+        self.inner.weights = ws
+        self.inner.biases = self.b
+        try:
+            return self.inner.forward(x)
+        finally:
+            self.inner.weights = saved
+            self.inner.biases = saved_b
+
+    def backward(self, dout):
+        if self._ws is None:
+            raise RuntimeError("WeightStandardization.backward: 必须先调用 forward()")
+        saved = self.inner.weights
+        saved_b = self.inner.biases
+        self.inner.weights = self._ws
+        self.inner.biases = self.b
+        try:
+            d_ws, db, dx = self.inner.backward(dout)
+        finally:
+            self.inner.weights = saved
+            self.inner.biases = saved_b
+        if d_ws is None:
+            d_ws = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        grad_w = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        for i in range(self.fan_out):
+            g = d_ws[i]
+            sd = self._sigma[i]
+            mean_g = sum(g) / float(self.fan_in)
+            mean_gv = sum(g[j] * self._ws[i][j] for j in range(self.fan_in)) \
+                / float(self.fan_in)
+            for j in range(self.fan_in):
+                grad_w[i][j] = (g[j] - mean_g - self._ws[i][j] * mean_gv) / sd
+        self.grad_w = grad_w
+        self.grad_b = list(db)
+        return dx
+
+    def zero_grad(self):
+        self.grad_w = [[0.0] * self.fan_in for _ in range(self.fan_out)]
+        self.grad_b = [0.0] * self.fan_out
+
+    def param_count(self):
+        return self.fan_out * self.fan_in + self.fan_out
+
+    def _sync_inner(self):
+        self.inner.weights = self.w
+        self.inner.biases = self.b
+
+    def sgd_step(self, lr: float):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"WeightStandardization.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for i in range(self.fan_out):
+            for j in range(self.fan_in):
+                self.w[i][j] -= lr * self.grad_w[i][j]
+            self.b[i] -= lr * self.grad_b[i]
+        self._sync_inner()
+        self.zero_grad()
+
+    def adam_step(self, lr: float, beta1: float = 0.9, beta2: float = 0.999,
+                  eps: float = 1e-8):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr < 0:
+            raise ValueError(
+                f"WeightStandardization.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self._adam_t += 1
+        _adam_apply(self.w, self.grad_w, self.m_w, self.v_w, self._adam_t,
+                    lr, beta1, beta2, eps)
+        _adam_apply(self.b, self.grad_b, self.m_b, self.v_b, self._adam_t,
+                    lr, beta1, beta2, eps)
+        self._sync_inner()
+        self.zero_grad()
+
+    def train(self):
+        self.training = True
+        if hasattr(self.inner, "train"):
+            self.inner.train()
+        return self
+
+    def eval(self):
+        self.training = False
+        if hasattr(self.inner, "eval"):
+            self.inner.eval()
+        return self
+
 class SpectralNorm:
     """谱归一化（Miyato et al. 2018）：w = v / sigma(v)
 
@@ -17009,6 +17165,7 @@ class MoE:
         self.zero_grad()
         self.x = None
         self.routes = None      # 每个 token: [(expert, weight), ...]
+        self._gate_all_probs = None  # 每个 token 的全专家门概率（均衡损失用）
         self.group_index = None  # 每个专家: [token 下标, ...]
         self.group_w = None
 
@@ -17068,6 +17225,7 @@ class MoE:
         self.x = [list(row) for row in x_seq]
 
         routes = []
+        self._gate_all_probs = []
         for t in range(T):
             xt = self.x[t]
             logits = [sum(map(_mul, self.W_gate[e], xt)) + self.b_gate[e]
@@ -17075,6 +17233,7 @@ class MoE:
             order = sorted(range(self.num_experts), key=lambda e: -logits[e])[:self.top_k]
             picked = [logits[e] for e in order]
             probs = _softmax_row(picked)
+            self._gate_all_probs.append(_softmax_row(logits))
             routes.append([(order[k], probs[k]) for k in range(self.top_k)])
         self.routes = routes
 
@@ -17153,6 +17312,40 @@ class MoE:
                     gw[j] += dz * xt[j]
                     dx[t][j] += dz * self.W_gate[e][j]
         return dx
+
+    def load_balancing_loss(self, coefficient: float = 0.01):
+        """Switch Transformer 风格的负载均衡辅助损失。
+
+        记 f_i 为分给专家 i 的 token 比例（按 top_k 计数后归一化），P_i 为
+        路由门分配给专家 i 的平均概率，则
+
+            L_aux = coefficient * num_experts * Σ_i f_i * P_i
+
+        均匀路由时 f_i = P_i = 1/E，L_aux = coefficient；路由塌缩到单个专家时
+        Σ f_i P_i → 1，L_aux → coefficient * E，从而在训练中惩罚塌缩。
+        需要先调用 :meth:`forward` 缓存全专家门概率。
+        """
+        if self._gate_all_probs is None:
+            raise RuntimeError("MoE.load_balancing_loss: 必须先调用 forward()")
+        if isinstance(coefficient, bool) or not isinstance(coefficient, (int, float)) \
+                or not math.isfinite(float(coefficient)) or float(coefficient) < 0.0:
+            raise ValueError(
+                f"MoE.load_balancing_loss: coefficient 必须是非负有限实数，"
+                f"收到 {coefficient!r}")
+        T = len(self._gate_all_probs)
+        E = self.num_experts
+        counts = [0] * E
+        for route in self.routes:
+            for e, _w in route:
+                counts[e] += 1
+        f = [c / float(T * self.top_k) for c in counts]
+        P = [sum(probs[e] for probs in self._gate_all_probs) / float(T)
+             for e in range(E)]
+        return float(coefficient) * float(E) * sum(f[e] * P[e] for e in range(E))
+
+    def aux_loss(self, coefficient: float = 0.01):
+        """:meth:`load_balancing_loss` 的别名。"""
+        return self.load_balancing_loss(coefficient)
 
     # ---- 优化
     def sgd_step(self, lr: float = 0.01):
@@ -48529,6 +48722,194 @@ def _w15_scale_of(value, bits, who):
     return peak / qmax, qmax
 
 
+# NF4（4-bit NormalFloat）：16 个分位点，QLoRA 的默认基座量化格式。
+NF4_LEVELS = [
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+    0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+    0.7229568362236023, 1.0,
+]
+
+
+def _nf4_flat(values, who):
+    """把任意嵌套的数字列表展平成 float 列表。"""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{who}: 输入必须是非空嵌套列表")
+    out = []
+
+    def walk(node):
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+        else:
+            if isinstance(node, bool) or not isinstance(node, (int, float)):
+                raise ValueError(f"{who}: 叶子必须是数字，收到 {node!r}")
+            if not math.isfinite(float(node)):
+                raise ValueError(f"{who}: 叶子必须是有限数字，收到 {node!r}")
+            out.append(float(node))
+
+    walk(values)
+    return out
+
+
+def _nf4_check_int(value, name, who, allow_zero=False):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{who}: {name} 必须是整数，收到 {value!r}")
+    if value < (0 if allow_zero else 1):
+        raise ValueError(f"{who}: {name} 必须 {'>= 0' if allow_zero else '>= 1'}，"
+                         f"收到 {value!r}")
+    return value
+
+
+def _nf4_reshape(flat, template):
+    """按 template 的嵌套形状重建列表。"""
+    state = {"pos": 0}
+
+    def build(node):
+        if isinstance(node, (list, tuple)):
+            return [build(item) for item in node]
+        value = flat[state["pos"]]
+        state["pos"] += 1
+        return value
+
+    return build(template)
+
+
+def nf4_quantize(values, block_size: int = 64):
+    """NF4 量化编码：每个 block 用 absmax 归一化，再取最近的 16 个分位点。
+
+    返回 ``{"codes", "scales", "block_size", "length"}``：``codes`` 是每个元素
+    的 0–15 级编号（扁平顺序），``scales`` 是每个 block 的 absmax 缩放因子。
+    与 :func:`fake_quantize` 的均匀格点不同，NF4 的分位点按正态分布密度布置，
+    在高斯权重上的期望误差更小。
+    """
+    who = "nf4_quantize"
+    _nf4_check_int(block_size, "block_size", who)
+    flat = _nf4_flat(values, who)
+    codes = []
+    scales = []
+    for start in range(0, len(flat), block_size):
+        block = flat[start:start + block_size]
+        absmax = max(abs(v) for v in block)
+        if absmax <= 0.0:
+            scale = 1.0
+            codes.extend([7] * len(block))
+            scales.append(0.0)
+            continue
+        scale = absmax
+        scales.append(scale)
+        for v in block:
+            x = v / scale
+            best = 0
+            best_err = abs(x - NF4_LEVELS[0])
+            for k in range(1, len(NF4_LEVELS)):
+                err = abs(x - NF4_LEVELS[k])
+                if err < best_err:
+                    best = k
+                    best_err = err
+            codes.append(best)
+    return {"codes": codes, "scales": scales, "block_size": block_size,
+            "length": len(flat)}
+
+
+def nf4_dequantize(quant):
+    """把 :func:`nf4_quantize` 的编码还原成扁平浮点列表。"""
+    if not isinstance(quant, dict):
+        raise ValueError("nf4_dequantize: 输入必须是 nf4_quantize 返回的 dict")
+    codes = quant.get("codes")
+    scales = quant.get("scales")
+    block_size = quant.get("block_size")
+    length = quant.get("length")
+    _nf4_check_int(block_size, "block_size", "nf4_dequantize")
+    _nf4_check_int(length, "length", "nf4_dequantize", allow_zero=True)
+    if not isinstance(codes, (list, tuple)) or len(codes) != length:
+        raise ValueError("nf4_dequantize: codes 长度与 length 不一致")
+    if not isinstance(scales, (list, tuple)) or \
+            len(scales) != (length + block_size - 1) // block_size:
+        raise ValueError("nf4_dequantize: scales 数量与 block 数不一致")
+    out = [0.0] * length
+    for i, code in enumerate(codes):
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code < 16:
+            raise ValueError(f"nf4_dequantize: code 必须是 0–15 的整数，收到 {code!r}")
+        out[i] = NF4_LEVELS[code] * scales[i // block_size]
+    return out
+
+
+def nf4_fake_quantize(values, block_size: int = 64):
+    """NF4 伪量化：量化后立刻反量化，返回与输入同形状的浮点列表。"""
+    flat = _nf4_flat(values, "nf4_fake_quantize")
+    quant = nf4_quantize(values, block_size=block_size)
+    out = _nf4_reshape(nf4_dequantize(quant), values)
+    if len(_nf4_flat(out, "nf4_fake_quantize")) != len(flat):
+        raise ValueError("nf4_fake_quantize: 内部形状恢复失败")
+    return out
+
+
+def double_quantize(scales, block_size: int = 256):
+    """双重量化：把一阶 absmax 缩放因子本身再用 8-bit 均匀量化一次。
+
+    QLoRA 的做法：对每 ``block_size`` 个缩放因子算一个二阶 absmax，
+    用 0–255 的整数近似（``code * outer / 255``）。反量化值即近似的
+    一阶缩放因子，显存里只需存 8-bit 码与极少量 fp32 的 outer 值。
+    返回 ``{"codes", "outers", "block_size", "length"}``。
+    """
+    who = "double_quantize"
+    _nf4_check_int(block_size, "block_size", who)
+    flat = _nf4_flat(scales, who)
+    if any(v < 0.0 for v in flat):
+        raise ValueError("double_quantize: 一阶缩放因子不能为负")
+    codes = []
+    outers = []
+    for start in range(0, len(flat), block_size):
+        block = flat[start:start + block_size]
+        outer = max(block)
+        if outer <= 0.0:
+            outers.append(0.0)
+            codes.extend([0] * len(block))
+            continue
+        outers.append(outer)
+        for v in block:
+            q = int(round(255.0 * v / outer))
+            codes.append(max(0, min(255, q)))
+    return {"codes": codes, "outers": outers, "block_size": block_size,
+            "length": len(flat)}
+
+
+def double_dequantize(quant):
+    """把 :func:`double_quantize` 的编码还原成近似的一阶缩放因子列表。"""
+    if not isinstance(quant, dict):
+        raise ValueError("double_dequantize: 输入必须是 double_quantize 返回的 dict")
+    codes = quant.get("codes")
+    outers = quant.get("outers")
+    block_size = quant.get("block_size")
+    length = quant.get("length")
+    _nf4_check_int(block_size, "block_size", "double_dequantize")
+    _nf4_check_int(length, "length", "double_dequantize", allow_zero=True)
+    if not isinstance(codes, (list, tuple)) or len(codes) != length:
+        raise ValueError("double_dequantize: codes 长度与 length 不一致")
+    if not isinstance(outers, (list, tuple)) or \
+            len(outers) != (length + block_size - 1) // block_size:
+        raise ValueError("double_dequantize: outers 数量与 block 数不一致")
+    out = [0.0] * length
+    for i, code in enumerate(codes):
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
+            raise ValueError(f"double_dequantize: code 必须是 0–255 的整数，收到 {code!r}")
+        out[i] = code * outers[i // block_size] / 255.0
+    return out
+
+
+def nf4_fake_quantize_double(values, block_size: int = 64,
+                              outer_block_size: int = 256):
+    """NF4 + 双重量化的伪量化（前向仍是反量化浮点，仅模拟存储压缩）。"""
+    quant = nf4_quantize(values, block_size=block_size)
+    scales2 = double_quantize(quant["scales"], block_size=outer_block_size)
+    approx = double_dequantize(scales2)
+    deq = [0.0] * quant["length"]
+    for i, code in enumerate(quant["codes"]):
+        deq[i] = NF4_LEVELS[code] * approx[i // block_size]
+    return _nf4_reshape(deq, values)
+
 def fake_quantize(value, bits=8, scale=None):
     """对称均匀量化的「伪量化」：量化后再反量化，返回同结构浮点。
 
@@ -56221,6 +56602,148 @@ def quantize_model(model, dtype="fp16"):
             layer.biases[k] = fn(layer.biases[k])
     return model
 
+
+class GradScaler:
+    """动态损失缩放（混合精度训练里 GradScaler 的教学实现）。
+
+    用法与 PyTorch 的 ``torch.cuda.amp.GradScaler`` 对齐的简化版本：
+
+        scaler = GradScaler()
+        loss = model.loss(x, y)
+        scaled = scaler.scale_loss(loss)          # loss * scale
+        grads = model.backward(scaled)             # 反向得到放大后的梯度
+        grads = scaler.unscale(grads)              # 检查 inf/nan 并除回 scale
+        if scaler.update():                        # 没有溢出才真正 step
+            optimizer.step(grads)
+
+    行为：连续 ``growth_interval`` 步没有溢出就把 scale 乘 ``growth_factor``；
+    一旦检测到 inf/nan 就把 scale 乘 ``backoff_factor`` 并跳过该步。
+    溢出检测在 :meth:`unscale` 内完成（float16 上溢常表现为 inf/nan）。
+    """
+
+    def __init__(self, init_scale: float = 65536.0, growth_factor: float = 2.0,
+                 backoff_factor: float = 0.5, growth_interval: int = 2000):
+        for name, value in (("init_scale", init_scale),
+                            ("growth_factor", growth_factor),
+                            ("backoff_factor", backoff_factor)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(
+                    f"GradScaler: {name} 必须是正的有限实数，收到 {value!r}")
+        if growth_factor <= 1.0:
+            raise ValueError("GradScaler: growth_factor 必须 > 1")
+        if not 0.0 < backoff_factor < 1.0:
+            raise ValueError("GradScaler: backoff_factor 必须在 (0, 1) 内")
+        if isinstance(growth_interval, bool) or not isinstance(growth_interval, int) \
+                or growth_interval < 1:
+            raise ValueError("GradScaler: growth_interval 必须是正整数")
+        self.init_scale = float(init_scale)
+        self.growth_factor = float(growth_factor)
+        self.backoff_factor = float(backoff_factor)
+        self.growth_interval = int(growth_interval)
+        self._scale = float(init_scale)
+        self._growth_tracker = 0
+        self._found_inf = False
+        self.steps_skipped = 0
+        self.steps_taken = 0
+        self.total_steps = 0
+
+    @property
+    def scale(self):
+        return self._scale
+
+    def scale_loss(self, loss):
+        if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+            raise ValueError(f"GradScaler.scale_loss: loss 必须是数字，收到 {loss!r}")
+        if not math.isfinite(float(loss)):
+            raise ValueError(f"GradScaler.scale_loss: loss 必须是有限数字，收到 {loss!r}")
+        return float(loss) * self._scale
+
+    @staticmethod
+    def _finite_flat(values, who):
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError(f"{who}: 梯度必须是非空嵌套列表")
+        finite = True
+
+        def walk(node):
+            nonlocal finite
+            if isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item)
+            else:
+                if isinstance(node, bool) or not isinstance(node, (int, float)):
+                    raise ValueError(f"{who}: 梯度叶子必须是数字，收到 {node!r}")
+                if not math.isfinite(float(node)):
+                    finite = False
+
+        walk(values)
+        return finite
+
+    def unscale(self, grads):
+        """检查 inf/nan 并把梯度除回 scale；返回新的梯度结构。"""
+        if not isinstance(grads, (list, tuple)) or not grads:
+            raise ValueError("GradScaler.unscale: grads 必须是非空列表")
+        seen_inf = False
+        out = []
+
+        def walk(node):
+            nonlocal seen_inf
+            if isinstance(node, (list, tuple)):
+                return [walk(item) for item in node]
+            if isinstance(node, bool) or not isinstance(node, (int, float)):
+                raise ValueError(
+                    f"GradScaler.unscale: 梯度叶子必须是数字，收到 {node!r}")
+            if not math.isfinite(float(node)):
+                seen_inf = True
+                return float(node)
+            return float(node) / self._scale
+
+        for item in grads:
+            out.append(walk(item))
+        self._found_inf = seen_inf
+        return out
+
+    def update(self, found_inf=None):
+        """根据本步是否溢出更新 scale；返回是否应执行 optimizer.step。"""
+        overflow = self._found_inf if found_inf is None else bool(found_inf)
+        self.total_steps += 1
+        self._found_inf = False
+        if overflow:
+            self._scale *= self.backoff_factor
+            self._growth_tracker = 0
+            self.steps_skipped += 1
+            return False
+        self._growth_tracker += 1
+        if self._growth_tracker >= self.growth_interval:
+            self._scale *= self.growth_factor
+            self._growth_tracker = 0
+        self.steps_taken += 1
+        return True
+
+    def state_dict(self):
+        return {
+            "scale": self._scale,
+            "growth_tracker": self._growth_tracker,
+            "steps_skipped": self.steps_skipped,
+            "steps_taken": self.steps_taken,
+            "total_steps": self.total_steps,
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            raise ValueError("GradScaler.load_state_dict: 状态必须是 dict")
+        scale = state.get("scale")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) \
+                or not math.isfinite(float(scale)) or float(scale) <= 0.0:
+            raise ValueError("GradScaler.load_state_dict: scale 必须是正的有限实数")
+        tracker = state.get("growth_tracker", 0)
+        if isinstance(tracker, bool) or not isinstance(tracker, int) or tracker < 0:
+            raise ValueError("GradScaler.load_state_dict: growth_tracker 必须是非负整数")
+        self._scale = float(scale)
+        self._growth_tracker = int(tracker)
+        self.steps_skipped = int(state.get("steps_skipped", 0))
+        self.steps_taken = int(state.get("steps_taken", 0))
+        self.total_steps = int(state.get("total_steps", 0))
 
 def mixed_precision_grads(model, xs, ys, scale=1024.0, dtype="fp16"):
     """模拟「loss scaling + 低精度梯度存储」的一步梯度，返回 ``(loss, grads)``

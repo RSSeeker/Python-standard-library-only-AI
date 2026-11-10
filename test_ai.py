@@ -32350,3 +32350,213 @@ class TestCTCBeamSearch:
         _asr_raises(lambda: AI.ctc_prefix_beam_search([[0.0], [1.0, 2.0]]))
         _asr_raises(lambda: AI.ctc_beam_decode([[0.0, float("nan")]]))
         _asr_raises(lambda: AI.ctc_beam_decode([[0.0, 1.0], [0.0]]))
+
+
+import math
+import random
+
+
+def _p1_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except TypeError:
+        if exc is ValueError:
+            return
+        raise
+    raise AssertionError("expected exception")
+
+
+class TestWeightStandardization:
+    def test_forward_and_param_count(self):
+        inner = AI.Layer(3, 2, "linear")
+        ws = AI.WeightStandardization(inner)
+        assert ws.param_count() == 8
+        saved = [row[:] for row in ws.w]
+        out = ws.forward([0.5, -0.3, 0.8])
+        assert len(out) == 2
+        # 前向不改动外层保存的原始权重
+        assert ws.w == saved
+
+    def test_backward_matches_finite_difference(self):
+        inner = AI.Layer(3, 2, "linear")
+        ws = AI.WeightStandardization(inner)
+        x = [0.5, -0.3, 0.8]
+        dout = [1.0, -0.5]
+
+        def loss():
+            o = ws.forward(x)
+            return sum(o[i] * dout[i] for i in range(2))
+
+        loss()
+        ws.zero_grad()
+        ws.backward(dout)
+        h = 1e-5
+        for i, j in ((0, 1), (1, 0)):
+            p0 = ws.w[i][j]
+            ws.w[i][j] = p0 + h
+            fp = loss()
+            ws.w[i][j] = p0 - h
+            fm = loss()
+            ws.w[i][j] = p0
+            fd = (fp - fm) / (2 * h)
+            assert abs(ws.grad_w[i][j] - fd) < 1e-5 * max(1.0, abs(fd))
+        p0 = ws.b[0]
+        ws.b[0] = p0 + h
+        fp = loss()
+        ws.b[0] = p0 - h
+        fm = loss()
+        ws.b[0] = p0
+        fd = (fp - fm) / (2 * h)
+        assert abs(ws.grad_b[0] - fd) < 1e-5
+
+    def test_updates_and_invalid(self):
+        ws = AI.WeightStandardization(AI.Layer(3, 2, "linear"))
+        ws.forward([0.5, -0.3, 0.8])
+        ws.backward([1.0, -0.5])
+        before = [row[:] for row in ws.w]
+        ws.sgd_step(0.1)
+        assert ws.w != before
+        ws.forward([0.5, -0.3, 0.8])
+        ws.backward([1.0, -0.5])
+        ws.adam_step(1e-3)
+        assert all(isinstance(v, float) for row in ws.w for v in row)
+        _p1_raises(lambda: AI.WeightStandardization(AI.Layer(3, 2, "relu"), eps=0))
+        _p1_raises(lambda: AI.WeightStandardization(object()))
+        ws2 = AI.WeightStandardization(AI.Layer(3, 2, "linear"))
+        _p1_raises(lambda: ws2.backward([1.0, 2.0]), RuntimeError)
+        _p1_raises(lambda: ws2.forward([1.0, 2.0]))
+        _p1_raises(lambda: ws2.sgd_step(-1.0))
+
+
+class TestNF4Quant:
+    def test_levels_and_roundtrip(self):
+        assert len(AI.NF4_LEVELS) == 16
+        assert AI.NF4_LEVELS[0] == -1.0
+        assert AI.NF4_LEVELS[-1] == 1.0
+        assert sorted(AI.NF4_LEVELS) == list(AI.NF4_LEVELS)
+        one = [[AI.NF4_LEVELS[i] * 3.0 for i in range(16)]]
+        deq = AI.nf4_fake_quantize(one, block_size=16)
+        assert len(deq) == 1 and len(deq[0]) == 16
+        for i in range(16):
+            assert abs(deq[0][i] - one[0][i]) < 1e-6
+        z = AI.nf4_fake_quantize([[0.0, 0.0, 0.0]], block_size=4)
+        assert z == [[0.0, 0.0, 0.0]]
+
+    def test_error_better_than_uniform(self):
+        random.seed(11)
+        w = [[random.gauss(0.0, 0.5) for _ in range(16)] for _ in range(4)]
+        nf4 = AI.nf4_fake_quantize(w, block_size=16)
+        uni = AI.fake_quantize(w, bits=4)
+        err_nf4 = sum(abs(a - b) for ra, rb in zip(nf4, w) for a, b in zip(ra, rb))
+        err_uni = sum(abs(a - b) for ra, rb in zip(uni, w) for a, b in zip(ra, rb))
+        # NF4 按正态分位点布点，在高斯权重的期望误差应小于 4-bit 均匀量化
+        assert err_nf4 < err_uni
+
+    def test_double_quantization(self):
+        random.seed(12)
+        w = [[random.gauss(0.0, 0.3) for _ in range(16)] for _ in range(4)]
+        q = AI.nf4_quantize(w, block_size=16)
+        dq = AI.double_quantize(q["scales"], block_size=64)
+        approx = AI.double_dequantize(dq)
+        assert len(approx) == len(q["scales"])
+        for a, b in zip(approx, q["scales"]):
+            assert abs(a - b) <= max(a, 1e-9) * 0.01
+        out = AI.nf4_fake_quantize_double(w, block_size=16, outer_block_size=64)
+        assert len(out) == 4 and len(out[0]) == 16
+        _p1_raises(lambda: AI.nf4_quantize([], block_size=16))
+        _p1_raises(lambda: AI.nf4_quantize([[1.0]], block_size=0))
+        _p1_raises(lambda: AI.double_quantize([-1.0], block_size=4))
+
+    def test_invalid_codes(self):
+        _p1_raises(lambda: AI.nf4_dequantize({
+            "codes": [16], "scales": [1.0], "block_size": 1, "length": 1}))
+        _p1_raises(lambda: AI.nf4_dequantize({
+            "codes": [0], "scales": [], "block_size": 1, "length": 1}))
+
+
+class TestGradScaler:
+    def test_scale_unscale_update(self):
+        gs = AI.GradScaler(init_scale=8.0, growth_factor=2.0,
+                           backoff_factor=0.5, growth_interval=2)
+        assert gs.scale == 8.0
+        assert abs(gs.scale_loss(2.0) - 16.0) < 1e-12
+        grads = [[[1.0, -2.0], [3.0, 4.0]], [0.5, -0.5]]
+        un = gs.unscale(grads)
+        assert abs(un[0][0][0] - 1.0 / 8.0) < 1e-12
+        assert gs.update() is True
+        assert gs.scale == 8.0
+        assert gs.update() is True
+        assert gs.scale == 16.0
+        bad = [[[1.0, float("inf")], [0.0, 0.0]], [0.0, 0.0]]
+        gs.unscale(bad)
+        assert gs.update() is False
+        assert gs.scale == 8.0
+        assert gs.steps_skipped == 1
+        assert gs.steps_taken == 2
+
+    def test_state_dict_and_invalid(self):
+        gs = AI.GradScaler(init_scale=4.0, growth_interval=2)
+        gs.scale_loss(1.0)
+        gs.unscale([1.0, 2.0])
+        gs.update()
+        st = gs.state_dict()
+        gs2 = AI.GradScaler(init_scale=1.0)
+        gs2.load_state_dict(st)
+        assert gs2.scale == gs.scale
+        assert gs2.state_dict()["growth_tracker"] == st["growth_tracker"]
+        _p1_raises(lambda: AI.GradScaler(init_scale=0.0))
+        _p1_raises(lambda: AI.GradScaler(growth_factor=1.0))
+        _p1_raises(lambda: AI.GradScaler(backoff_factor=1.0))
+        _p1_raises(lambda: AI.GradScaler(growth_interval=0))
+        _p1_raises(lambda: gs.scale_loss(float("nan")))
+        _p1_raises(lambda: gs.unscale([]))
+        _p1_raises(lambda: gs.load_state_dict({"scale": -1.0}))
+        # 非有限梯度被识别为溢出
+        gs.unscale([[float("nan")], [0.0]])
+        assert gs.update() is False
+
+
+class TestMoEAuxLoss:
+    @staticmethod
+    def _make(num_experts=4, top_k=2):
+        moe = AI.MoE(6, 12, num_experts=num_experts, top_k=top_k)
+        moe.W_gate = [[0.0] * 6 for _ in range(num_experts)]
+        moe.b_gate = [0.0] * num_experts
+        return moe
+
+    def test_uniform_and_collapse(self):
+        random.seed(3)
+        xs = [[random.gauss(0.0, 1.0) for _ in range(6)] for _ in range(20)]
+        moe = self._make(top_k=2)
+        moe.forward(xs)
+        # 全部 logits 相等时 top-2 固定为专家 0/1，但 P 均匀；aux 仍为正
+        val = moe.load_balancing_loss(0.03)
+        assert math.isfinite(val) and val >= 0.0
+        # 手工公式
+        E = moe.num_experts
+        T = len(xs)
+        counts = [0] * E
+        for route in moe.routes:
+            for e, _w in route:
+                counts[e] += 1
+        f = [c / float(T * moe.top_k) for c in counts]
+        P = [sum(p[e] for p in moe._gate_all_probs) / float(T) for e in range(E)]
+        manual = 0.03 * E * sum(f[e] * P[e] for e in range(E))
+        assert abs(val - manual) < 1e-12
+
+        # 塌缩：bias 强烈偏向专家 0
+        moe2 = self._make(top_k=1)
+        moe2.b_gate = [20.0, 0.0, 0.0, 0.0]
+        moe2.forward(xs)
+        collapsed = moe2.load_balancing_loss(0.01)
+        assert collapsed > 0.01 * 4 * 0.9
+
+    def test_invalid(self):
+        moe = self._make()
+        _p1_raises(lambda: moe.load_balancing_loss(0.01), RuntimeError)
+        moe.forward([[0.1 * i for i in range(6)] for _ in range(4)])
+        _p1_raises(lambda: moe.aux_loss(-0.1))
+        _p1_raises(lambda: moe.load_balancing_loss(True))
+        _p1_raises(lambda: moe.load_balancing_loss(float("inf")))

@@ -835,8 +835,9 @@
 
 - [x] ELECTRA 预训练框架：`ElectraDiscriminator`（双向 Transformer + 逐位置二分类头）与
   `ElectraModel`（`MaskedLM` 生成器 + 判别器，遮罩检测式预训练）；测试 `TestElectra` 5 例
+- [x] 训练小件补充：`WeightStandardization`（沿 fan_in 行标准化，反向精确公式）、`NF4_LEVELS` / `nf4_quantize` / `nf4_dequantize` / `nf4_fake_quantize`（QLoRA 分位点量化）、`double_quantize` / `double_dequantize`（absmax 缩放因子再量化）、`GradScaler`（动态 loss scaling）与 `MoE.load_balancing_loss`（Switch 负载均衡辅助损失）；测试 `TestWeightStandardization` / `TestNF4Quant` / `TestGradScaler` / `TestMoEAuxLoss` 共 11 例
 
-全量测试：1839 → 2082 passed（新增 243 例）。
+全量测试：1839 → 2093 passed（新增 254 例）。
 
 ---
 
