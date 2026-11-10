@@ -32809,3 +32809,105 @@ class TestMuP:
         _mup_raises(lambda: AI.mup_lr(_NotMLP()))
         _mup_raises(lambda: AI.mup_init(_NotMLP()))
         _mup_raises(lambda: AI.MuPAdam(_NotMLP()))
+
+
+import math
+
+import AI
+
+
+def _mcts_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestMCTS:
+    def test_prefers_high_value(self):
+        r = AI.mcts_search(lambda s: [("a", 0.9), ("b", 0.1)],
+                           lambda s: 1.0 if s == ("b",) else 0.0,
+                           lambda s: len(s) >= 1, (), num_simulations=100, seed=1)
+        assert r["action"] == "b"
+        assert abs(r["value"] - 1.0) < 1e-12
+        assert r["root_visits"] == 100
+        total = sum(c["visits"] for c in r["children"])
+        assert total == 100
+
+    def test_next_state_fn(self):
+        r = AI.mcts_search(lambda s: [(1, 0.5), (2, 0.5)],
+                           lambda s: float(s[0]),
+                           lambda s: s[0] >= 4, (0,), num_simulations=60,
+                           next_state_fn=lambda st, a: (st[0] + a,), seed=2)
+        assert r["action"] in (1, 2)
+        assert r["root_visits"] == 60
+
+    def test_terminal_root(self):
+        r = AI.mcts_search(lambda s: [("only", 1.0)], lambda s: 2.0,
+                           lambda s: True, "root", num_simulations=5, seed=0)
+        assert r["action"] is None
+        assert abs(r["value"] - 2.0) < 1e-12
+        assert r["root_visits"] == 5
+
+    def test_equal_values(self):
+        r = AI.mcts_search(lambda s: [("a", 0.5), ("b", 0.5)],
+                           lambda s: 0.0,
+                           lambda s: len(s) >= 1, (), num_simulations=40, seed=3)
+        assert r["action"] in ("a", "b")
+        assert r["root_visits"] == 40
+
+    def test_invalid_inputs(self):
+        good_propose = lambda s: [("a", 1.0)]  # noqa: E731
+        good_value = lambda s: 0.0  # noqa: E731
+        good_term = lambda s: len(s) >= 1  # noqa: E731
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, good_term, (), num_simulations=0))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, good_term, (), c_puct=0.0))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, good_term, (), c_puct=float("nan")))
+        assert _mcts_raises(lambda: AI.mcts_search("x", good_value, good_term, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, "x", good_term, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, "x", ()))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, good_term, (), next_state_fn=3))
+        assert _mcts_raises(lambda: AI.mcts_search(lambda s: [], lambda s: 0.0, lambda s: len(s) >= 5, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(lambda s: [("a", -1.0)], lambda s: 0.0, lambda s: len(s) >= 5, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(lambda s: [("a", float("nan"))], lambda s: 0.0, lambda s: len(s) >= 5, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, lambda s: float("nan"), good_term, ()))
+        assert _mcts_raises(lambda: AI.mcts_search(good_propose, good_value, lambda s: "no", ()))
+
+
+class TestTreeOfThought:
+    def test_best_path(self):
+        r = AI.tree_of_thought(lambda s: [("l", 0.5), ("r", 0.5)],
+                               lambda s: 5.0 if s == ("l", "r") else 0.0,
+                               lambda s: len(s) >= 2, (), breadth=2, depth=2, seed=0)
+        assert r["path"] == ["l", "r"]
+        assert abs(r["score"] - 5.0) < 1e-12
+
+    def test_next_state_fn(self):
+        r = AI.tree_of_thought(lambda s: [("x", 0.5), ("y", 0.5)],
+                               lambda s: 3.0 if s[0] == 1 else 0.0,
+                               lambda s: s[0] >= 1, (0,), breadth=2, depth=3,
+                               next_state_fn=lambda st, a: (st[0] + 1,), seed=1)
+        assert abs(r["score"] - 3.0) < 1e-12
+
+    def test_depth_limit(self):
+        r = AI.tree_of_thought(lambda s: [("x", 1.0)],
+                               lambda s: float(len(s)),
+                               lambda s: len(s) >= 4, (), breadth=1, depth=2, seed=0)
+        assert r["path"] == ["x", "x"]
+        assert abs(r["score"] - 2.0) < 1e-12
+
+    def test_invalid_inputs(self):
+        good_propose = lambda s: [("a", 1.0)]  # noqa: E731
+        good_eval = lambda s: 0.0  # noqa: E731
+        good_term = lambda s: len(s) >= 1  # noqa: E731
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, good_term, (), breadth=0))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, good_term, (), depth=0))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, good_term, (), beam_width=0))
+        assert _mcts_raises(lambda: AI.tree_of_thought("x", good_eval, good_term, ()))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, "x", good_term, ()))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, "x", ()))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, good_term, (), next_state_fn=1))
+        assert _mcts_raises(lambda: AI.tree_of_thought(lambda s: [], good_eval, lambda s: len(s) >= 5, ()))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, lambda s: "x", good_term, ()))
+        assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, lambda s: "no", ()))

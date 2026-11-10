@@ -838,8 +838,9 @@
 - [x] 训练小件补充：`WeightStandardization`（沿 fan_in 行标准化，反向精确公式）、`NF4_LEVELS` / `nf4_quantize` / `nf4_dequantize` / `nf4_fake_quantize`（QLoRA 分位点量化）、`double_quantize` / `double_dequantize`（absmax 缩放因子再量化）、`GradScaler`（动态 loss scaling）与 `MoE.load_balancing_loss`（Switch 负载均衡辅助损失）；测试 `TestWeightStandardization` / `TestNF4Quant` / `TestGradScaler` / `TestMoEAuxLoss` 共 11 例
 - [x] GRPO 族工具：`group_relative_advantages`（组内归一化）、`grpo_losses`（逐步 PPO 裁剪 + 长度归一化）、`best_of_n`、`self_consistency`、`rejection_sampling_filter`；`TestGRPO` / `TestBestOfN` / `TestSelfConsistency` / `TestRejectionSampling` 共 10 例。
 - [x] μP 参数化：`mup_target_std`（按 input / hidden / readout 分层给初始化 std，hidden 随宽度反比、readout 正比）、`mup_init`、`mup_lr`（逐层学习率）与 `MuPAdam`（每层用自己的 lr 做 Adam 更新）；`TestMuP` 5 例。
+- [x] 推理搜索：`MCTSNode`、`mcts_search`（PUCT 选择、单叶扩展、backprop 价值与访问数、按访问次数选动作，支持 `next_state_fn`）、`tree_of_thought`（逐层扩展 + 评分 + beam 剪枝）；`TestMCTS` 5 例、`TestTreeOfThought` 4 例。
 
-全量测试：1839 → 2108 passed（新增 269 例）。
+全量测试：1839 → 2117 passed（新增 278 例）。
 
 ---
 

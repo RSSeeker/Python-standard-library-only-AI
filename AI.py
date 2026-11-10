@@ -35670,6 +35670,234 @@ def rejection_sampling_filter(samples, rewards, threshold=None, top_ratio=None):
     kept_samples = [samples[i] for i in kept]
     return kept_samples, kept
 
+"""P4: Tree-of-Thought / MCTS search utilities (insert before class PPOAgent)."""
+
+
+
+"""P4: Tree-of-Thought / MCTS search utilities (insert before class PPOAgent)."""
+
+
+class MCTSNode:
+    """Monte-Carlo tree search node (single-player, maximize leaf value)."""
+
+    def __init__(self, state, parent=None, action=None, prior=0.0, depth=0):
+        self.state = state
+        self.parent = parent
+        self.action = action
+        self.prior = float(prior)
+        self.depth = depth
+        self.children = []
+        self.visits = 0
+        self.value_sum = 0.0
+        self.is_expanded = False
+
+    def value(self):
+        if self.visits == 0:
+            return 0.0
+        return self.value_sum / self.visits
+
+    def __repr__(self):
+        return "MCTSNode(depth=%d, visits=%d, value=%.4f)" % (
+            self.depth, self.visits, self.value())
+
+
+def _mcts_check_pos_int(value, name, minimum=1):
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError("MCTS: %s 必须是 >=%d 的整数" % (name, minimum))
+    return value
+
+
+def _mcts_check_pos_number(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("MCTS: %s 必须是正数" % name)
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("MCTS: %s 必须是正的有限数字" % name)
+    return value
+
+
+def _mcts_proposals(propose_fn, state, who):
+    proposals = propose_fn(state)
+    if not isinstance(proposals, (list, tuple)) or not proposals:
+        raise ValueError("MCTS: %s 必须返回非空的 [(action, prior), ...]" % who)
+    out = []
+    for item in proposals:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("MCTS: %s 的每个 proposal 必须是 (action, prior)" % who)
+        action, prior = item
+        if not isinstance(prior, (int, float)) or isinstance(prior, bool):
+            raise ValueError("MCTS: prior 必须是数字")
+        prior = float(prior)
+        if not math.isfinite(prior) or prior < 0.0:
+            raise ValueError("MCTS: prior 必须是有限非负数")
+        out.append((action, prior))
+    total = sum(p for _, p in out)
+    if total <= 0.0:
+        out = [(a, 1.0 / len(out)) for a, _ in out]
+    else:
+        out = [(a, p / total) for a, p in out]
+    return out
+
+
+def _mcts_child_state(state, action, next_state_fn):
+    if next_state_fn is not None:
+        return next_state_fn(state, action)
+    if isinstance(state, tuple):
+        return state + (action,)
+    return (state, action)
+
+
+def _mcts_score(value_fn, state, who):
+    score = value_fn(state)
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        raise ValueError("MCTS: %s 必须返回数字" % who)
+    score = float(score)
+    if not math.isfinite(score):
+        raise ValueError("MCTS: %s 返回了非有限值" % who)
+    return score
+
+
+def _mcts_terminal(is_terminal, state):
+    flag = is_terminal(state)
+    if not isinstance(flag, bool):
+        raise ValueError("MCTS: is_terminal 必须返回布尔值")
+    return flag
+
+def _mcts_pick_child(node, exploration):
+    """PUCT selection: Q + c * P * sqrt(parent_visits) / (1 + visits)."""
+    total = node.visits
+    best = None
+    best_score = None
+    for child in node.children:
+        q = child.value()
+        u = exploration * child.prior * math.sqrt(total) / (1.0 + child.visits)
+        score = q + u
+        if best is None or score > best_score:
+            best = child
+            best_score = score
+    return best
+
+
+def mcts_search(propose_fn, value_fn, is_terminal, initial_state,
+                num_simulations=128, c_puct=1.4, max_depth=16,
+                next_state_fn=None, seed=None):
+    """Run PUCT MCTS from ``initial_state``; return a summary dict.
+
+    ``propose_fn(state)`` returns ``[(action, prior), ...]``.
+    ``value_fn(state)`` returns a finite number to maximize.
+    ``is_terminal(state)`` returns True when no further action is possible.
+    ``next_state_fn(state, action)`` derives the child state; when omitted,
+    tuples are extended by the action and other states become ``(state, action)``.
+    """
+    _mcts_check_pos_int(num_simulations, "num_simulations")
+    _mcts_check_pos_int(max_depth, "max_depth")
+    exploration = _mcts_check_pos_number(c_puct, "c_puct")
+    if not callable(propose_fn) or not callable(value_fn) or not callable(is_terminal):
+        raise ValueError("MCTS: propose_fn / value_fn / is_terminal 必须可调用")
+    if next_state_fn is not None and not callable(next_state_fn):
+        raise ValueError("MCTS: next_state_fn 必须可调用或为 None")
+    rng = random.Random(seed)
+    root = MCTSNode(initial_state)
+    for _ in range(num_simulations):
+        node = root
+        visited = [root]
+        depth = 0
+        # 1) selection
+        while node.is_expanded and node.children and depth < max_depth:
+            child = _mcts_pick_child(node, exploration)
+            visited.append(child)
+            node = child
+            depth += 1
+        # 2) expansion (a single leaf per simulation)
+        if not node.is_expanded and not _mcts_terminal(is_terminal, node.state) and depth < max_depth:
+            proposals = _mcts_proposals(propose_fn, node.state, "propose_fn")
+            for action, prior in proposals:
+                state = _mcts_child_state(node.state, action, next_state_fn)
+                node.children.append(MCTSNode(state, parent=node, action=action,
+                                              prior=prior, depth=node.depth + 1))
+            node.is_expanded = True
+            if node.children:
+                child = node.children[rng.randrange(len(node.children))]
+                visited.append(child)
+                node = child
+                depth += 1
+        # 3) evaluation
+        value = _mcts_score(value_fn, node.state, "value_fn")
+        # 4) backpropagation
+        for item in visited:
+            item.visits += 1
+            item.value_sum += value
+    if not root.children:
+        return {"action": None, "value": _mcts_score(value_fn, root.state, "value_fn"),
+                "visits": 0, "root_visits": root.visits, "children": []}
+    best = root.children[0]
+    for child in root.children[1:]:
+        if child.visits > best.visits:
+            best = child
+        elif child.visits == best.visits and child.value() > best.value():
+            best = child
+    return {
+        "action": best.action,
+        "value": best.value(),
+        "visits": best.visits,
+        "root_visits": root.visits,
+        "children": [
+            {"action": c.action, "visits": c.visits, "value": c.value()}
+            for c in root.children
+        ],
+    }
+
+
+def tree_of_thought(propose_fn, evaluate_fn, is_terminal, initial_state,
+                    breadth=4, depth=3, beam_width=None,
+                    next_state_fn=None, seed=None):
+    """Breadth-first tree search with optional beam pruning.
+
+    Returns ``{"path": [...actions], "score": float, "expanded": int}``.
+    """
+    _mcts_check_pos_int(breadth, "breadth")
+    _mcts_check_pos_int(depth, "depth")
+    if beam_width is None:
+        beam_width = breadth
+    _mcts_check_pos_int(beam_width, "beam_width")
+    if not callable(propose_fn) or not callable(evaluate_fn) or not callable(is_terminal):
+        raise ValueError("ToT: propose_fn / evaluate_fn / is_terminal 必须可调用")
+    if next_state_fn is not None and not callable(next_state_fn):
+        raise ValueError("ToT: next_state_fn 必须可调用或为 None")
+    rng = random.Random(seed)
+    frontier = [(initial_state, [], _mcts_score(evaluate_fn, initial_state, "evaluate_fn"))]
+    best = None
+    for _level in range(depth):
+        candidates = []
+        for state, path, _score in frontier:
+            if _mcts_terminal(is_terminal, state):
+                if best is None or _score > best["score"]:
+                    best = {"path": list(path), "score": _score}
+                continue
+            proposals = _mcts_proposals(propose_fn, state, "propose_fn")
+            order = list(range(len(proposals)))
+            rng.shuffle(order)
+            for idx in order[:breadth]:
+                action, _prior = proposals[idx]
+                child_state = _mcts_child_state(state, action, next_state_fn)
+                child_path = list(path) + [action]
+                child_score = _mcts_score(evaluate_fn, child_state, "evaluate_fn")
+                candidates.append((child_state, child_path, child_score))
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        if best is not None and candidates[0][2] <= best["score"]:
+            break
+        frontier = candidates[:beam_width]
+    for state, path, score in frontier:
+        if _mcts_terminal(is_terminal, state) and (best is None or score > best["score"]):
+            best = {"path": list(path), "score": score}
+    if best is None:
+        state, path, score = frontier[0]
+        best = {"path": list(path), "score": score}
+    return {"path": best["path"], "score": best["score"],
+            "expanded": len(frontier)}
+
 class PPOAgent:
     """PPO（裁剪目标 + GAE + 熵正则）的离散动作实现。
 

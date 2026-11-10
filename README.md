@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2108 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2117 项）
 
 ## 特性
 
@@ -875,6 +875,44 @@ opt = AI.MuPAdam(m, base_lr=1e-3)       # 按 lrs 逐层更新
 
 边界：这是简化版 μP，只覆盖小型 MLP 的宽度参数化；不包含完整 Tensor Programs 谱系、
 attention / embedding 的 μP 特化，也不改变反向传播。
+
+### 推理搜索（MCTS / Tree-of-Thought）
+
+不依赖具体模型的搜索工具，用回调描述状态转移与价值评估，可直接用于 toy 模型或 LLM 采样：
+
+```python
+import AI
+
+# 单智能体 MCTS：按 PUCT 选择、按访问次数选最优动作
+result = AI.mcts_search(
+    propose_fn=lambda state: [("up", 0.7), ("down", 0.3)],
+    value_fn=lambda state: 1.0 if state == ("down",) else 0.0,
+    is_terminal=lambda state: len(state) >= 1,
+    initial_state=(),
+    num_simulations=64,
+    seed=0,
+)
+print(result["action"])   # down
+
+# Tree-of-Thought：逐层扩展 + 评分 + beam 剪枝
+best = AI.tree_of_thought(
+    propose_fn=lambda state: [("a", 0.5), ("b", 0.5)],
+    evaluate_fn=lambda state: 5.0 if state == ("b", "b") else 0.0,
+    is_terminal=lambda state: len(state) >= 2,
+    initial_state=(),
+    breadth=2,
+    depth=2,
+)
+print(best["path"], best["score"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `mcts_search(propose_fn, value_fn, is_terminal, initial_state, num_simulations=128, c_puct=1.4, max_depth=16, seed=None, next_state_fn=None)` | 单智能体 PUCT 树搜索；返回最优动作、价值、访问次数与 children 统计 |
+| `tree_of_thought(propose_fn, evaluate_fn, is_terminal, initial_state, breadth=4, depth=3, beam_width=None, seed=None, next_state_fn=None)` | 逐层扩展、评分、beam 剪枝，返回最优路径与其分数 |
+| `MCTSNode` | 搜索节点（state / parent / action / prior / depth / children / visits / value_sum） |
+
+边界：只做搜索与状态组织，不依赖也不训练任何模型；同分时按 `(-visits/价值, action)` 稳定排序；`next_state_fn` 缺省时以 `(state, action)` 扩展状态，复杂状态请显式传入；PUCT 未加入虚拟损失，ToT 也不使用价值网络。
 
 ### 损失函数
 
@@ -3955,7 +3993,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2108 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2117 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4158,6 +4196,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSelfConsistency` | 多数投票、并列、`normalize` 规范化、空/不可哈希输入 |
 | `TestRejectionSampling` | 阈值过滤、`top_ratio` 保留、空结果与非法参数 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
+| `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
+| `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4292,7 +4332,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2108 个单元测试
+├── test_ai.py       # 2117 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
