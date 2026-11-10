@@ -24705,6 +24705,193 @@ def ctc_loss(log_probs, targets, blank: int = 0):
 #  Optimizer: Adam
 # ============================================================================
 
+def mup_target_std(kind, fan_in, base_width=1.0, width=None, scale=1.0):
+    """μP 风格的分层初始化标准差。
+
+    kind 取 "input" / "hidden" / "readout"：
+
+    - input：sqrt(1/fan_in)
+    - hidden：sqrt(2/fan_in)（按 ReLU 的 He 初始化）
+    - readout：sqrt(1/fan_in)
+
+    ``width`` 与 ``base_width`` 只用于文档一致性检查：显式给出时按
+    ``width_mult = width / base_width`` 缩放最终标准差（hidden 乘
+    1/sqrt(width_mult)、readout 乘 sqrt(width_mult)），便于把窄模型上
+    调好的配置迁移到宽模型。
+    """
+    if kind not in ("input", "hidden", "readout"):
+        raise ValueError("mup_target_std: kind 必须是 input/hidden/readout")
+    fan_in = _mup_check_pos_int(fan_in, "fan_in")
+    base_width = _mup_check_pos_number(base_width, "base_width")
+    if width is not None:
+        width = _mup_check_pos_number(width, "width")
+        width_mult = width / base_width
+    else:
+        width_mult = 1.0
+    if not scale > 0.0:
+        raise ValueError("mup_target_std: scale 必须 > 0")
+    if kind == "hidden":
+        return scale * math.sqrt(2.0 / fan_in) / math.sqrt(width_mult)
+    if kind == "readout":
+        return scale * math.sqrt(1.0 / fan_in) * math.sqrt(width_mult)
+    return scale * math.sqrt(1.0 / fan_in)
+
+
+def _mup_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"mup: {name} 必须是正整数")
+    if value <= 0:
+        raise ValueError(f"mup: {name} 必须 > 0，收到 {value!r}")
+    return value
+
+
+def _mup_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"mup: {name} 必须是数字")
+    f = float(value)
+    if not (f == f and -float("inf") < f < float("inf")) or f <= 0.0:
+        raise ValueError(f"mup: {name} 必须是正有限数，收到 {value!r}")
+    return f
+
+
+def _mup_layer_kinds(num_layers):
+    if num_layers < 1:
+        raise ValueError("mup: 网络至少需要 1 层")
+    if num_layers == 1:
+        return ["readout"]
+    if num_layers == 2:
+        return ["input", "readout"]
+    kinds = ["input"] + ["hidden"] * (num_layers - 2) + ["readout"]
+    return kinds
+
+
+def mup_init(model, seed=None, input_std=None, hidden_std=None,
+             readout_std=None, bias_std=0.0):
+    """按 μP 风格的分层标准差初始化 MLP 权重（原地修改）。
+
+    默认标准差由 ``mup_target_std`` 给出；也可用 input_std/hidden_std/
+    readout_std 显式覆盖。``seed`` 是 ``random.Random(seed)`` 的种子，
+    传入 ``seed=None`` 时使用全局 random 状态（便于和现有初始化对齐）。
+    返回 model 本身。
+    """
+    if not isinstance(model, MLP):
+        raise TypeError("mup_init: model 必须是 MLP")
+    bias_std = float(bias_std)
+    if not (bias_std == bias_std and 0.0 <= bias_std < float("inf")):
+        raise ValueError("mup_init: bias_std 必须是非负有限数")
+    overrides = {"input": input_std, "hidden": hidden_std,
+                 "readout": readout_std}
+    for key, value in overrides.items():
+        if value is not None:
+            overrides[key] = _mup_check_pos_number(value, f"{key}_std")
+    rng = random.Random(seed) if seed is not None else random
+    kinds = _mup_layer_kinds(len(model.layers))
+    for layer, kind in zip(model.layers, kinds):
+        std = overrides[kind]
+        if std is None:
+            std = mup_target_std(kind, layer.fan_in)
+        for j in range(layer.fan_out):
+            row = layer.weights[j]
+            for i in range(layer.fan_in):
+                row[i] = rng.gauss(0.0, std)
+            if bias_std > 0.0:
+                layer.biases[j] = rng.gauss(0.0, bias_std)
+            else:
+                layer.biases[j] = 0.0
+    return model
+
+
+def mup_lr(model, base_lr=1e-3, width=None, base_width=1):
+    """μP 风格的分层学习率列表（模型有几层就返回几个数）。
+
+    ``width_mult = width / base_width``；hidden 层
+    ``lr = base_lr / width_mult``，readout 层 ``lr = base_lr * width_mult``，
+    input 层 ``lr = base_lr``。``width`` 缺省时取最宽的隐藏层
+    （所有层 fan_in 的最大值），因此窄模型只需传 base_lr 即可。
+    """
+    if not isinstance(model, MLP):
+        raise TypeError("mup_lr: model 必须是 MLP")
+    base_lr = _mup_check_pos_number(base_lr, "base_lr")
+    base_width = _mup_check_pos_number(base_width, "base_width")
+    if width is None:
+        width = max(layer.fan_in for layer in model.layers)
+    width = _mup_check_pos_number(width, "width")
+    width_mult = width / base_width
+    kinds = _mup_layer_kinds(len(model.layers))
+    lrs = []
+    for kind in kinds:
+        if kind == "hidden":
+            lrs.append(base_lr / width_mult)
+        elif kind == "readout":
+            lrs.append(base_lr * width_mult)
+        else:
+            lrs.append(base_lr)
+    return lrs
+
+
+class MuPAdam:
+    """μP 风格的 Adam：每个参数组用 ``mup_lr`` 给出的独立学习率。
+
+    更新公式与 :class:`Adam` 相同（一阶矩、二阶矩、偏差修正），只是
+    ``lr`` 逐层不同，用于演示「同一 base_lr 在窄/宽模型间迁移」。
+    ``layer_lrs`` 在构造时按 ``width``（缺省取最宽隐藏层）固定下来；
+    ``step`` 的 all_grads 与 Adam 完全一致（每层一个 (grad_w, grad_b)）。
+    """
+
+    def __init__(self, model, base_lr=1e-3, width=None, base_width=1,
+                 beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(model, MLP):
+            raise TypeError("MuPAdam: model 必须是 MLP")
+        self.model = model
+        self.base_lr = _mup_check_pos_number(base_lr, "base_lr")
+        self.base_width = _mup_check_pos_number(base_width, "base_width")
+        self.layer_lrs = mup_lr(model, self.base_lr, width=width,
+                                base_width=self.base_width)
+        self.beta1 = _mup_check_pos_number(beta1, "beta1")
+        self.beta2 = _mup_check_pos_number(beta2, "beta2")
+        if not (0.0 <= self.beta1 < 1.0):
+            raise ValueError("MuPAdam: beta1 必须在 [0,1)")
+        if not (0.0 <= self.beta2 < 1.0):
+            raise ValueError("MuPAdam: beta2 必须在 [0,1)")
+        self.eps = _mup_check_pos_number(eps, "eps")
+        self.step_count = 0
+
+    def step(self, all_grads):
+        if not isinstance(all_grads, (list, tuple)):
+            raise TypeError("MuPAdam.step: all_grads 必须是列表")
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError(
+                f"MuPAdam.step: 需要 {len(self.model.layers)} 层梯度，"
+                f"收到 {len(all_grads)}")
+        self.step_count += 1
+        b1, b2, eps = self.beta1, self.beta2, self.eps
+        c1 = 1.0 - b1 ** self.step_count
+        c2 = 1.0 - b2 ** self.step_count
+        o1, o2 = 1.0 - b1, 1.0 - b2
+        sqrt = math.sqrt
+        for layer, lr, (grad_w, grad_b) in zip(
+                self.model.layers, self.layer_lrs, all_grads):
+            if lr <= 0.0:
+                continue
+            m_w, v_w, W = layer.m_w, layer.v_w, layer.weights
+            m_b, v_b, B = layer.m_b, layer.v_b, layer.biases
+            for j in range(layer.fan_out):
+                g = grad_b[j]
+                m = b1 * m_b[j] + o1 * g
+                v = b2 * v_b[j] + o2 * g * g
+                m_b[j] = m
+                v_b[j] = v
+                B[j] -= lr * (m / c1) / (sqrt(v / c2) + eps)
+                gwj, mwj, vwj, Wj = grad_w[j], m_w[j], v_w[j], W[j]
+                for i in range(layer.fan_in):
+                    g = gwj[i]
+                    m = b1 * mwj[i] + o1 * g
+                    v = b2 * vwj[i] + o2 * g * g
+                    mwj[i] = m
+                    vwj[i] = v
+                    Wj[i] -= lr * (m / c1) / (sqrt(v / c2) + eps)
+
+
 class Adam:
     """Adam 优化器（一阶矩 + 二阶矩 + 偏差修正）
 

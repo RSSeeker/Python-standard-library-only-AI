@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2103 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2108 项）
 
 ## 特性
 
@@ -846,6 +846,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
 |------|------|
 | `Adam` | Adam（默认） |
 | `AdamW` | Adam + 解耦权重衰减（LLM 训练的默认选择；`weight_decay` 不进一阶/二阶矩） |
+| `MuPAdam(node, base_lr, width, base_width)` | μP 分层学习率 Adam：hidden 层 lr 随宽度反比缩放、readout 层正比缩放，用于把窄模型的超参迁移到宽模型 |
 | `AdaGrad` / `AdaDelta` / `Nadam` / `RAdam` | 经典自适应优化器四件套；状态存在优化器实例上，用 `state_dict()` / `load_state_dict()` 单独存档 |
 | `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
 | `Adan` / `Prodigy` / `CAME` | 进阶三件套：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
@@ -854,6 +855,26 @@ m = AI.Seq2SeqLM.load("s2s.json")
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
+
+### μP 参数化（mup_target_std / mup_init / mup_lr / MuPAdam）
+
+```python
+m = AI.MLP([64, 32, 16, 8], ["relu", "relu", "linear"])
+AI.mup_init(m, seed=11)                 # 初始化 std 按 input / hidden / readout 分层
+print(AI.mup_target_std("hidden", 32))  # sqrt(2 / fan_in)
+lrs = AI.mup_lr(m, base_lr=1e-3)        # hidden 层随宽度反比，readout 层正比
+opt = AI.MuPAdam(m, base_lr=1e-3)       # 按 lrs 逐层更新
+```
+
+| API | 说明 |
+|------|------|
+| `mup_target_std(kind, fan_in, base_width=1.0, width=None)` | 三种层类型的目标初始化标准差；给定 width 时 hidden 乘 `1/sqrt(width/base_width)`、readout 乘 `sqrt(width/base_width)` |
+| `mup_init(model, seed=None, ...)` | 按层类型重新初始化权重 std；偏置默认置 0 |
+| `mup_lr(model, base_lr=1e-3, width=None, base_width=1)` | 返回逐层学习率（input 不变、hidden 反比、readout 正比） |
+| `MuPAdam(model, base_lr=1e-3, ...)` | 与 `Adam` 相同的一阶/二阶矩更新，但每层用自己的 `layer_lrs` |
+
+边界：这是简化版 μP，只覆盖小型 MLP 的宽度参数化；不包含完整 Tensor Programs 谱系、
+attention / embedding 的 μP 特化，也不改变反向传播。
 
 ### 损失函数
 
@@ -3934,7 +3955,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2103 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2108 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4136,6 +4157,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestBestOfN` | 取最大奖励、并列取最小下标、非法输入 |
 | `TestSelfConsistency` | 多数投票、并列、`normalize` 规范化、空/不可哈希输入 |
 | `TestRejectionSampling` | 阈值过滤、`top_ratio` 保留、空结果与非法参数 |
+| `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4270,7 +4292,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2103 个单元测试
+├── test_ai.py       # 2108 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

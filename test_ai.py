@@ -32727,3 +32727,85 @@ class TestRejectionSampling:
                 pass
             else:
                 raise AssertionError(f"未报错: {samples!r} {kwargs!r}")
+
+
+def _mup_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("未抛出异常")
+
+
+class TestMuP:
+    def test_target_std_scaling(self):
+        base_h = AI.mup_target_std("hidden", 32)
+        assert abs(base_h - math.sqrt(2.0 / 32)) < 1e-12
+        wide = AI.mup_target_std("hidden", 32, width=4, base_width=1)
+        assert abs(wide - base_h / 2.0) < 1e-12
+        base_r = AI.mup_target_std("readout", 16)
+        assert abs(base_r - math.sqrt(1.0 / 16)) < 1e-12
+        wide_r = AI.mup_target_std("readout", 16, width=4, base_width=1)
+        assert abs(wide_r - base_r * 2.0) < 1e-12
+        assert AI.mup_target_std("input", 64) == math.sqrt(1.0 / 64)
+        _mup_raises(lambda: AI.mup_target_std("bad", 4))
+        _mup_raises(lambda: AI.mup_target_std("hidden", 0))
+
+    def test_init_layer_stds(self):
+        m = AI.MLP([64, 32, 16, 8], ["relu", "relu", "linear"])
+        AI.mup_init(m, seed=11)
+        def std_of(rows):
+            vals = [v for row in rows for v in row]
+            mean = sum(vals) / len(vals)
+            return math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+        assert abs(std_of(m.layers[0].weights) - math.sqrt(1.0 / 64)) < 0.03
+        assert abs(std_of(m.layers[1].weights) - math.sqrt(2.0 / 32)) < 0.04
+        assert abs(std_of(m.layers[2].weights) - math.sqrt(1.0 / 16)) < 0.04
+        for layer in m.layers:
+            assert layer.biases == [0.0] * layer.fan_out
+        _mup_raises(lambda: AI.mup_init("not mlp"))
+        _mup_raises(lambda: AI.mup_init(m, bias_std=-1.0))
+        _mup_raises(lambda: AI.mup_init(m, hidden_std=0.0))
+
+    def test_layer_learning_rates(self):
+        net = AI.MLP([3, 4, 5, 2], ["relu", "relu", "linear"])
+        lrs = AI.mup_lr(net, base_lr=1e-3)
+        assert lrs[0] == 1e-3
+        assert abs(lrs[1] - 1e-3 / 5) < 1e-18
+        assert abs(lrs[2] - 1e-3 * 5) < 1e-18
+        explicit = AI.mup_lr(net, base_lr=2e-3, width=10, base_width=2)
+        assert abs(explicit[1] - 2e-3 / 5) < 1e-18
+        assert abs(explicit[2] - 2e-3 * 5) < 1e-18
+        one = AI.MLP([4, 2], ["linear"])
+        assert AI.mup_lr(one, 1e-3) == [0.004]
+        _mup_raises(lambda: AI.mup_lr(net, base_lr=0.0))
+        _mup_raises(lambda: AI.mup_lr(net, width=0.0))
+
+    def test_mupadam_updates(self):
+        m = AI.MLP([3, 4, 2], ["relu", "linear"])
+        for layer in m.layers:
+            for j in range(layer.fan_out):
+                for i in range(layer.fan_in):
+                    layer.weights[j][i] = 0.0
+                layer.biases[j] = 0.0
+        opt = AI.MuPAdam(m, base_lr=1e-2)
+        grads = []
+        for layer in m.layers:
+            grads.append(([[1.0] * layer.fan_in for _ in range(layer.fan_out)],
+                          [1.0] * layer.fan_out))
+        before = [[row[:] for row in layer.weights] for layer in m.layers]
+        opt.step(grads)
+        for li, layer in enumerate(m.layers):
+            expected = opt.layer_lrs[li]
+            assert abs((layer.weights[0][0] - before[li][0][0]) + expected) < 1e-6
+            assert abs(layer.biases[0] + expected) < 1e-6
+        _mup_raises(lambda: AI.MuPAdam(m, base_lr=-1.0))
+        _mup_raises(lambda: AI.MuPAdam(m, beta1=1.0))
+        _mup_raises(lambda: opt.step([]))
+
+    def test_invalid_models_and_params(self):
+        class _NotMLP:
+            pass
+        _mup_raises(lambda: AI.mup_lr(_NotMLP()))
+        _mup_raises(lambda: AI.mup_init(_NotMLP()))
+        _mup_raises(lambda: AI.MuPAdam(_NotMLP()))
