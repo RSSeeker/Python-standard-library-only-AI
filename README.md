@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2175 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2181 项）
 
 ## 特性
 
@@ -2320,6 +2320,25 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### Mamba-2（简化 SSD 块）
+
+```python
+from AI import Mamba2Block, Mamba2Model
+
+blk = Mamba2Block(16, num_heads=2, d_state=4, seed=0)
+y = blk.forward(x)                    # x: T×16
+model = Mamba2Model(vocab_size=32, d_model=16, num_heads=2, d_state=4,
+                    num_layers=2, max_len=32, seed=0)
+losses = model.fit([[1, 2, 3, 4, 5]], epochs=10, lr=0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `Mamba2Block(d_model, num_heads=2, d_state=4, seed=None)` | 多头部 SSD 块：`in_proj` 拆 x/z，由 x 投影出 `dt`/`B`/`C`；每头**标量**衰减 `a_t = exp(-exp(A_log)·dt_t)`，递推 `state_t = a_t·state_{t-1} + x_t⊗B_t`、`y_t = C_t·state_t`；`out = x + out_proj((y + D⊙x) ⊙ SiLU(z))`；手写 BPTT 反向与 SGD |
+| `Mamba2Model(vocab_size, d_model=32, num_heads=2, d_state=4, num_layers=2, max_len=64, seed=None)` | 字符级 Mamba-2 语言模型：Embedding → N×`Mamba2Block` → 线性 LM 头；`forward` / `loss_and_backward` / `fit` / `sgd_step` / `param_count` |
+
+- 边界：A 是每头一个标量（Mamba-2 的 SSD 形式），不是 Mamba-1 的 d_inner×d_state 对角矩阵；`B_t`/`C_t` 在所有头之间共享（grouped，不支持分组数调节）；没有 depthwise 卷积、RoPE 与硬件并行扫描，时间维顺序递推，复杂度 O(T·d·d_state)。
+
 ### DETR（检测 Transformer）
 
 ```python
@@ -4150,7 +4169,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2175 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2181 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4357,6 +4376,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTreeAttention` | 祖先可见性偏置与布尔掩码一致、链式树、非法 parents/neg_inf |
 | `TestSAE` | 前向/参数、四项梯度有限差分、fit 降 loss 与 L1 分解、特征稀疏统计、非法输入 |
 | `TestGraphormer` | 最短路径与度/路径桶、前向与参数、偏置表/权重有限差分、fit 降 loss、非法输入 |
+| `TestMamba2Block` | 前向/参数、`A_log`/`D`/`dt_bias`/各投影权重有限差分、非法输入 |
+| `TestMamba2Model` | 语言模型前向/损失/参数、fit 降 loss、序列与 vocab 越界等非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4504,7 +4525,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2175 个单元测试
+├── test_ai.py       # 2181 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

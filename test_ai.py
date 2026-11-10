@@ -34189,3 +34189,115 @@ class TestGraphormer:
         _p15_raises(lambda: AI.graph_shortest_paths(0, []))
         _p15_raises(lambda: AI.graphormer_structure(3, [(0, 1)],
                                                     max_degree=0))
+
+
+import math
+
+import AI
+
+
+def _p16_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+_X = [[0.1, -0.2, 0.3, 0.4],
+      [0.2, 0.1, -0.1, 0.0],
+      [0.0, 0.5, -0.2, 0.1]]
+
+
+class TestMamba2Block:
+    def test_forward_and_param_count(self):
+        m = AI.Mamba2Block(4, num_heads=2, d_state=3, seed=1)
+        assert m.param_count() == 108
+        out = m.forward(_X)
+        assert len(out) == 3 and all(len(r) == 4 for r in out)
+        assert all(math.isfinite(v) for r in out for v in r)
+
+    def test_numerical_gradients(self):
+        m = AI.Mamba2Block(4, num_heads=2, d_state=3, seed=1)
+        m.forward(_X)
+        m.zero_grad()
+        m.backward([[1.0] * 4 for _ in range(3)])
+        h = 1e-6
+
+        def loss():
+            return sum(v for row in m.forward(_X) for v in row)
+
+        def check(tag, param, ana, setter):
+            old = param
+            setter(old + h)
+            lp = loss()
+            setter(old - h)
+            lm = loss()
+            setter(old)
+            num = (lp - lm) / (2.0 * h)
+            assert abs(ana - num) < 1e-6, (tag, ana, num)
+
+        check("in_proj", m.in_proj.weights[0][0], m.grads["in_proj"][0][0][0],
+              lambda v: m.in_proj.weights[0].__setitem__(0, v))
+        check("A_log", m.A_log[0], m.grad_A_log[0],
+              lambda v: m.A_log.__setitem__(0, v))
+        check("dt_bias", m.dt_bias[1], m.grad_dt_bias[1],
+              lambda v: m.dt_bias.__setitem__(1, v))
+        check("D", m.D[0], m.grad_D[0],
+              lambda v: m.D.__setitem__(0, v))
+        check("b_proj", m.b_proj.weights[0][0], m.grads["b_proj"][0][0][0],
+              lambda v: m.b_proj.weights[0].__setitem__(0, v))
+        check("c_proj", m.c_proj.weights[0][0], m.grads["c_proj"][0][0][0],
+              lambda v: m.c_proj.weights[0].__setitem__(0, v))
+        check("out_proj", m.out_proj.weights[0][0], m.grads["out_proj"][0][0][0],
+              lambda v: m.out_proj.weights[0].__setitem__(0, v))
+
+    def test_invalid_inputs(self):
+        _p16_raises(lambda: AI.Mamba2Block(4, num_heads=3))
+        _p16_raises(lambda: AI.Mamba2Block(0))
+        _p16_raises(lambda: AI.Mamba2Block(4, d_state=0))
+        m = AI.Mamba2Block(4, num_heads=2, d_state=3, seed=1)
+        _p16_raises(lambda: m.forward([]))
+        _p16_raises(lambda: m.forward([[0.1, 0.2]]))
+        _p16_raises(lambda: m.forward([[0.1, 0.2, 0.3, "x"]]))
+        _p16_raises(lambda: m.backward([[1.0] * 4]))
+        m.forward(_X)
+        _p16_raises(lambda: m.backward([[1.0] * 4]))
+        _p16_raises(lambda: m.sgd_step(-0.1))
+
+
+class TestMamba2Model:
+    def test_forward_loss_and_param_count(self):
+        m = AI.Mamba2Model(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                           num_layers=1, max_len=8, seed=1)
+        assert m.param_count() == 402
+        seq = [0, 1, 2, 3, 4]
+        logits = m.forward(seq)
+        assert len(logits) == 5 and len(logits[0]) == 6
+        loss = m.loss_and_backward(seq)
+        assert isinstance(loss, float) and loss > 0.0
+        loss2 = m.loss_and_backward(seq, targets=[1, 2, 3, 4])
+        assert isinstance(loss2, float) and loss2 > 0.0
+
+    def test_fit_reduces_loss(self):
+        m = AI.Mamba2Model(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                           num_layers=1, max_len=8, seed=1)
+        seqs = [[0, 1, 2, 3, 4], [1, 2, 3, 4, 5]]
+        hist = m.fit(seqs, epochs=20, lr=0.05, seed=1)
+        assert len(hist) == 20
+        assert hist[-1] < hist[0]
+        assert hist[-1] < 0.75 * hist[0]
+
+    def test_invalid_inputs(self):
+        _p16_raises(lambda: AI.Mamba2Model(0))
+        _p16_raises(lambda: AI.Mamba2Model(6, num_layers=0))
+        _p16_raises(lambda: AI.Mamba2Model(6, max_len=0))
+        m = AI.Mamba2Model(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                           num_layers=1, max_len=8, seed=1)
+        _p16_raises(lambda: m.forward([]))
+        _p16_raises(lambda: m.forward([0, 1, 2, 3, 4, 5, 0, 1, 2]))
+        _p16_raises(lambda: m.forward([0, 6]))
+        _p16_raises(lambda: m.loss_and_backward([0]))
+        _p16_raises(lambda: m.fit([]))
+        _p16_raises(lambda: m.fit([[0, 1]], epochs=0))
+        _p16_raises(lambda: m.sgd_step(-1.0))

@@ -40760,6 +40760,352 @@ class ElectraModel:
 # ============================================================================
 
 
+class Mamba2Block:
+    """Mamba-2 的简化 SSD 块（多头部标量衰减状态空间 + 门控输出）。
+
+    结构：``in_proj`` → 拆 x/z；``dt_proj``/``b_proj``/``c_proj`` 由 x 产生
+    （时间步、输入/输出矩阵）；每个头用**标量**衰减 ``a_t = exp(-exp(A_log)·dt_t)``
+    做递推 ``state_t = a_t·state_{t-1} + x_t ⊗ B_t``、``y_t = C_t·state_t``；
+    再 ``y = y_ssm ⊙ SiLU(z)``，输出投影 + 残差。
+
+    与 Mamba-1 的差异：A 是每头一个标量（不是 d_inner×d_state 矩阵），
+    ``dt`` 由 x（而不是卷积后的 u）产生；不做 depthwise 卷积与硬件并行扫描，
+    时间维顺序递推。
+
+    边界：``d_model`` 必须能被 ``num_heads`` 整除；``B_t``/``C_t`` 在所有头之间共享
+    （grouped，未做分组数可调）；无归一化与 dropout；反向为手写 BPTT。
+    """
+
+    def __init__(self, d_model, num_heads=2, d_state=4, seed=None):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"Mamba2Block: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(f"Mamba2Block: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"Mamba2Block: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if not isinstance(d_state, int) or isinstance(d_state, bool) or d_state < 1:
+            raise ValueError(f"Mamba2Block: d_state 必须是正整数，收到 {d_state!r}")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_state = d_state
+        self.d_inner = d_model
+        self.in_proj = Layer(d_model, 2 * self.d_inner, "linear")
+        self.dt_proj = Layer(d_model, num_heads, "linear")
+        self.b_proj = Layer(d_model, d_state, "linear")
+        self.c_proj = Layer(d_model, d_state, "linear")
+        self.A_log = [0.0] * num_heads
+        self.dt_bias = [0.0] * num_heads
+        self.D = [1.0] * self.d_inner
+        self.out_proj = Layer(self.d_inner, d_model, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grads = {}
+        for name in ("in_proj", "dt_proj", "b_proj", "c_proj", "out_proj"):
+            self.grads[name] = _layer_zero_grads(getattr(self, name))
+        self.grad_A_log = [0.0] * self.num_heads
+        self.grad_dt_bias = [0.0] * self.num_heads
+        self.grad_D = [0.0] * self.d_inner
+
+    def _check_seq(self, x, who):
+        if not isinstance(x, (list, tuple)) or not x:
+            raise ValueError(f"{who}: 输入必须是非空 (T, d_model) 序列")
+        out = []
+        for t, row in enumerate(x):
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(f"{who}: 第 {t} 行长度应为 {self.d_model}")
+            vals = []
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(v):
+                    raise ValueError(f"{who}: 第 {t} 行必须只包含有限数字")
+                vals.append(float(v))
+            out.append(vals)
+        return out
+
+    # ---------- 前向 ----------
+    def forward(self, x):
+        x = self._check_seq(x, "Mamba2Block.forward")
+        T = len(x)
+        H = self.num_heads
+        hd = self.head_dim
+        ds = self.d_state
+        proj, cache_in = _dense_rows_forward(self.in_proj, x)
+        xs = [row[:self.d_inner] for row in proj]
+        zs = [row[self.d_inner:] for row in proj]
+        dt_raw, cache_dt = _dense_rows_forward(self.dt_proj, xs)
+        Bt, cache_b = _dense_rows_forward(self.b_proj, xs)
+        Ct, cache_c = _dense_rows_forward(self.c_proj, xs)
+        states = []
+        state = [[[0.0] * ds for _ in range(hd)] for _ in range(H)]
+        dts = []
+        aas = []
+        ys = []
+        for t in range(T):
+            dt_t = []
+            a_t = []
+            for h in range(H):
+                raw = dt_raw[t][h] + self.dt_bias[h]
+                dtv = _softplus_scalar(raw)
+                dt_t.append(dtv)
+                a_t.append(math.exp(-math.exp(self.A_log[h]) * dtv))
+            dts.append(dt_t)
+            aas.append(a_t)
+            new_state = [[[0.0] * ds for _ in range(hd)] for _ in range(H)]
+            for h in range(H):
+                prev = state[h]
+                a_h = a_t[h]
+                for r in range(hd):
+                    u = xs[t][h * hd + r]
+                    row_prev = prev[r]
+                    row_new = new_state[h][r]
+                    for s in range(ds):
+                        row_new[s] = a_h * row_prev[s] + u * Bt[t][s]
+            state = new_state
+            states.append(state)
+            y_t = [0.0] * self.d_inner
+            for h in range(H):
+                for r in range(hd):
+                    acc = 0.0
+                    row_state = state[h][r]
+                    for s in range(ds):
+                        acc += row_state[s] * Ct[t][s]
+                    y_t[h * hd + r] = acc
+            ys.append(y_t)
+        y_ssm = [[ys[t][i] + self.D[i] * xs[t][i] for i in range(self.d_inner)]
+                 for t in range(T)]
+        gated = [[y_ssm[t][i] * _silu_scalar(zs[t][i])
+                  for i in range(self.d_inner)] for t in range(T)]
+        projected, cache_out = _dense_rows_forward(self.out_proj, gated)
+        out = [[x[t][i] + projected[t][i] for i in range(self.d_model)]
+               for t in range(T)]
+        self._cache = (T, x, cache_in, xs, zs, cache_dt, cache_b, cache_c,
+                       dt_raw, dts, aas, Bt, Ct, states, ys, y_ssm, gated, cache_out)
+        return out
+
+    # ---------- 反向 ----------
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("Mamba2Block.backward: 必须先调用 forward()")
+        (T, x, cache_in, xs, zs, cache_dt, cache_b, cache_c,
+         dt_raw, dts, aas, Bt, Ct, states, ys, y_ssm, gated, cache_out) = self._cache
+        if len(dout) != T:
+            raise ValueError(f"Mamba2Block.backward: dout 长度 {len(dout)} 应为 {T}")
+        H = self.num_heads
+        hd = self.head_dim
+        ds = self.d_state
+        grad_w, grad_b, dgated = _dense_rows_backward(self.out_proj, cache_out, dout)
+        _layer_add_grads(self.grads["out_proj"], (grad_w, grad_b))
+        dy_ssm = [[dgated[t][i] * _silu_scalar(zs[t][i])
+                   for i in range(self.d_inner)] for t in range(T)]
+        dz = [[dgated[t][i] * y_ssm[t][i] * _dsilu_scalar(zs[t][i])
+               for i in range(self.d_inner)] for t in range(T)]
+        dD = [0.0] * self.d_inner
+        dxs = [[dy_ssm[t][i] * self.D[i] for i in range(self.d_inner)]
+               for t in range(T)]
+        for t in range(T):
+            for i in range(self.d_inner):
+                dD[i] += dy_ssm[t][i] * xs[t][i]
+        dB = [[0.0] * ds for _ in range(T)]
+        dC = [[0.0] * ds for _ in range(T)]
+        d_dt_raw = [[0.0] * H for _ in range(T)]
+        dA_log = [0.0] * H
+        carrier = [[[0.0] * ds for _ in range(hd)] for _ in range(H)]
+        for t in range(T - 1, -1, -1):
+            dy = [[dy_ssm[t][h * hd + r] for r in range(hd)] for h in range(H)]
+            total = [[[0.0] * ds for _ in range(hd)] for _ in range(H)]
+            for h in range(H):
+                for r in range(hd):
+                    d_use = dy[h][r]
+                    for s in range(ds):
+                        total[h][r][s] = Ct[t][s] * d_use + carrier[h][r][s]
+            for s in range(ds):
+                acc_b = 0.0
+                acc_c = 0.0
+                for h in range(H):
+                    for r in range(hd):
+                        st = states[t][h][r][s]
+                        acc_c += dy[h][r] * st
+                        acc_b += total[h][r][s] * xs[t][h * hd + r]
+                dB[t][s] = acc_b
+                dC[t][s] = acc_c
+            for h in range(H):
+                a_h = aas[t][h]
+                prev = states[t - 1][h] if t > 0 else [[0.0] * ds for _ in range(hd)]
+                da = 0.0
+                for r in range(hd):
+                    for s in range(ds):
+                        tv = total[h][r][s]
+                        if tv != 0.0:
+                            dxs[t][h * hd + r] += tv * Bt[t][s]
+                        if prev[r][s] != 0.0:
+                            da += tv * prev[r][s]
+                A_exp = math.exp(self.A_log[h])
+                dA_log[h] += da * (-dts[t][h] * A_exp * a_h)
+                d_dt = da * (-A_exp * a_h)
+                raw = dt_raw[t][h] + self.dt_bias[h]
+                sig = 1.0 if raw > 30.0 else 1.0 / (1.0 + math.exp(-raw))
+                d_dt_raw[t][h] = d_dt * sig
+                self.grad_dt_bias[h] += d_dt * sig
+            carrier = [[[aas[t][h] * total[h][r][s] for s in range(ds)]
+                        for r in range(hd)] for h in range(H)]
+        grad_w, grad_b, du_dt = _dense_rows_backward(self.dt_proj, cache_dt, d_dt_raw)
+        _layer_add_grads(self.grads["dt_proj"], (grad_w, grad_b))
+        grad_w, grad_b, du_b = _dense_rows_backward(self.b_proj, cache_b, dB)
+        _layer_add_grads(self.grads["b_proj"], (grad_w, grad_b))
+        grad_w, grad_b, du_c = _dense_rows_backward(self.c_proj, cache_c, dC)
+        _layer_add_grads(self.grads["c_proj"], (grad_w, grad_b))
+        for t in range(T):
+            for i in range(self.d_inner):
+                dxs[t][i] += du_dt[t][i] + du_b[t][i] + du_c[t][i]
+        dproj = [dxs[t] + dz[t] for t in range(T)]
+        for i in range(self.d_inner):
+            self.grad_D[i] += dD[i]
+        for h in range(H):
+            self.grad_A_log[h] += dA_log[h]
+        grad_w, grad_b, dx_proj = _dense_rows_backward(self.in_proj, cache_in, dproj)
+        _layer_add_grads(self.grads["in_proj"], (grad_w, grad_b))
+        self._cache = None
+        return [[dout[t][i] + dx_proj[t][i] for i in range(self.d_model)]
+                for t in range(T)]
+
+    # ---------- 优化器 ----------
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"Mamba2Block.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        for name in ("in_proj", "dt_proj", "b_proj", "c_proj", "out_proj"):
+            _dense_apply_sgd(getattr(self, name), self.grads[name], lr)
+        for h in range(self.num_heads):
+            self.A_log[h] -= lr * self.grad_A_log[h]
+            self.dt_bias[h] -= lr * self.grad_dt_bias[h]
+        for i in range(self.d_inner):
+            self.D[i] -= lr * self.grad_D[i]
+
+    def param_count(self):
+        count = sum(_dense_param_count(getattr(self, name))
+                    for name in ("in_proj", "dt_proj", "b_proj", "c_proj", "out_proj"))
+        return count + self.num_heads * 2 + self.d_inner
+
+
+class Mamba2Model:
+    """字符级 Mamba-2 语言模型：Embedding → N×Mamba2Block → 线性 LM 头。"""
+
+    def __init__(self, vocab_size, d_model=32, num_heads=2, d_state=4,
+                 num_layers=2, max_len=64, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
+            raise ValueError(f"Mamba2Model: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"Mamba2Model: num_layers 必须是正整数，收到 {num_layers!r}")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"Mamba2Model: max_len 必须是正整数，收到 {max_len!r}")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        self.embedding = Embedding(vocab_size, d_model)
+        self.blocks = [Mamba2Block(d_model, num_heads, d_state, seed=seed)
+                       for _ in range(num_layers)]
+        self.head = Layer(d_model, vocab_size, "linear")
+        self.grads = {"head": _layer_zero_grads(self.head)}
+
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        for block in self.blocks:
+            block.zero_grad()
+        self.grads["head"] = _layer_zero_grads(self.head)
+
+    def _check_ids(self, ids, who):
+        seq = list(ids)
+        if not seq:
+            raise ValueError(f"{who}: ids 不能为空")
+        if len(seq) > self.max_len:
+            raise ValueError(f"{who}: 序列长度 {len(seq)} 超过 max_len={self.max_len}")
+        for t, idx in enumerate(seq):
+            if not isinstance(idx, int) or isinstance(idx, bool) \
+                    or not 0 <= idx < self.vocab_size:
+                raise ValueError(f"{who}: 第 {t} 个 id {idx!r} 越界")
+        return seq
+
+    def forward(self, ids):
+        seq = self._check_ids(ids, "Mamba2Model.forward")
+        x = self.embedding.forward(seq)
+        for block in self.blocks:
+            x = block.forward(x)
+        self._head_in = x
+        logits, self._head_cache = _dense_rows_forward(self.head, x)
+        return logits
+
+    def loss_and_backward(self, ids, targets=None):
+        seq = list(ids)
+        if len(seq) < 2:
+            raise ValueError("Mamba2Model.loss_and_backward: 序列至少需要 2 个 token")
+        if targets is None:
+            tgt = seq[1:]
+        else:
+            tgt = list(targets)
+            if len(tgt) != len(seq) - 1:
+                raise ValueError(
+                    f"Mamba2Model.loss_and_backward: targets 长度 {len(tgt)} 应为 {len(seq) - 1}")
+        logits = self.forward(seq)
+        T = len(seq)
+        n = T - 1
+        V = self.vocab_size
+        loss = 0.0
+        dlogits = [[0.0] * V for _ in range(T)]
+        for t in range(n):
+            y = tgt[t]
+            if not isinstance(y, int) or isinstance(y, bool) or not 0 <= y < V:
+                raise ValueError(f"Mamba2Model.loss_and_backward: 第 {t} 个 target {y!r} 越界")
+            p = _softmax_row(logits[t])
+            loss -= math.log(max(p[y], 1e-12))
+            scale = 1.0 / n
+            row = dlogits[t]
+            for v in range(V):
+                row[v] = (p[v] - (1.0 if v == y else 0.0)) * scale
+        loss /= n
+        grad_w, grad_b, dh = _dense_rows_backward(self.head, self._head_cache, dlogits)
+        _layer_add_grads(self.grads["head"], (grad_w, grad_b))
+        for block in reversed(self.blocks):
+            dh = block.backward(dh)
+        self.embedding.backward(dh)
+        return loss
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"Mamba2Model.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.embedding.sgd_step(lr)
+        for block in self.blocks:
+            block.sgd_step(lr)
+        _dense_apply_sgd(self.head, self.grads["head"], lr)
+
+    def param_count(self):
+        return (self.vocab_size * self.d_model
+                + sum(block.param_count() for block in self.blocks)
+                + _dense_param_count(self.head))
+
+    def fit(self, sequences, epochs=1, lr=3e-3, shuffle=True, seed=None, verbose=False):
+        if not sequences:
+            raise ValueError("Mamba2Model.fit: sequences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"Mamba2Model.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"Mamba2Model.fit: lr 必须是非负数，收到 {lr!r}")
+        rng = random.Random(seed)
+        order = list(range(len(sequences)))
+        losses = []
+        for epoch in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(sequences[idx])
+                self.sgd_step(lr)
+            losses.append(total / len(order))
+        return losses
+
 class RWKVBlock:
     """RWKV 风格 block：time-mixing（可学习指数衰减的状态递推）+ channel-mixing
 
