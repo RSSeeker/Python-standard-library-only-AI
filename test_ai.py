@@ -33911,3 +33911,73 @@ class TestLLMJudge:
         _p12_raises(lambda: AI.judge_agreement([]))
         _p12_raises(lambda: AI.judge_agreement([1, "x"]))
         _p12_raises(lambda: AI.judge_agreement([1, 2], tolerance=-0.1))
+
+
+import AI
+
+
+def _p13_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestDraftTree:
+    def test_shared_prefix(self):
+        t = AI.build_draft_tree([[1, 2, 3], [1, 2, 4], [5, 6]])
+        assert t["parents"] == [-1, 0, 1, 2, 2, 0, 5]
+        assert t["tokens"] == [None, 1, 2, 3, 4, 5, 6]
+        assert t["leaves"] == [3, 4, 6]
+        assert t["paths"] == [[1, 2, 3], [1, 2, 4], [5, 6]]
+
+    def test_single_and_duplicates(self):
+        t = AI.build_draft_tree([[7, 8]])
+        assert t["parents"] == [-1, 0, 1]
+        assert t["leaves"] == [2] and t["paths"] == [[1, 2]]
+        t = AI.build_draft_tree([[1, 2], [1, 2]])
+        assert len(t["parents"]) == 3
+        assert t["leaves"] == [2] and t["paths"] == [[1, 2]]
+
+    def test_errors(self):
+        _p13_raises(lambda: AI.build_draft_tree([]))
+        _p13_raises(lambda: AI.build_draft_tree(3))
+        _p13_raises(lambda: AI.build_draft_tree([[]]))
+        _p13_raises(lambda: AI.build_draft_tree([["a"]]))
+        _p13_raises(lambda: AI.build_draft_tree([[1, -2]]))
+        _p13_raises(lambda: AI.build_draft_tree([[1, True]]))
+
+
+class TestTreeAttention:
+    def test_bias_and_mask(self):
+        parents = [-1, 0, 1, 2, 2, 0, 5]
+        bias = AI.tree_attention_bias(parents)
+        assert len(bias) == 7 and all(len(r) == 7 for r in bias)
+        assert bias[0][0] == 0.0
+        assert bias[0][1] == -1e30
+        assert bias[3][:4] == [0.0, 0.0, 0.0, 0.0]
+        assert bias[3][4] == -1e30
+        assert bias[6][:6] == [0.0, -1e30, -1e30, -1e30, -1e30, 0.0]
+        mask = AI.tree_attention_mask(parents)
+        assert mask[3] == [True, True, True, True, False, False, False]
+        assert mask[6] == [True, False, False, False, False, True, True]
+        for i in range(7):
+            for j in range(7):
+                assert (bias[i][j] == 0.0) == mask[i][j]
+
+    def test_chain(self):
+        bias = AI.tree_attention_bias([-1, 0, 1, 2])
+        for i in range(4):
+            for j in range(4):
+                assert (bias[i][j] == 0.0) == (j <= i)
+
+    def test_invalid(self):
+        _p13_raises(lambda: AI.tree_attention_bias([]))
+        _p13_raises(lambda: AI.tree_attention_bias([0]))
+        _p13_raises(lambda: AI.tree_attention_bias([-1, 2]))
+        _p13_raises(lambda: AI.tree_attention_bias([-1, 0.5]))
+        _p13_raises(lambda: AI.tree_attention_bias([-1, 0], neg_inf=0.0))
+        _p13_raises(lambda: AI.tree_attention_bias([-1, 0], neg_inf=float("inf")))
+        _p13_raises(lambda: AI.tree_attention_mask([-1, 1]))
+        _p13_raises(lambda: AI.tree_attention_mask("bad"))

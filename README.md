@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2159 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2165 项）
 
 ## 特性
 
@@ -534,6 +534,9 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `token_id_mask(logits, allowed)` | 约束解码：只保留 `allowed` 里的 token id（其余置 `-inf`），可与任意采样器叠加 |
 | `token_prefix_mask(logits, generated, sequences, eos_id=None)` | 前缀约束：只允许仍是某个合法序列前缀的下一个 token；序列已完整时只允许 `eos_id` |
 | `speculative_accept(draft_ids, draft_probs, target_probs)` | 投机解码的接受判定：按 `min(1, p_target/p_draft)` 拒绝采样，被拒时从 `max(0, p_target − p_draft)` 重采样，返回 `(接受个数, 重采样 token)` |
+| `build_draft_tree(sequences)` | 把多条草稿 token 序列合成前缀共享 trie：返回 `{'parents','tokens','leaves','paths'}`，相同前缀只建一次节点 |
+| `tree_attention_bias(parents, neg_inf=-1e30)` | 树状注意力偏置：每个节点只能看到「祖先 + 自己」，允许位置 0.0、其余 `neg_inf`，供一次前向验证整棵 draft 树 |
+| `tree_attention_mask(parents)` | 同上的布尔掩码（`True` 表示可见），便于和现有 mask 逻辑组合 |
 | `generate(..., repetition_penalty=1.2)` | 重复惩罚：已出现的 token，正 logit 除以它、负 logit 乘以它（默认 1.0 不惩罚） |
 | `generate(..., presence_penalty=0.5, frequency_penalty=0.5)` | 存在惩罚（出现过就扣一次）/ 频率惩罚（按出现次数扣） |
 | `generate(..., no_repeat_ngram_size=3)` | 禁止 n-gram 立刻重复：末尾 (n-1)-gram 再次出现时，把它后面跟过的 token 置 `-inf` |
@@ -4100,7 +4103,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2159 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2165 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4303,6 +4306,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPrefixCacheStore` | 最长前缀匹配、精确命中、LRU 淘汰、`min_prefix` 与非法 token/cache |
 | `TestNeedleHaystack` | 长度/针位置/depth 端点、seed 可复现、自定义填充词、非法输入 |
 | `TestLLMJudge` | 提示词包含问答与参考、输出解析（大小写/中文冒号/截断）、缺字段报错、一致率与容差 |
+| `TestDraftTree` | 共享前缀 trie 的 parents/tokens/leaves/paths、单序列与重复序列、非法序列 |
+| `TestTreeAttention` | 祖先可见性偏置与布尔掩码一致、链式树、非法 parents/neg_inf |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4450,7 +4455,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2159 个单元测试
+├── test_ai.py       # 2165 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

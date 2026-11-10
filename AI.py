@@ -15275,6 +15275,117 @@ def token_prefix_mask(logits, generated, sequences, eos_id=None):
     return [v if i in allowed else float('-inf') for i, v in enumerate(logits)]
 
 
+def _tree_check_parents(parents):
+    if not isinstance(parents, (list, tuple)) or not parents:
+        raise ValueError('tree_attention: parents 必须是非空列表')
+    out = []
+    for i, p in enumerate(parents):
+        if isinstance(p, bool) or not isinstance(p, int):
+            raise ValueError('tree_attention: parents[%d] 必须是整数，收到 %r'
+                             % (i, p))
+        if p < -1 or p >= i:
+            raise ValueError('tree_attention: parents[%d]=%r 必须满足 -1 <= p < %d'
+                             '（父节点必须排在前面的层序位置）' % (i, p, i))
+        out.append(p)
+    if out[0] != -1:
+        raise ValueError('tree_attention: 根节点 parents[0] 必须是 -1')
+    return out
+
+
+def build_draft_tree(sequences):
+    """把多条草稿 token 序列合成前缀共享树（trie）
+
+    返回 ``{'parents', 'tokens', 'leaves', 'paths'}``：
+    ``parents[i]`` 是节点 i 的父节点下标（根为 0、父为 -1），``tokens[i]`` 是
+    该节点上的 token（根为 None），``leaves`` 是叶节点下标，``paths`` 是每个
+    叶节点的 token 下标路径（不含根）。相同前缀只建一次节点，因此树状注意力
+    一次前向就能验证多个 draft 分支。
+    """
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError('build_draft_tree: sequences 必须是非空列表')
+    for si, seq in enumerate(sequences):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError('build_draft_tree: sequences[%d] 必须是非空列表' % si)
+        for t in seq:
+            if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+                raise ValueError('build_draft_tree: sequences[%d] 的 token 必须是'
+                                 '非负整数，收到 %r' % (si, t))
+    parents = [-1]
+    tokens = [None]
+    children = {}          # (parent, token) -> node index
+    leaves = []
+    for seq in sequences:
+        cur = 0
+        for t in seq:
+            key = (cur, t)
+            nxt = children.get(key)
+            if nxt is None:
+                nxt = len(parents)
+                children[key] = nxt
+                parents.append(cur)
+                tokens.append(t)
+            cur = nxt
+        if cur not in leaves:
+            leaves.append(cur)
+    all_nodes = list(range(len(parents)))
+    child_set = set(parents[1:])
+    leaves = [n for n in all_nodes if n != 0 and n not in child_set]
+    leaves.sort()
+    paths = []
+    for leaf in leaves:
+        path = []
+        cur = leaf
+        while cur != 0:
+            path.append(cur)
+            cur = parents[cur]
+        paths.append(list(reversed(path)))
+    return {'parents': parents, 'tokens': tokens,
+            'leaves': leaves, 'paths': paths}
+
+
+def tree_attention_bias(parents, neg_inf: float = -1e30):
+    """构造树状注意力偏置：仅允许每个节点看到「祖先 + 自己」的 token。
+
+    返回 ``T×T`` 的嵌套列表，允许位置为 0.0，其余为 ``neg_inf``；可直接加到
+    ``MultiHeadAttention`` 的分数矩阵上（配合 mask 语义）实现分支间互不可见，
+    从而一次前向验证整棵 draft 树而不让不同分支的 token 互相污染。
+    """
+    parents = _tree_check_parents(parents)
+    if isinstance(neg_inf, bool) or not isinstance(neg_inf, (int, float)) \
+            or not math.isfinite(neg_inf) or neg_inf >= 0.0:
+        raise ValueError('tree_attention_bias: neg_inf 必须是负有限数字')
+    n = len(parents)
+    ancestors = []
+    for i in range(n):
+        seen = set()
+        cur = i
+        while cur != -1:
+            seen.add(cur)
+            cur = parents[cur]
+        ancestors.append(seen)
+    bias = []
+    for i in range(n):
+        row = []
+        for j in range(n):
+            row.append(0.0 if j in ancestors[i] else float(neg_inf))
+        bias.append(row)
+    return bias
+
+
+def tree_attention_mask(parents):
+    """树状注意力的布尔掩码：True 表示节点 j 对节点 i 可见。"""
+    parents = _tree_check_parents(parents)
+    n = len(parents)
+    mask = []
+    for i in range(n):
+        seen = set()
+        cur = i
+        while cur != -1:
+            seen.add(cur)
+            cur = parents[cur]
+        mask.append([j in seen for j in range(n)])
+    return mask
+
 def speculative_accept(draft_ids, draft_probs, target_probs, uniforms=None,
                        rng=None):
     """投机解码的接受判定（拒绝采样）
