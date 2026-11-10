@@ -2154,6 +2154,157 @@ class DiT:
         return (_conv_param_count(self.conv) + self.t_net.param_count()
                 + enc + self.d_model * self.patch_dim + self.patch_dim)
 
+def _safetensors_check_name(name):
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Safetensors: 张量名必须是非空字符串，收到 {name!r}")
+    if "__metadata__" == name:
+        raise ValueError("Safetensors: 张量名不能是 '__metadata__'")
+    return name
+
+
+def _safetensors_shape(tensor, name):
+    """把嵌套 list 张量规整为 (flat, shape)。只支持 1D/2D。"""
+    if not isinstance(tensor, (list, tuple)):
+        raise ValueError(f"Safetensors: 张量 '{name}' 必须是 list/tuple")
+    if not tensor:
+        raise ValueError(f"Safetensors: 张量 '{name}' 不能为空")
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+           for v in tensor):
+        shape = [len(tensor)]
+        flat = list(tensor)
+    else:
+        shape = [len(tensor)]
+        flat = []
+        row_len = None
+        for row in tensor:
+            if (not isinstance(row, (list, tuple)) or not row):
+                raise ValueError(
+                    f"Safetensors: 张量 '{name}' 的行必须是非空 list/tuple")
+            if row_len is None:
+                row_len = len(row)
+            elif len(row) != row_len:
+                raise ValueError(
+                    f"Safetensors: 张量 '{name}' 每行长度必须一致")
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(
+                        f"Safetensors: 张量 '{name}' 只能包含数字")
+                flat.append(v)
+        shape.append(row_len)
+    return [float(v) for v in flat], shape
+
+
+def safetensors_save(tensors, path):
+    """把 {name: 1D/2D 嵌套 list} 写成 Safetensors 文件（F32，小端）。"""
+    if not isinstance(tensors, dict) or not tensors:
+        raise ValueError("Safetensors: tensors 必须是非空字典")
+    names = list(tensors.keys())
+    header = {}
+    data = bytearray()
+    for name in names:
+        _safetensors_check_name(name)
+        flat, shape = _safetensors_shape(tensors[name], name)
+        start = len(data)
+        for v in flat:
+            data += struct.pack("<f", v)
+        header[name] = {
+            "dtype": "F32",
+            "shape": shape,
+            "data_offsets": [start, len(data)],
+        }
+    if not isinstance(path, str) or not path:
+        raise ValueError("Safetensors: path 必须是非空字符串")
+    raw_header = json.dumps(header, ensure_ascii=False,
+                            separators=(",", ":")).encode("utf-8")
+    pad = (-len(raw_header)) % 8
+    raw_header += b" " * pad
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(raw_header)))
+        fh.write(raw_header)
+        fh.write(bytes(data))
+    return path
+
+
+def safetensors_header(path):
+    """读取并返回 (header dict, 数据区字节数)。"""
+    if not isinstance(path, str) or not path:
+        raise ValueError("Safetensors: path 必须是非空字符串")
+    try:
+        fh = open(path, "rb")
+    except OSError as exc:
+        raise ValueError(f"Safetensors: 无法打开文件 {path!r}") from exc
+    with fh:
+        prefix = fh.read(8)
+        if len(prefix) != 8:
+            raise ValueError("Safetensors: 文件过短，缺少 8 字节 header 长度")
+        (header_len,) = struct.unpack("<Q", prefix)
+        if header_len == 0:
+            raise ValueError("Safetensors: header 长度不能为 0")
+        raw = fh.read(header_len)
+        if len(raw) != header_len:
+            raise ValueError("Safetensors: header 被截断")
+        try:
+            header = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Safetensors: header 不是合法 JSON: {exc}") from exc
+        if not isinstance(header, dict):
+            raise ValueError("Safetensors: header 必须是 JSON 对象")
+        total = 0
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(info, dict):
+                raise ValueError(f"Safetensors: 张量 '{name}' 的描述不是对象")
+            if info.get("dtype") != "F32":
+                raise ValueError(
+                    f"Safetensors: 暂只支持 F32，'{name}' 是 {info.get('dtype')!r}")
+            shape = info.get("shape")
+            offsets = info.get("data_offsets")
+            if (not isinstance(shape, list) or not shape
+                    or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
+                           for v in shape)):
+                raise ValueError(f"Safetensors: 张量 '{name}' 的 shape 非法")
+            if (not isinstance(offsets, list) or len(offsets) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, int)
+                           for v in offsets)):
+                raise ValueError(f"Safetensors: 张量 '{name}' 的 data_offsets 非法")
+            start, end = offsets
+            expect = 4
+            for v in shape:
+                expect *= v
+            if start < 0 or end - start != expect:
+                raise ValueError(
+                    f"Safetensors: 张量 '{name}' 的 data_offsets 与 shape 不匹配")
+            total += expect
+        return header, total
+
+
+def safetensors_load(path):
+    """读取 Safetensors 文件，返回 {name: 嵌套 list}。"""
+    header, total = safetensors_header(path)
+    with open(path, "rb") as fh:
+        buf = fh.read()
+    prefix_len = 8
+    (header_len,) = struct.unpack("<Q", buf[:8])
+    data = buf[prefix_len + header_len:]
+    if len(data) < total:
+        raise ValueError(
+            f"Safetensors: 数据区被截断（需要 {total} 字节，实际 {len(data)}）")
+    out = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        shape = info["shape"]
+        start, end = info["data_offsets"]
+        raw = data[start:end]
+        flat = list(struct.unpack("<" + "f" * (len(raw) // 4), raw))
+        if len(shape) == 1:
+            out[name] = flat
+        else:
+            rows, cols = shape
+            out[name] = [flat[i * cols:(i + 1) * cols] for i in range(rows)]
+    return out
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

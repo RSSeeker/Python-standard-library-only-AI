@@ -33562,3 +33562,131 @@ class TestDiT:
         _p9_raises(lambda: model.fit([_p9_image(0.0)], lr=0.0))
         _p9_raises(lambda: model.sample(0))
         _p9_raises(lambda: model.sgd_step(0.0))
+
+
+import json
+import os
+import struct
+import tempfile
+
+import AI
+
+
+def _p10_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p10_tmp(name):
+    d = os.path.join(tempfile.gettempdir(), "p10_tests")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
+
+class TestSafetensors:
+    def test_roundtrip_and_header(self):
+        p = _p10_tmp("rt.safetensors")
+        tensors = {"w": [[0.25, -1.5], [2.0, 3.25]],
+                   "b": [0.125, -0.5, 7.0]}
+        assert AI.safetensors_save(tensors, p) == p
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        (header_len,) = struct.unpack("<Q", raw[:8])
+        assert header_len % 8 == 0
+        assert len(raw) == 8 + header_len + 4 * 7
+        header = json.loads(raw[8:8 + header_len].decode("utf-8"))
+        assert header["w"]["dtype"] == "F32"
+        assert header["w"]["shape"] == [2, 2]
+        assert header["w"]["data_offsets"] == [0, 16]
+        assert header["b"]["shape"] == [3]
+        assert header["b"]["data_offsets"] == [16, 28]
+        loaded = AI.safetensors_load(p)
+        assert loaded == tensors
+        assert AI.safetensors_header(p)[1] == 28
+
+    def test_float_precision(self):
+        p = _p10_tmp("prec.safetensors")
+        vals = [0.1, 1.0 / 3.0, -1e-6, 1e6, 123.456]
+        AI.safetensors_save({"v": vals}, p)
+        got = AI.safetensors_load(p)["v"]
+        for a, b in zip(vals, got):
+            assert abs(a - b) <= 1e-6 * max(1.0, abs(a))
+
+    def test_metadata_and_1d(self):
+        p = _p10_tmp("meta.safetensors")
+        header = {
+            "x": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": {"format": "pt", "note": "kept only in header"},
+        }
+        raw_header = json.dumps(header).encode("utf-8")
+        raw_header += b" " * ((-len(raw_header)) % 8)
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", len(raw_header)))
+            fh.write(raw_header)
+            fh.write(struct.pack("<f", 2.5))
+        h, total = AI.safetensors_header(p)
+        assert "__metadata__" in h and total == 4
+        assert AI.safetensors_load(p) == {"x": [2.5]}
+
+    def test_save_errors(self):
+        p = _p10_tmp("err.safetensors")
+        _p10_raises(lambda: AI.safetensors_save({}, p))
+        _p10_raises(lambda: AI.safetensors_save({"x": []}, p))
+        _p10_raises(lambda: AI.safetensors_save({"x": [[1.0], [2.0, 3.0]]}, p))
+        _p10_raises(lambda: AI.safetensors_save({"x": [1.0, "a"]}, p))
+        _p10_raises(lambda: AI.safetensors_save({"": [1.0]}, p))
+        _p10_raises(lambda: AI.safetensors_save({"__metadata__": [1.0]}, p))
+        _p10_raises(lambda: AI.safetensors_save([1.0], p))
+        _p10_raises(lambda: AI.safetensors_save({"x": [1.0]}, 3))
+
+    def test_corrupt_files(self):
+        d = os.path.join(tempfile.gettempdir(), "p10_tests")
+
+        p = os.path.join(d, "short.safetensors")
+        with open(p, "wb") as fh:
+            fh.write(b"\x01\x02")
+        _p10_raises(lambda: AI.safetensors_header(p))
+
+        p = os.path.join(d, "zero.safetensors")
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", 0))
+        _p10_raises(lambda: AI.safetensors_header(p))
+
+        p = os.path.join(d, "badjson.safetensors")
+        raw = b"{not json"
+        raw += b" " * ((-len(raw)) % 8)
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", len(raw)))
+            fh.write(raw)
+        _p10_raises(lambda: AI.safetensors_header(p))
+
+        p = os.path.join(d, "dtype.safetensors")
+        h = {"x": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]}}
+        raw = json.dumps(h).encode("utf-8")
+        raw += b" " * ((-len(raw)) % 8)
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", len(raw)))
+            fh.write(raw)
+            fh.write(b"\x00" * 4)
+        _p10_raises(lambda: AI.safetensors_header(p))
+
+        p = os.path.join(d, "mismatch.safetensors")
+        h = {"x": {"dtype": "F32", "shape": [3], "data_offsets": [0, 8]}}
+        raw = json.dumps(h).encode("utf-8")
+        raw += b" " * ((-len(raw)) % 8)
+        with open(p, "wb") as fh:
+            fh.write(struct.pack("<Q", len(raw)))
+            fh.write(raw)
+            fh.write(b"\x00" * 8)
+        _p10_raises(lambda: AI.safetensors_header(p))
+
+        p = os.path.join(d, "trunc.safetensors")
+        AI.safetensors_save({"x": [1.0, 2.0]}, p)
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        with open(p, "wb") as fh:
+            fh.write(raw[:-4])
+        _p10_raises(lambda: AI.safetensors_load(p))

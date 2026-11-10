@@ -844,8 +844,9 @@
 - [x] Transformer 梯度检查点：`checkpoint_transformer`（段边界激活、段内缓存释放、反向逐段重放）；与普通反传逐位一致；`TestCheckpointTransformer` 4 例。
 - [x] 神经算子：`DeepONet`（branch/trunk 双 MLP + 内积输出）、`FNO1d`（复权重谱卷积 + 1×1 跳连，支持学习求导等非平移算子）；`TestDeepONet` 4 例、`TestFNO1d` 4 例。
 - [x] 扩散 Transformer（DiT）：图像块 Conv2d 嵌入 + 二维正弦位置编码 + TransformerEncoder + adaLN-simple 时间调制；DDPM ε-prediction 训练与反向采样；`TestDiT` 5 例。
+- [x] Safetensors 读写：F32 小端 1D/2D 张量、header JSON + 8 字节对齐、`safetensors_header` 一致性校验；`TestSafetensors` 5 例。
 
-全量测试：1839 → 2143 passed（新增 304 例）。
+全量测试：1839 → 2148 passed（新增 309 例）。
 
 ---
 

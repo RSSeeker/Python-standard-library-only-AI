@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2143 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2148 项）
 
 ## 特性
 
@@ -3185,6 +3185,28 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
   所以注册表里的文件和手动 `model.save()` 的格式完全一致。
 
+### Safetensors 读写
+
+`Safetensors` 是零拷贝友好的张量归档格式：8 字节小端 header 长度 + JSON header + 数据区，
+header 里每个张量记录 `dtype` / `shape` / `data_offsets`，数据区只放连续的原始字节。
+这里提供 F32、1D/2D 张量的最小实现，可把模型权重从 JSON 存档迁到更紧凑的二进制文件。
+
+```python
+AI.safetensors_save({"w": [[0.5, -1.0], [2.0, 3.0]], "b": [0.1, -0.2]},
+                    "weights.safetensors")
+header, data_bytes = AI.safetensors_header("weights.safetensors")
+weights = AI.safetensors_load("weights.safetensors")
+```
+
+| 接口 | 说明 |
+| --- | --- |
+| `safetensors_save(tensors, path)` | `{name: 1D/2D 嵌套 list}` → 小端 F32 文件；header JSON 紧凑序列化并按 8 字节补空格对齐，名字不能为空或 `__metadata__` |
+| `safetensors_header(path)` | 返回 `(header, 数据区字节数)`；逐项校验 dtype=F32、shape 与 `data_offsets` 一致 |
+| `safetensors_load(path)` | 按 shape 还原 1D/2D 嵌套 list，数据区截断报错；读取时跳过 `__metadata__` |
+
+边界：只支持 F32 与小端、1D/2D 张量；不处理 bf16/fp16 存储、不做 mmap 读取、不写 `__metadata__`；
+浮点值按 float32 往返，与 float64 相比有约 1e-7 相对误差。
+
 ### 命令行入口
 
 `ai_cli.py` 是仓库里唯一新增的可执行脚本，五个子命令都只依赖 `argparse` 与 `json`：
@@ -4074,7 +4096,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2143 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2148 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4272,6 +4294,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
 | `TestDiT` | 前向/参数计数/采样可复现、conv/head/时间 MLP 梯度中心差分、拟合降 loss、时间调制改变输出、非法输入 |
+| `TestSafetensors` | 1D/2D 往返、header 偏移/8 字节对齐、float32 精度、`__metadata__` 跳过、非法张量、截断/坏 JSON/坏 dtype/offsets 不匹配 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4419,7 +4442,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2143 个单元测试
+├── test_ai.py       # 2148 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
