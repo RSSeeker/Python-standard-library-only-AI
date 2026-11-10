@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2188 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2194 项）
 
 ## 特性
 
@@ -2259,6 +2259,30 @@ print(dist, st["deg"], model.predict(xs, edges))
 
 - 边界：`edges` 是无权无向边列表，邻接视为常量；度与最短路径桶按 `max_degree` / `max_path` 截断；注意力用多头拼接后线性投影；输出是图级标量回归（非节点级/边级）；全批量 SGD，无 dropout。
 
+### VMamba（2D 选择性扫描）
+
+`VMambaBlock` 把 Mamba 的选择性扫描推广到二维网格：沿行优先、行逆序、列优先、
+列逆序四个方向各做一次扫描，结果取平均后乘 SiLU 门控，再经输出投影加残差。
+`VMamba` 在此基础上做 patch 嵌入 + 多层 pre-LN 残差块，输出图像级特征向量。
+
+```python
+blk = VMambaBlock(d_model=4, d_state=3, seed=1)
+grid = [[[0.1 * r - 0.2 * c for _ in range(4)] for c in range(3)] for r in range(3)]
+out = blk.forward(grid)
+blk.backward(out)                     # 块级反向（可自定义训练循环）
+model = VMamba(in_channels=2, image_size=8, patch_size=4, d_model=6)
+feats = model.forward([img])          # 每张图一个 d_model 维特征
+```
+
+| API | 说明 |
+| --- | --- |
+| `VMambaBlock(d_model, d_state=4)` | 四方向 2D 选择性扫描 + SiLU 门控 + 残差；`forward(grid)`、`backward(dout)`、`sgd_step(lr)`、`param_count` |
+| `VMamba(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, d_state=4)` | patch 嵌入 + 多层 VMamba 块，`forward(images)` 返回图像级特征；`param_count` |
+
+边界：这是教学用的简化 VMamba——2D 选择性扫描用四个一维方向平均近似（不是 VSSD
+的交叉扫描合并），没有 CUDA 融合/并行扫描；`VMamba` 只提供前向特征提取，不包含
+分类头与端到端训练接口；块反向后参数梯度不累加，由调用方在 `sgd_step` 前自行汇总。
+
 ### Titans 神经记忆（TitansMemory / TitansSequenceMemory）
 
 `TitansMemory` 把长期记忆实现为一个小的 `MLP([d_model, hidden, d_model])`：
@@ -4193,7 +4217,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2188 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2194 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4404,6 +4428,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMamba2Model` | 语言模型前向/损失/参数、fit 降 loss、序列与 vocab 越界等非法输入 |
 | `TestTitansMemory` | 读/参数计数、update 降低 MSE 与计数、fit 降 loss、state 与非法输入 |
 | `TestTitansSequenceMemory` | 逐 token 读写、process(update=False) 不改记忆、非法输入 |
+| `TestVMambaBlock` | 前向形状/参数、四项中心差分、SGD 更新、非法输入 |
+| `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4551,7 +4577,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2188 个单元测试
+├── test_ai.py       # 2194 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -34401,3 +34401,107 @@ class TestTitansSequenceMemory:
         _p17_raises(lambda: sm.process([[0.1, 0.2]]))
         _p17_raises(lambda: sm.fit([]))
         _p17_raises(lambda: sm.fit([[1.0, 0.0, 0.0]], epochs=0))
+
+
+import math
+import random
+
+import AI
+
+
+def _p18_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p18_grid(h=3, w=3, d=4, seed=1):
+    rng = random.Random(seed)
+    return [[[rng.gauss(0.0, 1.0) for _ in range(d)] for _ in range(w)]
+            for _ in range(h)]
+
+
+class TestVMambaBlock:
+    def test_forward_and_param_count(self):
+        blk = AI.VMambaBlock(4, d_state=3, seed=1)
+        out = blk.forward(_p18_grid())
+        assert len(out) == 3 and len(out[0]) == 3 and len(out[0][0]) == 4
+        assert blk.param_count() == 118
+
+    def test_numerical_gradients(self):
+        blk = AI.VMambaBlock(4, d_state=3, seed=1)
+        grid = _p18_grid(seed=2)
+        rng = random.Random(7)
+        w = [[[rng.gauss(0.0, 1.0) for _ in range(4)] for _ in range(3)]
+             for _ in range(3)]
+
+        def loss_of():
+            out = blk.forward(grid)
+            return sum(out[r][c][j] * w[r][c][j]
+                       for r in range(3) for c in range(3) for j in range(4))
+
+        blk.zero_grad()
+        loss_of()
+        blk.backward(w)
+        ana = {"in": blk.grads["in_proj"][0][0][0],
+               "dt": blk.grads["dt_proj"][0][0][0],
+               "A": blk.grad_A_log[0], "D": blk.grad_D[0]}
+
+        def fd(setter, getter):
+            p0 = getter()
+            setter(p0 + 1e-5); lp = loss_of()
+            setter(p0 - 1e-5); lm = loss_of()
+            setter(p0)
+            return (lp - lm) / 2e-5
+
+        num = {
+            "in": fd(lambda v: blk.in_proj.weights[0].__setitem__(0, v),
+                     lambda: blk.in_proj.weights[0][0]),
+            "dt": fd(lambda v: blk.dt_proj.weights[0].__setitem__(0, v),
+                     lambda: blk.dt_proj.weights[0][0]),
+            "A": fd(lambda v: blk.A_log.__setitem__(0, v),
+                    lambda: blk.A_log[0]),
+            "D": fd(lambda v: blk.D.__setitem__(0, v), lambda: blk.D[0]),
+        }
+        for k in ana:
+            assert abs(ana[k] - num[k]) < 1e-3 * max(1.0, abs(num[k])), (k, ana[k], num[k])
+
+    def test_sgd_step_changes_weights(self):
+        blk = AI.VMambaBlock(4, d_state=3, seed=1)
+        grid = _p18_grid(seed=3)
+        w = [[[0.1] * 4 for _ in range(3)] for _ in range(3)]
+        blk.zero_grad()
+        before = blk.in_proj.weights[0][0]
+        blk.forward(grid)
+        blk.backward(w)
+        blk.sgd_step(0.01)
+        assert blk.in_proj.weights[0][0] != before
+        assert math.isfinite(blk.in_proj.weights[0][0])
+
+    def test_invalid_inputs(self):
+        _p18_raises(lambda: AI.VMambaBlock(0))
+        _p18_raises(lambda: AI.VMambaBlock(4, d_state=0))
+        blk = AI.VMambaBlock(4, d_state=3, seed=1)
+        _p18_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
+        _p18_raises(lambda: blk.sgd_step(0.0))
+
+
+class TestVMamba:
+    def test_forward_and_param_count(self):
+        model = AI.VMamba(in_channels=2, image_size=8, patch_size=4,
+                          d_model=6, num_layers=1, d_state=3, seed=2)
+        img = [[[0.5] * 8 for _ in range(8)] for _ in range(2)]
+        feats = model.forward([img])
+        assert len(feats) == 1 and len(feats[0]) == 6
+        assert model.param_count() == 444
+
+    def test_invalid_inputs(self):
+        _p18_raises(lambda: AI.VMamba(image_size=8, patch_size=3))
+        _p18_raises(lambda: AI.VMamba(d_model=0))
+        model = AI.VMamba(in_channels=2, image_size=8, patch_size=4,
+                          d_model=4, num_layers=1, seed=2)
+        _p18_raises(lambda: model.forward([]))
+        _p18_raises(lambda: model.forward([[[[0.0] * 8] * 8]]))
+        _p18_raises(lambda: model.forward([[[[float("nan")] * 8] * 8] for _ in range(2)]))

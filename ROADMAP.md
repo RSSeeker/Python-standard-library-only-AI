@@ -852,8 +852,9 @@
 - [x] 图 Transformer（Graphormer）：`graph_shortest_paths`（BFS 全源最短路）、`graphormer_structure`（度桶与最短路径桶）、`GraphormerLayer`（`sp_bias` + `deg_bias` 注意力偏置）、`Graphormer`（可学习度嵌入 + 均值池化图级回归）；`TestGraphormer` 5 例。
 - [x] Mamba-2（简化 SSD）：`Mamba2Block`（每头标量衰减 `a=exp(-exp(A_log)·dt)`、`state=a·state+x⊗B`、`y=C·state`、D 跳连 + SiLU 门控、手写 BPTT）、`Mamba2Model`（字符级 LM）；`TestMamba2Block` 3 例、`TestMamba2Model` 3 例。
 - [x] Titans 神经记忆：`TitansMemory`（MLP 记忆体、surprise 自适应步长、梯度裁剪、一阶动量）、`TitansSequenceMemory`（逐 token 读记忆并用下一 token 写入）；`TestTitansMemory` 4 例、`TestTitansSequenceMemory` 3 例。
+- [x] VMamba（2D 选择性扫描）：`VMambaBlock`（行/列双向共四个方向的选择性扫描、SiLU 门控、残差）、`VMamba`（patch 嵌入 + 多层块，图像级特征提取）；`TestVMambaBlock` 4 例、`TestVMamba` 2 例。
 
-全量测试：1839 → 2188 passed（新增 349 例）。
+全量测试：1839 → 2194 passed（新增 355 例）。
 
 ---
 

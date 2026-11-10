@@ -3267,6 +3267,343 @@ class TitansSequenceMemory:
     def param_count(self) -> int:
         return self.memory.param_count()
 
+def _vm_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"VMamba: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _vm_check_img(images, in_channels, image_size, who="VMamba"):
+    if not isinstance(images, (list, tuple)) or not images:
+        raise ValueError(f"{who}: images 必须是非空列表")
+    for idx, img in enumerate(images):
+        if not isinstance(img, (list, tuple)) or len(img) != in_channels:
+            raise ValueError(f"{who}: 第 {idx} 张图必须是 {in_channels} 通道 (C,H,W)")
+        for ch in range(in_channels):
+            if not isinstance(img[ch], (list, tuple)) or len(img[ch]) != image_size:
+                raise ValueError(f"{who}: 第 {idx} 张图每通道必须有 {image_size} 行")
+            for row in img[ch]:
+                if not isinstance(row, (list, tuple)) or len(row) != image_size:
+                    raise ValueError(f"{who}: 第 {idx} 张图必须是 {image_size}x{image_size}")
+                for v in row:
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                            or not math.isfinite(v):
+                        raise ValueError(f"{who}: 图像必须只包含有限数字")
+    return images
+
+
+def _vm_softplus(x):
+    if x > 20.0:
+        return x
+    if x < -20.0:
+        return math.exp(x)
+    return math.log1p(math.exp(x))
+
+
+def _vm_scan_forward(xs, dt_pre, bs, cs, a_log, D, d):
+    """单方向选择性扫描：state_t = exp(-exp(A_log)*dt)·state + x⊗B，y = C·state + D·x。"""
+    d_state = len(bs[0])
+    A = [math.exp(v) for v in a_log]
+    state = [[0.0] * d_state for _ in range(d)]
+    cache = {"A": A, "D": list(D), "xs": xs, "bs": bs, "cs": cs,
+             "dt": [], "a": [], "prev": [], "next": []}
+    ys = []
+    for t in range(len(xs)):
+        dt = [_vm_softplus(v) for v in dt_pre[t]]
+        a = [math.exp(-A[i] * dt[i]) for i in range(d)]
+        cache["dt"].append(dt)
+        cache["a"].append(a)
+        cache["prev"].append([row[:] for row in state])
+        for i in range(d):
+            xi = xs[t][i]
+            row = state[i]
+            for k in range(d_state):
+                row[k] = a[i] * row[k] + xi * bs[t][k]
+        cache["next"].append([row[:] for row in state])
+        y = [0.0] * d
+        for i in range(d):
+            row = state[i]
+            s = 0.0
+            for k in range(d_state):
+                s += row[k] * cs[t][k]
+            y[i] = s + D[i] * xs[t][i]
+        ys.append(y)
+    return ys, cache
+
+
+def _vm_scan_backward(dout, cache, d):
+    d_state = len(cache["bs"][0])
+    T = len(dout)
+    dxs = [[0.0] * d for _ in range(T)]
+    ddt_pre = [[0.0] * d for _ in range(T)]
+    dbs = [[0.0] * d_state for _ in range(T)]
+    dcs = [[0.0] * d_state for _ in range(T)]
+    dD = [0.0] * d
+    dA = [0.0] * d
+    dstate = [[0.0] * d_state for _ in range(d)]
+    for t in range(T - 1, -1, -1):
+        dy = dout[t]
+        for i in range(d):
+            dxs[t][i] = dy[i] * cache["D"][i]
+            dD[i] += dy[i] * cache["xs"][t][i]
+        cs_t = cache["cs"][t]
+        for i in range(d):
+            for k in range(d_state):
+                dcs[t][k] += dy[i] * cache["next"][t][i][k]
+                dstate[i][k] += dy[i] * cs_t[k]
+        xs_t = cache["xs"][t]
+        bs_t = cache["bs"][t]
+        for i in range(d):
+            for k in range(d_state):
+                dxs[t][i] += dstate[i][k] * bs_t[k]
+                dbs[t][k] += dstate[i][k] * xs_t[i]
+        a_t = cache["a"][t]
+        prev = cache["prev"][t]
+        A = cache["A"]
+        for i in range(d):
+            da = 0.0
+            for k in range(d_state):
+                da += dstate[i][k] * prev[i][k]
+            if da != 0.0:
+                dt_i = cache["dt"][t][i]
+                sig = 1.0 - math.exp(-dt_i)
+                ddt_pre[t][i] = da * (-A[i] * a_t[i]) * sig
+                dA[i] += da * (-a_t[i] * dt_i)
+        for i in range(d):
+            for k in range(d_state):
+                dstate[i][k] *= a_t[i]
+    for i in range(d):
+        dA[i] *= A[i]
+    return dxs, ddt_pre, dbs, dcs, dD, dA
+
+
+def _vm_dirs(gh, gw):
+    row_major = [(r, c) for r in range(gh) for c in range(gw)]
+    row_rev = list(reversed(row_major))
+    col_major = [(r, c) for c in range(gw) for r in range(gh)]
+    col_rev = list(reversed(col_major))
+    return [row_major, row_rev, col_major, col_rev]
+
+
+class VMambaBlock:
+    """VMamba 的 2D 选择性扫描块（简化版）：四个方向扫描后取平均，再乘 SiLU 门控。"""
+
+    def __init__(self, d_model, d_state=4, seed=None):
+        _vm_check_pos_int(d_model, "d_model")
+        _vm_check_pos_int(d_state, "d_state")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VMamba: seed 必须是整数或 None")
+        self.d_model = d_model
+        self.d_state = d_state
+        self.in_proj = Layer(d_model, 2 * d_model, "linear")
+        self.dt_proj = Layer(d_model, d_model, "linear")
+        self.B_proj = Layer(d_model, d_state, "linear")
+        self.C_proj = Layer(d_model, d_state, "linear")
+        self.out_proj = Layer(d_model, d_model, "linear")
+        rng = random.Random(seed)
+        self.A_log = [rng.gauss(0.0, 0.1) for _ in range(d_model)]
+        self.D = [1.0 for _ in range(d_model)]
+        self.grad_A_log = [0.0] * d_model
+        self.grad_D = [0.0] * d_model
+        self.grads = {name: None for name in
+                      ("in_proj", "dt_proj", "B_proj", "C_proj", "out_proj")}
+        self._cache = None
+
+    # ---------- 参数管理 ----------
+    def zero_grad(self):
+        self.grad_A_log = [0.0] * self.d_model
+        self.grad_D = [0.0] * self.d_model
+        for name in self.grads:
+            self.grads[name] = None
+        self._cache = None
+
+    def param_count(self):
+        return (_dense_param_count(self.in_proj) + _dense_param_count(self.dt_proj)
+                + _dense_param_count(self.B_proj) + _dense_param_count(self.C_proj)
+                + _dense_param_count(self.out_proj) + 2 * self.d_model)
+
+    def _accumulate(self, name, grads):
+        if self.grads[name] is None:
+            self.grads[name] = ([row[:] for row in grads[0]], grads[1][:])
+        else:
+            gw, gb = self.grads[name]
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    gw[i][j] += grads[0][i][j]
+            for i in range(len(gb)):
+                gb[i] += grads[1][i]
+
+    # ---------- 前向 ----------
+    def forward(self, grid):
+        gh = len(grid)
+        gw = len(grid[0])
+        d = self.d_model
+        self._grid = (gh, gw)
+        rows = [grid[r][c] for r in range(gh) for c in range(gw)]
+        proj, proj_cache = _dense_rows_forward(self.in_proj, rows)
+        xs = [p[:d] for p in proj]
+        zs = [p[d:] for p in proj]
+        dt_rows, dt_cache = _dense_rows_forward(self.dt_proj, xs)
+        b_rows, b_cache = _dense_rows_forward(self.B_proj, xs)
+        c_rows, c_cache = _dense_rows_forward(self.C_proj, xs)
+        acc = [[[0.0] * d for _ in range(gw)] for _ in range(gh)]
+        scans = []
+        for order in _vm_dirs(gh, gw):
+            idx = [r * gw + c for (r, c) in order]
+            ys, scache = _vm_scan_forward(
+                [xs[i] for i in idx], [dt_rows[i] for i in idx],
+                [b_rows[i] for i in idx], [c_rows[i] for i in idx],
+                self.A_log, self.D, d)
+            scans.append((idx, scache))
+            for pos, i in enumerate(idx):
+                r, c = divmod(i, gw)
+                for j in range(d):
+                    acc[r][c][j] += ys[pos][j] * 0.25
+        gated = []
+        for r in range(gh):
+            for c in range(gw):
+                row = []
+                for j in range(d):
+                    sig = 1.0 / (1.0 + math.exp(-zs[r * gw + c][j]))
+                    row.append(acc[r][c][j] * sig)
+                gated.append(row)
+        out_rows, out_cache = _dense_rows_forward(self.out_proj, gated)
+        out = [[[grid[r][c][j] + out_rows[r * gw + c][j] for j in range(d)]
+                for c in range(gw)] for r in range(gh)]
+        self._cache = {"proj_cache": proj_cache, "xs": xs, "zs": zs,
+                       "dt_cache": dt_cache, "b_cache": b_cache, "c_cache": c_cache,
+                       "scans": scans, "acc": acc, "gated": gated,
+                       "out_cache": out_cache, "grid": grid}
+        return out
+
+    # ---------- 反向 ----------
+    def backward(self, dout):
+        cache = self._cache
+        if cache is None:
+            raise RuntimeError("VMambaBlock: backward 之前必须先 forward")
+        gh, gw = self._grid
+        d = self.d_model
+        drows = [dout[r][c] for r in range(gh) for c in range(gw)]
+        gw_out, gb_out, d_gated = _dense_rows_backward(
+            self.out_proj, cache["out_cache"], drows)
+        self._accumulate("out_proj", (gw_out, gb_out))
+        d_acc = [[[0.0] * d for _ in range(gw)] for _ in range(gh)]
+        d_z = [[[0.0] * d for _ in range(gw)] for _ in range(gh)]
+        for r in range(gh):
+            for c in range(gw):
+                i = r * gw + c
+                for j in range(d):
+                    sig = 1.0 / (1.0 + math.exp(-cache["zs"][i][j]))
+                    d_acc[r][c][j] = d_gated[i][j] * sig
+                    d_z[r][c][j] = d_gated[i][j] * cache["acc"][r][c][j] * sig * (1.0 - sig)
+        n = len(cache["xs"])
+        d_xs = [[0.0] * d for _ in range(n)]
+        d_dt = [[0.0] * d for _ in range(n)]
+        d_b = [[0.0] * self.d_state for _ in range(n)]
+        d_c = [[0.0] * self.d_state for _ in range(n)]
+        for idx, scache in cache["scans"]:
+            seq_dy = [[v * 0.25 for v in d_acc[i // gw][i % gw]] for i in idx]
+            dxs, ddt, dbs, dcs, dD, dA = _vm_scan_backward(seq_dy, scache, d)
+            for pos, i in enumerate(idx):
+                for j in range(d):
+                    d_xs[i][j] += dxs[pos][j]
+                    d_dt[i][j] += ddt[pos][j]
+                for k in range(self.d_state):
+                    d_b[i][k] += dbs[pos][k]
+                    d_c[i][k] += dcs[pos][k]
+            for j in range(d):
+                self.grad_D[j] += dD[j]
+                self.grad_A_log[j] += dA[j]
+        gwd, gbd, d_xs_dt = _dense_rows_backward(self.dt_proj, cache["dt_cache"], d_dt)
+        self._accumulate("dt_proj", (gwd, gbd))
+        gwb, gbb, d_xs_b = _dense_rows_backward(self.B_proj, cache["b_cache"], d_b)
+        self._accumulate("B_proj", (gwb, gbb))
+        gwc, gbc, d_xs_c = _dense_rows_backward(self.C_proj, cache["c_cache"], d_c)
+        self._accumulate("C_proj", (gwc, gbc))
+        d_in_rows = []
+        for i in range(n):
+            row = [d_xs[i][j] + d_xs_dt[i][j] + d_xs_b[i][j] + d_xs_c[i][j]
+                   for j in range(d)]
+            row += [d_z[i // gw][i % gw][j] for j in range(d)]
+            d_in_rows.append(row)
+        gwi, gbi, d_input = _dense_rows_backward(self.in_proj, cache["proj_cache"], d_in_rows)
+        self._accumulate("in_proj", (gwi, gbi))
+        dgrid = [[dout[r][c][:] for c in range(gw)] for r in range(gh)]
+        for i in range(n):
+            r, c = divmod(i, gw)
+            for j in range(d):
+                dgrid[r][c][j] += d_input[i][j]
+        return dgrid
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0:
+            raise ValueError("VMamba: lr 必须为正数")
+        for name in self.grads:
+            grads = self.grads[name]
+            if grads is not None:
+                _dense_apply_sgd(getattr(self, name), grads, lr)
+        for j in range(self.d_model):
+            self.A_log[j] -= lr * self.grad_A_log[j]
+            self.D[j] -= lr * self.grad_D[j]
+        self.zero_grad()
+
+
+class VMamba:
+    """简化的 VMamba 特征提取器：patch 嵌入 + 多个 2D 选择性扫描块（pre-LN 残差）。
+
+    只提供前向特征（训练接口不在此实现，块级 backward 可用于自定义训练循环）。
+    """
+
+    def __init__(self, in_channels=3, image_size=8, patch_size=4, d_model=16,
+                 num_layers=2, d_state=4, seed=None):
+        for name, val in (("in_channels", in_channels), ("image_size", image_size),
+                          ("patch_size", patch_size), ("d_model", d_model),
+                          ("num_layers", num_layers), ("d_state", d_state)):
+            _vm_check_pos_int(val, name)
+        if image_size % patch_size != 0:
+            raise ValueError("VMamba: image_size 必须能被 patch_size 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VMamba: seed 必须是整数或 None")
+        self.in_channels = in_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.grid = image_size // patch_size
+        self.embed = Conv2d(in_channels, d_model, patch_size, stride=patch_size)
+        self.ln1 = [LayerNorm(d_model) for _ in range(num_layers)]
+        self.blocks = [VMambaBlock(d_model, d_state, seed) for _ in range(num_layers)]
+        self.ln_out = LayerNorm(d_model)
+
+    def forward(self, images):
+        _vm_check_img(images, self.in_channels, self.image_size)
+        d = self.d_model
+        gh = gw = self.grid
+        feats = []
+        for image in images:
+            feat = self.embed.forward(image)
+            grid = [[[feat[j][r][c] for j in range(d)] for c in range(gw)]
+                    for r in range(gh)]
+            for ln, blk in zip(self.ln1, self.blocks):
+                rows = [grid[r][c] for r in range(gh) for c in range(gw)]
+                normed, _ = _norm_rows_forward(ln, rows)
+                g2 = [[normed[r * gw + c] for c in range(gw)] for r in range(gh)]
+                g3 = blk.forward(g2)
+                grid = [[[grid[r][c][j] + g3[r][c][j] for j in range(d)]
+                         for c in range(gw)] for r in range(gh)]
+            rows = [grid[r][c] for r in range(gh) for c in range(gw)]
+            out, _ = _norm_rows_forward(self.ln_out, rows)
+            feats.append([sum(out[i][j] for i in range(len(out))) / len(out)
+                          for j in range(d)])
+        return feats
+
+    def param_count(self):
+        total = _conv_param_count(self.embed)
+        for ln, blk in zip(self.ln1, self.blocks):
+            total += _norm_param_count(ln) + blk.param_count()
+        total += _norm_param_count(self.ln_out)
+        return total
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
