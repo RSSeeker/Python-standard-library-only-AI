@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2148 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2159 项）
 
 ## 特性
 
@@ -438,6 +438,10 @@ model.train()     # 回到训练
 | `PrefixCache(num_layers, d_model)` | 逐层 KV 前缀缓存：`set`/`get`/`length`/`truncate`/`merge` + `to_dict`/`from_dict`/`save`/`load`（JSON 持久化） |
 | `ContinuousBatcher(max_batch=2, max_total_tokens=None)` | 连续批处理调度：`add(prompt, max_new, request_id)` 入队、`batch()` 取当前批、`step({id: token})` 喂 token 并补位、`result(id)`/`stats()`；只做调度与记账，不依赖模型实现 |
 | `PagedKVCache(num_layers, num_heads, head_dim, block_size=4, max_blocks=16)` | PagedAttention 的块表（数据结构演示）：`new_request`/`append`/`get`/`length`/`free`/`stats`；逻辑位置到物理块不必连续、释放后可复用 |
+| `PagedBlockManager(num_blocks, block_size=4, swap_capacity=None)` | PagedAttention 块分配器：`new_request`/`allocate`/`ensure`/`free`、`fork`（前缀共享计引用）、`cow`（写时复制）、`swap_out`/`swap_in`（换出到 CPU / 换回并报告旧→新块号）、`stats`；引用计数归零才回收物理块 |
+| `PrefixCacheStore(num_layers, d_model, max_entries=8, min_prefix=1)` | 跨请求 KV 前缀缓存：`put` 写入、`match` 找最长已缓存前缀、`get` 精确命中、`stats`/`clear`；超出 `max_entries` 按 LRU 淘汰 |
+| `make_needle_haystack(total_tokens=256, depth=0.5, needle='NEEDLE', seed=None)` | 生成 needle-in-a-haystack 长上下文：返回 `{'tokens','needle_index','needle'}`，`depth` 控制针的相对位置 |
+| `llm_judge_prompt(question, answer, reference=None, scale=10)` / `parse_judge_verdict(text, scale=10)` / `judge_agreement(scores, tolerance=1.0)` | LLM-as-judge 三件套：评审提示词模板、解析 `Score:`/`Verdict:` 输出（截断到 `[0, scale]`）、多评审打分的均值/标准差/最大差/一致率 |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
@@ -4096,7 +4100,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2148 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2159 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4295,6 +4299,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
 | `TestDiT` | 前向/参数计数/采样可复现、conv/head/时间 MLP 梯度中心差分、拟合降 loss、时间调制改变输出、非法输入 |
 | `TestSafetensors` | 1D/2D 往返、header 偏移/8 字节对齐、float32 精度、`__metadata__` 跳过、非法张量、截断/坏 JSON/坏 dtype/offsets 不匹配 |
+| `TestPagedBlockManager` | 分配/扩块/复用、`fork` 引用计数、COW 隔离、换出/换回（共享块复用）、非法参数与块耗尽、统计守恒 |
+| `TestPrefixCacheStore` | 最长前缀匹配、精确命中、LRU 淘汰、`min_prefix` 与非法 token/cache |
+| `TestNeedleHaystack` | 长度/针位置/depth 端点、seed 可复现、自定义填充词、非法输入 |
+| `TestLLMJudge` | 提示词包含问答与参考、输出解析（大小写/中文冒号/截断）、缺字段报错、一致率与容差 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4442,7 +4450,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2148 个单元测试
+├── test_ai.py       # 2159 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

@@ -14643,6 +14643,462 @@ def tail_free_filter(logits, tft: float = 0.5):
     return _apply_keep_mask(vals, allowed)
 
 
+class PagedBlockManager:
+    """PagedAttention 的块分配器（纯逻辑模拟，管理物理块而非真实显存）
+
+    ``PagedKVCache`` 只演示按块读写的表结构；这里补上分配/回收、写时复制
+    （copy-on-write，COW）与换出/换入（swap）策略，可与 ``ContinuousBatcher``
+    的调度循环配合：新请求先 ``allocate`` 拿初始块，插入 token 时
+    ``ensure`` 扩块，beam search 分支用 ``fork`` 共享前缀，写入共享块前
+    ``cow`` 复制一份，显存不足时把整条请求 ``swap_out`` 到 CPU 侧再
+    ``swap_in`` 回来。
+
+    - ``allocate(rid, count)``：为请求追加 ``count`` 个物理块
+    - ``ensure(rid, tokens)``：确保块表能容纳 ``tokens`` 个 token，返回块表
+    - ``free(rid)``：归还该请求的全部块（引用计数减到 0 才真正回收）
+    - ``fork(src, dst)``：``dst`` 共享 ``src`` 的块（引用计数递增）
+    - ``cow(rid, index)``：写前复制第 ``index`` 个块，返回新的块号
+    - ``swap_out(rid)`` / ``swap_in(rid)``：换出到 CPU 侧 / 换回并报告旧→新块号
+    - ``stats()``：``{'used_blocks', 'free_blocks', 'shared_blocks',
+      'swapped_blocks', 'requests', 'tables', 'copy_on_write'}``
+    """
+
+    def __init__(self, num_blocks: int, block_size: int = 4,
+                 swap_capacity: int = None):
+        for name, val in (('num_blocks', num_blocks),
+                          ('block_size', block_size)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError('PagedBlockManager: %s 必须是正整数，收到 %r'
+                                 % (name, val))
+        if swap_capacity is not None:
+            if (isinstance(swap_capacity, bool)
+                    or not isinstance(swap_capacity, int) or swap_capacity < 0):
+                raise ValueError('PagedBlockManager: swap_capacity 必须是非负整数，'
+                                 '收到 %r' % (swap_capacity,))
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.swap_capacity = swap_capacity
+        self._free = list(range(num_blocks))
+        self._ref = {}             # 物理块号 -> 引用计数
+        self._tables = {}          # rid -> [物理块号, ...]
+        self._swapped = {}         # rid -> 换出时的块表
+        self._cow_count = 0
+        self._seq = 0
+
+    # ---------- 校验 ----------
+    @staticmethod
+    def _check_rid(rid, who):
+        if isinstance(rid, bool) or not isinstance(rid, int) or rid < 0:
+            raise ValueError('%s: rid 必须是非负整数，收到 %r' % (who, rid))
+        return rid
+
+    def _check_known(self, rid, who):
+        if rid in self._swapped:
+            raise ValueError('%s: 请求 %r 已换出，请先 swap_in' % (who, rid))
+        if rid not in self._tables:
+            raise ValueError('%s: 未知请求 %r' % (who, rid))
+
+    @staticmethod
+    def _check_count(count, who, name='count'):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError('%s: %s 必须是非负整数，收到 %r'
+                             % (who, name, count))
+        return count
+
+    # ---------- 分配 / 回收 ----------
+    def new_request(self):
+        """创建空块表的请求，返回 rid。"""
+        rid = self._seq
+        self._seq += 1
+        self._tables[rid] = []
+        return rid
+
+    def allocate(self, rid, count):
+        """为请求追加 count 个新物理块；块不够时抛 ValueError。"""
+        who = 'PagedBlockManager.allocate'
+        self._check_rid(rid, who)
+        self._check_count(count, who)
+        self._check_known(rid, who)
+        if count > len(self._free):
+            raise ValueError('%s: 物理块不足（需要 %d，空闲 %d）'
+                             % (who, count, len(self._free)))
+        table = self._tables[rid]
+        for _ in range(count):
+            bid = self._free.pop(0)
+            self._ref[bid] = 1
+            table.append(bid)
+        return list(table)
+
+    def ensure(self, rid, tokens):
+        """确保块表容量 >= tokens 个 token，返回块表。"""
+        who = 'PagedBlockManager.ensure'
+        self._check_rid(rid, who)
+        self._check_count(tokens, who, 'tokens')
+        self._check_known(rid, who)
+        need = (tokens + self.block_size - 1) // self.block_size
+        have = len(self._tables[rid])
+        if need > have:
+            self.allocate(rid, need - have)
+        return list(self._tables[rid])
+
+    def free(self, rid):
+        """归还请求的全部物理块（共享块的引用计数减 1）。"""
+        who = 'PagedBlockManager.free'
+        self._check_rid(rid, who)
+        if rid in self._swapped:
+            del self._swapped[rid]
+            return []
+        self._check_known(rid, who)
+        table = self._tables.pop(rid)
+        for bid in table:
+            self._ref[bid] -= 1
+            if self._ref[bid] <= 0:
+                del self._ref[bid]
+                self._free.append(bid)
+        self._free.sort()
+        return table
+
+    # ---------- 共享 / 写时复制 ----------
+    def fork(self, src, dst=None):
+        """dst 请求共享 src 的当前块表（前缀共享 / beam 分支）。
+
+        ``dst=None`` 时自动分配一个新 rid，否则 ``dst`` 必须是尚未存在的请求。
+        """
+        who = 'PagedBlockManager.fork'
+        self._check_rid(src, who)
+        self._check_known(src, who)
+        if dst is None:
+            dst = self._seq
+            self._seq += 1
+        else:
+            self._check_rid(dst, who)
+            if dst in self._tables or dst in self._swapped:
+                raise ValueError('%s: 目标请求 %r 已存在' % (who, dst))
+        table = list(self._tables[src])
+        for bid in table:
+            self._ref[bid] += 1
+        self._tables[dst] = table
+        return dst
+
+    def cow(self, rid, index):
+        """写前复制第 index 个块；独占时直接返回原块号。"""
+        who = 'PagedBlockManager.cow'
+        self._check_rid(rid, who)
+        self._check_known(rid, who)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError('%s: index 必须是非负整数，收到 %r'
+                             % (who, index))
+        table = self._tables[rid]
+        if index >= len(table):
+            raise ValueError('%s: index 越界 %d（块表长度 %d）'
+                             % (who, index, len(table)))
+        old = table[index]
+        if self._ref[old] == 1:
+            return old
+        if not self._free:
+            raise ValueError('%s: 没有空闲块可供复制' % who)
+        new = self._free.pop(0)
+        self._ref[new] = 1
+        self._ref[old] -= 1
+        table[index] = new
+        self._cow_count += 1
+        return new
+
+    # ---------- 换出 / 换入 ----------
+    def swap_out(self, rid):
+        """把请求的块表换出到 CPU 侧并释放物理块，返回被释放的块号。"""
+        who = 'PagedBlockManager.swap_out'
+        self._check_rid(rid, who)
+        self._check_known(rid, who)
+        if (self.swap_capacity is not None
+                and len(self._swapped) >= self.swap_capacity):
+            raise ValueError('%s: swap 空间已满（容量 %d）'
+                             % (who, self.swap_capacity))
+        table = self._tables.pop(rid)
+        released = []
+        for bid in table:
+            self._ref[bid] -= 1
+            if self._ref[bid] <= 0:
+                del self._ref[bid]
+                self._free.append(bid)
+                released.append(bid)
+        self._free.sort()
+        self._swapped[rid] = table
+        return released
+
+    def swap_in(self, rid):
+        """把换出的请求换回：重新分配物理块，返回 {旧块号: 新块号}。"""
+        who = 'PagedBlockManager.swap_in'
+        self._check_rid(rid, who)
+        if rid not in self._swapped:
+            raise ValueError('%s: 请求 %r 不在 swap 区' % (who, rid))
+        table = self._swapped.pop(rid)
+        live = [bid for bid in table if bid in self._ref]
+        miss = len(table) - len(live)
+        if miss > len(self._free):
+            self._swapped[rid] = table
+            raise ValueError('%s: 物理块不足（需要 %d，空闲 %d）'
+                             % (who, miss, len(self._free)))
+        mapping = {}
+        new_table = []
+        for bid in table:
+            if bid in self._ref:
+                self._ref[bid] += 1
+                mapping[bid] = bid
+                new_table.append(bid)
+            else:
+                new = self._free.pop(0)
+                self._ref[new] = 1
+                mapping[bid] = new
+                new_table.append(new)
+        self._tables[rid] = new_table
+        return mapping
+
+    # ---------- 统计 ----------
+    def stats(self):
+        shared = sum(1 for bid, ref in self._ref.items() if ref > 1)
+        swapped_blocks = sum(len(t) for t in self._swapped.values())
+        return {
+            'used_blocks': len(self._ref),
+            'free_blocks': len(self._free),
+            'shared_blocks': shared,
+            'swapped_blocks': swapped_blocks,
+            'requests': len(self._tables) + len(self._swapped),
+            'tables': {rid: list(t) for rid, t in sorted(self._tables.items())},
+            'copy_on_write': self._cow_count,
+        }
+
+
+class PrefixCacheStore:
+    """跨请求的 KV 前缀缓存（LRU，按 token 前缀匹配复用）
+
+    ``PrefixCache`` 只负责一层层的 K/V 容器；这里补上"哪些前缀已经算过"的
+    索引：``put(tokens, cache)`` 把一段前缀的 KV 存进表，``match(tokens)`` 在
+    表里找**最长的已缓存 token 前缀**并返回对应 ``PrefixCache``，命中部分可以
+    直接复用；超出容量时按 LRU 淘汰最早写入且未被命中的条目。
+
+    - ``put(tokens, cache)``：写入一条前缀缓存，返回是否发生了淘汰
+    - ``match(tokens)``：返回 ``(matched_len, cache)``，未命中时 ``(0, None)``
+    - ``stats()``：``{'entries', 'hits', 'misses', 'max_entries'}``
+    - ``clear()``
+    """
+
+    def __init__(self, num_layers: int, d_model: int,
+                 max_entries: int = 8, min_prefix: int = 1):
+        for name, val in (('num_layers', num_layers), ('d_model', d_model),
+                          ('max_entries', max_entries),
+                          ('min_prefix', min_prefix)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError('PrefixCacheStore: %s 必须是正整数，收到 %r'
+                                 % (name, val))
+        if min_prefix > max_entries:
+            raise ValueError('PrefixCacheStore: min_prefix 不能大于 max_entries')
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.max_entries = max_entries
+        self.min_prefix = min_prefix
+        self._entries = {}       # token tuple -> PrefixCache
+        self._order = []         # LRU：越早越先淘汰
+        self._hits = 0
+        self._misses = 0
+
+    @staticmethod
+    def _check_tokens(tokens, who):
+        if not isinstance(tokens, (list, tuple)) or not tokens:
+            raise ValueError('%s: tokens 必须是非空列表' % who)
+        out = []
+        for t in tokens:
+            if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+                raise ValueError('%s: token 必须是非负整数，收到 %r'
+                                 % (who, t))
+            out.append(t)
+        return tuple(out)
+
+    def _check_cache(self, cache, who):
+        if not isinstance(cache, PrefixCache):
+            raise ValueError('%s: cache 必须是 PrefixCache 实例' % who)
+        if (cache.num_layers != self.num_layers
+                or cache.d_model != self.d_model):
+            raise ValueError('%s: cache 的层数/维度与缓存表不一致' % who)
+
+    def put(self, tokens, cache):
+        """写入前缀缓存；返回 ``True`` 表示此次触发了 LRU 淘汰。"""
+        who = 'PrefixCacheStore.put'
+        key = self._check_tokens(tokens, who)
+        self._check_cache(cache, who)
+        if len(key) < self.min_prefix:
+            raise ValueError('%s: 前缀长度 %d 小于 min_prefix=%d'
+                             % (who, len(key), self.min_prefix))
+        evicted = False
+        if key in self._entries:
+            self._order.remove(key)
+        else:
+            while len(self._order) >= self.max_entries:
+                old = self._order.pop(0)
+                del self._entries[old]
+                evicted = True
+        self._entries[key] = cache
+        self._order.append(key)
+        return evicted
+
+    def match(self, tokens):
+        """返回最长已缓存前缀的 (matched_len, cache)；未命中为 (0, None)。"""
+        who = 'PrefixCacheStore.match'
+        key = self._check_tokens(tokens, who)
+        best_len = 0
+        best = None
+        for cand in self._entries:
+            if cand == key:
+                best_len = len(cand)
+                best = self._entries[cand]
+                break
+            if len(cand) < len(key) and key[:len(cand)] == cand:
+                if len(cand) > best_len:
+                    best_len = len(cand)
+                    best = self._entries[cand]
+        if best is None:
+            self._misses += 1
+            return 0, None
+        self._hits += 1
+        self._order.remove(tuple(key[:best_len]))
+        self._order.append(tuple(key[:best_len]))
+        return best_len, best
+
+    def get(self, tokens):
+        """精确命中才返回 cache，否则 None（会更新命中统计与 LRU）。"""
+        who = 'PrefixCacheStore.get'
+        key = self._check_tokens(tokens, who)
+        if key not in self._entries:
+            self._misses += 1
+            return None
+        self._hits += 1
+        self._order.remove(key)
+        self._order.append(key)
+        return self._entries[key]
+
+    def stats(self):
+        return {'entries': len(self._entries), 'hits': self._hits,
+                'misses': self._misses, 'max_entries': self.max_entries}
+
+    def clear(self):
+        self._entries.clear()
+        self._order.clear()
+        self._hits = 0
+        self._misses = 0
+
+
+def make_needle_haystack(total_tokens: int = 256, depth: float = 0.5,
+                         needle: str = "NEEDLE", seed: int = None,
+                         filler_words=None):
+    """生成 needle-in-a-haystack 长上下文测试序列
+
+    返回 ``{'tokens': [...], 'needle_index': i, 'needle': needle}``；
+    ``depth`` 是针所在的相对位置（0=开头，1=结尾），其余位置用 ``filler_words``
+    （缺省用 hay1..hayN 循环填充）补齐。纯字符串列表，可直接拼进 prompt 后测
+    模型能否在长上下文中找回针。
+    """
+    if isinstance(total_tokens, bool) or not isinstance(total_tokens, int) \
+            or total_tokens < 8:
+        raise ValueError('make_needle_haystack: total_tokens 必须是 >= 8 的整数')
+    if isinstance(depth, bool) or not isinstance(depth, (int, float)) \
+            or not math.isfinite(depth) or not 0.0 <= depth <= 1.0:
+        raise ValueError('make_needle_haystack: depth 必须在 [0, 1] 内')
+    if not isinstance(needle, str) or not needle:
+        raise ValueError('make_needle_haystack: needle 必须是非空字符串')
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError('make_needle_haystack: seed 必须是整数或 None')
+    if filler_words is None:
+        filler_words = ['hay%d' % i for i in range(1, 9)]
+    if (not isinstance(filler_words, (list, tuple)) or not filler_words
+            or any(not isinstance(w, str) or not w for w in filler_words)):
+        raise ValueError('make_needle_haystack: filler_words 必须是非空字符串列表')
+    rng = random.Random(seed)
+    idx = int(round(depth * (total_tokens - 1)))
+    tokens = [rng.choice(filler_words) for _ in range(total_tokens)]
+    tokens[idx] = needle
+    return {'tokens': tokens, 'needle_index': idx, 'needle': needle}
+
+
+def llm_judge_prompt(question: str, answer: str, reference: str = None,
+                     scale: int = 10):
+    """构造 LLM-as-judge 评审提示词（纯模板，不调用模型）。"""
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError('llm_judge_prompt: question 必须是非空字符串')
+    if not isinstance(answer, str):
+        raise ValueError('llm_judge_prompt: answer 必须是字符串')
+    if reference is not None and not isinstance(reference, str):
+        raise ValueError('llm_judge_prompt: reference 必须是字符串或 None')
+    if isinstance(scale, bool) or not isinstance(scale, int) or scale < 2:
+        raise ValueError('llm_judge_prompt: scale 必须是 >= 2 的整数')
+    lines = [
+        '你是一个严格的评审。请比较模型回答与参考答案（若有），按正确性、'
+        '完整性和相关性打分，不要被措辞风格影响。',
+        '',
+        '问题：' + question,
+        '模型回答：' + answer,
+    ]
+    if reference is not None:
+        lines.append('参考答案：' + reference)
+    lines += [
+        '',
+        '请只输出两行：',
+        'Score: <1 到 %d 的整数>' % scale,
+        'Verdict: <PASS 或 FAIL>',
+    ]
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(text, scale: int = 10):
+    """解析 judge 输出，返回 ``{'score','verdict'}``；格式不符抛 ValueError。"""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('parse_judge_verdict: text 必须是非空字符串')
+    if isinstance(scale, bool) or not isinstance(scale, int) or scale < 2:
+        raise ValueError('parse_judge_verdict: scale 必须是 >= 2 的整数')
+    m_score = re.search(r'[Ss]core\s*[:：]\s*(-?\d+(?:\.\d+)?)', text)
+    m_verdict = re.search(r'[Vv]erdict\s*[:：]\s*(PASS|FAIL|pass|fail)', text)
+    if m_score is None:
+        raise ValueError('parse_judge_verdict: 找不到 Score: 行')
+    if m_verdict is None:
+        raise ValueError('parse_judge_verdict: 找不到 Verdict: 行')
+    score = float(m_score.group(1))
+    if not math.isfinite(score):
+        raise ValueError('parse_judge_verdict: score 不是有限数字')
+    score = max(0.0, min(float(scale), score))
+    verdict = m_verdict.group(1).upper()
+    return {'score': score, 'verdict': verdict}
+
+
+def judge_agreement(scores, tolerance: float = 1.0):
+    """多个 judge 打分的均值/标准差/最大差与一致率。
+
+    一致率 = 任意两个分数差 <= tolerance 的样本对占比；单个分数视为完全一致。
+    """
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError('judge_agreement: scores 必须是非空列表')
+    vals = []
+    for v in scores:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            raise ValueError('judge_agreement: 分数必须是有限数字')
+        vals.append(float(v))
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) \
+            or not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError('judge_agreement: tolerance 必须是非负有限数字')
+    n = len(vals)
+    mean = sum(vals) / n
+    std = math.sqrt(sum((v - mean) ** 2 for v in vals) / n)
+    pairs = 0
+    agree = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs += 1
+            if abs(vals[i] - vals[j]) <= tolerance + 1e-12:
+                agree += 1
+    agreement = 1.0 if pairs == 0 else agree / pairs
+    return {'mean': mean, 'std': std,
+            'max_gap': max(vals) - min(vals) if n > 1 else 0.0,
+            'agreement': agreement}
+
 class PagedKVCache:
     """PagedAttention 的块表（数据结构演示，不做真实显存管理）
 

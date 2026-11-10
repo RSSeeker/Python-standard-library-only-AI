@@ -845,8 +845,10 @@
 - [x] 神经算子：`DeepONet`（branch/trunk 双 MLP + 内积输出）、`FNO1d`（复权重谱卷积 + 1×1 跳连，支持学习求导等非平移算子）；`TestDeepONet` 4 例、`TestFNO1d` 4 例。
 - [x] 扩散 Transformer（DiT）：图像块 Conv2d 嵌入 + 二维正弦位置编码 + TransformerEncoder + adaLN-simple 时间调制；DDPM ε-prediction 训练与反向采样；`TestDiT` 5 例。
 - [x] Safetensors 读写：F32 小端 1D/2D 张量、header JSON + 8 字节对齐、`safetensors_header` 一致性校验；`TestSafetensors` 5 例。
+- [x] PagedAttention 块管理器：块分配/回收、前缀共享 `fork` + 引用计数、写时复制 `cow`、CPU 换出/换回 `swap_out`/`swap_in`；`TestPagedBlockManager` 6 例。
+- [x] 推理服务工具：`PrefixCacheStore`（跨请求前缀缓存 + LRU）、`make_needle_haystack`（长上下文探针）、`llm_judge_prompt`/`parse_judge_verdict`/`judge_agreement`（LLM-as-judge 模板与一致率）；`TestPrefixCacheStore`/`TestNeedleHaystack`/`TestLLMJudge` 共 5 例。
 
-全量测试：1839 → 2148 passed（新增 309 例）。
+全量测试：1839 → 2159 passed（新增 320 例）。
 
 ---
 

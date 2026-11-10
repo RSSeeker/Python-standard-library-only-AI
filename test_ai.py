@@ -33690,3 +33690,224 @@ class TestSafetensors:
         with open(p, "wb") as fh:
             fh.write(raw[:-4])
         _p10_raises(lambda: AI.safetensors_load(p))
+
+
+import AI
+
+
+def _p11_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestPagedBlockManager:
+    def test_allocate_ensure_and_reuse(self):
+        bm = AI.PagedBlockManager(6, block_size=4)
+        r0 = bm.new_request()
+        assert bm.allocate(r0, 2) == [0, 1]
+        assert bm.stats()["free_blocks"] == 4
+        bm.free(r0)
+        assert bm.stats()["free_blocks"] == 6
+        r1 = bm.new_request()
+        bm.ensure(r1, 1)
+        assert bm.ensure(r1, 5) == [0, 1]
+        assert bm.ensure(r1, 20) == [0, 1, 2, 3, 4]
+
+    def test_fork_shared_refcount(self):
+        bm = AI.PagedBlockManager(6, block_size=4)
+        r0 = bm.new_request()
+        bm.allocate(r0, 2)
+        r1 = bm.fork(r0)
+        assert r1 == 1
+        assert bm.stats()["shared_blocks"] == 2
+        bm.free(r0)
+        assert bm.stats()["free_blocks"] == 4
+        bm.free(r1)
+        assert bm.stats()["free_blocks"] == 6
+        assert bm.stats()["used_blocks"] == 0
+
+    def test_copy_on_write(self):
+        bm = AI.PagedBlockManager(6, block_size=4)
+        r0 = bm.new_request()
+        bm.allocate(r0, 2)
+        r1 = bm.fork(r0)
+        assert bm.cow(r1, 0) == 2
+        assert bm.stats()["tables"][r0] == [0, 1]
+        assert bm.stats()["tables"][r1] == [2, 1]
+        assert bm.cow(r1, 1) == 3
+        assert bm.cow(r1, 0) == 2
+        assert bm.stats()["copy_on_write"] == 2
+        assert bm.stats()["shared_blocks"] == 0
+        assert bm.stats()["tables"][r0] == [0, 1]
+
+    def test_swap_out_and_in(self):
+        bm = AI.PagedBlockManager(6, block_size=4, swap_capacity=1)
+        r0 = bm.new_request()
+        bm.allocate(r0, 2)
+        assert bm.swap_out(r0) == [0, 1]
+        assert bm.stats()["free_blocks"] == 6
+        assert bm.stats()["swapped_blocks"] == 2
+        assert bm.swap_in(r0) == {0: 0, 1: 1}
+        assert bm.stats()["tables"][r0] == [0, 1]
+        # 共享前缀在换出后仍存活：换回时直接复用同一物理块
+        bm = AI.PagedBlockManager(6, block_size=4)
+        a = bm.new_request()
+        bm.allocate(a, 2)
+        b = bm.fork(a)
+        bm.swap_out(a)
+        assert bm.stats()["free_blocks"] == 4
+        assert bm.swap_in(a) == {0: 0, 1: 1}
+        assert bm.stats()["shared_blocks"] == 2
+
+    def test_errors(self):
+        bm = AI.PagedBlockManager(2, block_size=4)
+        r = bm.new_request()
+        _p11_raises(lambda: bm.allocate(r, 3))
+        _p11_raises(lambda: bm.allocate(r, -1))
+        _p11_raises(lambda: bm.allocate(99, 1))
+        _p11_raises(lambda: bm.ensure(r, -2))
+        _p11_raises(lambda: bm.fork(99))
+        r2 = bm.fork(r)
+        _p11_raises(lambda: bm.fork(r, r2))
+        _p11_raises(lambda: bm.cow(r, 0))
+        _p11_raises(lambda: bm.cow(r, -1))
+        _p11_raises(lambda: bm.swap_out(99))
+        _p11_raises(lambda: bm.swap_in(99))
+        bm.allocate(r, 1)
+        bm.swap_out(r)
+        _p11_raises(lambda: bm.allocate(r, 1))
+        _p11_raises(lambda: bm.ensure(r, 1))
+        _p11_raises(lambda: AI.PagedBlockManager(0))
+        _p11_raises(lambda: AI.PagedBlockManager(2, block_size=0))
+        _p11_raises(lambda: AI.PagedBlockManager(2, swap_capacity=-1))
+        bm2 = AI.PagedBlockManager(4, block_size=2, swap_capacity=1)
+        a = bm2.new_request()
+        bm2.allocate(a, 1)
+        b = bm2.new_request()
+        bm2.allocate(b, 1)
+        bm2.swap_out(a)
+        _p11_raises(lambda: bm2.swap_out(b))
+
+    def test_stats_invariant(self):
+        bm = AI.PagedBlockManager(10, block_size=4)
+        rs = [bm.new_request() for _ in range(4)]
+        for i, r in enumerate(rs):
+            bm.allocate(r, i + 1)
+        st = bm.stats()
+        assert st["used_blocks"] + st["free_blocks"] == 10
+        assert st["requests"] == 4
+        assert len(st["tables"]) == 4
+        bm.swap_out(rs[0])
+        st = bm.stats()
+        assert st["swapped_blocks"] == 1
+        assert st["used_blocks"] + st["free_blocks"] == 10
+
+
+import AI
+
+
+def _p12_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p12_cache(layers=2, d=4):
+    c = AI.PrefixCache(layers, d)
+    for layer in range(layers):
+        c.set(layer, [[float(layer + i)] * d for i in range(2)],
+              [[0.5] * d for _ in range(2)])
+    return c
+
+
+class TestPrefixCacheStore:
+    def test_match_and_lru(self):
+        s = AI.PrefixCacheStore(2, 4, max_entries=2, min_prefix=2)
+        c1, c2, c3 = _p12_cache(), _p12_cache(), _p12_cache()
+        assert s.put([1, 2], c1) is False
+        assert s.put([1, 2, 3], c2) is False
+        n, got = s.match([1, 2, 3, 4])
+        assert n == 3 and got is c2
+        assert s.match([9, 9]) == (0, None)
+        assert s.stats() == {"entries": 2, "hits": 1, "misses": 1,
+                             "max_entries": 2}
+        assert s.put([7, 7], c3) is True
+        n, got = s.match([1, 2, 3])
+        assert n == 3 and got is c2
+        assert s.match([1, 2])[0] == 0
+        assert s.get([1, 2, 3]) is c2
+        assert s.get([5, 5]) is None
+        s.clear()
+        assert s.stats()["entries"] == 0
+
+    def test_errors(self):
+        s = AI.PrefixCacheStore(2, 4, max_entries=2, min_prefix=2)
+        _p12_raises(lambda: s.put([1], _p12_cache()))
+        _p12_raises(lambda: s.put([1, 2], "not cache"))
+        _p12_raises(lambda: s.put([1, 2], AI.PrefixCache(3, 4)))
+        _p12_raises(lambda: s.put([], _p12_cache()))
+        _p12_raises(lambda: s.put([1, -2], _p12_cache()))
+        _p12_raises(lambda: s.put([1, True], _p12_cache()))
+        _p12_raises(lambda: s.match([]))
+        _p12_raises(lambda: s.match([1, 2.5]))
+        _p12_raises(lambda: AI.PrefixCacheStore(0, 4))
+        _p12_raises(lambda: AI.PrefixCacheStore(2, 4, max_entries=0))
+        _p12_raises(lambda: AI.PrefixCacheStore(2, 4, max_entries=2,
+                                                min_prefix=3))
+
+
+class TestNeedleHaystack:
+    def test_basic(self):
+        h = AI.make_needle_haystack(32, 0.5, "KEY", seed=1)
+        assert len(h["tokens"]) == 32 and h["needle_index"] == 16
+        assert h["tokens"][16] == "KEY" and h["tokens"].count("KEY") == 1
+        assert AI.make_needle_haystack(32, 0.5, "KEY", seed=1) == h
+        h0 = AI.make_needle_haystack(9, 0.0, "N")
+        assert h0["needle_index"] == 0 and h0["tokens"][0] == "N"
+        h1 = AI.make_needle_haystack(9, 1.0, "N")
+        assert h1["needle_index"] == 8 and h1["tokens"][-1] == "N"
+        h3 = AI.make_needle_haystack(12, 0.25, "N", filler_words=["a", "b"])
+        assert all(t in ("a", "b", "N") for t in h3["tokens"])
+        _p12_raises(lambda: AI.make_needle_haystack(7))
+        _p12_raises(lambda: AI.make_needle_haystack(8, 1.5))
+        _p12_raises(lambda: AI.make_needle_haystack(8, 0.5, ""))
+        _p12_raises(lambda: AI.make_needle_haystack(8, 0.5, "N", seed=1.5))
+        _p12_raises(lambda: AI.make_needle_haystack(8, 0.5, "N",
+                                                    filler_words=[]))
+
+
+class TestLLMJudge:
+    def test_prompt_and_parse(self):
+        prompt = AI.llm_judge_prompt("1+1=?", "2", "2")
+        assert "1+1=?" in prompt and "模型回答：2" in prompt
+        assert "参考答案：2" in prompt and "Verdict" in prompt
+        prompt2 = AI.llm_judge_prompt("q", "a")
+        assert "\n参考答案：" not in prompt2
+        assert AI.parse_judge_verdict("Score: 8\nVerdict: PASS") == {
+            "score": 8.0, "verdict": "PASS"}
+        assert AI.parse_judge_verdict("score：7.5\nverdict: fail") == {
+            "score": 7.5, "verdict": "FAIL"}
+        assert AI.parse_judge_verdict("Score: 99\nVerdict: PASS")["score"] == 10.0
+        _p12_raises(lambda: AI.parse_judge_verdict("just bad"))
+        _p12_raises(lambda: AI.parse_judge_verdict("Score: nan\nVerdict: PASS"))
+        _p12_raises(lambda: AI.llm_judge_prompt("", "a"))
+        _p12_raises(lambda: AI.llm_judge_prompt("q", "a", 3))
+        _p12_raises(lambda: AI.llm_judge_prompt("q", "a", scale=1))
+
+    def test_agreement(self):
+        a = AI.judge_agreement([7, 8, 7.5])
+        assert abs(a["mean"] - 7.5) < 1e-12
+        assert abs(a["std"] - 0.408248290463863) < 1e-9
+        assert a["agreement"] == 1.0 and a["max_gap"] == 1.0
+        b = AI.judge_agreement([5, 9], tolerance=1.0)
+        assert b["agreement"] == 0.0 and b["max_gap"] == 4.0
+        c = AI.judge_agreement([5])
+        assert c["std"] == 0.0 and c["agreement"] == 1.0
+        _p12_raises(lambda: AI.judge_agreement([]))
+        _p12_raises(lambda: AI.judge_agreement([1, "x"]))
+        _p12_raises(lambda: AI.judge_agreement([1, 2], tolerance=-0.1))
