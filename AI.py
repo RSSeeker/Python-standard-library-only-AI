@@ -1762,6 +1762,398 @@ class FNO1d:
     def predict(self, x_seq):
         return self.forward(x_seq)
 
+def _dit_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"DiT: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _dit_sin_cos(t, dim):
+    """时间步 t∈[0,1) 的正弦特征，返回长度 dim 的列表。"""
+    out = []
+    half = dim // 2
+    for i in range(half):
+        freq = math.exp(-math.log(10000.0) * i / max(1, half - 1))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    if dim % 2 == 1:
+        out.append(math.sin(t))
+    return out
+
+
+def _dit_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"DiT: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _dit_sin_cos(t, dim):
+    """时间步 t∈[0,1) 的正弦特征，返回长度 dim 的列表。"""
+    out = []
+    half = dim // 2
+    for i in range(half):
+        freq = math.exp(-math.log(10000.0) * i / max(1, half - 1))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    if dim % 2 == 1:
+        out.append(math.sin(t))
+    return out
+
+
+class DiT:
+    """扩散 Transformer（Diffusion Transformer）的教学实现。
+
+    图像按 ``patch_size`` 切成不重叠块，用步长等于核大小的 ``Conv2d``
+    做逐块线性嵌入，加固定二维正弦位置编码后送入 ``TransformerEncoder``；
+    时间步 ``t`` 的正弦特征经小 MLP 生成 per-token 的缩放/平移（adaLN-simple）：
+
+    ``h' = h * (1 + scale(t)) + shift(t)``
+
+    输出头把每个 token 映射回图像块的噪声向量，再拼回整图。训练目标为
+    DDPM 的 ε-prediction：对随机时间步加噪，最小化预测噪声与真实噪声的 MSE。
+    """
+
+    def __init__(self, in_channels=3, image_size=8, patch_size=4,
+                 d_model=32, num_heads=4, d_ff=64, num_layers=2,
+                 timesteps=50, seed=None):
+        self.in_channels = _dit_check_pos_int(in_channels, "in_channels")
+        self.image_size = _dit_check_pos_int(image_size, "image_size")
+        self.patch_size = _dit_check_pos_int(patch_size, "patch_size")
+        self.d_model = _dit_check_pos_int(d_model, "d_model")
+        self.num_heads = _dit_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _dit_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _dit_check_pos_int(num_layers, "num_layers")
+        self.timesteps = _dit_check_pos_int(timesteps, "timesteps")
+        if self.image_size % self.patch_size != 0:
+            raise ValueError(
+                f"DiT: image_size={self.image_size} 必须能被 "
+                f"patch_size={self.patch_size} 整除")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"DiT: d_model={self.d_model} 必须能被 "
+                f"num_heads={self.num_heads} 整除")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("DiT: seed 必须是整数或 None")
+        self.grid = self.image_size // self.patch_size
+        self.num_tokens = self.grid * self.grid
+        self.patch_dim = self.in_channels * self.patch_size * self.patch_size
+        self._rng = random.Random(seed)
+        state = random.getstate()
+        try:
+            random.seed(seed)
+            self.conv = Conv2d(self.in_channels, self.d_model,
+                               self.patch_size, stride=self.patch_size)
+            self.t_net = MLP([self.d_model, d_model * 2, d_model * 2],
+                             ["relu", "linear"])
+            self.encoder = TransformerEncoder(
+                self.d_model, self.num_heads, self.d_ff,
+                num_layers=self.num_layers, dropout=0.0, causal=False)
+            self.head = Layer(self.d_model, self.patch_dim, "linear")
+        finally:
+            random.setstate(state)
+        self.pos = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                row = []
+                for i in range(self.d_model):
+                    if i % 2 == 0:
+                        v = math.sin(math.pi * (r * self.d_model + i)
+                                     / max(1, self.grid))
+                    else:
+                        v = math.cos(math.pi * (c * self.d_model + i)
+                                     / max(1, self.grid))
+                    row.append(v)
+                self.pos.append(row)
+        self._head_grads = None
+        self._t_grads = None
+        self.zero_grad()
+
+    # ---------- 校验与工具 ----------
+
+    def _check_image(self, image):
+        if (not isinstance(image, (list, tuple))
+                or len(image) != self.in_channels):
+            raise ValueError(
+                f"DiT: 图像必须是 {self.in_channels} 个通道的列表")
+        n = self.image_size
+        out = []
+        for ch in image:
+            if (not isinstance(ch, (list, tuple)) or len(ch) != n):
+                raise ValueError(f"DiT: 每个通道必须是 {n}x{n} 的列表")
+            rows = []
+            for row in ch:
+                if (not isinstance(row, (list, tuple)) or len(row) != n):
+                    raise ValueError(f"DiT: 每个通道必须是 {n}x{n} 的列表")
+                vals = []
+                for v in row:
+                    if (not isinstance(v, (int, float))
+                            or isinstance(v, bool) or not math.isfinite(v)):
+                        raise ValueError("DiT: 图像像素必须是有限数字")
+                    vals.append(float(v))
+                rows.append(vals)
+            out.append(rows)
+        return out
+
+    def _check_batch(self, images):
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("DiT: images 必须是非空列表")
+        return [self._check_image(img) for img in images]
+
+    def _check_ts(self, ts, n):
+        if (not isinstance(ts, (list, tuple)) or len(ts) != n):
+            raise ValueError(f"DiT: ts 必须是长度 {n} 的列表")
+        out = []
+        for t in ts:
+            if (isinstance(t, bool) or not isinstance(t, int)
+                    or t < 0 or t >= self.timesteps):
+                raise ValueError(
+                    f"DiT: 时间步必须是 0..{self.timesteps - 1} 的整数")
+            out.append(t)
+        return out
+
+    def _tokens_from_conv(self, channels):
+        return [[channels[k][r][c] for k in range(self.d_model)]
+                for r in range(self.grid) for c in range(self.grid)]
+
+    def _tokens_to_image(self, tokens):
+        image = [[[0.0] * self.image_size for _ in range(self.image_size)]
+                 for _ in range(self.in_channels)]
+        for r in range(self.grid):
+            for c in range(self.grid):
+                vec = tokens[r * self.grid + c]
+                k = 0
+                for ch in range(self.in_channels):
+                    for i in range(self.patch_size):
+                        for j in range(self.patch_size):
+                            image[ch][r * self.patch_size + i][
+                                c * self.patch_size + j] = vec[k]
+                            k += 1
+        return image
+
+    def _time_grad_row(self, d_mod, tokens):
+        d_shift = [0.0] * self.d_model
+        d_scale = [0.0] * self.d_model
+        for i in range(self.num_tokens):
+            for k in range(self.d_model):
+                d_shift[k] += d_mod[i][k]
+                d_scale[k] += d_mod[i][k] * tokens[i][k]
+        return d_shift + d_scale
+
+    def _forward_sample(self, image, t):
+        """单张图前向，返回 (噪声预测图像, 反向用的 ctx)。"""
+        channels = self.conv.forward(image)
+        tokens = self._tokens_from_conv(channels)
+        feats = _dit_sin_cos((t + 0.5) / self.timesteps, self.d_model)
+        shift_scale = self.t_net.forward(feats)
+        shift = shift_scale[:self.d_model]
+        scale = shift_scale[self.d_model:]
+        mod = [[tokens[i][k] * (1.0 + scale[k]) + shift[k]
+                for k in range(self.d_model)] for i in range(self.num_tokens)]
+        mem = [[mod[i][k] + self.pos[i][k] for k in range(self.d_model)]
+               for i in range(self.num_tokens)]
+        h = self.encoder.forward(mem)
+        rows, head_cache = _dense_rows_forward(self.head, h)
+        pred = self._tokens_to_image(rows)
+        return pred, {
+            "tokens": tokens,
+            "scale": scale,
+            "head_cache": head_cache,
+            "h": h,
+            "t": t,
+        }
+
+    def forward(self, images, ts):
+        batch = self._check_batch(images)
+        ts = self._check_ts(ts, len(batch))
+        return [self._forward_sample(img, t)[0]
+                for img, t in zip(batch, ts)]
+
+    # ---------- 损失与反向 ----------
+
+    def _backward_sample(self, ctx, image, t, d_pred, scale):
+        tokens = ctx["tokens"]
+        scale_v = ctx["scale"]
+        d_rows = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                tok = r * self.grid + c
+                vec = []
+                for ch in range(self.in_channels):
+                    for i in range(self.patch_size):
+                        for j in range(self.patch_size):
+                            vec.append(d_pred[ch][r * self.patch_size + i]
+                                       [c * self.patch_size + j])
+                d_rows.append(vec)
+        gw, gb, d_h = _dense_rows_backward(
+            self.head, ctx["head_cache"], d_rows)
+        self._accumulate_head(gw, gb)
+        d_mem = self.encoder.backward(d_h)
+        d_mod = d_mem
+        rows_t = self._time_grad_row(d_mod, tokens)
+        grads = _mlp_backward(self.t_net, rows_t)
+        self._accumulate_t(grads)
+        d_conv = [[[0.0] * self.grid for _ in range(self.grid)]
+                  for _ in range(self.d_model)]
+        for r in range(self.grid):
+            for c in range(self.grid):
+                tok = r * self.grid + c
+                for k in range(self.d_model):
+                    d_conv[k][r][c] = d_mod[tok][k] * (1.0 + scale_v[k])
+        self.conv.backward(d_conv)
+
+    def _accumulate_head(self, gw, gb):
+        if self._head_grads is None:
+            self._head_grads = (
+                [[v for v in row] for row in gw],
+                [v for v in gb])
+        else:
+            out_gw, out_gb = self._head_grads
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    out_gw[i][j] += gw[i][j]
+            for i in range(len(gb)):
+                out_gb[i] += gb[i]
+
+    def _accumulate_t(self, grads):
+        if self._t_grads is None:
+            self._t_grads = []
+            for gw, gb in grads:
+                self._t_grads.append((
+                    [[v for v in row] for row in gw],
+                    [v for v in gb]))
+        else:
+            for idx, (gw, gb) in enumerate(grads):
+                acc_gw, acc_gb = self._t_grads[idx]
+                for i in range(len(gw)):
+                    for j in range(len(gw[i])):
+                        acc_gw[i][j] += gw[i][j]
+                for i in range(len(gb)):
+                    acc_gb[i] += gb[i]
+
+    def _schedule(self):
+        betas = [1e-4 + (2e-2 - 1e-4) * i / max(1, self.timesteps - 1)
+                 for i in range(self.timesteps)]
+        alphas = [1.0 - b for b in betas]
+        abars = []
+        acc = 1.0
+        for a in alphas:
+            acc *= a
+            abars.append(acc)
+        return alphas, abars
+
+    def loss_and_backward(self, images, seed=None):
+        batch = self._check_batch(images)
+        rng = random.Random(seed) if seed is not None else self._rng
+        _, abars = self._schedule()
+        pixels = self.in_channels * self.image_size * self.image_size
+        scale = 1.0 / (len(batch) * pixels)
+        total = 0.0
+        for image in batch:
+            t = rng.randrange(self.timesteps)
+            eps = [[[rng.gauss(0.0, 1.0) for _ in range(self.image_size)]
+                    for _ in range(self.image_size)]
+                   for _ in range(self.in_channels)]
+            abar = abars[t]
+            x_t = [[[math.sqrt(abar) * image[ch][i][j]
+                     + math.sqrt(1.0 - abar) * eps[ch][i][j]
+                     for j in range(self.image_size)]
+                    for i in range(self.image_size)]
+                   for ch in range(self.in_channels)]
+            pred, ctx = self._forward_sample(x_t, t)
+            d_pred = [[[0.0] * self.image_size for _ in range(self.image_size)]
+                      for _ in range(self.in_channels)]
+            for ch in range(self.in_channels):
+                for i in range(self.image_size):
+                    for j in range(self.image_size):
+                        diff = pred[ch][i][j] - eps[ch][i][j]
+                        total += diff * diff
+                        d_pred[ch][i][j] = 2.0 * diff * scale
+            self._backward_sample(ctx, x_t, t, d_pred, scale)
+        return total / (len(batch) * pixels)
+
+    # ---------- 优化 ----------
+
+    def zero_grad(self):
+        self.conv.zero_grad()
+        self.encoder.zero_grad()
+        self._head_grads = None
+        self._t_grads = None
+
+    def sgd_step(self, lr):
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or not math.isfinite(lr) or lr <= 0.0):
+            raise ValueError(f"DiT: lr 必须是正数，收到 {lr!r}")
+        lr = float(lr)
+        _conv_sgd(self.conv, lr)
+        self.encoder.sgd_step(lr)
+        if self._head_grads is not None:
+            gw, gb = self._head_grads
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.head.weights[i][j] -= lr * gw[i][j]
+            for i in range(len(gb)):
+                self.head.biases[i] -= lr * gb[i]
+        if self._t_grads is not None:
+            for layer, (gw, gb) in zip(self.t_net.layers, self._t_grads):
+                for i in range(len(gw)):
+                    for j in range(len(gw[i])):
+                        layer.weights[i][j] -= lr * gw[i][j]
+                for i in range(len(gb)):
+                    layer.biases[i] -= lr * gb[i]
+
+    def fit(self, images, epochs=100, lr=0.01, seed=None):
+        batch = self._check_batch(images)
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"DiT: epochs 必须是正整数，收到 {epochs!r}")
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or not math.isfinite(lr) or lr <= 0.0):
+            raise ValueError(f"DiT: lr 必须是正数，收到 {lr!r}")
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            loss = self.loss_and_backward(batch, seed=seed)
+            self.sgd_step(lr)
+            history.append({"loss": loss})
+        return history
+
+    def sample(self, num_samples=1, steps=10, seed=None):
+        n = _dit_check_pos_int(num_samples, "num_samples")
+        steps = _dit_check_pos_int(steps, "steps")
+        rng = random.Random(seed)
+        _, abars = self._schedule()
+        out = []
+        for _ in range(n):
+            x = [[[rng.gauss(0.0, 1.0) for _ in range(self.image_size)]
+                  for _ in range(self.image_size)]
+                 for _ in range(self.in_channels)]
+            schedule = [min(self.timesteps - 1,
+                            int(self.timesteps * (1.0 - k / steps)))
+                        for k in range(steps)]
+            for idx, t in enumerate(schedule):
+                eps = self.forward([x], [t])[0]
+                abar = abars[t]
+                x0 = [[[ (x[ch][i][j] - math.sqrt(1.0 - abar) * eps[ch][i][j])
+                         / math.sqrt(abar)
+                         for j in range(self.image_size)]
+                       for i in range(self.image_size)]
+                      for ch in range(self.in_channels)]
+                prev = abars[schedule[idx + 1]] if idx + 1 < steps else 1.0
+                x = [[[math.sqrt(prev) * x0[ch][i][j]
+                       + math.sqrt(1.0 - prev) * eps[ch][i][j]
+                       for j in range(self.image_size)]
+                      for i in range(self.image_size)]
+                     for ch in range(self.in_channels)]
+            out.append(x)
+        return out
+
+    def param_count(self):
+        enc = self.num_layers * (4 * self.d_model * self.d_model
+                                 + 9 * self.d_model
+                                 + 2 * self.d_model * self.d_ff + self.d_ff)
+        return (_conv_param_count(self.conv) + self.t_net.param_count()
+                + enc + self.d_model * self.patch_dim + self.patch_dim)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

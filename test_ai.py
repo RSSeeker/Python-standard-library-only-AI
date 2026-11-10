@@ -33455,3 +33455,110 @@ class TestFNO1d:
         _p8_raises(lambda: model.forward([[0.0, 0.0, 0.0, 0.0,
                                            0.0, 0.0, 0.0, 0.0],
                                           [0.0] * 8]))
+
+
+import math
+
+import AI
+
+
+def _p9_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p9_image(c):
+    return [[[c if (r in (1, 2) and col in (1, 2)) else 0.0
+              for col in range(4)] for r in range(4)]]
+
+
+class TestDiT:
+    def _model(self):
+        return AI.DiT(1, 4, 2, d_model=8, num_heads=2, d_ff=16,
+                      num_layers=1, timesteps=10, seed=1)
+
+    def test_forward_param_count_and_sample(self):
+        model = self._model()
+        assert model.param_count() == 1092
+        pred = model.forward([_p9_image(0.5)], [3])[0]
+        assert len(pred) == 1 and len(pred[0]) == 4 and len(pred[0][0]) == 4
+        for ch in pred:
+            for row in ch:
+                for v in row:
+                    assert isinstance(v, float) and math.isfinite(v)
+        s1 = model.sample(2, steps=4, seed=3)
+        s2 = model.sample(2, steps=4, seed=3)
+        assert len(s1) == 2 and s1 == s2
+        for img in s1:
+            for ch in img:
+                for row in ch:
+                    for v in row:
+                        assert math.isfinite(v)
+
+    def test_numerical_gradients(self):
+        model = self._model()
+        images = [_p9_image(0.2), _p9_image(0.8), _p9_image(-0.4)]
+        h = 1e-6
+
+        def fd(get, setv, getgrad, tag):
+            old = get()
+            model.zero_grad()
+            model.loss_and_backward(images, seed=7)
+            ana = getgrad()
+            setv(old + h)
+            lp = model.loss_and_backward(images, seed=7)
+            setv(old - h)
+            lm = model.loss_and_backward(images, seed=7)
+            setv(old)
+            num = (lp - lm) / (2.0 * h)
+            assert abs(num - ana) < 1e-3, tag
+
+        fd(lambda: model.conv.weights[0][0][0][0],
+           lambda v: model.conv.weights[0][0][0].__setitem__(0, v),
+           lambda: model.conv.grad_w[0][0][0][0], "conv")
+        fd(lambda: model.head.weights[0][0],
+           lambda v: model.head.weights[0].__setitem__(0, v),
+           lambda: model._head_grads[0][0][0], "head")
+        fd(lambda: model.t_net.layers[0].weights[0][0],
+           lambda v: model.t_net.layers[0].weights[0].__setitem__(0, v),
+           lambda: model._t_grads[0][0][0][0], "t_net")
+
+    def test_fit_reduces_loss(self):
+        model = self._model()
+        images = [_p9_image(0.2), _p9_image(0.8), _p9_image(-0.4)]
+        hist = model.fit(images, epochs=60, lr=0.02, seed=5)
+        assert len(hist) == 60
+        assert hist[-1]["loss"] < 0.7 * hist[0]["loss"]
+        assert model.loss_and_backward(images, seed=9) >= 0.0
+
+    def test_time_modulation_changes_prediction(self):
+        model = self._model()
+        img = _p9_image(0.5)
+        p0 = model.forward([img], [0])[0]
+        p1 = model.forward([img], [9])[0]
+        diff = 0.0
+        for ch in range(1):
+            for i in range(4):
+                for j in range(4):
+                    diff += abs(p0[ch][i][j] - p1[ch][i][j])
+        assert diff > 1e-9
+
+    def test_invalid_inputs(self):
+        model = self._model()
+        _p9_raises(lambda: AI.DiT(1, 4, 3))
+        _p9_raises(lambda: AI.DiT(1, 4, 2, d_model=7, num_heads=2))
+        _p9_raises(lambda: AI.DiT(1, 4, 2, timesteps=0))
+        _p9_raises(lambda: AI.DiT(1, 4, 2, seed=1.5))
+        _p9_raises(lambda: model.forward([], [0]))
+        _p9_raises(lambda: model.forward([_p9_image(0.0)], []))
+        _p9_raises(lambda: model.forward([_p9_image(0.0)], [-1]))
+        _p9_raises(lambda: model.forward([_p9_image(0.0)], [10]))
+        _p9_raises(lambda: model.forward([[[[0.0] * 3] * 3]], [0]))
+        _p9_raises(lambda: model.loss_and_backward([], seed=1))
+        _p9_raises(lambda: model.fit([_p9_image(0.0)], epochs=0))
+        _p9_raises(lambda: model.fit([_p9_image(0.0)], lr=0.0))
+        _p9_raises(lambda: model.sample(0))
+        _p9_raises(lambda: model.sgd_step(0.0))

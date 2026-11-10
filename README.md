@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2138 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2143 项）
 
 ## 特性
 
@@ -3912,6 +3912,29 @@ samples = ddpm.sample(8)
 训练曲线在探针里分别降 6.9×、把生成均值从 3.16 拉到 1.75、降 4.4×。采样端另有 `ddim_sample(steps=20, eta=0)`：`eta=0` 时完全确定性、且只需训练步数的一个子序列。DDPM 的
 `train_step` 允许显式传入 `t` 与 `noise`，就是为了让测试能固定随机性做差分。
 
+## 扩散 Transformer（DiT）
+
+`DiT` 把图像切成不重叠的图像块，用步长等于核大小的 `Conv2d` 做逐块线性嵌入，
+加固定二维正弦位置编码后送入 `TransformerEncoder`；扩散时间步 `t` 的正弦特征经
+一个小 MLP 生成 per-token 的缩放/平移，对 token 做 adaLN-simple 调制
+`h' = h * (1 + scale(t)) + shift(t)`，再用线性头把每个 token 映射回图像块的噪声向量。
+
+```python
+import math
+
+dit = AI.DiT(in_channels=1, image_size=4, patch_size=2, d_model=8,
+             num_heads=2, d_ff=16, num_layers=1, timesteps=10, seed=1)
+hist = dit.fit(images, epochs=60, lr=0.02)          # ε-prediction MSE
+noise = dit.forward([image], [3])                    # 指定时间步的噪声预测
+sample = dit.sample(2, steps=10, seed=3)             # 从纯噪声反向去噪
+```
+
+| 接口 | 说明 |
+| --- | --- |
+| `DiT(in_channels=3, image_size=8, patch_size=4, d_model=32, num_heads=4, d_ff=64, num_layers=2, timesteps=50, seed=None)` | 图像块嵌入 + 二维正弦位置编码 + TransformerEncoder + adaLN-simple 时间调制；`forward(images, ts)` 返回噪声预测；`loss_and_backward(images, seed=None)` 用 DDPM ε-prediction MSE（返回 float）；`fit(epochs=100, lr=0.01)`、`sample(num_samples=1, steps=10)`、`param_count` |
+
+边界：这是最小 DiT，没有类别条件 / CFG（class-free guidance）、没有 adaLN-Zero 的六个调制参数与门控、没有 patch 级重排与二维 RoPE；`forward` 逐图循环、`sample` 每个时间步重算整图，偏慢；时间步与噪声支持用 seed 复现以便数值校验。
+
 ## 序列标注与多标签分类
 
 `CausalLM` / `TransformerEncoder` 输出的是逐位置隐状态，接上分类头就能做 NER、
@@ -4051,7 +4074,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2138 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2143 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4248,6 +4271,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
+| `TestDiT` | 前向/参数计数/采样可复现、conv/head/时间 MLP 梯度中心差分、拟合降 loss、时间调制改变输出、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4395,7 +4419,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2138 个单元测试
+├── test_ai.py       # 2143 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
