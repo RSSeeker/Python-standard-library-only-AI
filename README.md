@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2130 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2138 项）
 
 ## 特性
 
@@ -2373,6 +2373,34 @@ print(model.generate([0, 1], max_new_tokens=3, temperature=0.8))
 channel-mixing 使用 `relu(k)²` 而不是 GELU 变体，也没有 dropout；注意力退化为逐通道
 状态递推，因此训练时按完整序列前向/反向，不做并行扫描优化。
 
+### 神经算子（DeepONet / FNO1d）
+
+`DeepONet` 与 `FNO1d` 都学习「函数到函数」的映射，与上面的 PINN（求解单个方程）互补。
+
+```python
+import math
+
+# DeepONet：分支网络编码输入函数，主干网络编码查询坐标，二者内积输出
+don = AI.DeepONet(sensor_dim=1, coord_dim=1, branch_hidden=(8,),
+                  trunk_hidden=(8,), latent_dim=4, seed=1)
+loss = don.loss_and_backward([[0.5], [1.0]], [[0.2], [0.5], [0.9]],
+                             [[0.5 * math.sin(0.4), 0.5 * math.sin(1.0), 0.5 * math.sin(1.8)],
+                              [1.0 * math.sin(0.4), 1.0 * math.sin(1.0), 1.0 * math.sin(1.8)]])
+don.fit(branch_inputs, coords, targets, epochs=100, lr=0.05)
+
+# FNO1d：逐点提升 → 谱卷积（复权重）+ 跳连 → 逐点投影
+fno = AI.FNO1d(in_channels=1, out_channels=1, width=8, modes=4,
+               num_layers=1, grid_size=16, seed=2)
+hist = fno.fit(functions, derivatives, epochs=200, lr=0.05)
+```
+
+| 接口 | 说明 |
+| --- | --- |
+| `DeepONet(sensor_dim, coord_dim=1, branch_hidden=(32, 32), trunk_hidden=(32, 32), latent_dim=8, seed=None)` | `forward(branch_input, coords)` 返回每个坐标处的标量；`loss_and_backward(branch_inputs, coords, targets)` 用 MSE（返回 float）；`fit(epochs=200, lr=0.01)`、`predict`、`param_count` |
+| `FNO1d(in_channels=1, out_channels=1, width=16, modes=4, num_layers=2, grid_size=16, seed=None)` | 谱卷积用复数权重 `W=A+iB` 与输入谱 `X=C-iS` 相乘（让 sin 分量可以旋转成 cos，例如求导算子），再逆变换回时域；`forward`/`loss_and_backward`/`fit`/`predict`/`param_count` |
+
+边界：DeepONet 的 branch/trunk 都是小型 MLP（不是 CNN/Transformer），loss 为逐点 MSE；FNO1d 只用固定 cos/sin 基的朴素离散变换（无 FFT、无更高阶模式处理、`modes ≤ grid_size//2`），只支持一维、规则网格，且用全批量 SGD（无 mini-batch / Adam）。
+
 ### 神经 ODE 与物理信息网络（Neural ODE / PINN）
 
 | API | 说明 |
@@ -4023,7 +4051,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2130 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2138 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4218,6 +4246,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
+| `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
+| `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4365,7 +4395,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2130 个单元测试
+├── test_ai.py       # 2138 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

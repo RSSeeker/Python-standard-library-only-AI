@@ -1193,6 +1193,575 @@ class KAN:
             history.append({"loss": loss})
         return history
 
+def _deeponet_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"DeepONet: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _deeponet_check_hidden(hidden):
+    if not isinstance(hidden, (list, tuple)):
+        raise ValueError("DeepONet: hidden 必须是正整数元组/列表")
+    return tuple(_deeponet_check_pos_int(v, "hidden 中的维度") for v in hidden)
+
+
+class DeepONet:
+    """深度算子网络（DeepONet）：学「函数 → 函数」的映射。
+
+    ``输出(branch_input, x) = bias + Σ_r branch(branch_input)[r] * trunk(x)[r]``：
+    branch 网络把传感器采样值（一个函数的有限个观测）编码成 ``latent_dim`` 维
+    特征，trunk 网络把查询坐标编码成同样维度的特征，两者点积得到该坐标处的
+    函数值。训练用 MSE，梯度对流经两个 MLP 反传。
+    """
+
+    def __init__(self, sensor_dim, coord_dim=1, branch_hidden=(32, 32),
+                 trunk_hidden=(32, 32), latent_dim=8, seed=None):
+        self.sensor_dim = _deeponet_check_pos_int(sensor_dim, "sensor_dim")
+        self.coord_dim = _deeponet_check_pos_int(coord_dim, "coord_dim")
+        self.branch_hidden = _deeponet_check_hidden(branch_hidden)
+        self.trunk_hidden = _deeponet_check_hidden(trunk_hidden)
+        self.latent_dim = _deeponet_check_pos_int(latent_dim, "latent_dim")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("DeepONet: seed 必须是整数或 None")
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            self.branch = MLP(
+                [self.sensor_dim] + list(self.branch_hidden) + [self.latent_dim],
+                ["relu"] * len(self.branch_hidden) + ["linear"])
+            self.trunk = MLP(
+                [self.coord_dim] + list(self.trunk_hidden) + [self.latent_dim],
+                ["relu"] * len(self.trunk_hidden) + ["linear"])
+        finally:
+            random.setstate(state)
+        self.bias = 0.0
+        self._branch_acc = None
+        self._trunk_acc = None
+        self._bias_grad = 0.0
+
+    # ---------- 辅助 ----------
+
+    def _check_vector(self, vec, dim, who):
+        if not isinstance(vec, (list, tuple)) or len(vec) != dim:
+            raise ValueError(f"DeepONet: {who} 必须是长度 {dim} 的列表")
+        out = []
+        for v in vec:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(v):
+                raise ValueError(f"DeepONet: {who} 必须只包含有限数字")
+            out.append(float(v))
+        return out
+
+    def _check_coords(self, coords):
+        if not isinstance(coords, (list, tuple)) or not coords:
+            raise ValueError("DeepONet: coords 必须是非空列表")
+        return [self._check_vector(c, self.coord_dim, "coord") for c in coords]
+
+    @staticmethod
+    def _accumulate(acc, grads):
+        if acc is None:
+            return [(gw, gb) for gw, gb in grads]
+        out = []
+        for (gw, gb), (nw, nb) in zip(acc, grads):
+            if gw is None:
+                out.append((gw, gb))
+                continue
+            if nw is not None:
+                for j, row in enumerate(nw):
+                    gj = gw[j]
+                    for k, v in enumerate(row):
+                        gj[k] += v
+            if nb is not None:
+                for j, v in enumerate(nb):
+                    gb[j] += v
+            out.append((gw, gb))
+        return out
+
+    # ---------- 前向/反向 ----------
+
+    def forward(self, branch_input, coords):
+        b_in = self._check_vector(branch_input, self.sensor_dim, "branch_input")
+        cs = self._check_coords(coords)
+        b = self.branch.forward(b_in)
+        out = []
+        for c in cs:
+            t = self.trunk.forward(c)
+            out.append(self.bias + sum(b[r] * t[r] for r in range(self.latent_dim)))
+        return out
+
+    def zero_grad(self):
+        self._branch_acc = None
+        self._trunk_acc = None
+        self._bias_grad = 0.0
+
+    def loss_and_backward(self, branch_inputs, coords, targets):
+        if not isinstance(branch_inputs, (list, tuple)) or not branch_inputs:
+            raise ValueError("DeepONet: branch_inputs 必须是非空列表")
+        b_inputs = [self._check_vector(b, self.sensor_dim, "branch_input")
+                    for b in branch_inputs]
+        cs = self._check_coords(coords)
+        if not isinstance(targets, (list, tuple)) or len(targets) != len(b_inputs):
+            raise ValueError("DeepONet: targets 必须与 branch_inputs 等长")
+        n = len(b_inputs)
+        p_count = len(cs)
+        scale = 2.0 / (n * p_count)
+        total = 0.0
+        d_trunk = [[0.0] * self.latent_dim for _ in range(p_count)]
+        for i, b_in in enumerate(b_inputs):
+            t_raw = targets[i]
+            if not isinstance(t_raw, (list, tuple)) or len(t_raw) != p_count:
+                raise ValueError("DeepONet: 每个 target 必须是按 coords 展开的列表")
+            tg = [float(v) for v in t_raw]
+            for v in tg:
+                if not math.isfinite(v):
+                    raise ValueError("DeepONet: target 必须只包含有限数字")
+            b = self.branch.forward(b_in)
+            d_branch = [0.0] * self.latent_dim
+            for p, c in enumerate(cs):
+                t = self.trunk.forward(c)
+                pred = self.bias + sum(b[r] * t[r] for r in range(self.latent_dim))
+                diff = pred - tg[p]
+                total += diff * diff
+                d = scale * diff
+                self._bias_grad += d
+                for r in range(self.latent_dim):
+                    d_branch[r] += d * t[r]
+                    d_trunk[p][r] += d * b[r]
+            grads = _mlp_backward(self.branch, d_branch)
+            self._branch_acc = self._accumulate(self._branch_acc, grads)
+        for p, c in enumerate(cs):
+            self.trunk.forward(c)
+            grads = _mlp_backward(self.trunk, d_trunk[p])
+            self._trunk_acc = self._accumulate(self._trunk_acc, grads)
+        return total / (n * p_count)
+
+    # ---------- 训练 ----------
+
+    def fit(self, branch_inputs, coords, targets, epochs=200, lr=0.01, seed=None):
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"DeepONet: epochs 必须是正整数，收到 {epochs!r}")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError(f"DeepONet: lr 必须是正数，收到 {lr!r}")
+        opt_branch = Adam(self.branch, lr=float(lr))
+        opt_trunk = Adam(self.trunk, lr=float(lr))
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            loss = self.loss_and_backward(branch_inputs, coords, targets)
+            opt_branch.step(self._branch_acc)
+            opt_trunk.step(self._trunk_acc)
+            self.bias -= float(lr) * self._bias_grad
+            history.append({"loss": loss})
+        return history
+
+    def predict(self, branch_input, coords):
+        return self.forward(branch_input, coords)
+
+    def param_count(self):
+        return self.branch.param_count() + self.trunk.param_count() + 1
+
+def _fno1d_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"FNO1d: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+class FNO1d:
+    """1 维傅里叶神经算子（FNO）的教学实现。
+
+    结构：逐点线性提升 → 若干「谱卷积 + 1×1 跳连 → ReLU」层 → 逐点线性投影。
+    谱卷积只保留前 ``modes`` 个频率：对输入的每个频率 ``k`` 用复数权重
+    ``W[k] = A[k] + i·B[k]`` 与输入谱 ``X[k] = C[k] - i·S[k]`` 相乘
+    （``C/S`` 分别是输入在 cos/sin 基上的系数），再取实部逆变换：
+
+    ``Yr = Σ_i (A·C + B·S)，Yi = Σ_i (B·C - A·S)``
+    ``y[o][n] = Σ_k f_k · (Yr·cos(2πkn/N) + Yi·sin(2πkn/N))``
+
+    ``f_0 = 1/N``、``k>0`` 时 ``f_k = 2/N``。复乘让 sin 分量可以旋转成 cos
+    （例如实现求导算子），这是 FNO 能学到非平移算子的关键。所有梯度手写：
+    对 ``A/B``、提升/投影权重、跳连权重都解析求出。
+    """
+
+    def __init__(self, in_channels=1, out_channels=1, width=16, modes=4,
+                 num_layers=2, grid_size=16, seed=None):
+        self.in_channels = _fno1d_check_pos_int(in_channels, "in_channels")
+        self.out_channels = _fno1d_check_pos_int(out_channels, "out_channels")
+        self.width = _fno1d_check_pos_int(width, "width")
+        self.modes = _fno1d_check_pos_int(modes, "modes")
+        self.num_layers = _fno1d_check_pos_int(num_layers, "num_layers")
+        self.grid_size = _fno1d_check_pos_int(grid_size, "grid_size")
+        if self.modes > self.grid_size // 2:
+            raise ValueError(
+                f"FNO1d: modes 不能超过 grid_size//2（{self.grid_size // 2}），"
+                f"收到 {self.modes}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("FNO1d: seed 必须是整数或 None")
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            std = math.sqrt(2.0 / (self.width * max(1, self.modes)))
+            self.W_lift = [[random.gauss(0.0, 1.0 / math.sqrt(self.width))
+                            for _ in range(self.in_channels)]
+                           for _ in range(self.width)]
+            self.b_lift = [0.0] * self.width
+            self.layers = []
+            for _ in range(self.num_layers):
+                A = [[[random.gauss(0.0, std) for _ in range(self.width)]
+                      for _ in range(self.width)] for _ in range(self.modes)]
+                B = [[[random.gauss(0.0, std) for _ in range(self.width)]
+                      for _ in range(self.width)] for _ in range(self.modes)]
+                W_skip = [[random.gauss(0.0, 1.0 / math.sqrt(self.width))
+                           for _ in range(self.width)] for _ in range(self.width)]
+                self.layers.append({
+                    "A": A, "B": B, "W_skip": W_skip,
+                    "b_skip": [0.0] * self.width,
+                    "cache": None,
+                })
+            self.W_out = [[random.gauss(0.0, 1.0 / math.sqrt(self.width))
+                           for _ in range(self.width)]
+                          for _ in range(self.out_channels)]
+            self.b_out = [0.0] * self.out_channels
+        finally:
+            random.setstate(state)
+        self._base = self._cos_sin_tables()
+        self.zero_grad()
+
+    # ---------- 基函数 ----------
+
+    def _cos_sin_tables(self):
+        n = self.grid_size
+        tables = []
+        for k in range(self.modes):
+            c = [math.cos(2.0 * math.pi * k * j / n) for j in range(n)]
+            s = [math.sin(2.0 * math.pi * k * j / n) for j in range(n)]
+            f = 1.0 / n if k == 0 else 2.0 / n
+            tables.append((c, s, f))
+        return tables
+
+    # ---------- 参数计数 ----------
+
+    def param_count(self):
+        total = self.width * self.in_channels + self.width + self.out_channels * self.width + self.out_channels
+        for layer in self.layers:
+            total += 2 * self.modes * self.width * self.width
+            total += self.width * self.width + self.width
+        return total
+
+    # ---------- 梯度容器 ----------
+
+    def zero_grad(self):
+        self.grad_W_lift = [[0.0] * self.in_channels for _ in range(self.width)]
+        self.grad_b_lift = [0.0] * self.width
+        for layer in self.layers:
+            layer["gA"] = [[[0.0] * self.width for _ in range(self.width)]
+                           for _ in range(self.modes)]
+            layer["gB"] = [[[0.0] * self.width for _ in range(self.width)]
+                           for _ in range(self.modes)]
+            layer["gW_skip"] = [[0.0] * self.width for _ in range(self.width)]
+            layer["gb_skip"] = [0.0] * self.width
+        self.grad_W_out = [[0.0] * self.width for _ in range(self.out_channels)]
+        self.grad_b_out = [0.0] * self.out_channels
+
+    # ---------- 前向 ----------
+
+    def _check_tensor(self, data, channels):
+        if (not isinstance(data, (list, tuple))
+                or len(data) != channels):
+            raise ValueError(
+                f"FNO1d: 输入必须是 {channels} 个通道的列表")
+        out = []
+        for ch in data:
+            if (not isinstance(ch, (list, tuple))
+                    or len(ch) != self.grid_size):
+                raise ValueError(
+                    f"FNO1d: 每个通道必须是长度 {self.grid_size} 的列表")
+            row = []
+            for v in ch:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(v):
+                    raise ValueError("FNO1d: 输入必须只包含有限数字")
+                row.append(float(v))
+            out.append(row)
+        return out
+
+    def _spectral_forward(self, layer, h, record):
+        n = self.grid_size
+        w = self.width
+        coeff_c = [[0.0] * w for _ in range(self.modes)]
+        coeff_s = [[0.0] * w for _ in range(self.modes)]
+        for k in range(self.modes):
+            cos, sin, _ = self._base[k]
+            for ch in range(w):
+                hc = h[ch]
+                cc = 0.0
+                ss = 0.0
+                for j in range(n):
+                    v = hc[j]
+                    cc += v * cos[j]
+                    ss += v * sin[j]
+                coeff_c[k][ch] = cc
+                coeff_s[k][ch] = ss
+        y = [[0.0] * n for _ in range(w)]
+        A = layer["A"]
+        B = layer["B"]
+        for k in range(self.modes):
+            cos, sin, f = self._base[k]
+            ac = coeff_c[k]
+            as_ = coeff_s[k]
+            for o in range(w):
+                row_a = A[k][o]
+                row_b = B[k][o]
+                yr = 0.0
+                yi = 0.0
+                for i in range(w):
+                    a = row_a[i]
+                    b = row_b[i]
+                    if a == 0.0 and b == 0.0:
+                        continue
+                    c = ac[i]
+                    s = as_[i]
+                    yr += a * c + b * s
+                    yi += b * c - a * s
+                yr *= f
+                yi *= f
+                yo = y[o]
+                for j in range(n):
+                    yo[j] += yr * cos[j] + yi * sin[j]
+        if record:
+            layer["cache"] = {"h": [row[:] for row in h],
+                              "coeff_c": coeff_c, "coeff_s": coeff_s}
+        return y
+
+    def forward(self, x_seq):
+        x = self._check_tensor(x_seq, self.in_channels)
+        n = self.grid_size
+        w = self.width
+        h = [[self.b_lift[o] + sum(self.W_lift[o][i] * x[i][j]
+                                   for i in range(self.in_channels))
+              for j in range(n)] for o in range(w)]
+        for layer in self.layers:
+            spec = self._spectral_forward(layer, h, True)
+            W_skip = layer["W_skip"]
+            b_skip = layer["b_skip"]
+            pre = []
+            masks = []
+            for o in range(w):
+                row = spec[o]
+                hrow = h[o]
+                wrow = W_skip[o]
+                for j in range(n):
+                    row[j] += b_skip[o] + sum(wrow[i] * h[i][j] for i in range(w))
+                mask = [1.0 if v > 0.0 else 0.0 for v in row]
+                masks.append(mask)
+                pre.append([row[j] if mask[j] > 0.0 else 0.0 for j in range(n)])
+            layer["cache"]["mask"] = masks
+            layer["cache"]["pre"] = pre
+            layer["cache"]["h_in"] = h
+            h = pre
+        out = []
+        for o in range(self.out_channels):
+            row = [self.b_out[o] + sum(self.W_out[o][i] * h[i][j]
+                                       for i in range(w)) for j in range(n)]
+            out.append(row)
+        return out
+
+    # ---------- 反向 ----------
+
+    def _spectral_backward(self, k, layer, d_pre, dh):
+        n = self.grid_size
+        w = self.width
+        cos, sin, f = self._base[k]
+        A = layer["A"][k]
+        B = layer["B"][k]
+        d_yr = [0.0] * w
+        d_yi = [0.0] * w
+        for o in range(w):
+            row = d_pre[o]
+            r = 0.0
+            i2 = 0.0
+            for j in range(n):
+                d = row[j]
+                if d == 0.0:
+                    continue
+                r += d * cos[j]
+                i2 += d * sin[j]
+            d_yr[o] = r * f
+            d_yi[o] = i2 * f
+        coeff_c = layer["cache"]["coeff_c"][k]
+        coeff_s = layer["cache"]["coeff_s"][k]
+        gA = layer["gA"][k]
+        gB = layer["gB"][k]
+        for o in range(w):
+            a_ = d_yr[o]
+            b_ = d_yi[o]
+            if a_ == 0.0 and b_ == 0.0:
+                continue
+            for i in range(w):
+                c = coeff_c[i]
+                s = coeff_s[i]
+                gA[o][i] += a_ * c - b_ * s
+                gB[o][i] += a_ * s + b_ * c
+        d_c = [0.0] * w
+        d_s = [0.0] * w
+        for i in range(w):
+            acc_c = 0.0
+            acc_s = 0.0
+            for o in range(w):
+                acc_c += A[o][i] * d_yr[o] + B[o][i] * d_yi[o]
+                acc_s += B[o][i] * d_yr[o] - A[o][i] * d_yi[o]
+            d_c[i] = acc_c
+            d_s[i] = acc_s
+        for ch in range(w):
+            chan = dh[ch]
+            dch = d_c[ch]
+            dsh = d_s[ch]
+            for j in range(n):
+                chan[j] += dch * cos[j] + dsh * sin[j]
+
+    def loss_and_backward(self, xs, ys):
+        if (not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple))
+                or not xs or len(xs) != len(ys)):
+            raise ValueError("FNO1d: xs 与 ys 必须是非空且等长的列表")
+        n = self.grid_size
+        out_c = self.out_channels
+        total = 0.0
+        for x, y in zip(xs, ys):
+            y = self._check_tensor(y, out_c)
+            pred = self.forward(x)
+            dout = [[0.0] * n for _ in range(out_c)]
+            for o in range(out_c):
+                pro = pred[o]
+                tro = y[o]
+                for j in range(n):
+                    diff = pro[j] - tro[j]
+                    total += diff * diff
+                    dout[o][j] = 2.0 * diff
+        count = float(len(xs) * out_c * n)
+        scale = 1.0 / count
+        total /= count
+        for x, y in zip(xs, ys):
+            self._backward_single(x, y, scale)
+        return total
+
+    def _backward_single(self, x, y, scale):
+        # 重新前向以拿到本样本缓存
+        n = self.grid_size
+        w = self.width
+        out_c = self.out_channels
+        y = self._check_tensor(y, self.out_channels)
+        pred = self.forward(x)
+        for o in range(out_c):
+            self.grad_b_out[o] += scale * 2.0 * sum(pred[o][j] - y[o][j] for j in range(n))
+        # 顶层：dout -> 最后一层输出
+        dout = [[scale * 2.0 * (pred[o][j] - y[o][j]) for j in range(n)]
+                for o in range(out_c)]
+        for o in range(out_c):
+            for i in range(w):
+                g = 0.0
+                for j in range(n):
+                    g += dout[o][j] * self.layers[-1]["cache"]["pre"][i][j]
+                self.grad_W_out[o][i] += g
+        dh = [[0.0] * n for _ in range(w)]
+        for i in range(w):
+            for j in range(n):
+                acc = 0.0
+                for o in range(out_c):
+                    acc += self.W_out[o][i] * dout[o][j]
+                dh[i][j] = acc
+        for li in range(len(self.layers) - 1, -1, -1):
+            layer = self.layers[li]
+            cache = layer["cache"]
+            mask = cache["mask"]
+            d_pre = [[dh[o][j] * mask[o][j] for j in range(n)] for o in range(w)]
+            # skip
+            h_in = cache["h_in"]
+            gW = layer["gW_skip"]
+            gb = layer["gb_skip"]
+            for o in range(w):
+                gb[o] += sum(d_pre[o])
+                for i in range(w):
+                    acc = 0.0
+                    for j in range(n):
+                        acc += d_pre[o][j] * h_in[i][j]
+                    gW[o][i] += acc
+            d_h_prev = [[0.0] * n for _ in range(w)]
+            for o in range(w):
+                row = d_pre[o]
+                for i in range(w):
+                    a = layer["W_skip"][o][i]
+                    if a == 0.0:
+                        continue
+                    target = d_h_prev[i]
+                    for j in range(n):
+                        target[j] += a * row[j]
+            for k in range(self.modes):
+                self._spectral_backward(k, layer, d_pre, d_h_prev)
+            dh = d_h_prev
+        # lift 反向
+        for o in range(w):
+            self.grad_b_lift[o] += sum(dh[o])
+            for i in range(self.in_channels):
+                acc = 0.0
+                for j in range(n):
+                    acc += dh[o][j] * x[i][j]
+                self.grad_W_lift[o][i] += acc
+
+    # ---------- 训练 ----------
+
+    def fit(self, xs, ys, epochs=200, lr=0.01, seed=None):
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"FNO1d: epochs 必须是正整数，收到 {epochs!r}")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError(f"FNO1d: lr 必须是正数，收到 {lr!r}")
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            loss = self.loss_and_backward(xs, ys)
+            self._sgd_step(lr)
+            history.append({"loss": loss})
+        return history
+
+    def _sgd_step(self, lr):
+        for o in range(self.width):
+            row = self.W_lift[o]
+            g = self.grad_W_lift[o]
+            for i in range(self.in_channels):
+                row[i] -= lr * g[i]
+            self.b_lift[o] -= lr * self.grad_b_lift[o]
+        for layer in self.layers:
+            A = layer["A"]
+            B = layer["B"]
+            gA = layer["gA"]
+            gB = layer["gB"]
+            for k in range(self.modes):
+                for o in range(self.width):
+                    ra = A[k][o]
+                    rb = B[k][o]
+                    ga = gA[k][o]
+                    gb = gB[k][o]
+                    for i in range(self.width):
+                        ra[i] -= lr * ga[i]
+                        rb[i] -= lr * gb[i]
+            for o in range(self.width):
+                row = layer["W_skip"][o]
+                g = layer["gW_skip"][o]
+                for i in range(self.width):
+                    row[i] -= lr * g[i]
+                layer["b_skip"][o] -= lr * layer["gb_skip"][o]
+        for o in range(self.out_channels):
+            row = self.W_out[o]
+            g = self.grad_W_out[o]
+            for i in range(self.width):
+                row[i] -= lr * g[i]
+            self.b_out[o] -= lr * self.grad_b_out[o]
+
+    def predict(self, x_seq):
+        return self.forward(x_seq)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

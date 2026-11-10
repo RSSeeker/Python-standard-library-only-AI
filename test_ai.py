@@ -33295,3 +33295,163 @@ class TestCheckpointTransformer:
             AI.checkpoint_transformer(enc, x, dout, segments=0)
         with pytest.raises(ValueError):
             AI.checkpoint_transformer(object(), x, dout)
+
+
+import math
+
+import AI
+
+
+def _p8_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestDeepONet:
+    def _data(self):
+        # 算子 y(c) = a * sin(2c)：分支输入是 a，trunk 坐标是 c
+        branch_inputs = [[0.5], [1.0], [-0.5]]
+        coords = [[0.2], [0.5], [0.9]]
+        targets = []
+        for (a,) in branch_inputs:
+            targets.append([a * math.sin(2.0 * c) for (c,) in coords])
+        return branch_inputs, coords, targets
+
+    def test_forward_and_param_count(self):
+        model = AI.DeepONet(1, coord_dim=1, branch_hidden=(8,),
+                            trunk_hidden=(8,), latent_dim=4, seed=1)
+        branch_inputs, coords, _ = self._data()
+        out = model.forward(branch_inputs[0], coords)
+        assert len(out) == 3
+        for v in out:
+            assert isinstance(v, float) and math.isfinite(v)
+        expected = model.branch.param_count() + model.trunk.param_count() + 1
+        assert model.param_count() == expected
+
+    def test_numerical_gradients(self):
+        model = AI.DeepONet(1, coord_dim=1, branch_hidden=(4,),
+                            trunk_hidden=(4,), latent_dim=3, seed=2)
+        branch_inputs, coords, targets = self._data()
+
+        def loss():
+            return model.loss_and_backward(branch_inputs, coords, targets)
+
+        layer = model.branch.layers[0]
+        old = layer.weights[0][0]
+        model.zero_grad()
+        loss()
+        ana = None
+        # 解析梯度在 branch 累积里，取第一层的 (gw, gb)
+        gw, gb = model._branch_acc[0]
+        ana = gw[0][0]
+        h = 1e-6
+        layer.weights[0][0] = old + h
+        lp = loss()
+        layer.weights[0][0] = old - h
+        lm = loss()
+        layer.weights[0][0] = old
+        num = (lp - lm) / (2.0 * h)
+        assert abs(num - ana) < 1e-4
+
+    def test_fit_operator(self):
+        model = AI.DeepONet(1, coord_dim=1, branch_hidden=(8,),
+                            trunk_hidden=(8,), latent_dim=4, seed=3)
+        branch_inputs, coords, targets = self._data()
+        hist = model.fit(branch_inputs, coords, targets, epochs=150, lr=0.05)
+        assert len(hist) == 150
+        assert hist[-1]["loss"] < 0.5 * hist[0]["loss"]
+        assert model.loss_and_backward(branch_inputs, coords, targets) >= 0.0
+
+    def test_invalid_inputs(self):
+        model = AI.DeepONet(2, seed=1)
+        _p8_raises(lambda: AI.DeepONet(0))
+        _p8_raises(lambda: AI.DeepONet(2, branch_hidden=(0,)))
+        _p8_raises(lambda: model.forward([0.1], [[0.5]]))
+        _p8_raises(lambda: model.forward([0.1, 0.2], []))
+        _p8_raises(lambda: model.forward([0.1, 0.2], [[0.5, 0.6]]))
+        _p8_raises(lambda: model.loss_and_backward([], [[0.5]], []))
+        _p8_raises(lambda: model.loss_and_backward(
+            [[0.1]], [[0.5]], [[1.0], [2.0]]))
+
+
+class TestFNO1d:
+    def _data(self, n=16):
+        xs = []
+        ys = []
+        for a in (0.2, 0.5, 1.0):
+            xs.append([[a * math.sin(2.0 * math.pi * j / n) for j in range(n)]])
+            ys.append([[a * math.cos(2.0 * math.pi * j / n) for j in range(n)]])
+        return xs, ys
+
+    def test_forward_and_param_count(self):
+        model = AI.FNO1d(in_channels=1, out_channels=1, width=4, modes=2,
+                         num_layers=1, grid_size=8, seed=1)
+        out = model.forward([[1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0]])
+        assert len(out) == 1 and len(out[0]) == 8
+        expected = (4 * 1 + 4) + (2 * 2 * 4 * 4 + 4 * 4 + 4) + (1 * 4 + 1)
+        assert model.param_count() == expected
+
+    def test_numerical_gradients(self):
+        n = 16
+        xs, ys = self._data(n)
+        model = AI.FNO1d(1, 1, width=4, modes=2, num_layers=1,
+                         grid_size=n, seed=2)
+        h = 1e-6
+
+        def fd(get, setv, getgrad, tag):
+            old = get()
+            model.zero_grad()
+            model.loss_and_backward(xs, ys)
+            ana = getgrad()
+            setv(old + h)
+            lp = model.loss_and_backward(xs, ys)
+            setv(old - h)
+            lm = model.loss_and_backward(xs, ys)
+            setv(old)
+            num = (lp - lm) / (2.0 * h)
+            assert abs(num - ana) < 1e-3, tag
+
+        fd(lambda: model.W_lift[0][0],
+           lambda v: model.W_lift[0].__setitem__(0, v),
+           lambda: model.grad_W_lift[0][0], "lift")
+        fd(lambda: model.layers[0]["A"][0][0][0],
+           lambda v: model.layers[0]["A"][0][0].__setitem__(0, v),
+           lambda: model.layers[0]["gA"][0][0][0], "A")
+        fd(lambda: model.layers[0]["B"][1][0][1],
+           lambda v: model.layers[0]["B"][1][0].__setitem__(1, v),
+           lambda: model.layers[0]["gB"][1][0][1], "B")
+        fd(lambda: model.layers[0]["W_skip"][1][2],
+           lambda v: model.layers[0]["W_skip"][1].__setitem__(2, v),
+           lambda: model.layers[0]["gW_skip"][1][2], "skip")
+        fd(lambda: model.W_out[0][3],
+           lambda v: model.W_out[0].__setitem__(3, v),
+           lambda: model.grad_W_out[0][3], "out")
+        fd(lambda: model.b_out[0], lambda v: setattr(model, "b_out", [v]),
+           lambda: model.grad_b_out[0], "bias")
+
+    def test_fit_derivative_operator(self):
+        n = 16
+        xs, ys = self._data(n)
+        model = AI.FNO1d(1, 1, width=8, modes=4, num_layers=1,
+                         grid_size=n, seed=2)
+        hist = model.fit(xs, ys, epochs=250, lr=0.05)
+        assert len(hist) == 250
+        assert hist[-1]["loss"] < 0.1 * hist[0]["loss"]
+        pred = model.forward(xs[1])
+        for j in range(0, n, 3):
+            assert abs(pred[0][j] - ys[1][0][j]) < 0.6
+
+    def test_invalid_inputs(self):
+        model = AI.FNO1d(1, 1, width=4, modes=2, grid_size=8, seed=1)
+        _p8_raises(lambda: AI.FNO1d(0, 1))
+        _p8_raises(lambda: AI.FNO1d(1, 1, modes=0))
+        _p8_raises(lambda: AI.FNO1d(1, 1, modes=9, grid_size=8))
+        _p8_raises(lambda: model.forward([[0.0] * 7]))
+        _p8_raises(lambda: model.forward([]))
+        _p8_raises(lambda: model.loss_and_backward([], []))
+        _p8_raises(lambda: model.forward([[0.0, 0.0, 0.0, 0.0,
+                                           0.0, 0.0, 0.0, 0.0],
+                                          [0.0] * 8]))

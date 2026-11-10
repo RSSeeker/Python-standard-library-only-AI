@@ -842,8 +842,9 @@
 - [x] KAN（Kolmogorov-Arnold Network）：`KANLayer`（均匀节点 B 样条边函数、Cox-de Boor 基与导数、手写反向、SGD）、`KAN`（单向量/批量前向、MSE `loss_and_backward`、`fit`）；`TestKAN` 5 例。
 - [x] QLoRA NF4：`QLoRA(..., quant='nf4')` 用 4-bit NF4 分位点查表 + 双重量化量化冻结基座，默认 `quant='int'` 保持原行为；`TestQLoRANF4` 4 例。
 - [x] Transformer 梯度检查点：`checkpoint_transformer`（段边界激活、段内缓存释放、反向逐段重放）；与普通反传逐位一致；`TestCheckpointTransformer` 4 例。
+- [x] 神经算子：`DeepONet`（branch/trunk 双 MLP + 内积输出）、`FNO1d`（复权重谱卷积 + 1×1 跳连，支持学习求导等非平移算子）；`TestDeepONet` 4 例、`TestFNO1d` 4 例。
 
-全量测试：1839 → 2130 passed（新增 291 例）。
+全量测试：1839 → 2138 passed（新增 299 例）。
 
 ---
 
