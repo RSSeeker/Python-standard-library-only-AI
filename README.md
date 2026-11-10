@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2126 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2130 项）
 
 ## 特性
 
@@ -254,6 +254,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | 函数 | 说明 |
 |---|---|
 | `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同**；`release=True` 时每段结束丢弃 `input/z/a`，真正把激活峰值压到 O(段数) |
+| `checkpoint_transformer(encoder, x_seq, dout_seq, segments=2)` | TransformerEncoder 版梯度检查点：前向只保留段边界，段内每层 Q/K/V、注意力权重与 FFN 中间激活全部释放；反向逐段重放并逐层回传，参数梯度累积回各层；与 `encoder.forward`+`backward` 逐位相同 |
 | `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`|v| > 65504` 返回 `inf`，低于次正规返回 0 |
 | `bf16_round(value)` | 舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even） |
 | `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
@@ -4022,7 +4023,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2126 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2130 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4216,6 +4217,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestE3NN` | 旋转/平移等变与置换等变、`phi_e`/`phi_x`/`phi_h` 与坐标梯度有限差分、模型参数量 104、距离和拟合下降、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
+| `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4363,7 +4365,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2126 个单元测试
+├── test_ai.py       # 2130 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

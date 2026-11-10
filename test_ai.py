@@ -33205,3 +33205,93 @@ class TestQLoRANF4:
             AI.QLoRA(layer, rank=2, quant=3)
         with pytest.raises(TypeError):
             AI.QLoRA("not a layer", quant="nf4")
+
+
+import random
+
+
+def _p7_encoder(num_layers=4, causal=False):
+    return AI.TransformerEncoder(8, 2, 16, num_layers=num_layers,
+                                 dropout=0.0, causal=causal)
+
+
+def _p7_collect_grads(enc):
+    vals = []
+    for layer in enc.layers:
+        for key in ("ln1_gamma", "ln1_beta", "ln2_gamma", "ln2_beta"):
+            vals.extend(float(v) for v in layer.grads[key])
+        for key in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+            vals.extend(_p7_flat(layer.self_attn.grads[key]))
+        for key in ("W1", "b1", "W2", "b2"):
+            vals.extend(_p7_flat(layer.ffn.grads[key]))
+    return vals
+
+
+def _p7_flat(node):
+    if isinstance(node, (int, float)):
+        return [float(node)]
+    out = []
+    for v in node:
+        out.extend(_p7_flat(v))
+    return out
+
+
+class TestCheckpointTransformer:
+    def _data(self):
+        rng = random.Random(3)
+        x = [[rng.gauss(0, 0.5) for _ in range(8)] for _ in range(5)]
+        d = [[rng.gauss(0, 0.3) for _ in range(8)] for _ in range(5)]
+        return x, d
+
+    def test_matches_plain_backward(self):
+        x, dout = self._data()
+        enc = _p7_encoder()
+        enc.eval()
+        enc.forward(x)
+        enc.zero_grad()
+        dx_ref = enc.backward(dout)
+        grads_ref = _p7_collect_grads(enc)
+        for segs in (1, 2, 4):
+            enc.zero_grad()
+            dx = AI.checkpoint_transformer(enc, x, dout, segments=segs)
+            assert dx == dx_ref
+            assert _p7_collect_grads(enc) == grads_ref
+
+    def test_causal_encoder_matches(self):
+        x, dout = self._data()
+        enc = _p7_encoder(causal=True)
+        enc.eval()
+        enc.forward(x)
+        enc.zero_grad()
+        dx_ref = enc.backward(dout)
+        grads_ref = _p7_collect_grads(enc)
+        enc.zero_grad()
+        dx = AI.checkpoint_transformer(enc, x, dout, segments=2)
+        assert dx == dx_ref
+        assert _p7_collect_grads(enc) == grads_ref
+
+    def test_releases_caches(self):
+        x, dout = self._data()
+        enc = _p7_encoder()
+        enc.eval()
+        enc.zero_grad()
+        AI.checkpoint_transformer(enc, x, dout, segments=2)
+        for layer in enc.layers:
+            assert layer.x is None
+            assert layer.res1 is None
+            assert layer.res2 is None
+            assert layer.self_attn.Q is None
+            assert layer.self_attn.concat is None
+            assert layer.ffn.x is None
+
+    def test_invalid_inputs(self):
+        x, dout = self._data()
+        enc = _p7_encoder()
+        with pytest.raises(ValueError):
+            AI.checkpoint_transformer(enc, [], dout)
+        with pytest.raises(ValueError):
+            AI.checkpoint_transformer(enc, x, dout[:2])
+        with pytest.raises(ValueError):
+            AI.checkpoint_transformer(enc, x, dout, segments=0)
+        with pytest.raises(ValueError):
+            AI.checkpoint_transformer(object(), x, dout)

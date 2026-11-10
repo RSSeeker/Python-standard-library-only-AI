@@ -57491,6 +57491,88 @@ def checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False):
     return total / n, grads
 
 
+def _release_transformer_layer_cache(layer):
+    """释放 ``TransformerEncoderLayer`` 的前向缓存（供梯度检查点使用）。
+
+    缓存的激活集中在两处：层自身的残差输入/dropout mask，以及
+    ``self_attn``（Q/K/V、注意力权重、拼接头输出）和 ``ffn``（输入/中间激活）。
+    反向重放前向时会重建这些缓存，所以释放后调用 ``backward`` 仍然正确。
+    """
+    layer.x = None
+    layer.res1 = None
+    layer.res2 = None
+    layer.dropout1_masks = None
+    layer.dropout2_masks = None
+    attn = getattr(layer, "self_attn", None)
+    if attn is not None:
+        attn.x = None
+        attn.Q = None
+        attn.K = None
+        attn.V = None
+        attn.attn_weights = []
+        attn.attn_dropped = []
+        attn.attn_masks = []
+        attn.head_out = []
+        attn.concat = None
+        attn._rel_bias = None
+    ffn = getattr(layer, "ffn", None)
+    if ffn is not None:
+        ffn.x = None
+        ffn.h = None
+        ffn.z = None
+
+
+def checkpoint_transformer(encoder, x_seq, dout_seq, segments=2):
+    """用**梯度检查点**反向传播一个 :class:`TransformerEncoder`，返回输入梯度。
+
+    前向只保留每段边界的激活，段内各层的 Q/K/V、注意力权重、FFN 中间激活全部
+    释放；反向时从段边界重放该段前向、重建缓存，再逐层反传。参数梯度累积在
+    各层自己的 ``grads`` 里（与普通 ``encoder.backward`` 相同），调用方之后
+    正常 ``sgd_step`` / ``adam_step`` 即可。
+
+    参数：
+    ``encoder``：有 ``layers`` 列表的编码器（``TransformerEncoder``）。
+    ``x_seq``：``(seq_len, d_model)`` 的输入序列。
+    ``dout_seq``：传回编码器的输出梯度，形状与 ``x_seq`` 相同。
+    ``segments``：把层切成几段；段数越多越省显存、重放次数越多。
+
+    与 ``encoder.forward`` + ``encoder.backward`` 的数值结果逐位一致（dropout=0
+    时；训练模式下 dropout mask 会被重放，因此也一致）。
+    """
+    layers = getattr(encoder, "layers", None)
+    if not layers:
+        raise ValueError("checkpoint_transformer: encoder 没有层")
+    if not isinstance(x_seq, (list, tuple)) or not x_seq:
+        raise ValueError("checkpoint_transformer: x_seq 必须是非空序列")
+    if not isinstance(dout_seq, (list, tuple)) or len(dout_seq) != len(x_seq):
+        raise ValueError(
+            "checkpoint_transformer: dout_seq 必须与 x_seq 等长")
+    bounds = _w10f_segments(len(layers), segments)
+
+    # 第一遍：只保留段边界处的激活，段内缓存立即释放
+    boundaries = [x_seq]
+    h = x_seq
+    for s, e in bounds:
+        for i in range(s, e):
+            h = layers[i].forward(h)
+        boundaries.append(h)
+        for i in range(s, e):
+            _release_transformer_layer_cache(layers[i])
+
+    # 第二遍：从后往前逐段重放前向，再反传该段
+    delta = dout_seq
+    for idx in range(len(bounds) - 1, -1, -1):
+        s, e = bounds[idx]
+        h = boundaries[idx]
+        for i in range(s, e):
+            h = layers[i].forward(h)
+        for i in range(e - 1, s - 1, -1):
+            delta = layers[i].backward(delta)
+        for i in range(s, e):
+            _release_transformer_layer_cache(layers[i])
+    return delta
+
+
 def fp16_round(value):
     """把浮点数舍入到 IEEE 半精度（fp16）能表示的最接近值（返回 float）
 
