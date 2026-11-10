@@ -33120,3 +33120,88 @@ class TestKAN:
         _kan_raises(lambda: model.fit([], [], epochs=3))
         _kan_raises(lambda: model.sgd_step(0.0))
         _kan_raises(lambda: model.backward([1.0] * 5))
+
+
+import math
+
+
+def _p6_layer(fan_in=4, fan_out=3):
+    layer = AI.Layer(fan_in, fan_out, "linear")
+    layer.weights = [[0.1 * (j + 1) + 0.01 * i for i in range(fan_in)]
+                     for j in range(fan_out)]
+    layer.biases = [0.01 * j for j in range(fan_out)]
+    return layer
+
+
+def _p6_ref(weights, biases):
+    layer = AI.Layer(len(biases) and len(weights[0]), len(biases), "linear")
+    layer.weights = [row[:] for row in weights]
+    layer.biases = list(biases)
+    return layer
+
+
+class TestQLoRANF4:
+    def test_int_quant_default_preserved(self):
+        layer = _p6_layer()
+        w_before = [row[:] for row in layer.weights]
+        q = AI.QLoRA(layer, rank=2)
+        assert q.quant == "int"
+        assert q.bits == 4
+        assert layer.weights == AI.fake_quantize(w_before, bits=4)
+        ref = _p6_ref(layer.weights, layer.biases)
+        assert q.forward([0.5, -0.2, 0.3, 0.1]) == ref.forward([0.5, -0.2, 0.3, 0.1])
+        assert q.trainable_param_count() == 2 * 4 + 2 * 3
+        assert q.total_param_count() == 3 * (4 + 1) + q.trainable_param_count()
+
+    def test_nf4_quantization(self):
+        layer = _p6_layer()
+        w_before = [row[:] for row in layer.weights]
+        q = AI.QLoRA(layer, rank=2, quant="nf4")
+        assert q.quant == "nf4"
+        assert q.bits == 4
+        assert layer.weights == AI.nf4_fake_quantize_double(w_before)
+        ref = _p6_ref(layer.weights, layer.biases)
+        x = [0.5, -0.2, 0.3, 0.1]
+        assert q.forward(x) == ref.forward(x)
+        other = _p6_layer()
+        q_int = AI.QLoRA(other, rank=2, quant="int")
+        assert any(abs(a - b) > 1e-9
+                   for r1, r2 in zip(layer.weights, other.weights)
+                   for a, b in zip(r1, r2))
+
+    def test_nf4_frozen_base_and_step(self):
+        layer = _p6_layer()
+        q = AI.QLoRA(layer, rank=2, quant="nf4")
+        w_quant = [row[:] for row in layer.weights]
+        x = [0.5, -0.2, 0.3, 0.1]
+        c = [0.7, -0.4, 0.2]
+
+        def loss():
+            y = q.forward(x)
+            return sum(y[j] * c[j] for j in range(len(c)))
+
+        q.zero_grad()
+        before = loss()
+        q.backward(c)
+        assert layer.weights == w_quant
+        assert all(math.isfinite(v) for row in q.adapter.grad_A for v in row)
+        assert all(math.isfinite(v) for row in q.adapter.grad_B for v in row)
+        lr = 0.05
+        for r in range(q.adapter.rank):
+            for i in range(q.fan_in):
+                q.adapter.A[r][i] -= lr * q.adapter.grad_A[r][i]
+        for j in range(q.fan_out):
+            for r in range(q.adapter.rank):
+                q.adapter.B[j][r] -= lr * q.adapter.grad_B[j][r]
+        assert loss() < before
+
+    def test_invalid_quant(self):
+        layer = _p6_layer()
+        with pytest.raises(ValueError):
+            AI.QLoRA(layer, rank=2, quant="bad")
+        with pytest.raises(ValueError):
+            AI.QLoRA(layer, rank=2, quant="nf4", bits=8)
+        with pytest.raises(ValueError):
+            AI.QLoRA(layer, rank=2, quant=3)
+        with pytest.raises(TypeError):
+            AI.QLoRA("not a layer", quant="nf4")

@@ -23162,26 +23162,38 @@ class IA3:
 class QLoRA:
     """QLoRA：冻结的基座权重先做低比特伪量化，再训练 LoRA 适配器。
 
-    ``y = Q(W) x + scaling · B(A x)``，``Q`` 是 ``fake_quantize`` 的伪量化
-    反量化值（前向不需要额外解包）；``A/B`` 与 :class:`LoRA` 相同，``B`` 初始
-    为 0，因此训练开始时输出等于「量化后的基座」——与全精度基座的差距就是
-    量化误差。这是教学用的组合：把 4/8 bit 基座与低秩适配器接在一起，不真的
-    用 int4 压缩存储。
+    ``y = Q(W) x + scaling · B(A x)``；``A/B`` 与 :class:`LoRA` 相同，``B``
+    初始为 0，因此训练开始时输出等于「量化后的基座」——与全精度基座的差距
+    就是量化误差。``quant="int"``（默认）使用均匀 per-tensor 伪量化
+    （``fake_quantize``）；``quant="nf4"`` 使用 4-bit NF4 分位点查表 + 双重量化
+    （``nf4_fake_quantize_double``，块内 absmax 缩放因子再被 8-bit 量化）。
+    这是教学用的组合：把量化基座与低秩适配器接在一起，不真的压缩存储。
     """
 
     def __init__(self, layer: Layer, rank: int = 4, alpha: float = None,
-                 bits: int = 4):
+                 bits: int = 4, quant: str = "int"):
         if not isinstance(layer, Layer):
             raise TypeError(
                 f"QLoRA: layer 必须是 Layer 实例，收到 {type(layer).__name__}")
-        _w15_check_bits(bits, "QLoRA")
+        if quant not in ("int", "nf4"):
+            raise ValueError(
+                f"QLoRA: quant 必须是 'int' 或 'nf4'，收到 {quant!r}")
+        if quant == "nf4":
+            if bits != 4:
+                raise ValueError("QLoRA: quant='nf4' 时 bits 必须是 4")
+        else:
+            _w15_check_bits(bits, "QLoRA")
         self.bits = bits
+        self.quant = quant
         self.adapter = LoRA(layer, rank, alpha)
         self.layer = layer
         self.fan_in = layer.fan_in
         self.fan_out = layer.fan_out
         # 基座权重低比特伪量化（冻结；写回反量化值，前向路径不变）
-        layer.weights = fake_quantize(layer.weights, bits=bits)
+        if quant == "nf4":
+            layer.weights = nf4_fake_quantize_double(layer.weights)
+        else:
+            layer.weights = fake_quantize(layer.weights, bits=bits)
         self.merged = False
 
     def zero_grad(self):

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2122 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2126 项）
 
 ## 特性
 
@@ -497,7 +497,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `RMSNorm(num_features, eps=1e-6)` | RMS 归一化 |
 | `LoRA(layer, rank=4, alpha=None)` | 低秩适配：冻结原层，只训 `A (rank, in)` / `B (out, rank)`；`B` 初始为 0（包装后行为不变）；`merge()` 把 `scaling·BA` 折进原层权重 |
 | `IA3(layer, init=1.0)` | IA³ 适配器：冻结原层，只训每个输出通道的缩放标量 `y = v ⊙ Layer(x)`；`v` 初始全 1（包装后行为不变），`params()`/`zero_grad()` 与 LoRA 同构，`trainable_param_count()` 只有输出通道数 |
-| `QLoRA(layer, rank=4, alpha=None, bits=4)` | 量化基座 + LoRA：先用 `fake_quantize` 把冻结基座权重做对称伪量化（`bits` 2..16），再挂 LoRA 适配器；`B` 初始为 0 时输出与量化后基座逐位相等；`merge()` 把适配器折回量化基座；`trainable_param_count()` 只统计适配器参数 |
+| `QLoRA(layer, rank=4, alpha=None, bits=4, quant='int')` | 量化基座 + LoRA：`quant='int'` 用 `fake_quantize` 对称伪量化（`bits` 2..16），`quant='nf4'` 用 4-bit NF4 分位点查表 + 双重量化（`nf4_fake_quantize_double`）；`B` 初始为 0 时输出与量化后基座逐位相等；`merge()` 把适配器折回量化基座；`trainable_param_count()` 只统计适配器参数 |
 | `VeRA(layer, rank=4, alpha=None, seed=None)` | 共享冻结随机投影 + 可训练逐秩缩放：`A`/`B` 随机生成后冻结，只训 `d`（`rank` 个标量），`y = Layer(x) + scaling·B(d ⊙ Ax)`；`merge()` 可折回原层 |
 | `ReFT(layer, rank=2, alpha=None, seed=None)` | 低秩表示干预：`P` 冻结随机投影（`rank×fan_out`），只训 `W`（`rank×fan_out`）与 `b`（`rank`），`y = Layer(x) + scaling·Pᵀ(W·Layer(x)+b)`；包装任意 `Layer`，不做 merge |
 | `DoRALinear(layer, rank=4, alpha=None)` | DoRA：权重拆成「幅度 `m` × 方向 `V`」，LoRA 只改方向（`W' = m·Weff/‖Weff‖`），`V`/`m` 也可训；`B=0` 时与原层逐位一致，`merge()` 折回原层 |
@@ -4022,7 +4022,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2122 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2126 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4228,6 +4228,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
 | `TestKAN` | B 样条基单位分解、单层前向与参数/梯度、模型前向/MSE/拟合 sin、非法输入 |
+| `TestQLoRANF4` | 默认 int 量化路径不变、NF4 权重与量化基座逐位等价、基座冻结与一步更新、非法 quant/bits |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4362,7 +4363,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2122 个单元测试
+├── test_ai.py       # 2126 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
