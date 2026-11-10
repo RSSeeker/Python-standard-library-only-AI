@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2117 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2122 项）
 
 ## 特性
 
@@ -840,6 +840,35 @@ m = AI.Seq2SeqLM.load("s2s.json")
   否则展开 `num_beams` 个。`Seq2SeqLM` 的束搜索会把以 `eos_id` 结尾的候选放进「已完成」再统一比较。
 - `top_k` 必须是 `>= 0` 的整数；`generate` 会校验源序列长度不超过 `max_len`、token id 在词表内
   （这两条原来只有 `forward` 检查，生成路径会绕过它们）。
+### KAN（Kolmogorov-Arnold Network）
+
+KAN 把「激活函数在节点上」换成「边上是可学习的 B 样条函数」：每个输入-输出连接带一组
+样条系数，输出是 `b_i + Σ_j Σ_k coeff[i][j][k] * B_k(x_j)`，其中 `B_k` 为均匀节点上的
+Cox-de Boor 基函数。梯度对系数、偏置与输入都可解析求出。
+
+```python
+from AI import KAN, KANLayer
+
+layer = KANLayer(2, 3, num_grid=5, spline_order=3, seed=1)
+print(layer.forward([[0.2, -0.3]]))     # 每个输入行 -> 3 个数
+print(layer.param_count())              # 3 * (2 * 8 + 1) = 51
+
+model = KAN([1, 1], seed=2)
+history = model.fit([[i / 8 - 1] for i in range(17)],
+                    [[__import__("math").sin(3.141592653589793 * (i / 8 - 1))] for i in range(17)],
+                    epochs=100, lr=0.1)
+print(history[-1]["loss"])
+```
+
+| API | 说明 |
+|------|------|
+| `KANLayer(in_dim, out_dim, num_grid=5, spline_order=3, grid_range=1.0, seed=None)` | 单层 KAN：`forward(rows)` / `backward(dout_rows)` / `sgd_step(lr)` / `param_count()` |
+| `KAN(layer_sizes, num_grid=5, spline_order=3, grid_range=1.0, seed=None)` | 多层 KAN：`forward(x)` 单向量、`forward_batch(rows)`、`loss_and_backward(xs, ys)`、`fit(xs, ys, epochs, lr)` |
+| `KAN.fit(...)` | 每轮 zero_grad → MSE → sgd_step，返回每轮 `{"loss": ...}` 列表 |
+
+边界：B 样条使用**均匀固定节点**，没有 KAN 原文的自适应 grid 扩展；优化器固定为 SGD；
+单向量前向与批量前向是两套独立入口。
+
 ### 优化器
 
 | 优化器 | 说明 |
@@ -3993,7 +4022,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2117 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2122 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4198,6 +4227,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
+| `TestKAN` | B 样条基单位分解、单层前向与参数/梯度、模型前向/MSE/拟合 sin、非法输入 |
 | `TestDataPipeline` | Dataset 抽象与 `ListDataset`/`Subset`、`LazyDataset` 的懒加载/命中计数/FIFO 淘汰、六种 Sampler 与 `BatchSampler` 的批数、`bucket_by_length` 的覆盖性与桶内长度极差、`PreprocessCache` 的未命中→命中→改文件失效→`clear`、`DataLoader` 的默认路径与 `sampler`/`batch_sampler` 两条新路径 |
 | `TestEncoders` | `LabelEncoder`/`OrdinalEncoder` 的往返与未知类别、`OneHotEncoder` 的展开宽度/`drop='first'`/`handle_unknown='ignore'`、`TargetEncoder` 的 `smoothing=0` 组均值与 `smoothing=1` 闭式解、`FrequencyEncoder` 频率、`WOEEncoder` 闭式解与反号、空输入/行宽/非二值 `y` 的报错 |
 | `TestImageAugmentation` | 双线性的角点/中点插值、`Compose` 顺序与空列表报错、`RandomCrop` 同种子复现与 `padding` 填充、`RandomResizedCrop` 值域、`RandomRotation` 灰度不变与 delta 质心、`ColorJitter` 亮度缩放/灰度色相/等通道饱和度、`GaussianBlur` 常量保持与 delta 能量、`Normalize` 数值与通道校验、整条管道的可复现性 |
@@ -4332,7 +4362,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2117 个单元测试
+├── test_ai.py       # 2122 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

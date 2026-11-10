@@ -32911,3 +32911,212 @@ class TestTreeOfThought:
         assert _mcts_raises(lambda: AI.tree_of_thought(lambda s: [], good_eval, lambda s: len(s) >= 5, ()))
         assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, lambda s: "x", good_term, ()))
         assert _mcts_raises(lambda: AI.tree_of_thought(good_propose, good_eval, lambda s: "no", ()))
+
+
+import math
+
+
+def _kan_raises(fn, exc=(ValueError, RuntimeError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected exception")
+
+
+class TestKAN:
+    def test_bspline_basis(self):
+        for x in (-0.9, -0.35, 0.0, 0.3, 0.75, 0.99):
+            vals, ders = AI._kan_basis(x, 5, 3, 1.0)
+            assert len(vals) == 8
+            assert len(ders) == 8
+            assert abs(sum(vals) - 1.0) < 1e-12
+            assert abs(sum(ders)) < 1e-10
+        # 样条阶 0 时只有所在区间为 1
+        vals, ders = AI._kan_basis(0.1, 4, 0, 1.0)
+        assert sum(vals) == 1.0
+        assert all(v == 0.0 for v in ders)
+
+    def test_layer_forward_and_param_count(self):
+        layer = AI.KANLayer(2, 3, num_grid=5, spline_order=3, seed=5)
+        assert layer.num_basis == 8
+        assert layer.param_count() == 3 * (2 * 8 + 1)
+        out = layer.forward([[0.3, -0.4], [-0.7, 0.2]])
+        assert len(out) == 2
+        assert len(out[0]) == 3
+        assert layer.backward([[1.0, 2.0, -1.0], [0.5, -0.5, 1.0]])
+        _kan_raises(lambda: layer.backward([[1.0]]))
+        _kan_raises(lambda: AI.KANLayer(2, 3, num_grid=0))
+        _kan_raises(lambda: AI.KANLayer(2, 3, spline_order=0))
+        _kan_raises(lambda: AI.KANLayer(2, 3, grid_range=-1.0))
+        _kan_raises(lambda: AI.KANLayer(2, 3).forward([]))
+        _kan_raises(lambda: AI.KANLayer(2, 3).forward([[0.1]]))
+
+    def test_layer_numerical_gradients(self):
+        layer = AI.KANLayer(2, 3, seed=5)
+        rows = [[0.3, -0.4], [-0.7, 0.2]]
+        weights = [[0.5, -0.3, 0.8], [0.1, 0.7, -0.6]]
+
+        def loss():
+            out = layer.forward(rows)
+            return sum(weights[i][k] * out[i][k]
+                       for i in range(2) for k in range(3))
+
+        layer.forward(rows)
+        layer.backward([weights[0][:], weights[1][:]])
+
+        def fd(getter, setter, h=1e-6):
+            p0 = getter()
+            setter(p0 + h)
+            lp = loss()
+            setter(p0 - h)
+            lm = loss()
+            setter(p0)
+            return (lp - lm) / (2.0 * h)
+
+        checks = [
+            (layer.grad_coeff[1][0][2],
+             lambda: layer.coeff[1][0][2],
+             lambda v: layer.coeff[1][0].__setitem__(2, v)),
+            (layer.grad_coeff[2][1][0],
+             lambda: layer.coeff[2][1][0],
+             lambda v: layer.coeff[2][1].__setitem__(0, v)),
+            (layer.grad_biases[2],
+             lambda: layer.biases[2],
+             lambda v: layer.biases.__setitem__(2, v)),
+        ]
+        for analytic, getter, setter in checks:
+            numeric = fd(getter, setter)
+            rel = abs(analytic - numeric) / max(1.0, abs(analytic), abs(numeric))
+            assert rel < 1e-4, (analytic, numeric, rel)
+        # sgd 更新后梯度被清空
+        layer.sgd_step(0.01)
+        assert layer.grad_coeff is None and layer.grad_biases is None
+
+    def test_model_fit_sin(self):
+        xs = [[-1.0 + 2.0 * i / 16.0] for i in range(17)]
+        ys = [[math.sin(math.pi * x[0])] for x in xs]
+        model = AI.KAN([1, 1], num_grid=5, spline_order=3, seed=1)
+        assert model.param_count() == 9
+        hist = model.fit(xs, ys, epochs=100, lr=0.1)
+        assert len(hist) == 100
+        assert hist[-1]["loss"] < 0.05
+        assert hist[-1]["loss"] < hist[0]["loss"] * 0.2
+        pred = model.forward([0.25])
+        assert len(pred) == 1
+        batch = model.forward_batch([[0.0], [0.5]])
+        assert len(batch) == 2 and len(batch[0]) == 1
+        _kan_raises(lambda: model.forward([0.1, 0.2]))
+        _kan_raises(lambda: model.forward_batch([]))
+
+    def test_param_counts_and_multi_layer(self):
+        model = AI.KAN([2, 3, 1], seed=1)
+        # 第 1 层 3*(2*8+1)=51，第 2 层 1*(3*8+1)=25
+        assert model.param_count() == 76
+        out = model.forward([0.2, -0.3])
+        assert len(out) == 1
+        outs = model.forward_batch([[0.2, -0.3], [-0.1, 0.4], [0.0, 0.0]])
+        assert len(outs) == 3 and len(outs[0]) == 1
+        _kan_raises(lambda: AI.KAN([1]))
+        _kan_raises(lambda: AI.KAN([1, 0]))
+        _kan_raises(lambda: AI.KAN([1, 1], seed="x"))
+        _kan_raises(lambda: model.fit([[0.1, 0.1]], [[1.0]], epochs=0))
+        _kan_raises(lambda: model.sgd_step(0.0))
+
+
+import math
+
+
+def _kan_raises(fn, exc=(ValueError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected exception")
+
+
+def _kan_fd(getter, setter, loss, h=1e-5):
+    p0 = getter()
+    setter(p0 + h)
+    lp = loss()
+    setter(p0 - h)
+    lm = loss()
+    setter(p0)
+    return (lp - lm) / (2.0 * h)
+
+
+class TestKAN:
+    def test_basis_partition_of_unity(self):
+        for x in (-0.95, -0.5, 0.0, 0.25, 0.9):
+            vals, ders = AI._kan_basis(x, 5, 3, 1.0)
+            assert len(vals) == 8
+            assert abs(sum(vals) - 1.0) < 1e-12
+            assert abs(sum(ders)) < 1e-9
+
+    def test_layer_forward_backward(self):
+        layer = AI.KANLayer(2, 3, num_grid=5, spline_order=3, grid_range=1.0, seed=5)
+        assert layer.param_count() == 3 * (2 * 8 + 1) == 51
+        rows = [[0.3, -0.4], [-0.7, 0.2]]
+        out = layer.forward(rows)
+        assert len(out) == 2 and len(out[0]) == 3
+        weights = [[0.5, -0.3, 0.8], [0.1, 0.7, -0.6]]
+
+        def loss():
+            o = layer.forward(rows)
+            return sum(weights[i][k] * o[i][k] for i in range(2) for k in range(3))
+
+        layer.forward(rows)
+        layer.backward([weights[0][:], weights[1][:]])
+        ana_c = layer.grad_coeff[1][0][2]
+        num_c = _kan_fd(lambda: layer.coeff[1][0][2],
+                        lambda v: layer.coeff[1][0].__setitem__(2, v), loss)
+        assert abs(ana_c - num_c) < 1e-6
+        ana_b = layer.grad_biases[2]
+        num_b = _kan_fd(lambda: layer.biases[2],
+                        lambda v: layer.biases.__setitem__(2, v), loss)
+        assert abs(ana_b - num_b) < 1e-6
+        before = layer.forward(rows)[0][0]
+        layer.sgd_step(0.05)
+        after = layer.forward(rows)[0][0]
+        assert abs(after - before) > 1e-9
+
+    def test_model_forward_and_mse(self):
+        model = AI.KAN([2, 3, 1], seed=1)
+        assert model.param_count() == 76
+        out = model.forward([0.2, -0.3])
+        assert len(out) == 1
+        batch = model.forward_batch([[0.2, -0.3], [-0.1, 0.4]])
+        assert len(batch) == 2 and len(batch[0]) == 1
+        xs = [[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1]]
+        ys = [[0.3], [-0.2], [0.1]]
+        loss = model.loss_and_backward(xs, ys)
+        assert isinstance(loss, float) and loss >= 0.0
+        model.sgd_step(0.01)
+        model.zero_grad()
+
+    def test_fit_sin(self):
+        xs = [[-1.0 + 2.0 * i / 16.0] for i in range(17)]
+        ys = [[math.sin(math.pi * x[0])] for x in xs]
+        model = AI.KAN([1, 1], seed=2)
+        hist = model.fit(xs, ys, epochs=100, lr=0.1)
+        assert len(hist) == 100
+        assert hist[-1]["loss"] < 0.05
+        assert hist[-1]["loss"] < hist[0]["loss"] * 0.5
+        pred = model.forward([0.0])
+        assert abs(pred[0] - 0.0) < 0.2
+
+    def test_invalid_inputs(self):
+        _kan_raises(lambda: AI.KAN([1, 0]))
+        _kan_raises(lambda: AI.KAN([1, 1, 1], num_grid=0))
+        _kan_raises(lambda: AI.KAN([1, 1, 1], spline_order=0))
+        _kan_raises(lambda: AI.KAN([1, 1, 1], grid_range=-1.0))
+        _kan_raises(lambda: AI.KANLayer(2, 3, seed=1).forward([]))
+        _kan_raises(lambda: AI.KANLayer(2, 3, seed=1).forward([[0.1]]))
+        _kan_raises(lambda: AI.KANLayer(2, 3, seed=1).forward([[float("nan")]]))
+        model = AI.KAN([1, 1], seed=1)
+        _kan_raises(lambda: model.forward([0.1, 0.2]))
+        _kan_raises(lambda: model.forward([float("inf")]))
+        _kan_raises(lambda: model.fit([[0.1]], [[0.2]], epochs=0))
+        _kan_raises(lambda: model.fit([], [], epochs=3))
+        _kan_raises(lambda: model.sgd_step(0.0))
+        _kan_raises(lambda: model.backward([1.0] * 5))

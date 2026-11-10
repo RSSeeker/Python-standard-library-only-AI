@@ -839,8 +839,9 @@
 - [x] GRPO 族工具：`group_relative_advantages`（组内归一化）、`grpo_losses`（逐步 PPO 裁剪 + 长度归一化）、`best_of_n`、`self_consistency`、`rejection_sampling_filter`；`TestGRPO` / `TestBestOfN` / `TestSelfConsistency` / `TestRejectionSampling` 共 10 例。
 - [x] μP 参数化：`mup_target_std`（按 input / hidden / readout 分层给初始化 std，hidden 随宽度反比、readout 正比）、`mup_init`、`mup_lr`（逐层学习率）与 `MuPAdam`（每层用自己的 lr 做 Adam 更新）；`TestMuP` 5 例。
 - [x] 推理搜索：`MCTSNode`、`mcts_search`（PUCT 选择、单叶扩展、backprop 价值与访问数、按访问次数选动作，支持 `next_state_fn`）、`tree_of_thought`（逐层扩展 + 评分 + beam 剪枝）；`TestMCTS` 5 例、`TestTreeOfThought` 4 例。
+- [x] KAN（Kolmogorov-Arnold Network）：`KANLayer`（均匀节点 B 样条边函数、Cox-de Boor 基与导数、手写反向、SGD）、`KAN`（单向量/批量前向、MSE `loss_and_backward`、`fit`）；`TestKAN` 5 例。
 
-全量测试：1839 → 2117 passed（新增 278 例）。
+全量测试：1839 → 2122 passed（新增 283 例）。
 
 ---
 

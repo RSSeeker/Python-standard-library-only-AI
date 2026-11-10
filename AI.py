@@ -841,6 +841,358 @@ def mimic_init(student, teacher):
     return {"widths": widths, "depth_copied": n}
 
 
+#  ==========================================================================
+#  KAN（Kolmogorov-Arnold Network：B 样条边函数）
+#  ==========================================================================
+
+
+def _kan_check_positive_int(value, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"KAN: {name} 必须是正整数")
+    return value
+
+
+def _kan_check_positive_number(value, name: str) -> float:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value <= 0.0):
+        raise ValueError(f"KAN: {name} 必须是正的有限数字")
+    return float(value)
+
+
+def _kan_knots(num_grid: int, spline_order: int, grid_range: float):
+    """均匀扩展节点向量，长度为 num_grid + 2*order + 1。"""
+    lo, hi = -grid_range, grid_range
+    step = (hi - lo) / num_grid
+    return [lo + (i - spline_order) * step
+            for i in range(num_grid + 2 * spline_order + 1)]
+
+
+def _kan_basis(x, num_grid: int, spline_order: int, grid_range: float):
+    """一次求值返回 (B 样条基函数值, 各基函数对 x 的导数)，长度均为 num_grid+order。"""
+    knots = _kan_knots(num_grid, spline_order, grid_range)
+    n0 = len(knots) - 1
+    vals = [1.0 if knots[i] <= x < knots[i + 1] else 0.0 for i in range(n0)]
+    ders = [0.0] * n0
+    for p in range(1, spline_order + 1):
+        m = n0 - p
+        new_vals = [0.0] * m
+        new_ders = [0.0] * m
+        for i in range(m):
+            d1 = knots[i + p] - knots[i]
+            d2 = knots[i + p + 1] - knots[i + 1]
+            a = (x - knots[i]) / d1 if d1 > 0.0 else 0.0
+            b = (knots[i + p + 1] - x) / d2 if d2 > 0.0 else 0.0
+            new_vals[i] = a * vals[i] + b * vals[i + 1]
+            dv = 0.0
+            if d1 > 0.0:
+                dv += p / d1 * vals[i]
+            if d2 > 0.0:
+                dv -= p / d2 * vals[i + 1]
+            new_ders[i] = dv
+        vals, ders = new_vals, new_ders
+    return vals, ders
+
+
+class KANLayer:
+    """一层 KAN：y_i = b_i + sum_j sum_b c[i][j][b] * B_b(x_j)。"""
+
+    def __init__(self, in_dim: int, out_dim: int, num_grid: int = 5,
+                 spline_order: int = 3, grid_range: float = 1.0,
+                 seed: Optional[int] = None):
+        self.in_dim = _kan_check_positive_int(in_dim, "in_dim")
+        self.out_dim = _kan_check_positive_int(out_dim, "out_dim")
+        self.num_grid = _kan_check_positive_int(num_grid, "num_grid")
+        if (not isinstance(spline_order, int) or isinstance(spline_order, bool)
+                or spline_order <= 0 or spline_order > 5):
+            raise ValueError("KAN: spline_order 必须是 1 到 5 之间的整数")
+        self.spline_order = spline_order
+        self.grid_range = _kan_check_positive_number(grid_range, "grid_range")
+        self.num_basis = self.num_grid + self.spline_order
+        rng = random.Random(seed) if seed is not None else random
+        scale = math.sqrt(2.0 / (self.in_dim * self.num_basis))
+        self.coeff = [[[rng.gauss(0.0, scale) for _ in range(self.num_basis)]
+                       for _ in range(self.in_dim)]
+                      for _ in range(self.out_dim)]
+        self.biases = [0.0] * self.out_dim
+        self.grad_coeff = None
+        self.grad_biases = None
+        self._cache = None
+        self.training = True
+        self._basis_memo = {}
+
+    def _basis(self, x: float):
+        key = float(x)
+        hit = self._basis_memo.get(key)
+        if hit is None:
+            hit = _kan_basis(key, self.num_grid, self.spline_order,
+                             self.grid_range)
+            self._basis_memo[key] = hit
+        return hit
+
+    def _check_row(self, row, who: str):
+        if not isinstance(row, (list, tuple)) or len(row) != self.in_dim:
+            raise ValueError(f"KANLayer: {who} 必须是长度 {self.in_dim} 的数字列表")
+        out = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v)):
+                raise ValueError(f"KANLayer: {who} 必须只包含有限数字")
+            out.append(float(v))
+        return out
+
+    def forward(self, rows):
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise ValueError("KANLayer: forward 需要非空的输入行列表")
+        rows = [self._check_row(row, "输入行") for row in rows]
+        basis_rows = [[self._basis(v) for v in row] for row in rows]
+        out_rows = []
+        for basis_row in basis_rows:
+            y = list(self.biases)
+            for i in range(self.out_dim):
+                ci = self.coeff[i]
+                total = y[i]
+                for j in range(self.in_dim):
+                    cj = ci[j]
+                    bj = basis_row[j][0]
+                    for b in range(self.num_basis):
+                        total += cj[b] * bj[b]
+                y[i] = total
+            out_rows.append(y)
+        self._cache = (basis_rows, len(rows))
+        return out_rows
+
+    def backward(self, dout_rows, *, zero_after: bool = False):
+        if self._cache is None:
+            raise RuntimeError("KANLayer: 必须先调用 forward 再调用 backward")
+        basis_rows, n = self._cache
+        if not isinstance(dout_rows, (list, tuple)) or len(dout_rows) != n:
+            raise ValueError("KANLayer: 输出梯度的行数必须与前向输入一致")
+        for row in dout_rows:
+            if (not isinstance(row, (list, tuple)) or len(row) != self.out_dim):
+                raise ValueError(f"KANLayer: 输出梯度每行长度必须是 {self.out_dim}")
+            for v in row:
+                if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                        or not math.isfinite(v)):
+                    raise ValueError("KANLayer: 输出梯度必须只包含有限数字")
+        grad_coeff = [[[0.0] * self.num_basis for _ in range(self.in_dim)]
+                      for _ in range(self.out_dim)]
+        grad_biases = [0.0] * self.out_dim
+        dx_rows = []
+        for drow, basis_row in zip(dout_rows, basis_rows):
+            for i in range(self.out_dim):
+                d = float(drow[i])
+                grad_biases[i] += d
+                if d == 0.0:
+                    continue
+                gci = grad_coeff[i]
+                ci = self.coeff[i]
+                for j in range(self.in_dim):
+                    bj = basis_row[j][0]
+                    gcj = gci[j]
+                    for b in range(self.num_basis):
+                        gcj[b] += d * bj[b]
+            dx = [0.0] * self.in_dim
+            for j in range(self.in_dim):
+                dbj = basis_row[j][1]
+                total = 0.0
+                for i in range(self.out_dim):
+                    d = float(drow[i])
+                    if d == 0.0:
+                        continue
+                    cj = self.coeff[i][j]
+                    inner = 0.0
+                    for b in range(self.num_basis):
+                        inner += cj[b] * dbj[b]
+                    total += d * inner
+                dx[j] = total
+            dx_rows.append(dx)
+        if self.grad_coeff is None:
+            self.grad_coeff = grad_coeff
+            self.grad_biases = grad_biases
+        else:
+            for i in range(self.out_dim):
+                for j in range(self.in_dim):
+                    gj = self.grad_coeff[i][j]
+                    nj = grad_coeff[i][j]
+                    for b in range(self.num_basis):
+                        gj[b] += nj[b]
+                self.grad_biases[i] += grad_biases[i]
+        if zero_after:
+            self._cache = None
+        return dx_rows
+
+    def zero_grad(self):
+        self.grad_coeff = None
+        self.grad_biases = None
+
+    def sgd_step(self, lr: float = 0.01):
+        if self.grad_coeff is None:
+            raise RuntimeError("KANLayer: 没有可用的梯度，请先反向传播")
+        lr = _kan_check_positive_number(lr, "学习率")
+        for i in range(self.out_dim):
+            for j in range(self.in_dim):
+                cj = self.coeff[i][j]
+                gj = self.grad_coeff[i][j]
+                for b in range(self.num_basis):
+                    cj[b] -= lr * gj[b]
+            self.biases[i] -= lr * self.grad_biases[i]
+        self.zero_grad()
+
+    def param_count(self) -> int:
+        return self.out_dim * (self.in_dim * self.num_basis + 1)
+
+    def train(self):
+        self.training = True
+
+    def eval(self):
+        self.training = False
+
+
+class KAN:
+    """多层 KAN，forward 接受单个输入向量，forward_batch 接受行列表。"""
+
+    def __init__(self, layer_sizes, num_grid: int = 5, spline_order: int = 3,
+                 grid_range: float = 1.0, seed: Optional[int] = None):
+        if (not isinstance(layer_sizes, (list, tuple))
+                or len(layer_sizes) < 2):
+            raise ValueError("KAN: layer_sizes 至少需要两个维度（输入和输出）")
+        sizes = [_kan_check_positive_int(v, "layer_sizes 中的维度")
+                 for v in layer_sizes]
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise ValueError("KAN: seed 必须是整数或 None")
+        self.layer_sizes = sizes
+        self.num_grid = _kan_check_positive_int(num_grid, "num_grid")
+        if (not isinstance(spline_order, int) or isinstance(spline_order, bool)
+                or spline_order <= 0 or spline_order > 5):
+            raise ValueError("KAN: spline_order 必须是 1 到 5 之间的整数")
+        self.spline_order = spline_order
+        self.grid_range = _kan_check_positive_number(grid_range, "grid_range")
+        self.layers = []
+        for idx in range(len(sizes) - 1):
+            layer_seed = None if seed is None else seed + idx
+            self.layers.append(KANLayer(sizes[idx], sizes[idx + 1],
+                                        self.num_grid, self.spline_order,
+                                        self.grid_range, seed=layer_seed))
+        self._last_mode = None
+
+    def _check_vector(self, x, who: str, expected_len=None):
+        if not isinstance(x, (list, tuple)):
+            raise ValueError(f"KAN: {who} 必须是数字列表")
+        expected = self.layer_sizes[0] if expected_len is None else expected_len
+        if len(x) != expected:
+            raise ValueError(f"KAN: {who} 长度必须是 {expected}")
+        out = []
+        for v in x:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v)):
+                raise ValueError(f"KAN: {who} 必须只包含有限数字")
+            out.append(float(v))
+        return out
+
+    def forward(self, x):
+        h = self._check_vector(x, "输入")
+        self._last_mode = "single"
+        for layer in self.layers:
+            h = layer.forward([h])[0]
+        return h
+
+    def forward_batch(self, rows):
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise ValueError("KAN: forward_batch 需要非空的输入行列表")
+        rows = [self._check_vector(row, "输入行") for row in rows]
+        self._last_mode = "batch"
+        h = rows
+        for layer in self.layers:
+            h = layer.forward(h)
+        return h
+
+    def backward(self, dout):
+        if self._last_mode != "single":
+            raise RuntimeError("KAN: 单样本 backward 之前必须调用 forward")
+        d = self._check_vector(dout, "输出梯度", expected_len=self.layer_sizes[-1])
+        grad = [d]
+        for layer in reversed(self.layers):
+            grad = layer.backward(grad)
+        return grad[0]
+
+    def backward_batch(self, dout_rows):
+        if self._last_mode != "batch":
+            raise RuntimeError("KAN: backward_batch 之前必须调用 forward_batch")
+        if (not isinstance(dout_rows, (list, tuple))
+                or len(dout_rows) != self._last_size()):
+            raise ValueError("KAN: 输出梯度行数必须与前向输入一致")
+        d = [self._check_vector(row, "输出梯度行", expected_len=self.layer_sizes[-1]) for row in dout_rows]
+        for layer in reversed(self.layers):
+            d = layer.backward(d)
+        return d
+
+    def _last_size(self) -> int:
+        return len(self.layers[0]._cache[0]) if self.layers[0]._cache else 0
+
+    def zero_grad(self):
+        for layer in self.layers:
+            layer.zero_grad()
+
+    def sgd_step(self, lr: float = 0.01):
+        lr = _kan_check_positive_number(lr, "学习率")
+        for layer in self.layers:
+            layer.sgd_step(lr)
+
+    def param_count(self) -> int:
+        return sum(layer.param_count() for layer in self.layers)
+
+    def loss_and_backward(self, xs, ys):
+        if (not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple))
+                or not xs or len(xs) != len(ys)):
+            raise ValueError("KAN: xs 与 ys 必须是非空且等长的列表")
+        pred = self.forward_batch(xs)
+        n = len(xs)
+        out_dim = self.layer_sizes[-1]
+        dout = []
+        total = 0.0
+        for i in range(n):
+            if (not isinstance(ys[i], (list, tuple))
+                    or len(ys[i]) != out_dim):
+                raise ValueError(f"KAN: ys 中每个元素长度必须是 {out_dim}")
+            row = []
+            for k in range(out_dim):
+                target = ys[i][k]
+                if (not isinstance(target, (int, float))
+                        or isinstance(target, bool) or not math.isfinite(target)):
+                    raise ValueError("KAN: 目标必须只包含有限数字")
+                diff = pred[i][k] - float(target)
+                total += diff * diff
+                row.append(2.0 * diff / n)
+            dout.append(row)
+        self.backward_batch(dout)
+        return total / n
+
+    def fit(self, xs, ys, epochs: int = 100, lr: float = 0.05,
+            shuffle: bool = False, seed: Optional[int] = None):
+        if (not isinstance(epochs, int) or isinstance(epochs, bool) or epochs <= 0):
+            raise ValueError("KAN: epochs 必须是正整数")
+        lr = _kan_check_positive_number(lr, "学习率")
+        if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+            raise ValueError("KAN: xs 与 ys 必须是列表")
+        if not xs or len(xs) != len(ys):
+            raise ValueError("KAN: xs 与 ys 必须非空且等长")
+        rng = random.Random(seed)
+        history = []
+        indices = list(range(len(xs)))
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(indices)
+            self.zero_grad()
+            if shuffle:
+                order_x = [xs[i] for i in indices]
+                order_y = [ys[i] for i in indices]
+            else:
+                order_x, order_y = xs, ys
+            loss = self.loss_and_backward(order_x, order_y)
+            self.sgd_step(lr)
+            history.append({"loss": loss})
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
