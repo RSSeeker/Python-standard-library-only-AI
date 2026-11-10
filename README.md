@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2165 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2170 项）
 
 ## 特性
 
@@ -1916,6 +1916,30 @@ print(cf['target'], cf['distance'])
 - `tcav` / `network_dissection` / `prototype_examples` 只需要前向（或只回传到目标层），可用于卷积容器；`activation_maximization` / `counterfactual_example` / `influence_scores` 要回传到输入或参数，**只支持由 `Layer` 组成的 MLP**，卷积模型请用 `cam_heatmap`。
 - `counterfactual_example` 用「目标类 one-hot 减原类 one-hot」的单次回传做梯度下降，不是 CEM 的对比解释，也没有 line search；距离由 `l2` 约束，不保证最小。
 - `influence_scores` 是一阶梯度余弦，不是「留一重训」的精确影响；只在 MSE、单输出、MLP 上有定义。
+
+### 稀疏自编码器（SAE）
+
+```python
+from AI import SAE
+
+sae = SAE(d_in=16, d_hidden=64, l1_coeff=1e-3, seed=0)
+sae.fit(activations, epochs=200, lr=0.05, seed=1)
+stats = sae.feature_stats(activations)
+print(stats["dead_features"], stats["mean_active"])
+
+f = sae.encode(activations[0])
+recon = sae.decode(f)
+```
+
+| API | 说明 |
+|---|---|
+| `SAE(d_in, d_hidden=64, l1_coeff=1e-3, seed=None)` | 单层稀疏自编码器：`f = relu(W_enc x + b_enc)`、`x_hat = W_dec f + b_dec`，参数随机初始化 |
+| `SAE.forward(xs)` / `encode(x)` / `decode(f)` | 批量前向返回 `{'recon','features','pre'}`；单样本编码/解码 |
+| `SAE.loss_and_backward(xs)` | 重建 MSE + `l1_coeff * mean(|f|)` 稀疏损失，手写反向并累积梯度 |
+| `SAE.fit(xs, epochs=100, lr=0.01, seed=None)` / `sgd_step(lr)` | 全批量 SGD，返回每轮 `{'loss','mse','l1'}` |
+| `SAE.feature_stats(xs)` / `param_count()` | 每个隐藏特征的激活比例、dead feature 数与平均激活数 / 参数量 `2*d_in*d_hidden+d_in+d_hidden` |
+
+- 边界：编码与解码各一层线性 + ReLU，没有 tied weights、归一化或 top-k 稀疏；L1 用 `mean(|f|)` 的次梯度（`f=0` 处取 0）；`fit` 是全批量 SGD，不做 mini-batch 与 Adam。
 
 ### 结构化剪枝
 
@@ -4103,7 +4127,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2165 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2170 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4308,6 +4332,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLLMJudge` | 提示词包含问答与参考、输出解析（大小写/中文冒号/截断）、缺字段报错、一致率与容差 |
 | `TestDraftTree` | 共享前缀 trie 的 parents/tokens/leaves/paths、单序列与重复序列、非法序列 |
 | `TestTreeAttention` | 祖先可见性偏置与布尔掩码一致、链式树、非法 parents/neg_inf |
+| `TestSAE` | 前向/参数、四项梯度有限差分、fit 降 loss 与 L1 分解、特征稀疏统计、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4455,7 +4480,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2165 个单元测试
+├── test_ai.py       # 2170 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

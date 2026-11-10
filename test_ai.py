@@ -33981,3 +33981,101 @@ class TestTreeAttention:
         _p13_raises(lambda: AI.tree_attention_bias([-1, 0], neg_inf=float("inf")))
         _p13_raises(lambda: AI.tree_attention_mask([-1, 1]))
         _p13_raises(lambda: AI.tree_attention_mask("bad"))
+
+
+import AI
+
+
+def _p14_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p14_samples():
+    return [[1.0, 0.0, 0.5, -0.5],
+            [0.2, 0.8, -0.3, 0.1],
+            [0.0, 0.5, 0.0, 0.9]]
+
+
+class TestSAE:
+    def test_forward_and_param_count(self):
+        m = AI.SAE(4, 8, l1_coeff=1e-3, seed=1)
+        assert m.param_count() == 8 * 4 + 8 + 4 * 8 + 4
+        out = m.forward(_p14_samples())
+        assert len(out["recon"]) == 3 and len(out["features"]) == 3
+        assert all(len(r) == 4 for r in out["recon"])
+        assert all(len(f) == 8 for f in out["features"])
+        assert all(v >= 0.0 for f in out["features"] for v in f)
+        x = _p14_samples()[0]
+        assert m.decode(m.encode(x)) == out["recon"][0]
+
+    def test_numerical_gradients(self):
+        m = AI.SAE(3, 5, l1_coeff=0.01, seed=3)
+        xs = [[0.5, -0.2, 0.1], [0.3, 0.7, -0.4]]
+        h = 1e-6
+
+        def fd(getter, setter, getgrad, tag):
+            old = getter()
+            m.zero_grad()
+            m.loss_and_backward(xs)
+            ana = getgrad()
+            setter(old + h)
+            m.zero_grad()
+            lp = m.loss_and_backward(xs)["loss"]
+            setter(old - h)
+            m.zero_grad()
+            lm = m.loss_and_backward(xs)["loss"]
+            setter(old)
+            num = (lp - lm) / (2.0 * h)
+            assert abs(ana - num) < 1e-4, (tag, ana, num)
+
+        fd(lambda: m.W_enc[0][0], lambda v: m.W_enc[0].__setitem__(0, v),
+           lambda: m.grad_W_enc[0][0], "W_enc")
+        fd(lambda: m.W_dec[1][2], lambda v: m.W_dec[1].__setitem__(2, v),
+           lambda: m.grad_W_dec[1][2], "W_dec")
+        fd(lambda: m.b_enc[0], lambda v: m.b_enc.__setitem__(0, v),
+           lambda: m.grad_b_enc[0], "b_enc")
+        fd(lambda: m.b_dec[2], lambda v: m.b_dec.__setitem__(2, v),
+           lambda: m.grad_b_dec[2], "b_dec")
+
+    def test_fit_reduces_loss(self):
+        m = AI.SAE(4, 8, l1_coeff=1e-3, seed=1)
+        xs = _p14_samples()
+        hist = m.fit(xs, epochs=50, lr=0.05, seed=2)
+        assert len(hist) == 50
+        assert hist[-1]["loss"] < 0.5 * hist[0]["loss"]
+        assert hist[-1]["mse"] <= hist[0]["mse"]
+        for row in hist[-1:]:
+            assert row["l1"] >= 0.0
+            assert abs(row["loss"] - (row["mse"] + row["l1"])) < 1e-12
+
+    def test_feature_stats_and_sparsity(self):
+        m = AI.SAE(4, 8, l1_coeff=0.2, seed=1)
+        xs = _p14_samples()
+        m.fit(xs, epochs=100, lr=0.05, seed=2)
+        st = m.feature_stats(xs)
+        assert len(st["active_fraction"]) == 8
+        assert 0 <= st["dead_features"] <= 8
+        assert st["dead_features"] == sum(
+            1 for v in st["active_fraction"] if v == 0.0)
+        assert 0.0 < st["mean_active"] <= 1.0
+
+    def test_invalid_inputs(self):
+        m = AI.SAE(4, 8, seed=1)
+        _p14_raises(lambda: AI.SAE(0, 8))
+        _p14_raises(lambda: AI.SAE(4, 0))
+        _p14_raises(lambda: AI.SAE(4, 8, l1_coeff=-0.1))
+        _p14_raises(lambda: AI.SAE(4, 8, seed=1.5))
+        _p14_raises(lambda: m.forward([]))
+        _p14_raises(lambda: m.forward([[0.1, 0.2]]))
+        _p14_raises(lambda: m.forward([[0.1, 0.2, 0.3, "x"]]))
+        _p14_raises(lambda: m.encode([0.1, 0.2]))
+        _p14_raises(lambda: m.decode([0.1] * 3))
+        _p14_raises(lambda: m.loss_and_backward([]))
+        _p14_raises(lambda: m.fit(_p14_samples(), epochs=0))
+        _p14_raises(lambda: m.fit(_p14_samples(), lr=0.0))
+        _p14_raises(lambda: m.sgd_step(0.0))
+        _p14_raises(lambda: m.feature_stats([]))

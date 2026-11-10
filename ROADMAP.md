@@ -848,8 +848,9 @@
 - [x] PagedAttention 块管理器：块分配/回收、前缀共享 `fork` + 引用计数、写时复制 `cow`、CPU 换出/换回 `swap_out`/`swap_in`；`TestPagedBlockManager` 6 例。
 - [x] 推理服务工具：`PrefixCacheStore`（跨请求前缀缓存 + LRU）、`make_needle_haystack`（长上下文探针）、`llm_judge_prompt`/`parse_judge_verdict`/`judge_agreement`（LLM-as-judge 模板与一致率）；`TestPrefixCacheStore`/`TestNeedleHaystack`/`TestLLMJudge` 共 5 例。
 - [x] 树状注意力（投机解码多分支验证）：`build_draft_tree`（前缀共享 trie）、`tree_attention_bias`/`tree_attention_mask`（仅祖先可见）；`TestDraftTree` 3 例、`TestTreeAttention` 3 例。
+- [x] 稀疏自编码器（SAE）：`SAE`（`f=relu(W_enc x+b_enc)`、`x_hat=W_dec f+b_dec`，重建 MSE + `l1_coeff*mean(|f|)` 稀疏损失，全批量 SGD，`feature_stats` 统计 dead feature）；`TestSAE` 5 例。
 
-全量测试：1839 → 2165 passed（新增 326 例）。
+全量测试：1839 → 2170 passed（新增 331 例）。
 
 ---
 

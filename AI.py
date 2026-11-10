@@ -2305,6 +2305,208 @@ def safetensors_load(path):
             out[name] = [flat[i * cols:(i + 1) * cols] for i in range(rows)]
     return out
 
+class SAE:
+    """稀疏自编码器（Sparse Autoencoder，可解释性特征提取的最小实现）
+
+    编码器 ``f = relu(W_enc x + b_enc)``，解码器 ``x_hat = W_dec f + b_dec``；
+    损失 = 重建 MSE + ``l1_coeff * mean(|f|)``。L1 把大多数特征压到 0，让单个
+    特征对应较少语义方向，是分析 LLM 激活"单义特征"的常用工具。
+
+    - ``forward(xs)``：逐样本返回 ``{'recon','features','pre'}``
+    - ``loss_and_backward(xs)``：返回 ``{'loss','mse','l1'}`` 并累积梯度
+    - ``fit(xs, epochs=100, lr=0.01, seed=None)``：全批量 SGD，返回每轮损失
+    - ``encode(x)`` / ``decode(f)`` / ``feature_stats(xs)`` / ``param_count()``
+    """
+
+    def __init__(self, d_in: int, d_hidden: int = 64, l1_coeff: float = 1e-3,
+                 seed: int = None):
+        for name, val in (('d_in', d_in), ('d_hidden', d_hidden)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError('SAE: %s 必须是正整数，收到 %r' % (name, val))
+        if isinstance(l1_coeff, bool) or not isinstance(l1_coeff, (int, float)) \
+                or not math.isfinite(l1_coeff) or l1_coeff < 0:
+            raise ValueError('SAE: l1_coeff 必须是非负有限数字')
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError('SAE: seed 必须是整数或 None')
+        self.d_in = d_in
+        self.d_hidden = d_hidden
+        self.l1_coeff = float(l1_coeff)
+        rng = random.Random(seed)
+        scale = math.sqrt(2.0 / d_in)
+        self.W_enc = [[rng.gauss(0.0, scale) for _ in range(d_in)]
+                      for _ in range(d_hidden)]
+        self.b_enc = [0.0] * d_hidden
+        scale2 = math.sqrt(2.0 / d_hidden)
+        self.W_dec = [[rng.gauss(0.0, scale2) for _ in range(d_hidden)]
+                      for _ in range(d_in)]
+        self.b_dec = [0.0] * d_in
+        self.zero_grad()
+
+    # ---------- 校验 ----------
+    def _check_x(self, x, who):
+        if not isinstance(x, (list, tuple)) or len(x) != self.d_in:
+            raise ValueError('%s: 输入必须是长度 %d 的列表' % (who, self.d_in))
+        out = []
+        for v in x:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError('%s: 输入必须只包含有限数字' % who)
+            out.append(float(v))
+        return out
+
+    def _check_features(self, f, who):
+        if not isinstance(f, (list, tuple)) or len(f) != self.d_hidden:
+            raise ValueError('%s: features 必须是长度 %d 的列表'
+                             % (who, self.d_hidden))
+        out = []
+        for v in f:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError('%s: features 必须只包含有限数字' % who)
+            out.append(float(v))
+        return out
+
+    def _check_batch(self, xs, who):
+        if not isinstance(xs, (list, tuple)) or not xs:
+            raise ValueError('%s: 输入必须是非空样本列表' % who)
+        return [self._check_x(x, who) for x in xs]
+
+    # ---------- 前向 ----------
+    def encode(self, x):
+        xv = self._check_x(x, 'SAE.encode')
+        pre = [sum(self.W_enc[i][j] * xv[j] for j in range(self.d_in))
+               + self.b_enc[i] for i in range(self.d_hidden)]
+        features = [v if v > 0.0 else 0.0 for v in pre]
+        return features
+
+    def decode(self, features):
+        f = self._check_features(features, 'SAE.decode')
+        return [sum(self.W_dec[i][j] * f[j] for j in range(self.d_hidden))
+                + self.b_dec[i] for i in range(self.d_in)]
+
+    def forward(self, xs):
+        """逐样本前向，返回 ``{'recon','features','pre'}`` 三个等长列表。"""
+        batch = self._check_batch(xs, 'SAE.forward')
+        recon, features, pres = [], [], []
+        for x in batch:
+            pre = [sum(self.W_enc[i][j] * x[j] for j in range(self.d_in))
+                   + self.b_enc[i] for i in range(self.d_hidden)]
+            f = [v if v > 0.0 else 0.0 for v in pre]
+            r = [sum(self.W_dec[i][j] * f[j] for j in range(self.d_hidden))
+                 + self.b_dec[i] for i in range(self.d_in)]
+            pres.append(pre)
+            features.append(f)
+            recon.append(r)
+        return {'recon': recon, 'features': features, 'pre': pres}
+
+    # ---------- 反向 ----------
+    def loss_and_backward(self, xs):
+        """重建 MSE + L1 稀疏损失；返回 ``{'loss','mse','l1'}``。"""
+        batch = self._check_batch(xs, 'SAE.loss_and_backward')
+        n = len(batch)
+        mse_total = 0.0
+        l1_total = 0.0
+        for x in batch:
+            pre = [sum(self.W_enc[i][j] * x[j] for j in range(self.d_in))
+                   + self.b_enc[i] for i in range(self.d_hidden)]
+            f = [v if v > 0.0 else 0.0 for v in pre]
+            r = [sum(self.W_dec[i][j] * f[j] for j in range(self.d_hidden))
+                 + self.b_dec[i] for i in range(self.d_in)]
+            for i in range(self.d_in):
+                d = r[i] - x[i]
+                mse_total += d * d
+            l1_total += sum(abs(v) for v in f)
+            # 解码器反向
+            d_r = [2.0 * (r[i] - x[i]) / self.d_in for i in range(self.d_in)]
+            for i in range(self.d_in):
+                self.grad_b_dec[i] += d_r[i] / n
+                row = self.W_dec[i]
+                for j in range(self.d_hidden):
+                    if f[j] != 0.0:
+                        self.grad_W_dec[i][j] += d_r[i] * f[j] / n
+            d_f = [0.0] * self.d_hidden
+            for j in range(self.d_hidden):
+                acc = 0.0
+                for i in range(self.d_in):
+                    acc += self.W_dec[i][j] * d_r[i]
+                d_f[j] = acc + self.l1_coeff * (1.0 if f[j] > 0.0 else
+                                                (-1.0 if f[j] < 0.0 else 0.0)) \
+                    / self.d_hidden
+            # 编码器反向（relu 门）
+            d_pre = [d_f[i] if pre[i] > 0.0 else 0.0
+                     for i in range(self.d_hidden)]
+            for i in range(self.d_hidden):
+                self.grad_b_enc[i] += d_pre[i] / n
+                row = self.W_enc[i]
+                for j in range(self.d_in):
+                    self.grad_W_enc[i][j] += d_pre[i] * x[j] / n
+        mse = mse_total / (n * self.d_in)
+        l1 = self.l1_coeff * l1_total / (n * self.d_hidden)
+        return {'loss': mse + l1, 'mse': mse, 'l1': l1}
+
+    # ---------- 优化器 / 训练 ----------
+    def zero_grad(self):
+        self.grad_W_enc = [[0.0] * self.d_in for _ in range(self.d_hidden)]
+        self.grad_b_enc = [0.0] * self.d_hidden
+        self.grad_W_dec = [[0.0] * self.d_hidden for _ in range(self.d_in)]
+        self.grad_b_dec = [0.0] * self.d_in
+
+    def sgd_step(self, lr: float = 0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('SAE.sgd_step: lr 必须是正有限数字')
+        for i in range(self.d_hidden):
+            for j in range(self.d_in):
+                self.W_enc[i][j] -= lr * self.grad_W_enc[i][j]
+            self.b_enc[i] -= lr * self.grad_b_enc[i]
+        for i in range(self.d_in):
+            for j in range(self.d_hidden):
+                self.W_dec[i][j] -= lr * self.grad_W_dec[i][j]
+            self.b_dec[i] -= lr * self.grad_b_dec[i]
+        self.zero_grad()
+
+    def fit(self, xs, epochs: int = 100, lr: float = 0.01, seed: int = None):
+        batch = self._check_batch(xs, 'SAE.fit')
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError('SAE.fit: epochs 必须是正整数')
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('SAE.fit: lr 必须是正有限数字')
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError('SAE.fit: seed 必须是整数或 None')
+        rng = random.Random(seed)
+        hist = []
+        for _ in range(epochs):
+            order = list(range(len(batch)))
+            rng.shuffle(order)
+            self.zero_grad()
+            info = self.loss_and_backward([batch[i] for i in order])
+            self.sgd_step(lr)
+            hist.append({'loss': info['loss'], 'mse': info['mse'],
+                         'l1': info['l1']})
+        return hist
+
+    def param_count(self) -> int:
+        return (self.d_hidden * self.d_in + self.d_hidden
+                + self.d_in * self.d_hidden + self.d_in)
+
+    def feature_stats(self, xs):
+        """统计每个隐藏特征在样本集上的激活比例（0 的比例越高越稀疏）。"""
+        batch = self._check_batch(xs, 'SAE.feature_stats')
+        counts = [0] * self.d_hidden
+        for x in batch:
+            pre = [sum(self.W_enc[i][j] * x[j] for j in range(self.d_in))
+                   + self.b_enc[i] for i in range(self.d_hidden)]
+            for i in range(self.d_hidden):
+                if pre[i] > 0.0:
+                    counts[i] += 1
+        n = len(batch)
+        return {'active_fraction': [c / n for c in counts],
+                'dead_features': sum(1 for c in counts if c == 0),
+                'mean_active': sum(counts) / (n * self.d_hidden)}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
