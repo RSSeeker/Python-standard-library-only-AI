@@ -3824,6 +3824,323 @@ class DINOv2Trainer:
     def param_count(self):
         return self.student.param_count()
 
+# ---------- 掩码图像自蒸馏（BEiT v2 / iBOT 简化版） ----------
+
+
+def _ibot_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"iBOT: {name} 必须是 >=1 的整数，收到 {value!r}")
+    return value
+
+
+def _ibot_check_image(image, in_channels, image_size):
+    if not isinstance(image, (list, tuple)):
+        raise ValueError("iBOT: image 必须是 (C,H,W) 列表")
+    if len(image) != in_channels:
+        raise ValueError(
+            f"iBOT: 输入通道数 {len(image)} 与 in_channels={in_channels} 不符")
+    for ch in image:
+        if not isinstance(ch, (list, tuple)):
+            raise ValueError("iBOT: image 的每个通道必须是二维列表")
+        if len(ch) != image_size[0] or len(ch[0]) != image_size[1]:
+            raise ValueError(
+                f"iBOT: 输入尺寸 {(len(ch), len(ch[0]))} 与 image_size={image_size} 不符")
+        for row in ch:
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(v):
+                    raise ValueError("iBOT: 像素必须是有限数字")
+
+
+def block_mask_indices(grid_h, grid_w, mask_ratio=0.3, block_size=2, seed=None):
+    """按 block 生成掩码 patch 下标（行优先编号），返回 (indices, mask_bool)。
+
+    简化实现：把网格分成若干 `block_size x block_size` 的不重叠块，随机挑选
+    若干块整块遮蔽，直到被遮 patch 数 >= round(mask_ratio * patch 数)。
+    """
+    grid_h = _ibot_check_pos_int(grid_h, "grid_h")
+    grid_w = _ibot_check_pos_int(grid_w, "grid_w")
+    mask_ratio = float(mask_ratio)
+    if not math.isfinite(mask_ratio) or mask_ratio <= 0.0 or mask_ratio >= 1.0:
+        raise ValueError("iBOT: mask_ratio 必须在 (0,1) 内")
+    block_size = _ibot_check_pos_int(block_size, "block_size")
+    rng = random.Random(seed)
+    blocks = []
+    for top in range(0, grid_h, block_size):
+        for left in range(0, grid_w, block_size):
+            cells = []
+            for r in range(top, min(top + block_size, grid_h)):
+                for c in range(left, min(left + block_size, grid_w)):
+                    cells.append(r * grid_w + c)
+            blocks.append(cells)
+    total = grid_h * grid_w
+    want = max(1, int(round(mask_ratio * total)))
+    order = list(range(len(blocks)))
+    rng.shuffle(order)
+    chosen = set()
+    for bi in order:
+        chosen.update(blocks[bi])
+        if len(chosen) >= want:
+            break
+    indices = sorted(chosen)
+    mask_bool = [i in chosen for i in range(total)]
+    return indices, mask_bool
+
+
+def ibot_loss(student_logits, teacher_logits, masked_indices, temp_s=0.1,
+              temp_t=0.04, center=None):
+    """掩码位置上学生-教师软目标交叉熵。
+
+    student_logits/teacher_logits 均为「每 patch 一行」的 num_classes 维 logits；
+    masked_indices 为被遮蔽的 patch 下标（只在这些位置计算损失）。
+    返回 (loss, dstudent_logits)；未被遮的位置梯度为 0。
+    """
+    if not isinstance(student_logits, (list, tuple)) \
+            or not isinstance(teacher_logits, (list, tuple)):
+        raise ValueError("iBOT: logits 必须是行列表")
+    if len(student_logits) != len(teacher_logits) or not student_logits:
+        raise ValueError("iBOT: 学生/教师 logits 必须等长且非空")
+    n_tokens = len(student_logits)
+    n_classes = len(student_logits[0])
+    if n_classes < 1:
+        raise ValueError("iBOT: logits 维度必须 >=1")
+    masked = []
+    for idx in masked_indices:
+        if isinstance(idx, bool) or not isinstance(idx, int) \
+                or idx < 0 or idx >= n_tokens:
+            raise ValueError("iBOT: masked_indices 必须是合法 patch 下标")
+        masked.append(idx)
+    if not masked:
+        raise ValueError("iBOT: masked_indices 不能为空")
+    temp_s = float(temp_s)
+    temp_t = float(temp_t)
+    if not math.isfinite(temp_s) or temp_s <= 0.0:
+        raise ValueError("iBOT: temp_s 必须为正")
+    if not math.isfinite(temp_t) or temp_t <= 0.0:
+        raise ValueError("iBOT: temp_t 必须为正")
+    if center is not None and len(center) != n_classes:
+        raise ValueError("iBOT: center 长度必须等于特征维度")
+    total = 0.0
+    d_student = [[0.0] * n_classes for _ in range(n_tokens)]
+    m = len(masked)
+    for idx in masked:
+        t_row = [float(v) for v in teacher_logits[idx]]
+        if center is not None:
+            for k in range(n_classes):
+                t_row[k] -= center[k]
+        t_max = max(t_row)
+        t_exp = [math.exp(v - t_max) for v in t_row]
+        t_sum = sum(t_exp)
+        pt = [v / t_sum for v in t_exp]
+        s_row = [float(v) / temp_s for v in student_logits[idx]]
+        if len(s_row) != n_classes:
+            raise ValueError("iBOT: logits 行长度必须一致")
+        s_max = max(s_row)
+        s_exp = [math.exp(v - s_max) for v in s_row]
+        s_sum = sum(s_exp)
+        ps = [v / s_sum for v in s_exp]
+        for k in range(n_classes):
+            total -= pt[k] * math.log(max(ps[k], 1e-300))
+            d_student[idx][k] = (ps[k] - pt[k]) / (m * temp_s)
+    return total / m, d_student
+
+
+def update_ibot_center(center, probs_rows, momentum=0.9):
+    """按动量更新教师输出中心（就地修改 center）。"""
+    if not isinstance(center, (list, tuple)) or not center:
+        raise ValueError("iBOT: center 不能为空")
+    momentum = float(momentum)
+    if not math.isfinite(momentum) or momentum < 0.0 or momentum > 1.0:
+        raise ValueError("iBOT: momentum 必须在 [0,1] 内")
+    if not isinstance(probs_rows, (list, tuple)) or not probs_rows:
+        raise ValueError("iBOT: probs_rows 必须非空")
+    n_classes = len(center)
+    avg = [0.0] * n_classes
+    for row in probs_rows:
+        if len(row) != n_classes:
+            raise ValueError("iBOT: probs 行长必须等于 center 长度")
+        for k in range(n_classes):
+            avg[k] += float(row[k])
+    inv = 1.0 / len(probs_rows)
+    for k in range(n_classes):
+        center[k] = momentum * center[k] + (1.0 - momentum) * avg[k] * inv
+
+
+def _ibot_teacher_probs(teacher_logits, center, temp_t=0.04):
+    probs = []
+    for row in teacher_logits:
+        vals = [float(v) - center[k] for k, v in enumerate(row)]
+        mx = max(vals)
+        ex = [math.exp(v / temp_t - mx / temp_t) for v in vals]
+        s = sum(ex)
+        probs.append([v / s for v in ex])
+    return probs
+
+
+def _ibot_forward(vit, image, masked=None):
+    """ViT 的逐 patch 输出（不经过 CLS 分类头），返回 (logits, cache)。"""
+    patches = vit.patch_embed.forward(image)
+    n_patches = len(patches)
+    if masked is not None:
+        for idx in masked:
+            patches[idx] = [0.0] * vit.d_model
+    seq = [list(vit.cls)] + [list(t) for t in patches]
+    for i in range(len(seq)):
+        row = seq[i]
+        pos_i = vit.pos[i]
+        for j in range(vit.d_model):
+            row[j] += pos_i[j]
+    out = vit.encoder.forward(seq)
+    patch_out = out[1:]
+    normed, norm_cache = _norm_rows_forward(vit.norm, patch_out)
+    logits, head_cache = _dense_rows_forward(vit.head, normed)
+    cache = {"patches": patches, "masked": set(masked or []), "seq": seq,
+             "patch_out": patch_out, "norm_cache": norm_cache,
+             "head_cache": head_cache, "normed": normed}
+    return logits, cache
+
+
+def _ibot_backward(vit, cache, d_logits):
+    """逐 patch logits 梯度 → 图像梯度（参数梯度就地累积）。"""
+    if len(d_logits) != len(cache["patches"]):
+        raise ValueError("iBOT: d_logits 行数必须等于 patch 数")
+    gw, gb, d_normed = _dense_rows_backward(vit.head, cache["head_cache"], d_logits)
+    for i in range(len(gw)):
+        grow = vit.head.grad_w[i]
+        for j in range(len(gw[i])):
+            grow[j] += gw[i][j]
+    for i in range(len(gb)):
+        vit.head.grad_b[i] += gb[i]
+    g_gamma, g_beta, d_patch_out = _norm_rows_backward(
+        vit.norm, cache["norm_cache"], d_normed)
+    for j in range(vit.d_model):
+        vit.norm_grads[0][j] += g_gamma[j]
+        vit.norm_grads[1][j] += g_beta[j]
+    d_seq = [[0.0] * vit.d_model] + d_patch_out
+    d_in = vit.encoder.backward(d_seq)
+    d_patches = d_in[1:]
+    for idx in cache["masked"]:
+        d_patches[idx] = [0.0] * vit.d_model
+    dimage = vit.patch_embed.backward(d_patches)
+    return dimage
+
+
+def _ibot_ema_params(student, teacher, momentum):
+    """student 参数按 EMA 写入 teacher（momentum=1 时保持 teacher 不变）。"""
+    if not isinstance(momentum, (int, float)) or isinstance(momentum, bool) \
+            or not math.isfinite(float(momentum)) or not (0.0 <= float(momentum) <= 1.0):
+        raise ValueError("iBOT: teacher_momentum 必须在 [0,1]")
+    m = float(momentum)
+    for (name, src), (_, dst) in zip(student._layer_params(),
+                                     teacher._layer_params()):
+        _d19_blend_values(src, dst, m)
+    _d19_blend_values(student.patch_embed.conv.weights,
+                      teacher.patch_embed.conv.weights, m)
+    _d19_blend_values(student.patch_embed.conv.biases,
+                      teacher.patch_embed.conv.biases, m)
+
+
+class iBOTTrainer:
+    """简化版 iBOT 训练器：学生看块状遮挡图，教师看原图并做 EMA。
+
+    每步：随机块掩码 → 学生逐 patch logits（只对被遮位置算软目标交叉熵，
+    教师目标经温度 sharpening + 中心化）→ 学生反向 + SGD → 教师 EMA →
+    更新教师中心。参数里学生可训练，教师只做目标。
+    """
+
+    def __init__(self, in_channels=2, image_size=8, patch_size=4, d_model=16,
+                 num_heads=2, d_ff=32, num_layers=1, proj_dim=8,
+                 mask_ratio=0.3, block_size=2, teacher_momentum=0.99,
+                 center_momentum=0.9, seed=1):
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+        if not isinstance(image_size, (tuple, list)) or len(image_size) != 2:
+            raise ValueError("iBOT: image_size 必须是 int 或 (H,W)")
+        self.in_channels = in_channels
+        self.image_size = (int(image_size[0]), int(image_size[1]))
+        self.patch_size = patch_size
+        args = (in_channels, self.image_size, patch_size, d_model, num_heads,
+                d_ff, num_layers, proj_dim)
+        self.student = ViT(*args)
+        self.teacher = ViT(*args)
+        self.teacher.eval()
+        _ibot_ema_params(self.student, self.teacher, 0.0)
+        self.mask_ratio = float(mask_ratio)
+        if not (0.0 < self.mask_ratio < 1.0):
+            raise ValueError("iBOT: mask_ratio 必须在 (0,1) 内")
+        self.block_size = _ibot_check_pos_int(block_size, "block_size")
+        if not isinstance(teacher_momentum, (int, float)) \
+                or isinstance(teacher_momentum, bool) \
+                or not (0.0 <= float(teacher_momentum) <= 1.0):
+            raise ValueError("iBOT: teacher_momentum 必须在 [0,1]")
+        if not isinstance(center_momentum, (int, float)) \
+                or isinstance(center_momentum, bool) \
+                or not (0.0 <= float(center_momentum) <= 1.0):
+            raise ValueError("iBOT: center_momentum 必须在 [0,1]")
+        self.teacher_momentum = float(teacher_momentum)
+        self.center_momentum = float(center_momentum)
+        self.proj_dim = proj_dim
+        self.center = [0.0] * proj_dim
+        self.updates = 0
+        gh, gw = self.student.grid
+        self.grid = (gh, gw)
+        self.num_patches = gh * gw
+        self._rng = random.Random(seed)
+
+    def param_count(self):
+        return self.student.param_count()
+
+    def teacher_param_count(self):
+        return self.teacher.param_count()
+
+    def train_step(self, images, lr=0.02, mask_ratio=None, seed=None):
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("iBOT: images 必须是非空列表")
+        lr = float(lr)
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("iBOT: lr 必须为正")
+        ratio = self.mask_ratio if mask_ratio is None else float(mask_ratio)
+        for image in images:
+            _ibot_check_image(image, self.in_channels, self.image_size)
+        self.student.zero_grad()
+        gh, gw = self.grid
+        total = 0.0
+        n_masked = 0
+        teacher_probs_all = []
+        for i, image in enumerate(images):
+            mask_seed = None if seed is None else seed + 1000 * i
+            indices, _ = block_mask_indices(gh, gw, ratio, self.block_size,
+                                            seed=mask_seed)
+            s_logits, s_cache = _ibot_forward(self.student, image, indices)
+            t_logits, _ = _ibot_forward(self.teacher, image, None)
+            loss, d_logits = ibot_loss(s_logits, t_logits, indices,
+                                       temp_s=0.1, temp_t=0.04,
+                                       center=self.center)
+            _ibot_backward(self.student, s_cache, d_logits)
+            total += loss
+            n_masked += len(indices)
+            teacher_probs_all.extend(
+                _ibot_teacher_probs(t_logits, self.center, temp_t=0.04))
+        self.student.sgd_step(lr)
+        _ibot_ema_params(self.student, self.teacher, self.teacher_momentum)
+        update_ibot_center(self.center, teacher_probs_all, self.center_momentum)
+        self.updates += 1
+        return {"loss": total / len(images), "masked": n_masked}
+
+    def fit(self, images, epochs=10, lr=0.02, seed=None):
+        epochs = _ibot_check_pos_int(epochs, "epochs")
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("iBOT: images 必须是非空列表")
+        if seed is not None:
+            self._rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            info = self.train_step(images, lr=lr,
+                                   seed=self._rng.randrange(1 << 30))
+            history.append(info["loss"])
+        return history
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

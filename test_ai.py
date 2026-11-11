@@ -34605,3 +34605,111 @@ class TestDINOv2Trainer:
                               proj_dim=4)
         _p19_raises(lambda: tr.train_step(images, lr=0.0))
         _p19_raises(lambda: tr.fit(images, epochs=0))
+
+
+import math
+import random
+
+import AI
+
+
+def _p20_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p20_img(value=0.5):
+    return [[[value + 0.01 * ((r + c) % 3) for c in range(8)] for r in range(8)]
+            for _ in range(2)]
+
+
+class TestBlockMask:
+    def test_mask_blocks(self):
+        idx, mask = AI.block_mask_indices(4, 4, 0.5, 2, seed=7)
+        assert idx == sorted(set(idx))
+        assert len(idx) >= int(round(0.5 * 16))
+        assert mask.count(True) == len(idx)
+        idx2, _ = AI.block_mask_indices(4, 4, 0.5, 2, seed=7)
+        assert idx == idx2
+
+    def test_invalid_inputs(self):
+        _p20_raises(lambda: AI.block_mask_indices(0, 4))
+        _p20_raises(lambda: AI.block_mask_indices(4, 4, 0.0))
+        _p20_raises(lambda: AI.block_mask_indices(4, 4, 1.0))
+        _p20_raises(lambda: AI.block_mask_indices(4, 4, 0.5, 0))
+
+
+class TestiBOTLoss:
+    def test_loss_and_gradient(self):
+        rng = random.Random(11)
+        s = [[rng.gauss(0.0, 1.0) for _ in range(3)] for _ in range(4)]
+        t = [[rng.gauss(0.0, 1.0) for _ in range(3)] for _ in range(4)]
+        center = [0.1, -0.2, 0.05]
+        masked = [1, 2]
+        loss, d = AI.ibot_loss(s, t, masked, center=center)
+        assert isinstance(loss, float) and loss > 0.0
+        h = 1e-6
+        for idx in masked:
+            for k in range(3):
+                sp = [row[:] for row in s]
+                sm = [row[:] for row in s]
+                sp[idx][k] += h
+                sm[idx][k] -= h
+                num = (AI.ibot_loss(sp, t, masked, center=center)[0]
+                       - AI.ibot_loss(sm, t, masked, center=center)[0]) / (2 * h)
+                assert abs(num - d[idx][k]) < 1e-5, (idx, k, num, d[idx][k])
+        assert all(abs(v) == 0.0 for row in (d[0], d[3]) for v in row)
+
+    def test_invalid_inputs(self):
+        _p20_raises(lambda: AI.ibot_loss([], [[0.0]]))
+        _p20_raises(lambda: AI.ibot_loss([[0.0]], [[0.0]], []))
+        _p20_raises(lambda: AI.ibot_loss([[0.0]], [[0.0]], [3]))
+        _p20_raises(lambda: AI.ibot_loss([[0.0]], [[0.0]], [0], temp_s=0.0))
+        _p20_raises(lambda: AI.ibot_loss([[0.0]], [[0.0]], [0], center=[0.0, 1.0]))
+
+
+class TestCenterUpdate:
+    def test_center_momentum(self):
+        center = [0.0, 0.0]
+        AI.update_ibot_center(center, [[1.0, 0.0]], momentum=0.0)
+        assert center == [1.0, 0.0]
+        center2 = [0.5, 0.5]
+        AI.update_ibot_center(center2, [[0.0, 1.0]], momentum=1.0)
+        assert center2 == [0.5, 0.5]
+        _p20_raises(lambda: AI.update_ibot_center([], [[0.0]]))
+        _p20_raises(lambda: AI.update_ibot_center([0.0], [[0.0]], momentum=1.5))
+
+
+class TestiBOTTrainer:
+    def test_step_and_fit(self):
+        images = [_p20_img(), _p20_img(value=0.2)]
+        tr = AI.iBOTTrainer(in_channels=2, image_size=8, patch_size=4,
+                            d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                            proj_dim=4, mask_ratio=0.5, block_size=1, seed=1)
+        assert tr.param_count() == 964
+        assert tr.teacher_param_count() == 964
+        w_before = tr.student.head.weights[0][0]
+        t_before = tr.teacher.head.weights[0][0]
+        info = tr.train_step(images, lr=0.02)
+        assert set(info) == {"loss", "masked"}
+        assert isinstance(info["loss"], float) and math.isfinite(info["loss"])
+        assert info["masked"] >= 2
+        assert tr.student.head.weights[0][0] != w_before
+        assert tr.teacher.head.weights[0][0] != t_before
+        assert any(abs(v) > 0.0 for v in tr.center)
+        hist = tr.fit(images, epochs=3, lr=0.02, seed=2)
+        assert len(hist) == 3 and all(math.isfinite(v) for v in hist)
+
+    def test_invalid_inputs(self):
+        images = [_p20_img()]
+        _p20_raises(lambda: AI.iBOTTrainer(mask_ratio=0.0))
+        _p20_raises(lambda: AI.iBOTTrainer(teacher_momentum=1.5))
+        tr = AI.iBOTTrainer(in_channels=2, image_size=8, patch_size=4,
+                            d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                            proj_dim=4, seed=1)
+        _p20_raises(lambda: tr.train_step([]))
+        _p20_raises(lambda: tr.train_step(images, lr=0.0))
+        _p20_raises(lambda: tr.fit(images, epochs=0))

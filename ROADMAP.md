@@ -854,8 +854,9 @@
 - [x] Titans 神经记忆：`TitansMemory`（MLP 记忆体、surprise 自适应步长、梯度裁剪、一阶动量）、`TitansSequenceMemory`（逐 token 读记忆并用下一 token 写入）；`TestTitansMemory` 4 例、`TestTitansSequenceMemory` 3 例。
 - [x] VMamba（2D 选择性扫描）：`VMambaBlock`（行/列双向共四个方向的选择性扫描、SiLU 门控、残差）、`VMamba`（patch 嵌入 + 多层块，图像级特征提取）；`TestVMambaBlock` 4 例、`TestVMamba` 2 例。
 - [x] DINOv2 自蒸馏训练：`dinov2_loss`（教师 sharpening/中心化 + 软目标交叉熵）、`make_dino_views`（随机裁剪/翻转多视图）、`DINOv2Trainer`（学生-教师 ViT、教师 EMA、中心动量更新）；`TestDINOv2Loss`/`TestDINOv2Views`/`TestDINOv2Trainer` 共 7 例。
+- [x] 掩码图像自蒸馏（BEiT v2 / iBOT 简化版）：`block_mask_indices`（块状遮蔽）、`ibot_loss`（只在被遮 patch 上的温度软目标交叉熵）、`update_ibot_center`、`iBOTTrainer`（学生-教师 ViT、教师 EMA、块掩码训练）；`TestBlockMask`/`TestiBOTLoss`/`TestCenterUpdate`/`TestiBOTTrainer` 共 7 例。
 
-全量测试：1839 → 2201 passed（新增 362 例）。
+全量测试：1839 → 2208 passed（新增 369 例）。
 
 ---
 

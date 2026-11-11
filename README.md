@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2201 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2208 项）
 
 ## 特性
 
@@ -2259,6 +2259,32 @@ print(dist, st["deg"], model.predict(xs, edges))
 
 - 边界：`edges` 是无权无向边列表，邻接视为常量；度与最短路径桶按 `max_degree` / `max_path` 截断；注意力用多头拼接后线性投影；输出是图级标量回归（非节点级/边级）；全批量 SGD，无 dropout。
 
+### 掩码图像自蒸馏（BEiT v2 / iBOT 简化版）
+
+iBOT 把 BERT 式块状掩码搬到视觉自蒸馏：学生看被遮掉若干 patch 的图像，教师看原图，
+只对学生被遮位置的输出与教师对应位置做带温度 sharpening + 中心化的软目标交叉熵；
+学生 SGD，教师参数与输出中心都按动量更新。
+
+```python
+indices, mask_bool = block_mask_indices(2, 2, mask_ratio=0.5, block_size=1, seed=3)
+loss, dlogits = ibot_loss(student_logits, teacher_logits, indices,
+                          temp_s=0.1, temp_t=0.04, center=center)
+
+trainer = iBOTTrainer(in_channels=2, image_size=8, patch_size=4,
+                      d_model=8, proj_dim=4, mask_ratio=0.5, block_size=1)
+info = trainer.train_step(images, lr=0.02)   # {'loss': ..., 'masked': ...}
+```
+
+| API | 说明 |
+| --- | --- |
+| `block_mask_indices(grid_h, grid_w, mask_ratio, block_size, seed)` | 按块随机遮蔽，返回 (indices, mask_bool) |
+| `ibot_loss(student_logits, teacher_logits, masked_indices, temp_s=0.1, temp_t=0.04, center=None)` | 返回 `(loss, dstudent_logits)`，只在被遮 patch 上算 |
+| `update_ibot_center(center, probs_rows, momentum=0.9)` | 教师输出中心动量更新 |
+| `iBOTTrainer(...)` | 学生-教师 ViT、块掩码、教师 EMA、`train_step`/`fit`/`param_count` |
+
+边界：这是教学版 iBOT——只做单视图块掩码（没有多尺度视图/局部-全局混合）、
+教师直接用 ViT 线性头（不是 3 层 MLP）、不包含 KL 正则/遮挡 token 的可学习 mask token。
+
 ### DINOv2 自蒸馏训练（DINOv2Trainer）
 
 DINOv2 是教师-学生自蒸馏：同一批图生成两组随机裁剪视图，学生看一组、教师看另一组
@@ -4240,7 +4266,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2201 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2208 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4454,6 +4480,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVMambaBlock` | 前向形状/参数、四项中心差分、SGD 更新、非法输入 |
 | `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
 | `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
+| `TestBlockMask` / `TestiBOTLoss` / `TestCenterUpdate` / `TestiBOTTrainer` | 块掩码、掩码软目标损失/梯度、中心动量、学生-教师训练步 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4601,7 +4628,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2201 个单元测试
+├── test_ai.py       # 2208 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
