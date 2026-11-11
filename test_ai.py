@@ -34823,3 +34823,99 @@ class TestJambaModel:
         _p21_raises(lambda: m.sgd_step(-1.0))
         _p21_raises(lambda: m.fit([]))
         _p21_raises(lambda: m.fit([[0, 1, 2]], epochs=0))
+
+
+import math
+
+import AI
+
+
+def _p22_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestCosineSimilarity:
+    def test_basic(self):
+        assert abs(AI.cosine_similarity([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-12
+        assert abs(AI.cosine_similarity([1.0, 0.0], [0.0, 1.0])) < 1e-12
+        assert abs(AI.cosine_similarity([1.0, 1.0], [1.0, 1.0]) - 1.0) < 1e-12
+        assert AI.cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+    def test_invalid_inputs(self):
+        _p22_raises(lambda: AI.cosine_similarity([], [1.0]))
+        _p22_raises(lambda: AI.cosine_similarity([1.0], [1.0, 2.0]))
+        _p22_raises(lambda: AI.cosine_similarity([1.0, float("nan")], [1.0, 0.0]))
+
+
+class TestSentenceSimilarity:
+    def test_matrix(self):
+        mat = AI.sentence_similarity_matrix([[1, 0], [0, 1]], [[1, 0], [1, 1]])
+        assert len(mat) == 2 and len(mat[0]) == 2
+        assert abs(mat[0][0] - 1.0) < 1e-12
+        assert abs(mat[0][1]) < 1e-12
+        assert abs(mat[1][0] - 1.0 / math.sqrt(2.0)) < 1e-12
+
+    def test_invalid_inputs(self):
+        _p22_raises(lambda: AI.sentence_similarity_matrix([], [[1.0]]))
+        _p22_raises(lambda: AI.sentence_similarity_matrix([[1.0]], [[1.0, 2.0]]))
+
+
+class TestNLIConsistency:
+    def test_three_way_labels(self):
+        info = AI.nli_consistency_score(
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 0.0], [-1.0, 0.0], [0.5, 0.5]])
+        assert info["labels"] == ["entail", "contradict", "neutral"]
+        assert abs(info["entail_ratio"] - 1 / 3) < 1e-12
+        assert abs(info["contradiction_ratio"] - 1 / 3) < 1e-12
+        assert abs(info["score"]) < 1e-12
+
+    def test_invalid_thresholds(self):
+        _p22_raises(lambda: AI.nli_consistency_score([[1.0]], [[1.0]],
+                                                    entail_threshold=1.5))
+        _p22_raises(lambda: AI.nli_consistency_score([[1.0]], [[1.0]],
+                                                    contradiction_threshold=-0.1))
+        _p22_raises(lambda: AI.nli_consistency_score([[1.0]], [[1.0]],
+                                                    entail_threshold=0.3,
+                                                    contradiction_threshold=0.6))
+
+
+class TestHallucinationDetect:
+    def test_flagged_and_spans(self):
+        answer_vecs = [[1, 0], [0.5, 0.5], [0.5, 0.5], [1, 0], [0.5, 0.5]]
+        src_vecs = [[1, 0], [0, 1]]
+        info = AI.hallucination_detect(
+            ["a", "b", "c", "d", "e"], answer_vecs, ["x", "y"], src_vecs,
+            threshold=0.9)
+        assert info["flagged"] == [1, 2, 4]
+        assert info["spans"] == [(1, 2), (4, 4)]
+        assert abs(info["hallucination_ratio"] - 0.6) < 1e-12
+        assert len(info["similarities"]) == 5
+
+    def test_invalid_inputs(self):
+        _p22_raises(lambda: AI.hallucination_detect([], [], ["x"], [[1.0]]))
+        _p22_raises(lambda: AI.hallucination_detect(["a"], [[1.0]], [], [[1.0]]))
+        _p22_raises(lambda: AI.hallucination_detect(["a"], [[1.0]], ["x"],
+                                                    [[1.0, 2.0]]))
+        _p22_raises(lambda: AI.hallucination_detect(["a", "b"], [[1.0]],
+                                                    ["x"], [[1.0]]))
+        _p22_raises(lambda: AI.hallucination_detect(["a"], [[1.0]], ["x"],
+                                                    [[1.0]], threshold=1.5))
+
+
+class TestHallucinationReport:
+    def test_verdicts(self):
+        supported = AI.hallucination_report(["a"], [[1, 0]], ["x"], [[1, 0]],
+                                            threshold=0.5)
+        assert supported["verdict"] == "supported"
+        partial = AI.hallucination_report(["a", "b"], [[1, 0], [0.5, 0.5]],
+                                          ["x"], [[1, 0]], threshold=0.9)
+        assert partial["verdict"] == "partially_supported"
+        unsupported = AI.hallucination_report(
+            ["a", "b"], [[0.5, 0.5], [0.5, 0.5]], ["x"], [[1, 0]], threshold=0.9)
+        assert unsupported["verdict"] == "unsupported"
+        assert unsupported["unsupported_tokens"] == ["a", "b"]

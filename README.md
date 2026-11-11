@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2212 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2221 项）
 
 ## 特性
 
@@ -2417,6 +2417,36 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### 幻觉检测（向量一致性 / NLI 简化版）
+
+幻觉检测在推理侧做一致性核对：把答案句/答案 token 与来源（文档、检索片段）的向量做
+余弦相似度，超过阈值判为「有支撑」，明显偏低判为「缺乏支撑」，中等区间判为中性；
+token 级检测还能把连续不可信 token 合并成 span。
+
+```python
+info = AI.hallucination_detect(
+    answer_tokens, answer_vecs, source_tokens, source_vecs, threshold=0.5)
+# {'flagged': [...], 'spans': [(start, end), ...],
+#  'hallucination_ratio': 0.25, 'similarities': [...]}
+
+report = AI.hallucination_report(answer_tokens, answer_vecs,
+                                 source_tokens, source_vecs, threshold=0.5)
+# report['verdict'] ∈ {'supported', 'partially_supported', 'unsupported'}
+
+nli = AI.nli_consistency_score(premise_vecs, hypothesis_vecs)
+# {'entail_ratio', 'contradiction_ratio', 'neutral_ratio', 'score', 'labels'}
+```
+
+| API | 说明 |
+| --- | --- |
+| `cosine_similarity(a, b)` / `sentence_similarity_matrix(premise, hypothesis)` | 余弦相似度与句间相似度矩阵 |
+| `nli_consistency_score(premise_vecs, hypothesis_vecs, entail_threshold=0.75, contradiction_threshold=0.35)` | 最大相似度三分类：蕴含/矛盾/中性 |
+| `hallucination_detect(...)` | token 级检测：返回 flagged 下标、连续 span、比例、逐 token 相似度 |
+| `hallucination_report(...)` | 在 detect 基础上给出 supported/partially_supported/unsupported 结论 |
+
+边界：不是训练好的 NLI 模型——用向量余弦近似蕴含/矛盾，阈值依赖 embedding 质量；
+向量需要调用方提供（本仓库不内置文本编码器）；span 按答案 token 顺序合并。
+
 ### Jamba：Mamba + Attention 混合语言模型
 
 Jamba 把 Mamba 状态空间块与注意力层交替堆叠：Mamba 块负责线性时间的长程递归记忆，
@@ -4287,7 +4317,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2212 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2221 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4503,6 +4533,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
 | `TestBlockMask` / `TestiBOTLoss` / `TestCenterUpdate` / `TestiBOTTrainer` | 块掩码、掩码软目标损失/梯度、中心动量、学生-教师训练步 |
 | `TestJambaModel` | 混合层参数计数、Mamba/Attention 混合反向 FD、前向/训练、非法输入 |
+| `TestCosineSimilarity` / `TestSentenceSimilarity` / `TestNLIConsistency` / `TestHallucinationDetect` / `TestHallucinationReport` | 余弦相似度、NLI 三分类、token 级幻觉 span、报告结论 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4650,7 +4681,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2212 个单元测试
+├── test_ai.py       # 2221 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

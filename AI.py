@@ -4310,6 +4310,158 @@ class JambaModel:
         return losses
 
 
+# ---------- 幻觉检测（基于向量一致性的 NLI 简化版） ----------
+
+
+def _hall_check_vec(vec, name):
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise ValueError(f"hallucination: {name} 必须是非空向量")
+    out = []
+    for v in vec:
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(v):
+            raise ValueError(f"hallucination: {name} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def _hall_check_vecs(vecs, name, dim=None):
+    if not isinstance(vecs, (list, tuple)) or not vecs:
+        raise ValueError(f"hallucination: {name} 必须是非空向量列表")
+    out = []
+    for i, vec in enumerate(vecs):
+        row = _hall_check_vec(vec, f"{name}[{i}]")
+        if dim is not None and len(row) != dim:
+            raise ValueError(
+                f"hallucination: {name}[{i}] 维度 {len(row)} 与 {dim} 不一致")
+        out.append(row)
+    return out
+
+
+def cosine_similarity(a, b):
+    """两个向量的余弦相似度（0 向量视为相似度 0）。"""
+    va = _hall_check_vec(a, "a")
+    vb = _hall_check_vec(b, "b")
+    if len(va) != len(vb):
+        raise ValueError(
+            f"cosine_similarity: 向量维度不一致 {len(va)} vs {len(vb)}")
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(va, vb):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def sentence_similarity_matrix(premise_vecs, hypothesis_vecs):
+    """返回 len(hypothesis) × len(premise) 的余弦相似度矩阵。"""
+    pre = _hall_check_vecs(premise_vecs, "premise_vecs")
+    hyp = _hall_check_vecs(hypothesis_vecs, "hypothesis_vecs", dim=len(pre[0]))
+    mat = []
+    for h in hyp:
+        row = [cosine_similarity(h, p) for p in pre]
+        mat.append(row)
+    return mat
+
+
+def nli_consistency_score(premise_vecs, hypothesis_vecs, entail_threshold=0.75,
+                          contradiction_threshold=0.35):
+    """把前提/假设句向量对齐后做三分类（entail/contradict/neutral）。
+
+    每个假设句取与所有前提句的最大余弦相似度：>= entail_threshold → 蕴含，
+    <= contradiction_threshold → 矛盾，否则中性。返回比例与总分。
+    """
+    ent = float(entail_threshold)
+    con = float(contradiction_threshold)
+    if not (math.isfinite(ent) and 0.0 <= ent <= 1.0):
+        raise ValueError("nli_consistency_score: entail_threshold 必须在 [0,1]")
+    if not (math.isfinite(con) and 0.0 <= con <= 1.0):
+        raise ValueError("nli_consistency_score: contradiction_threshold 必须在 [0,1]")
+    if con > ent:
+        raise ValueError("nli_consistency_score: contradiction_threshold 不能大于 entail_threshold")
+    mat = sentence_similarity_matrix(premise_vecs, hypothesis_vecs)
+    labels = []
+    for row in mat:
+        best = max(row)
+        if best >= ent:
+            labels.append("entail")
+        elif best <= con:
+            labels.append("contradict")
+        else:
+            labels.append("neutral")
+    n = len(labels)
+    entail = sum(1 for x in labels if x == "entail") / n
+    contradict = sum(1 for x in labels if x == "contradict") / n
+    neutral = 1.0 - entail - contradict
+    return {"entail_ratio": entail, "contradiction_ratio": contradict,
+            "neutral_ratio": neutral, "score": entail - contradict,
+            "labels": labels}
+
+
+def hallucination_detect(answer_tokens, answer_vecs, source_tokens, source_vecs,
+                         threshold=0.5):
+    """token 级幻觉检测：每个答案 token 取与源 token 的最大余弦相似度。
+
+    相似度 < threshold 的 token 视为缺乏支撑；返回被标记的 token 下标、连续
+    span 列表与 hallucination_ratio。
+    """
+    if not isinstance(answer_tokens, (list, tuple)) or not answer_tokens:
+        raise ValueError("hallucination_detect: answer_tokens 必须是非空列表")
+    if not isinstance(source_tokens, (list, tuple)) or not source_tokens:
+        raise ValueError("hallucination_detect: source_tokens 必须是非空列表")
+    for t in answer_tokens:
+        if not isinstance(t, (str, int)) or isinstance(t, bool):
+            raise ValueError("hallucination_detect: answer_tokens 必须是 str/int")
+    for t in source_tokens:
+        if not isinstance(t, (str, int)) or isinstance(t, bool):
+            raise ValueError("hallucination_detect: source_tokens 必须是 str/int")
+    ans_vecs = _hall_check_vecs(answer_vecs, "answer_vecs")
+    src_vecs = _hall_check_vecs(source_vecs, "source_vecs", dim=len(ans_vecs[0]))
+    if len(ans_vecs) != len(answer_tokens) or len(src_vecs) != len(source_tokens):
+        raise ValueError(
+            "hallucination_detect: 向量数必须与 token 数一致")
+    threshold = float(threshold)
+    if not math.isfinite(threshold) or not (0.0 <= threshold <= 1.0):
+        raise ValueError("hallucination_detect: threshold 必须在 [0,1]")
+    flagged = []
+    sims = []
+    for i, av in enumerate(ans_vecs):
+        best = max(cosine_similarity(av, sv) for sv in src_vecs)
+        sims.append(best)
+        if best < threshold:
+            flagged.append(i)
+    spans = []
+    for i in flagged:
+        if spans and i == spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], i)
+        else:
+            spans.append((i, i))
+    return {"flagged": flagged,
+            "spans": spans,
+            "hallucination_ratio": len(flagged) / len(answer_tokens),
+            "similarities": sims}
+
+
+def hallucination_report(answer_tokens, answer_vecs, source_tokens, source_vecs,
+                         threshold=0.5):
+    """生成简短的幻觉检测报告（不含模型调用，纯数值汇总）。"""
+    info = hallucination_detect(answer_tokens, answer_vecs, source_tokens,
+                                source_vecs, threshold)
+    if not info["flagged"]:
+        verdict = "supported"
+    elif info["hallucination_ratio"] <= 0.5:
+        verdict = "partially_supported"
+    else:
+        verdict = "unsupported"
+    info["verdict"] = verdict
+    info["unsupported_tokens"] = [answer_tokens[i] for i in info["flagged"]]
+    return info
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
