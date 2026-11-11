@@ -34919,3 +34919,84 @@ class TestHallucinationReport:
             ["a", "b"], [[0.5, 0.5], [0.5, 0.5]], ["x"], [[1, 0]], threshold=0.9)
         assert unsupported["verdict"] == "unsupported"
         assert unsupported["unsupported_tokens"] == ["a", "b"]
+
+
+import io
+import json
+import os
+import shutil
+import tempfile
+
+import AI
+
+
+def _p23_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestVersionedStore:
+    def test_disk_roundtrip_and_reload(self):
+        tmp = tempfile.mkdtemp(prefix="vs_test_")
+        try:
+            store = AI.VersionedStore(tmp)
+            v1 = store.put("prompt", "hello", {"tag": "a"})
+            v2 = store.put("prompt", "hello world")
+            assert store.latest("prompt") == v2["version"]
+            assert store.get("prompt") == "hello world"
+            assert store.get("prompt", v1["version"]) == "hello"
+            assert store.verify("prompt")
+            assert store.verify("prompt", v1["version"])
+            assert store.names() == ["prompt"]
+            assert len(store.versions("prompt")) == 2
+            again = AI.VersionedStore(tmp)
+            assert again.names() == ["prompt"]
+            assert again.get("prompt") == "hello world"
+            assert again.versions("prompt")[0]["version"] == v1["version"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_memory_store(self):
+        store = AI.VersionedStore()
+        info = store.put("cfg", {"lr": 0.01})
+        assert store.get("cfg") == {"lr": 0.01}
+        assert store.verify("cfg")
+        assert store.versions("cfg")[0]["version"] == info["version"]
+
+    def test_rollback(self):
+        store = AI.VersionedStore()
+        v1 = store.put("data", [1, 2])
+        store.put("data", [3, 4])
+        assert store.get("data", v1["version"]) == [1, 2]
+        assert store.get("data") == [3, 4]
+
+    def test_errors(self):
+        store = AI.VersionedStore()
+        _p23_raises(lambda: AI.VersionedStore(123))
+        _p23_raises(lambda: store.put("", 1))
+        _p23_raises(lambda: store.put("bad name", 1))
+        _p23_raises(lambda: store.put("x", object()))
+        _p23_raises(lambda: store.put("x", 1, metadata=[1]))
+        _p23_raises(lambda: store.get("missing"), KeyError)
+        store.put("x", 1)
+        _p23_raises(lambda: store.get("x", "0" * 64), KeyError)
+        _p23_raises(lambda: store.get("x", "not-a-version"))
+        _p23_raises(lambda: store.latest("missing"), KeyError)
+        _p23_raises(lambda: store.verify("missing"), KeyError)
+
+    def test_verify_detects_tamper(self):
+        tmp = tempfile.mkdtemp(prefix="vs_tamper_")
+        try:
+            store = AI.VersionedStore(tmp)
+            info = store.put("doc", {"a": 1})
+            version = info["version"]
+            path = os.path.join(tmp, "objects", version[:2], version[2:] + ".json")
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"a": 999}))
+            _p23_raises(lambda: store.verify("doc"), ValueError)
+            _p23_raises(lambda: store.get("doc"), ValueError)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)

@@ -4462,6 +4462,168 @@ def hallucination_report(answer_tokens, answer_vecs, source_tokens, source_vecs,
     return info
 
 
+# ---------- 命名数据版本库（Prompt / 数据集的 versioned store） ----------
+
+
+def _vs_check_name(name):
+    if not isinstance(name, str) or not name:
+        raise ValueError("VersionedStore: name 必须是非空字符串")
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,128}", name):
+        raise ValueError(
+            "VersionedStore: name 只能包含字母/数字/下划线/点/连字符（最长 128）")
+    return name
+
+
+def _vs_check_version(version):
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9a-f]{64}", version):
+        raise ValueError(
+            f"VersionedStore: version 必须是 64 位小写十六进制，收到 {version!r}")
+    return version
+
+
+def _vs_check_metadata(metadata):
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise ValueError("VersionedStore: metadata 必须是 dict 或 None")
+    try:
+        json.dumps(metadata, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"VersionedStore: metadata 必须可 JSON 序列化（{exc}）")
+    return dict(metadata)
+
+
+class VersionedStore:
+    """命名数据（prompt / 数据集 / 配置）的内容寻址版本库。
+
+    每次 ``put(name, data)`` 用 ``dataset_version`` 的 JSON-SHA256 规则算版本号：
+    - ``store_dir=None`` 时纯内存保存（进程内可用）；
+    - 给定 ``store_dir`` 时对象落到 ``objects/<前2位>/<其余>.json``，
+      每个 name 的版本清单落到 ``names/<name>.jsonl``，重启后可重新加载。
+    ``get(name)`` 默认取最新版本，也支持按 version 取历史版本；``verify`` 会重算
+    内容哈希做完整性校验。
+    """
+
+    def __init__(self, store_dir=None):
+        if store_dir is not None and (not isinstance(store_dir, str) or not store_dir):
+            raise ValueError("VersionedStore: store_dir 必须是非空字符串或 None")
+        self.store_dir = store_dir
+        self._objects = {}
+        self._versions = {}
+        self._latest = {}
+        self._manifest_path = None
+        if store_dir is not None:
+            os.makedirs(os.path.join(store_dir, "objects"), exist_ok=True)
+            os.makedirs(os.path.join(store_dir, "names"), exist_ok=True)
+            self._manifest_path = os.path.join(store_dir, "names")
+
+    # -- 内部：版本清单读写 --
+    def _name_path(self, name):
+        return os.path.join(self._manifest_path, name + ".jsonl")
+
+    def _load_versions(self, name):
+        if name in self._versions:
+            return self._versions[name]
+        records = []
+        if self._manifest_path is not None:
+            path = self._name_path(name)
+            if os.path.exists(path):
+                with io.open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+        self._versions[name] = records
+        if records:
+            self._latest[name] = records[-1]["version"]
+        return records
+
+    def _append_version(self, name, record):
+        self._load_versions(name)
+        self._versions[name].append(record)
+        self._latest[name] = record["version"]
+        if self._manifest_path is not None:
+            path = self._name_path(name)
+            with io.open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+
+    # -- 公共 API --
+    def put(self, name, data, metadata=None):
+        name = _vs_check_name(name)
+        meta = _vs_check_metadata(metadata)
+        try:
+            info = dataset_version(data, self.store_dir)
+        except ValueError:
+            raise
+        if self.store_dir is None:
+            payload = json.dumps(data, sort_keys=True, ensure_ascii=False,
+                                 separators=(",", ":"))
+            self._objects[info["version"]] = json.loads(payload)
+        record = {"version": info["version"], "bytes": info["bytes"],
+                  "created_at": int(time.time()), "metadata": meta}
+        self._append_version(name, record)
+        return dict(record)
+
+    def latest(self, name):
+        name = _vs_check_name(name)
+        self._load_versions(name)
+        if name not in self._latest:
+            raise KeyError(f"VersionedStore: 没有名为 {name!r} 的数据")
+        return self._latest[name]
+
+    def versions(self, name):
+        name = _vs_check_name(name)
+        return [dict(rec) for rec in self._load_versions(name)]
+
+    def get(self, name, version=None):
+        name = _vs_check_name(name)
+        records = self._load_versions(name)
+        if not records:
+            raise KeyError(f"VersionedStore: 没有名为 {name!r} 的数据")
+        if version is None:
+            version = self._latest[name]
+        version = _vs_check_version(version)
+        if not any(rec["version"] == version for rec in records):
+            raise KeyError(
+                f"VersionedStore: {name!r} 没有版本 {version[:12]}…")
+        if self.store_dir is not None:
+            data = load_dataset_version(self.store_dir, version)
+        else:
+            if version not in self._objects:
+                raise KeyError(
+                    f"VersionedStore: 内存库不包含版本 {version[:12]}…")
+            data = self._objects[version]
+        return data
+
+    def verify(self, name, version=None):
+        name = _vs_check_name(name)
+        records = self._load_versions(name)
+        if not records:
+            raise KeyError(f"VersionedStore: 没有名为 {name!r} 的数据")
+        if version is None:
+            version = self._latest[name]
+        version = _vs_check_version(version)
+        if not any(rec["version"] == version for rec in records):
+            raise KeyError(
+                f"VersionedStore: {name!r} 没有版本 {version[:12]}…")
+        if self.store_dir is not None:
+            data = load_dataset_version(self.store_dir, version)
+        else:
+            if version not in self._objects:
+                return False
+            data = self._objects[version]
+        actual = dataset_version(data)["version"]
+        return actual == version
+
+    def names(self):
+        names = set(self._versions)
+        if self._manifest_path is not None and os.path.isdir(self._manifest_path):
+            for fn in os.listdir(self._manifest_path):
+                if fn.endswith(".jsonl"):
+                    names.add(fn[:-6])
+        return sorted(names)
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

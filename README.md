@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2221 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2226 项）
 
 ## 特性
 
@@ -3384,6 +3384,7 @@ print(AI.membership_inference_attack(member, other))            # auc 越接近 
 | `ModelRegistry(directory)` | `register` / `versions` / `latest` / `get` / `describe` / `rollback` |
 | `dataset_version(data, store_dir=None)` | 给数据做内容寻址版本（DVC 风格）：规范化 JSON 的 SHA-256 作为版本号；给定 `store_dir` 时写 `objects/<前2位>/<其余>.json` 并追加 `versions.jsonl` |
 | `load_dataset_version(store_dir, version)` | 按版本号读回数据并校验 SHA-256；版本缺失抛 `FileNotFoundError`，内容被篡改抛 `ValueError` |
+| `VersionedStore(store_dir=None)` | 命名数据（prompt / 数据集 / 配置）的内容寻址版本库：`put` / `latest` / `versions` / `get` / `verify` / `names`；磁盘模式复用 `dataset_version` 对象库并按 name 记录版本清单 |
 
 ```python
 cfg = AI.load_config("train.yaml")            # 也可以 .json / .toml / .ini
@@ -3405,6 +3406,29 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
 - 注册表把每次 `register` 存成 `<root>/<name>/v<n>.json` 并更新 `index.json`
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
   所以注册表里的文件和手动 `model.save()` 的格式完全一致。
+
+### 命名数据版本库（VersionedStore）
+
+```python
+store = AI.VersionedStore("runs/versions")
+v1 = store.put("prompt", "summarize this", {"tag": "baseline"})
+v2 = store.put("prompt", "summarize this in one sentence")
+store.latest("prompt") == v2["version"]        # 最新版本
+store.get("prompt", v1["version"])            # 取历史版本（回滚语义）
+store.verify("prompt")                        # 重算内容哈希
+```
+
+| API | 说明 |
+| --- | --- |
+| `put(name, data, metadata=None)` | 写入新版本，返回 `version` / `bytes` / `created_at` / `metadata` |
+| `get(name, version=None)` | 取版本数据，默认最新；版本不存在抛 `KeyError` |
+| `latest(name)` / `versions(name)` | 最新版本号 / 版本清单 |
+| `verify(name, version=None)` | 重新计算内容哈希，判断对象是否被篡改 |
+| `names()` | 列出已登记的 name |
+
+边界：`store_dir=None` 时只存在进程内存；磁盘模式复用 `dataset_version`
+（JSON 规范化 SHA-256、单机教学版、无远端/GC/锁）；name 限 `[A-Za-z0-9_.-]`，
+版本清单按 name 追加到 `names/<name>.jsonl`，同一内容在不同 name 下共享对象。
 
 ### Safetensors 读写
 
@@ -4317,7 +4341,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2221 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2226 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4531,6 +4555,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVMambaBlock` | 前向形状/参数、四项中心差分、SGD 更新、非法输入 |
 | `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
 | `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
+| `TestVersionedStore` | 磁盘/内存 roundtrip、版本回滚、篡改检测、非法 name/version/metadata |
 | `TestBlockMask` / `TestiBOTLoss` / `TestCenterUpdate` / `TestiBOTTrainer` | 块掩码、掩码软目标损失/梯度、中心动量、学生-教师训练步 |
 | `TestJambaModel` | 混合层参数计数、Mamba/Attention 混合反向 FD、前向/训练、非法输入 |
 | `TestCosineSimilarity` / `TestSentenceSimilarity` / `TestNLIConsistency` / `TestHallucinationDetect` / `TestHallucinationReport` | 余弦相似度、NLI 三分类、token 级幻觉 span、报告结论 |
@@ -4681,7 +4706,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2221 个单元测试
+├── test_ai.py       # 2226 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```
