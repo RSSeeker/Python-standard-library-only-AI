@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2208 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2212 项）
 
 ## 特性
 
@@ -2417,6 +2417,27 @@ grads = back(dy)          # {"du": ..., "ddelta": ..., "dA": ..., "dB": ..., "dC
 
 边界：只实现对角 `A` 的 S6 扫描（无卷积形式、无分块并行扫描），`delta` 视为已由外部线性层投影并激活；`A` 为负值时可稳定递推，但本函数不做参数化（`A = -exp(A_log)` 形式的保证由调用方负责）。时间步之间是严格的顺序递推，复杂度 O(T·d_in·d_state)。
 
+### Jamba：Mamba + Attention 混合语言模型
+
+Jamba 把 Mamba 状态空间块与注意力层交替堆叠：Mamba 块负责线性时间的长程递归记忆，
+注意力层负责精确的 token 间交互，两条路径共享同一残差流（`d_model`）。层顺序可配置。
+
+```python
+model = JambaModel(vocab_size=32, d_model=16, num_heads=2, d_state=4,
+                   layer_types=("mamba", "attn", "mamba", "attn"), d_ff=32)
+loss = model.loss_and_backward([0, 1, 2, 3])
+history = model.fit([[0, 1, 2, 3], [1, 2, 3, 4]], epochs=10, lr=0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `JambaModel(vocab_size, d_model, num_heads, d_state, layer_types, d_ff, max_len, seed)` | `layer_types` 由 `"mamba"`/`"attn"` 组成，按顺序堆叠 |
+| `forward` / `loss_and_backward` / `fit` / `param_count` | 逐 token teacher forcing，反向穿过混合层 |
+
+边界：教学版 Jamba——不带 MoE 专家、不做滑动窗口/分组查询注意力、不做并行扫描；
+注意力层是全注意力（因果掩码由 `TransformerEncoderLayer` 的 `causal=False` 决定，
+这里为双向，语言模型示例依赖 teacher forcing 而非因果掩码）。
+
 ### Mamba-2（简化 SSD 块）
 
 ```python
@@ -4266,7 +4287,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2208 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2212 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4481,6 +4502,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
 | `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
 | `TestBlockMask` / `TestiBOTLoss` / `TestCenterUpdate` / `TestiBOTTrainer` | 块掩码、掩码软目标损失/梯度、中心动量、学生-教师训练步 |
+| `TestJambaModel` | 混合层参数计数、Mamba/Attention 混合反向 FD、前向/训练、非法输入 |
 | `TestWeightStandardization` | 前向形状与参数计数、`dW`/`db` 中心差分、SGD/Adam 更新、非法 `eps`/维度/未 forward 校验 |
 | `TestNF4Quant` | 16 个分位点有序、精确格点 roundtrip、零块、NF4 误差小于 4-bit 均匀量化、双重量化误差 <1%、非法 code/block |
 | `TestGradScaler` | `scale_loss`/`unscale`、两步增长到翻倍、inf 回退半步、`state_dict` 往返、非法参数与 nan 梯度 |
@@ -4628,7 +4650,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2208 个单元测试
+├── test_ai.py       # 2212 个单元测试
 ├── ROADMAP.md       # 后续扩展路线图（20 波、约 240 个实现单元）
 └── README.md
 ```

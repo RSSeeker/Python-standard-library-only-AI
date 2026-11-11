@@ -4141,6 +4141,175 @@ class iBOTTrainer:
         return history
 
 
+# ---------- Jamba：Mamba + Attention 混合语言模型 ----------
+
+
+def _jamba_check_layer_types(layer_types):
+    if not isinstance(layer_types, (list, tuple)) or not layer_types:
+        raise ValueError("JambaModel: layer_types 必须是非空列表")
+    out = []
+    for i, kind in enumerate(layer_types):
+        if kind not in ("mamba", "attn"):
+            raise ValueError(
+                f"JambaModel: layer_types[{i}] 必须是 'mamba' 或 'attn'，收到 {kind!r}")
+        out.append(kind)
+    return out
+
+
+class JambaModel:
+    """Jamba 风格混合语言模型：Mamba 状态空间块与注意力层交替堆叠。
+
+    默认模式 ``("mamba", "attn", "mamba", "attn")``：Mamba 块负责长程递归记忆
+    （线性时间），注意力层负责精确的 token 间交互；两者结构不同但残差流
+    ``d_model`` 一致，可以直接串联。
+
+    这是教学简化版：不做 MoE 专家层、不做滑动窗口注意力、不做分组查询/并行扫描。
+    """
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_state=4,
+                 layer_types=("mamba", "attn", "mamba", "attn"), d_ff=None,
+                 max_len=64, seed=None):
+        if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) \
+                or vocab_size < 1:
+            raise ValueError(f"JambaModel: vocab_size 必须是正整数，收到 {vocab_size!r}")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model < 1:
+            raise ValueError(f"JambaModel: d_model 必须是正整数，收到 {d_model!r}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
+            raise ValueError(f"JambaModel: num_heads 必须是正整数，收到 {num_heads!r}")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"JambaModel: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+            raise ValueError(f"JambaModel: max_len 必须是正整数，收到 {max_len!r}")
+        self.layer_types = _jamba_check_layer_types(layer_types)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_state = d_state
+        self.d_ff = 4 * d_model if d_ff is None else d_ff
+        if not isinstance(self.d_ff, int) or isinstance(self.d_ff, bool) \
+                or self.d_ff < 1:
+            raise ValueError(f"JambaModel: d_ff 必须是正整数，收到 {d_ff!r}")
+        self.max_len = max_len
+        self.embedding = Embedding(vocab_size, d_model)
+        self.blocks = []
+        for kind in self.layer_types:
+            if kind == "mamba":
+                self.blocks.append(
+                    Mamba2Block(d_model, num_heads, d_state, seed=seed))
+            else:
+                self.blocks.append(
+                    TransformerEncoderLayer(d_model, num_heads, self.d_ff,
+                                            dropout=0.0, causal=False))
+        self.head = Layer(d_model, vocab_size, "linear")
+        self._attn_param = (4 * d_model * d_model + 9 * d_model
+                            + 2 * d_model * self.d_ff + self.d_ff)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        for block in self.blocks:
+            block.zero_grad()
+        self.grads = {"head": _layer_zero_grads(self.head)}
+
+    def _check_ids(self, ids, who):
+        seq = list(ids)
+        if not seq:
+            raise ValueError(f"{who}: ids 不能为空")
+        if len(seq) > self.max_len:
+            raise ValueError(f"{who}: 序列长度 {len(seq)} 超过 max_len={self.max_len}")
+        for t, idx in enumerate(seq):
+            if not isinstance(idx, int) or isinstance(idx, bool) \
+                    or not 0 <= idx < self.vocab_size:
+                raise ValueError(f"{who}: 第 {t} 个 id {idx!r} 越界")
+        return seq
+
+    def forward(self, ids):
+        seq = self._check_ids(ids, "JambaModel.forward")
+        x = self.embedding.forward(seq)
+        for block in self.blocks:
+            x = block.forward(x)
+        self._head_in = x
+        logits, self._head_cache = _dense_rows_forward(self.head, x)
+        return logits
+
+    def loss_and_backward(self, ids, targets=None):
+        seq = list(ids)
+        if len(seq) < 2:
+            raise ValueError("JambaModel.loss_and_backward: 序列至少需要 2 个 token")
+        if targets is None:
+            tgt = seq[1:]
+        else:
+            tgt = list(targets)
+            if len(tgt) != len(seq) - 1:
+                raise ValueError(
+                    f"JambaModel.loss_and_backward: targets 长度 {len(tgt)} 应为 {len(seq) - 1}")
+        logits = self.forward(seq)
+        T = len(seq)
+        n = T - 1
+        V = self.vocab_size
+        loss = 0.0
+        dlogits = [[0.0] * V for _ in range(T)]
+        for t in range(n):
+            y = tgt[t]
+            if not isinstance(y, int) or isinstance(y, bool) or not 0 <= y < V:
+                raise ValueError(
+                    f"JambaModel.loss_and_backward: 第 {t} 个 target {y!r} 越界")
+            p = _softmax_row(logits[t])
+            loss -= math.log(max(p[y], 1e-12))
+            scale = 1.0 / n
+            row = dlogits[t]
+            for v in range(V):
+                row[v] = (p[v] - (1.0 if v == y else 0.0)) * scale
+        loss /= n
+        grad_w, grad_b, dh = _dense_rows_backward(self.head, self._head_cache, dlogits)
+        _layer_add_grads(self.grads["head"], (grad_w, grad_b))
+        for block in reversed(self.blocks):
+            dh = block.backward(dh)
+        self.embedding.backward(dh)
+        return loss
+
+    def sgd_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"JambaModel.sgd_step: lr 必须是非负数，收到 {lr!r}")
+        self.embedding.sgd_step(lr)
+        for block in self.blocks:
+            block.sgd_step(lr)
+        _dense_apply_sgd(self.head, self.grads["head"], lr)
+
+    def param_count(self):
+        total = self.vocab_size * self.d_model
+        for kind, block in zip(self.layer_types, self.blocks):
+            if kind == "mamba":
+                total += block.param_count()
+            else:
+                total += self._attn_param
+        total += _dense_param_count(self.head)
+        return total
+
+    def fit(self, sequences, epochs=1, lr=3e-3, shuffle=True, seed=None):
+        if not sequences:
+            raise ValueError("JambaModel.fit: sequences 不能为空")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"JambaModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"JambaModel.fit: lr 必须是非负数，收到 {lr!r}")
+        rng = random.Random(seed)
+        order = list(range(len(sequences)))
+        losses = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(sequences[idx])
+                self.sgd_step(lr)
+            losses.append(total / len(order))
+        return losses
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

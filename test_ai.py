@@ -34713,3 +34713,113 @@ class TestiBOTTrainer:
         _p20_raises(lambda: tr.train_step([]))
         _p20_raises(lambda: tr.train_step(images, lr=0.0))
         _p20_raises(lambda: tr.fit(images, epochs=0))
+
+
+import math
+
+import AI
+
+
+def _p21_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+def _p21_smax(row):
+    mx = max(row)
+    ex = [math.exp(v - mx) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _p21_loss(model, ids):
+    logits = model.forward(ids)
+    n = len(ids) - 1
+    total = 0.0
+    for t in range(n):
+        p = _p21_smax(logits[t])
+        total -= math.log(max(p[ids[t + 1]], 1e-12))
+    return total / n
+
+
+def _p21_fd(model, ids, getter, setter, analytic_getter, h=1e-5):
+    model.zero_grad()
+    model.loss_and_backward(ids)
+    analytic = analytic_getter()
+    old = getter()
+    setter(old + h)
+    lp = _p21_loss(model, ids)
+    setter(old - h)
+    lm = _p21_loss(model, ids)
+    setter(old)
+    return abs((lp - lm) / (2 * h) - analytic)
+
+
+class TestJambaModel:
+    def test_param_count_and_layer_types(self):
+        m = AI.JambaModel(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                          layer_types=("mamba", "attn"), d_ff=16, max_len=8,
+                          seed=1)
+        assert m.param_count() == 1002
+        assert m.layer_types == ["mamba", "attn"]
+        only_m = AI.JambaModel(vocab_size=5, d_model=8, num_heads=2, d_state=3,
+                               layer_types=("mamba",), d_ff=16, max_len=6, seed=2)
+        only_a = AI.JambaModel(vocab_size=5, d_model=8, num_heads=2, d_state=3,
+                               layer_types=("attn",), d_ff=16, max_len=6, seed=2)
+        assert only_m.param_count() != only_a.param_count()
+
+    def test_gradients_mixed_backward(self):
+        m = AI.JambaModel(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                          layer_types=("mamba", "attn"), d_ff=16, max_len=8,
+                          seed=1)
+        ids = [0, 1, 2, 3]
+        block = m.blocks[0]
+        attn = m.blocks[1]
+        checks = [
+            (lambda: m.head.weights[0][0],
+             lambda v: m.head.weights[0].__setitem__(0, v),
+             lambda: m.grads["head"][0][0][0]),
+            (lambda: block.in_proj.weights[0][0],
+             lambda v: block.in_proj.weights[0].__setitem__(0, v),
+             lambda: block.grads["in_proj"][0][0][0]),
+            (lambda: attn.self_attn.W_q[0][0],
+             lambda v: attn.self_attn.W_q[0].__setitem__(0, v),
+             lambda: attn.self_attn.grads["W_q"][0][0]),
+            (lambda: attn.ffn.W1[0][0],
+             lambda v: attn.ffn.W1[0].__setitem__(0, v),
+             lambda: attn.ffn.grads["W1"][0][0]),
+        ]
+        for getter, setter, ana in checks:
+            assert _p21_fd(m, ids, getter, setter, ana) < 1e-3
+
+    def test_forward_and_fit(self):
+        m = AI.JambaModel(vocab_size=6, d_model=8, num_heads=2, d_state=3,
+                          layer_types=("mamba", "attn"), d_ff=16, max_len=8,
+                          seed=1)
+        logits = m.forward([0, 1, 2, 3])
+        assert len(logits) == 4 and len(logits[0]) == 6
+        loss = m.loss_and_backward([0, 1, 2, 3])
+        assert isinstance(loss, float) and math.isfinite(loss)
+        hist = m.fit([[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]],
+                     epochs=20, lr=0.05, seed=2)
+        assert len(hist) == 20 and hist[-1] < hist[0]
+
+    def test_invalid_inputs(self):
+        _p21_raises(lambda: AI.JambaModel(vocab_size=6, layer_types=[]))
+        _p21_raises(lambda: AI.JambaModel(vocab_size=6, layer_types=("x",)))
+        _p21_raises(lambda: AI.JambaModel(vocab_size=6, layer_types="mamba"))
+        _p21_raises(lambda: AI.JambaModel(vocab_size=6, num_heads=5, d_model=8))
+        m = AI.JambaModel(vocab_size=5, d_model=8, num_heads=2, d_state=3,
+                          layer_types=("mamba",), d_ff=16, max_len=6, seed=2)
+        _p21_raises(lambda: m.forward([]))
+        _p21_raises(lambda: m.forward([0, 1, 2, 3, 4, 5, 6]))
+        _p21_raises(lambda: m.forward([0, 9]))
+        _p21_raises(lambda: m.loss_and_backward([0]))
+        _p21_raises(lambda: m.loss_and_backward([0, 1, 2], targets=[0]))
+        _p21_raises(lambda: m.loss_and_backward([0, 1, 2], targets=[9, 0]))
+        _p21_raises(lambda: m.sgd_step(-1.0))
+        _p21_raises(lambda: m.fit([]))
+        _p21_raises(lambda: m.fit([[0, 1, 2]], epochs=0))

@@ -855,8 +855,9 @@
 - [x] VMamba（2D 选择性扫描）：`VMambaBlock`（行/列双向共四个方向的选择性扫描、SiLU 门控、残差）、`VMamba`（patch 嵌入 + 多层块，图像级特征提取）；`TestVMambaBlock` 4 例、`TestVMamba` 2 例。
 - [x] DINOv2 自蒸馏训练：`dinov2_loss`（教师 sharpening/中心化 + 软目标交叉熵）、`make_dino_views`（随机裁剪/翻转多视图）、`DINOv2Trainer`（学生-教师 ViT、教师 EMA、中心动量更新）；`TestDINOv2Loss`/`TestDINOv2Views`/`TestDINOv2Trainer` 共 7 例。
 - [x] 掩码图像自蒸馏（BEiT v2 / iBOT 简化版）：`block_mask_indices`（块状遮蔽）、`ibot_loss`（只在被遮 patch 上的温度软目标交叉熵）、`update_ibot_center`、`iBOTTrainer`（学生-教师 ViT、教师 EMA、块掩码训练）；`TestBlockMask`/`TestiBOTLoss`/`TestCenterUpdate`/`TestiBOTTrainer` 共 7 例。
+- [x] Jamba（Mamba + Attention 混合语言模型）：`JambaModel`（`layer_types` 可配置的 Mamba2Block 与 TransformerEncoderLayer 交替堆叠、teacher forcing 训练、混合反向）；`TestJambaModel` 4 例。
 
-全量测试：1839 → 2208 passed（新增 369 例）。
+全量测试：1839 → 2212 passed（新增 373 例）。
 
 ---
 
