@@ -28,89 +28,208 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 80 个顶层分节
-# （920 个 def / 297 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 109 个顶层分节
+# （1224 个 def / 366 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
-#   3. CNN: Conv2d / MaxPool2d / Flatten
-#   4. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
-#   5. GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
-#   6. Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
-#   7. Regularization: Dropout / BatchNorm1d / LayerNorm
-#   8. RNN / LSTM
-#   9. Matrix helpers (用于 Transformer)
-#  10. GRU (Gated Recurrent Unit)
-#  11. Transformer 组件
-#  12. Embedding / Residual / Sequential
-#  13. Loss Functions
-#  14. Optimizer: Adam
-#  15. More Optimizers: SGD / SGD+Momentum / RMSprop
-#  16. SGDW / Nesterov / Lookahead / SWA / EMA
-#  17. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
-#  18. Layer-wise Optimizers: LARS / LAMB / Ranger
-#  19. Advanced Optimizers: Adan / Prodigy / CAME
-#  20. Gradient Clipping / LR Scheduler
+#   3. KAN（Kolmogorov-Arnold Network：B 样条边函数）
+#   4. CNN: Conv2d / MaxPool2d / Flatten
+#   5. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
+#   6. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#   7. GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
+#   8. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#   9. Regularization: Dropout / BatchNorm1d / LayerNorm
+#   10. RNN / LSTM
+#   11. Matrix helpers (用于 Transformer)
+#   12. GRU (Gated Recurrent Unit)
+#   13. Transformer 组件
+#   14. Embedding / Residual / Sequential
+#   15. Loss Functions
+#   16. Optimizer: Adam
+#   17. More Optimizers: SGD / SGD+Momentum / RMSprop
+#   18. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#   19. Layer-wise Optimizers: LARS / LAMB / Ranger
+#   20. Advanced Optimizers: Adan / Prodigy / CAME
+#   21. 进阶优化器：Shampoo / Sophia / L-BFGS
+#   22. Gradient Clipping / LR Scheduler
+#   23. 学习率调度器族
+#   24. Data Utilities
+#   25. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#   26. 图像增强管道（Compose / RandomCrop / RandomResizedCrop / RandomRotation / ColorJitter / GaussianBlur / Normalize）
+#   27. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+#   28. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#   29. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#   30. 降维 / 不平衡采样 / 特征选择
+#   31. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#   32. Scaler 族（RobustScaler / MaxAbsScaler / QuantileTransformer / PowerTransformer）
+#   33. Text Processing（分词与文本工具）
+#   34. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#   35. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#   36. Trainer
+#   37. 评估指标（分类 / 回归 / 序列 / 生成）
+#   38. 校准指标（ECE / MCE / Reliability Diagram）
+#   39. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#   40. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#   41. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#   42. 多模态：CLIP 双塔 + 跨模态融合
+#   43. 自监督：预测式任务（Rotation / Jigsaw）
+#   44. RL 算法（DQN 族）
+#   45. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#   46. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#   47. ELECTRA：生成器 + 判别器的预训练框架
+#   48. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+#   49. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+#   50. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
+#   51. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+#   52. DETR（DEtection TRansformer，简化版）
+#   53. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+#   54. E(3) 等变图神经网络（EGNN，教学版）
+#   55. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#   56. 全模块梯度自检（grad_check_all）
+#   57. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#   58. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#   59. 研究前沿：神经符号（规则约束的候选过滤）
+#   60. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#   61. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#   62. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#   63. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#   64. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+#   65. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+#   66. 集成测试 / doctest / 属性测试的运行时支撑
+#   67. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#   68. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#   69. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#   70. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#   71. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
+#   72. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#   73. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#   74. 领域应用：DeepFM / DIN
+#   75. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#   76. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#   77. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#   78. RL 环境（GridWorld / CartPole）
+#   79. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#   80. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#   81. 推理与部署：批内打包与投机解码
+#   82. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#   83. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#   84. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#   85. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#   86. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#   87. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#   88. 可解释性：置换重要性 / 特征图字符画
+#   89. 可解释性：注意力 Rollout / Flow
+#   90. 可解释性：输入归因
+#   91. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#   92. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#   93. 语音识别指标（WER / CER / SER）
+#   94. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#   95. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#   96. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#   97. 模型保存 / 加载 (JSON)
+#   98. 序列标注 / 多标签分类头
+#   99. PyTorch 数值对齐对比
+#   100. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#   101. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#   102. 梯度检查点（activation checkpointing）与混合精度模拟
+#   103. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#   104. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#   105. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#   106. 生成模型：VAE / GAN / DDPM
+#   107. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#   108. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#   109. Main: 回归 + 分类 + CNN 完整示例
+#  10. Transformer 组件
+#  11. Embedding / Residual / Sequential
+#  12. Loss Functions
+#  13. Optimizer: Adam
+#  14. More Optimizers: SGD / SGD+Momentum / RMSprop
+#  15. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#  16. Layer-wise Optimizers: LARS / LAMB / Ranger
+#  17. Advanced Optimizers: Adan / Prodigy / CAME
+#  18. 进阶优化器：Shampoo / Sophia / L-BFGS
+#  19. Gradient Clipping / LR Scheduler
+#  20. 学习率调度器族
 #  21. Data Utilities
 #  22. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
-#  23. Text Processing（分词与文本工具）
-#  24. Trainer
-#  25. 评估指标（分类 / 回归 / 序列 / 生成）
-#  26. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
-#  27. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
-#  28. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#  29. 多模态：CLIP 双塔 + 跨模态融合
-#  30. 自监督：预测式任务（Rotation / Jigsaw）
-#  31. RL 算法（DQN 族）
-#  32. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#  33. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
-#  34. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
-#  35. 全模块梯度自检（grad_check_all）
-#  36. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#  37. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#  38. 研究前沿：神经符号（规则约束的候选过滤）
-#  39. 研究前沿：Mixture-of-Depths 路由与 Early Exit
-#  40. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#  41. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#  42. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
-#  43. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-#  44. 领域应用：视频（3D-CNN / Two-Stream 融合）
-#  45. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#  46. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#  47. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
-#  48. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#  49. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#  50. 领域应用：DeepFM / DIN
-#  51. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-#  52. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
-#  53. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
-#  54. RL 环境（GridWorld / CartPole）
-#  55. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
-#  56. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#  57. 推理与部署：批内打包与投机解码
-#  58. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
-#  59. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#  60. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#  61. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#  62. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#  63. 可解释性：注意力 Rollout / Flow
-#  64. 可解释性：输入归因
-#  65. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#  66. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#  67. 模型保存 / 加载 (JSON)
-#  68. 序列标注 / 多标签分类头
-#  69. PyTorch 数值对齐对比
-#  70. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#  71. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  72. 梯度检查点（activation checkpointing）与混合精度模拟
-#  73. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#  74. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#  75. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#  76. 生成模型：VAE / GAN / DDPM
-#  77. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#  78. 组合模型：T5 / BERT（相对位置偏置 + MLM/NSP 双头）
-#  79. 组合模型：ConvNeXt（ConvNeXtBlock stage 拼装 + 分类头）
-#  80. Main: 回归 + 分类 + CNN 完整示例
+#  23. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#  24. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#  25. 降维 / 不平衡采样 / 特征选择
+#  26. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#  27. Text Processing（分词与文本工具）
+#  28. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#  29. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#  30. Trainer
+#  31. 评估指标（分类 / 回归 / 序列 / 生成）
+#  32. 校准指标（ECE / MCE / Reliability Diagram）
+#  33. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#  34. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#  35. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#  36. 多模态：CLIP 双塔 + 跨模态融合
+#  37. 自监督：预测式任务（Rotation / Jigsaw）
+#  38. RL 算法（DQN 族）
+#  39. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#  40. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#  41. ELECTRA：生成器 + 判别器的预训练框架
+#  42. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+#  43. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+#  44. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
+#  45. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+#  46. DETR（DEtection TRansformer，简化版）
+#  47. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+#  48. E(3) 等变图神经网络（EGNN，教学版）
+#  49. 全模块梯度自检（grad_check_all）
+#  50. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#  51. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#  52. 研究前沿：神经符号（规则约束的候选过滤）
+#  53. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#  54. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#  55. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#  56. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#  57. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+#  58. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+#  59. 集成测试 / doctest / 属性测试的运行时支撑
+#  60. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#  61. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#  62. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#  63. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#  64. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#  65. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#  66. 领域应用：DeepFM / DIN
+#  67. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#  68. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#  69. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#  70. RL 环境（GridWorld / CartPole）
+#  71. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#  72. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#  73. 推理与部署：批内打包与投机解码
+#  74. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#  75. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#  76. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#  77. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#  78. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#  79. 可解释性：注意力 Rollout / Flow
+#  80. 可解释性：输入归因
+#  81. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#  82. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#  83. 语音识别指标（WER / CER / SER）
+#  84. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#  85. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#  86. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#  87. 模型保存 / 加载 (JSON)
+#  88. 序列标注 / 多标签分类头
+#  89. PyTorch 数值对齐对比
+#  90. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#  91. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#  92. 梯度检查点（activation checkpointing）与混合精度模拟
+#  93. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#  94. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#  95. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#  96. 生成模型：VAE / GAN / DDPM
+#  97. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#  98. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#  99. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -841,9 +960,9 @@ def mimic_init(student, teacher):
     return {"widths": widths, "depth_copied": n}
 
 
-#  ==========================================================================
+# ============================================================================
 #  KAN（Kolmogorov-Arnold Network：B 样条边函数）
-#  ==========================================================================
+# ============================================================================
 
 
 def _kan_check_positive_int(value, name: str) -> int:
@@ -1278,7 +1397,7 @@ class DeepONet:
             out.append((gw, gb))
         return out
 
-    # ---------- 前向/反向 ----------
+    # ---------- 前向 / 反向 ----------
 
     def forward(self, branch_input, coords):
         b_in = self._check_vector(branch_input, self.sensor_dim, "branch_input")
@@ -4517,7 +4636,7 @@ class VersionedStore:
             os.makedirs(os.path.join(store_dir, "names"), exist_ok=True)
             self._manifest_path = os.path.join(store_dir, "names")
 
-    # -- 内部：版本清单读写 --
+    # ---------- 内部：版本清单读写 ----------
     def _name_path(self, name):
         return os.path.join(self._manifest_path, name + ".jsonl")
 
@@ -4547,7 +4666,7 @@ class VersionedStore:
             with io.open(path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
-    # -- 公共 API --
+    # ---------- 公共 API ----------
     def put(self, name, data, metadata=None):
         name = _vs_check_name(name)
         meta = _vs_check_metadata(metadata)
@@ -11059,7 +11178,7 @@ class SwinBlock:
         d = self.d_model
         n = len(rolled)
         d_rolled = [dout[i] for i in perm]
-        # ---- MLP 分支 ----
+        # ---------- MLP 分支 ----------
         g2, b2, dh = _dense_rows_backward(self.f2, f2c, d_rolled)
         _layer_add_grads(self.grads["f2"], (g2, b2))
         g1, b1, db = _dense_rows_backward(self.f1, f1c, dh)
@@ -11071,7 +11190,7 @@ class SwinBlock:
             ng2[1][c] += gbl[c]
         dmerged = [[d_rolled[t][c] + dmerged_ln[t][c] for c in range(d)]
                    for t in range(n)]
-        # ---- 注意力分支 ----
+        # ---------- 注意力分支 ----------
         go, gbo2, dctx = _dense_rows_backward(self.o, oc, dmerged)
         _layer_add_grads(self.grads["o"], (go, gbo2))
         dq, dk_, dv = _win_attn_backward(dctx, q, k, v, windows, attn_cache,
@@ -13316,8 +13435,9 @@ def diverse_beam_generate(model, prompt_ids, num_beams: int = 4, num_return: int
                                eos_id=eos_id)
 
 
+# ============================================================================
 #  领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
-# =====================================================================
+# ============================================================================
 
 def _w7e_char_predicate(spec):
     """把字符类说明（'digit' / 'alpha' / 单字符串）变成 predicate。"""
@@ -14940,7 +15060,7 @@ def fit_pix2pix(generator, discriminator, pairs, steps=30, lambda_l1=100.0,
             lambda_l1=lambda_l1, lr_g=lr_g, lr_d=lr_d))
     return history
 
-# =============================================================================
+# ============================================================================
 """StyleGAN 轻量可训练生成器：映射网络 + 常数输入 + AdaIN 风格调制 + 逐级上采样。"""
 
 
@@ -15445,8 +15565,9 @@ class ProgressiveGenerator:
             else:
                 _p2p_sgd_layer(layer, lr)
 
+# ============================================================================
 #  研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
-# =============================================================================
+# ============================================================================
 #  这一节的共同点是「只依赖一个可调用的 score / energy 函数」，因此不需要
 #  额外训练一个网络就能验证数学：探针里用高斯数据的**闭式 score** 做端到端
 #  采样，与理论方差对照。真实训练时把 score_fn 换成 MLP(x, sigma) -> list 即可。
@@ -15505,7 +15626,7 @@ def _w8b_call_score(score_fn, x, sigma):
     return vec
 
 
-# ---------------------------------------------------------------- 扩散系数 --
+# ---------- 扩散系数 ----------
 def vp_beta(t, beta_min=0.1, beta_max=20.0):
     """VP-SDE 的线性 beta 调度：beta(t) = beta_min + t (beta_max - beta_min)。"""
     tt = _w8b_scalar(t, "t", minimum=0.0)
@@ -15563,7 +15684,7 @@ def ve_diffusion(t, sigma_min=0.01, sigma_max=50.0):
     return math.sqrt(2.0 * sigma * sigma * log_ratio)
 
 
-# --------------------------------------------------------- 反向 SDE / ODE --
+# ---------- 反向 SDE / ODE ----------
 def reverse_sde_step(x, t, score, dt, noise=None, kind="ve",
                      beta_min=0.1, beta_max=20.0, sigma_min=0.01, sigma_max=50.0):
     """反向 SDE 单步：dx = [f - g² score] dt + g sqrt(|dt|) z（dt 应为负）。
@@ -15623,7 +15744,7 @@ def probability_flow_step(x, t, score, dt, kind="ve",
     return out
 
 
-# ----------------------------------------------------- NCSN（去噪分数匹配） --
+# ---------- NCSN（去噪分数匹配） ----------
 def ncsn_loss(score_fn, xs, sigmas=(1.0, 0.5, 0.2), seed=None):
     """去噪分数匹配（NCSN）：每个噪声等级上回归 `-eps/sigma`。
 
@@ -15698,7 +15819,7 @@ def annealed_langevin_sample(score_fn, x0, sigmas=(1.0, 0.5, 0.2, 0.1),
     return x
 
 
-# ---------------------------------------------------------------- EBM ------
+# ---------- EBM ----------
 def ebm_langevin(grad_energy, x0, steps=20, step_size=0.01, noise=0.01, seed=None):
     """能量模型的 Langevin 采样：`x -= step * gradE(x) + noise * z`。
 
@@ -15762,7 +15883,7 @@ def ebm_contrastive_divergence(energy_fn, grad_energy, x_data, steps=20,
                   "negative_samples": neg, "steps": int(steps)}
 
 
-# --------------------------------------------------------- 一致性模型 ------
+# ---------- 一致性模型 ----------
 def _w8b_call_net(fn, x, t, who="net"):
     if not callable(fn):
         raise TypeError("%s 必须可调用，收到 %r" % (who, type(fn).__name__))
@@ -15818,7 +15939,7 @@ def consistency_sample(student, x_noisy, t=0.8):
     return _w8b_call_net(student, x_noisy, t, "student")
 
 
-# ------------------------------------------------- 多尺度 Glow（组合） ------
+# ---------- 多尺度 Glow（组合） ----------
 def _w8b_flow_det(blocks):
     total = 0.0
     for b in blocks:
@@ -15992,7 +16113,7 @@ class MultiScaleGlow:
         return sum(flow.param_count() for flow in self.scales)
 
 
-# --------------------------------------------------- PixelCNN / WaveNet ----
+# ---------- PixelCNN / WaveNet ----------
 def pixelcnn_mask(kernel_size=3, kind="A"):
     """PixelCNN 的掩码卷积核掩码（`kind='A'` 不遮中心，`'B'` 遮中心）。
 
@@ -16081,7 +16202,7 @@ def wavenet_dilations(levels=4, kernel_size=2):
     return d, rf
 
 
-# ------------------------------------------------------ 潜空间扩散（组合） --
+# ---------- 潜空间扩散（组合） ----------
 def latent_diffusion_shapes(image_shape, downsample=4):
     """潜空间扩散的尺寸换算：`(C,H,W) -> (C, H//ds, W//ds)`。"""
     if not isinstance(image_shape, (list, tuple)) or len(image_shape) != 3:
@@ -29457,7 +29578,7 @@ class RMSprop:
 
 # ============================================================================
 #  SGDW / Nesterov / Lookahead / SWA / EMA
-#
+#        
 #  前两个是「改更新式」，后三个是「在优化器之外维护一份权重」：
 #  Lookahead 包住任意优化器（需要 .step/.model），SWA / EMA 各自维护影子权重，
 #  训练完用 apply_to() 换进模型。三者都能被 fit(callbacks=...) 自动驱动
@@ -30932,7 +31053,9 @@ class CAME(_LayerwiseOptimizer):
 
 
 
-# ==== 进阶优化器：Shampoo / Sophia / L-BFGS ====
+# ============================================================================
+#  进阶优化器：Shampoo / Sophia / L-BFGS
+# ============================================================================
 #
 # 这三个都需要「整层」的信息（矩阵逆根 / Hessian 对角 / 历史位移对），
 # 因此同样挂在 `_LayerwiseOptimizer` 上；只支持二维 `Layer` 权重。
@@ -31469,7 +31592,9 @@ def clip_grad_by_value(all_grads, clip_val: float):
             gb[j] = max(-clip_val, min(clip_val, gb[j]))
 
 
-# ==== 学习率调度器族 ====
+# ============================================================================
+#  学习率调度器族
+# ============================================================================
 # 约定：epoch 从 1 开始（`Model.fit` 就是这么调的）；`step(epoch)` 直接赋值
 # `optimizer.lr`，因此调度器之间可以互相嵌套（`ChainedScheduler` / `SequentialLR`）。
 
@@ -33035,10 +33160,10 @@ class PreprocessCache:
 
 
 # ============================================================================
-#  ======================================================================
+# ============================================================================
 #  图像增强管道（Compose / RandomCrop / RandomResizedCrop /
-#          RandomRotation / ColorJitter / GaussianBlur / Normalize）
-#  ======================================================================
+#        RandomRotation / ColorJitter / GaussianBlur / Normalize）
+# ============================================================================
 
 def _aug3_check(x, who):
     """校验 (C, H, W) 浮点图像。"""
@@ -33437,6 +33562,7 @@ class Normalize:
         ]
 
 
+# ============================================================================
 #  编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
 # ============================================================================
 
@@ -33874,9 +34000,9 @@ def k_fold_indices(n_samples: int, n_splits: int = 5, shuffle: bool = True,
     return out
 
 
-#  ======================================================================
+# ============================================================================
 #  切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
-#  ======================================================================
+# ============================================================================
 
 def _w11d_int(value, who, name, minimum=None):
     """校验整数超参（bool 不算整数）。"""
@@ -34141,9 +34267,9 @@ class MinMaxScaler:
         return out
 
 
-#  ======================================================================
+# ============================================================================
 #  文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
-#  ======================================================================
+# ============================================================================
 
 def _w11h_tokens(tokens, who):
     if not isinstance(tokens, (list, tuple)):
@@ -34748,9 +34874,9 @@ def fvd_lite(frames_a, frames_b, embed_fn=None, eps=1e-10):
     var_term = sum((math.sqrt(var_a[i] + eps) - math.sqrt(var_b[i] + eps)) ** 2 for i in range(dim))
     return math.sqrt(max(0.0, mean_term + var_term))
 
-#  ======================================================================
+# ============================================================================
 #  降维 / 不平衡采样 / 特征选择
-#  ======================================================================
+# ============================================================================
 
 def _w11g_matrix(x, who):
     """校验纯数值二维矩阵（不允许 None），返回 (行数, 列数)。"""
@@ -35461,9 +35587,9 @@ class L1Selector:
             raise ValueError("L1Selector: 请先 fit")
         return list(self.support_)
 
-#  ======================================================================
+# ============================================================================
 #  缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
-#  ======================================================================
+# ============================================================================
 
 def _w11f_matrix(x, who):
     """校验二维矩阵，允许 `None` 表示缺失；返回 (行数, 列数, 缺失个数)。"""
@@ -35773,10 +35899,10 @@ class IterativeImputer:
     def fit_transform(self, x):
         return self.fit(x).transform(x)
 
-#  ======================================================================
+# ============================================================================
 #  Scaler 族（RobustScaler / MaxAbsScaler /
-#          QuantileTransformer / PowerTransformer）
-#  ======================================================================
+#        QuantileTransformer / PowerTransformer）
+# ============================================================================
 
 def _w11e_matrix(x, who):
     """校验二维数值矩阵，返回特征宽度。"""
@@ -36541,9 +36667,9 @@ class BytePairTokenizer:
         return f"BytePairTokenizer(vocab_size={self.vocab_size})"
 
 
-#  ======================================================================
+# ============================================================================
 #  特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
-#  ======================================================================
+# ============================================================================
 
 class SpecialTokens:
     """BOS / EOS / PAD / UNK / SEP / CLS / MASK 的**统一管理**。
@@ -36751,9 +36877,9 @@ def tokenize_batch(tokenizer, texts, max_len=None, pad_value=0, truncate="post",
                            truncate=truncate, padding=padding)
 
 
-#  ======================================================================
+# ============================================================================
 #  分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
-#  ======================================================================
+# ============================================================================
 
 def _w12b_text(text, who):
     if not isinstance(text, str):
@@ -45837,6 +45963,7 @@ def eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=
         },
     }
 
+# ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================
 
@@ -48037,7 +48164,9 @@ def _w19c_metric_map(metrics, what):
         out[key] = value
     return out
 
-# ==== 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据 ====
+# ============================================================================
+#  实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+# ============================================================================
 
 def git_hash(directory=None):
     """尽力取当前 git HEAD；取不到返回 None（不是所有环境都有 git 或仓库）。
@@ -48109,7 +48238,7 @@ class ExperimentTracker:
         self.path = None
         self._finished = False
 
-    # --- 生命周期 ---
+    # ---------- 生命周期 ----------
     def __enter__(self):
         self.start()
         return self
@@ -48170,7 +48299,7 @@ class ExperimentTracker:
         self._write(status=status, error=error)
         return self.path
 
-    # --- 序列化 ---
+    # ---------- 序列化 ----------
     def to_dict(self, status="running", error=None):
         record = {
             "format": 1,
@@ -48297,7 +48426,9 @@ def load_model_metadata(path):
     return meta
 
 
-# ==== 回归基线快照（固定 seed 下数值存 JSON，CI 比对） ====
+# ============================================================================
+#  回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+# ============================================================================
 
 _W18C_FORMAT = 1
 
@@ -48504,7 +48635,9 @@ def baseline_model(layer_sizes=(3, 4, 2), seed=12345,
     return MLP(list(layer_sizes), activations=list(activations))
 
 
-# ==== 集成测试 / doctest / 属性测试的运行时支撑 ====
+# ============================================================================
+#  集成测试 / doctest / 属性测试的运行时支撑
+# ============================================================================
 
 def run_doctests(module=None, verbose=False, optionflags=None, require_examples=True):
     """运行 docstring 里的 `>>>` 示例，返回 `{"attempted", "failed", "failures"}`。
@@ -48597,9 +48730,9 @@ def check_shape_consistency(model, x):
         out.append(list(cur))
     return out, info
 
-# ======================================================================
+# ============================================================================
 #  领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-# ======================================================================
+# ============================================================================
 
 
 class _w17e3_relu2d:
@@ -49029,9 +49162,9 @@ def nms(boxes, scores, iou_threshold=0.5):
     return keep
 
 
-# ======================================================================
+# ============================================================================
 #  领域应用：视频（3D-CNN / Two-Stream 融合）
-# ======================================================================
+# ============================================================================
 
 
 def _w17e2b_clip(clip, who, in_channels=None):
@@ -49321,9 +49454,9 @@ class TwoStreamFusion:
         return self._grads
 
 
-# ======================================================================
+# ============================================================================
 #  领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-# ======================================================================
+# ============================================================================
 
 
 def _w17e2_points(points, who, dim=None):
@@ -49583,9 +49716,9 @@ class PointNetEncoder:
         self._grads = None
 
 
-# ========================================================================
+# ============================================================================
 #  领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-# ========================================================================
+# ============================================================================
 
 
 def _w17e_samples(samples, who):
@@ -49864,7 +49997,7 @@ class ConformerBlock:
         x = [[x[t][c] + half * f2[t][c] for c in range(self.d_model)] for t in range(T)]
         return [self.norm_out.forward(row) for row in x]
 
-# ========================================================================
+# ============================================================================
 # -*- coding: utf-8 -*-
 """TTS 轻量实现：FastSpeech 式声学模型 + Griffin-Lim 声码器。
 
@@ -49874,9 +50007,7 @@ _conv_sgd / mel_filterbank / frame_signal。
 """
 
 
-# ---------------------------------------------------------------------------
-# 小工具
-# ---------------------------------------------------------------------------
+# ---------- 小工具 ----------
 
 def _tts_check_pos_int(value, name, minimum=1):
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -49945,9 +50076,7 @@ def _tts_mag_frames(wave, n_fft, hop_length, window):
     return mags, phases
 
 
-# ---------------------------------------------------------------------------
-# Griffin-Lim 声码器
-# ---------------------------------------------------------------------------
+# ---------- Griffin-Lim 声码器 ----------
 
 def griffin_lim(magnitude, n_fft=None, hop_length=None, iterations=60,
                 seed=0, window=None):
@@ -50005,9 +50134,7 @@ def griffin_lim(magnitude, n_fft=None, hop_length=None, iterations=60,
     return y
 
 
-# ---------------------------------------------------------------------------
-# Mel → 线性幅度（最小二乘）
-# ---------------------------------------------------------------------------
+# ---------- Mel → 线性幅度（最小二乘） ----------
 
 def _tts_solve(a, b):
     """高斯消元解 a·x=b（a 为方阵）；奇异时抛 ValueError"""
@@ -50061,9 +50188,7 @@ def mel_to_linear(mel, mel_fb, eps=1e-10):
     return out
 
 
-# ---------------------------------------------------------------------------
-# FastSpeech 式声学模型（文本 → Mel，时长外部给定）
-# ---------------------------------------------------------------------------
+# ---------- FastSpeech 式声学模型（文本 → Mel，时长外部给定） ----------
 
 class TextToMel:
     """字符/词 id + 时长 → Mel 谱（非自回归，FastSpeech 简化版）。"""
@@ -50097,7 +50222,7 @@ class TextToMel:
         self.grad_out = None
         self._cache = None
 
-    # ---- 参数与更新 ----
+    # ---------- 参数与更新 ----------
     def _zero_grads(self):
         self.embedding.zero_grad()
         self.conv1.zero_grad()
@@ -50122,7 +50247,7 @@ class TextToMel:
         _dense_apply_sgd(self.out, self.grad_out, lr)
         self.grad_out = None
 
-    # ---- 校验 ----
+    # ---------- 校验 ----------
     def _check_ids(self, ids):
         if not isinstance(ids, (list, tuple)) or not ids:
             raise ValueError("TextToMel: ids 必须是非空列表")
@@ -50161,7 +50286,7 @@ class TextToMel:
     def _transpose(m):
         return [list(col) for col in zip(*m)]
 
-    # ---- 前向 ----
+    # ---------- 前向 ----------
     def forward(self, ids, durations):
         ids = self._check_ids(ids)
         durations = self._check_durations(ids, durations)
@@ -50189,7 +50314,7 @@ class TextToMel:
         }
         return mel
 
-    # ---- 反向 ----
+    # ---------- 反向 ----------
     def backward(self, dmel):
         if self._cache is None:
             raise RuntimeError("TextToMel.backward: 请先调用 forward")
@@ -50219,7 +50344,7 @@ class TextToMel:
         self._cache = None
         return None
 
-    # ---- 训练 ----
+    # ---------- 训练 ----------
     def loss_and_backward(self, ids, durations, target_mel):
         pred = self.forward(ids, durations)
         if not isinstance(target_mel, (list, tuple)) or \
@@ -50284,8 +50409,9 @@ def tts_synthesize(model, ids, durations, mel_fb, n_fft=None,
     return griffin_lim(linear, n_fft=n_fft, hop_length=hop_length,
                        iterations=iterations, seed=seed)
 
+# ============================================================================
 #  领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
-# ========================================================================
+# ============================================================================
 
 
 def _w17d_vector(vec, who, dim=None):
@@ -50638,9 +50764,9 @@ def retrieval_recall(truth, got):
     hits = len(set(truth) & set(got))
     return hits / float(len(truth))
 
-# ========================================================================
+# ============================================================================
 #  领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-# ========================================================================
+# ============================================================================
 
 
 def _w17c2_image(x, who, min_side=1):
@@ -50981,9 +51107,9 @@ class DnCNN:
             history.append(total / n)
         return history
 
-# ======================================================================
+# ============================================================================
 #  领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-# ======================================================================
+# ============================================================================
 
 
 def _w17c_image(x, who, min_side=2):
@@ -51256,9 +51382,9 @@ def style_transfer(content, style, extractor=None, steps=50, lr=0.02,
         "extractor": extractor,
     }
 
-# ======================================================================
+# ============================================================================
 #  领域应用：DeepFM / DIN
-# ======================================================================
+# ============================================================================
 
 
 def _w17b2_field_values(field_ids, field_values, num_fields, who):
@@ -51696,9 +51822,9 @@ class DIN:
         return total
 
 
-# ======================================================================
+# ============================================================================
 #  领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-# ======================================================================
+# ============================================================================
 
 
 def _w17b_rng(seed):
@@ -51886,7 +52012,7 @@ class NCF:
         self.out_w = [rng.gauss(0.0, std) for _ in range(fan_in)]
         self.out_b = 0.0
 
-    # --- 前向 -------------------------------------------------------
+    # ---------- 前向 ----------
     def _forward_one(self, user, item):
         u = _w17b_int(user, "NCF.scores", "user")
         i = _w17b_int(item, "NCF.scores", "item")
@@ -51917,7 +52043,7 @@ class NCF:
         """交互概率（sigmoid）。"""
         return [1.0 / (1.0 + math.exp(-z)) for z in self.scores(user_ids, item_ids)]
 
-    # --- 反向 -------------------------------------------------------
+    # ---------- 反向 ----------
     def loss_and_grads(self, user_ids, item_ids, labels):
         """二分类交叉熵 + 逐参数梯度；返回 `(loss, grads)`。"""
         if not isinstance(labels, (list, tuple)):
@@ -55655,6 +55781,7 @@ def embedding_visualize(data, labels=None, method="tsne", seed=42,
         "ascii": scatter_ascii(pts, labels=labels, width=width, height=height),
     }
 
+# ============================================================================
 #  可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
 # ============================================================================
 
@@ -55980,6 +56107,7 @@ def cam_ascii(heatmap, max_width=24):
     """把 [0,1] 热图渲染成 ASCII（复用 ``feature_maps_ascii`` 的字符表）。"""
     return feature_maps_ascii([heatmap], max_width=max_width)
 
+# ============================================================================
 #  可解释性：置换重要性 / 特征图字符画
 # ============================================================================
 
@@ -57611,9 +57739,7 @@ def pr_auc_score(y_true, y_score) -> float:
     return area
 
 
-# ---------------------------------------------------------------------------
-#  高级评估：Mahalanobis OOD / Conformal Prediction / 鲁棒性
-# ---------------------------------------------------------------------------
+# ---------- 高级评估：Mahalanobis OOD / Conformal Prediction / 鲁棒性 ----------
 
 def _feature_matrix_rows(features, who):
     """校验特征矩阵：非空、每行非空、等宽、元素为有限数字。"""
@@ -65143,7 +65269,7 @@ class RealNVP:
         self._adam = None
         self._init_adam()
 
-    # ---- 参数与状态 -------------------------------------------------
+    # ---------- 参数与状态 ----------
     def _params(self):
         out = []
         for lay in self.layers:
@@ -65168,7 +65294,7 @@ class RealNVP:
             total += len(layer.weights) * len(layer.weights[0]) + len(layer.biases)
         return total
 
-    # ---- 前向 / 反向 -----------------------------------------------
+    # ---------- 前向 / 反向 ----------
     def _split(self, x, mask):
         xa = [x[i] for i in range(len(x)) if mask[i]]
         xb = [x[i] for i in range(len(x)) if not mask[i]]
@@ -65278,7 +65404,7 @@ class RealNVP:
                         (_zeros_like(layer.weights), [0.0] * len(layer.biases)))
         return grad
 
-    # ---- 逆变换 / 似然 ---------------------------------------------
+    # ---------- 逆变换 / 似然 ----------
     def inverse(self, y):
         """把 ``y`` 映射回数据空间（与 ``forward`` 精确互逆，误差 ~1e-15）"""
         self._check_x(y)
@@ -65316,7 +65442,7 @@ class RealNVP:
             out.append(self.inverse(z))
         return out
 
-    # ---- 训练 -------------------------------------------------------
+    # ---------- 训练 ----------
     def train_step(self, x, lr=1e-3):
         """一步最大似然：最小化 nll = -log_prob(x)"""
         y, logdet = self.forward(x)
@@ -67168,7 +67294,7 @@ class LlamaModel:
         self._norm_out = None
         self.zero_grad()
 
-    # ---- 参数 / 梯度 --------------------------------------------------------
+    # ---------- 参数 / 梯度 ----------
     def zero_grad(self):
         self.embedding.zero_grad()
         for block in self.blocks:
@@ -67212,7 +67338,7 @@ class LlamaModel:
             block.eval()
         return self
 
-    # ---- 前向 / 反向 --------------------------------------------------------
+    # ---------- 前向 / 反向 ----------
     def forward(self, ids):
         """ids: List[int] → logits (T, vocab_size)（未 softmax）"""
         if not ids:
@@ -67447,7 +67573,7 @@ class ResNet:
         self._cache = None
         self.zero_grad()
 
-    # ---- 参数 / 梯度 --------------------------------------------------------
+    # ---------- 参数 / 梯度 ----------
     def zero_grad(self):
         self.stem.zero_grad()
         for stage in self.stages:
@@ -67483,7 +67609,7 @@ class ResNet:
                 block.eval()
         return self
 
-    # ---- 前向 / 反向 --------------------------------------------------------
+    # ---------- 前向 / 反向 ----------
     @staticmethod
     def _relu3(x):
         return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
@@ -67844,7 +67970,7 @@ class BertModel:
         d_h = [[0.0] * self.d_model for _ in range(len(h))]
         loss = 0.0
 
-        # ---- MLM：只在给定位置算交叉熵 ----
+        # ---------- MLM：只在给定位置算交叉熵 ----------
         mask_positions = list(mask_positions or [])
         mask_labels = list(mask_labels or [])
         if len(mask_positions) != len(mask_labels):
@@ -67878,7 +68004,7 @@ class BertModel:
                     d_h[pos][j] += dvw * wrow[j]
                 self.grads["b_mlm"][v] += dvw
 
-        # ---- NSP：取第 0 个位置（[CLS]）的二分类 ----
+        # ---------- NSP：取第 0 个位置（[CLS]）的二分类 ----------
         if nsp_label is not None:
             if isinstance(nsp_label, bool) or not isinstance(nsp_label, int) \
                     or nsp_label not in (0, 1):
@@ -67899,7 +68025,7 @@ class BertModel:
                     d_h[0][j] += dv * wrow[j]
                 self.grads["b_nsp"][v] += dv
 
-        # ---- 反向穿过编码器与 embedding ----
+        # ---------- 反向穿过编码器与 embedding ----------
         d_enc = self.encoder.backward(d_h)
         self.token_embedding.backward(d_enc)
         self.seg_embedding.backward(d_enc)

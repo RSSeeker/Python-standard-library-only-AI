@@ -178,7 +178,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `DenseBlock` | 稠密连接块：每层 `BN → ReLU → 3x3 Conv`，输出与输入在通道维拼接；`(Cin,H,W) → (Cin+growth*num_layers,H,W)`，BN 梯度收在 `bn_grads` |
 | `ConvNeXtBlock` | ConvNeXt：`7x7 depthwise Conv → LayerNorm（逐位置跨通道）→ 1x1 升维 → GELU → 1x1 降维` + 残差 |
 | `AdaptiveMaxPool2d(out_size)` | 自适应最大池化，bin 边界与 `AdaptiveAvgPool2d` 同一套规则；`(2)` 与 `MaxPool2d(2)` 逐位相同 |
-| `LPPool2d(norm_type, kernel_size, stride=None)` | Lp 池化：`(Σ|x|^p/area)^(1/p)`，`norm_type=1` 退化为平均、趋向 ∞ 逼近最大 |
+| `LPPool2d(norm_type, kernel_size, stride=None)` | Lp 池化：`(Σ\|x\|^p/area)^(1/p)`，`norm_type=1` 退化为平均、趋向 ∞ 逼近最大 |
 | `FractionalMaxPool2d(output_ratio=(0.5,0.5), rng=None)` | 分数最大池化：相邻窗口按比例重叠，起点在允许范围内随机（可注入 `random.Random` 复现） |
 | `StochasticPool2d(kernel_size, stride=None, rng=None)` | 随机池化：按 `relu(x)/Σrelu` 采样一个位置输出原值（训练）或概率加权期望（`eval()`） |
 | `ConditionalNorm(features, cond_dim)` | 条件归一化（CiM）：`gamma = 1 + W_g·c + b_g`、`beta = W_b·c + b_b`，反向同时给出 `grad_cond` |
@@ -255,7 +255,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 |---|---|
 | `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同**；`release=True` 时每段结束丢弃 `input/z/a`，真正把激活峰值压到 O(段数) |
 | `checkpoint_transformer(encoder, x_seq, dout_seq, segments=2)` | TransformerEncoder 版梯度检查点：前向只保留段边界，段内每层 Q/K/V、注意力权重与 FFN 中间激活全部释放；反向逐段重放并逐层回传，参数梯度累积回各层；与 `encoder.forward`+`backward` 逐位相同 |
-| `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`|v| > 65504` 返回 `inf`，低于次正规返回 0 |
+| `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`\|v\| > 65504` 返回 `inf`，低于次正规返回 0 |
 | `bf16_round(value)` | 舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even） |
 | `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
 | `quantize_model(model, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | 把权重与偏置**原地**舍入到低精度，用于模拟部署 |
@@ -390,11 +390,11 @@ model.train()     # 回到训练
 |------|------|
 | `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`window=N` → 滑动窗口局部因果；`rope=True` → Q/K 旋转位置编码；`dropout>0` → 注意力权重 dropout） |
 | `FeedForward(d_model, d_ff, activation='relu')` | 前馈网络（`activation` 可选 relu/gelu/sigmoid/silu/mish/elu/selu/linear） |
-| `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN；`gate="swish|silu|gelu|relu|bilinear"` 对应 GeGLU / ReGLU / Bilinear GLU |
+| `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN；`gate="swish\|silu\|gelu\|relu\|bilinear"` 对应 GeGLU / ReGLU / Bilinear GLU |
 | `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
 | `VAE(input_dim, hidden_dim=32, latent_dim=2, beta=1.0)` | 变分自编码器：重参数化采样 `z = mu + eps·std`，损失 = 重构 MSE + `beta·KL`；`fit` / `sample` |
-| `ActNorm(dim)` / `InvertibleLinear(dim, noise=0.05, seed=0)` | Glow 的两个可逆组件：`ActNorm` 做逐维仿射 `y=(x-b)·e^{log_s}`（`data_init(batch)` 按首批均值/方差初始化，`logdet = Σlog_s` 与输入无关）；`InvertibleLinear` 做 `y=Wx`，`log|det J|=log|det W|` **精确**（LU + 部分主元），`inverse` 用高斯消元求解而非矩阵求逆；两者都有 `backward`（`InvertibleLinear` 的 `g_W` 含 `g_logdet·W^{-T}` 项）与 `sgd_step`/`adam_step` |
-| `RealNVP(data_dim=2, hidden_dim=16, num_layers=4, scale_limit=1.0)` | 仿射耦合流：`s = scale_limit·tanh(W_s2 σ(W_s1 x_a+b_s1)+b_s2)`、`y_b = x_b·e^s + t`，`log|det J| = Σs` **精确**；`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 给真密度、`nll`/`fit`/`sample`；`tanh` 限幅避免 `exp` 溢出（教学简化，原论文用自由 scale） |
+| `ActNorm(dim)` / `InvertibleLinear(dim, noise=0.05, seed=0)` | Glow 的两个可逆组件：`ActNorm` 做逐维仿射 `y=(x-b)·e^{log_s}`（`data_init(batch)` 按首批均值/方差初始化，`logdet = Σlog_s` 与输入无关）；`InvertibleLinear` 做 `y=Wx`，`log\|det J\|=log\|det W\|` **精确**（LU + 部分主元），`inverse` 用高斯消元求解而非矩阵求逆；两者都有 `backward`（`InvertibleLinear` 的 `g_W` 含 `g_logdet·W^{-T}` 项）与 `sgd_step`/`adam_step` |
+| `RealNVP(data_dim=2, hidden_dim=16, num_layers=4, scale_limit=1.0)` | 仿射耦合流：`s = scale_limit·tanh(W_s2 σ(W_s1 x_a+b_s1)+b_s2)`、`y_b = x_b·e^s + t`，`log\|det J\| = Σs` **精确**；`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 给真密度、`nll`/`fit`/`sample`；`tanh` 限幅避免 `exp` 溢出（教学简化，原论文用自由 scale） |
 | `GAN(input_dim, hidden_dim=32, latent_dim=2, variant="bce")` | 生成对抗网络：`variant` 选判别器损失 `bce` / `lsgan` / `wgan` / `hinge`（非 bce 时 `d2` 输出裸分数，`score()` 拿原始值、`discriminate()` 仍返回概率）；G 的梯度经 D 反传；`step` 一次更新 D 与 G，`wgan` 每步把判别器权重裁到 `±clip_value`（默认 0.01，不裁会发散）；`r1_penalty` 是**诊断量**（单阶反向没有二阶图，不参与更新） |
 | `DDPM(data_dim, hidden_dim=32, steps=50, prediction="eps")` | 扩散模型：线性 beta 表 + 累积 `abar`；`prediction` 可选 `eps`/`v`/`x0`（`target()` 与 `pred_to_x0_eps()` 互为反函数）；`q_sample` 加噪、`sample` DDPM 反向去噪、`ddim_sample(steps=, eta=)` 确定性 DDIM（可只走子序列）；`train_step(..., min_snr_gamma=)` 按 `min(SNR, γ)/SNR` 加权 |
 | `VQVAE(input_dim, hidden_dim=32, latent_dim=2, num_codes=8, beta=0.25)` | 向量量化自编码器：`encode` / `quantize` / `decode`，重构 + 码本 + commitment 三项损失，straight-through 反向；`codebook_histogram()` 看码字使用 |
@@ -506,7 +506,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `VeRA(layer, rank=4, alpha=None, seed=None)` | 共享冻结随机投影 + 可训练逐秩缩放：`A`/`B` 随机生成后冻结，只训 `d`（`rank` 个标量），`y = Layer(x) + scaling·B(d ⊙ Ax)`；`merge()` 可折回原层 |
 | `ReFT(layer, rank=2, alpha=None, seed=None)` | 低秩表示干预：`P` 冻结随机投影（`rank×fan_out`），只训 `W`（`rank×fan_out`）与 `b`（`rank`），`y = Layer(x) + scaling·Pᵀ(W·Layer(x)+b)`；包装任意 `Layer`，不做 merge |
 | `DoRALinear(layer, rank=4, alpha=None)` | DoRA：权重拆成「幅度 `m` × 方向 `V`」，LoRA 只改方向（`W' = m·Weff/‖Weff‖`），`V`/`m` 也可训；`B=0` 时与原层逐位一致，`merge()` 折回原层 |
-| `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `|A_r|·|B_:,r|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
+| `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `\|A_r\|·\|B_:,r\|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
 | `Lion(model, lr=1e-4, beta1=0.9, beta2=0.99)` | 符号动量优化器：更新量恒为 `±lr`（+ 解耦 wd），只存一份动量；**lr 通常比 Adam 小一个量级** |
 | `Adafactor(model, lr=1e-3, eps2=1e-3, weight_decay=0.0)` | 行列因子化二阶矩，显存 O(m+n)；乘相对步长 `max(eps2, rms(g))`，所以 lr 语义比 Adam 小一个量级 |
@@ -848,6 +848,7 @@ m = AI.Seq2SeqLM.load("s2s.json")
   否则展开 `num_beams` 个。`Seq2SeqLM` 的束搜索会把以 `eos_id` 结尾的候选放进「已完成」再统一比较。
 - `top_k` 必须是 `>= 0` 的整数；`generate` 会校验源序列长度不超过 `max_len`、token id 在词表内
   （这两条原来只有 `forward` 检查，生成路径会绕过它们）。
+
 ### KAN（Kolmogorov-Arnold Network）
 
 KAN 把「激活函数在节点上」换成「边上是可学习的 B 样条函数」：每个输入-输出连接带一组
@@ -1227,7 +1228,7 @@ x_filled = iter_imp.transform(train_x)
 | 类 | 变换 | 特点 |
 |---|---|---|
 | `RobustScaler(with_centering=True, with_scaling=True, quantile_range=(25,75))` | `(x - 中位数) / IQR` | 对离群点不敏感；IQR 为 0 时按 1 处理 |
-| `MaxAbsScaler()` | `x / max|x|` | 不中心化，保留稀疏结构 |
+| `MaxAbsScaler()` | `x / max\|x\|` | 不中心化，保留稀疏结构 |
 | `QuantileTransformer(n_quantiles=100, output_distribution='uniform', subsample=None, seed=42)` | 分位数映射到 `[0,1]` 均匀分布，或再套正态分位函数 | 非线性；可以把任意单调变形「拉平」 |
 | `PowerTransformer(method='yeo-js', standardize=True)` | Box-Cox / Yeo-Johnson 幂变换 | 每个特征单独估 `lambda`（黄金分割搜索最大化对数似然），之后零均值单位方差 |
 
@@ -1315,7 +1316,7 @@ WAV 读写与重采样），用来演示「训练时对输入加扰动」这类�
 | `eda_augment(tokens, synonyms, num_aug=4, alpha_sr=0.1, alpha_ri=0.1, alpha_rs=0.1, p_rd=0.1, seed=None)` | 依次做 替换→插入→交换→删除，返回 `num_aug` 个副本（不含原句） |
 | `audio_gain(waveform, db=0.0)` | 振幅缩放 `10**(db/20)` |
 | `audio_add_noise(waveform, snr_db=10.0, seed=None)` | 按整体信号/噪声功率比加高斯白噪声；全零波形原样返回 |
-| `audio_time_shift(waveform, shift=0, fill=0.0)` | 整段平移，空位填 `fill`（要求 `|shift| < len`） |
+| `audio_time_shift(waveform, shift=0, fill=0.0)` | 整段平移，空位填 `fill`（要求 `\|shift\| < len`） |
 | `audio_clip(waveform, limit=1.0)` | 硬限幅，模拟削波 |
 | `audio_polarity_invert(waveform)` | 极性反转 |
 
@@ -1630,8 +1631,8 @@ print(adjusted_rand_score(y, [7, 7, 3, 3]))  # 1.0（标签重命名不影响）
 
 | 函数 | 说明 |
 |---|---|
-| `expected_calibration_error(y_true, y_proba, n_bins=10, strategy=)` | ECE：`Σ (n_b/N)·|acc_b − conf_b|` |
-| `maximum_calibration_error(...)` | MCE：各非空箱 `|acc_b − conf_b|` 的最大值 |
+| `expected_calibration_error(y_true, y_proba, n_bins=10, strategy=)` | ECE：`Σ (n_b/N)·\|acc_b − conf_b\|` |
+| `maximum_calibration_error(...)` | MCE：各非空箱 `\|acc_b − conf_b\|` 的最大值 |
 | `reliability_diagram(...)` | 非空箱列表：`{"lo","hi","count","confidence","accuracy"}` |
 
 ```python
@@ -1803,7 +1804,7 @@ print(equal_opportunity_difference([1, 0, 1, 0], y_pred,
 | `ms_ssim_score(a, b, weights=(...))` | 多尺度 SSIM：CS 项连乘 + 末级亮度 |
 | `fid_score(features_a, features_b)` | `‖Δμ‖² + tr(Σa+Σb−2(ΣaΣb)^{1/2})` |
 | `kid_score(features_a, features_b)` | RBF 核无偏 MMD²（`σ` 取成对距离中位数） |
-| `inception_score(probs)` | `exp(mean KL(p(y|x)‖p(y)))` |
+| `inception_score(probs)` | `exp(mean KL(p(y\|x)‖p(y)))` |
 
 ```python
 a = [[[0.0, 1.0], [1.0, 0.0]]]          # (C, H, W) 嵌套列表
@@ -1935,7 +1936,7 @@ recon = sae.decode(f)
 |---|---|
 | `SAE(d_in, d_hidden=64, l1_coeff=1e-3, seed=None)` | 单层稀疏自编码器：`f = relu(W_enc x + b_enc)`、`x_hat = W_dec f + b_dec`，参数随机初始化 |
 | `SAE.forward(xs)` / `encode(x)` / `decode(f)` | 批量前向返回 `{'recon','features','pre'}`；单样本编码/解码 |
-| `SAE.loss_and_backward(xs)` | 重建 MSE + `l1_coeff * mean(|f|)` 稀疏损失，手写反向并累积梯度 |
+| `SAE.loss_and_backward(xs)` | 重建 MSE + `l1_coeff * mean(\|f\|)` 稀疏损失，手写反向并累积梯度 |
 | `SAE.fit(xs, epochs=100, lr=0.01, seed=None)` / `sgd_step(lr)` | 全批量 SGD，返回每轮 `{'loss','mse','l1'}` |
 | `SAE.feature_stats(xs)` / `param_count()` | 每个隐藏特征的激活比例、dead feature 数与平均激活数 / 参数量 `2*d_in*d_hidden+d_in+d_hidden` |
 
@@ -1975,7 +1976,7 @@ print(sparsity_report(net))
 | `quantize_weights(model, bits=8)` | 训练后量化（PTQ）：每层一个 scale，写入反量化值并返回 `{"bits","scales","codes"}`（`codes` 是真 int 编码） |
 | `quantization_error(model, bits=8)` | 逐层量化前后的最大 / 平均绝对误差（不改模型） |
 | `qat_grads(model, xs, ys, bits=8)` | QAT 的直通估计梯度：在伪量化权重上前向反传，返回各层平均梯度 |
-| `smooth_quant_scale(activation_peak, weight_peak, alpha=0.5)` | SmoothQuant 缩放因子 `s = max|x|^α / max|w|^(1-α)` |
+| `smooth_quant_scale(activation_peak, weight_peak, alpha=0.5)` | SmoothQuant 缩放因子 `s = max\|x\|^α / max\|w\|^(1-α)` |
 | `smooth_quant_apply(layer, scales)` | 把缩放折进权重列（`W[:, j] *= s_j`），激活端需自行除以 `s_j` |
 | `NF4_LEVELS` | QLoRA 的 16 个 4-bit 正态分位点（从 −1 到 1，非均匀间隔） |
 | `nf4_quantize(value, block_size=64)` | 按 absmax 分块做 NF4 量化，返回 `{"codes", "scales", "block_size", "length"}` |
@@ -2693,7 +2694,7 @@ shaped = AI.rlhf_reward([1.0, 0.0], [-0.2, -1.0], [-0.2, -0.6], beta=0.5)
 | `maml_outer_grads(model, tasks, ...)` | 一阶 MAML 外循环梯度；`tasks` 每项是 `(support_x, support_y, query_x, query_y)` |
 | `reptile_step(model, tasks, inner_lr, inner_steps, meta_lr)` | 朝「各任务适配后参数的均值」走一步，原地更新 |
 | `prototype_embeddings(embeddings, labels)` | 每类嵌入均值（原型） |
-| `prototype_logits(query, prototypes, temperature=1.0)` | `-||q-p_c||^2 / T`，返回 `(logits, labels)` |
+| `prototype_logits(query, prototypes, temperature=1.0)` | `-\|\|q-p_c\|\|^2 / T`，返回 `(logits, labels)` |
 | `prototypical_loss(query, y, support, y_support, temperature)` | ProtoNet 损失 + 对查询嵌入的梯度 |
 | `matching_attention(query, support, temperature=1.0)` | 余弦相似度 softmax（Matching Networks） |
 | `matching_logits(query, support, y_support, num_classes)` | 注意力按标签累加成类概率 |
@@ -2721,7 +2722,7 @@ loss, d_query = prototypical_loss(query_emb, query_labels, support_emb, support_
 | `named_params(model)` | 把 MLP 参数摊平成 `{"L0.W": [...], "L0.b": [...]}`（行主序） |
 | `load_named_params(model, params)` | 逆操作，形状不符直接报错 |
 | `fedavg(updates, weights=None)` | 按客户端权重对同名参数加权平均 |
-| `fedprox_penalty(local, global_params, mu=0.01)` | 近端项 `0.5*mu*||local-global||²` 及其梯度 |
+| `fedprox_penalty(local, global_params, mu=0.01)` | 近端项 `0.5*mu*\|\|local-global\|\|²` 及其梯度 |
 | `fedbn_split(update, private_prefixes=("bn.","norm."))` | 拆成「共享」与「私有」两组参数 |
 | `fedbn_average(updates, private_prefixes, weights=None)` | 只平均共享参数，私有参数各自保留 |
 
@@ -2904,7 +2905,7 @@ print(dn.denoise(noisy)[0][0])
 
 | 接口 | 说明 |
 |------|------|
-| `BruteForceIndex(metric='l2'|'ip', dim=None)` | 暴力线性扫描，结果与精确最近邻逐位一致；`add` / `search(query, k)` / `__len__` |
+| `BruteForceIndex(metric='l2'\|'ip', dim=None)` | 暴力线性扫描，结果与精确最近邻逐位一致；`add` / `search(query, k)` / `__len__` |
 | `IVFIndex(n_clusters=2, n_probe=1, n_iter=10, metric='l2', dim=None, seed=None)` | 先 k-means 分簇再只扫最近的 `n_probe` 个簇；`train()` 在 `add` 之后调用 |
 | `NSWIndex(m=6, ef_search=16, metric='l2', dim=None)` | **单层**可导航小世界图（贪心束搜索），不是分层 HNSW |
 | `retrieval_recall(truth, got)` | 两个 id 列表的交集比例 |
@@ -3151,7 +3152,7 @@ print(rep["ok"], rep["checked"], rep["worst"])
 遍历，把每个带 `weights` / `biases` / `forward` / `backward` / `fan_in` 的模块挑出来，
 各自验证：
 
-```
+```text
 x = U(-1, 1)^fan_in            y = layer.forward(x)
 dout = U(-1, 1)^len(y)         gw, gb, _ = layer.backward(dout)
 比对 d<dout, y> / dparam       与解析的 gw / gb
@@ -3318,7 +3319,7 @@ print(early["exit_layer"], early_exit_savings(early["exit_layer"], 3)["savings"]
 
 | API | 语义 |
 |-----|------|
-| `weight_mask(model, keep_ratio=0.5)` | 按 `|w|` 生成**跨层统一阈值**的布尔掩码 |
+| `weight_mask(model, keep_ratio=0.5)` | 按 `\|w\|` 生成**跨层统一阈值**的布尔掩码 |
 | `mask_sparsity(mask)` | 掩码的零比例 |
 | `apply_weight_mask(model, mask)` | 把掩码外权重清零，返回清零个数 |
 | `masked_reinit(model, mask, seed=None)` | 掩码内重新做 He 初始化，掩码外清零 |
@@ -3464,7 +3465,7 @@ weights = AI.safetensors_load("weights.safetensors")
 | `export` | 导出「模型 + 元数据」包装 | `--model` `--out`，元数据来自 `model_metadata` |
 | `finetune` | 在已有模型上继续训练 | `--model` `--data` `--out` `--epochs` `--lr` |
 
-```
+```bash
 python ai_cli.py train  --data train.json --out model.json --task classification --hidden 16
 python ai_cli.py predict --model model.json --input x.json --classes
 python ai_cli.py eval    --model model.json --data test.json
@@ -3522,7 +3523,7 @@ AI.save_model_metadata("model.json", AI.model_metadata(model, metrics={"acc": 0.
 
 实测（`n_samples=30`、`n_test=150`、`seed=7`，`test_mse` 保留 4 位）：
 
-```
+```text
 dims      4       8       16      24      30       40      60      120
 test_mse  0.8891  0.7027  0.7165  2.9952  11.9403  2.9237  0.4788  0.8663
 train_mse 9.1e-01 5.4e-01 4.1e-01 9.7e-02 6.4e-21 6.1e-23 5.9e-25 1.2e-25
@@ -3832,7 +3833,7 @@ print(g.out_shape(), g.param_count(), score, gp["penalty"])
 |-----|------|
 | `vp_beta(t, beta_min=0.1, beta_max=20.0)` / `vp_diffusion` / `vp_drift` / `vp_marginal_std` | VP-SDE 的线性 `β(t)`、`g(t)=√β`、漂移 `−½βx`、边缘标准差 `√(1−e^{−∫β})` |
 | `ve_sigma(t, sigma_min=0.01, sigma_max=50.0)` / `ve_diffusion` | VE-SDE 的对数插值 `σ(t)` 与 `g(t)=√(2σ²·log(σ_max/σ_min))` |
-| `reverse_sde_step(x, t, score, dt, noise=None, kind='ve')` / `probability_flow_step(...)` | 单步反向 SDE（`dx = f dt − g²∇log p dt + g√|dt| z`）与概率流 ODE（去掉噪声项）；`dt` 必须为负 |
+| `reverse_sde_step(x, t, score, dt, noise=None, kind='ve')` / `probability_flow_step(...)` | 单步反向 SDE（`dx = f dt − g²∇log p dt + g√\|dt\| z`）与概率流 ODE（去掉噪声项）；`dt` 必须为负 |
 | `ncsn_loss(score_fn, xs, sigmas, seed=None)` | 去噪分数匹配的逐 σ 平均，返回 `(loss, info)`，`info["per_sigma"]` 分开给 |
 | `annealed_langevin_sample(score_fn, x0, sigmas, steps_per_sigma=10, epsilon=0.01, seed=None)` | 退火 Langevin 采样（每个 σ 走若干步，步长按 `ε·σ²/σ_last²` 缩放） |
 | `ebm_langevin(grad_energy, x0, steps, step_size, noise, seed=None)` | 能量模型的 Langevin 采样：`x ← x − η∇E + √(2η)·noise` |
@@ -4397,7 +4398,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInfoNCELoss` | loss 与闭式公式一致 / 四个梯度 vs 数值 / 难负样本 loss 更大 / 非法参数 |
 | `TestDiceLoss` | loss 与公式一致 / 梯度 vs 数值 / 完美预测≈0 / 形状不一致报错 |
 | `TestCTCLoss` | loss 与穷举所有对齐路径一致 / 梯度 vs 数值 / 不可达与非法标签 |
-| `TestLayerwiseOptimizers` | LARS/LAMB 与手写参考逐步逐位一致、LARS 零权重回落 `lr`、LAMB 的 `trust_clip` 单调、Ranger 第一步是纯动量且 Lookahead 后 `fast == slow`、三者 `state_dict` 往返续训逐位一致（需连权重一起搬）、非法超参 || `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
+| `TestLayerwiseOptimizers` | LARS/LAMB 与手写参考逐步逐位一致、LARS 零权重回落 `lr`、LAMB 的 `trust_clip` 单调、Ranger 第一步是纯动量且 Lookahead 后 `fast == slow`、三者 `state_dict` 往返续训逐位一致（需连权重一起搬）、非法超参 |
+| `TestClassicOptimizers` | AdaGrad/AdaDelta/Nadam/RAdam 与手写参考逐步逐位一致、AdaGrad 步长单调不增、AdaDelta 尺度不变、Nadam(b1=0) 退化、RAdam 动量相→修正相、state_dict 往返续训逐位一致（含别名回归）、非法超参 |
 | `TestSGDWFamily` | `wd=0/mu=0` 时 `SGDW` 与 `SGD` 逐位相同、纯衰减时 `p *= 1-lr·wd`、`NesterovSGD` 三步与手写参考一致 |
 | `TestLookahead` | 只在第 `k` 步同步、`alpha=0.5` 恰为中点、`Lookahead(Adam)` 的 `state_dict` 续训逐位一致 |
 | `TestEMAAndSWA` | EMA 三步闭式解、warmup 有效衰减、SWA 增量均值 == 算术均值、两者存档往返、非法输入 |
@@ -4703,7 +4705,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 
 ## 文件结构
 
-```
+```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
 ├── test_ai.py       # 2226 个单元测试
