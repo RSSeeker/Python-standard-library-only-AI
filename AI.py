@@ -26441,6 +26441,158 @@ class CausalLM:
         return ids
 
 
+
+class MTPLanguageModel(CausalLM):
+    """带多 token 预测（MTP）头的因果语言模型
+
+    在主语言模型之外，为每个「未来偏移」k=1..num_future 增加一个独立
+    线性头：用位置 t 的隐状态 h_t 预测 ids[t + k + 1]（主头预测 ids[t+1]）。
+    训练损失 = 主交叉熵 + mtp_weight * 各未来头交叉熵均值。
+
+    简化点：
+      - 每个未来头只做一层线性投影（不额外串一层 Transformer block）；
+      - 未来头的隐状态直接复用主模型编码器的输出 h_t，不额外做归一化；
+      - 训练仍按序列 teacher forcing，不做跨样本的 token 级打包。
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, num_heads: int = 4,
+                 d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
+                 dropout: float = 0.0, rope: bool = False, use_abs_pos=None,
+                 window: int = None, num_kv_heads: int = None,
+                 alibi: bool = False, num_future: int = 1,
+                 mtp_weight: float = 0.5):
+        if (not isinstance(num_future, int) or isinstance(num_future, bool)
+                or num_future < 0 or num_future > 8):
+            raise ValueError(f"MTPLanguageModel: num_future 必须是 0..8 的整数，收到 {num_future!r}")
+        if (not isinstance(mtp_weight, (int, float)) or isinstance(mtp_weight, bool)
+                or not math.isfinite(float(mtp_weight))
+                or not (0.0 < float(mtp_weight) <= 1.0)):
+            raise ValueError(
+                f"MTPLanguageModel: mtp_weight 必须是 (0, 1] 内的有限数字，收到 {mtp_weight!r}")
+        self.num_future = int(num_future)
+        self.mtp_weight = float(mtp_weight)
+        # 先铺好 MTP 参数，父类 __init__ 里会调用被重写的 zero_grad()
+        std = math.sqrt(2.0 / d_model) if isinstance(d_model, (int, float)) and d_model > 0 else 0.0
+        self.mtp_W = [[[random.gauss(0.0, std) for _ in range(d_model)]
+                       for _ in range(vocab_size)] for _ in range(self.num_future)]
+        self.mtp_b = [[0.0] * vocab_size for _ in range(self.num_future)]
+        super().__init__(vocab_size, d_model, num_heads, d_ff, num_layers,
+                         max_len, dropout, rope, use_abs_pos, window,
+                         num_kv_heads, alibi)
+
+    # ---------- 参数 / 梯度 ----------
+
+    def zero_grad(self):
+        super().zero_grad()
+        self.mtp_grad_W = [[[0.0] * self.d_model for _ in range(self.vocab_size)]
+                           for _ in range(self.num_future)]
+        self.mtp_grad_b = [[0.0] * self.vocab_size for _ in range(self.num_future)]
+
+    def _named_params(self):
+        for name, param, grad in super()._named_params():
+            yield name, param, grad
+        for k in range(self.num_future):
+            yield f"mtp{k}.W", self.mtp_W[k], self.mtp_grad_W[k]
+            yield f"mtp{k}.b", self.mtp_b[k], self.mtp_grad_b[k]
+
+    # ---------- 训练 ----------
+
+    def _mtp_extra_loss_and_backward(self, ids, key_mask, valid, grad_scale):
+        """在已前向的缓存 h 上计算未来头损失并累积梯度；返回未来头平均损失。"""
+        if self.num_future <= 0:
+            self._mtp_last_loss = 0.0
+            return 0.0
+        h = self.h
+        if h is None:
+            raise RuntimeError("MTPLanguageModel: 前向缓存缺失，无法回传 MTP 头梯度")
+        d_model = self.d_model
+        vocab = self.vocab_size
+        total = 0.0
+        dh = [[0.0] * d_model for _ in range(len(h))]
+        for k in range(1, self.num_future + 1):
+            offset = k + 1
+            W = self.mtp_W[k - 1]
+            b = self.mtp_b[k - 1]
+            gW = self.mtp_grad_W[k - 1]
+            gb = self.mtp_grad_b[k - 1]
+            n = 0
+            loss_k = 0.0
+            dh_k = [[0.0] * d_model for _ in range(len(h))]
+            for t in range(0, len(h) - offset + 1):
+                target_idx = t + offset
+                if target_idx >= len(ids):
+                    continue
+                if valid is not None and (not valid[t] or not valid[target_idx]):
+                    continue
+                target = ids[target_idx]
+                ht = h[t]
+                scores = [sum(W[v][j] * ht[j] for j in range(d_model)) + b[v]
+                          for v in range(vocab)]
+                probs = _softmax_row(scores)
+                p = probs[target]
+                loss_k += -math.log(p if p > 1e-12 else 1e-12)
+                d = list(probs)
+                d[target] -= 1.0
+                for v in range(vocab):
+                    dv = d[v]
+                    gb[v] += dv
+                    row = gW[v]
+                    for j in range(d_model):
+                        row[j] += dv * ht[j]
+                for j in range(d_model):
+                    s = 0.0
+                    for v in range(vocab):
+                        s += d[v] * W[v][j]
+                    dh_k[t][j] += s
+                n += 1
+            if n == 0:
+                continue
+            total += loss_k / n
+            inv = (grad_scale * self.mtp_weight) / (self.num_future * n)
+            for t in range(len(h)):
+                for j in range(d_model):
+                    dh[t][j] += inv * dh_k[t][j]
+            # gW / gb 已按未缩放累加，统一缩放到梯度缓冲
+            for v in range(vocab):
+                row = gW[v]
+                for j in range(d_model):
+                    row[j] *= inv
+                gb[v] *= inv
+        if total > 0.0:
+            d_seq = self.encoder.backward(dh)
+            self.embedding.backward(d_seq)
+        mean = total / self.num_future
+        self._mtp_last_loss = mean
+        return mean
+
+    def _loss_and_backward(self, ids, pad_mask=None, grad_scale: float = 1.0):
+        """主交叉熵 + MTP 未来头交叉熵（共享主干反向）"""
+        main = super()._loss_and_backward(ids, pad_mask, grad_scale)
+        valid = None
+        if pad_mask is not None:
+            valid = _check_pad_mask(pad_mask, len(ids), "MTPLanguageModel._loss_and_backward")
+        mtp = self._mtp_extra_loss_and_backward(
+            _check_token_ids(ids, self.vocab_size, "MTPLanguageModel._loss_and_backward"),
+            None, valid, grad_scale)
+        total = main + self.mtp_weight * mtp
+        self._last_main_loss = main
+        return total
+
+    def fit(self, sequences, epochs: int = 1, lr: float = 3e-3,
+            shuffle: bool = True, seed=None, verbose: bool = False,
+            batch_size: int = 1):
+        """训练（复用父类批量/单条逻辑；MTP 损失已并入 `_loss_and_backward`）"""
+        return super().fit(sequences, epochs=epochs, lr=lr, shuffle=shuffle,
+                           seed=seed, verbose=verbose, batch_size=batch_size)
+
+    def mtp_losses(self):
+        """最近一次 _loss_and_backward 的 (主损失, MTP 平均损失)。"""
+        return getattr(self, "_last_main_loss", 0.0), getattr(self, "_mtp_last_loss", 0.0)
+
+    # 存档：MTP 头与父类存档格式不兼容，显式拒绝而不是静默丢头
+    def save(self, filepath: str, include_optimizer: bool = False, quiet: bool = False):
+        raise ValueError("MTPLanguageModel: 暂不支持 save/load（存档格式只覆盖 CausalLM）")
+
 class Seq2SeqLM:
     """编码器-解码器序列到序列模型（翻译 / 改写 / 复制类任务）
 

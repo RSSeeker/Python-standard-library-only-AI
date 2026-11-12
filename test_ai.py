@@ -35159,3 +35159,131 @@ class TestGSPO:
             lambda: AI.gspo_losses(seqs, old, acts, advs, clip_ratio=1.2))
         assert _p10a_raises(
             lambda: AI.gspo_losses(seqs, old, acts, advs, clip_ratio_high=-0.1))
+
+
+import math
+
+
+def _p10b_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("未抛出预期异常")
+
+
+def _p10b_copy_params(src, dst):
+    for (n1, p1, _), (n2, p2, _) in zip(src._named_params(), dst._named_params()):
+        assert n1 == n2
+        if p1 and isinstance(p1[0], list):
+            for i in range(len(p1)):
+                for j in range(len(p1[i])):
+                    p2[i][j] = p1[i][j]
+        else:
+            for i in range(len(p1)):
+                p2[i] = p1[i]
+
+
+class TestMTPLanguageModel:
+    def test_construction_and_param_count(self):
+        import AI
+        m = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                                num_layers=1, max_len=16, num_future=3,
+                                mtp_weight=0.5)
+        base = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                                   num_layers=1, max_len=16, num_future=0)
+        assert m.param_count() - base.param_count() == 3 * (4 * 4 + 4)
+        assert m.num_future == 3 and m.mtp_weight == 0.5
+        assert len(m.mtp_W) == 3 and len(m.mtp_b) == 3
+        assert base.param_count() > 0
+        _p10b_raises(lambda: AI.MTPLanguageModel(4, d_model=4, num_heads=2, d_ff=8,
+                                                 num_layers=1, max_len=8, num_future=-1))
+        _p10b_raises(lambda: AI.MTPLanguageModel(4, d_model=4, num_heads=2, d_ff=8,
+                                                 num_layers=1, max_len=8, num_future=9))
+        _p10b_raises(lambda: AI.MTPLanguageModel(4, d_model=4, num_heads=2, d_ff=8,
+                                                 num_layers=1, max_len=8, mtp_weight=0.0))
+        _p10b_raises(lambda: AI.MTPLanguageModel(4, d_model=4, num_heads=2, d_ff=8,
+                                                 num_layers=1, max_len=8, mtp_weight=1.5))
+
+    def test_loss_composition_and_gradients(self):
+        import AI
+        ids = [0, 1, 2, 3, 0, 1, 2, 3]
+        m = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                                num_layers=1, max_len=16, num_future=2,
+                                mtp_weight=0.5)
+        m.zero_grad()
+        loss = m._loss_and_backward(ids)
+        main, mtp = m.mtp_losses()
+        assert isinstance(loss, float) and loss > 0.0
+        assert abs(loss - (main + 0.5 * mtp)) < 1e-12
+        assert mtp > 0.0
+
+        def numeric(param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 - h)
+            lp = m._loss_and_backward(ids)
+            param_set(p0 + h)
+            lm = m._loss_and_backward(ids)
+            param_set(p0)
+            return (lm - lp) / (2.0 * h)
+
+        def check(grad_get, param_get, param_set, name):
+            m.zero_grad()
+            m._loss_and_backward(ids)
+            ana = grad_get()
+            num = numeric(param_get, param_set)
+            rel = abs(ana - num) / max(1e-9, abs(ana) + abs(num))
+            assert rel < 1e-4, f"{name}: ana={ana} num={num} rel={rel}"
+
+        check(lambda: m.mtp_grad_W[0][1][2],
+              lambda: m.mtp_W[0][1][2],
+              lambda v: m.mtp_W[0][1].__setitem__(2, v), "mtp_W")
+        check(lambda: m.mtp_grad_b[1][3],
+              lambda: m.mtp_b[1][3],
+              lambda v: m.mtp_b[1].__setitem__(3, v), "mtp_b")
+        check(lambda: m.embedding.grad_weight[0][0],
+              lambda: m.embedding.weight[0][0],
+              lambda v: m.embedding.weight[0].__setitem__(0, v), "emb.weight")
+
+    def test_num_future_zero_matches_causal_lm(self):
+        import AI
+        ids = [0, 1, 2, 3, 0, 1, 2, 3]
+        m0 = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                                 num_layers=1, max_len=16, num_future=0)
+        plain = AI.CausalLM(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                            num_layers=1, max_len=16)
+        _p10b_copy_params(m0, plain)
+        plain.zero_grad()
+        lp = plain._loss_and_backward(ids)
+        m0.zero_grad()
+        l0 = m0._loss_and_backward(ids)
+        assert abs(lp - l0) < 1e-12
+        for i in range(4):
+            for j in range(4):
+                assert abs(plain.embedding.grad_weight[i][j]
+                           - m0.embedding.grad_weight[i][j]) < 1e-12
+
+    def test_fit_reduces_loss_and_generate(self):
+        import AI
+        tr = AI.MTPLanguageModel(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                                 num_layers=1, max_len=16, num_future=2,
+                                 mtp_weight=0.3)
+        seqs = [[0, 1, 2, 3, 0, 1, 2, 3], [3, 2, 1, 0, 3, 2, 1, 0]]
+        hist = tr.fit(seqs, epochs=40, lr=0.03, seed=1)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.7
+        out = tr.generate([0, 1], max_new_tokens=5)
+        assert len(out) == 7
+
+    def test_invalid_inputs(self):
+        import AI
+        m = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2, d_ff=8,
+                                num_layers=1, max_len=8, num_future=2)
+        _p10b_raises(lambda: m._loss_and_backward([0]))
+        _p10b_raises(lambda: m._loss_and_backward([0, 1, 2, 3, 4]))
+        _p10b_raises(lambda: m._loss_and_backward([0, 1, 2, 3, 4, 5, 6, 7, 8]))
+        _p10b_raises(lambda: m.save("tmp_mtp.json"))
+        _p10b_raises(lambda: m.fit([], epochs=1))
+        _p10b_raises(lambda: m.fit([[0, 1]], epochs=-1))
+        _p10b_raises(lambda: m.forward([]))
+        _p10b_raises(lambda: m.forward([0, 1, 2, 3, 4, 5, 6, 7, 8]))

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2237 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2242 项）
 
 ## 特性
 
@@ -443,6 +443,7 @@ model.train()     # 回到训练
 | `make_needle_haystack(total_tokens=256, depth=0.5, needle='NEEDLE', seed=None)` | 生成 needle-in-a-haystack 长上下文：返回 `{'tokens','needle_index','needle'}`，`depth` 控制针的相对位置 |
 | `llm_judge_prompt(question, answer, reference=None, scale=10)` / `parse_judge_verdict(text, scale=10)` / `judge_agreement(scores, tolerance=1.0)` | LLM-as-judge 三件套：评审提示词模板、解析 `Score:`/`Verdict:` 输出（截断到 `[0, scale]`）、多评审打分的均值/标准差/最大差/一致率 |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训） |
+| `MTPLanguageModel` | 带多 token 预测头的因果语言模型：在 `CausalLM` 之上为未来 1–8 个偏移各加一个线性头，训练损失 = 主交叉熵 + `mtp_weight`×各未来头交叉熵均值；其余训练/生成接口与 `CausalLM` 相同 |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
 | `Seq2SeqLM` | 序列到序列（encoder-decoder）：源端 `TransformerEncoder` → 目标端因果 `TransformerDecoder` + 交叉注意力 → 词表头；自带 Adam、`fit` / `evaluate` / `generate`，`fit` 用 teacher forcing（目标端 `BOS` 放在词表外的一个 id），`generate` 逐 token 解码并支持 `eos_id` 提前停 |
 
@@ -467,6 +468,31 @@ lm.generate([0], max_new_tokens=8)                 # → [0, 1, 2, 0, 1, 2, 0, 1
 
 > 注意：`generate()` 会把模型切到 `eval()` 模式（关闭 Dropout）并保持；
 > 想继续训练请再调 `train()`。
+
+### 多 token 预测（MTP）
+
+`MTPLanguageModel` 在 `CausalLM` 的「预测下一个 token」主头之外，再为未来 k 个位置
+（k=1..num_future）各加一个线性头：用位置 t 的隐状态 `h_t` 同时预测 `ids[t+k+1]`。
+训练时主干只反传一次，未来头的梯度叠加到同一份编码器/词向量缓存上。
+
+```python
+mtp = MTPLanguageModel(vocab_size=16, d_model=32, num_heads=4, d_ff=64,
+                       num_layers=2, max_len=64, num_future=2, mtp_weight=0.5)
+history = mtp.fit([[0, 1, 2, 3, 0, 1, 2, 3]], epochs=50, lr=0.01, seed=1)
+main_loss, mtp_loss = mtp.mtp_losses()      # 最近一次前向的两部分损失
+pred = mtp.generate([0, 1], max_new_tokens=5)
+
+logits = mtp.forward([0, 1, 2])             # 主头 logits（未来头不参与生成）
+```
+
+| API | 说明 |
+| --- | --- |
+| `MTPLanguageModel(vocab_size, ..., num_future=1, mtp_weight=0.5)` | 构造参数与 `CausalLM` 相同，另加未来头数（0–8）与 MTP 损失权重；`num_future=0` 时与 `CausalLM` 逐位等价 |
+| `MTPLanguageModel._loss_and_backward(ids, pad_mask=None, grad_scale=1.0)` | 主交叉熵 + `mtp_weight`×未来头交叉熵均值，同时累积主干与未来头梯度 |
+| `MTPLanguageModel.mtp_losses()` | 返回最近一次反向的 `(主损失, 未来头平均损失)` |
+| `param_count()` / `fit` / `evaluate` / `generate` | 继承自 `CausalLM`；`param_count` 含未来头参数 |
+
+- 边界：未来头只做单层线性投影（不像 DeepSeek-V3 那样串一条额外 Transformer block）；未来头复用主模型隐状态、不做额外归一化；`save`/`load` 暂不支持（会显式报错，避免静默丢掉未来头）；只支持 teacher forcing 训练，不做 token 级跨样本打包。
 
 ### 现代 LLM 组件（GELU / RMSNorm / AdamW / warmup / RoPE / KV cache）
 
@@ -4353,7 +4379,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2237 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2242 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4584,6 +4610,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDrGRPO` | 去均值优势数值、分组独立、非法输入 |
 | `TestDAPO` | token 级归一化手算对照、clip-higher 行为、logits 数值梯度、非法输入 |
 | `TestGSPO` | 序列级重要性比手算对照、logits 数值梯度、clip_ratio 非法输入 |
+| `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4721,6 +4748,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2237 个单元测试
+├── test_ai.py       # 2242 个单元测试
 └── README.md
 ```
