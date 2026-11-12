@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2259 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2272 项）
 
 ## 特性
 
@@ -2042,6 +2042,35 @@ base = magnitude_prune(weights, sparsity=0.5)      # 幅度剪枝基线
 | `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `|w|` 保留） |
 
 - 边界：量化是逐行/逐列 absmax 区间，非真实 KIVI 的分组/残差；Wanda 用一次校准统计，不含激活感知的迭代补偿或稀疏格式；每行至少保留 1 个权重；只支持 2D 张量/1D 嵌套 list。
+
+### 稀疏检索与混合重排（BM25 / RRF / ColBERT-lite）
+
+内置纯 Python 的检索工具：BM25 稀疏打分、dense 余弦重排、RRF 融合与
+ColBERT 式 late interaction，便于在检索增强/Agent 流程里做混合召回。
+
+```python
+docs = ["apple banana", "apple apple apple", "banana"]
+idx = BM25Index(docs)
+print(idx.search("apple"), idx.score("apple", 0))
+
+dense = dense_rerank([1.0, 0.0], [[0.0, 1.0], [1.0, 0.0]])   # 余弦降序
+fused = rrf_fuse([[0, 1, 2], [2, 1, 0]], k=60)               # RRF 融合
+score = colbert_lite_score([[1.0, 0.0], [0.0, 1.0]],
+                           [[1.0, 0.0], [0.0, 2.0]])          # Σ_q max_d cos
+
+hits = hybrid_search(idx, "apple", [1.0, 0.0],
+                     [[1.0, 0.0], [0.0, 1.0], [0.0, 2.0]])
+```
+
+| API | 说明 |
+| --- | --- |
+| `BM25Index(docs, k1=1.5, b=0.75)` | Okapi BM25：`score(query, doc_id)`、`search(query, top_k)` 返回 `[{"index","score"}]` |
+| `dense_rerank(query_vec, doc_vecs)` | 余弦相似度重排，返回 `[{"index","score"}]`（降序、同分按原序） |
+| `rrf_fuse(rankings, k=60, weights=None)` | Reciprocal Rank Fusion：`score(d)=Σ w/(k+rank+1)`，返回 `{"order","scores"}` |
+| `colbert_lite_score(query_vecs, doc_vecs, normalize=True)` | late interaction：每个 query token 取文档最大余弦后求和 |
+| `hybrid_search(index, query, query_vec, doc_vecs, top_k=5, rrf_k=60, ...)` | BM25 + dense 两路排名用 RRF 融合，返回 `rrf_score`/`bm25_rank`/`dense_rank` |
+
+- 边界：切词固定为小写 `[a-z0-9]+`（中文需先分词）；BM25 只做纯 Python 打分，不含倒排索引/增量更新；RRF 不下沉原始分数；ColBERT-lite 用向量最大相似度近似 MaxSim，不做 query 扩展。
 
 ### 量化与 SmoothQuant
 
@@ -4456,7 +4485,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2259 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2272 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4692,6 +4721,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
+| `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
+| `TestRerank` | 余弦排序与同分、RRF 手算、加权融合、非法输入 |
+| `TestColBERT` | late interaction 手算、normalize 开关、维度错误 |
+| `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4829,6 +4862,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2259 个单元测试
+├── test_ai.py       # 2272 个单元测试
 └── README.md
 ```

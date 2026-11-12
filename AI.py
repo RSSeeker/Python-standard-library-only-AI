@@ -5158,6 +5158,181 @@ def wanda_prune(weights, activations, sparsity: float = 0.5):
     imp = wanda_importance(weights, activations)
     return _prune_topk_per_row(weights, imp, sparsity)
 
+
+def _ret_tokenize(text):
+    if not isinstance(text, str):
+        raise ValueError(f"retrieval: 文本必须是字符串，收到 {text!r}")
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _ret_check_vec(vec, name: str = "vector"):
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise ValueError(f"retrieval: {name} 必须是非空数字列表")
+    out = []
+    for v in vec:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError(f"retrieval: {name} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def _ret_cosine(a, b):
+    va = _ret_check_vec(a, "vector a")
+    vb = _ret_check_vec(b, "vector b")
+    if len(va) != len(vb):
+        raise ValueError("retrieval: 两个向量维度必须一致")
+    na = math.sqrt(sum(x * x for x in va))
+    nb = math.sqrt(sum(x * x for x in vb))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return sum(va[i] * vb[i] for i in range(len(va))) / (na * nb)
+
+
+class BM25Index:
+    """Okapi BM25 稀疏检索（标准库实现，按空白/标点切词后小写）。"""
+
+    def __init__(self, docs, k1: float = 1.5, b: float = 0.75):
+        if not isinstance(docs, (list, tuple)) or not docs:
+            raise ValueError("retrieval: docs 必须是非空字符串列表")
+        for k, name in ((k1, "k1"), (b, "b")):
+            if (not isinstance(k, (int, float)) or isinstance(k, bool)
+                    or not math.isfinite(float(k)) or float(k) < 0.0):
+                raise ValueError(f"retrieval: {name} 必须是非负有限数字，收到 {k!r}")
+        if float(b) > 1.0:
+            raise ValueError(f"retrieval: b 必须在 [0,1]，收到 {b!r}")
+        self.docs = [str(d) for d in docs]
+        self.k1 = float(k1)
+        self.b = float(b)
+        self.tokens = [_ret_tokenize(d) for d in self.docs]
+        if any(not t for t in self.tokens):
+            raise ValueError("retrieval: 文档必须至少包含一个词")
+        self.doc_len = [len(t) for t in self.tokens]
+        self.avgdl = sum(self.doc_len) / len(self.doc_len)
+        df = {}
+        for toks in self.tokens:
+            for w in set(toks):
+                df[w] = df.get(w, 0) + 1
+        n = len(self.docs)
+        self.idf = {w: math.log(1.0 + (n - c + 0.5) / (c + 0.5))
+                    for w, c in df.items()}
+        self.tf = []
+        for toks in self.tokens:
+            counts = {}
+            for w in toks:
+                counts[w] = counts.get(w, 0) + 1
+            self.tf.append(counts)
+
+    def score(self, query, doc_id: int):
+        if not isinstance(doc_id, int) or isinstance(doc_id, bool):
+            raise ValueError(f"retrieval: doc_id 必须是整数，收到 {doc_id!r}")
+        if doc_id < 0 or doc_id >= len(self.docs):
+            raise ValueError(f"retrieval: doc_id 越界：{doc_id}")
+        terms = _ret_tokenize(query)
+        if not terms:
+            raise ValueError("retrieval: query 必须至少包含一个词")
+        dl = self.doc_len[doc_id]
+        total = 0.0
+        for w in terms:
+            if w not in self.idf:
+                continue
+            f = self.tf[doc_id].get(w, 0)
+            denom = f + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl)
+            total += self.idf[w] * (f * (self.k1 + 1.0)) / denom
+        return total
+
+    def search(self, query, top_k: int = 5):
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+            raise ValueError(f"retrieval: top_k 必须是正整数，收到 {top_k!r}")
+        scores = [self.score(query, i) for i in range(len(self.docs))]
+        order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+        return [{"index": i, "score": scores[i]} for i in order[:top_k]]
+
+
+def dense_rerank(query_vec, doc_vecs):
+    """按余弦相似度对文档向量重排，返回 [{'index','score'}]（降序、同分按原序）。"""
+    if not isinstance(doc_vecs, (list, tuple)) or not doc_vecs:
+        raise ValueError("retrieval: doc_vecs 必须是非空列表")
+    if not isinstance(query_vec, (list, tuple)) or not query_vec:
+        raise ValueError("retrieval: query_vec 必须是非空数字列表")
+    dim = len(query_vec)
+    scores = []
+    for i, vec in enumerate(doc_vecs):
+        if not isinstance(vec, (list, tuple)) or len(vec) != dim:
+            raise ValueError("retrieval: 文档向量维度必须与 query_vec 一致")
+        scores.append(_ret_cosine(query_vec, vec))
+    order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+    return [{"index": i, "score": scores[i]} for i in order]
+
+
+def rrf_fuse(rankings, k: int = 60, weights=None):
+    """Reciprocal Rank Fusion：score(d)=Σ w_r/(k+rank_r(d)+1)。"""
+    if not isinstance(rankings, (list, tuple)) or not rankings:
+        raise ValueError("retrieval: rankings 必须是非空列表")
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"retrieval: k 必须是正整数，收到 {k!r}")
+    if weights is None:
+        weights = [1.0] * len(rankings)
+    if (not isinstance(weights, (list, tuple)) or len(weights) != len(rankings)):
+        raise ValueError("retrieval: weights 长度必须与 rankings 一致")
+    scores = {}
+    for r, ranking in enumerate(rankings):
+        if not isinstance(ranking, (list, tuple)):
+            raise ValueError("retrieval: 每个 ranking 必须是列表")
+        w = weights[r]
+        if (not isinstance(w, (int, float)) or isinstance(w, bool)
+                or not math.isfinite(float(w)) or float(w) < 0.0):
+            raise ValueError(f"retrieval: weights[{r}] 必须是非负有限数字")
+        for rank, doc_id in enumerate(ranking):
+            if not isinstance(doc_id, int) or isinstance(doc_id, bool) or doc_id < 0:
+                raise ValueError("retrieval: ranking 里的 doc_id 必须是非负整数")
+            scores[doc_id] = scores.get(doc_id, 0.0) + float(w) / (float(k) + rank + 1.0)
+    order = sorted(scores, key=lambda d: (-scores[d], d))
+    return {"order": order, "scores": {d: scores[d] for d in order}}
+
+
+def colbert_lite_score(query_vecs, doc_vecs, normalize: bool = True):
+    """ColBERT 式 late interaction：Σ_q max_d cosine(q, d)。"""
+    if not isinstance(query_vecs, (list, tuple)) or not query_vecs:
+        raise ValueError("retrieval: query_vecs 必须是非空列表")
+    if not isinstance(doc_vecs, (list, tuple)) or not doc_vecs:
+        raise ValueError("retrieval: doc_vecs 必须是非空列表")
+    if not isinstance(normalize, bool):
+        raise ValueError("retrieval: normalize 必须是布尔值")
+    total = 0.0
+    for q in query_vecs:
+        best = None
+        for d in doc_vecs:
+            c = _ret_cosine(q, d)
+            if not normalize:
+                c = max(-1.0, c)
+            if best is None or c > best:
+                best = c
+        total += best
+    return total
+
+
+def hybrid_search(index: BM25Index, query, query_vec, doc_vecs, top_k: int = 5,
+                  rrf_k: int = 60, bm25_weight: float = 1.0,
+                  dense_weight: float = 1.0):
+    """BM25 稀疏排名 + dense 余弦排名，用 RRF 融合后返回前 top_k。"""
+    if not isinstance(index, BM25Index):
+        raise ValueError("retrieval: index 必须是 BM25Index")
+    if len(doc_vecs) != len(index.docs):
+        raise ValueError("retrieval: doc_vecs 数量必须与索引文档数一致")
+    bm = index.search(query, top_k=len(index.docs))
+    de = dense_rerank(query_vec, doc_vecs)
+    fused = rrf_fuse([[r["index"] for r in bm], [r["index"] for r in de]],
+                     k=rrf_k, weights=[bm25_weight, dense_weight])
+    out = []
+    bm_rank = {r["index"]: pos for pos, r in enumerate(bm)}
+    de_rank = {r["index"]: pos for pos, r in enumerate(de)}
+    for doc_id in fused["order"][:top_k]:
+        out.append({"index": doc_id, "rrf_score": fused["scores"][doc_id],
+                    "bm25_rank": bm_rank.get(doc_id),
+                    "dense_rank": de_rank.get(doc_id)})
+    return out
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

@@ -35556,3 +35556,103 @@ class TestWandaPruning:
         _p10e_raises(lambda: AI.wanda_prune([[1.0]], [1.0], 1.0))
         _p10e_raises(lambda: AI.wanda_prune([[1.0]], [1.0], -0.1))
         _p10e_raises(lambda: AI.magnitude_prune([[1.0]], 2.0))
+
+
+import math
+
+def _p10f_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError("expected exception")
+
+
+class TestBM25:
+    def test_ranking_frequency_and_length(self):
+        idx = AI.BM25Index(["apple banana", "apple apple apple", "banana"])
+        hits = idx.search("apple")
+        assert [h["index"] for h in hits] == [1, 0, 2]
+        assert hits[0]["score"] > hits[1]["score"] > hits[2]["score"] == 0.0
+        assert hits[0]["score"] == pytest.approx(0.696302, abs=1e-5)
+
+    def test_single_doc_score_formula(self):
+        idx = AI.BM25Index(["a b c"])
+        expected = math.log(1.0 + (1 - 1 + 0.5) / (1 + 0.5))
+        assert idx.score("a", 0) == pytest.approx(expected, abs=1e-12)
+
+    def test_idf_prefers_rare_terms(self):
+        idx = AI.BM25Index(["a b", "a c", "a d"])
+        rare = idx.score("b", 0)
+        common = idx.score("a", 0)
+        assert rare > common
+
+    def test_search_top_k_and_errors(self):
+        idx = AI.BM25Index(["a", "a b"])
+        assert len(idx.search("a", top_k=1)) == 1
+        _p10f_raises(lambda: idx.search("a", top_k=0))
+        _p10f_raises(lambda: idx.score("a", 5))
+        _p10f_raises(lambda: idx.score("", 0))
+        _p10f_raises(lambda: AI.BM25Index([]))
+        _p10f_raises(lambda: AI.BM25Index([" "]))
+        _p10f_raises(lambda: AI.BM25Index(["a"], k1=-1.0))
+        _p10f_raises(lambda: AI.BM25Index(["a"], b=1.5))
+
+
+class TestRerank:
+    def test_dense_ranking_and_ties(self):
+        out = AI.dense_rerank([1.0, 0.0], [[0.0, 1.0], [1.0, 0.0], [0.0, 2.0]])
+        assert [r["index"] for r in out] == [1, 0, 2]
+        assert out[0]["score"] == pytest.approx(1.0)
+        assert out[1]["score"] == 0.0
+
+    def test_rrf_hand_formula(self):
+        fused = AI.rrf_fuse([[0, 1, 2], [2, 1, 0]], k=1)
+        assert fused["order"] == [0, 2, 1]
+        assert fused["scores"][0] == pytest.approx(0.75)
+        assert fused["scores"][1] == pytest.approx(2.0 / 3.0)
+
+    def test_rrf_weights(self):
+        fused = AI.rrf_fuse([[1], [0]], k=1, weights=[2.0, 0.0])
+        assert fused["order"] == [1, 0]
+        assert fused["scores"][1] == pytest.approx(1.0)
+
+    def test_rrf_errors(self):
+        _p10f_raises(lambda: AI.rrf_fuse([]))
+        _p10f_raises(lambda: AI.rrf_fuse([[0]], k=0))
+        _p10f_raises(lambda: AI.rrf_fuse([[0]], weights=[1.0, 2.0]))
+        _p10f_raises(lambda: AI.rrf_fuse([[-1]]))
+
+
+class TestColBERT:
+    def test_hand_score(self):
+        score = AI.colbert_lite_score([[1.0, 0.0], [0.0, 1.0]],
+                                      [[1.0, 0.0], [0.0, 2.0]])
+        assert score == pytest.approx(2.0)
+
+    def test_normalize_switch(self):
+        score = AI.colbert_lite_score([[1.0, 0.0]], [[0.0, 1.0]], normalize=False)
+        assert score == 0.0
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.colbert_lite_score([], [[1.0]]))
+        _p10f_raises(lambda: AI.colbert_lite_score([[1.0, 0.0]], []))
+        _p10f_raises(lambda: AI.colbert_lite_score([[1.0]], [[1.0, 0.0]]))
+        _p10f_raises(lambda: AI.colbert_lite_score([[1.0]], [[1.0]], normalize=1))
+
+
+class TestHybridSearch:
+    def test_fused_ranking(self):
+        idx = AI.BM25Index(["apple banana", "apple apple apple", "banana"])
+        hits = AI.hybrid_search(idx, "apple", [1.0, 0.0],
+                                [[1.0, 0.0], [0.0, 1.0], [0.0, 2.0]], top_k=3)
+        assert [h["index"] for h in hits] == [0, 1, 2]
+        assert hits[0]["rrf_score"] > hits[2]["rrf_score"]
+        assert set(hits[0]) == {"index", "rrf_score", "bm25_rank", "dense_rank"}
+
+    def test_errors(self):
+        idx = AI.BM25Index(["a", "b"])
+        _p10f_raises(lambda: AI.hybrid_search("x", "a", [1.0], [[1.0], [1.0]]))
+        _p10f_raises(lambda: AI.hybrid_search(idx, "a", [1.0], [[1.0]]))
+        _p10f_raises(lambda: AI.hybrid_search(idx, "a", [1.0], [[1.0], [1.0]],
+                                              bm25_weight=-1.0))
