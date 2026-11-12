@@ -28,8 +28,8 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 109 个顶层分节
-# （1224 个 def / 366 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 110 个顶层分节
+# （1359 个 def / 373 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
@@ -48,98 +48,99 @@
 #   15. Loss Functions
 #   16. Optimizer: Adam
 #   17. More Optimizers: SGD / SGD+Momentum / RMSprop
-#   18. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
-#   19. Layer-wise Optimizers: LARS / LAMB / Ranger
-#   20. Advanced Optimizers: Adan / Prodigy / CAME
-#   21. 进阶优化器：Shampoo / Sophia / L-BFGS
-#   22. Gradient Clipping / LR Scheduler
-#   23. 学习率调度器族
-#   24. Data Utilities
-#   25. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
-#   26. 图像增强管道（Compose / RandomCrop / RandomResizedCrop / RandomRotation / ColorJitter / GaussianBlur / Normalize）
-#   27. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
-#   28. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
-#   29. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
-#   30. 降维 / 不平衡采样 / 特征选择
-#   31. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
-#   32. Scaler 族（RobustScaler / MaxAbsScaler / QuantileTransformer / PowerTransformer）
-#   33. Text Processing（分词与文本工具）
-#   34. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
-#   35. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
-#   36. Trainer
-#   37. 评估指标（分类 / 回归 / 序列 / 生成）
-#   38. 校准指标（ECE / MCE / Reliability Diagram）
-#   39. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
-#   40. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
-#   41. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#   42. 多模态：CLIP 双塔 + 跨模态融合
-#   43. 自监督：预测式任务（Rotation / Jigsaw）
-#   44. RL 算法（DQN 族）
-#   45. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#   46. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
-#   47. ELECTRA：生成器 + 判别器的预训练框架
-#   48. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
-#   49. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
-#   50. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
-#   51. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
-#   52. DETR（DEtection TRansformer，简化版）
-#   53. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
-#   54. E(3) 等变图神经网络（EGNN，教学版）
-#   55. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
-#   56. 全模块梯度自检（grad_check_all）
-#   57. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#   58. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#   59. 研究前沿：神经符号（规则约束的候选过滤）
-#   60. 研究前沿：Mixture-of-Depths 路由与 Early Exit
-#   61. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#   62. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#   63. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
-#   64. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
-#   65. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
-#   66. 集成测试 / doctest / 属性测试的运行时支撑
-#   67. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-#   68. 领域应用：视频（3D-CNN / Two-Stream 融合）
-#   69. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#   70. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#   71. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
-#   72. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#   73. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#   74. 领域应用：DeepFM / DIN
-#   75. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-#   76. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
-#   77. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
-#   78. RL 环境（GridWorld / CartPole）
-#   79. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
-#   80. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#   81. 推理与部署：批内打包与投机解码
-#   82. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
-#   83. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#   84. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#   85. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#   86. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#   87. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
-#   88. 可解释性：置换重要性 / 特征图字符画
-#   89. 可解释性：注意力 Rollout / Flow
-#   90. 可解释性：输入归因
-#   91. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
-#   92. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
-#   93. 语音识别指标（WER / CER / SER）
-#   94. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#   95. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
-#   96. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#   97. 模型保存 / 加载 (JSON)
-#   98. 序列标注 / 多标签分类头
-#   99. PyTorch 数值对齐对比
-#   100. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#   101. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#   102. 梯度检查点（activation checkpointing）与混合精度模拟
-#   103. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#   104. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#   105. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#   106. 生成模型：VAE / GAN / DDPM
-#   107. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
-#   108. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#   109. Main: 回归 + 分类 + CNN 完整示例
+#   18. SGDW / Nesterov / Lookahead / SWA / EMA
+#   19. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#   20. Layer-wise Optimizers: LARS / LAMB / Ranger
+#   21. Advanced Optimizers: Adan / Prodigy / CAME
+#   22. 进阶优化器：Shampoo / Sophia / L-BFGS
+#   23. Gradient Clipping / LR Scheduler
+#   24. 学习率调度器族
+#   25. Data Utilities
+#   26. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#   27. 图像增强管道（Compose / RandomCrop / RandomResizedCrop / RandomRotation / ColorJitter / GaussianBlur / Normalize）
+#   28. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+#   29. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#   30. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#   31. 降维 / 不平衡采样 / 特征选择
+#   32. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#   33. Scaler 族（RobustScaler / MaxAbsScaler / QuantileTransformer / PowerTransformer）
+#   34. Text Processing（分词与文本工具）
+#   35. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#   36. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#   37. Trainer
+#   38. 评估指标（分类 / 回归 / 序列 / 生成）
+#   39. 校准指标（ECE / MCE / Reliability Diagram）
+#   40. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#   41. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#   42. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#   43. 多模态：CLIP 双塔 + 跨模态融合
+#   44. 自监督：预测式任务（Rotation / Jigsaw）
+#   45. RL 算法（DQN 族）
+#   46. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#   47. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#   48. ELECTRA：生成器 + 判别器的预训练框架
+#   49. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+#   50. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+#   51. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
+#   52. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+#   53. DETR（DEtection TRansformer，简化版）
+#   54. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+#   55. E(3) 等变图神经网络（EGNN，教学版）
+#   56. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#   57. 全模块梯度自检（grad_check_all）
+#   58. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#   59. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#   60. 研究前沿：神经符号（规则约束的候选过滤）
+#   61. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#   62. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#   63. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#   64. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#   65. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+#   66. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+#   67. 集成测试 / doctest / 属性测试的运行时支撑
+#   68. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#   69. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#   70. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#   71. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#   72. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
+#   73. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#   74. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#   75. 领域应用：DeepFM / DIN
+#   76. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#   77. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#   78. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#   79. RL 环境（GridWorld / CartPole）
+#   80. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#   81. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#   82. 推理与部署：批内打包与投机解码
+#   83. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#   84. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#   85. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#   86. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#   87. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#   88. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#   89. 可解释性：置换重要性 / 特征图字符画
+#   90. 可解释性：注意力 Rollout / Flow
+#   91. 可解释性：输入归因
+#   92. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#   93. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#   94. 语音识别指标（WER / CER / SER）
+#   95. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#   96. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#   97. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#   98. 模型保存 / 加载 (JSON)
+#   99. 序列标注 / 多标签分类头
+#   100. PyTorch 数值对齐对比
+#   101. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#   102. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#   103. 梯度检查点（activation checkpointing）与混合精度模拟
+#   104. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#   105. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#   106. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#   107. 生成模型：VAE / GAN / DDPM
+#   108. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#   109. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#   110. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -32598,12 +32599,11 @@ class RMSprop:
 
 # ============================================================================
 #  SGDW / Nesterov / Lookahead / SWA / EMA
-#        
+# ============================================================================
 #  前两个是「改更新式」，后三个是「在优化器之外维护一份权重」：
 #  Lookahead 包住任意优化器（需要 .step/.model），SWA / EMA 各自维护影子权重，
 #  训练完用 apply_to() 换进模型。三者都能被 fit(callbacks=...) 自动驱动
 #  （见本节的 EMACallback / SWACallback）。
-# ============================================================================
 
 class SGDW:
     """解耦权重衰减的 SGD（SGDW，Loshchilov & Hutter 2019）
@@ -64879,12 +64879,14 @@ def _param_leaves(param):
 
 
 def _pget(param, path):
+    """按路径读取嵌套配置/参数字典中的值。"""
     for i in path:
         param = param[i]
     return param
 
 
 def _pset(param, path, value):
+    """按路径写入嵌套配置/参数字典中的值。"""
     for i in path[:-1]:
         param = param[i]
     param[path[-1]] = value
@@ -65647,6 +65649,7 @@ def _semi_argmax(row):
 
 
 def _semi_norm(v):
+    """计算向量的 L2 范数（半监督工具内部使用）。"""
     return math.sqrt(sum(x * x for x in v))
 
 
@@ -65911,6 +65914,7 @@ def fixmatch_targets(probs_weak, confidence=0.95):
 
 
 def _semi_onehot(label, n):
+    """把类别标签转成 one-hot 向量。"""
     out = [0.0] * n
     out[label] = 1.0
     return out
@@ -67705,6 +67709,7 @@ class Model:
 # ============================================================================
 
 def _gauss_vec(n, rng):
+    """生成指定长度的标准正态随机向量（rng 为空时用全局 random）。"""
     r = rng or random
     return [r.gauss(0.0, 1.0) for _ in range(n)]
 
@@ -68076,6 +68081,7 @@ _GAN_VARIANTS = ("bce", "lsgan", "wgan", "hinge")
 
 
 def _gan_check_variant(variant, who):
+    """校验 GAN 损失变体名是否在支持列表内。"""
     if variant not in _GAN_VARIANTS:
         raise ValueError(f"{who}: variant 只能是 {_GAN_VARIANTS} 之一，"
                          f"收到 {variant!r}")
@@ -68157,6 +68163,7 @@ def r2_penalty(d_scores, lam=10.0):
 
 
 def _r1_r2_check_discriminator(discriminator):
+    """校验 R1/R2 正则使用的判别器类型。"""
     if not isinstance(discriminator, DCGANDiscriminator):
         raise TypeError("R1/R2 诊断: discriminator 必须是 DCGANDiscriminator")
 
@@ -68255,6 +68262,7 @@ def _glow_lu(a):
 
 
 def _glow_det(a):
+    """用 LU 分解计算方阵行列式（Glow 对数似然用）。"""
     m, _perm, sign = _glow_lu(a)
     d = sign
     for i in range(len(m)):
@@ -68283,6 +68291,7 @@ def _glow_solve(a, b):
 
 
 def _glow_inverse_matrix(a):
+    """用 LU 分解求方阵的逆（Glow 反向/采样用）。"""
     n = len(a)
     cols = []
     for j in range(n):
@@ -69322,6 +69331,7 @@ def _diffusion_denoise(denoise_fn, x, sigma, who):
 
 
 def _edm_euler_step(x, x0, sigma, sigma_next):
+    """EDM 采样器的 Euler 单步更新。"""
     if sigma <= 0.0:
         return list(x0)
     return [x[i] + (sigma_next - sigma) * (x[i] - x0[i]) / sigma for i in range(len(x))]
@@ -69711,6 +69721,7 @@ _SCHEDULER_KEYS = frozenset({
 
 
 def _config_mapping(config, who):
+    """读取配置（dict 或 JSON 文件路径）并校验键名。"""
     if isinstance(config, str):
         with io.open(config, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -69724,6 +69735,7 @@ def _config_mapping(config, who):
 
 
 def _config_int(config, key, default, minimum=None, who="config"):
+    """读取整数配置项并做类型与下界校验。"""
     value = config.get(key, default)
     if value is None:
         value = default
@@ -69735,6 +69747,7 @@ def _config_int(config, key, default, minimum=None, who="config"):
 
 
 def _config_number(config, key, default, who="config"):
+    """读取有限实数配置项。"""
     value = config.get(key, default)
     if value is None:
         value = default
@@ -69746,6 +69759,7 @@ def _config_number(config, key, default, who="config"):
 
 
 def _config_bool(config, key, default, who="config"):
+    """读取布尔配置项。"""
     value = config.get(key, default)
     if isinstance(value, bool):
         return value

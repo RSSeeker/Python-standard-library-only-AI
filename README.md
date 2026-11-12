@@ -2037,9 +2037,9 @@ base = magnitude_prune(weights, sparsity=0.5)      # 幅度剪枝基线
 | `kv_dequantize(quant)` | 按 codes/mins/scales 还原浮点 2D 列表 |
 | `kv_cache_quantize(k_cache, v_cache, key_bits=4, value_bits=4)` | KIVI 风格：key 按通道量化、value 按 token 量化 |
 | `kv_cache_dequantize(quant)` / `kv_cache_quantization_error(...)` | 还原 / 返回 key/value 相对误差与最大绝对误差 |
-| `wanda_importance(weights, activations)` | `|W_ij| × ||X_j||`；`activations` 可为每列范数（1D）或 2D 校准数据 |
+| `wanda_importance(weights, activations)` | `\|W_ij\| × \|\|X_j\|\|`；`activations` 可为每列范数（1D）或 2D 校准数据 |
 | `wanda_prune(weights, activations, sparsity=0.5)` | 每行保留重要性 top-(1-sparsity)，返回 `{'weights','mask','sparsity','keep_per_row'}` |
-| `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `|w|` 保留） |
+| `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `\|w\|` 保留） |
 
 - 边界：量化是逐行/逐列 absmax 区间，非真实 KIVI 的分组/残差；Wanda 用一次校准统计，不含激活感知的迭代补偿或稀疏格式；每行至少保留 1 个权重；只支持 2D 张量/1D 嵌套 list。
 
@@ -2203,7 +2203,7 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 
 | API | 说明 |
 | --- | --- |
-| `sam_weights(weights, grads, rho=0.05, eps=1e-12)` | 按全局 L2 范数归一化后加 `rho·g/||g||`，返回扰动后权重（不改原值） |
+| `sam_weights(weights, grads, rho=0.05, eps=1e-12)` | 按全局 L2 范数归一化后加 `rho·g/\|\|g\|\|`，返回扰动后权重（不改原值） |
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
