@@ -5725,6 +5725,109 @@ def streaming_attention_bias(seq_len: int, sink_size: int = 4,
     mask = streaming_attention_mask(seq_len, sink_size, window_size)
     return [[0.0 if ok else float(neg_inf) for ok in row] for row in mask]
 
+
+def _dep2_check_matrix(rows, name: str = "scores"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"moe: {name} 必须是非空二维数字列表")
+    out = []
+    dim = None
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"moe: {name}[{i}] 必须是非空数字列表")
+        cur = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"moe: {name} 必须只包含有限数字")
+            cur.append(float(v))
+        if dim is None:
+            dim = len(cur)
+        elif len(cur) != dim:
+            raise ValueError(f"moe: {name} 各行维度必须一致")
+        out.append(cur)
+    return out
+
+
+def expert_choice_route(scores, capacity: int = 2):
+    """Expert-Choice 路由：每个专家按分数选 top-capacity token。"""
+    mat = _dep2_check_matrix(scores, "scores")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+        raise ValueError(f"moe: capacity 必须是正整数，收到 {capacity!r}")
+    tokens, experts = len(mat), len(mat[0])
+    expert_tokens = []
+    selected_by = [[] for _ in range(tokens)]
+    for e in range(experts):
+        order = sorted(range(tokens), key=lambda t: (-mat[t][e], t))
+        picked = order[:min(capacity, tokens)]
+        expert_tokens.append(picked)
+        for t in picked:
+            selected_by[t].append(e)
+    token_expert = []
+    for t in range(tokens):
+        if not selected_by[t]:
+            token_expert.append(-1)
+        else:
+            best = max(selected_by[t], key=lambda e: (mat[t][e], -e))
+            token_expert.append(best)
+    overflow = [t for t in range(tokens) if len(selected_by[t]) > 1]
+    unassigned = [t for t in range(tokens) if not selected_by[t]]
+    load = [len(ids) for ids in expert_tokens]
+    return {"token_expert": token_expert, "expert_tokens": expert_tokens,
+            "load": load, "overflow": overflow, "unassigned": unassigned}
+
+
+def bitnet_ternary(weights, eps: float = 1e-8):
+    """BitNet 1.58b 式三值量化：q=clamp(round(w/scale),-1,1)，scale=mean(|w|)。"""
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(float(eps)) or float(eps) <= 0.0):
+        raise ValueError(f"bitnet: eps 必须是正有限数字，收到 {eps!r}")
+    if not isinstance(weights, (list, tuple)) or not weights:
+        raise ValueError("bitnet: weights 必须是非空数字列表")
+    is_2d = isinstance(weights[0], (list, tuple))
+    if is_2d:
+        rows = _dep2_check_matrix(weights, "weights")
+        flat = [v for row in rows for v in row]
+    else:
+        flat = []
+        for v in weights:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("bitnet: weights 必须只包含有限数字")
+            flat.append(float(v))
+    if not flat:
+        raise ValueError("bitnet: weights 不能为空")
+    scale = sum(abs(v) for v in flat) / len(flat)
+    if scale == 0.0:
+        scale = float(eps)
+    q = []
+    for v in flat:
+        val = int(round(v / scale))
+        q.append(max(-1, min(1, val)))
+    if is_2d:
+        out, k = [], 0
+        for row in rows:
+            out.append(q[k:k + len(row)])
+            k += len(row)
+        return {"values": out, "scale": scale}
+    return {"values": q, "scale": scale}
+
+
+def bitnet_dequantize(quant):
+    """三值反量化：values × scale。"""
+    if not isinstance(quant, dict) or "values" not in quant or "scale" not in quant:
+        raise ValueError("bitnet: quant 必须是 {'values','scale'} 字典")
+    scale = quant["scale"]
+    if (not isinstance(scale, (int, float)) or isinstance(scale, bool)
+            or not math.isfinite(float(scale)) or float(scale) <= 0.0):
+        raise ValueError("bitnet: scale 必须是正有限数字")
+    vals = quant["values"]
+    scale = float(scale)
+    if isinstance(vals, (list, tuple)) and vals and isinstance(vals[0], (list, tuple)):
+        return [[v * scale for v in row] for row in vals]
+    if not isinstance(vals, (list, tuple)) or not vals:
+        raise ValueError("bitnet: values 必须是非空列表")
+    return [v * scale for v in vals]
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

@@ -35883,3 +35883,46 @@ class TestStreamingAttentionMask:
         _p10f_raises(lambda: AI.streaming_attention_mask(4, 4, 1))
         _p10f_raises(lambda: AI.streaming_attention_mask(4, 0, 0))
         _p10f_raises(lambda: AI.streaming_attention_bias(4, 1, 1, neg_inf=0.0))
+
+
+class TestExpertChoice:
+    def test_basic_route(self):
+        out = AI.expert_choice_route([[0.9, 0.1], [0.8, 0.2], [0.1, 0.95]], capacity=1)
+        assert out["token_expert"] == [0, -1, 1]
+        assert out["expert_tokens"] == [[0], [2]]
+        assert out["load"] == [1, 1]
+        assert out["overflow"] == [] and out["unassigned"] == [1]
+
+    def test_overflow_and_capacity(self):
+        out = AI.expert_choice_route([[0.9, 0.8], [0.1, 0.2]], capacity=1)
+        assert out["token_expert"] == [0, -1]
+        assert out["overflow"] == [0] and out["unassigned"] == [1]
+        out = AI.expert_choice_route([[1.0, 0.0], [0.5, 0.5]], capacity=9)
+        assert out["load"] == [2, 2]
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.expert_choice_route([], 1))
+        _p10f_raises(lambda: AI.expert_choice_route([[1.0, 2.0], [1.0]], 1))
+        _p10f_raises(lambda: AI.expert_choice_route([[1.0, 2.0]], 0))
+
+
+class TestBitNet:
+    def test_ternary_hand(self):
+        out = AI.bitnet_ternary([[1.0, -1.0], [0.2, 3.0]])
+        assert out["scale"] == pytest.approx(1.3)
+        assert out["values"] == [[1, -1], [0, 1]]
+        d = AI.bitnet_dequantize(out)
+        assert [v for row in d for v in row] == pytest.approx([1.3, -1.3, 0.0, 1.3])
+
+    def test_1d_and_zero_scale(self):
+        out = AI.bitnet_ternary([0.1, -0.1], eps=0.5)
+        assert out["scale"] == pytest.approx(0.1)
+        assert out["values"] == [1, -1]
+        out = AI.bitnet_ternary([0.0, 0.0], eps=1e-3)
+        assert out["scale"] == 1e-3 and out["values"] == [0, 0]
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.bitnet_ternary([], eps=1.0))
+        _p10f_raises(lambda: AI.bitnet_ternary([1.0], eps=0.0))
+        _p10f_raises(lambda: AI.bitnet_dequantize([]))
+        _p10f_raises(lambda: AI.bitnet_dequantize({"values": [1], "scale": 0.0}))

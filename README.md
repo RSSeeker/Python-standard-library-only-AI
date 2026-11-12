@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2299 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2305 项）
 
 ## 特性
 
@@ -2167,6 +2167,27 @@ bias = streaming_attention_bias(64, sink_size=4, window_size=16)
 | `streaming_attention_bias(...)` | 同语义的加性掩码（可见 0.0，不可见 neg_inf） |
 
 - 边界：水印是固定 green list 的简化版（不按前一词哈希），检测只给 z 分数不分段；StreamingLLM 掩码只负责掩码构造，不实现滚动 KV cache 驱逐。
+
+### 高效路由与低比特权重（Expert-Choice / BitNet）
+
+Expert-Choice 路由让每个专家按分数挑 token（而非 token 选专家），BitNet 1.58b
+则把权重压成 `{-1,0,+1}` 三值并保留一个 per-tensor 缩放因子。
+
+```python
+route = expert_choice_route(scores, capacity=2)
+print(route["token_expert"], route["load"], route["overflow"])
+
+q = bitnet_ternary(weights)          # {"values","scale"}
+w_hat = bitnet_dequantize(q)         # values * scale
+```
+
+| API | 说明 |
+| --- | --- |
+| `expert_choice_route(scores, capacity=2)` | 每个专家选 top-capacity token；返回 token_expert/expert_tokens/load/overflow/unassigned |
+| `bitnet_ternary(weights, eps=1e-8)` | 三值量化：scale=mean(\|w\|)，q=clamp(round(w/scale),-1,1)；支持 1D/2D |
+| `bitnet_dequantize(quant)` | 三值反量化：`values × scale` |
+
+- 边界：Expert-Choice 只做路由与统计，不实现 token dropping/容量因子损失/专家并行；BitNet 是量化工具而非训练好的 1.58b 模型，scale 用全张量均值，无每层/每通道细粒度。
 
 ### 量化与 SmoothQuant
 
@@ -4581,7 +4602,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2299 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2305 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4832,6 +4853,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestReactEpisode` | 多步工具调用顺序、非法 registry/steps/action |
 | `TestWatermark` | green list 确定性/大小、logit 偏置、z 分数手算、非法参数 |
 | `TestStreamingAttentionMask` | 逐行掩码手算、因果性、bias 与 mask 一致、非法参数 |
+| `TestExpertChoice` | 路由手算、overflow/unassigned、capacity 截断、非法输入 |
+| `TestBitNet` | 三值量化/反量化手算、1D 与零权重回退、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4969,6 +4992,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2299 个单元测试
+├── test_ai.py       # 2305 个单元测试
 └── README.md
 ```
