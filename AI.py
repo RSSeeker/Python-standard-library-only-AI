@@ -5548,6 +5548,86 @@ def toxicity_score(tokens, lexicon):
             idx.append(i)
     return {"score": len(idx) / len(tokens), "flagged": idx}
 
+
+class ToolRegistry:
+    """记录可调用工具并统一分发（ReAct/Agent 流程用）。"""
+
+    def __init__(self):
+        self._tools = {}
+
+    def register(self, name: str, fn, description: str = ""):
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool: name 必须是非空字符串")
+        if not callable(fn):
+            raise ValueError("tool: fn 必须可调用")
+        if not isinstance(description, str):
+            raise ValueError("tool: description 必须是字符串")
+        if name in self._tools:
+            raise ValueError(f"tool: 工具已注册：{name!r}")
+        self._tools[name] = {"fn": fn, "description": description}
+        return self
+
+    def unregister(self, name: str):
+        if name not in self._tools:
+            raise ValueError(f"tool: 工具未注册：{name!r}")
+        del self._tools[name]
+        return self
+
+    def call(self, name: str, **kwargs):
+        if name not in self._tools:
+            raise ValueError(f"tool: 工具未注册：{name!r}")
+        return self._tools[name]["fn"](**kwargs)
+
+    def list_tools(self):
+        return [{"name": name, "description": info["description"]}
+                for name, info in self._tools.items()]
+
+    def __len__(self):
+        return len(self._tools)
+
+    def __contains__(self, name):
+        return name in self._tools
+
+
+def parse_react_output(text):
+    """解析 ReAct 文本输出的各字段（Thought/Action/Action Input/Observation/Final Answer）。"""
+    if not isinstance(text, str):
+        raise ValueError("react: text 必须是字符串")
+    patterns = [
+        ("thought", r"Thought\s*[:：]\s*(.*?)(?=\n(?:Action|Action Input|Observation|Final Answer)\s*[:：]|\Z)"),
+        ("action", r"Action\s*[:：]\s*([^\n]*)"),
+        ("action_input", r"Action Input\s*[:：]\s*(.*?)(?=\n(?:Thought|Observation|Final Answer)\s*[:：]|\Z)"),
+        ("observation", r"Observation\s*[:：]\s*(.*?)(?=\n(?:Thought|Action|Final Answer)\s*[:：]|\Z)"),
+        ("final_answer", r"Final Answer\s*[:：]\s*(.*)\Z"),
+    ]
+    out = {key: None for key, _ in patterns}
+    for key, pat in patterns:
+        m = re.search(pat, text, flags=re.S | re.I)
+        if m:
+            val = m.group(1).strip()
+            out[key] = val if val != "" else None
+    if all(v is None for v in out.values()):
+        raise ValueError("react: 未解析到 Thought/Action/Final Answer 任一字段")
+    return out
+
+
+def react_episode(registry: ToolRegistry, steps):
+    """执行显式给定的 ReAct 步骤序列（[{action,action_input}]），返回观测列表。"""
+    if not isinstance(registry, ToolRegistry):
+        raise ValueError("react: registry 必须是 ToolRegistry")
+    if not isinstance(steps, (list, tuple)) or not steps:
+        raise ValueError("react: steps 必须是非空列表")
+    observations = []
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict) or "action" not in step:
+            raise ValueError(f"react: steps[{i}] 必须是含 action 的字典")
+        action = step["action"]
+        args = step.get("action_input", {})
+        if not isinstance(args, dict):
+            raise ValueError(f"react: steps[{i}].action_input 必须是字典")
+        observations.append(registry.call(action, **args))
+    return observations
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

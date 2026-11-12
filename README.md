@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2285 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2292 项）
 
 ## 特性
 
@@ -2120,6 +2120,29 @@ tox = toxicity_score(tokens, banned_words)    # {"score","flagged"}
 | `toxicity_score(tokens, lexicon)` | 命中毒性词表比例与命中下标 |
 
 - 边界：pass@k 为无偏组合估计而非置信区间；PRM 聚合只看逐步分数、不训练 PRM；verifier 排序假设分数已由外部模型给出；毒性只做词表匹配（不做语义/上下文判断）。
+
+### Agent 工具注册与 ReAct 解析（ToolRegistry / react_episode）
+
+ReAct/Agent 流程的最小基础设施：工具注册表负责注册/分发，`parse_react_output`
+解析模型输出的 Thought/Action/Action Input/Observation/Final Answer，
+`react_episode` 按给定动作序列顺序调用工具并收集观测。
+
+```python
+reg = ToolRegistry()
+reg.register("add", lambda x, y: x + y, "加法")
+
+out = parse_react_output("Thought: ...\nAction: add\n"
+                         "Action Input: {\"x\": 1, \"y\": 2}\nFinal Answer: 3")
+obs = react_episode(reg, [{"action": "add", "action_input": {"x": 1, "y": 2}}])
+```
+
+| API | 说明 |
+| --- | --- |
+| `ToolRegistry()` | `register(name, fn, description="")`、`unregister`、`call(name, **kwargs)`、`list_tools()`、`len`/`in` |
+| `parse_react_output(text)` | 解析 ReAct 文本字段，未出现的字段为 `None`；完全无字段抛 ValueError |
+| `react_episode(registry, steps)` | 按 `[{"action","action_input"}]` 顺序调用工具，返回观测列表 |
+
+- 边界：只做注册/分发与文本解析，不内置 LLM 调用、重试或多轮 ReAct 循环；工具调用不经沙箱与权限检查；`action_input` 是原文字符串，需调用方自行 JSON 解码。
 
 ### 量化与 SmoothQuant
 
@@ -4534,7 +4557,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2285 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2292 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4780,6 +4803,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
 | `TestToxicity` | 比例与命中下标、非法输入 |
 | `TestRankingMetricsCompat` | 已有 Recall@k / reciprocal_rank 语义回归 |
+| `TestToolRegistry` | 注册/分发/列表/注销与重复/缺失工具错误 |
+| `TestParseReAct` | 完整字段、仅 Final Answer 与中文冒号、无字段报错 |
+| `TestReactEpisode` | 多步工具调用顺序、非法 registry/steps/action |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4917,6 +4943,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2285 个单元测试
+├── test_ai.py       # 2292 个单元测试
 └── README.md
 ```

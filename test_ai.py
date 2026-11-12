@@ -35756,3 +35756,68 @@ class TestRankingMetricsCompat:
         assert AI.recall_at_k(rel, scores, 3) == pytest.approx(1.0)
         assert AI.reciprocal_rank(rel, scores) == pytest.approx(1.0)
         assert AI.reciprocal_rank([0, 1], [0.9, 0.8]) == pytest.approx(0.5)
+
+
+class TestToolRegistry:
+    def test_register_and_call(self):
+        reg = AI.ToolRegistry()
+        reg.register("add", lambda x, y: x + y, "加法")
+        assert reg.call("add", x=2, y=3) == 5
+        assert len(reg) == 1 and "add" in reg
+        tools = reg.list_tools()
+        assert tools == [{"name": "add", "description": "加法"}]
+        assert reg.unregister("add") is reg and len(reg) == 0
+
+    def test_errors(self):
+        reg = AI.ToolRegistry()
+        _p10f_raises(lambda: reg.register("", lambda: None))
+        _p10f_raises(lambda: reg.register("f", "not callable"))
+        reg.register("f", lambda: 1)
+        _p10f_raises(lambda: reg.register("f", lambda: 2))
+        _p10f_raises(lambda: reg.unregister("missing"))
+        _p10f_raises(lambda: reg.call("missing"))
+
+
+class TestParseReAct:
+    def test_full_fields(self):
+        text = ("Thought: I need to add.\n"
+                "Action: add\n"
+                "Action Input: {\"x\": 1, \"y\": 2}\n"
+                "Observation: 3\n"
+                "Thought: done\n"
+                "Final Answer: 3")
+        out = AI.parse_react_output(text)
+        assert out["action"] == "add"
+        assert out["action_input"] == '{"x": 1, "y": 2}'
+        assert out["observation"] == "3"
+        assert out["final_answer"] == "3"
+        assert out["thought"] == "I need to add."
+
+    def test_final_only_and_chinese_colon(self):
+        out = AI.parse_react_output("Final Answer：完成")
+        assert out["final_answer"] == "完成"
+        assert out["action"] is None
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.parse_react_output("just plain text"))
+        _p10f_raises(lambda: AI.parse_react_output(123))
+
+
+class TestReactEpisode:
+    def test_run_steps(self):
+        reg = AI.ToolRegistry()
+        reg.register("add", lambda x, y: x + y)
+        reg.register("mul", lambda x, y: x * y)
+        obs = AI.react_episode(reg, [
+            {"action": "add", "action_input": {"x": 1, "y": 2}},
+            {"action": "mul", "action_input": {"x": 3, "y": 4}},
+        ])
+        assert obs == [3, 12]
+
+    def test_errors(self):
+        reg = AI.ToolRegistry()
+        reg.register("f", lambda: 1)
+        _p10f_raises(lambda: AI.react_episode("reg", [{"action": "f"}]))
+        _p10f_raises(lambda: AI.react_episode(reg, []))
+        _p10f_raises(lambda: AI.react_episode(reg, [{"action": "f", "action_input": 1}]))
+        _p10f_raises(lambda: AI.react_episode(reg, [{"action": "missing"}]))
