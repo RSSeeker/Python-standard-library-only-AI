@@ -36148,3 +36148,66 @@ class TestGradientBoostingRegressor:
         _p10f_raises(lambda: AI.GradientBoostingRegressor(learning_rate=0.0))
         _p10f_raises(lambda: AI.GradientBoostingRegressor().predict([[0.0]]))
         _p10f_raises(lambda: AI.GradientBoostingRegressor().fit([[0.0], [1.0]], [0.0]))
+
+
+def _p11d_traj():
+    return {"states": [[0.0, 1.0], [1.0, 0.0], [0.0, -1.0], [-1.0, 0.0]],
+            "actions": [[0.5], [-0.5], [0.5], [-0.5]],
+            "returns": [4.0, 3.0, 2.0, 1.0]}
+
+
+class TestDecisionTransformer:
+    def test_forward_and_param_count(self):
+        m = AI.DecisionTransformer(2, 1, d_model=4, num_heads=2, d_ff=8,
+                                   num_layers=1, max_len=8, seed=1)
+        assert m.param_count() == 205
+        pred = m.forward(_p11d_traj())
+        assert len(pred) == 4 and len(pred[0]) == 1
+
+    def test_numerical_gradients(self):
+        m = AI.DecisionTransformer(2, 1, d_model=4, num_heads=2, d_ff=8,
+                                   num_layers=1, max_len=8, seed=2)
+        traj = _p11d_traj()
+        m.zero_grad()
+        base = m.loss_and_backward(traj)
+        h = 1e-5
+
+        def fd(get_grad, get_param, set_param):
+            g = get_grad()
+            p0 = get_param()
+            set_param(p0 + h)
+            m.zero_grad()
+            lp = m.loss_and_backward(traj)
+            set_param(p0 - h)
+            m.zero_grad()
+            lm = m.loss_and_backward(traj)
+            set_param(p0)
+            return abs(g - (lp - lm) / (2 * h)) / max(1e-8, abs(g))
+
+        assert fd(lambda: m.grad_W_s[0][0][0],
+                  lambda: m.W_s.weights[0][0],
+                  lambda v: m.W_s.weights[0].__setitem__(0, v)) < 1e-4
+        assert fd(lambda: m.grad_head[0][0][0],
+                  lambda: m.head.weights[0][0],
+                  lambda v: m.head.weights[0].__setitem__(0, v)) < 1e-4
+        assert base > 0.0
+
+    def test_fit_decreases_loss(self):
+        m = AI.DecisionTransformer(2, 1, d_model=4, num_heads=2, d_ff=8,
+                                   num_layers=1, max_len=8, seed=3)
+        hist = m.fit([_p11d_traj()], epochs=30, lr=0.05, seed=1)
+        assert hist[-1]["loss"] < hist[0]["loss"] * 0.5
+
+    def test_invalid_inputs(self):
+        _p10f_raises(lambda: AI.DecisionTransformer(0, 1))
+        _p10f_raises(lambda: AI.DecisionTransformer(2, 1, num_heads=3, d_model=4))
+        _p10f_raises(lambda: AI.DecisionTransformer(2, 1, num_layers=0))
+        m = AI.DecisionTransformer(2, 1, d_model=4, num_heads=2, d_ff=8,
+                                   num_layers=1, max_len=8)
+        _p10f_raises(lambda: m.forward({}))
+        _p10f_raises(lambda: m.forward({"states": [], "actions": [], "returns": []}))
+        _p10f_raises(lambda: m.forward(
+            {"states": [[0.0]], "actions": [[0.5]], "returns": [1.0]}))
+        _p10f_raises(lambda: m.fit([], epochs=1))
+        _p10f_raises(lambda: m.fit([_p11d_traj()], epochs=0))
+        _p10f_raises(lambda: m.fit([_p11d_traj()], lr=-0.1))

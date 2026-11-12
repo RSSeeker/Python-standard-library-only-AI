@@ -6377,6 +6377,190 @@ class GradientBoostingRegressor:
             out.append(value)
         return out
 
+
+def _dt_check_trajectory(traj, state_dim, act_dim):
+    if not isinstance(traj, dict):
+        raise ValueError("dt: 轨迹必须是 dict")
+    keys = ("states", "actions", "returns")
+    for k in keys:
+        if k not in traj or not isinstance(traj[k], (list, tuple)) or not traj[k]:
+            raise ValueError(f"dt: 轨迹必须包含非空列表 {k}")
+    T = len(traj["states"])
+    if len(traj["actions"]) != T or len(traj["returns"]) != T:
+        raise ValueError("dt: states/actions/returns 长度必须一致")
+    states = []
+    for row in traj["states"]:
+        if not isinstance(row, (list, tuple)) or len(row) != state_dim:
+            raise ValueError(f"dt: 每个 state 长度必须是 {state_dim}")
+        states.append([float(v) for v in row])
+    actions = []
+    for row in traj["actions"]:
+        if not isinstance(row, (list, tuple)) or len(row) != act_dim:
+            raise ValueError(f"dt: 每个 action 长度必须是 {act_dim}")
+        actions.append([float(v) for v in row])
+    returns = []
+    for v in traj["returns"]:
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError("dt: returns 必须是数字列表")
+        returns.append(float(v))
+    for rows in (states, actions):
+        for row in rows:
+            for v in row:
+                if not math.isfinite(v):
+                    raise ValueError("dt: 输入必须只包含有限数字")
+    if not all(math.isfinite(v) for v in returns):
+        raise ValueError("dt: returns 必须只包含有限数字")
+    return {"states": states, "actions": actions, "returns": returns}
+
+
+class DecisionTransformer:
+    """Decision Transformer：把离线轨迹当序列建模，用 returns-to-go 条件化预测动作。"""
+
+    def __init__(self, state_dim, act_dim, d_model=32, num_heads=4, d_ff=64,
+                 num_layers=1, max_len=32, seed=None):
+        for name, val in (("state_dim", state_dim), ("act_dim", act_dim),
+                          ("d_model", d_model), ("num_heads", num_heads),
+                          ("d_ff", d_ff), ("num_layers", num_layers),
+                          ("max_len", max_len)):
+            if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+                raise ValueError(f"dt: {name} 必须是正整数")
+        if d_model % num_heads != 0:
+            raise ValueError("dt: d_model 必须能被 num_heads 整除")
+        self.state_dim = state_dim
+        self.act_dim = act_dim
+        self.d_model = d_model
+        self.d_ff = d_ff
+        old = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.W_s = Layer(state_dim, d_model, "linear")
+            self.W_a = Layer(act_dim, d_model, "linear")
+            self.W_r = Layer(1, d_model, "linear")
+            self.pos = PositionalEncoding(d_model, max_len)
+            self.encoder = TransformerEncoder(
+                d_model, num_heads, d_ff, num_layers, dropout=0.0, causal=True)
+            self.head = Layer(d_model, act_dim, "linear")
+        finally:
+            random.setstate(old)
+        self._cache = None
+        self.grad_W_s = None
+        self.grad_W_a = None
+        self.grad_W_r = None
+        self.grad_head = None
+
+    def _tokens(self, traj):
+        states, actions, returns = traj["states"], traj["actions"], traj["returns"]
+        T = len(states)
+        s_rows, s_cache = _dense_rows_forward(self.W_s, states)
+        a_in = [[0.0] * self.act_dim] + actions[:-1]
+        a_rows, a_cache = _dense_rows_forward(self.W_a, a_in)
+        r_rows, r_cache = _dense_rows_forward(self.W_r, [[v] for v in returns])
+        h = [[s_rows[t][k] + a_rows[t][k] + r_rows[t][k]
+              for k in range(self.d_model)] for t in range(T)]
+        self._cache = {"s": s_cache, "a": a_cache, "r": r_cache, "h": h, "T": T}
+        return h
+
+    def forward(self, traj):
+        traj = _dt_check_trajectory(traj, self.state_dim, self.act_dim)
+        h = self._tokens(traj)
+        hp = self.pos.forward(h)
+        encoded = self.encoder.forward(hp)
+        self._cache["out"] = encoded
+        pred, head_cache = _dense_rows_forward(self.head, encoded)
+        self._cache["head"] = head_cache
+        return pred
+
+    def loss_and_backward(self, traj):
+        traj = _dt_check_trajectory(traj, self.state_dim, self.act_dim)
+        pred = self.forward(traj)
+        targets = traj["actions"]
+        T = len(targets)
+        d = self.act_dim
+        total = 0.0
+        d_pred = []
+        for t in range(T):
+            row = []
+            for k in range(d):
+                diff = pred[t][k] - targets[t][k]
+                total += diff * diff
+                row.append(2.0 * diff / (T * d))
+            d_pred.append(row)
+        loss = total / (T * d)
+        gw, gb, dh = _dense_rows_backward(self.head, self._cache["head"], d_pred)
+        self.grad_head = self._acc(self.grad_head, (gw, gb))
+        d_enc = self.encoder.backward(dh)
+        d_h = self.pos.backward(d_enc)
+        cache = self._cache
+        gw_s, gb_s, _ = _dense_rows_backward(self.W_s, cache["s"], d_h)
+        self.grad_W_s = self._acc(self.grad_W_s, (gw_s, gb_s))
+        d_a = [[0.0] * self.d_model] + d_h[:-1]
+        gw_a, gb_a, _ = _dense_rows_backward(self.W_a, cache["a"], d_a)
+        self.grad_W_a = self._acc(self.grad_W_a, (gw_a, gb_a))
+        gw_r, gb_r, _ = _dense_rows_backward(self.W_r, cache["r"], d_h)
+        self.grad_W_r = self._acc(self.grad_W_r, (gw_r, gb_r))
+        return loss
+
+    @staticmethod
+    def _acc(old, new):
+        if old is None:
+            return new
+        gw, gb = old
+        nw, nb = new
+        for i in range(len(gw)):
+            for j in range(len(gw[i])):
+                gw[i][j] += nw[i][j]
+        for i in range(len(gb)):
+            gb[i] += nb[i]
+        return old
+
+    def zero_grad(self):
+        self.grad_W_s = None
+        self.grad_W_a = None
+        self.grad_W_r = None
+        self.grad_head = None
+        self.encoder.zero_grad()
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0.0:
+            raise ValueError("dt: lr 必须是正数")
+        for layer, grads in ((self.W_s, self.grad_W_s), (self.W_a, self.grad_W_a),
+                             (self.W_r, self.grad_W_r), (self.head, self.grad_head)):
+            if grads is not None:
+                _dense_apply_sgd(layer, grads, lr)
+        self.encoder.sgd_step(lr)
+
+    def fit(self, trajectories, epochs=20, lr=0.01, seed=None):
+        if not isinstance(trajectories, (list, tuple)) or not trajectories:
+            raise ValueError("dt: trajectories 必须是非空列表")
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs <= 0:
+            raise ValueError("dt: epochs 必须是正整数")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or not math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError("dt: lr 必须是正数")
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(trajectories)))
+            rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(trajectories[idx])
+                self.sgd_step(lr)
+            history.append({"loss": total / len(trajectories)})
+        return history
+
+    def predict(self, traj):
+        return self.forward(traj)
+
+    def param_count(self):
+        d = self.d_model
+        d_ff = self.d_ff
+        enc_layer = 4 * d * d + 9 * d + 2 * d * d_ff + d_ff
+        return (_dense_param_count(self.W_s) + _dense_param_count(self.W_a)
+                + _dense_param_count(self.W_r) + _dense_param_count(self.head)
+                + len(self.encoder.layers) * enc_layer)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2343 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2347 项）
 
 ## 特性
 
@@ -2226,6 +2226,28 @@ score = hmm_sequence_score(emissions, transitions, path)
 | `hmm_sequence_score(emissions, transitions, path, start=None)` | 给定路径的 emission+transition 对数总分 |
 
 - 边界：输入是**对数域**发射/转移势（不做概率归一化校验）；只支持离散状态的一阶马尔可夫链，不含高阶转移、批处理、半马尔可夫；posterior 用 logsumexp 稳定计算。
+
+### 决策 Transformer（Decision Transformer）
+
+把离线轨迹当序列建模：每步 token = 状态嵌入 + 上一步动作嵌入 + returns-to-go 嵌入，
+因果 Transformer 编码后预测当前动作，用行为克隆式 MSE 训练。
+
+```python
+traj = {"states": [[0, 1], [1, 0], [0, -1], [-1, 0]],
+        "actions": [[0.5], [-0.5], [0.5], [-0.5]],
+        "returns": [4, 3, 2, 1]}
+m = DecisionTransformer(2, 1, d_model=4, num_heads=2, d_ff=8, num_layers=1, max_len=8)
+pred = m.forward(traj)                 # 每步一个动作
+hist = m.fit([traj], epochs=30, lr=0.05)
+```
+
+| API | 说明 |
+| --- | --- |
+| `DecisionTransformer(state_dim, act_dim, d_model=32, num_heads=4, d_ff=64, num_layers=1, max_len=32, seed=None)` | 状态/动作/回报三路线性嵌入 + 位置编码 + 因果 TransformerEncoder + 动作头 |
+| `forward(traj)` / `predict(traj)` | 输入 `{"states","actions","returns"}`，返回逐步动作预测 |
+| `loss_and_backward(traj)` / `fit(trajectories, epochs=20, lr=0.01, seed=None)` / `param_count()` | 手写反传（MSE 梯度经动作头 → encoder → 三路嵌入）；`sgd_step` 更新 |
+
+- 边界：只做行为克隆（不使用在线回报或 TD 目标）；输入需等长且维度固定，无 padding/变长批处理，无 timestep 嵌入与 layer norm 变体。
 
 ### 梯度提升树（GBDT）
 
@@ -4696,7 +4718,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2343 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2347 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4961,6 +4983,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKvOffloadPlan` | 块布局、前块驻 GPU、容量超限、非法输入 |
 | `TestRegressionTree` | 拟合/叶子均值、未拟合与非法输入 |
 | `TestGradientBoostingRegressor` | 线性目标 MSE、常数目标、超参/未拟合校验 |
+| `TestDecisionTransformer` | 前向/参数量、梯度有限差分、fit 降损失、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5098,6 +5121,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2343 个单元测试
+├── test_ai.py       # 2347 个单元测试
 └── README.md
 ```
