@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2226 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2237 项）
 
 ## 特性
 
@@ -2357,7 +2357,7 @@ losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
 一阶动量的普通梯度下降，test-time 更新不参与外层反向传播；`process(update=False)`
 只读不写。
 
-### 优势归一化与推理采样工具（GRPO / Best-of-N / Self-Consistency / 拒绝采样）
+### 优势归一化、裁剪变体与推理采样工具（GRPO / RLOO / DAPO / GSPO / Best-of-N / 拒绝采样）
 
 这些工具补在 PPO 之后不依赖单独的反向逻辑：先按组把奖励变成相对优势，再把逐步损失交给 `ppo_loss`；推理侧提供无梯度、无模型的投票/挑选/过滤工具。
 
@@ -2368,6 +2368,10 @@ losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
 | `best_of_n(samples, rewards)` | 在 N 个候选中取奖励最高者，返回 `{"best","index","reward","scores"}` |
 | `self_consistency(samples, normalize=None)` | 多数投票：返回 `(best, tally, confidence)`，相同票数取首次出现顺序 |
 | `rejection_sampling_filter(samples, rewards, threshold=None, top_ratio=None)` | RFT / 拒绝采样过滤，返回 `(kept_samples, kept_indices)` |
+| `rloo_advantages(rewards, group_size=None)` | RLOO 留一法优势：`r_i - mean(同组除 r_i 外的奖励)`，不减均值、不除标准差 |
+| `dr_grpo_advantages(rewards, group_size=None)` | Dr. GRPO 优势：只减组内均值，不做标准差归一化（避免难题被放大） |
+| `dapo_token_losses(logit_seqs, old_logp_seqs, action_seqs, advantage_seqs, clip_ratio=0.2, clip_ratio_high=0.28, entropy_coef=0.0)` | DAPO 的 token 级裁剪损失（clip-higher：上界更松），按整批 token 总数归一化 |
+| `gspo_losses(logit_seqs, old_logp_seqs, action_seqs, sequence_advantages, clip_ratio=0.2, clip_ratio_high=None, entropy_coef=0.0)` | GSPO 的序列级重要性比裁剪：`s_i=exp(mean_t(logp_new-logp_old))`，梯度按 `s_i/T` 分摊到各 token |
 
 示例：
 
@@ -2381,6 +2385,13 @@ vote, tally, conf = AI.self_consistency([1, 2, 2, 3, 2])  # vote == 2, conf == 0
 kept, idx = AI.rejection_sampling_filter(
     ["a", "b", "c"], [0.1, 0.9, 0.5], top_ratio=0.5)      # idx == [1]
 ```
+
+`rloo_advantages` / `dr_grpo_advantages` 是两种**不需要价值网络**的优势估计：
+前者用同组其余样本的均值作基线（留一法，方差更低），后者只去均值、不除标准差
+（Dr. GRPO 指出按标准差归一化会让简单题梯度被放大）。`dapo_token_losses` 与
+`gspo_losses` 则分别从 **token 级**和**序列级**计算重要性比并做不对称裁剪：
+DAPO 的 `clip_ratio_high` 通常略大于 `clip_ratio` 以抑制熵塌缩；GSPO 先把整条
+序列的 log-ratio 取平均再加权，适合长度差异大的推理轨迹。
 
 边界：GRPO 只做「组内优势 + 裁剪损失」，不含参考模型的 KL 项、不做序列级长度归一化的额外处理；`grpo_losses` 的 `dlogits` 需要调用方按策略网络/语言模型手工回传；Best-of-N、Self-Consistency、拒绝采样只作用于已采样结果（奖励函数由调用方提供）。
 
@@ -4342,7 +4353,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2226 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2237 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4569,6 +4580,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestBestOfN` | 取最大奖励、并列取最小下标、非法输入 |
 | `TestSelfConsistency` | 多数投票、并列、`normalize` 规范化、空/不可哈希输入 |
 | `TestRejectionSampling` | 阈值过滤、`top_ratio` 保留、空结果与非法参数 |
+| `TestRLOO` | 留一法基线数值、分组求和为零、非法 group_size/NaN 输入 |
+| `TestDrGRPO` | 去均值优势数值、分组独立、非法输入 |
+| `TestDAPO` | token 级归一化手算对照、clip-higher 行为、logits 数值梯度、非法输入 |
+| `TestGSPO` | 序列级重要性比手算对照、logits 数值梯度、clip_ratio 非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4706,6 +4721,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2226 个单元测试
+├── test_ai.py       # 2237 个单元测试
 └── README.md
 ```

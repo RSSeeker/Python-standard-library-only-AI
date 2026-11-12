@@ -40283,6 +40283,258 @@ def tree_of_thought(propose_fn, evaluate_fn, is_terminal, initial_state,
     return {"path": best["path"], "score": best["score"],
             "expanded": len(frontier)}
 
+def _rlv_finite(value, who):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{who} 必须是有限数字，收到 {value!r}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{who} 必须是有限数字，收到 {value!r}")
+    return float(value)
+
+
+def _rlv_groups(total, group_size, who):
+    if group_size is None:
+        return [(0, total)]
+    if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 2:
+        raise ValueError(f"{who}: group_size 必须是 >=2 的整数，收到 {group_size!r}")
+    if total % group_size != 0:
+        raise ValueError(
+            f"{who}: 样本数 {total} 必须能被 group_size {group_size} 整除")
+    return [(s, s + group_size) for s in range(0, total, group_size)]
+
+
+def _rlv_reward_groups(rewards, group_size, who):
+    if not isinstance(rewards, (list, tuple)) or not rewards:
+        raise ValueError(f"{who}: rewards 必须是非空列表")
+    vals = []
+    for i, r in enumerate(rewards):
+        vals.append(_rlv_finite(r, f"{who}: rewards[{i}]"))
+    return vals, _rlv_groups(len(vals), group_size, who)
+
+
+def rloo_advantages(rewards, group_size=None):
+    """RLOO 的留一法基线优势：``A_i = r_i - mean(同组除 r_i 外的奖励)``。
+
+    与 ``group_relative_advantages`` 的区别：不减组内均值、不除标准差，
+    每个样本用「其余样本」的均值作基线。返回等长浮点列表。
+    """
+    vals, groups = _rlv_reward_groups(rewards, group_size, "rloo_advantages")
+    out = [0.0] * len(vals)
+    for start, end in groups:
+        size = end - start
+        if size < 2:
+            raise ValueError("rloo_advantages: 每组至少需要 2 个样本")
+        total = sum(vals[start:end])
+        for i in range(start, end):
+            out[i] = vals[i] - (total - vals[i]) / (size - 1)
+    return out
+
+
+def dr_grpo_advantages(rewards, group_size=None):
+    """Dr. GRPO 优势：只减组内均值，不做标准差归一化（避免难度偏置）。"""
+    vals, groups = _rlv_reward_groups(rewards, group_size, "dr_grpo_advantages")
+    out = [0.0] * len(vals)
+    for start, end in groups:
+        mean = sum(vals[start:end]) / (end - start)
+        for i in range(start, end):
+            out[i] = vals[i] - mean
+    return out
+
+
+def _rlv_check_step_batch(logit_seqs, old_logp_seqs, action_seqs, advantage_seqs,
+                          who):
+    named = [("logit_seqs", logit_seqs), ("old_logp_seqs", old_logp_seqs),
+             ("action_seqs", action_seqs), ("advantage_seqs", advantage_seqs)]
+    for name, obj in named:
+        if not isinstance(obj, (list, tuple)) or not obj:
+            raise ValueError(f"{who}: {name} 必须是非空列表")
+    n = len(logit_seqs)
+    for name, obj in named:
+        if len(obj) != n:
+            raise ValueError(f"{who}: {name} 必须与 logit_seqs 等长")
+    for i in range(n):
+        lt = logit_seqs[i]
+        if not isinstance(lt, (list, tuple)) or not lt:
+            raise ValueError(f"{who}: logit_seqs[{i}] 必须是非空列表")
+        t = len(lt)
+        for name, obj in named[1:]:
+            if len(obj[i]) != t:
+                raise ValueError(f"{who}: 第 {i} 条序列的四类输入长度必须一致")
+        for t_i in range(t):
+            row = lt[t_i]
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError(f"{who}: logit_seqs[{i}][{t_i}] 必须是非空列表")
+            for j, v in enumerate(row):
+                _rlv_finite(v, f"{who}: logit_seqs[{i}][{t_i}][{j}]")
+            if isinstance(action_seqs[i][t_i], bool) \
+                    or not isinstance(action_seqs[i][t_i], int) \
+                    or not (0 <= action_seqs[i][t_i] < len(row)):
+                raise ValueError(
+                    f"{who}: action_seqs[{i}][{t_i}] 必须是 0..{len(row) - 1} 的整数")
+            _rlv_finite(old_logp_seqs[i][t_i], f"{who}: old_logp_seqs[{i}][{t_i}]")
+            _rlv_finite(advantage_seqs[i][t_i], f"{who}: advantage_seqs[{i}][{t_i}]")
+
+
+def _rlv_softmax_step_loss(logits, old_logp, action, advantage, clip_low, clip_high,
+                           entropy_coef):
+    row = [float(v) for v in logits]
+    probs = _rl_softmax(row)
+    logs = _rl_log_softmax(row)
+    ratio = math.exp(logs[action] - old_logp)
+    lo = 1.0 - clip_low
+    hi = 1.0 + clip_high
+    clipped = lo if ratio < lo else (hi if ratio > hi else ratio)
+    unclipped_term = ratio * advantage
+    clipped_term = clipped * advantage
+    use_unclipped = unclipped_term <= clipped_term
+    loss = -min(unclipped_term, clipped_term)
+    grad = [0.0] * len(row)
+    if use_unclipped:
+        for j in range(len(row)):
+            onehot = 1.0 if j == action else 0.0
+            grad[j] = -advantage * ratio * (onehot - probs[j])
+    if entropy_coef:
+        h, dh = entropy_term(row)
+        loss -= entropy_coef * h
+        for j in range(len(row)):
+            grad[j] += entropy_coef * dh[j]
+    return loss, grad, ratio, not use_unclipped
+
+
+def dapo_token_losses(logit_seqs, old_logp_seqs, action_seqs, advantage_seqs,
+                      clip_ratio=0.2, clip_ratio_high=0.28, entropy_coef=0.0):
+    """DAPO 的 token 级裁剪损失（支持 clip-higher）。
+
+    ``clip_ratio`` 是下界裁剪系数，``clip_ratio_high`` 是上界裁剪系数
+    （DAPO 让上界更松以避免熵塌缩）。损失按整批 token 总数归一化，而不是
+    每条序列内平均——这是 DAPO 与 GRPO 在 batch 长度不齐时的关键区别。
+    返回 ``(loss, dlogits_seqs, infos)``。
+    """
+    _rlv_check_step_batch(logit_seqs, old_logp_seqs, action_seqs,
+                          advantage_seqs, "dapo_token_losses")
+    for name, v in (("clip_ratio", clip_ratio), ("clip_ratio_high", clip_ratio_high)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not (0.0 < v < 1.0):
+            raise ValueError(f"dapo_token_losses: {name} 必须在 (0,1) 内，收到 {v!r}")
+    if isinstance(entropy_coef, bool) or not isinstance(entropy_coef, (int, float)) \
+            or entropy_coef < 0.0:
+        raise ValueError("dapo_token_losses: entropy_coef 必须 >= 0")
+    total_tokens = sum(len(seq) for seq in logit_seqs)
+    total_loss = 0.0
+    grads = []
+    infos = []
+    for i, seq in enumerate(logit_seqs):
+        seq_grads = []
+        seq_infos = []
+        for t in range(len(seq)):
+            loss, grad, ratio, clipped = _rlv_softmax_step_loss(
+                seq[t], float(old_logp_seqs[i][t]), action_seqs[i][t],
+                float(advantage_seqs[i][t]),
+                float(clip_ratio), float(clip_ratio_high), entropy_coef)
+            total_loss += loss
+            seq_grads.append([v / total_tokens for v in grad])
+            seq_infos.append({"ratio": ratio, "clipped": clipped})
+        grads.append(seq_grads)
+        infos.append(seq_infos)
+    return total_loss / total_tokens, grads, infos
+
+
+def gspo_losses(logit_seqs, old_logp_seqs, action_seqs, sequence_advantages,
+                clip_ratio=0.2, clip_ratio_high=None, entropy_coef=0.0):
+    """GSPO 的序列级重要性比裁剪损失。
+
+    序列级 ratio ``s_i = exp(mean_t(logp_new - logp_old))``，损失
+    ``-min(s_i*A_i, clip(s_i,1-eps_low,1+eps_high)*A_i)``；梯度按
+    ``s_i/T`` 分摊到各 token。``sequence_advantages`` 是每条序列一个标量。
+    返回 ``(loss, dlogits_seqs, infos)``。
+    """
+    if not isinstance(logit_seqs, (list, tuple)) or not logit_seqs:
+        raise ValueError("gspo_losses: logit_seqs 必须是非空列表")
+    n = len(logit_seqs)
+    for name, obj in (("old_logp_seqs", old_logp_seqs),
+                      ("action_seqs", action_seqs),
+                      ("sequence_advantages", sequence_advantages)):
+        if not isinstance(obj, (list, tuple)) or len(obj) != n:
+            raise ValueError(f"gspo_losses: {name} 必须与 logit_seqs 等长")
+    for i in range(n):
+        lt = logit_seqs[i]
+        if not isinstance(lt, (list, tuple)) or not lt:
+            raise ValueError(f"gspo_losses: logit_seqs[{i}] 必须是非空列表")
+        t = len(lt)
+        if len(old_logp_seqs[i]) != t or len(action_seqs[i]) != t:
+            raise ValueError(f"gspo_losses: 第 {i} 条序列的 old_logps/actions 长度必须一致")
+        for t_i in range(t):
+            row = lt[t_i]
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError(f"gspo_losses: logit_seqs[{i}][{t_i}] 必须是非空列表")
+            for j, v in enumerate(row):
+                _rlv_finite(v, f"gspo_losses: logit_seqs[{i}][{t_i}][{j}]")
+            a = action_seqs[i][t_i]
+            if isinstance(a, bool) or not isinstance(a, int) or not (0 <= a < len(row)):
+                raise ValueError(f"gspo_losses: action_seqs[{i}][{t_i}] 越界")
+            _rlv_finite(old_logp_seqs[i][t_i], f"gspo_losses: old_logp_seqs[{i}][{t_i}]")
+        _rlv_finite(sequence_advantages[i], f"gspo_losses: sequence_advantages[{i}]")
+    if isinstance(clip_ratio, bool) or not isinstance(clip_ratio, (int, float)) \
+            or not (0.0 < clip_ratio < 1.0):
+        raise ValueError("gspo_losses: clip_ratio 必须在 (0,1) 内")
+    if clip_ratio_high is None:
+        clip_ratio_high = clip_ratio
+    if isinstance(clip_ratio_high, bool) or not isinstance(clip_ratio_high, (int, float)) \
+            or not (0.0 < clip_ratio_high < 1.0):
+        raise ValueError("gspo_losses: clip_ratio_high 必须在 (0,1) 内")
+    if isinstance(entropy_coef, bool) or not isinstance(entropy_coef, (int, float)) \
+            or entropy_coef < 0.0:
+        raise ValueError("gspo_losses: entropy_coef 必须 >= 0")
+    total_loss = 0.0
+    grads = []
+    infos = []
+    for i, seq in enumerate(logit_seqs):
+        t = len(seq)
+        probs_rows = []
+        logs_rows = []
+        probs_actions = []
+        old_sum = 0.0
+        for t_i in range(t):
+            row = [float(v) for v in seq[t_i]]
+            probs = _rl_softmax(row)
+            logs = _rl_log_softmax(row)
+            a = action_seqs[i][t_i]
+            probs_rows.append(probs)
+            logs_rows.append(logs)
+            probs_actions.append(probs[a])
+            old_sum += float(old_logp_seqs[i][t_i])
+        new_sum = sum(logs_rows[t_i][action_seqs[i][t_i]] for t_i in range(t))
+        # log(mean ratio) = mean(logp_new - logp_old)
+        mean_log_ratio = (new_sum - old_sum) / t
+        s = math.exp(mean_log_ratio)
+        adv = float(sequence_advantages[i])
+        lo = 1.0 - float(clip_ratio)
+        hi = 1.0 + float(clip_ratio_high)
+        clipped = lo if s < lo else (hi if s > hi else s)
+        unclipped_term = s * adv
+        clipped_term = clipped * adv
+        use_unclipped = unclipped_term <= clipped_term
+        loss = -min(unclipped_term, clipped_term)
+        seq_grads = []
+        for t_i in range(t):
+            row_len = len(seq[t_i])
+            grad = [0.0] * row_len
+            if use_unclipped:
+                factor = -adv * s / t
+                onehot = [0.0] * row_len
+                onehot[action_seqs[i][t_i]] = 1.0
+                for j in range(row_len):
+                    grad[j] = factor * (onehot[j] - probs_rows[t_i][j])
+            if entropy_coef:
+                h, dh = entropy_term([float(v) for v in seq[t_i]])
+                loss -= entropy_coef * h / t
+                for j in range(row_len):
+                    grad[j] += entropy_coef * dh[j] / t
+            seq_grads.append([v / n for v in grad])
+        total_loss += loss
+        grads.append(seq_grads)
+        infos.append({"ratio": s, "clipped": not use_unclipped})
+    return total_loss / n, grads, infos
+
 class PPOAgent:
     """PPO（裁剪目标 + GAE + 熵正则）的离散动作实现。
 

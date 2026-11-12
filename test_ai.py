@@ -35000,3 +35000,162 @@ class TestVersionedStore:
             _p23_raises(lambda: store.get("doc"), ValueError)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+import math
+
+import AI
+
+
+def _p10a_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _p10a_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+class TestRLOO:
+    def test_leave_one_out_baseline(self):
+        adv = AI.rloo_advantages([1.0, 2.0, 3.0])
+        assert [_p10a_close(v, e) for v, e in zip(adv, [-1.5, 0.0, 1.5])] == [True] * 3
+        assert _p10a_close(sum(adv), 0.0)
+        g = AI.rloo_advantages([1, 2, 3, 4], group_size=2)
+        assert [round(v, 9) for v in g] == [-1.0, 1.0, -1.0, 1.0]
+        assert _p10a_close(sum(g), 0.0)
+
+    def test_invalid_inputs(self):
+        assert _p10a_raises(lambda: AI.rloo_advantages([]))
+        assert _p10a_raises(lambda: AI.rloo_advantages([1, 2, 3], group_size=1))
+        assert _p10a_raises(lambda: AI.rloo_advantages([1, 2, 3], group_size=2))
+        assert _p10a_raises(lambda: AI.rloo_advantages([1.0, float('nan')]))
+        assert _p10a_raises(lambda: AI.rloo_advantages([1, True]))
+
+
+class TestDrGRPO:
+    def test_mean_centered_advantages(self):
+        adv = AI.dr_grpo_advantages([1, 2, 3])
+        assert [round(v, 9) for v in adv] == [-1.0, 0.0, 1.0]
+        g = AI.dr_grpo_advantages([1, 2, 3, 4], group_size=2)
+        assert [round(v, 9) for v in g] == [-0.5, 0.5, -0.5, 0.5]
+
+    def test_invalid_inputs(self):
+        assert _p10a_raises(lambda: AI.dr_grpo_advantages([]))
+        assert _p10a_raises(lambda: AI.dr_grpo_advantages([1, 2, 3], group_size=True))
+        assert _p10a_raises(lambda: AI.dr_grpo_advantages([1.0, float('inf')]))
+
+
+class TestDAPO:
+    def _batch(self):
+        seqs = [[[0.1, 0.2, 0.7]], [[0.1, 0.2, 0.7], [0.2, 0.3, 0.5]]]
+        old = [[0.0], [0.0, 0.0]]
+        acts = [[0], [0, 0]]
+        advs = [[1.0], [2.0, 1.0]]
+        return seqs, old, acts, advs
+
+    def test_token_level_loss_and_shapes(self):
+        seqs, old, acts, advs = self._batch()
+        loss, grads, infos = AI.dapo_token_losses(seqs, old, acts, advs)
+        assert isinstance(loss, float)
+        assert [len(g) for g in grads] == [1, 2]
+        assert len(infos) == 2 and 'ratio' in infos[0][0]
+        # 手工逐 token 求和后除以 token 总数
+        manual = 0.0
+        for i in range(2):
+            for t in range(len(seqs[i])):
+                row = seqs[i][t]
+                z = sum(math.exp(v) for v in row)
+                p = math.exp(row[acts[i][t]]) / z
+                cr = min(max(p, 0.8), 1.28)
+                manual += -min(p * advs[i][t], cr * advs[i][t])
+        manual /= 3.0
+        assert _p10a_close(loss, manual)
+
+    def test_clip_higher(self):
+        row = [0.0, 0.0, 0.0]
+        old_logp = math.log(1.0 / 3.0) - math.log(1.25)
+        l_hi, _, info_hi = AI.dapo_token_losses(
+            [[row]], [[old_logp]], [[0]], [[1.0]],
+            clip_ratio=0.2, clip_ratio_high=0.28)
+        assert not info_hi[0][0]['clipped']
+        l_lo, _, info_lo = AI.dapo_token_losses(
+            [[row]], [[old_logp]], [[0]], [[1.0]],
+            clip_ratio=0.2, clip_ratio_high=0.2)
+        assert info_lo[0][0]['clipped']
+        assert l_hi < l_lo
+
+    def test_numerical_gradient(self):
+        seqs, old, acts, advs = self._batch()
+        _, grads, _ = AI.dapo_token_losses(seqs, old, acts, advs)
+        h = 1e-6
+        base = seqs[0][0][1]
+        seqs[0][0][1] = base + h
+        lp, _, _ = AI.dapo_token_losses(seqs, old, acts, advs)
+        seqs[0][0][1] = base - h
+        lm, _, _ = AI.dapo_token_losses(seqs, old, acts, advs)
+        seqs[0][0][1] = base
+        num = (lp - lm) / (2 * h)
+        assert _p10a_close(grads[0][0][1], num, 1e-5)
+
+    def test_invalid_inputs(self):
+        seqs, old, acts, advs = self._batch()
+        assert _p10a_raises(lambda: AI.dapo_token_losses([], [], [], []))
+        assert _p10a_raises(
+            lambda: AI.dapo_token_losses(seqs, old, acts, advs, clip_ratio=0.0))
+        assert _p10a_raises(
+            lambda: AI.dapo_token_losses(seqs, old, acts, advs, clip_ratio_high=1.5))
+        assert _p10a_raises(lambda: AI.dapo_token_losses(seqs, old, [[0]], advs))
+
+
+class TestGSPO:
+    def _batch(self):
+        seqs = [[[0.1, 0.2, 0.7]], [[0.1, 0.2, 0.7], [0.2, 0.3, 0.5]]]
+        old = [[0.0], [0.0, 0.0]]
+        acts = [[0], [0, 0]]
+        return seqs, old, acts, [1.0, -1.0]
+
+    def test_sequence_level_loss(self):
+        seqs, old, acts, advs = self._batch()
+        loss, grads, infos = AI.gspo_losses(seqs, old, acts, advs)
+        assert isinstance(loss, float)
+        assert [len(g) for g in grads] == [1, 2]
+        manual = 0.0
+        for i in range(2):
+            t = len(seqs[i])
+            s = 1.0
+            for k in range(t):
+                row = seqs[i][k]
+                z = sum(math.exp(v) for v in row)
+                p = math.exp(row[acts[i][k]]) / z
+                s *= p
+            s = s ** (1.0 / t)
+            cr = min(max(s, 0.8), 1.2)
+            manual += -min(s * advs[i], cr * advs[i])
+        manual /= 2.0
+        assert _p10a_close(loss, manual)
+
+    def test_numerical_gradient(self):
+        seqs, old, acts, advs = self._batch()
+        _, grads, _ = AI.gspo_losses(seqs, old, acts, advs)
+        h = 1e-6
+        base = seqs[0][0][1]
+        seqs[0][0][1] = base + h
+        lp, _, _ = AI.gspo_losses(seqs, old, acts, advs)
+        seqs[0][0][1] = base - h
+        lm, _, _ = AI.gspo_losses(seqs, old, acts, advs)
+        seqs[0][0][1] = base
+        num = (lp - lm) / (2 * h)
+        assert _p10a_close(grads[0][0][1], num, 1e-5)
+
+    def test_invalid_inputs(self):
+        seqs, old, acts, advs = self._batch()
+        assert _p10a_raises(lambda: AI.gspo_losses([], [], [], []))
+        assert _p10a_raises(lambda: AI.gspo_losses(seqs, old, acts, [1.0]))
+        assert _p10a_raises(
+            lambda: AI.gspo_losses(seqs, old, acts, advs, clip_ratio=1.2))
+        assert _p10a_raises(
+            lambda: AI.gspo_losses(seqs, old, acts, advs, clip_ratio_high=-0.1))
