@@ -36110,3 +36110,41 @@ class TestKvOffloadPlan:
         _p10f_raises(lambda: AI.kv_offload_plan(0, 4, 1))
         _p10f_raises(lambda: AI.kv_offload_plan(8, 0, 1))
         _p10f_raises(lambda: AI.kv_offload_plan(8, 4, -1))
+
+
+class TestRegressionTree:
+    def test_fit_predict(self):
+        tree = AI.RegressionTree(max_depth=2).fit([[0.0], [1.0], [2.0], [3.0]], [0.0, 1.0, 2.0, 3.0])
+        assert tree.predict([[0.5], [2.5]]) == pytest.approx([0.5, 2.5])
+
+    def test_mean_leaf(self):
+        tree = AI.RegressionTree(max_depth=0).fit([[0.0], [1.0]], [1.0, 3.0])
+        assert tree.predict([[0.0], [1.0]]) == pytest.approx([2.0, 2.0])
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.RegressionTree(max_depth=-1))
+        _p10f_raises(lambda: AI.RegressionTree(min_samples=0))
+        _p10f_raises(lambda: AI.RegressionTree().predict([[0.0]]))
+        _p10f_raises(lambda: AI.RegressionTree().fit([], []))
+        _p10f_raises(lambda: AI.RegressionTree().fit([[0.0, 1.0], [0.0]], [0.0, 1.0]))
+
+
+class TestGradientBoostingRegressor:
+    def test_fits_linear(self):
+        X = [[float(i)] for i in range(20)]
+        y = [2.0 * x[0] + 1.0 for x in X]
+        model = AI.GradientBoostingRegressor(n_estimators=30, learning_rate=0.3).fit(X, y)
+        pred = model.predict(X)
+        mse = sum((pred[i] - y[i]) ** 2 for i in range(len(y))) / len(y)
+        assert mse < 0.1
+
+    def test_constant_target(self):
+        X = [[float(i)] for i in range(5)]
+        model = AI.GradientBoostingRegressor(n_estimators=5).fit(X, [7.0] * 5)
+        assert model.predict(X) == pytest.approx([7.0] * 5)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.GradientBoostingRegressor(n_estimators=0))
+        _p10f_raises(lambda: AI.GradientBoostingRegressor(learning_rate=0.0))
+        _p10f_raises(lambda: AI.GradientBoostingRegressor().predict([[0.0]]))
+        _p10f_raises(lambda: AI.GradientBoostingRegressor().fit([[0.0], [1.0]], [0.0]))

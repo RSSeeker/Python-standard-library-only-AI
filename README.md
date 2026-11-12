@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2337 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2343 项）
 
 ## 特性
 
@@ -2226,6 +2226,25 @@ score = hmm_sequence_score(emissions, transitions, path)
 | `hmm_sequence_score(emissions, transitions, path, start=None)` | 给定路径的 emission+transition 对数总分 |
 
 - 边界：输入是**对数域**发射/转移势（不做概率归一化校验）；只支持离散状态的一阶马尔可夫链，不含高阶转移、批处理、半马尔可夫；posterior 用 logsumexp 稳定计算。
+
+### 梯度提升树（GBDT）
+
+CART 回归树 + 平方损失梯度提升，用于表格数据基线（不依赖 numpy/pandas）。
+
+```python
+X = [[float(i)] for i in range(20)]
+y = [2.0 * x[0] + 1.0 for x in X]
+model = GradientBoostingRegressor(n_estimators=30, learning_rate=0.3, max_depth=2).fit(X, y)
+pred = model.predict(X)                      # MSE < 0.1
+tree = RegressionTree(max_depth=2).fit([[0], [1], [2], [3]], [0, 1, 2, 3])
+```
+
+| API | 说明 |
+| --- | --- |
+| `RegressionTree(max_depth=2, min_samples=2)` | CART 回归树：枚举特征/相邻取值中点做最优平方误差分裂，叶子取均值 |
+| `GradientBoostingRegressor(n_estimators=20, learning_rate=0.1, max_depth=2, min_samples=2)` | 以均值为初始值，每轮拟合残差树并按学习率叠加；`fit`/`predict` |
+
+- 边界：只支持数值特征与一维回归目标；不做缺失值处理/特征重要性/早停/正则，分裂增益 ≤1e-18 时提前成为叶子。
 
 ### Matryoshka 嵌入与 KV 分层存放（Matryoshka / KV offload）
 
@@ -4677,7 +4696,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2337 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2343 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4940,6 +4959,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConcordanceIndex` | 完美/反向排序、同分与删失、非法输入 |
 | `TestMatryoshka` | 前缀截断归一化、零向量、前缀相似度、非法输入 |
 | `TestKvOffloadPlan` | 块布局、前块驻 GPU、容量超限、非法输入 |
+| `TestRegressionTree` | 拟合/叶子均值、未拟合与非法输入 |
+| `TestGradientBoostingRegressor` | 线性目标 MSE、常数目标、超参/未拟合校验 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5077,6 +5098,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2337 个单元测试
+├── test_ai.py       # 2343 个单元测试
 └── README.md
 ```

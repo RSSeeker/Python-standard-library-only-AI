@@ -6238,6 +6238,145 @@ def kv_offload_plan(seq_len, block_size, gpu_blocks, cpu_blocks=None):
         })
     return plan
 
+
+def _gbdt_check_xy(X, y):
+    if not isinstance(X, (list, tuple)) or not X:
+        raise ValueError("gbdt: X 必须是非空二维列表")
+    rows = []
+    n_cols = None
+    for row in X:
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("gbdt: X 的每一行必须是列表")
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("gbdt: X 必须只包含有限数字")
+            vals.append(float(v))
+        if n_cols is None:
+            n_cols = len(vals)
+        if len(vals) != n_cols or n_cols == 0:
+            raise ValueError("gbdt: X 每行列数必须一致且大于 0")
+        rows.append(vals)
+    if len(y) != len(rows):
+        raise ValueError("gbdt: y 长度必须与 X 行数一致")
+    ys = []
+    for v in y:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("gbdt: y 必须只包含有限数字")
+        ys.append(float(v))
+    return rows, ys
+
+
+def _gbdt_best_split(rows, ys, indices):
+    best = None
+    n = len(indices)
+    base = sum(ys[i] for i in indices) / n
+    base_sse = sum((ys[i] - base) ** 2 for i in indices)
+    n_cols = len(rows[0])
+    for col in range(n_cols):
+        values = sorted({rows[i][col] for i in indices})
+        for a in range(len(values) - 1):
+            thr = (values[a] + values[a + 1]) / 2.0
+            left = [i for i in indices if rows[i][col] <= thr]
+            right = [i for i in indices if rows[i][col] > thr]
+            if not left or not right:
+                continue
+            ml = sum(ys[i] for i in left) / len(left)
+            mr = sum(ys[i] for i in right) / len(right)
+            sse = (sum((ys[i] - ml) ** 2 for i in left)
+                   + sum((ys[i] - mr) ** 2 for i in right))
+            gain = base_sse - sse
+            if best is None or gain > best[0]:
+                best = (gain, col, thr, left, right)
+    return best
+
+
+class RegressionTree:
+    """CART 回归树（平方误差），用于 GBDT 的基学习器。"""
+
+    def __init__(self, max_depth=2, min_samples=2):
+        if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth < 0:
+            raise ValueError("gbdt: max_depth 必须是非负整数")
+        if not isinstance(min_samples, int) or isinstance(min_samples, bool) or min_samples < 1:
+            raise ValueError("gbdt: min_samples 必须是正整数")
+        self.max_depth = max_depth
+        self.min_samples = min_samples
+        self.tree = None
+
+    def fit(self, X, y):
+        rows, ys = _gbdt_check_xy(X, y)
+        self.tree = self._build(rows, ys, list(range(len(ys))), 0)
+        return self
+
+    def _leaf(self, ys, indices):
+        return {"leaf": True, "value": sum(ys[i] for i in indices) / len(indices)}
+
+    def _build(self, rows, ys, indices, depth):
+        if depth >= self.max_depth or len(indices) <= self.min_samples:
+            return self._leaf(ys, indices)
+        split = _gbdt_best_split(rows, ys, indices)
+        if split is None or split[0] <= 1e-18:
+            return self._leaf(ys, indices)
+        _, col, thr, left, right = split
+        return {"leaf": False, "col": col, "thr": thr,
+                "left": self._build(rows, ys, left, depth + 1),
+                "right": self._build(rows, ys, right, depth + 1)}
+
+    def _predict_row(self, node, row):
+        while not node["leaf"]:
+            node = node["left"] if row[node["col"]] <= node["thr"] else node["right"]
+        return node["value"]
+
+    def predict(self, X):
+        if self.tree is None:
+            raise ValueError("gbdt: 必须先 fit 再 predict")
+        rows, _ = _gbdt_check_xy(X, [0.0] * len(X))
+        return [self._predict_row(self.tree, row) for row in rows]
+
+
+class GradientBoostingRegressor:
+    """平方损失 GBDT：初始值为均值，每轮拟合一棵回归树，按 learning_rate 叠加。"""
+
+    def __init__(self, n_estimators=20, learning_rate=0.1, max_depth=2, min_samples=2):
+        if not isinstance(n_estimators, int) or isinstance(n_estimators, bool) or n_estimators < 1:
+            raise ValueError("gbdt: n_estimators 必须是正整数")
+        if (not isinstance(learning_rate, (int, float)) or isinstance(learning_rate, bool)
+                or not math.isfinite(float(learning_rate)) or not 0.0 < float(learning_rate) <= 1.0):
+            raise ValueError("gbdt: learning_rate 必须在 (0, 1] 内")
+        self.n_estimators = n_estimators
+        self.learning_rate = float(learning_rate)
+        self.max_depth = max_depth
+        self.min_samples = min_samples
+        self.base = 0.0
+        self.trees = []
+
+    def fit(self, X, y):
+        rows, ys = _gbdt_check_xy(X, y)
+        self.base = sum(ys) / len(ys)
+        pred = [self.base] * len(ys)
+        self.trees = []
+        for _ in range(self.n_estimators):
+            residual = [ys[i] - pred[i] for i in range(len(ys))]
+            tree = RegressionTree(self.max_depth, self.min_samples).fit(rows, residual)
+            updates = tree.predict(rows)
+            pred = [pred[i] + self.learning_rate * updates[i] for i in range(len(ys))]
+            self.trees.append(tree)
+        return self
+
+    def predict(self, X):
+        if not self.trees:
+            raise ValueError("gbdt: 必须先 fit 再 predict")
+        rows, _ = _gbdt_check_xy(X, [0.0] * len(X))
+        out = []
+        for row in rows:
+            value = self.base
+            for tree in self.trees:
+                value += self.learning_rate * tree._predict_row(tree.tree, row)
+            out.append(value)
+        return out
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
