@@ -5828,6 +5828,90 @@ def bitnet_dequantize(quant):
         raise ValueError("bitnet: values 必须是非空列表")
     return [v * scale for v in vals]
 
+
+def _opt_check_pair(weights, grads):
+    if not isinstance(weights, (list, tuple)) or not weights:
+        raise ValueError("opt: weights 必须是非空数字列表")
+    if not isinstance(grads, (list, tuple)) or not grads:
+        raise ValueError("opt: grads 必须是非空数字列表")
+    is_2d = isinstance(weights[0], (list, tuple))
+    if is_2d:
+        w_rows = _dep2_check_matrix(weights, "weights")
+        g_rows = _dep2_check_matrix(grads, "grads")
+        if len(w_rows) != len(g_rows):
+            raise ValueError("opt: weights 与 grads 形状必须一致")
+        for w, g in zip(w_rows, g_rows):
+            if len(w) != len(g):
+                raise ValueError("opt: weights 与 grads 形状必须一致")
+        return w_rows, g_rows, True
+    w = []
+    for v in weights:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("opt: weights 必须只包含有限数字")
+        w.append(float(v))
+    g = []
+    for v in grads:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("opt: grads 必须只包含有限数字")
+        g.append(float(v))
+    if len(w) != len(g):
+        raise ValueError("opt: weights 与 grads 形状必须一致")
+    return w, g, False
+
+
+def _opt_flat(rows, is_2d):
+    if is_2d:
+        return [v for row in rows for v in row]
+    return list(rows)
+
+
+def _opt_unflat(flat, template, is_2d):
+    if not is_2d:
+        return list(flat)
+    out, k = [], 0
+    for row in template:
+        out.append(flat[k:k + len(row)])
+        k += len(row)
+    return out
+
+
+def sam_weights(weights, grads, rho: float = 0.05, eps: float = 1e-12):
+    """SAM 扰动：w + rho·g/||g||₂（全局范数），返回扰动后的权重复本。"""
+    w, g, is_2d = _opt_check_pair(weights, grads)
+    if (not isinstance(rho, (int, float)) or isinstance(rho, bool)
+            or not math.isfinite(float(rho)) or float(rho) < 0.0):
+        raise ValueError(f"opt: rho 必须是非负有限数字，收到 {rho!r}")
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(float(eps)) or float(eps) <= 0.0):
+        raise ValueError(f"opt: eps 必须是正有限数字，收到 {eps!r}")
+    flat_w = _opt_flat(w, is_2d)
+    flat_g = _opt_flat(g, is_2d)
+    norm = math.sqrt(sum(v * v for v in flat_g))
+    if norm == 0.0:
+        adv = list(flat_w)
+    else:
+        adv = [flat_w[i] + float(rho) * flat_g[i] / (norm + float(eps))
+               for i in range(len(flat_w))]
+    return _opt_unflat(adv, w, is_2d)
+
+
+def gradient_centralize(grads, mode: str = "rows"):
+    """梯度中心化：按行（每行减该行均值）或按列（每列减该列均值）。"""
+    if mode not in ("rows", "cols"):
+        raise ValueError(f"opt: mode 必须是 rows/cols，收到 {mode!r}")
+    mat = _dep2_check_matrix(grads, "grads")
+    rows, cols = len(mat), len(mat[0])
+    if mode == "rows":
+        out = []
+        for row in mat:
+            m = sum(row) / cols
+            out.append([v - m for v in row])
+        return out
+    col_means = [sum(mat[i][j] for i in range(rows)) / rows for j in range(cols)]
+    return [[mat[i][j] - col_means[j] for j in range(cols)] for i in range(rows)]
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

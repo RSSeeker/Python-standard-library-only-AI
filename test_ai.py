@@ -35926,3 +35926,35 @@ class TestBitNet:
         _p10f_raises(lambda: AI.bitnet_ternary([1.0], eps=0.0))
         _p10f_raises(lambda: AI.bitnet_dequantize([]))
         _p10f_raises(lambda: AI.bitnet_dequantize({"values": [1], "scale": 0.0}))
+
+
+class TestSAM:
+    def test_perturb_hand(self):
+        adv = AI.sam_weights([[1.0, 2.0]], [[3.0, 4.0]], rho=0.5)
+        assert adv[0][0] == pytest.approx(1.3)
+        assert adv[0][1] == pytest.approx(2.4)
+        assert AI.sam_weights([1.0], [0.0], rho=1.0) == [1.0]
+
+    def test_1d_and_errors(self):
+        adv = AI.sam_weights([1.0, 1.0], [3.0, 4.0], rho=0.5)
+        assert adv[0] == pytest.approx(1.3) and adv[1] == pytest.approx(1.4)
+        _p10f_raises(lambda: AI.sam_weights([], [1.0]))
+        _p10f_raises(lambda: AI.sam_weights([1.0], [1.0, 2.0]))
+        _p10f_raises(lambda: AI.sam_weights([[1.0]], [[1.0, 2.0]]))
+        _p10f_raises(lambda: AI.sam_weights([1.0], [1.0], rho=-0.1))
+        _p10f_raises(lambda: AI.sam_weights([1.0], [1.0], eps=0.0))
+
+
+class TestGradientCentralize:
+    def test_rows_hand(self):
+        out = AI.gradient_centralize([[1.0, 2.0, 3.0], [5.0, 5.0, 5.0]], "rows")
+        assert out == [[-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+
+    def test_cols_hand(self):
+        out = AI.gradient_centralize([[1.0, 2.0], [3.0, 4.0]], "cols")
+        assert out == [[-1.0, -1.0], [1.0, 1.0]]
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.gradient_centralize([1.0, 2.0]))
+        _p10f_raises(lambda: AI.gradient_centralize([[1.0]], "diag"))
+        _p10f_raises(lambda: AI.gradient_centralize([[1.0], [2.0, 3.0]]))

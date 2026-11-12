@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2305 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2310 项）
 
 ## 特性
 
@@ -2188,6 +2188,25 @@ w_hat = bitnet_dequantize(q)         # values * scale
 | `bitnet_dequantize(quant)` | 三值反量化：`values × scale` |
 
 - 边界：Expert-Choice 只做路由与统计，不实现 token dropping/容量因子损失/专家并行；BitNet 是量化工具而非训练好的 1.58b 模型，scale 用全张量均值，无每层/每通道细粒度。
+
+### 训练优化辅助（SAM 扰动 / 梯度中心化）
+
+Sharpness-Aware Minimization 的扰动步骤与梯度中心化（GC）两步常用技巧。
+
+```python
+adv = sam_weights(weights, grads, rho=0.05)   # w + rho·g/||g||₂
+# ... 在 adv 上前向/反向得到新梯度后恢复原权重 ...
+
+gc = gradient_centralize(grads, mode="rows")  # 每行减去该行均值
+gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
+```
+
+| API | 说明 |
+| --- | --- |
+| `sam_weights(weights, grads, rho=0.05, eps=1e-12)` | 按全局 L2 范数归一化后加 `rho·g/||g||`，返回扰动后权重（不改原值） |
+| `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
+
+- 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
 
 ### 量化与 SmoothQuant
 
@@ -4602,7 +4621,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2305 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2310 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4855,6 +4874,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStreamingAttentionMask` | 逐行掩码手算、因果性、bias 与 mask 一致、非法参数 |
 | `TestExpertChoice` | 路由手算、overflow/unassigned、capacity 截断、非法输入 |
 | `TestBitNet` | 三值量化/反量化手算、1D 与零权重回退、非法输入 |
+| `TestSAM` | 扰动方向与范数手算、零梯度/1D、非法参数 |
+| `TestGradientCentralize` | 行/列中心化手算、非法 mode/形状 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4992,6 +5013,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2305 个单元测试
+├── test_ai.py       # 2310 个单元测试
 └── README.md
 ```
