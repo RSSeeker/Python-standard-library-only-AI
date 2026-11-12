@@ -140,96 +140,6 @@
 #   107. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
 #   108. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
 #   109. Main: 回归 + 分类 + CNN 完整示例
-#  10. Transformer 组件
-#  11. Embedding / Residual / Sequential
-#  12. Loss Functions
-#  13. Optimizer: Adam
-#  14. More Optimizers: SGD / SGD+Momentum / RMSprop
-#  15. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
-#  16. Layer-wise Optimizers: LARS / LAMB / Ranger
-#  17. Advanced Optimizers: Adan / Prodigy / CAME
-#  18. 进阶优化器：Shampoo / Sophia / L-BFGS
-#  19. Gradient Clipping / LR Scheduler
-#  20. 学习率调度器族
-#  21. Data Utilities
-#  22. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
-#  23. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
-#  24. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
-#  25. 降维 / 不平衡采样 / 特征选择
-#  26. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
-#  27. Text Processing（分词与文本工具）
-#  28. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
-#  29. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
-#  30. Trainer
-#  31. 评估指标（分类 / 回归 / 序列 / 生成）
-#  32. 校准指标（ECE / MCE / Reliability Diagram）
-#  33. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
-#  34. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
-#  35. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#  36. 多模态：CLIP 双塔 + 跨模态融合
-#  37. 自监督：预测式任务（Rotation / Jigsaw）
-#  38. RL 算法（DQN 族）
-#  39. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#  40. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
-#  41. ELECTRA：生成器 + 判别器的预训练框架
-#  42. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
-#  43. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
-#  44. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
-#  45. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
-#  46. DETR（DEtection TRansformer，简化版）
-#  47. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
-#  48. E(3) 等变图神经网络（EGNN，教学版）
-#  49. 全模块梯度自检（grad_check_all）
-#  50. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#  51. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#  52. 研究前沿：神经符号（规则约束的候选过滤）
-#  53. 研究前沿：Mixture-of-Depths 路由与 Early Exit
-#  54. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#  55. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#  56. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
-#  57. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
-#  58. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
-#  59. 集成测试 / doctest / 属性测试的运行时支撑
-#  60. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-#  61. 领域应用：视频（3D-CNN / Two-Stream 融合）
-#  62. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#  63. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#  64. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#  65. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#  66. 领域应用：DeepFM / DIN
-#  67. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-#  68. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
-#  69. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
-#  70. RL 环境（GridWorld / CartPole）
-#  71. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
-#  72. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#  73. 推理与部署：批内打包与投机解码
-#  74. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
-#  75. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#  76. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#  77. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#  78. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#  79. 可解释性：注意力 Rollout / Flow
-#  80. 可解释性：输入归因
-#  81. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
-#  82. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
-#  83. 语音识别指标（WER / CER / SER）
-#  84. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#  85. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
-#  86. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#  87. 模型保存 / 加载 (JSON)
-#  88. 序列标注 / 多标签分类头
-#  89. PyTorch 数值对齐对比
-#  90. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#  91. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#  92. 梯度检查点（activation checkpointing）与混合精度模拟
-#  93. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#  94. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#  95. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#  96. 生成模型：VAE / GAN / DDPM
-#  97. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
-#  98. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#  99. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -11577,7 +11487,6 @@ def _g_act(name: str):
                      "sigmoid / gelu / silu / mish / elu / selu）" % (name,))
 
 
-
 _G_ACT_ROW = {
     'gelu': lambda z: [_gelu_scalar(v) for v in z],
     'silu': lambda z: [v * _silu_scalar(v) for v in z],
@@ -21447,7 +21356,6 @@ class FeedForward:
         return dx_seq
 
 
-
 class SwiGLU:
     """门控前馈网络（LLaMA / PaLM 用的 SwiGLU）
 
@@ -27108,7 +27016,6 @@ class Sequential:
         return delta
 
 
-
 class LoRA:
     """低秩适配（LoRA）：冻结原层，只训练两个小矩阵
 
@@ -27219,7 +27126,6 @@ class LoRA:
     def total_param_count(self):
         """包装后的参数总数：原层参数 + 可训练的 A/B"""
         return self.fan_out * (self.fan_in + 1) + self.trainable_param_count()
-
 
 
 _ATTN_RAMP = " .:-=+*#%@"
@@ -29574,8 +29480,6 @@ class RMSprop:
                     Wj[i] -= lr * g / (sqrt(s) + eps)
 
 
-
-
 # ============================================================================
 #  SGDW / Nesterov / Lookahead / SWA / EMA
 #        
@@ -30949,7 +30853,6 @@ class Prodigy(_LayerwiseOptimizer):
                     param[i] -= lr * m[i] / (math.sqrt(v[i]) + eps)
 
 
-
 class CAME(_LayerwiseOptimizer):
     """CAME（2023）：置信度引导的因子化二阶矩（Adafactor 思路 + 不稳定维校正）
 
@@ -31049,8 +30952,6 @@ class CAME(_LayerwiseOptimizer):
             mb[j] = b1 * mb[j] + (1.0 - b1) * g
             vb[j] = b2 * vb[j] + (1.0 - b2) * g * g
             layer.biases[j] -= lr * mb[j] / (math.sqrt(vb[j]) + eps)
-
-
 
 
 # ============================================================================
@@ -32114,8 +32015,6 @@ class WarmupLR:
             self.base_scheduler.step(epoch)
 
 
-
-
 class ReduceLROnPlateau:
     """按验证指标停滞降学习率：``lr *= factor``（PyTorch 同名调度器）
 
@@ -32175,7 +32074,6 @@ class ReduceLROnPlateau:
             self.num_bad = 0
             self.reductions += 1
         return self.optimizer.lr
-
 
 
 # ============================================================================
@@ -40159,7 +40057,6 @@ def rejection_sampling_filter(samples, rewards, threshold=None, top_ratio=None):
     return kept_samples, kept
 
 """P4: Tree-of-Thought / MCTS search utilities (insert before class PPOAgent)."""
-
 
 
 """P4: Tree-of-Thought / MCTS search utilities (insert before class PPOAgent)."""
@@ -59918,11 +59815,9 @@ def _looks_like_probs(model, sample) -> bool:
     return all(float(v) >= 0.0 for v in out) and abs(total - 1.0) < 1e-9
 
 
-
 # ============================================================================
 #  模型保存 / 加载 (JSON)
 # ============================================================================
-
 
 
 def _optimizer_state(optimizer):
@@ -67117,7 +67012,6 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
               val_split=val_split, patience=patience, verbose=verbose,
               seed=seed)
     return model
-
 
 
 # ============================================================================
