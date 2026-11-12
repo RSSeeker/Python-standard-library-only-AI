@@ -35287,3 +35287,95 @@ class TestMTPLanguageModel:
         _p10b_raises(lambda: m.fit([[0, 1]], epochs=-1))
         _p10b_raises(lambda: m.forward([]))
         _p10b_raises(lambda: m.forward([0, 1, 2, 3, 4, 5, 6, 7, 8]))
+
+
+import math
+import AI
+
+
+def _p10c_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("未抛出预期异常")
+
+
+class TestModelMerging:
+    def test_model_soup(self):
+        assert AI.model_soup([[1.0, 2.0], [3.0, 4.0]]) == [2.0, 3.0]
+        merged = AI.model_soup([[[1.0, 2.0], [3.0, 4.0]],
+                                [[3.0, 4.0], [5.0, 6.0]]])
+        assert merged == [[2.0, 3.0], [4.0, 5.0]]
+        assert AI.model_soup([[1.5]]) == [1.5]
+        _p10c_raises(lambda: AI.model_soup([]))
+        _p10c_raises(lambda: AI.model_soup([[1.0, 2.0], [1.0]]))
+        _p10c_raises(lambda: AI.model_soup([[1.0, float("nan")]]))
+        _p10c_raises(lambda: AI.model_soup([[1.0], [2.0], [3.0, 4.0]]))
+
+    def test_slerp_merge(self):
+        a = [1.0, 0.0]
+        b = [0.0, 1.0]
+        mid = AI.slerp_merge(a, b, 0.5)
+        assert abs(mid[0] - 1.0 / math.sqrt(2.0)) < 1e-12
+        assert abs(mid[1] - 1.0 / math.sqrt(2.0)) < 1e-12
+        assert abs(math.hypot(*mid) - 1.0) < 1e-12
+        assert AI.slerp_merge(a, b, 0.0) == [1.0, 0.0]
+        assert AI.slerp_merge(a, b, 1.0) == [0.0, 1.0]
+        # 同向/零向量退化为线性插值
+        assert AI.slerp_merge([1.0, 2.0], [1.0, 2.0], 0.5) == [1.0, 2.0]
+        assert AI.slerp_merge([0.0, 0.0], [2.0, 4.0], 0.5) == [1.0, 2.0]
+        out = AI.slerp_merge([[1.0, 0.0]], [[0.0, 1.0]], 0.5)
+        assert abs(out[0][0] - 1.0 / math.sqrt(2.0)) < 1e-12
+        _p10c_raises(lambda: AI.slerp_merge(a, b, -0.1))
+        _p10c_raises(lambda: AI.slerp_merge(a, b, 1.5))
+        _p10c_raises(lambda: AI.slerp_merge(a, b, float("nan")))
+        _p10c_raises(lambda: AI.slerp_merge(a, b, 0.5, eps=-1.0))
+        _p10c_raises(lambda: AI.slerp_merge(a, [0.0], 0.5))
+
+    def test_ties_merge_hand_computed(self):
+        merged = AI.ties_merge([[1.0, 1.0], [-3.0, 1.0], [1.0, 2.0]],
+                               trim_fraction=0.0, density=1.0)
+        assert abs(merged[0] - 1.0) < 1e-12
+        assert abs(merged[1] - 4.0 / 3.0) < 1e-12
+        # trim 丢弃最小 |delta|（1）后只剩 2 与 10
+        assert AI.ties_merge([[1.0], [2.0], [10.0]],
+                             trim_fraction=0.5, density=1.0) == [6.0]
+        # base 不为 0 时合并 base + 任务向量
+        assert AI.ties_merge([[3.0], [5.0]], base=[2.0], trim_fraction=0.0) == [4.0]
+        # 符号票数相同（+1/-1）时该坐标置 0
+        tie = AI.ties_merge([[1.0], [-1.0], [2.0]], trim_fraction=0.0)
+        assert abs(tie[0] - 1.5) < 1e-12
+        assert AI.ties_merge([[1.0], [-2.0]], trim_fraction=0.0) == [0.0]
+
+    def test_ties_density_and_errors(self):
+        out = AI.ties_merge([[1.0, 0.0, 2.0], [1.0, 0.0, 2.0]],
+                            trim_fraction=0.0, density=0.34)
+        # 只保留 |merged| 最大的 1 个坐标
+        assert out.count(0.0) == 2
+        _p10c_raises(lambda: AI.ties_merge([[1.0]], trim_fraction=1.0))
+        _p10c_raises(lambda: AI.ties_merge([[1.0]], trim_fraction=-0.1))
+        _p10c_raises(lambda: AI.ties_merge([[1.0]], density=0.0))
+        _p10c_raises(lambda: AI.ties_merge([[1.0]], density=1.5))
+        _p10c_raises(lambda: AI.ties_merge([[1.0]], base=[1.0, 2.0]))
+
+    def test_dare_merge(self):
+        assert AI.dare_merge([[1.0, 2.0], [3.0, 4.0]], drop_rate=0.0) == [2.0, 3.0]
+        a = AI.dare_merge([[1.0, 2.0], [3.0, 4.0]], drop_rate=0.5, seed=7)
+        b = AI.dare_merge([[1.0, 2.0], [3.0, 4.0]], drop_rate=0.5, seed=7)
+        assert a == b
+        assert len(a) == 2
+        out = AI.dare_merge([[1.0, 2.0], [3.0, 4.0]], drop_rate=0.5,
+                            rescale=False, seed=1)
+        assert all(0.0 <= v <= 4.0 for v in out)
+        _p10c_raises(lambda: AI.dare_merge([[1.0]], drop_rate=1.0))
+        _p10c_raises(lambda: AI.dare_merge([[1.0]], drop_rate=-0.5))
+        _p10c_raises(lambda: AI.dare_merge([[1.0]], base=[1.0, 2.0]))
+
+    def test_shapes(self):
+        flat = AI.slerp_merge([1.0, 0.0], [0.0, 1.0], 0.5)
+        assert isinstance(flat, list) and len(flat) == 2
+        two_d = AI.model_soup([[[1.0, 2.0], [3.0, 4.0]],
+                               [[1.0, 2.0], [3.0, 4.0]]])
+        assert two_d == [[1.0, 2.0], [3.0, 4.0]]
+        _p10c_raises(lambda: AI.model_soup([[[]]]))

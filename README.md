@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2242 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2248 项）
 
 ## 特性
 
@@ -1993,6 +1993,26 @@ print(sparsity_report(net))
 
 - `prune_channels` / `prune_heads` 是**掩码式**置零（形状不变、下游不用改）；`prune_channels_structured` 才是真删通道（会裁掉下一层的输入列并更新 `fan_in`）。
 - `prune_layers` 会新建 `MLP`，只删中间层；删完前后维度对不上就抛 `ValueError`，不会悄悄改形状。
+
+### 模型合并（model soup / SLERP / TIES / DARE）
+
+多份微调模型可以在参数空间直接合并，而不必重新训练：
+
+```python
+soup = model_soup([w_a, w_b, w_c])              # 算术平均
+mid  = slerp_merge(w_a, w_b, t=0.5)             # 球面线性插值（保范数）
+ties = ties_merge([w_a, w_b], base=w0, trim_fraction=0.2, density=0.5)
+dare = dare_merge([w_a, w_b], base=w0, drop_rate=0.5, seed=0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `model_soup(weights)` | 逐元素算术平均；`weights` 是形状一致的 1D/2D 张量列表 |
+| `slerp_merge(a, b, t=0.5, eps=1e-8)` | 球面线性插值：同向/零向量退化为线性插值，`t=0/1` 返回端点 |
+| `ties_merge(weights, base=None, trim_fraction=0.2, density=1.0)` | TIES：裁剪最小 `trim_fraction` 的任务向量、逐坐标符号选举、同号取均值，`density<1` 时只保留幅值最大的坐标 |
+| `dare_merge(weights, base=None, drop_rate=0.5, rescale=True, seed=None)` | DARE：随机丢弃任务向量元素（`rescale=True` 时按 `1/(1-p)` 放大）后平均 |
+
+- 边界：只做参数空间合并，不含推理时的权重加载/格式转换；TIES/DARE 的 `base` 缺省视为 0（即把权重本身当任务向量）；张量只支持 1D/2D 嵌套 list；`dare_merge` 用 `random.Random(seed)` 保证可复现。
 
 ### 量化与 SmoothQuant
 
@@ -4379,7 +4399,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2242 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2248 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4611,6 +4631,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDAPO` | token 级归一化手算对照、clip-higher 行为、logits 数值梯度、非法输入 |
 | `TestGSPO` | 序列级重要性比手算对照、logits 数值梯度、clip_ratio 非法输入 |
 | `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
+| `TestModelMerging` | soup 均值、SLERP 端点/保范数/退化、TIES 手算与裁剪、DARE 复现与丢弃、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4748,6 +4769,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2242 个单元测试
+├── test_ai.py       # 2248 个单元测试
 └── README.md
 ```

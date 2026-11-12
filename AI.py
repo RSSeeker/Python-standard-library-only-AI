@@ -4653,6 +4653,166 @@ class VersionedStore:
         return sorted(names)
 
 
+
+def _merge_check_number(value, where: str) -> float:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(float(value))):
+        raise ValueError(f"merge: {where} 必须是有限数字，收到 {value!r}")
+    return float(value)
+
+
+def _merge_flatten(tensor, name: str):
+    """把 1D/2D 嵌套数字列表展平，返回 (flat, shape)。"""
+    if not isinstance(tensor, (list, tuple)) or not tensor:
+        raise ValueError(f"merge: {name} 必须是非空列表")
+    if isinstance(tensor[0], (list, tuple)):
+        rows = []
+        width = None
+        for row in tensor:
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError(f"merge: {name} 的每一行必须是非空列表")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError(f"merge: {name} 的各行长度必须一致")
+            rows.append([_merge_check_number(v, name) for v in row])
+        return [v for row in rows for v in row], (len(rows), width)
+    flat = [_merge_check_number(v, name) for v in tensor]
+    return flat, (len(flat),)
+
+
+def _merge_unflatten(flat, shape):
+    if len(shape) == 1:
+        return list(flat)
+    rows, width = shape
+    return [list(flat[i * width:(i + 1) * width]) for i in range(rows)]
+
+
+def _merge_same_shape(tensors, name: str = "weights"):
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        raise ValueError(f"merge: {name} 必须是非空列表")
+    flats = []
+    shape = None
+    for idx, t in enumerate(tensors):
+        flat, shp = _merge_flatten(t, f"{name}[{idx}]")
+        if shape is None:
+            shape = shp
+        elif shp != shape:
+            raise ValueError("merge: 所有参数张量必须形状一致")
+        flats.append(flat)
+    return flats, shape
+
+
+def model_soup(weights):
+    """权重平均（model soup）：逐元素取均值，返回与输入同形状的张量。"""
+    flats, shape = _merge_same_shape(weights)
+    n = len(flats)
+    merged = [sum(row[i] for row in flats) / n for i in range(len(flats[0]))]
+    return _merge_unflatten(merged, shape)
+
+
+def slerp_merge(a, b, t: float = 0.5, eps: float = 1e-8):
+    """球面线性插值（SLERP）：保持范数地从 a 旋转到 b，t∈[0,1]。"""
+    if not isinstance(t, (int, float)) or isinstance(t, bool) or not math.isfinite(float(t)):
+        raise ValueError(f"merge: t 必须是有限数字，收到 {t!r}")
+    if not (0.0 <= float(t) <= 1.0):
+        raise ValueError(f"merge: t 必须在 [0,1]，收到 {t!r}")
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(float(eps)) or eps < 0.0):
+        raise ValueError(f"merge: eps 必须是非负有限数字，收到 {eps!r}")
+    flats, shape = _merge_same_shape([a, b], "weights")
+    fa, fb = flats
+    na = math.sqrt(sum(v * v for v in fa))
+    nb = math.sqrt(sum(v * v for v in fb))
+    if na <= eps or nb <= eps:
+        out = [(1.0 - float(t)) * fa[i] + float(t) * fb[i] for i in range(len(fa))]
+        return _merge_unflatten(out, shape)
+    dot = sum(fa[i] * fb[i] for i in range(len(fa)))
+    cos = max(-1.0, min(1.0, dot / (na * nb)))
+    if cos > 1.0 - 1e-7 or cos < -1.0 + 1e-7:
+        out = [(1.0 - float(t)) * fa[i] + float(t) * fb[i] for i in range(len(fa))]
+        return _merge_unflatten(out, shape)
+    theta = math.acos(cos)
+    sin_theta = math.sin(theta)
+    wa = math.sin((1.0 - float(t)) * theta) / sin_theta
+    wb = math.sin(float(t) * theta) / sin_theta
+    out = [wa * fa[i] + wb * fb[i] for i in range(len(fa))]
+    return _merge_unflatten(out, shape)
+
+
+def ties_merge(weights, base=None, trim_fraction: float = 0.2,
+               density: float = 1.0):
+    """TIES 合并：裁剪小任务向量、符号选举、同号取均值，可选稀疏化。"""
+    if (not isinstance(trim_fraction, (int, float)) or isinstance(trim_fraction, bool)
+            or not math.isfinite(float(trim_fraction)) or not (0.0 <= float(trim_fraction) < 1.0)):
+        raise ValueError(f"merge: trim_fraction 必须在 [0,1)，收到 {trim_fraction!r}")
+    if (not isinstance(density, (int, float)) or isinstance(density, bool)
+            or not math.isfinite(float(density)) or not (0.0 < float(density) <= 1.0)):
+        raise ValueError(f"merge: density 必须在 (0,1]，收到 {density!r}")
+    flats, shape = _merge_same_shape(weights)
+    n = len(flats)
+    size = len(flats[0])
+    if base is None:
+        base_flat = [0.0] * size
+    else:
+        base_flat, base_shape = _merge_flatten(base, "base")
+        if base_shape != shape:
+            raise ValueError("merge: base 必须与 weights 形状一致")
+    tv = [[flats[j][i] - base_flat[i] for i in range(size)] for j in range(n)]
+    abs_vals = sorted(abs(tv[j][i]) for j in range(n) for i in range(size))
+    k = int(float(trim_fraction) * len(abs_vals))
+    threshold = abs_vals[k - 1] if k > 0 else 0.0
+    merged = []
+    for i in range(size):
+        kept = [tv[j][i] for j in range(n) if abs(tv[j][i]) > threshold]
+        if not kept:
+            merged.append(0.0)
+            continue
+        sign_sum = sum(1 if v > 0.0 else -1 for v in kept)
+        if sign_sum == 0:
+            merged.append(0.0)
+            continue
+        sign = 1.0 if sign_sum > 0 else -1.0
+        same = [v for v in kept if (v > 0.0) == (sign > 0.0)]
+        merged.append(sum(same) / len(same))
+    if float(density) < 1.0:
+        keep = max(1, int(round(size * float(density))))
+        order = sorted(range(size), key=lambda i: (-abs(merged[i]), i))[:keep]
+        mask = set(order)
+        merged = [v if i in mask else 0.0 for i, v in enumerate(merged)]
+    out = [base_flat[i] + merged[i] for i in range(size)]
+    return _merge_unflatten(out, shape)
+
+
+def dare_merge(weights, base=None, drop_rate: float = 0.5,
+               rescale: bool = True, seed=None):
+    """DARE 合并：随机丢弃任务向量元素（可选按 1/(1-p) 重缩放）后取均值。"""
+    if (not isinstance(drop_rate, (int, float)) or isinstance(drop_rate, bool)
+            or not math.isfinite(float(drop_rate)) or not (0.0 <= float(drop_rate) < 1.0)):
+        raise ValueError(f"merge: drop_rate 必须在 [0,1)，收到 {drop_rate!r}")
+    flats, shape = _merge_same_shape(weights)
+    n = len(flats)
+    size = len(flats[0])
+    if base is None:
+        base_flat = [0.0] * size
+    else:
+        base_flat, base_shape = _merge_flatten(base, "base")
+        if base_shape != shape:
+            raise ValueError("merge: base 必须与 weights 形状一致")
+    rng = random.Random(seed) if seed is not None else random
+    total = [0.0] * size
+    p = float(drop_rate)
+    for j in range(n):
+        for i in range(size):
+            delta = flats[j][i] - base_flat[i]
+            if rng.random() < p:
+                delta = 0.0
+            elif rescale:
+                delta = delta / (1.0 - p)
+            total[i] += delta
+    merged = [base_flat[i] + total[i] / n for i in range(size)]
+    return _merge_unflatten(merged, shape)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
