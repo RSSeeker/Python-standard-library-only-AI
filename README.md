@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2329 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2337 项）
 
 ## 特性
 
@@ -2226,6 +2226,25 @@ score = hmm_sequence_score(emissions, transitions, path)
 | `hmm_sequence_score(emissions, transitions, path, start=None)` | 给定路径的 emission+transition 对数总分 |
 
 - 边界：输入是**对数域**发射/转移势（不做概率归一化校验）；只支持离散状态的一阶马尔可夫链，不含高阶转移、批处理、半马尔可夫；posterior 用 logsumexp 稳定计算。
+
+### Matryoshka 嵌入与 KV 分层存放（Matryoshka / KV offload）
+
+- Matryoshka：按前缀维度截断向量再逐维归一化，便于同一嵌入在不同检索预算下复用。
+- KV offload：把 KV cache 按块划分，前若干块驻 GPU、其余块驻 CPU，仅做布局规划不做抢占迁移。
+
+```python
+matryoshka_truncate([3, 4, 0, 0], [2, 4])       # {2: [0.6, 0.8], 4: [...]}
+matryoshka_similarity([1, 0], [0.6, 0.8], [1, 2])  # {1: 1.0, 2: 0.6}
+kv_offload_plan(10, 4, 1, 3)                    # 块 0 驻 GPU，块 1/2 驻 CPU
+```
+
+| API | 说明 |
+| --- | --- |
+| `matryoshka_truncate(vec, dims)` | 每个维度前缀截断后 L2 归一化，返回 `{dim: 向量}`；零向量返回全 0 |
+| `matryoshka_similarity(vec_a, vec_b, dims)` | 各前缀维度的归一化余弦相似度 |
+| `kv_offload_plan(seq_len, block_size, gpu_blocks, cpu_blocks=None)` | 逐块标注 `location` 为 `gpu`/`cpu`；容量不足抛 ValueError |
+
+- 边界：dims 必须是升序以外的任意正整数集合（逐一校验），不要求单调；KV offload 仅规划布局，不含真实数据搬移/抢占/换入换出，`cpu_blocks=None` 视为无限容量。
 
 ### 生存分析（Kaplan-Meier / log-rank / C-index）
 
@@ -4658,7 +4677,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2329 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2337 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4919,6 +4938,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKaplanMeier` | 手算生存率/删失、风险集、非法输入 |
 | `TestLogRank` | 分离组显著、相同组统计量 0、无事件、非法输入 |
 | `TestConcordanceIndex` | 完美/反向排序、同分与删失、非法输入 |
+| `TestMatryoshka` | 前缀截断归一化、零向量、前缀相似度、非法输入 |
+| `TestKvOffloadPlan` | 块布局、前块驻 GPU、容量超限、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5056,6 +5077,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2329 个单元测试
+├── test_ai.py       # 2337 个单元测试
 └── README.md
 ```

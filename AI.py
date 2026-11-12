@@ -6161,6 +6161,83 @@ def concordance_index(durations, events, scores):
         return 0.5
     return concordant / comparable
 
+
+def _mat_check_dims(vec, dims):
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise ValueError("matryoshka: 向量必须是非空列表")
+    for v in vec:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("matryoshka: 向量必须只包含有限数字")
+    if (not isinstance(dims, (list, tuple)) or not dims):
+        raise ValueError("matryoshka: dims 必须是非空列表")
+    out = []
+    for d in dims:
+        if not isinstance(d, int) or isinstance(d, bool) or d <= 0 or d > len(vec):
+            raise ValueError(f"matryoshka: 维度 {d!r} 必须是 [1, {len(vec)}] 内的整数")
+        out.append(d)
+    return [float(v) for v in vec], out
+
+
+def _mat_normalize(values):
+    norm = math.sqrt(sum(v * v for v in values))
+    if norm == 0.0:
+        return [0.0] * len(values)
+    return [v / norm for v in values]
+
+
+def matryoshka_truncate(vec, dims):
+    """按前缀维度截断，再逐维 L2 归一化；返回 {dim: 归一化向量}。"""
+    values, dims = _mat_check_dims(vec, dims)
+    return {d: _mat_normalize(values[:d]) for d in dims}
+
+
+def matryoshka_similarity(vec_a, vec_b, dims):
+    """各前缀维度上的归一化余弦相似度；返回 {dim: score}。"""
+    a, dims = _mat_check_dims(vec_a, dims)
+    b, _ = _mat_check_dims(vec_b, dims)
+    if len(a) != len(b):
+        raise ValueError("matryoshka: 两个向量长度必须一致")
+    out = {}
+    for d in dims:
+        na = _mat_normalize(a[:d])
+        nb = _mat_normalize(b[:d])
+        out[d] = sum(x * y for x, y in zip(na, nb))
+    return out
+
+
+def kv_offload_plan(seq_len, block_size, gpu_blocks, cpu_blocks=None):
+    """KV cache 分层存放计划：前 gpu_blocks 个块驻 GPU，其余块按 cpu_blocks 上限驻 CPU。
+
+    返回 [{"block","token_start","token_end","location"}]；若所需块数超过 gpu+cpu
+    容量则抛 ValueError（不做抢占迁移）。
+    """
+    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
+        raise ValueError("offload: seq_len 必须是正整数")
+    if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
+        raise ValueError("offload: block_size 必须是正整数")
+    if not isinstance(gpu_blocks, int) or isinstance(gpu_blocks, bool) or gpu_blocks < 0:
+        raise ValueError("offload: gpu_blocks 必须是非负整数")
+    if cpu_blocks is None:
+        cpu_blocks = 10 ** 18
+    if not isinstance(cpu_blocks, int) or isinstance(cpu_blocks, bool) or cpu_blocks < 0:
+        raise ValueError("offload: cpu_blocks 必须是非负整数")
+    n_blocks = (seq_len + block_size - 1) // block_size
+    if n_blocks > gpu_blocks + cpu_blocks:
+        raise ValueError(
+            f"offload: 需要 {n_blocks} 个块，超过 GPU+CPU 容量 {gpu_blocks + cpu_blocks}")
+    plan = []
+    for b in range(n_blocks):
+        start = b * block_size
+        end = min(seq_len, start + block_size)
+        plan.append({
+            "block": b,
+            "token_start": start,
+            "token_end": end,
+            "location": "gpu" if b < gpu_blocks else "cpu",
+        })
+    return plan
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

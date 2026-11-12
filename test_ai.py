@@ -36068,3 +36068,45 @@ class TestConcordanceIndex:
         _p10f_raises(lambda: AI.concordance_index([1], [True], [1.0, 2.0]))
         _p10f_raises(lambda: AI.concordance_index([1], [True], [float("nan")]))
         _p10f_raises(lambda: AI.concordance_index([1], [True], "x"))
+
+
+class TestMatryoshka:
+    def test_truncate_normalizes_each_prefix(self):
+        out = AI.matryoshka_truncate([3.0, 4.0, 0.0, 0.0], [2, 4])
+        assert out[2] == pytest.approx([0.6, 0.8])
+        assert out[4] == pytest.approx([0.6, 0.8, 0.0, 0.0])
+
+    def test_zero_vector(self):
+        out = AI.matryoshka_truncate([0.0, 0.0], [2])
+        assert out[2] == pytest.approx([0.0, 0.0])
+
+    def test_similarity_prefixes(self):
+        out = AI.matryoshka_similarity([1.0, 0.0], [0.6, 0.8], [1, 2])
+        assert out[1] == pytest.approx(1.0)
+        assert out[2] == pytest.approx(0.6)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.matryoshka_truncate([], [1]))
+        _p10f_raises(lambda: AI.matryoshka_truncate([1.0], [2]))
+        _p10f_raises(lambda: AI.matryoshka_truncate([1.0], [0]))
+        _p10f_raises(lambda: AI.matryoshka_similarity([1.0], [1.0, 2.0], [1]))
+        _p10f_raises(lambda: AI.matryoshka_truncate([float("nan")], [1]))
+
+
+class TestKvOffloadPlan:
+    def test_plan_layout(self):
+        plan = AI.kv_offload_plan(10, 4, 1, 3)
+        assert [(b["block"], b["token_start"], b["token_end"], b["location"]) for b in plan] == [
+            (0, 0, 4, "gpu"), (1, 4, 8, "cpu"), (2, 8, 10, "cpu")]
+
+    def test_all_gpu(self):
+        plan = AI.kv_offload_plan(8, 4, 2)
+        assert [b["location"] for b in plan] == ["gpu", "gpu"]
+
+    def test_capacity_exceeded(self):
+        _p10f_raises(lambda: AI.kv_offload_plan(12, 4, 1, 1))
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.kv_offload_plan(0, 4, 1))
+        _p10f_raises(lambda: AI.kv_offload_plan(8, 0, 1))
+        _p10f_raises(lambda: AI.kv_offload_plan(8, 4, -1))
