@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2253 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2259 项）
 
 ## 特性
 
@@ -2013,6 +2013,35 @@ dare = dare_merge([w_a, w_b], base=w0, drop_rate=0.5, seed=0)
 | `dare_merge(weights, base=None, drop_rate=0.5, rescale=True, seed=None)` | DARE：随机丢弃任务向量元素（`rescale=True` 时按 `1/(1-p)` 放大）后平均 |
 
 - 边界：只做参数空间合并，不含推理时的权重加载/格式转换；TIES/DARE 的 `base` 缺省视为 0（即把权重本身当任务向量）；张量只支持 1D/2D 嵌套 list；`dare_merge` 用 `random.Random(seed)` 保证可复现。
+
+### KV cache 量化（KIVI 简化）与 Wanda 剪枝
+
+KV cache 量化把 key/value 压成低比特整数，Wanda 用「权重幅值 × 输入激活范数」
+决定剪掉哪些权重；两者都是部署侧的显存/带宽优化。
+
+```python
+q = kv_cache_quantize(k_cache, v_cache, key_bits=4, value_bits=8)
+k_hat, v_hat = kv_cache_dequantize(q)
+err = kv_cache_quantization_error(k_cache, v_cache, key_bits=4, value_bits=8)
+
+imp = wanda_importance(weights, activations)       # |W_ij| * ||X_j||
+out = wanda_prune(weights, activations, sparsity=0.5)
+print(out["weights"], out["mask"], out["sparsity"])
+
+base = magnitude_prune(weights, sparsity=0.5)      # 幅度剪枝基线
+```
+
+| API | 说明 |
+| --- | --- |
+| `kv_quantize(tensor, bits=4, axis=0)` | 2D 张量分组非对称量化；`axis=0` 逐 token、`axis=1` 逐通道，返回 `{'codes','mins','scales','bits','axis','shape'}` |
+| `kv_dequantize(quant)` | 按 codes/mins/scales 还原浮点 2D 列表 |
+| `kv_cache_quantize(k_cache, v_cache, key_bits=4, value_bits=4)` | KIVI 风格：key 按通道量化、value 按 token 量化 |
+| `kv_cache_dequantize(quant)` / `kv_cache_quantization_error(...)` | 还原 / 返回 key/value 相对误差与最大绝对误差 |
+| `wanda_importance(weights, activations)` | `|W_ij| × ||X_j||`；`activations` 可为每列范数（1D）或 2D 校准数据 |
+| `wanda_prune(weights, activations, sparsity=0.5)` | 每行保留重要性 top-(1-sparsity)，返回 `{'weights','mask','sparsity','keep_per_row'}` |
+| `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `|w|` 保留） |
+
+- 边界：量化是逐行/逐列 absmax 区间，非真实 KIVI 的分组/残差；Wanda 用一次校准统计，不含激活感知的迭代补偿或稀疏格式；每行至少保留 1 个权重；只支持 2D 张量/1D 嵌套 list。
 
 ### 量化与 SmoothQuant
 
@@ -4427,7 +4456,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2253 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2259 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4661,6 +4690,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
 | `TestModelMerging` | soup 均值、SLERP 端点/保范数/退化、TIES 手算与裁剪、DARE 复现与丢弃、非法输入 |
 | `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
+| `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
+| `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4798,6 +4829,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2253 个单元测试
+├── test_ai.py       # 2259 个单元测试
 └── README.md
 ```

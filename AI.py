@@ -4939,6 +4939,225 @@ def simhash_dedup(items, threshold: float = 0.9, bits: int = 64):
             hashes.append(h)
     return {"indices": kept, "hashes": hashes}
 
+
+def _kvq_check_bits(bits, name: str = "bits") -> int:
+    if (not isinstance(bits, int) or isinstance(bits, bool) or not (1 <= bits <= 16)):
+        raise ValueError(f"kvq: {name} 必须是 1..16 的整数，收到 {bits!r}")
+    return int(bits)
+
+
+def _kvq_check_matrix(tensor, name: str = "tensor"):
+    if not isinstance(tensor, (list, tuple)) or not tensor:
+        raise ValueError(f"kvq: {name} 必须是非空二维列表")
+    rows = []
+    width = None
+    for row in tensor:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"kvq: {name} 的每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"kvq: {name} 的各行长度必须一致")
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"kvq: {name} 必须只包含有限数字")
+            vals.append(float(v))
+        rows.append(vals)
+    return rows
+
+
+def kv_quantize(tensor, bits: int = 4, axis: int = 0):
+    """对 2D KV 张量做分组非对称量化（absmax 区间）。
+
+    axis=0：逐 token（每行）共享一组 min/scale；axis=1：逐通道（每列）共享。
+    返回 {'codes','mins','scales','bits','axis','shape'}，codes 为 0..2^bits-1 整数。
+    """
+    bits = _kvq_check_bits(bits)
+    if axis not in (0, 1):
+        raise ValueError(f"kvq: axis 只能是 0 或 1，收到 {axis!r}")
+    rows = _kvq_check_matrix(tensor, "tensor")
+    n_rows = len(rows)
+    n_cols = len(rows[0])
+    levels = (1 << bits) - 1
+    codes = [[0] * n_cols for _ in range(n_rows)]
+    if axis == 0:
+        mins = [0.0] * n_rows
+        scales = [0.0] * n_rows
+        for i in range(n_rows):
+            lo = min(rows[i])
+            hi = max(rows[i])
+            scale = (hi - lo) / levels if hi > lo else 0.0
+            mins[i] = lo
+            scales[i] = scale
+            for j in range(n_cols):
+                q = 0 if scale == 0.0 else int(round((rows[i][j] - lo) / scale))
+                codes[i][j] = max(0, min(levels, q))
+    else:
+        mins = [0.0] * n_cols
+        scales = [0.0] * n_cols
+        for j in range(n_cols):
+            lo = min(rows[i][j] for i in range(n_rows))
+            hi = max(rows[i][j] for i in range(n_rows))
+            scale = (hi - lo) / levels if hi > lo else 0.0
+            mins[j] = lo
+            scales[j] = scale
+            for i in range(n_rows):
+                q = 0 if scale == 0.0 else int(round((rows[i][j] - lo) / scale))
+                codes[i][j] = max(0, min(levels, q))
+    return {"codes": codes, "mins": mins, "scales": scales,
+            "bits": bits, "axis": axis, "shape": (n_rows, n_cols)}
+
+
+def kv_dequantize(quant):
+    """把 kv_quantize 的结果还原为浮点 2D 列表。"""
+    if not isinstance(quant, dict) or "codes" not in quant:
+        raise ValueError("kvq: quant 必须是 kv_quantize 返回的字典")
+    codes = _kvq_check_matrix(quant["codes"], "codes")
+    bits = _kvq_check_bits(quant.get("bits"), "bits")
+    axis = quant.get("axis", 0)
+    if axis not in (0, 1):
+        raise ValueError(f"kvq: axis 只能是 0 或 1，收到 {axis!r}")
+    mins = quant.get("mins")
+    scales = quant.get("scales")
+    if not isinstance(mins, list) or not isinstance(scales, list):
+        raise ValueError("kvq: quant 缺少 mins/scales")
+    levels = (1 << bits) - 1
+    n_rows = len(codes)
+    n_cols = len(codes[0])
+    if axis == 0:
+        if len(mins) != n_rows or len(scales) != n_rows:
+            raise ValueError("kvq: axis=0 时 mins/scales 长度必须等于行数")
+        out = []
+        for i in range(n_rows):
+            lo = float(mins[i])
+            scale = float(scales[i])
+            row = []
+            for j in range(n_cols):
+                q = int(codes[i][j])
+                if q < 0 or q > levels:
+                    raise ValueError("kvq: codes 超出 bits 范围")
+                row.append(lo + q * scale)
+            out.append(row)
+        return out
+    if len(mins) != n_cols or len(scales) != n_cols:
+        raise ValueError("kvq: axis=1 时 mins/scales 长度必须等于列数")
+    out = [[0.0] * n_cols for _ in range(n_rows)]
+    for j in range(n_cols):
+        lo = float(mins[j])
+        scale = float(scales[j])
+        for i in range(n_rows):
+            q = int(codes[i][j])
+            if q < 0 or q > levels:
+                raise ValueError("kvq: codes 超出 bits 范围")
+            out[i][j] = lo + q * scale
+    return out
+
+
+def kv_cache_quantize(k_cache, v_cache, key_bits: int = 4, value_bits: int = 4):
+    """KIVI 风格：key 按通道（axis=1）、value 按 token（axis=0）分别量化。"""
+    return {"keys": kv_quantize(k_cache, key_bits, axis=1),
+            "values": kv_quantize(v_cache, value_bits, axis=0)}
+
+
+def kv_cache_dequantize(quant):
+    """还原 kv_cache_quantize 的结果，返回 (k_cache, v_cache)。"""
+    if not isinstance(quant, dict) or "keys" not in quant or "values" not in quant:
+        raise ValueError("kvq: quant 必须是 kv_cache_quantize 返回的字典")
+    return kv_dequantize(quant["keys"]), kv_dequantize(quant["values"])
+
+
+def kv_cache_quantization_error(k_cache, v_cache, key_bits: int = 4,
+                                value_bits: int = 4):
+    """量化/反量化后的相对误差与最大绝对误差（教学诊断用）。"""
+    k = _kvq_check_matrix(k_cache, "k_cache")
+    v = _kvq_check_matrix(v_cache, "v_cache")
+    q = kv_cache_quantize(k, v, key_bits, value_bits)
+    k2, v2 = kv_cache_dequantize(q)
+
+    def stats(orig, approx):
+        total = 0.0
+        norm = 0.0
+        max_abs = 0.0
+        for i in range(len(orig)):
+            for j in range(len(orig[i])):
+                diff = abs(orig[i][j] - approx[i][j])
+                max_abs = max(max_abs, diff)
+                total += diff
+                norm += abs(orig[i][j])
+        rel = total / norm if norm > 0.0 else 0.0
+        return rel, max_abs
+
+    k_rel, k_max = stats(k, k2)
+    v_rel, v_max = stats(v, v2)
+    return {"key_rel_error": k_rel, "key_max_abs": k_max,
+            "value_rel_error": v_rel, "value_max_abs": v_max,
+            "key_bits": key_bits, "value_bits": value_bits}
+
+
+def wanda_importance(weights, activations):
+    """Wanda 重要性：|W_ij| * ||X_j||，activations 是 1D 列范数或 2D 校准数据。"""
+    rows = _kvq_check_matrix(weights, "weights")
+    n_cols = len(rows[0])
+    if (not isinstance(activations, (list, tuple)) or not activations):
+        raise ValueError("wanda: activations 必须是非空列表")
+    if isinstance(activations[0], (list, tuple)):
+        calib = _kvq_check_matrix(activations, "activations")
+        if len(calib[0]) != n_cols:
+            raise ValueError("wanda: 校准数据的列数必须等于权重列数")
+        norms = []
+        for j in range(n_cols):
+            vals = [calib[i][j] for i in range(len(calib))]
+            mean = sum(vals) / len(vals)
+            var = sum((x - mean) ** 2 for x in vals) / len(vals)
+            norms.append(math.sqrt(var + mean * mean))
+    else:
+        norms = []
+        for x in activations:
+            if (not isinstance(x, (int, float)) or isinstance(x, bool)
+                    or not math.isfinite(float(x)) or float(x) < 0.0):
+                raise ValueError("wanda: activations 必须是非负有限数字")
+            norms.append(float(x))
+        if len(norms) != n_cols:
+            raise ValueError("wanda: activations 长度必须等于权重列数")
+    return [[abs(rows[i][j]) * norms[j] for j in range(n_cols)]
+            for i in range(len(rows))]
+
+
+def _prune_topk_per_row(weights, importance, sparsity):
+    if (not isinstance(sparsity, (int, float)) or isinstance(sparsity, bool)
+            or not math.isfinite(float(sparsity)) or not (0.0 <= float(sparsity) < 1.0)):
+        raise ValueError(f"prune: sparsity 必须在 [0,1)，收到 {sparsity!r}")
+    rows = _kvq_check_matrix(weights, "weights")
+    n_cols = len(rows[0])
+    keep = int(round(n_cols * (1.0 - float(sparsity))))
+    keep = max(1, min(n_cols, keep))
+    mask = []
+    out = []
+    for i in range(len(rows)):
+        order = sorted(range(n_cols), key=lambda j: (-importance[i][j], j))
+        kept = set(order[:keep])
+        mask.append([j in kept for j in range(n_cols)])
+        out.append([rows[i][j] if j in kept else 0.0 for j in range(n_cols)])
+    actual = sum(1 for row in mask for v in row if not v)
+    total = len(mask) * n_cols
+    return {"weights": out, "mask": mask, "sparsity": actual / total,
+            "keep_per_row": keep}
+
+
+def magnitude_prune(weights, sparsity: float = 0.5):
+    """幅度剪枝基线：每行只保留 |w| 最大的 (1-sparsity) 比例。"""
+    rows = _kvq_check_matrix(weights, "weights")
+    imp = [[abs(v) for v in row] for row in rows]
+    return _prune_topk_per_row(rows, imp, sparsity)
+
+
+def wanda_prune(weights, activations, sparsity: float = 0.5):
+    """Wanda 剪枝：重要性 = |W_ij| * ||X_j||，每行保留 top-(1-sparsity)。"""
+    imp = wanda_importance(weights, activations)
+    return _prune_topk_per_row(weights, imp, sparsity)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

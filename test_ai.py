@@ -35450,3 +35450,109 @@ class TestDedup:
         assert len(out["hashes"]) == 2
         _p10d_raises(lambda: AI.simhash_dedup([], 0.9))
         _p10d_raises(lambda: AI.simhash_dedup([[1]], -0.1))
+
+
+import math
+import AI
+
+
+def _p10e_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("未抛出预期异常")
+
+
+def _p10e_abs_err(orig, approx):
+    return max(abs(a - b) for r1, r2 in zip(orig, approx) for a, b in zip(r1, r2))
+
+
+class TestKVQuantization:
+    def test_quantize_roundtrip(self):
+        k = [[float((i * 7 + j * 3) % 11 - 5) * 0.37 for j in range(8)]
+             for i in range(5)]
+        q8 = AI.kv_quantize(k, bits=8, axis=1)
+        k8 = AI.kv_dequantize(q8)
+        err8 = _p10e_abs_err(k, k8)
+        assert err8 < 2e-2
+        q2 = AI.kv_quantize(k, bits=2, axis=1)
+        k2 = AI.kv_dequantize(q2)
+        err2 = _p10e_abs_err(k, k2)
+        assert err2 >= err8
+        assert q2["bits"] == 2 and q2["axis"] == 1
+        assert q2["shape"] == (5, 8)
+        assert all(0 <= c <= 3 for row in q2["codes"] for c in row)
+        _p10e_raises(lambda: AI.kv_quantize(k, bits=0))
+        _p10e_raises(lambda: AI.kv_quantize(k, bits=17))
+        _p10e_raises(lambda: AI.kv_quantize(k, axis=2))
+        _p10e_raises(lambda: AI.kv_quantize([]))
+        _p10e_raises(lambda: AI.kv_quantize([[1.0], [1.0, 2.0]]))
+        _p10e_raises(lambda: AI.kv_quantize([[float("inf")]]))
+
+    def test_axis_semantics(self):
+        x = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        q_row = AI.kv_quantize(x, bits=4, axis=0)
+        assert len(q_row["mins"]) == 2 and len(q_row["scales"]) == 2
+        q_col = AI.kv_quantize(x, bits=4, axis=1)
+        assert len(q_col["mins"]) == 3 and len(q_col["scales"]) == 3
+        # 常数行 → scale=0，反量化还原该常数
+        q_const = AI.kv_quantize([[2.0, 2.0, 2.0]], bits=4, axis=0)
+        assert q_const["scales"] == [0.0]
+        assert AI.kv_dequantize(q_const) == [[2.0, 2.0, 2.0]]
+
+    def test_kv_cache_quantize(self):
+        k = [[0.1 * (i + 1) + 0.05 * j for j in range(6)] for i in range(4)]
+        v = [[-0.2 * j + 0.1 * i for j in range(6)] for i in range(4)]
+        q = AI.kv_cache_quantize(k, v, key_bits=4, value_bits=8)
+        assert q["keys"]["bits"] == 4 and q["values"]["bits"] == 8
+        assert q["keys"]["axis"] == 1 and q["values"]["axis"] == 0
+        k2, v2 = AI.kv_cache_dequantize(q)
+        assert len(k2) == 4 and len(k2[0]) == 6
+        assert len(v2) == 4 and len(v2[0]) == 6
+        err = AI.kv_cache_quantization_error(k, v, 4, 8)
+        assert set(err) >= {"key_rel_error", "key_max_abs",
+                            "value_rel_error", "value_max_abs"}
+        assert err["value_rel_error"] < err["key_rel_error"] + 1e-9
+        _p10e_raises(lambda: AI.kv_cache_quantize(k, v, key_bits=0))
+        _p10e_raises(lambda: AI.kv_cache_dequantize({"keys": q["keys"]}))
+        _p10e_raises(lambda: AI.kv_dequantize({"codes": [[0]]}))
+        _p10e_raises(lambda: AI.kv_dequantize({"codes": [[9]], "bits": 2,
+                                               "mins": [0.0], "scales": [1.0],
+                                               "axis": 0}))
+
+
+class TestWandaPruning:
+    def test_wanda_importance(self):
+        imp = AI.wanda_importance([[1.0, 2.0]], [3.0, 4.0])
+        assert imp == [[3.0, 8.0]]
+        calib = [[3.0], [4.0]]
+        norm = math.sqrt((3.5 ** 2) + 0.25)
+        imp2 = AI.wanda_importance([[1.0]], calib)
+        assert abs(imp2[0][0] - norm) < 1e-12
+        _p10e_raises(lambda: AI.wanda_importance([[1.0]], []))
+        _p10e_raises(lambda: AI.wanda_importance([[1.0, 2.0]], [1.0]))
+        _p10e_raises(lambda: AI.wanda_importance([[1.0]], [-1.0]))
+        _p10e_raises(lambda: AI.wanda_importance([[1.0]], [[1.0, 2.0]]))
+        _p10e_raises(lambda: AI.wanda_importance([[1.0]], [float("nan")]))
+
+    def test_wanda_prune_hand_computed(self):
+        out = AI.wanda_prune([[1.0, 2.0], [3.0, 4.0]], [100.0, 1.0], 0.5)
+        assert out["weights"] == [[1.0, 0.0], [3.0, 0.0]]
+        assert out["mask"] == [[True, False], [True, False]]
+        assert out["keep_per_row"] == 1
+        assert abs(out["sparsity"] - 0.5) < 1e-12
+        # 幅度剪枝与 Wanda 在同等校准下可能不同
+        mag = AI.magnitude_prune([[1.0, 2.0], [3.0, 4.0]], 0.5)
+        assert mag["weights"] == [[0.0, 2.0], [0.0, 4.0]]
+
+    def test_sparsity_edges(self):
+        out0 = AI.wanda_prune([[1.0, 2.0]], [1.0, 1.0], 0.0)
+        assert out0["weights"] == [[1.0, 2.0]]
+        assert out0["sparsity"] == 0.0
+        out9 = AI.wanda_prune([[1.0, 2.0, 3.0, 4.0]], [1.0] * 4, 0.9)
+        assert out9["keep_per_row"] == max(1, int(round(4 * 0.1)))
+        assert sum(1 for v in out9["mask"][0] if not v) == 3
+        _p10e_raises(lambda: AI.wanda_prune([[1.0]], [1.0], 1.0))
+        _p10e_raises(lambda: AI.wanda_prune([[1.0]], [1.0], -0.1))
+        _p10e_raises(lambda: AI.magnitude_prune([[1.0]], 2.0))
