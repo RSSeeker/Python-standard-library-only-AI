@@ -36430,3 +36430,62 @@ class TestLinearChainCRF:
         _p10f_raises(lambda: crf.fit([_EM], []))
         _p10f_raises(lambda: crf.fit([_EM], [[0, 1, 0]], epochs=0))
         _p10f_raises(lambda: crf.fit([_EM], [[0, 1, 0]], lr=0.0))
+
+
+import random
+
+import pytest
+
+import AI
+
+
+def _ring_mat(rng, n, d):
+    return [[rng.gauss(0.0, 0.3) for _ in range(d)] for _ in range(n)]
+
+
+class TestRingAttention:
+    def test_matches_dense_attention(self):
+        rng = random.Random(0)
+        q = _ring_mat(rng, 7, 4)
+        k = _ring_mat(rng, 7, 4)
+        v = _ring_mat(rng, 7, 3)
+        for block_size in (1, 2, 3, 7):
+            for causal in (False, True):
+                got = AI.ring_attention(q, k, v, block_size=block_size, causal=causal)
+                ref = AI._ring_dense_attention(q, k, v, causal=causal)
+                for i in range(7):
+                    for j in range(3):
+                        assert got[i][j] == pytest.approx(ref[i][j], abs=1e-12)
+
+    def test_uneven_blocks_and_rect_sequences(self):
+        rng = random.Random(1)
+        q = _ring_mat(rng, 5, 3)
+        k = _ring_mat(rng, 8, 3)
+        v = _ring_mat(rng, 8, 2)
+        got = AI.ring_attention(q, k, v, block_size=3)
+        ref = AI._ring_dense_attention(q, k, v)
+        for i in range(5):
+            for j in range(2):
+                assert got[i][j] == pytest.approx(ref[i][j], abs=1e-12)
+
+    def test_large_scores_stable(self):
+        q = [[100.0, 0.0], [0.0, 100.0]]
+        k = [[100.0, 0.0], [0.0, 100.0]]
+        v = [[1.0], [2.0]]
+        got = AI.ring_attention(q, k, v, block_size=1)
+        assert got[0][0] == pytest.approx(1.0, abs=1e-9)
+        assert got[1][0] == pytest.approx(2.0, abs=1e-9)
+
+    def test_errors(self):
+        q = [[1.0, 0.0]]
+        k = [[1.0, 0.0]]
+        v = [[1.0]]
+        _p10f_raises(lambda: AI.ring_attention([], k, v))
+        _p10f_raises(lambda: AI.ring_attention(q, [], v))
+        _p10f_raises(lambda: AI.ring_attention(q, k, []))
+        _p10f_raises(lambda: AI.ring_attention(q, k[:-1], v))
+        _p10f_raises(lambda: AI.ring_attention(q, k, v[:-1]))
+        _p10f_raises(lambda: AI.ring_attention([[1.0, 0.0]], [[1.0, 2.0, 3.0]], v))
+        _p10f_raises(lambda: AI.ring_attention([[float("nan"), 0.0]], k, v))
+        _p10f_raises(lambda: AI.ring_attention(q, k, v, block_size=0))
+        _p10f_raises(lambda: AI.ring_attention(q, k, v, block_size=True))

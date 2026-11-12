@@ -6970,6 +6970,108 @@ class LinearChainCRF:
     def param_count(self):
         return self.num_tags * self.num_tags + 2 * self.num_tags
 
+
+def _ring_check_matrix(x, name="query"):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("ring: %s 必须是非空二维列表" % name)
+    rows = []
+    width = None
+    for row in x:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("ring: %s 的每一行必须是非空列表" % name)
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("ring: %s 的每行长度必须一致" % name)
+        out = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("ring: %s 必须只包含有限数字" % name)
+            out.append(float(v))
+        rows.append(out)
+    return rows
+
+
+def _ring_dense_attention(query, key, value, causal=False):
+    nq = len(query)
+    d = len(query[0])
+    scale = 1.0 / _math_sqrt(d)
+    out = []
+    for qi in range(nq):
+        scores = []
+        for kj in range(len(key)):
+            if causal and kj > qi:
+                continue
+            s = 0.0
+            for t in range(d):
+                s += query[qi][t] * key[kj][t]
+            scores.append((s * scale, kj))
+        m = max(s for s, _ in scores)
+        denom = 0.0
+        acc = [0.0] * len(value[0])
+        for s, kj in scores:
+            w = math.exp(s - m)
+            denom += w
+            for t in range(len(value[0])):
+                acc[t] += w * value[kj][t]
+        out.append([a / denom for a in acc])
+    return out
+
+
+def ring_attention(query, key, value, block_size=2, causal=False):
+    """分块环形（online softmax）注意力：逐块传递 KV，结果与稠密注意力一致。"""
+    query = _ring_check_matrix(query, "query")
+    key = _ring_check_matrix(key, "key")
+    value = _ring_check_matrix(value, "value")
+    if len(key) != len(value):
+        raise ValueError("ring: key 与 value 的序列长度必须一致")
+    if len(query[0]) != len(key[0]):
+        raise ValueError("ring: query 与 key 的维度必须一致")
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+        raise ValueError("ring: block_size 必须是正整数")
+    nq = len(query)
+    nk = len(key)
+    d = len(query[0])
+    dv = len(value[0])
+    scale = 1.0 / _math_sqrt(d)
+    n_qblocks = (nq + block_size - 1) // block_size
+    n_kblocks = (nk + block_size - 1) // block_size
+    out = [[0.0] * dv for _ in range(nq)]
+    for qb in range(n_qblocks):
+        q_idx = list(range(qb * block_size, min((qb + 1) * block_size, nq)))
+        m = [-math.inf] * len(q_idx)
+        l = [0.0] * len(q_idx)
+        acc = [[0.0] * dv for _ in q_idx]
+        for step in range(n_kblocks):
+            kb = (qb + step) % n_kblocks
+            k_idx = list(range(kb * block_size, min((kb + 1) * block_size, nk)))
+            for pos, qi in enumerate(q_idx):
+                for kj in k_idx:
+                    if causal and kj > qi:
+                        continue
+                    s = 0.0
+                    qrow = query[qi]
+                    krow = key[kj]
+                    for t in range(d):
+                        s += qrow[t] * krow[t]
+                    s *= scale
+                    if s > m[pos]:
+                        m_new = s
+                        alpha = math.exp(m[pos] - m_new) if l[pos] > 0.0 else 0.0
+                        l[pos] = l[pos] * alpha + 1.0
+                        for t in range(dv):
+                            acc[pos][t] = acc[pos][t] * alpha + value[kj][t]
+                        m[pos] = m_new
+                    else:
+                        w = math.exp(s - m[pos])
+                        l[pos] += w
+                        for t in range(dv):
+                            acc[pos][t] += w * value[kj][t]
+        for pos, qi in enumerate(q_idx):
+            out[qi] = [acc[pos][t] / l[pos] for t in range(dv)]
+    return out
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

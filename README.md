@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2368 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2372 项）
 
 ## 特性
 
@@ -2207,6 +2207,20 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### 环形注意力（RingAttention 分块 online softmax）
+
+按 KV 块环形传递、online softmax 累积，结果与稠密注意力一致；用于演示长序列的序列并行注意力。
+
+```python
+out = ring_attention(query, key, value, block_size=2, causal=False)
+```
+
+| API | 说明 |
+| --- | --- |
+| `ring_attention(query, key, value, block_size=2, causal=False)` | 分块环形（online softmax）注意力，query/key 维度一致，key/value 等长；返回逐 query 行输出 |
+
+- 边界：纯 Python 模拟，块间“环形传递”仅体现在遍历顺序，不做真实设备间通信；因果模式下按全局位置屏蔽未来 key；支持 query 与 key 长度不同（非因果）。
 
 ### 线性链条件随机场（CRF）
 
@@ -4765,7 +4779,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2368 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2372 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5038,6 +5052,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCRFMarginals` | 节点/边边缘与暴力枚举一致、后验解码 |
 | `TestCRFLikelihoodAndGradient` | 对数似然、梯度有限差分、梯度归零性质 |
 | `TestLinearChainCRF` | 参数量、fit 提升似然、委托方法与非法输入 |
+| `TestRingAttention` | 与稠密注意力一致（多 block_size/因果/非因果）、不等长块、大分数稳定性、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5175,6 +5190,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2368 个单元测试
+├── test_ai.py       # 2372 个单元测试
 └── README.md
 ```
