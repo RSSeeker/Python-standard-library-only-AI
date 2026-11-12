@@ -5464,6 +5464,90 @@ def patching_delta(clean_rows, patched_rows, direction):
     pp = project_onto(patched, direction)
     return sum(pp) / len(pp) - sum(pc) / len(pc)
 
+
+def _eval_check_int(value, name: str, allow_zero: bool = True):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"eval: {name} 必须是整数，收到 {value!r}")
+    if value < 0 or (not allow_zero and value == 0):
+        raise ValueError(f"eval: {name} 必须是{'非负' if allow_zero else '正'}整数")
+    return value
+
+
+def pass_at_k(n: int, c: int, k: int):
+    """pass@k 无偏估计：1 - C(n-c,k)/C(n,k)（n 总样本，c 正确数）。"""
+    _eval_check_int(n, "n", allow_zero=False)
+    _eval_check_int(c, "c")
+    _eval_check_int(k, "k", allow_zero=False)
+    if c > n:
+        raise ValueError("eval: c 不能大于 n")
+    if k > n:
+        raise ValueError("eval: k 不能大于 n")
+    if n - c < k:
+        return 1.0
+    num = 1.0
+    den = 1.0
+    for i in range(k):
+        num *= (n - c - i)
+        den *= (n - i)
+    return 1.0 - num / den
+
+
+def prm_aggregate(step_scores, mode: str = "mean", discount: float = 1.0):
+    """过程奖励聚合：mean / min / last / discounted（discount^t 加权后归一化）。"""
+    if not isinstance(step_scores, (list, tuple)) or not step_scores:
+        raise ValueError("eval: step_scores 必须是非空数字列表")
+    vals = []
+    for v in step_scores:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("eval: step_scores 必须只包含有限数字")
+        vals.append(float(v))
+    if mode not in ("mean", "min", "last", "discounted"):
+        raise ValueError(f"eval: mode 必须是 mean/min/last/discounted，收到 {mode!r}")
+    if (not isinstance(discount, (int, float)) or isinstance(discount, bool)
+            or not math.isfinite(float(discount)) or not (0.0 < float(discount) <= 1.0)):
+        raise ValueError(f"eval: discount 必须在 (0,1]，收到 {discount!r}")
+    if mode == "mean":
+        return sum(vals) / len(vals)
+    if mode == "min":
+        return min(vals)
+    if mode == "last":
+        return vals[-1]
+    weights = [float(discount) ** i for i in range(len(vals))]
+    return sum(w * v for w, v in zip(weights, vals)) / sum(weights)
+
+
+def verifier_rank(candidates, scores):
+    """按 verifier 分数降序排名，同分按原序，返回 [{'index','score'}]。"""
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        raise ValueError("eval: candidates 必须是非空列表")
+    if not isinstance(scores, (list, tuple)) or len(scores) != len(candidates):
+        raise ValueError("eval: scores 长度必须与 candidates 一致")
+    vals = []
+    for s in scores:
+        if (not isinstance(s, (int, float)) or isinstance(s, bool)
+                or not math.isfinite(float(s))):
+            raise ValueError("eval: scores 必须只包含有限数字")
+        vals.append(float(s))
+    order = sorted(range(len(vals)), key=lambda i: (-vals[i], i))
+    return [{"index": i, "score": vals[i]} for i in order]
+
+
+def toxicity_score(tokens, lexicon):
+    """词表毒性比例：命中词数 / 总词数，并返回命中下标。"""
+    if not isinstance(tokens, (list, tuple)) or not tokens:
+        raise ValueError("eval: tokens 必须是非空列表")
+    if not isinstance(lexicon, (list, tuple, set)) or not lexicon:
+        raise ValueError("eval: lexicon 必须是非空列表/集合")
+    bad = {str(w).lower() for w in lexicon}
+    idx = []
+    for i, tok in enumerate(tokens):
+        if not isinstance(tok, str):
+            raise ValueError("eval: tokens 必须都是字符串")
+        if tok.lower() in bad:
+            idx.append(i)
+    return {"score": len(idx) / len(tokens), "flagged": idx}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

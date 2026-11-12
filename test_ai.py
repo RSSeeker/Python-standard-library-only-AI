@@ -35694,3 +35694,65 @@ class TestInterpretability:
         _p10f_raises(lambda: AI.steer([[1.0]], [1.0, 2.0]))
         _p10f_raises(lambda: AI.steer([[1.0]], [1.0], alpha=float("nan")))
         _p10f_raises(lambda: AI.patching_delta([[1.0]], [[1.0, 2.0]], [1.0]))
+
+
+class TestPassAtK:
+    def test_estimator_hand(self):
+        assert AI.pass_at_k(10, 2, 1) == pytest.approx(0.2)
+        assert AI.pass_at_k(10, 2, 5) == pytest.approx(1.0 - (8 * 7 * 6 * 5 * 4) / (10 * 9 * 8 * 7 * 6))
+        assert AI.pass_at_k(5, 5, 3) == 1.0
+        assert AI.pass_at_k(5, 0, 3) == 0.0
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.pass_at_k(0, 0, 1))
+        _p10f_raises(lambda: AI.pass_at_k(3, 4, 1))
+        _p10f_raises(lambda: AI.pass_at_k(10, 2, 11))
+        _p10f_raises(lambda: AI.pass_at_k(10, 2, 0))
+
+
+class TestProcessReward:
+    def test_modes_hand(self):
+        assert AI.prm_aggregate([1.0, 2.0, 3.0], "mean") == pytest.approx(2.0)
+        assert AI.prm_aggregate([1.0, 2.0, 3.0], "min") == pytest.approx(1.0)
+        assert AI.prm_aggregate([1.0, 2.0, 3.0], "last") == pytest.approx(3.0)
+        expected = (1.0 + 0.5 * 2.0 + 0.25 * 3.0) / (1.0 + 0.5 + 0.25)
+        assert AI.prm_aggregate([1.0, 2.0, 3.0], "discounted", 0.5) == pytest.approx(expected)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.prm_aggregate([]))
+        _p10f_raises(lambda: AI.prm_aggregate([1.0], "median"))
+        _p10f_raises(lambda: AI.prm_aggregate([1.0], "mean", discount=0.0))
+        _p10f_raises(lambda: AI.prm_aggregate([1.0], "mean", discount=1.5))
+
+
+class TestVerifierRank:
+    def test_order_and_ties(self):
+        out = AI.verifier_rank(["a", "b", "c"], [0.2, 0.9, 0.9])
+        assert [r["index"] for r in out] == [1, 2, 0]
+        assert out[0]["score"] == 0.9
+        _p10f_raises(lambda: AI.verifier_rank([], []))
+        _p10f_raises(lambda: AI.verifier_rank(["a"], [0.1, 0.2]))
+        _p10f_raises(lambda: AI.verifier_rank(["a"], [float("nan")]))
+
+
+class TestToxicity:
+    def test_score_hand(self):
+        out = AI.toxicity_score(["bad", "good", "BAD"], ["bad"])
+        assert out["score"] == pytest.approx(2.0 / 3.0)
+        assert out["flagged"] == [0, 2]
+        assert AI.toxicity_score(["good"], ["bad"])["score"] == 0.0
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.toxicity_score([], ["bad"]))
+        _p10f_raises(lambda: AI.toxicity_score(["x"], []))
+        _p10f_raises(lambda: AI.toxicity_score([1], ["bad"]))
+
+
+class TestRankingMetricsCompat:
+    def test_recall_and_reciprocal_rank(self):
+        rel = [1, 0, 1]
+        scores = [0.9, 0.8, 0.7]
+        assert AI.recall_at_k(rel, scores, 2) == pytest.approx(0.5)
+        assert AI.recall_at_k(rel, scores, 3) == pytest.approx(1.0)
+        assert AI.reciprocal_rank(rel, scores) == pytest.approx(1.0)
+        assert AI.reciprocal_rank([0, 1], [0.9, 0.8]) == pytest.approx(0.5)

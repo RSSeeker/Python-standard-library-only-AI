@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2277 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2285 项）
 
 ## 特性
 
@@ -2097,6 +2097,29 @@ delta = patching_delta(clean_hidden, patched_hidden, direction)
 | `patching_delta(clean_rows, patched_rows, direction)` | patched 与 clean 在方向上的平均投影差 |
 
 - 边界：纯表示层工具，不包含解码头之外的模型逻辑；残差方向只是均值差（不做 PCA/白化）；activation patching 只给投影差，不做逐 head/path 定位；只支持二维浮点列表。
+
+### 验证器与评测工具（pass@k / PRM 聚合 / verifier 排序 / 毒性）
+
+面向后训练评测的轻量工具：pass@k 无偏估计、过程奖励聚合、候选 verifier 排序
+与词表毒性比例。
+
+```python
+p1 = pass_at_k(10, 2, 1)                      # 0.2
+p5 = pass_at_k(10, 2, 5)                      # ~0.778
+
+score = prm_aggregate([0.1, 0.9, 0.6], "discounted", discount=0.9)
+ranked = verifier_rank(candidates, [0.2, 0.9, 0.5])
+tox = toxicity_score(tokens, banned_words)    # {"score","flagged"}
+```
+
+| API | 说明 |
+| --- | --- |
+| `pass_at_k(n, c, k)` | 1 − C(n−c,k)/C(n,k)，n 为采样数、c 为正确数；`k>n` 非法 |
+| `prm_aggregate(step_scores, mode="mean", discount=1.0)` | 过程奖励聚合：`mean`/`min`/`last`/`discounted`（折扣加权归一化） |
+| `verifier_rank(candidates, scores)` | 按 verifier 分数降序（同分按原序），返回 `[{"index","score"}]` |
+| `toxicity_score(tokens, lexicon)` | 命中毒性词表比例与命中下标 |
+
+- 边界：pass@k 为无偏组合估计而非置信区间；PRM 聚合只看逐步分数、不训练 PRM；verifier 排序假设分数已由外部模型给出；毒性只做词表匹配（不做语义/上下文判断）。
 
 ### 量化与 SmoothQuant
 
@@ -4511,7 +4534,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2277 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2285 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4752,6 +4775,11 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestColBERT` | late interaction 手算、normalize 开关、维度错误 |
 | `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
 | `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
+| `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
+| `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
+| `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
+| `TestToxicity` | 比例与命中下标、非法输入 |
+| `TestRankingMetricsCompat` | 已有 Recall@k / reciprocal_rank 语义回归 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4889,6 +4917,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2277 个单元测试
+├── test_ai.py       # 2285 个单元测试
 └── README.md
 ```
