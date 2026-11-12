@@ -5333,6 +5333,137 @@ def hybrid_search(index: BM25Index, query, query_vec, doc_vecs, top_k: int = 5,
                     "dense_rank": de_rank.get(doc_id)})
     return out
 
+
+def _interp_check_matrix(rows, name: str = "hidden"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"interp: {name} 必须是非空二维数字列表")
+    out = []
+    dim = None
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"interp: {name}[{i}] 必须是非空数字列表")
+        cur = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"interp: {name} 必须只包含有限数字")
+            cur.append(float(v))
+        if dim is None:
+            dim = len(cur)
+        elif len(cur) != dim:
+            raise ValueError(f"interp: {name} 各行维度必须一致")
+        out.append(cur)
+    return out
+
+
+def _interp_softmax(vec):
+    m = max(vec)
+    exps = [math.exp(v - m) for v in vec]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def _interp_check_vector(vec, name: str = "direction"):
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise ValueError(f"interp: {name} 必须是非空数字列表")
+    out = []
+    for v in vec:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError(f"interp: {name} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def logit_lens(hidden_rows, W_out, b_out=None):
+    """把中间层表示经输出头投影并 softmax，返回每行的词表概率。"""
+    hidden = _interp_check_matrix(hidden_rows, "hidden_rows")
+    dim = len(hidden[0])
+    if not isinstance(W_out, (list, tuple)) or not W_out:
+        raise ValueError("interp: W_out 必须是非空二维数字列表")
+    vocab = []
+    for i, row in enumerate(W_out):
+        if not isinstance(row, (list, tuple)) or len(row) != dim:
+            raise ValueError("interp: W_out 每行维度必须等于 hidden 维度")
+        vocab.append(_interp_check_vector(row, f"W_out[{i}]"))
+    if b_out is None:
+        bias = [0.0] * len(vocab)
+    else:
+        bias = _interp_check_vector(b_out, "b_out")
+        if len(bias) != len(vocab):
+            raise ValueError("interp: b_out 长度必须等于词表大小")
+    out = []
+    for h in hidden:
+        logits = [sum(h[j] * vocab[v][j] for j in range(dim)) + bias[v]
+                  for v in range(len(vocab))]
+        out.append(_interp_softmax(logits))
+    return out
+
+
+def top_k_tokens(probs_rows, k: int = 5):
+    """取每行概率 top-k，返回 [{'index','score'}] 或按行嵌套。"""
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"interp: k 必须是正整数，收到 {k!r}")
+    if not isinstance(probs_rows, (list, tuple)) or not probs_rows:
+        raise ValueError("interp: probs_rows 必须是非空列表")
+    single = isinstance(probs_rows[0], (int, float))
+    rows = [probs_rows] if single else _interp_check_matrix(probs_rows, "probs_rows")
+    out = []
+    for row in rows:
+        if k > len(row):
+            raise ValueError("interp: k 不能大于词表大小")
+        order = sorted(range(len(row)), key=lambda i: (-row[i], i))
+        out.append([{"index": i, "score": row[i]} for i in order[:k]])
+    return out[0] if single else out
+
+
+def residual_direction(pos_rows, neg_rows):
+    """残差方向：正例均值 - 负例均值（同样的 hidden 维度）。"""
+    pos = _interp_check_matrix(pos_rows, "pos_rows")
+    neg = _interp_check_matrix(neg_rows, "neg_rows")
+    if len(pos[0]) != len(neg[0]):
+        raise ValueError("interp: pos/neg 的 hidden 维度必须一致")
+    dim = len(pos[0])
+    vec = []
+    for j in range(dim):
+        mp = sum(r[j] for r in pos) / len(pos)
+        mn = sum(r[j] for r in neg) / len(neg)
+        vec.append(mp - mn)
+    return vec
+
+
+def project_onto(rows, direction):
+    """把每行投影到给定方向（点积），返回标量列表。"""
+    hidden = _interp_check_matrix(rows, "rows")
+    d = _interp_check_vector(direction)
+    if len(d) != len(hidden[0]):
+        raise ValueError("interp: direction 维度必须与 rows 一致")
+    return [sum(row[j] * d[j] for j in range(len(d))) for row in hidden]
+
+
+def steer(rows, direction, alpha: float = 1.0):
+    """在残差流上施加转向：row + alpha * direction。"""
+    hidden = _interp_check_matrix(rows, "rows")
+    d = _interp_check_vector(direction)
+    if len(d) != len(hidden[0]):
+        raise ValueError("interp: direction 维度必须与 rows 一致")
+    if (not isinstance(alpha, (int, float)) or isinstance(alpha, bool)
+            or not math.isfinite(float(alpha))):
+        raise ValueError(f"interp: alpha 必须是有限数字，收到 {alpha!r}")
+    a = float(alpha)
+    return [[row[j] + a * d[j] for j in range(len(d))] for row in hidden]
+
+
+def patching_delta(clean_rows, patched_rows, direction):
+    """激活替换效应：patched 与 clean 在 direction 上平均投影之差。"""
+    clean = _interp_check_matrix(clean_rows, "clean_rows")
+    patched = _interp_check_matrix(patched_rows, "patched_rows")
+    if len(clean[0]) != len(patched[0]):
+        raise ValueError("interp: clean/patched 的 hidden 维度必须一致")
+    pc = project_onto(clean, direction)
+    pp = project_onto(patched, direction)
+    return sum(pp) / len(pp) - sum(pc) / len(pc)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

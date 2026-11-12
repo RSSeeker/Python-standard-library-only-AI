@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2272 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2277 项）
 
 ## 特性
 
@@ -2071,6 +2071,32 @@ hits = hybrid_search(idx, "apple", [1.0, 0.0],
 | `hybrid_search(index, query, query_vec, doc_vecs, top_k=5, rrf_k=60, ...)` | BM25 + dense 两路排名用 RRF 融合，返回 `rrf_score`/`bm25_rank`/`dense_rank` |
 
 - 边界：切词固定为小写 `[a-z0-9]+`（中文需先分词）；BM25 只做纯 Python 打分，不含倒排索引/增量更新；RRF 不下沉原始分数；ColBERT-lite 用向量最大相似度近似 MaxSim，不做 query 扩展。
+
+### 可解释性工具（logit lens / 残差方向 / activation patching）
+
+一组轻量的表示分析工具：把中间层隐状态投影到输出词表、用正负样本均值构造
+残差方向，并在残差流上做转向与激活替换效应估计。
+
+```python
+probs = logit_lens(hidden, W_out, b_out)      # 每行词表概率
+top = top_k_tokens(probs[0], k=5)             # [{"index","score"}]
+
+direction = residual_direction(pos_hidden, neg_hidden)
+scores = project_onto(hidden, direction)      # 每行投影标量
+steered = steer(hidden, direction, alpha=2.0)
+delta = patching_delta(clean_hidden, patched_hidden, direction)
+```
+
+| API | 说明 |
+| --- | --- |
+| `logit_lens(hidden_rows, W_out, b_out=None)` | 中间层表示经输出头投影并逐行 softmax |
+| `top_k_tokens(probs_rows, k=5)` | 每行概率 top-k（同分按原序），支持单行或按行嵌套 |
+| `residual_direction(pos_rows, neg_rows)` | 正例均值 − 负例均值 |
+| `project_onto(rows, direction)` | 每行在方向上的投影（点积） |
+| `steer(rows, direction, alpha=1.0)` | 残差流上加 `alpha × direction` |
+| `patching_delta(clean_rows, patched_rows, direction)` | patched 与 clean 在方向上的平均投影差 |
+
+- 边界：纯表示层工具，不包含解码头之外的模型逻辑；残差方向只是均值差（不做 PCA/白化）；activation patching 只给投影差，不做逐 head/path 定位；只支持二维浮点列表。
 
 ### 量化与 SmoothQuant
 
@@ -4485,7 +4511,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2272 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2277 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4725,6 +4751,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRerank` | 余弦排序与同分、RRF 手算、加权融合、非法输入 |
 | `TestColBERT` | late interaction 手算、normalize 开关、维度错误 |
 | `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
+| `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4862,6 +4889,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2272 个单元测试
+├── test_ai.py       # 2277 个单元测试
 └── README.md
 ```

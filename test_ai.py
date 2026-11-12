@@ -35656,3 +35656,41 @@ class TestHybridSearch:
         _p10f_raises(lambda: AI.hybrid_search(idx, "a", [1.0], [[1.0]]))
         _p10f_raises(lambda: AI.hybrid_search(idx, "a", [1.0], [[1.0], [1.0]],
                                               bm25_weight=-1.0))
+
+
+class TestInterpretability:
+    def test_logit_lens_softmax(self):
+        probs = AI.logit_lens([[1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]])
+        assert len(probs) == 1 and len(probs[0]) == 2
+        assert pytest.approx(1.0) == sum(probs[0])
+        assert probs[0][0] == pytest.approx(0.7310585786, abs=1e-9)
+        assert probs[0][1] == pytest.approx(0.2689414214, abs=1e-9)
+
+    def test_logit_lens_bias_and_errors(self):
+        probs = AI.logit_lens([[0.0]], [[1.0]], b_out=[2.0])
+        assert probs[0][0] == pytest.approx(1.0)
+        _p10f_raises(lambda: AI.logit_lens([], [[1.0]]))
+        _p10f_raises(lambda: AI.logit_lens([[1.0, 2.0]], [[1.0]]))
+        _p10f_raises(lambda: AI.logit_lens([[1.0]], [[1.0]], b_out=[1.0, 2.0]))
+
+    def test_top_k_tokens(self):
+        out = AI.top_k_tokens([0.1, 0.7, 0.2], 2)
+        assert out == [{"index": 1, "score": 0.7}, {"index": 2, "score": 0.2}]
+        tie = AI.top_k_tokens([0.5, 0.5, 0.0], 2)
+        assert [r["index"] for r in tie] == [0, 1]
+        _p10f_raises(lambda: AI.top_k_tokens([0.5, 0.5], 3))
+        _p10f_raises(lambda: AI.top_k_tokens([0.5], 0))
+
+    def test_residual_direction_and_projection(self):
+        vec = AI.residual_direction([[1.0, 0.0], [2.0, 0.0]], [[0.0, 1.0]])
+        assert vec == [1.5, -1.0]
+        assert AI.project_onto([[1.0, 2.0], [3.0, 4.0]], [1.0, 0.0]) == [1.0, 3.0]
+        _p10f_raises(lambda: AI.residual_direction([[1.0]], [[1.0, 2.0]]))
+
+    def test_steer_and_patching_delta(self):
+        assert AI.steer([[1.0, 0.0]], [0.0, 1.0], 2.0) == [[1.0, 2.0]]
+        assert AI.steer([[1.0, 0.0]], [0.0, 1.0]) == [[1.0, 1.0]]
+        assert AI.patching_delta([[1.0, 0.0]], [[3.0, 0.0]], [1.0, 0.0]) == pytest.approx(2.0)
+        _p10f_raises(lambda: AI.steer([[1.0]], [1.0, 2.0]))
+        _p10f_raises(lambda: AI.steer([[1.0]], [1.0], alpha=float("nan")))
+        _p10f_raises(lambda: AI.patching_delta([[1.0]], [[1.0, 2.0]], [1.0]))
