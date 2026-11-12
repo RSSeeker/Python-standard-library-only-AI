@@ -6561,6 +6561,105 @@ class DecisionTransformer:
                 + _dense_param_count(self.W_r) + _dense_param_count(self.head)
                 + len(self.encoder.layers) * enc_layer)
 
+
+def _uplift_check_arrays(scores, treatment, outcome):
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError("uplift: scores 必须是非空列表")
+    n = len(scores)
+    if len(treatment) != n or len(outcome) != n:
+        raise ValueError("uplift: scores/treatment/outcome 长度必须一致")
+    ss, tt, yy = [], [], []
+    for v in scores:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("uplift: scores 必须只包含有限数字")
+        ss.append(float(v))
+    for v in treatment:
+        if not isinstance(v, (bool, int)) or isinstance(v, float):
+            raise ValueError("uplift: treatment 必须是 bool 或 0/1")
+        tt.append(bool(v))
+    for v in outcome:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("uplift: outcome 必须是数值")
+        if not math.isfinite(float(v)):
+            raise ValueError("uplift: outcome 必须是有限数值")
+        yy.append(float(v))
+    return ss, tt, yy
+
+
+def uplift_score(treatment_pred, control_pred):
+    """双模型 uplift：处理组预测减对照组预测，逐样本返回差值。"""
+    if (not isinstance(treatment_pred, (list, tuple))
+            or not isinstance(control_pred, (list, tuple))
+            or len(treatment_pred) != len(control_pred) or not treatment_pred):
+        raise ValueError("uplift: treatment_pred/control_pred 必须等长且非空")
+    out = []
+    for a, b in zip(treatment_pred, control_pred):
+        if (not isinstance(a, (int, float)) or isinstance(a, bool)
+                or not isinstance(b, (int, float)) or isinstance(b, bool)
+                or not math.isfinite(float(a)) or not math.isfinite(float(b))):
+            raise ValueError("uplift: 预测值必须是有限数字")
+        out.append(float(a) - float(b))
+    return out
+
+
+def qini_curve(scores, treatment, outcome):
+    """Qini 曲线：按分数降序累计，q_k = n*(cum_t/n_t - cum_c/n_c)。"""
+    ss, tt, yy = _uplift_check_arrays(scores, treatment, outcome)
+    order = sorted(range(len(ss)), key=lambda i: (-ss[i], i))
+    n = len(order)
+    n_t = sum(1 for t in tt if t)
+    n_c = n - n_t
+    if n_t == 0 or n_c == 0:
+        raise ValueError("uplift: 必须同时包含处理组与对照组样本")
+    q = [0.0]
+    fractions = [0.0]
+    cum_t = 0.0
+    cum_c = 0.0
+    for rank, idx in enumerate(order, start=1):
+        if tt[idx]:
+            cum_t += yy[idx]
+        else:
+            cum_c += yy[idx]
+        q.append((cum_t / n_t - cum_c / n_c) * n)
+        fractions.append(rank / n)
+    return {"fractions": fractions, "qini": q}
+
+
+def qini_coefficient(scores, treatment, outcome):
+    """Qini 系数：Qini 曲线（终点归一化）与对角随机基线之间的面积差。"""
+    curve = qini_curve(scores, treatment, outcome)
+    q = curve["qini"]
+    fr = curve["fractions"]
+    final = q[-1]
+    if abs(final) < 1e-12:
+        return 0.0
+    area = 0.0
+    for i in range(len(q) - 1):
+        y0 = q[i] / final
+        y1 = q[i + 1] / final
+        area += (y0 + y1 - fr[i] - fr[i + 1]) * (fr[i + 1] - fr[i]) / 2.0
+    return area
+
+
+def uplift_at_fraction(scores, treatment, outcome, fraction=0.1):
+    """取分数最高的 fraction 部分样本，返回处理组/对照组平均结果与 uplift 差。"""
+    if (not isinstance(fraction, (int, float)) or isinstance(fraction, bool)
+            or not math.isfinite(float(fraction)) or not 0.0 < float(fraction) <= 1.0):
+        raise ValueError("uplift: fraction 必须在 (0, 1] 内")
+    ss, tt, yy = _uplift_check_arrays(scores, treatment, outcome)
+    order = sorted(range(len(ss)), key=lambda i: (-ss[i], i))
+    k = max(1, int(round(len(order) * fraction)))
+    chosen = order[:k]
+    treated = [yy[i] for i in chosen if tt[i]]
+    control = [yy[i] for i in chosen if not tt[i]]
+    if not treated or not control:
+        raise ValueError("uplift: 该 fraction 内必须同时包含处理组与对照组")
+    mean_t = sum(treated) / len(treated)
+    mean_c = sum(control) / len(control)
+    return {"n": k, "treated_mean": mean_t, "control_mean": mean_c,
+            "uplift": mean_t - mean_c}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

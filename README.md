@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2347 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2354 项）
 
 ## 特性
 
@@ -2286,6 +2286,26 @@ kv_offload_plan(10, 4, 1, 3)                    # 块 0 驻 GPU，块 1/2 驻 CP
 | `kv_offload_plan(seq_len, block_size, gpu_blocks, cpu_blocks=None)` | 逐块标注 `location` 为 `gpu`/`cpu`；容量不足抛 ValueError |
 
 - 边界：dims 必须是升序以外的任意正整数集合（逐一校验），不要求单调；KV offload 仅规划布局，不含真实数据搬移/抢占/换入换出，`cpu_blocks=None` 视为无限容量。
+
+### Uplift 建模与 Qini 评估
+
+因果增益（uplift）评估工具：双模型差值打分、Qini 曲线/Qini 系数、Top 分位 uplift。
+
+```python
+uplift_score([1.0, 0.5], [0.2, 0.1])        # [0.8, 0.4]
+qini_curve([0.9, 0.8, 0.7, 0.6], [1, 1, 0, 0], [1, 1, 0, 0])
+qini_coefficient([0.9, 0.8, 0.7, 0.6], [1, 1, 0, 0], [1, 1, 0, 0])  # 0.25
+uplift_at_fraction(scores, treatment, outcome, fraction=0.1)       # {"n","treated_mean","control_mean","uplift"}
+```
+
+| API | 说明 |
+| --- | --- |
+| `uplift_score(treatment_pred, control_pred)` | 处理组/对照组预测逐样本差值 |
+| `qini_curve(scores, treatment, outcome)` | 按分数降序累计 `q_k = n*(cum_t/n_t - cum_c/n_c)`，返回 fractions/qini |
+| `qini_coefficient(...)` | Qini 曲线（终点归一化）与对角随机基线的面积差；完美排序为正、反向为负 |
+| `uplift_at_fraction(..., fraction=0.1)` | 取最高分 fraction 部分的组均值与 uplift 差 |
+
+- 边界：二进制处理标记与数值结果；两组样本都必须存在，否则 ValueError；fraction 内必须同时含处理/对照组；不做因果森林/DR-learner/置信区间。
 
 ### 生存分析（Kaplan-Meier / log-rank / C-index）
 
@@ -4718,7 +4738,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2347 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2354 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4984,6 +5004,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRegressionTree` | 拟合/叶子均值、未拟合与非法输入 |
 | `TestGradientBoostingRegressor` | 线性目标 MSE、常数目标、超参/未拟合校验 |
 | `TestDecisionTransformer` | 前向/参数量、梯度有限差分、fit 降损失、非法输入 |
+| `TestUpliftScore` | 逐样本差值、非法输入 |
+| `TestQini` | 完美/反向排序、单组数据、非法输入 |
+| `TestUpliftAtFraction` | Top 分位组均值、fraction 边界与单组数据 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5121,6 +5144,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2347 个单元测试
+├── test_ai.py       # 2354 个单元测试
 └── README.md
 ```

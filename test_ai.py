@@ -36211,3 +36211,42 @@ class TestDecisionTransformer:
         _p10f_raises(lambda: m.fit([], epochs=1))
         _p10f_raises(lambda: m.fit([_p11d_traj()], epochs=0))
         _p10f_raises(lambda: m.fit([_p11d_traj()], lr=-0.1))
+
+
+class TestUpliftScore:
+    def test_difference(self):
+        assert AI.uplift_score([1.0, 0.5], [0.2, 0.1]) == pytest.approx([0.8, 0.4])
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.uplift_score([], []))
+        _p10f_raises(lambda: AI.uplift_score([1.0], [1.0, 2.0]))
+        _p10f_raises(lambda: AI.uplift_score([1.0], [float("nan")]))
+
+
+class TestQini:
+    def test_perfect_ranking(self):
+        q = AI.qini_curve([0.9, 0.8, 0.7, 0.6], [1, 1, 0, 0], [1, 1, 0, 0])
+        assert q["qini"] == pytest.approx([0.0, 2.0, 4.0, 4.0, 4.0])
+        assert q["fractions"] == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.0])
+        assert AI.qini_coefficient([0.9, 0.8, 0.7, 0.6], [1, 1, 0, 0], [1, 1, 0, 0]) > 0.1
+
+    def test_inverted_ranking(self):
+        coef = AI.qini_coefficient([0.1, 0.2, 0.3, 0.4], [1, 1, 0, 0], [1, 1, 0, 0])
+        assert coef < -0.1
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.qini_curve([], [], []))
+        _p10f_raises(lambda: AI.qini_curve([0.5], [1], [1]))  # 只有处理组
+        _p10f_raises(lambda: AI.qini_coefficient([0.5], [1], [1]))
+
+
+class TestUpliftAtFraction:
+    def test_top_fraction(self):
+        out = AI.uplift_at_fraction([0.9, 0.8, 0.7, 0.6], [1, 1, 0, 0], [1, 1, 0, 0], 0.75)
+        assert out["n"] == 3
+        assert out["uplift"] == pytest.approx(1.0)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 0], [1, 0], 0.0))
+        _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 0], [1, 0], 1.5))
+        _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 1], [1, 0], 0.5))
