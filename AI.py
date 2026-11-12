@@ -7211,6 +7211,204 @@ def moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=None
                 mask[i][j] = True
     return mask
 
+
+def _tc_check_matrix(x, name="x"):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"transcoder: {name} 必须是非空二维列表")
+    out = []
+    width = None
+    for row in x:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"transcoder: {name} 的每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"transcoder: {name} 的每行长度必须一致")
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"transcoder: {name} 必须只包含有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _tc_check_pos_int(v, name):
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"transcoder: {name} 必须是正整数")
+    return v
+
+
+def _tc_check_params(params, d_in=None):
+    if not isinstance(params, dict):
+        raise ValueError("transcoder: params 必须是字典")
+    for key in ("W_enc", "b_enc", "W_dec", "b_dec"):
+        if key not in params:
+            raise ValueError(f"transcoder: params 缺少 {key}")
+    w_enc = _tc_check_matrix(params["W_enc"], "W_enc")
+    w_dec = _tc_check_matrix(params["W_dec"], "W_dec")
+    d_hidden = len(w_enc)
+    if len(w_dec[0]) != d_hidden:
+        raise ValueError("transcoder: W_dec 的列数必须等于 W_enc 的行数")
+    if len(params["b_enc"]) != d_hidden:
+        raise ValueError("transcoder: b_enc 长度必须等于特征数")
+    if len(params["b_dec"]) != len(w_dec):
+        raise ValueError("transcoder: b_dec 长度必须等于输入维度")
+    if d_in is not None and len(w_enc[0]) != d_in:
+        raise ValueError("transcoder: W_enc 的列数必须等于输入维度")
+    for key in ("b_enc", "b_dec"):
+        for v in params[key]:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"transcoder: {key} 必须只包含有限数字")
+    return w_enc, w_dec
+
+
+def transcoder_apply(params, activations):
+    """给定转码器参数，返回每个样本的稀疏特征与重建。"""
+    w_enc, w_dec = _tc_check_params(params)
+    acts = _tc_check_matrix(activations, "activations")
+    d_hidden = len(w_enc)
+    d_in = len(w_dec)
+    if len(acts[0]) != len(w_enc[0]):
+        raise ValueError("transcoder: activations 维度与 W_enc 不一致")
+    b_enc = [float(v) for v in params["b_enc"]]
+    b_dec = [float(v) for v in params["b_dec"]]
+    features = []
+    recon = []
+    for x in acts:
+        pre = []
+        for j in range(d_hidden):
+            s = b_enc[j]
+            for t in range(d_in):
+                s += w_enc[j][t] * x[t]
+            pre.append(s)
+        f = [max(0.0, v) for v in pre]
+        y = [b_dec[t] + sum(w_dec[t][j] * f[j] for j in range(d_hidden)) for t in range(d_in)]
+        features.append(f)
+        recon.append(y)
+    return {"features": features, "reconstruction": recon}
+
+
+def transcoder_train(activations, d_hidden=4, l1_coeff=1e-3, epochs=50, lr=0.05, seed=0):
+    """训练一个 1 隐层转码器（ReLU 特征 + L1 稀疏），全批量 SGD。"""
+    acts = _tc_check_matrix(activations, "activations")
+    d_hidden = _tc_check_pos_int(d_hidden, "d_hidden")
+    if (not isinstance(l1_coeff, (int, float)) or isinstance(l1_coeff, bool)
+            or not math.isfinite(float(l1_coeff)) or l1_coeff < 0.0):
+        raise ValueError("transcoder: l1_coeff 必须是非负有限数字")
+    epochs = _tc_check_pos_int(epochs, "epochs")
+    if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+            or not math.isfinite(float(lr)) or lr <= 0.0):
+        raise ValueError("transcoder: lr 必须是正有限数字")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("transcoder: seed 必须是整数")
+    n = len(acts)
+    d_in = len(acts[0])
+    rng = random.Random(seed)
+    w_enc = [[rng.gauss(0.0, 1.0 / _math_sqrt(d_in)) for _ in range(d_in)] for _ in range(d_hidden)]
+    b_enc = [0.0] * d_hidden
+    w_dec = [[rng.gauss(0.0, 1.0 / _math_sqrt(d_hidden)) for _ in range(d_hidden)] for _ in range(d_in)]
+    b_dec = [0.0] * d_in
+    history = []
+    for _ in range(epochs):
+        gw_enc = [[0.0] * d_in for _ in range(d_hidden)]
+        gb_enc = [0.0] * d_hidden
+        gw_dec = [[0.0] * d_hidden for _ in range(d_in)]
+        gb_dec = [0.0] * d_in
+        total = 0.0
+        for x in acts:
+            pre = []
+            for j in range(d_hidden):
+                s = b_enc[j]
+                for t in range(d_in):
+                    s += w_enc[j][t] * x[t]
+                pre.append(s)
+            f = [max(0.0, v) for v in pre]
+            y = [b_dec[t] + sum(w_dec[t][j] * f[j] for j in range(d_hidden)) for t in range(d_in)]
+            for t in range(d_in):
+                diff = y[t] - x[t]
+                total += diff * diff
+            d_y = [2.0 * (y[t] - x[t]) / (n * d_in) for t in range(d_in)]
+            for t in range(d_in):
+                gb_dec[t] += d_y[t]
+                for j in range(d_hidden):
+                    gw_dec[t][j] += d_y[t] * f[j]
+            d_f = [0.0] * d_hidden
+            for j in range(d_hidden):
+                for t in range(d_in):
+                    d_f[j] += d_y[t] * w_dec[t][j]
+            for j in range(d_hidden):
+                if pre[j] <= 0.0:
+                    continue
+                dpre = d_f[j] + l1_coeff / (n * d_hidden)
+                gb_enc[j] += dpre
+                for t in range(d_in):
+                    gw_enc[j][t] += dpre * x[t]
+        for j in range(d_hidden):
+            b_enc[j] -= lr * gb_enc[j]
+            for t in range(d_in):
+                w_enc[j][t] -= lr * gw_enc[j][t]
+        for t in range(d_in):
+            b_dec[t] -= lr * gb_dec[t]
+            for j in range(d_hidden):
+                w_dec[t][j] -= lr * gw_dec[t][j]
+        history.append({"loss": total / (n * d_in)})
+    params = {"W_enc": w_enc, "b_enc": b_enc, "W_dec": w_dec, "b_dec": b_dec}
+    return {"params": params, "history": history}
+
+
+def transcoder_feature_attribution(params, activation, output_direction, top_k=3):
+    """单样本特征归因：f_j * (W_dec[:,j]·output_direction)，按绝对值取 top-k。"""
+    w_enc, w_dec = _tc_check_params(params)
+    x = _tc_check_matrix([activation], "activation")[0]
+    if len(x) != len(w_enc[0]):
+        raise ValueError("transcoder: activation 维度与 W_enc 不一致")
+    if (not isinstance(output_direction, (list, tuple))
+            or len(output_direction) != len(w_dec)):
+        raise ValueError("transcoder: output_direction 长度必须等于输入维度")
+    direction = []
+    for v in output_direction:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("transcoder: output_direction 必须只包含有限数字")
+        direction.append(float(v))
+    top_k = _tc_check_pos_int(top_k, "top_k")
+    d_hidden = len(w_enc)
+    d_in = len(w_dec)
+    pre = []
+    for j in range(d_hidden):
+        s = float(params["b_enc"][j])
+        for t in range(d_in):
+            s += w_enc[j][t] * x[t]
+        pre.append(s)
+    items = []
+    for j in range(d_hidden):
+        f = max(0.0, pre[j])
+        proj = sum(w_dec[t][j] * direction[t] for t in range(d_in))
+        items.append((j, f * proj))
+    items.sort(key=lambda item: (-abs(item[1]), item[0]))
+    return [{"feature": j, "score": float(s)} for j, s in items[:top_k]]
+
+
+def transcoder_ablate(params, activations, feature_indices):
+    """将指定特征置零后重算重建。"""
+    w_enc, w_dec = _tc_check_params(params)
+    result = transcoder_apply(params, activations)
+    idx = set()
+    for j in feature_indices:
+        if isinstance(j, bool) or not isinstance(j, int) or j < 0 or j >= len(w_enc):
+            raise ValueError("transcoder: feature_indices 必须是合法特征下标")
+        idx.add(j)
+    recon = []
+    for f in result["features"]:
+        masked = [0.0 if j in idx else f[j] for j in range(len(f))]
+        y = [float(params["b_dec"][t]) + sum(w_dec[t][j] * masked[j] for j in range(len(w_dec[0])))
+             for t in range(len(w_dec))]
+        recon.append(y)
+    return {"features": result["features"], "reconstruction": recon, "ablated": sorted(idx)}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

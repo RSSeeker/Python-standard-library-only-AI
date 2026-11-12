@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2377 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2381 项）
 
 ## 特性
 
@@ -2207,6 +2207,26 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### 转码器（Transcoder）特征归因
+
+1 隐层转码器：把模型激活映射到稀疏特征再重建，并支持特征归因与消融。
+
+```python
+res = transcoder_train(activations, d_hidden=16, l1_coeff=1e-3, epochs=200, lr=0.05, seed=0)
+out = transcoder_apply(res["params"], activations)          # {"features", "reconstruction"}
+attr = transcoder_feature_attribution(res["params"], act, output_direction, top_k=3)
+abl = transcoder_ablate(res["params"], activations, [0, 5])  # 置零特征后重建
+```
+
+| API | 说明 |
+| --- | --- |
+| `transcoder_train(activations, d_hidden=4, l1_coeff=1e-3, epochs=50, lr=0.05, seed=0)` | 全批量 SGD 训练 1 隐层转码器（MSE + L1），返回 `{"params","history"}` |
+| `transcoder_apply(params, activations)` | 前向：稀疏特征与重建 |
+| `transcoder_feature_attribution(params, activation, output_direction, top_k=3)` | 单样本归因 `f_j·(W_dec[:,j]·direction)`，按绝对值取 top-k |
+| `transcoder_ablate(params, activations, feature_indices)` | 指定特征置零后的重建 |
+
+- 边界：单层转码器（无层级/跨层转码），特征为 ReLU 稀疏编码，归因基于线性化输出方向（非严格电路追踪）；`params` 为 1D 偏置 + 2D 权重字典。
 
 ### 稀疏注意力掩码（NSA / MoBA 简化）
 
@@ -4797,7 +4817,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2377 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2381 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5072,6 +5092,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLinearChainCRF` | 参数量、fit 提升似然、委托方法与非法输入 |
 | `TestRingAttention` | 与稠密注意力一致（多 block_size/因果/非因果）、不等长块、大分数稳定性、非法输入 |
 | `TestSparseAttentionMasks` | NSA 因果/sink/窗口结构、选块可复现、MoBA top-k 块、块相关度、非法输入 |
+| `TestTranscoder` | 训练降损失与稀疏性、apply/归因手算、特征消融、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5209,6 +5230,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2377 个单元测试
+├── test_ai.py       # 2381 个单元测试
 └── README.md
 ```

@@ -36564,3 +36564,81 @@ class TestSparseAttentionMasks:
         _sparse_raises(lambda: AI.moba_attention_mask(4, block_scores=[[0.0] * 2]))
         _sparse_raises(lambda: AI.block_relevance([], [[1.0]]))
         _sparse_raises(lambda: AI.block_relevance([[1.0, 2.0]], [[1.0]]))
+
+
+import math
+
+import pytest
+
+import AI
+
+
+def _tc_raises(fn, exc=(ValueError, TypeError)):
+    with pytest.raises(exc):
+        fn()
+
+
+def _simple_params():
+    # d_in=2, d_hidden=2：特征 0 提取第一维，特征 1 提取第二维（偏置为 0）
+    params = {
+        "W_enc": [[1.0, 0.0], [0.0, 1.0]],
+        "b_enc": [0.0, 0.0],
+        "W_dec": [[1.0, 0.0], [0.0, 1.0]],
+        "b_dec": [0.0, 0.0],
+    }
+    return params
+
+
+class TestTranscoder:
+    def test_train_reduces_loss_and_sparsity(self):
+        rng = __import__("random").Random(5)
+        acts = []
+        for _ in range(30):
+            a = rng.gauss(0.0, 1.0)
+            acts.append([a, 0.0, 0.0])
+        res = AI.transcoder_train(acts, d_hidden=4, l1_coeff=1e-4, epochs=120, lr=0.05, seed=0)
+        history = res["history"]
+        assert history[-1]["loss"] < history[0]["loss"] * 0.5
+        out = AI.transcoder_apply(res["params"], acts)
+        assert len(out["features"]) == 30 and len(out["features"][0]) == 4
+        assert len(out["reconstruction"]) == 30 and len(out["reconstruction"][0]) == 3
+        nonzero = sum(1 for f in out["features"] for v in f if v > 1e-9)
+        assert nonzero < 30 * 4
+
+    def test_apply_and_attribution_hand_computed(self):
+        params = _simple_params()
+        out = AI.transcoder_apply(params, [[2.0, -1.0], [0.0, 3.0]])
+        assert out["features"] == [[2.0, 0.0], [0.0, 3.0]]
+        assert out["reconstruction"] == [[2.0, 0.0], [0.0, 3.0]]
+        attr = AI.transcoder_feature_attribution(params, [2.0, 1.0], [1.0, 0.0], top_k=2)
+        assert attr[0] == {"feature": 0, "score": 2.0}
+        assert attr[1]["feature"] == 1 and attr[1]["score"] == pytest.approx(0.0)
+        attr2 = AI.transcoder_feature_attribution(params, [1.0, 2.0], [-1.0, -1.0], top_k=1)
+        assert attr2[0]["feature"] == 1
+        assert attr2[0]["score"] == pytest.approx(-2.0)
+
+    def test_ablate_zeros_features(self):
+        params = _simple_params()
+        out = AI.transcoder_ablate(params, [[2.0, 3.0]], [0])
+        assert out["ablated"] == [0]
+        assert out["reconstruction"] == [[0.0, 3.0]]
+        out2 = AI.transcoder_ablate(params, [[2.0, 3.0]], [0, 1])
+        assert out2["reconstruction"] == [[0.0, 0.0]]
+
+    def test_invalid_inputs(self):
+        params = _simple_params()
+        _tc_raises(lambda: AI.transcoder_train([]))
+        _tc_raises(lambda: AI.transcoder_train([[1.0], [1.0, 2.0]]))
+        _tc_raises(lambda: AI.transcoder_train([[1.0, 2.0]], d_hidden=0))
+        _tc_raises(lambda: AI.transcoder_train([[1.0, 2.0]], l1_coeff=-1.0))
+        _tc_raises(lambda: AI.transcoder_train([[1.0, 2.0]], epochs=0))
+        _tc_raises(lambda: AI.transcoder_train([[1.0, 2.0]], lr=-0.1))
+        _tc_raises(lambda: AI.transcoder_train([[1.0, 2.0]], seed=1.5))
+        _tc_raises(lambda: AI.transcoder_apply(params, []))
+        _tc_raises(lambda: AI.transcoder_apply(params, [[1.0, 2.0, 3.0]]))
+        _tc_raises(lambda: AI.transcoder_apply({"W_enc": [[1.0]]}, [[1.0]]))
+        _tc_raises(lambda: AI.transcoder_feature_attribution(params, [1.0], [1.0, 0.0]))
+        _tc_raises(lambda: AI.transcoder_feature_attribution(params, [1.0, 1.0], [1.0]))
+        _tc_raises(lambda: AI.transcoder_feature_attribution(params, [1.0, 1.0], [1.0, 0.0], top_k=0))
+        _tc_raises(lambda: AI.transcoder_ablate(params, [[1.0, 1.0]], [2]))
+        _tc_raises(lambda: AI.transcoder_ablate(params, [[1.0, 1.0]], [True]))
