@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2310 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2318 项）
 
 ## 特性
 
@@ -2207,6 +2207,25 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### 序列解码（Viterbi / 前向-后向）
+
+对数域的 HMM/线性链 CRF 解码工具：Viterbi 求最优路径、前向-后向求状态后验，
+另附给定路径的序列得分。
+
+```python
+best = viterbi_decode(emissions, transitions, start, end)   # {"path","score"}
+post = forward_backward_posteriors(emissions, transitions)  # 每时刻状态后验
+score = hmm_sequence_score(emissions, transitions, path)
+```
+
+| API | 说明 |
+| --- | --- |
+| `viterbi_decode(emissions, transitions, start=None, end=None)` | 对数域最优化路径（DP + 回溯），`start/end` 为初始/终止势 |
+| `forward_backward_posteriors(emissions, transitions, start=None)` | 对数域前向-后向，返回每时刻状态后验概率（行归一化） |
+| `hmm_sequence_score(emissions, transitions, path, start=None)` | 给定路径的 emission+transition 对数总分 |
+
+- 边界：输入是**对数域**发射/转移势（不做概率归一化校验）；只支持离散状态的一阶马尔可夫链，不含高阶转移、批处理、半马尔可夫；posterior 用 logsumexp 稳定计算。
 
 ### 量化与 SmoothQuant
 
@@ -4621,7 +4640,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2310 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2318 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4876,6 +4895,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestBitNet` | 三值量化/反量化手算、1D 与零权重回退、非法输入 |
 | `TestSAM` | 扰动方向与范数手算、零梯度/1D、非法参数 |
 | `TestGradientCentralize` | 行/列中心化手算、非法 mode/形状 |
+| `TestViterbi` | 切换路径手算、start/end 势、非法形状 |
+| `TestForwardBackward` | 均匀后验、强发射后验收缩、非法输入 |
+| `TestHMMSequenceScore` | 路径得分手算、非法路径长度/状态 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5013,6 +5035,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2310 个单元测试
+├── test_ai.py       # 2318 个单元测试
 └── README.md
 ```

@@ -5912,6 +5912,140 @@ def gradient_centralize(grads, mode: str = "rows"):
     col_means = [sum(mat[i][j] for i in range(rows)) / rows for j in range(cols)]
     return [[mat[i][j] - col_means[j] for j in range(cols)] for i in range(rows)]
 
+
+def _hmm_check_matrix(rows, name: str = "emissions"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"hmm: {name} 必须是非空二维数字列表")
+    out = []
+    dim = None
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"hmm: {name}[{i}] 必须是非空数字列表")
+        cur = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"hmm: {name} 必须只包含有限数字")
+            cur.append(float(v))
+        if dim is None:
+            dim = len(cur)
+        elif len(cur) != dim:
+            raise ValueError(f"hmm: {name} 各行维度必须一致")
+        out.append(cur)
+    return out
+
+
+def _hmm_check_vector(vec, n: int, name: str):
+    if (not isinstance(vec, (list, tuple)) or len(vec) != n):
+        raise ValueError(f"hmm: {name} 长度必须等于状态数 {n}")
+    out = []
+    for v in vec:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError(f"hmm: {name} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def viterbi_decode(emissions, transitions, start=None, end=None):
+    """Viterbi 解码（对数域）：返回最优状态路径与总分，可用于 HMM/线性链 CRF。"""
+    em = _hmm_check_matrix(emissions, "emissions")
+    T, S = len(em), len(em[0])
+    tr = _hmm_check_matrix(transitions, "transitions")
+    if len(tr) != S:
+        raise ValueError("hmm: transitions 必须是状态数×状态数的方阵")
+    for row in tr:
+        if len(row) != S:
+            raise ValueError("hmm: transitions 必须是状态数×状态数的方阵")
+    if start is None:
+        init = [0.0] * S
+    else:
+        init = _hmm_check_vector(start, S, "start")
+    if end is None:
+        final = [0.0] * S
+    else:
+        final = _hmm_check_vector(end, S, "end")
+    dp = [[init[s] + em[0][s] for s in range(S)]]
+    back = [[-1] * S]
+    for t in range(1, T):
+        row = []
+        brow = []
+        for s in range(S):
+            best_p, best_prev = None, -1
+            for p in range(S):
+                val = dp[t - 1][p] + tr[p][s]
+                if best_p is None or val > best_p:
+                    best_p, best_prev = val, p
+            row.append(best_p + em[t][s])
+            brow.append(best_prev)
+        dp.append(row)
+        back.append(brow)
+    best_last = None
+    last = -1
+    for s in range(S):
+        val = dp[T - 1][s] + final[s]
+        if best_last is None or val > best_last:
+            best_last, last = val, s
+    path = [last]
+    for t in range(T - 1, 0, -1):
+        path.append(back[t][path[-1]])
+    path.reverse()
+    return {"path": path, "score": best_last}
+
+
+def forward_backward_posteriors(emissions, transitions, start=None):
+    """对数域前向-后向，返回每个时刻的状态后验概率。"""
+    em = _hmm_check_matrix(emissions, "emissions")
+    T, S = len(em), len(em[0])
+    tr = _hmm_check_matrix(transitions, "transitions")
+    if len(tr) != S or any(len(row) != S for row in tr):
+        raise ValueError("hmm: transitions 必须是状态数×状态数的方阵")
+    init = [0.0] * S if start is None else _hmm_check_vector(start, S, "start")
+
+    def logsumexp(vals):
+        m = max(vals)
+        return m + math.log(sum(math.exp(v - m) for v in vals))
+
+    alpha = [[0.0] * S for _ in range(T)]
+    for s in range(S):
+        alpha[0][s] = init[s] + em[0][s]
+    for t in range(1, T):
+        for s in range(S):
+            alpha[t][s] = logsumexp([alpha[t - 1][p] + tr[p][s] for p in range(S)]) + em[t][s]
+    beta = [[0.0] * S for _ in range(T)]
+    for s in range(S):
+        beta[T - 1][s] = 0.0
+    for t in range(T - 2, -1, -1):
+        for s in range(S):
+            beta[t][s] = logsumexp(
+                [tr[s][nxt] + em[t + 1][nxt] + beta[t + 1][nxt] for nxt in range(S)])
+    log_z = logsumexp([alpha[T - 1][s] + beta[T - 1][s] for s in range(S)])
+    out = []
+    for t in range(T):
+        row = [math.exp(alpha[t][s] + beta[t][s] - log_z) for s in range(S)]
+        total = sum(row)
+        out.append([v / total for v in row])
+    return out
+
+
+def hmm_sequence_score(emissions, transitions, path, start=None):
+    """给定路径的对数总得分：sum emission + 转移 + start。"""
+    em = _hmm_check_matrix(emissions, "emissions")
+    T, S = len(em), len(em[0])
+    if not isinstance(path, (list, tuple)) or len(path) != T:
+        raise ValueError("hmm: path 长度必须等于序列长度")
+    tr = _hmm_check_matrix(transitions, "transitions")
+    if len(tr) != S or any(len(row) != S for row in tr):
+        raise ValueError("hmm: transitions 必须是状态数×状态数的方阵")
+    for s in path:
+        if not isinstance(s, int) or isinstance(s, bool) or s < 0 or s >= S:
+            raise ValueError(f"hmm: path 状态越界：{s!r}")
+    init = [0.0] * S if start is None else _hmm_check_vector(start, S, "start")
+    total = init[path[0]] + em[0][path[0]]
+    for t in range(1, T):
+        total += tr[path[t - 1]][path[t]] + em[t][path[t]]
+    return total
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

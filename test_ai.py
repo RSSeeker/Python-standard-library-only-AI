@@ -35958,3 +35958,56 @@ class TestGradientCentralize:
         _p10f_raises(lambda: AI.gradient_centralize([1.0, 2.0]))
         _p10f_raises(lambda: AI.gradient_centralize([[1.0]], "diag"))
         _p10f_raises(lambda: AI.gradient_centralize([[1.0], [2.0, 3.0]]))
+
+
+class TestViterbi:
+    def test_switch_path_hand(self):
+        em = [[0.0, -1.0], [-1.0, 0.0]]
+        tr = [[0.0, 0.0], [0.0, 0.0]]
+        out = AI.viterbi_decode(em, tr)
+        assert out["path"] == [0, 1]
+        assert out["score"] == pytest.approx(0.0)
+
+    def test_start_end_scores(self):
+        em = [[0.0, 0.0], [0.0, 0.0]]
+        tr = [[0.0, 0.0], [0.0, 0.0]]
+        out = AI.viterbi_decode(em, tr, start=[5.0, -5.0], end=[-5.0, 3.0])
+        assert out["path"] == [0, 1]
+        assert out["score"] == pytest.approx(8.0)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.viterbi_decode([], [[0.0]]))
+        _p10f_raises(lambda: AI.viterbi_decode([[0.0, 0.0]], [[0.0, 0.0]]))
+        _p10f_raises(lambda: AI.viterbi_decode([[0.0]], [[0.0]], start=[0.0, 0.0]))
+
+
+class TestForwardBackward:
+    def test_uniform_posteriors(self):
+        post = AI.forward_backward_posteriors([[0.0, 0.0], [0.0, 0.0]],
+                                              [[0.0, 0.0], [0.0, 0.0]])
+        assert post == [[0.5, 0.5], [0.5, 0.5]]
+
+    def test_strong_emission_posterior(self):
+        em = [[0.0, -20.0], [0.0, -20.0]]
+        post = AI.forward_backward_posteriors(
+            em, [[0.0, 0.0], [0.0, 0.0]])
+        assert post[0][0] > 0.999 and post[1][0] > 0.999
+        assert post[0][0] + post[0][1] == pytest.approx(1.0)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.forward_backward_posteriors([], [[0.0]]))
+        _p10f_raises(lambda: AI.forward_backward_posteriors([[0.0]], [[0.0, 0.0]]))
+
+
+class TestHMMSequenceScore:
+    def test_score_hand(self):
+        em = [[0.0, -1.0], [-1.0, 0.0]]
+        tr = [[0.0, 0.0], [0.0, 0.0]]
+        assert AI.hmm_sequence_score(em, tr, [0, 1]) == pytest.approx(0.0)
+        assert AI.hmm_sequence_score(em, tr, [0, 0]) == pytest.approx(-1.0)
+
+    def test_errors(self):
+        em = [[0.0, 0.0], [0.0, 0.0]]
+        tr = [[0.0, 0.0], [0.0, 0.0]]
+        _p10f_raises(lambda: AI.hmm_sequence_score(em, tr, [0]))
+        _p10f_raises(lambda: AI.hmm_sequence_score(em, tr, [0, 2]))
