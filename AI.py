@@ -7409,6 +7409,214 @@ def transcoder_ablate(params, activations, feature_indices):
         recon.append(y)
     return {"features": result["features"], "reconstruction": recon, "ablated": sorted(idx)}
 
+
+def _umap_check_points(points, name="points"):
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError(f"umap: {name} 必须是非空二维列表")
+    out = []
+    width = None
+    for row in points:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"umap: {name} 的每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"umap: {name} 的每行长度必须一致")
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError(f"umap: {name} 必须只包含有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _umap_euclid(a, b):
+    s = 0.0
+    for i in range(len(a)):
+        d = a[i] - b[i]
+        s += d * d
+    return _math_sqrt(s)
+
+
+def _umap_knn(points, n_neighbors=5):
+    n = len(points)
+    if isinstance(n_neighbors, bool) or not isinstance(n_neighbors, int):
+        raise ValueError("umap: n_neighbors 必须是整数")
+    if n_neighbors < 1 or n_neighbors > n - 1:
+        raise ValueError("umap: n_neighbors 必须在 [1, n-1] 之间")
+    knn = []
+    for i in range(n):
+        pairs = []
+        for j in range(n):
+            if i == j:
+                continue
+            pairs.append((_umap_euclid(points[i], points[j]), j))
+        pairs.sort(key=lambda p: (p[0], p[1]))
+        knn.append([(j, d) for d, j in pairs[:n_neighbors]])
+    return knn
+
+
+def _umap_sigmas(knn, perplexity=None):
+    n = len(knn)
+    sigmas = []
+    rho = 0.0
+    for i in range(n):
+        dists = [d for _, d in knn[i]]
+        if not dists:
+            sigmas.append(1.0)
+            continue
+        rho = dists[0]
+        target = math.log(min(perplexity or len(dists), len(dists)))
+        if target <= 0.0:
+            sigmas.append(1.0)
+            continue
+        lo, hi = 0.0, 100.0
+        sigma = 1.0
+        for _ in range(64):
+            sigma = (lo + hi) / 2.0
+            total = 0.0
+            for d in dists:
+                total += math.exp(-(d - rho) / sigma)
+            if total > target:
+                hi = sigma
+            else:
+                lo = sigma
+        sigmas.append(sigma)
+    return sigmas
+
+
+def umap_fuzzy_graph(points, n_neighbors=5):
+    """构造对称模糊单纯集（简化 UMAP 图）。"""
+    pts = _umap_check_points(points)
+    knn = _umap_knn(pts, n_neighbors)
+    sigmas = _umap_sigmas(knn)
+    n = len(pts)
+    graph = [dict() for _ in range(n)]
+    for i in range(n):
+        for (j, d) in knn[i]:
+            rho = knn[i][0][1]
+            w = math.exp(-(d - rho) / max(sigmas[i], 1e-12))
+            graph[i][j] = w
+    for i in range(n):
+        for j in list(graph[i].keys()):
+            w_ij = graph[i][j]
+            w_ji = graph[j].get(i)
+            if w_ji is None:
+                continue
+            sym = w_ij + w_ji - w_ij * w_ji
+            graph[i][j] = sym
+            graph[j][i] = sym
+    edges = []
+    for i in range(n):
+        for j, w in graph[i].items():
+            if i < j:
+                edges.append((i, j, w))
+    return {"edges": edges, "knn": [[j for j, _ in row] for row in knn], "sigmas": sigmas}
+
+
+def _umap_ab(min_dist=0.1, spread=1.0):
+    min_dist = float(min_dist)
+    spread = float(spread)
+    if not math.isfinite(min_dist) or min_dist < 0.0:
+        raise ValueError("umap: min_dist 必须是非负有限数字")
+    if not math.isfinite(spread) or spread <= 0.0:
+        raise ValueError("umap: spread 必须是正有限数字")
+    xs = [0.01 + 3.0 * i / 60.0 for i in range(61)]
+    targets = [1.0 if x <= min_dist else math.exp(-(x - min_dist) / spread) for x in xs]
+    best = None
+    for step in range(19):
+        b = 0.5 + step * 0.05
+        numer = 0.0
+        denom = 0.0
+        for x, t in zip(xs, targets):
+            if t <= 1e-12 or x <= 1e-9:
+                continue
+            xb = x ** (2.0 * b)
+            numer += xb * (1.0 / t - 1.0)
+            denom += xb * xb
+        if denom <= 0.0:
+            continue
+        a = numer / denom
+        if a <= 0.0:
+            continue
+        err = 0.0
+        for x, t in zip(xs, targets):
+            pred = 1.0 / (1.0 + a * x ** (2.0 * b))
+            err += (pred - t) ** 2
+        if best is None or err < best[0]:
+            best = (err, a, b)
+    if best is None:
+        return 1.0, 1.0
+    return best[1], best[2]
+
+
+def umap_embed(points, n_neighbors=5, n_components=2, n_epochs=100, min_dist=0.1,
+               spread=1.0, learning_rate=1.0, negative_rate=5, seed=0):
+    """简化 UMAP：模糊图 + 吸引/排斥 SGD 布局。"""
+    pts = _umap_check_points(points)
+    if isinstance(n_components, bool) or not isinstance(n_components, int) or n_components < 1:
+        raise ValueError("umap: n_components 必须是正整数")
+    if isinstance(n_epochs, bool) or not isinstance(n_epochs, int) or n_epochs < 1:
+        raise ValueError("umap: n_epochs 必须是正整数")
+    if (not isinstance(learning_rate, (int, float)) or isinstance(learning_rate, bool)
+            or not math.isfinite(float(learning_rate)) or learning_rate <= 0.0):
+        raise ValueError("umap: learning_rate 必须是正有限数字")
+    if isinstance(negative_rate, bool) or not isinstance(negative_rate, int) or negative_rate < 1:
+        raise ValueError("umap: negative_rate 必须是正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("umap: seed 必须是整数")
+    graph = umap_fuzzy_graph(pts, n_neighbors)
+    edges = graph["edges"]
+    a, b = _umap_ab(min_dist, spread)
+    n = len(pts)
+    rng = random.Random(seed)
+    emb = [[rng.gauss(0.0, 0.01) for _ in range(n_components)] for _ in range(n)]
+    for epoch in range(n_epochs):
+        lr = learning_rate * (1.0 - epoch / n_epochs)
+        for (i, j, w) in edges:
+            yi = emb[i]
+            yj = emb[j]
+            diff = [yi[t] - yj[t] for t in range(n_components)]
+            dist_sq = sum(d * d for d in diff)
+            if dist_sq > 0.0:
+                grad = (-2.0 * a * b * (dist_sq ** (b - 1.0))) / (a * dist_sq ** b + 1.0)
+                for t in range(n_components):
+                    g = max(-4.0, min(4.0, grad * diff[t]))
+                    yi[t] += lr * w * g
+                    yj[t] -= lr * w * g
+            for _ in range(negative_rate):
+                k = rng.randrange(n)
+                if k == i:
+                    continue
+                yk = emb[k]
+                diff2 = [yi[t] - yk[t] for t in range(n_components)]
+                d2 = sum(d * d for d in diff2) + 1e-3
+                grad2 = (2.0 * b) / ((0.001 + d2) * (a * d2 ** b + 1.0))
+                if grad2 > 4.0:
+                    grad2 = 4.0
+                for t in range(n_components):
+                    yi[t] += lr * grad2 * diff2[t]
+    return {"embedding": emb, "edges": edges, "a": a, "b": b,
+            "knn": graph["knn"], "sigmas": graph["sigmas"]}
+
+
+def umap_knn_overlap(points, embedding, n_neighbors=5):
+    """高维 kNN 邻域在嵌入空间中的平均保留比例。"""
+    pts = _umap_check_points(points)
+    emb = _umap_check_points(embedding, "embedding")
+    if len(pts) != len(emb):
+        raise ValueError("umap: points 与 embedding 的行数必须一致")
+    hi = _umap_knn(pts, n_neighbors)
+    lo = _umap_knn(emb, n_neighbors)
+    total = 0.0
+    for i in range(len(pts)):
+        hi_set = set(j for j, _ in hi[i])
+        lo_set = set(j for j, _ in lo[i])
+        total += len(hi_set & lo_set) / float(len(hi_set))
+    return total / len(pts)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

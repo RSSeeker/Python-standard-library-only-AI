@@ -36642,3 +36642,80 @@ class TestTranscoder:
         _tc_raises(lambda: AI.transcoder_feature_attribution(params, [1.0, 1.0], [1.0, 0.0], top_k=0))
         _tc_raises(lambda: AI.transcoder_ablate(params, [[1.0, 1.0]], [2]))
         _tc_raises(lambda: AI.transcoder_ablate(params, [[1.0, 1.0]], [True]))
+
+
+import random
+import statistics
+
+import pytest
+
+import AI
+
+
+def _umap_raises(fn, exc=(ValueError, TypeError)):
+    with pytest.raises(exc):
+        fn()
+
+
+def _clusters():
+    rng = random.Random(0)
+    pts = []
+    for center in ((0.0,) * 8, (5.0,) * 8):
+        for _ in range(10):
+            pts.append([c + rng.gauss(0.0, 0.1) for c in center])
+    return pts
+
+
+class TestUMAP:
+    def test_fuzzy_graph(self):
+        pts = _clusters()
+        graph = AI.umap_fuzzy_graph(pts, n_neighbors=4)
+        assert len(graph["edges"]) > 0
+        assert len(graph["knn"]) == 20
+        for row in graph["knn"]:
+            assert len(row) == 4
+        for i, j, w in graph["edges"]:
+            assert i < j
+            assert 0.0 < w <= 1.0
+        for sigma in graph["sigmas"]:
+            assert sigma > 0.0
+
+    def test_two_clusters_separate(self):
+        pts = _clusters()
+        res = AI.umap_embed(pts, n_neighbors=4, n_epochs=250, learning_rate=1.0, seed=0)
+        emb = res["embedding"]
+        assert len(emb) == 20 and len(emb[0]) == 2
+        ca = [statistics.mean(p[i] for p in emb[:10]) for i in range(2)]
+        cb = [statistics.mean(p[i] for p in emb[10:]) for i in range(2)]
+        dist = _math_dist(ca, cb)
+        wa = sum(_math_dist(p, ca) for p in emb[:10]) / 10.0
+        wb = sum(_math_dist(p, cb) for p in emb[10:]) / 10.0
+        assert dist > 3.0 * ((wa + wb) / 2.0)
+        assert AI.umap_knn_overlap(pts, emb, 4) > 0.55
+
+    def test_line_neighborhood_preserved_and_deterministic(self):
+        line = [[float(i)] for i in range(12)]
+        a = AI.umap_embed(line, n_neighbors=3, n_epochs=200, learning_rate=1.0, seed=1)
+        b = AI.umap_embed(line, n_neighbors=3, n_epochs=200, learning_rate=1.0, seed=1)
+        assert a["embedding"] == b["embedding"]
+        assert AI.umap_knn_overlap(line, a["embedding"], 3) > 0.6
+
+    def test_invalid_inputs(self):
+        pts = _clusters()
+        _umap_raises(lambda: AI.umap_embed([]))
+        _umap_raises(lambda: AI.umap_embed([[1.0], [1.0, 2.0]]))
+        _umap_raises(lambda: AI.umap_embed([[float("nan")], [1.0]]))
+        _umap_raises(lambda: AI.umap_embed(pts, n_neighbors=0))
+        _umap_raises(lambda: AI.umap_embed(pts, n_neighbors=25))
+        _umap_raises(lambda: AI.umap_embed(pts, n_components=0))
+        _umap_raises(lambda: AI.umap_embed(pts, n_epochs=0))
+        _umap_raises(lambda: AI.umap_embed(pts, learning_rate=0.0))
+        _umap_raises(lambda: AI.umap_embed(pts, negative_rate=0))
+        _umap_raises(lambda: AI.umap_embed(pts, seed=1.2))
+        _umap_raises(lambda: AI.umap_embed(pts, n_components=2, min_dist=-1.0))
+        _umap_raises(lambda: AI.umap_embed(pts, spread=0.0))
+        _umap_raises(lambda: AI.umap_knn_overlap(pts, pts[:-1], 4))
+
+
+def _math_dist(a, b):
+    return sum((a[i] - b[i]) ** 2 for i in range(len(a))) ** 0.5

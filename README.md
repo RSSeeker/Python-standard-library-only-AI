@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2381 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2385 项）
 
 ## 特性
 
@@ -2207,6 +2207,25 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### UMAP 降维（kNN 图 + 模糊单纯集 + SGD 布局）
+
+简化 UMAP：高维 kNN 图 → 每点自适应带宽的模糊权重并对称化 → 吸引/排斥 SGD 布局。
+
+```python
+res = umap_embed(points, n_neighbors=15, n_components=2, n_epochs=200, min_dist=0.1, seed=0)
+res["embedding"]                     # 低维坐标
+umap_knn_overlap(points, res["embedding"], 15)   # 高维邻域保留比例
+graph = umap_fuzzy_graph(points, n_neighbors=15) # {"edges", "knn", "sigmas"}
+```
+
+| API | 说明 |
+| --- | --- |
+| `umap_fuzzy_graph(points, n_neighbors=5)` | kNN 图 + 每点 sigma 二分（perplexity 匹配）+ 对称模糊权重 |
+| `umap_embed(points, n_neighbors=5, n_components=2, n_epochs=100, min_dist=0.1, spread=1.0, learning_rate=1.0, negative_rate=5, seed=0)` | SGD 布局，返回 `{"embedding","edges","knn","sigmas","a","b"}` |
+| `umap_knn_overlap(points, embedding, n_neighbors=5)` | 高维 kNN 邻域在低维的平均保留比例 |
+
+- 边界：简化版（无近似 kNN、无 nndescent、无 epoch 采样优化、无谱初始化），`a/b` 由 `min_dist/spread` 网格拟合得到；距离为欧氏距离；仅用于教学与中小数据。
 
 ### 转码器（Transcoder）特征归因
 
@@ -4817,7 +4836,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2381 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2385 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5093,6 +5112,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRingAttention` | 与稠密注意力一致（多 block_size/因果/非因果）、不等长块、大分数稳定性、非法输入 |
 | `TestSparseAttentionMasks` | NSA 因果/sink/窗口结构、选块可复现、MoBA top-k 块、块相关度、非法输入 |
 | `TestTranscoder` | 训练降损失与稀疏性、apply/归因手算、特征消融、非法输入 |
+| `TestUMAP` | 模糊图结构、双簇分离与邻域保留、直线邻域与确定性、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5230,6 +5250,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2381 个单元测试
+├── test_ai.py       # 2385 个单元测试
 └── README.md
 ```
