@@ -36489,3 +36489,78 @@ class TestRingAttention:
         _p10f_raises(lambda: AI.ring_attention([[float("nan"), 0.0]], k, v))
         _p10f_raises(lambda: AI.ring_attention(q, k, v, block_size=0))
         _p10f_raises(lambda: AI.ring_attention(q, k, v, block_size=True))
+
+
+import random
+
+import pytest
+
+import AI
+
+
+def _sparse_raises(fn, exc=(ValueError, TypeError)):
+    with pytest.raises(exc):
+        fn()
+
+
+class TestSparseAttentionMasks:
+    def test_nsa_mask_structure(self):
+        seq_len = 10
+        block_size = 2
+        window_size = 2
+        sink_size = 1
+        mask = AI.nsa_attention_mask(seq_len, block_size=block_size, window_size=window_size,
+                                     selected_blocks=1, sink_size=sink_size, seed=3)
+        assert len(mask) == seq_len
+        for i in range(seq_len):
+            assert len(mask[i]) == seq_len
+            for j in range(seq_len):
+                if j > i:
+                    assert mask[i][j] is False
+                if j <= i and j > i - window_size:
+                    assert mask[i][j] is True
+            assert mask[i][0] is True
+            assert sum(1 for j in range(i + 1) if mask[i][j]) <= (
+                window_size + sink_size + 3 * block_size)
+
+    def test_nsa_selected_blocks_deterministic(self):
+        a = AI.nsa_attention_mask(12, block_size=2, window_size=2, selected_blocks=1, sink_size=2, seed=7)
+        b = AI.nsa_attention_mask(12, block_size=2, window_size=2, selected_blocks=1, sink_size=2, seed=7)
+        variants = {tuple(tuple(row) for row in AI.nsa_attention_mask(
+            12, block_size=2, window_size=2, selected_blocks=1, sink_size=2, seed=s)) for s in range(6)}
+        assert a == b
+        assert len(variants) >= 2
+
+    def test_moba_selects_highest_score_blocks(self):
+        scores = [[0.0] * 5 for _ in range(5)]
+        scores[3][1] = 2.0
+        scores[3][2] = 1.0
+        mask = AI.moba_attention_mask(10, block_size=2, top_k_blocks=1, block_scores=scores)
+        for i in (6, 7):
+            for j in range(10):
+                if j > i:
+                    assert mask[i][j] is False
+            assert mask[i][2] is True and mask[i][3] is True
+            assert mask[i][4] is False and mask[i][5] is False
+        for i in (0, 1):
+            assert mask[i][i] is True
+
+    def test_moba_default_and_block_relevance(self):
+        mask = AI.moba_attention_mask(8, block_size=2, top_k_blocks=1)
+        assert len(mask) == 8 and all(len(row) == 8 for row in mask)
+        scores = AI.block_relevance([[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], block_size=2)
+        assert len(scores) == 1 and len(scores[0]) == 1
+        assert scores[0][0] == pytest.approx(0.5, abs=1e-12)
+
+    def test_invalid_inputs(self):
+        _sparse_raises(lambda: AI.nsa_attention_mask(0))
+        _sparse_raises(lambda: AI.nsa_attention_mask(4, block_size=0))
+        _sparse_raises(lambda: AI.nsa_attention_mask(4, window_size=-1))
+        _sparse_raises(lambda: AI.nsa_attention_mask(4, sink_size=-1))
+        _sparse_raises(lambda: AI.nsa_attention_mask(4, seed=1.5))
+        _sparse_raises(lambda: AI.moba_attention_mask(0))
+        _sparse_raises(lambda: AI.moba_attention_mask(4, block_size=0))
+        _sparse_raises(lambda: AI.moba_attention_mask(4, block_scores=[]))
+        _sparse_raises(lambda: AI.moba_attention_mask(4, block_scores=[[0.0] * 2]))
+        _sparse_raises(lambda: AI.block_relevance([], [[1.0]]))
+        _sparse_raises(lambda: AI.block_relevance([[1.0, 2.0]], [[1.0]]))

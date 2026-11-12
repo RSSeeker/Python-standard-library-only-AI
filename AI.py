@@ -7072,6 +7072,145 @@ def ring_attention(query, key, value, block_size=2, causal=False):
             out[qi] = [acc[pos][t] / l[pos] for t in range(dv)]
     return out
 
+
+def _sa_check_pos_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"sparse_attn: {name} 必须是 >= {minimum} 的整数")
+    return value
+
+
+def _sa_check_matrix(x, name="rows"):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("sparse_attn: %s 必须是非空二维列表" % name)
+    out = []
+    width = None
+    for row in x:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("sparse_attn: %s 的每一行必须是非空列表" % name)
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("sparse_attn: %s 的每行长度必须一致" % name)
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("sparse_attn: %s 必须只包含有限数字" % name)
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def block_relevance(query_rows, key_rows, block_size=4):
+    """粗粒度块相关度：query 块均值与 key 块均值的点积。返回 Qb×Kb 矩阵。"""
+    q = _sa_check_matrix(query_rows, "query")
+    k = _sa_check_matrix(key_rows, "key")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("sparse_attn: query 与 key 维度必须一致")
+    block_size = _sa_check_pos_int(block_size, "block_size")
+    nq = len(q)
+    nk = len(k)
+    d = len(q[0])
+    nq_blocks = (nq + block_size - 1) // block_size
+    nk_blocks = (nk + block_size - 1) // block_size
+    scores = []
+    for qb in range(nq_blocks):
+        q_idx = range(qb * block_size, min((qb + 1) * block_size, nq))
+        qmean = [0.0] * d
+        for qi in q_idx:
+            for t in range(d):
+                qmean[t] += q[qi][t]
+        cnt = len(list(q_idx))
+        for t in range(d):
+            qmean[t] /= cnt
+        row = []
+        for kb in range(nk_blocks):
+            k_idx = range(kb * block_size, min((kb + 1) * block_size, nk))
+            kmean = [0.0] * d
+            for kj in k_idx:
+                for t in range(d):
+                    kmean[t] += k[kj][t]
+            kcnt = len(list(k_idx))
+            for t in range(d):
+                kmean[t] /= kcnt
+            row.append(sum(qmean[t] * kmean[t] for t in range(d)))
+        scores.append(row)
+    return scores
+
+
+def nsa_attention_mask(seq_len, block_size=4, window_size=8, selected_blocks=2,
+                       sink_size=1, seed=0):
+    """自然稀疏注意力（NSA 简化）掩码：sink + 局部窗口 + 随机选块 + 因果。"""
+    seq_len = _sa_check_pos_int(seq_len, "seq_len")
+    block_size = _sa_check_pos_int(block_size, "block_size")
+    window_size = _sa_check_pos_int(window_size, "window_size")
+    selected_blocks = _sa_check_pos_int(selected_blocks, "selected_blocks")
+    sink_size = _sa_check_pos_int(sink_size, "sink_size", minimum=0)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("sparse_attn: seed 必须是整数")
+    rng = random.Random(seed)
+    n_blocks = (seq_len + block_size - 1) // block_size
+    selected = []
+    for qb in range(n_blocks):
+        candidates = [b for b in range(qb) if b < qb]
+        if len(candidates) <= selected_blocks:
+            chosen = candidates
+        else:
+            chosen = sorted(rng.sample(candidates, selected_blocks))
+        selected.append(chosen)
+    mask = [[False] * seq_len for _ in range(seq_len)]
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if j > i:
+                continue
+            if j < sink_size:
+                mask[i][j] = True
+                continue
+            if i - window_size < j <= i:
+                mask[i][j] = True
+                continue
+            qb = i // block_size
+            kb = j // block_size
+            if qb < n_blocks and kb in selected[qb]:
+                mask[i][j] = True
+    return mask
+
+
+def moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=None):
+    """MoBA 简化掩码：当前块因果 + 按块相关度选 top-k 历史块（整块可见）。"""
+    seq_len = _sa_check_pos_int(seq_len, "seq_len")
+    block_size = _sa_check_pos_int(block_size, "block_size")
+    top_k_blocks = _sa_check_pos_int(top_k_blocks, "top_k_blocks")
+    n_blocks = (seq_len + block_size - 1) // block_size
+    if block_scores is not None:
+        scores = _sa_check_matrix(block_scores, "block_scores")
+        if len(scores) != n_blocks:
+            raise ValueError("sparse_attn: block_scores 行数必须等于 query 块数")
+        if any(len(row) != n_blocks for row in scores):
+            raise ValueError("sparse_attn: block_scores 列数必须等于 key 块数")
+    else:
+        scores = [[0.0] * n_blocks for _ in range(n_blocks)]
+        for qb in range(n_blocks):
+            for kb in range(qb):
+                scores[qb][kb] = 1.0 / (1.0 + abs(qb - kb))
+    mask = [[False] * seq_len for _ in range(seq_len)]
+    for qb in range(n_blocks):
+        prior = [(scores[qb][kb], kb) for kb in range(qb)]
+        prior.sort(key=lambda item: (-item[0], item[1]))
+        chosen = {kb for _, kb in prior[:top_k_blocks]}
+        q_start = qb * block_size
+        q_end = min((qb + 1) * block_size, seq_len)
+        for i in range(q_start, q_end):
+            for kb in chosen:
+                k_start = kb * block_size
+                k_end = min((kb + 1) * block_size, seq_len)
+                for j in range(k_start, k_end):
+                    if j <= i:
+                        mask[i][j] = True
+            for j in range(q_start, i + 1):
+                mask[i][j] = True
+    return mask
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

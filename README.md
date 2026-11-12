@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2372 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2377 项）
 
 ## 特性
 
@@ -2207,6 +2207,24 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### 稀疏注意力掩码（NSA / MoBA 简化）
+
+桶级稀疏注意力的掩码构造：NSA 用 sink + 局部窗口 + 随机选块，MoBA 用块相关度选 top-k 历史块。
+
+```python
+mask = nsa_attention_mask(seq_len, block_size=4, window_size=8, selected_blocks=2, sink_size=1, seed=0)
+scores = block_relevance(query_rows, key_rows, block_size=4)   # Qb×Kb 块均值点积
+mask = moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=scores)
+```
+
+| API | 说明 |
+| --- | --- |
+| `block_relevance(query_rows, key_rows, block_size=4)` | query 块均值与 key 块均值的点积矩阵 |
+| `nsa_attention_mask(seq_len, block_size=4, window_size=8, selected_blocks=2, sink_size=1, seed=0)` | sink + 局部窗口 + 每 query 块随机选历史块 + 因果掩码，返回布尔矩阵 |
+| `moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=None)` | 当前块因果 + 按块相关度选 top-k 历史整块，返回布尔矩阵 |
+
+- 边界：只构造布尔掩码，不执行注意力；NSA 的选块是随机模拟（真实实现按学习到的块重要性）；MoBA 未提供 block_scores 时用 `1/(1+|qb-kb|)` 的启发式；均要求 seq_len/block_size 为正整数，且因果屏蔽未来位置。
 
 ### 环形注意力（RingAttention 分块 online softmax）
 
@@ -4779,7 +4797,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2372 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2377 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5053,6 +5071,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCRFLikelihoodAndGradient` | 对数似然、梯度有限差分、梯度归零性质 |
 | `TestLinearChainCRF` | 参数量、fit 提升似然、委托方法与非法输入 |
 | `TestRingAttention` | 与稠密注意力一致（多 block_size/因果/非因果）、不等长块、大分数稳定性、非法输入 |
+| `TestSparseAttentionMasks` | NSA 因果/sink/窗口结构、选块可复现、MoBA top-k 块、块相关度、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5190,6 +5209,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2372 个单元测试
+├── test_ai.py       # 2377 个单元测试
 └── README.md
 ```
