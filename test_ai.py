@@ -35821,3 +35821,65 @@ class TestReactEpisode:
         _p10f_raises(lambda: AI.react_episode(reg, []))
         _p10f_raises(lambda: AI.react_episode(reg, [{"action": "f", "action_input": 1}]))
         _p10f_raises(lambda: AI.react_episode(reg, [{"action": "missing"}]))
+
+
+class TestWatermark:
+    def test_green_ids_deterministic(self):
+        a = AI.watermark_green_ids(100, seed=7, gamma=0.25)
+        b = AI.watermark_green_ids(100, seed=7, gamma=0.25)
+        assert a == b
+        assert len(a) == 25
+        assert a == sorted(set(a))
+        assert all(0 <= t < 100 for t in a)
+        assert AI.watermark_green_ids(100, seed=8, gamma=0.25) != a
+
+    def test_bias_logits(self):
+        out = AI.watermark_bias_logits([0.0, 0.0, 0.0], [0, 2], 1.5)
+        assert out == [1.5, 0.0, 1.5]
+        out = AI.watermark_bias_logits([1.0], [0])
+        assert out == [3.0]
+
+    def test_z_score_hand(self):
+        green = AI.watermark_green_ids(10, seed=0, gamma=0.5)
+        out = AI.watermark_z_score(green, 10, seed=0, gamma=0.5)
+        assert out["hits"] == 5 and out["n"] == 5
+        assert out["z"] == pytest.approx((5 - 2.5) / (5 * 0.25) ** 0.5)
+        assert AI.watermark_z_score([0, 1, 2, 3], 100, 0, 0.5)["z"] < 2.236
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.watermark_green_ids(0, 0, 0.5))
+        _p10f_raises(lambda: AI.watermark_green_ids(10, 0, 0.0))
+        _p10f_raises(lambda: AI.watermark_green_ids(10, 0, 1.0))
+        _p10f_raises(lambda: AI.watermark_bias_logits([], [0]))
+        _p10f_raises(lambda: AI.watermark_bias_logits([1.0], [5]))
+        _p10f_raises(lambda: AI.watermark_z_score([], 10, 0, 0.5))
+        _p10f_raises(lambda: AI.watermark_z_score([11], 10, 0, 0.5))
+
+
+class TestStreamingAttentionMask:
+    def test_mask_rows_hand(self):
+        mask = AI.streaming_attention_mask(6, sink_size=2, window_size=2)
+        assert mask[0] == [True, False, False, False, False, False]
+        assert mask[1] == [True, True, False, False, False, False]
+        assert mask[4] == [True, True, False, True, True, False]
+        assert mask[5] == [True, True, False, False, True, True]
+        for t, row in enumerate(mask):
+            for j, ok in enumerate(row):
+                if j > t:
+                    assert not ok
+                if ok:
+                    assert j < 2 or j >= t - 2 + 1
+
+    def test_bias_matches_mask(self):
+        bias = AI.streaming_attention_bias(4, sink_size=1, window_size=2)
+        mask = AI.streaming_attention_mask(4, 1, 2)
+        for t in range(4):
+            for j in range(4):
+                assert (bias[t][j] == 0.0) == mask[t][j]
+        assert bias[3][0] == 0.0 and bias[3][1] == -1e30
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.streaming_attention_mask(0, 1, 1))
+        _p10f_raises(lambda: AI.streaming_attention_mask(4, 4, 1))
+        _p10f_raises(lambda: AI.streaming_attention_mask(4, 0, 0))
+        _p10f_raises(lambda: AI.streaming_attention_bias(4, 1, 1, neg_inf=0.0))

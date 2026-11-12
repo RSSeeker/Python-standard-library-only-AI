@@ -5628,6 +5628,103 @@ def react_episode(registry: ToolRegistry, steps):
         observations.append(registry.call(action, **args))
     return observations
 
+
+def _dep_check_int(value, name: str, allow_zero: bool = False):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"deploy: {name} 必须是整数，收到 {value!r}")
+    if value < 0 or (not allow_zero and value == 0):
+        raise ValueError(f"deploy: {name} 必须是{'非负' if allow_zero else '正'}整数")
+    return value
+
+
+def watermark_green_ids(vocab_size: int, seed: int = 0, gamma: float = 0.5):
+    """按种子确定性地从词表抽取 green list（Kirchenbauer 水印简化版）。"""
+    _dep_check_int(vocab_size, "vocab_size")
+    _dep_check_int(seed, "seed", allow_zero=True)
+    if (not isinstance(gamma, (int, float)) or isinstance(gamma, bool)
+            or not math.isfinite(float(gamma)) or not (0.0 < float(gamma) < 1.0)):
+        raise ValueError(f"deploy: gamma 必须在 (0,1)，收到 {gamma!r}")
+    rng = random.Random(seed)
+    k = int(round(vocab_size * float(gamma)))
+    k = max(1, min(vocab_size - 1, k)) if vocab_size > 1 else 0
+    if k == 0:
+        raise ValueError("deploy: vocab_size 太小时无法构造 green list")
+    return sorted(rng.sample(range(vocab_size), k))
+
+
+def watermark_bias_logits(logits, green_ids, delta: float = 2.0):
+    """给 green token 的 logits 加 delta（软水印采样偏置）。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError("deploy: logits 必须是非空数字列表")
+    vals = []
+    for v in logits:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("deploy: logits 必须只包含有限数字")
+        vals.append(float(v))
+    if not isinstance(green_ids, (list, tuple, set)) or not green_ids:
+        raise ValueError("deploy: green_ids 必须是非空列表/集合")
+    green = set()
+    for g in green_ids:
+        if not isinstance(g, int) or isinstance(g, bool) or g < 0 or g >= len(vals):
+            raise ValueError(f"deploy: green token 下标越界：{g!r}")
+        green.add(g)
+    if (not isinstance(delta, (int, float)) or isinstance(delta, bool)
+            or not math.isfinite(float(delta))):
+        raise ValueError(f"deploy: delta 必须是有限数字，收到 {delta!r}")
+    d = float(delta)
+    return [v + (d if i in green else 0.0) for i, v in enumerate(vals)]
+
+
+def watermark_z_score(token_ids, vocab_size: int, seed: int = 0,
+                      gamma: float = 0.5):
+    """统计 green token 命中数的 z 分数（越高越像水印文本）。"""
+    if not isinstance(token_ids, (list, tuple)) or not token_ids:
+        raise ValueError("deploy: token_ids 必须是非空列表")
+    for t in token_ids:
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0 or t >= vocab_size:
+            raise ValueError(f"deploy: token id 越界：{t!r}")
+    green = set(watermark_green_ids(vocab_size, seed, gamma))
+    n = len(token_ids)
+    hits = sum(1 for t in token_ids if t in green)
+    p = len(green) / float(vocab_size)
+    sigma = math.sqrt(n * p * (1.0 - p))
+    if sigma == 0.0:
+        raise ValueError("deploy: gamma 退化，z 分数无定义")
+    return {"z": (hits - n * p) / sigma, "hits": hits, "n": n, "green_fraction": p}
+
+
+def streaming_attention_mask(seq_len: int, sink_size: int = 4,
+                             window_size: int = 8):
+    """StreamingLLM 式掩码：每个位置可见 sink 前缀 + 最近 window 个 token（因果）。"""
+    _dep_check_int(seq_len, "seq_len")
+    _dep_check_int(sink_size, "sink_size", allow_zero=True)
+    _dep_check_int(window_size, "window_size")
+    if sink_size >= seq_len:
+        raise ValueError("deploy: sink_size 必须小于 seq_len")
+    rows = []
+    for t in range(seq_len):
+        row = []
+        for j in range(seq_len):
+            if j > t:
+                ok = False
+            elif j < sink_size:
+                ok = True
+            else:
+                ok = j >= t - window_size + 1
+            row.append(bool(ok))
+        rows.append(row)
+    return rows
+
+
+def streaming_attention_bias(seq_len: int, sink_size: int = 4,
+                             window_size: int = 8, neg_inf: float = -1e30):
+    if (not isinstance(neg_inf, (int, float)) or isinstance(neg_inf, bool)
+            or not math.isfinite(float(neg_inf)) or float(neg_inf) >= 0.0):
+        raise ValueError(f"deploy: neg_inf 必须是负有限数字，收到 {neg_inf!r}")
+    mask = streaming_attention_mask(seq_len, sink_size, window_size)
+    return [[0.0 if ok else float(neg_inf) for ok in row] for row in mask]
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

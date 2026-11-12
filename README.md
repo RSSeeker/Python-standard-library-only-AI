@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2292 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2299 项）
 
 ## 特性
 
@@ -2143,6 +2143,30 @@ obs = react_episode(reg, [{"action": "add", "action_input": {"x": 1, "y": 2}}])
 | `react_episode(registry, steps)` | 按 `[{"action","action_input"}]` 顺序调用工具，返回观测列表 |
 
 - 边界：只做注册/分发与文本解析，不内置 LLM 调用、重试或多轮 ReAct 循环；工具调用不经沙箱与权限检查；`action_input` 是原文字符串，需调用方自行 JSON 解码。
+
+### 部署与推理工具（文本水印 / StreamingLLM 掩码）
+
+两个部署侧小工具：Kirchenbauer 式 green-list 文本水印（采样偏置 + z 分数检测），
+以及 StreamingLLM 式的「sink 前缀 + 最近窗口」注意力掩码。
+
+```python
+green = watermark_green_ids(vocab_size=1000, seed=7, gamma=0.25)
+biased = watermark_bias_logits(logits, green, delta=2.0)
+stat = watermark_z_score(token_ids, vocab_size=1000, seed=7, gamma=0.25)
+
+mask = streaming_attention_mask(seq_len=64, sink_size=4, window_size=16)
+bias = streaming_attention_bias(64, sink_size=4, window_size=16)
+```
+
+| API | 说明 |
+| --- | --- |
+| `watermark_green_ids(vocab_size, seed=0, gamma=0.5)` | 按种子确定性抽取 green list（大小为 round(vocab·gamma)） |
+| `watermark_bias_logits(logits, green_ids, delta=2.0)` | 给 green token 的 logits 加 delta |
+| `watermark_z_score(token_ids, vocab_size, seed=0, gamma=0.5)` | green 命中数的 z 分数、命中数与占比 |
+| `streaming_attention_mask(seq_len, sink_size=4, window_size=8)` | 因果 + sink 前缀 + 最近窗口的布尔掩码 |
+| `streaming_attention_bias(...)` | 同语义的加性掩码（可见 0.0，不可见 neg_inf） |
+
+- 边界：水印是固定 green list 的简化版（不按前一词哈希），检测只给 z 分数不分段；StreamingLLM 掩码只负责掩码构造，不实现滚动 KV cache 驱逐。
 
 ### 量化与 SmoothQuant
 
@@ -4557,7 +4581,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2292 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2299 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4806,6 +4830,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestToolRegistry` | 注册/分发/列表/注销与重复/缺失工具错误 |
 | `TestParseReAct` | 完整字段、仅 Final Answer 与中文冒号、无字段报错 |
 | `TestReactEpisode` | 多步工具调用顺序、非法 registry/steps/action |
+| `TestWatermark` | green list 确定性/大小、logit 偏置、z 分数手算、非法参数 |
+| `TestStreamingAttentionMask` | 逐行掩码手算、因果性、bias 与 mask 一致、非法参数 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4943,6 +4969,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2292 个单元测试
+├── test_ai.py       # 2299 个单元测试
 └── README.md
 ```
