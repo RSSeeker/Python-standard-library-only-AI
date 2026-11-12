@@ -6046,6 +6046,121 @@ def hmm_sequence_score(emissions, transitions, path, start=None):
         total += tr[path[t - 1]][path[t]] + em[t][path[t]]
     return total
 
+
+def _surv_check_arrays(durations, events, name: str = ""):
+    if not isinstance(durations, (list, tuple)) or not isinstance(events, (list, tuple)):
+        raise ValueError(f"survival: {name}durations/events 必须是列表")
+    if len(durations) != len(events) or not durations:
+        raise ValueError("survival: durations 与 events 必须等长且非空")
+    ds = []
+    for v in durations:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v)) or float(v) < 0.0):
+            raise ValueError("survival: 时间必须是有限非负数字")
+        ds.append(float(v))
+    es = []
+    for v in events:
+        if isinstance(v, float) or not isinstance(v, (bool, int)):
+            raise ValueError("survival: 事件标记必须是 bool 或 0/1")
+        es.append(bool(v))
+    return ds, es
+
+
+def kaplan_meier(durations, events):
+    """Kaplan-Meier 乘积极限估计：返回每个事件时刻的生存率。"""
+    ds, es = _surv_check_arrays(durations, events)
+    pairs = sorted(zip(ds, es), key=lambda p: p[0])
+    n = len(pairs)
+    out = {"times": [], "survival": [], "at_risk": [], "events": []}
+    surv = 1.0
+    i = 0
+    while i < n:
+        t = pairs[i][0]
+        d = 0
+        j = i
+        while j < n and pairs[j][0] == t:
+            if pairs[j][1]:
+                d += 1
+            j += 1
+        if d > 0:
+            at_risk = n - i
+            surv *= (at_risk - d) / at_risk
+            out["times"].append(t)
+            out["survival"].append(surv)
+            out["at_risk"].append(at_risk)
+            out["events"].append(d)
+        i = j
+    return out
+
+
+def _surv_risk_sets(pairs_a, pairs_b):
+    times = sorted({t for t, _ in pairs_a} | {t for t, _ in pairs_b})
+    obs = 0.0
+    var = 0.0
+    for t in times:
+        n_a = sum(1 for d, _ in pairs_a if d >= t)
+        n_b = sum(1 for d, _ in pairs_b if d >= t)
+        n = n_a + n_b
+        if n == 0:
+            continue
+        d_a = sum(1 for d, e in pairs_a if d == t and e)
+        d_b = sum(1 for d, e in pairs_b if d == t and e)
+        d = d_a + d_b
+        if d == 0:
+            continue
+        expected_a = d * n_a / n
+        obs += d_a - expected_a
+        if n > 1:
+            var += d * (n_a / n) * (n_b / n) * (n - d) / (n - 1)
+    return obs, var
+
+
+def logrank_test(durations_a, events_a, durations_b, events_b):
+    """两样本 log-rank 检验，返回卡方统计量与 p 值（df=1，erfc 精确）。"""
+    da, ea = _surv_check_arrays(durations_a, events_a, "A:")
+    db, eb = _surv_check_arrays(durations_b, events_b, "B:")
+    obs, var = _surv_risk_sets(list(zip(da, ea)), list(zip(db, eb)))
+    if var <= 0.0:
+        return {"statistic": 0.0, "p_value": 1.0}
+    stat = obs * obs / var
+    p = math.erfc(math.sqrt(stat / 2.0))
+    return {"statistic": stat, "p_value": min(1.0, max(0.0, p))}
+
+
+def concordance_index(durations, events, scores):
+    """Harrell C-index：可比对（较早发生事件）样本对中得分排序正确的比例。"""
+    ds, es = _surv_check_arrays(durations, events)
+    if (not isinstance(scores, (list, tuple)) or len(scores) != len(ds)):
+        raise ValueError("survival: scores 长度必须与 durations 一致")
+    ss = []
+    for v in scores:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("survival: scores 必须是有限数字")
+        ss.append(float(v))
+    concordant = 0
+    comparable = 0
+    n = len(ds)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ti, tj = ds[i], ds[j]
+            if ti < tj and es[i]:
+                hi, hj, earlier_is_i = ss[i], ss[j], True
+            elif tj < ti and es[j]:
+                hi, hj, earlier_is_i = ss[j], ss[i], False
+            elif ti == tj:
+                continue
+            else:
+                continue
+            comparable += 1
+            if hi > hj:
+                concordant += 1
+            elif hi == hj:
+                concordant += 0.5
+    if comparable == 0:
+        return 0.5
+    return concordant / comparable
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

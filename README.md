@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2318 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2329 项）
 
 ## 特性
 
@@ -2226,6 +2226,24 @@ score = hmm_sequence_score(emissions, transitions, path)
 | `hmm_sequence_score(emissions, transitions, path, start=None)` | 给定路径的 emission+transition 对数总分 |
 
 - 边界：输入是**对数域**发射/转移势（不做概率归一化校验）；只支持离散状态的一阶马尔可夫链，不含高阶转移、批处理、半马尔可夫；posterior 用 logsumexp 稳定计算。
+
+### 生存分析（Kaplan-Meier / log-rank / C-index）
+
+经典生存分析工具：乘积极限生存曲线、两组 log-rank 检验、Harrell C-index 排序评估。
+
+```python
+km = kaplan_meier([1, 2, 3, 4], [True, True, False, True])   # {"times","survival","at_risk","events"}
+lr = logrank_test([1, 2, 3], [True] * 3, [10, 11, 12], [True] * 3)  # {"statistic","p_value"}
+c = concordance_index([1, 2], [True, True], [0.9, 0.1])      # C-index
+```
+
+| API | 说明 |
+| --- | --- |
+| `kaplan_meier(durations, events)` | 乘积极限估计，按事件时刻返回生存率/风险集/事件数（删失不更新生存率） |
+| `logrank_test(durations_a, events_a, durations_b, events_b)` | 两样本 log-rank 卡方统计量与 p 值（df=1，erfc 精确） |
+| `concordance_index(durations, events, scores)` | Harrell C-index：可比对样本对中得分与风险方向一致的比例，同分计 0.5 |
+
+- 边界：时间非负、事件为 bool；方差为零时返回统计量 0/p 值 1；C-index 无可比对样本对时返回 0.5；不做 Cox 回归/分层检验/置信区间。
 
 ### 量化与 SmoothQuant
 
@@ -4640,7 +4658,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2318 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2329 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4898,6 +4916,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestViterbi` | 切换路径手算、start/end 势、非法形状 |
 | `TestForwardBackward` | 均匀后验、强发射后验收缩、非法输入 |
 | `TestHMMSequenceScore` | 路径得分手算、非法路径长度/状态 |
+| `TestKaplanMeier` | 手算生存率/删失、风险集、非法输入 |
+| `TestLogRank` | 分离组显著、相同组统计量 0、无事件、非法输入 |
+| `TestConcordanceIndex` | 完美/反向排序、同分与删失、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5035,6 +5056,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2318 个单元测试
+├── test_ai.py       # 2329 个单元测试
 └── README.md
 ```

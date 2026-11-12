@@ -36011,3 +36011,60 @@ class TestHMMSequenceScore:
         tr = [[0.0, 0.0], [0.0, 0.0]]
         _p10f_raises(lambda: AI.hmm_sequence_score(em, tr, [0]))
         _p10f_raises(lambda: AI.hmm_sequence_score(em, tr, [0, 2]))
+
+
+class TestKaplanMeier:
+    def test_hand_values(self):
+        out = AI.kaplan_meier([1, 2, 3, 4], [True, True, False, True])
+        assert out["times"] == [1.0, 2.0, 4.0]
+        assert out["survival"] == pytest.approx([0.75, 0.5, 0.0])
+        assert out["at_risk"] == [4, 3, 1]
+        assert out["events"] == [1, 1, 1]
+
+    def test_censored_last(self):
+        out = AI.kaplan_meier([1, 2, 5], [True, True, False])
+        assert out["times"] == [1.0, 2.0]
+        assert out["survival"] == pytest.approx([2.0 / 3.0, 1.0 / 3.0])
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.kaplan_meier([], []))
+        _p10f_raises(lambda: AI.kaplan_meier([1, 2], [True]))
+        _p10f_raises(lambda: AI.kaplan_meier([-1], [True]))
+        _p10f_raises(lambda: AI.kaplan_meier([1], [0.5]))
+
+
+class TestLogRank:
+    def test_separated_groups(self):
+        out = AI.logrank_test([1, 2, 3], [True] * 3, [10, 11, 12], [True] * 3)
+        assert out["statistic"] > 3.0
+        assert out["p_value"] < 0.05
+
+    def test_identical_groups(self):
+        out = AI.logrank_test([1, 2], [True, True], [1, 2], [True, True])
+        assert out["statistic"] == pytest.approx(0.0)
+        assert out["p_value"] == pytest.approx(1.0)
+
+    def test_no_events(self):
+        out = AI.logrank_test([1, 2], [False, False], [3, 4], [False, False])
+        assert out["statistic"] == 0.0 and out["p_value"] == 1.0
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.logrank_test([], [], [1], [True]))
+        _p10f_raises(lambda: AI.logrank_test([1], [True], [2], [True, False]))
+
+
+class TestConcordanceIndex:
+    def test_perfect(self):
+        assert AI.concordance_index([1, 2], [1, 1], [0.9, 0.1]) == pytest.approx(1.0)
+
+    def test_reversed(self):
+        assert AI.concordance_index([1, 2], [1, 1], [0.1, 0.9]) == pytest.approx(0.0)
+
+    def test_tied_score_and_censoring(self):
+        out = AI.concordance_index([1, 2, 3], [1, 1, 0], [0.5, 0.5, 0.9])
+        assert out == pytest.approx(1.0 / 6.0)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.concordance_index([1], [True], [1.0, 2.0]))
+        _p10f_raises(lambda: AI.concordance_index([1], [True], [float("nan")]))
+        _p10f_raises(lambda: AI.concordance_index([1], [True], "x"))
