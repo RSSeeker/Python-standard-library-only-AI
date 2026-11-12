@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2354 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2368 项）
 
 ## 特性
 
@@ -2207,6 +2207,33 @@ gc = gradient_centralize(grads, mode="cols")  # 每列减去该列均值
 | `gradient_centralize(grads, mode="rows")` | 梯度中心化：`rows` 每行减行均值、`cols` 每列减列均值 |
 
 - 边界：SAM 只给扰动权重，不含第二步「在扰动点重算梯度后更新原权重」的循环；梯度中心化只支持 2D 梯度矩阵，不处理 bias/1D 参数。
+
+### 线性链条件随机场（CRF）
+
+对数域前向-后向 / Viterbi / 负对数似然梯度 / 全批量 SGD：
+
+```python
+em = [[0.5, -0.2], [-0.1, 0.3], [0.2, 0.1]]
+tr = [[0.1, -0.2], [0.3, 0.0]]
+crf_log_partition(em, tr)                  # log Z
+crf_viterbi(em, tr, start, end)            # {"path", "score"}
+crf_marginals(em, tr, start, end)          # {"node", "edge", "log_z"}
+crf_log_likelihood(em, tr, tags, start, end)
+crf_gradient(em, tr, tags, start, end)     # 负对数似然对 emissions/transitions/start/end
+crf = LinearChainCRF(num_tags=2, seed=1); crf.fit(em_seq_list, tag_seq_list, epochs=50, lr=0.1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `crf_log_partition(emissions, transitions, start=None, end=None)` | 前向算法求 log Z |
+| `crf_viterbi(...)` | 最大概率标签序列与路径得分 |
+| `crf_marginals(...)` | 节点/边后验边缘概率 |
+| `crf_log_likelihood(..., tags)` | 给定标签的路径得分减 log Z |
+| `crf_gradient(..., tags)` | 负对数似然梯度（边缘减 one-hot / 期望减观测） |
+| `crf_posterior_decode(...)` | 逐位置边缘概率最大标签 |
+| `LinearChainCRF(num_tags, seed=None)` | 学习转移/起始/终止对数势（观测势由调用方给出），`fit` 全批量 SGD |
+
+- 边界：观测势（emissions）直接作为输入，不含特征到势的线性模型；不支持高阶转移 / 半马尔可夫 / 批量张量；`fit` 只更新转移、起始、终止三组参数。
 
 ### 序列解码（Viterbi / 前向-后向）
 
@@ -4738,7 +4765,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2354 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2368 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5007,6 +5034,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestUpliftScore` | 逐样本差值、非法输入 |
 | `TestQini` | 完美/反向排序、单组数据、非法输入 |
 | `TestUpliftAtFraction` | Top 分位组均值、fraction 边界与单组数据 |
+| `TestCRFPartitionAndPath` | log Z / Viterbi 与暴力枚举一致、边界输入 |
+| `TestCRFMarginals` | 节点/边边缘与暴力枚举一致、后验解码 |
+| `TestCRFLikelihoodAndGradient` | 对数似然、梯度有限差分、梯度归零性质 |
+| `TestLinearChainCRF` | 参数量、fit 提升似然、委托方法与非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -5144,6 +5175,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2354 个单元测试
+├── test_ai.py       # 2368 个单元测试
 └── README.md
 ```

@@ -6660,6 +6660,316 @@ def uplift_at_fraction(scores, treatment, outcome, fraction=0.1):
     return {"n": k, "treated_mean": mean_t, "control_mean": mean_c,
             "uplift": mean_t - mean_c}
 
+
+def _crf_check_matrix(x, name="emissions"):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("crf: %s 必须是非空二维列表" % name)
+    rows = []
+    width = None
+    for row in x:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("crf: %s 的每一行必须是非空列表" % name)
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("crf: %s 的每行长度必须一致" % name)
+        out = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("crf: %s 必须只包含有限数字" % name)
+            out.append(float(v))
+        rows.append(out)
+    return rows
+
+
+def _crf_check_square(x, k, name="transitions"):
+    rows = _crf_check_matrix(x, name)
+    if len(rows) != k:
+        raise ValueError("crf: %s 必须是 %d x %d" % (name, k, k))
+    for row in rows:
+        if len(row) != k:
+            raise ValueError("crf: %s 必须是 %d x %d" % (name, k, k))
+    return rows
+
+
+def _crf_check_vector(x, k, name="start"):
+    if not isinstance(x, (list, tuple)) or len(x) != k:
+        raise ValueError("crf: %s 长度必须是 %d" % (name, k))
+    out = []
+    for v in x:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("crf: %s 必须只包含有限数字" % name)
+        out.append(float(v))
+    return out
+
+
+def _crf_logsumexp(values):
+    if not values:
+        raise ValueError("crf: logsumexp 输入不能为空")
+    m = max(values)
+    if not math.isfinite(m):
+        return m
+    return m + math.log(sum(math.exp(v - m) for v in values))
+
+
+def _crf_log_partition(emissions, transitions, start=None, end=None):
+    emissions = _crf_check_matrix(emissions)
+    T = len(emissions)
+    K = len(emissions[0])
+    trans = _crf_check_square(transitions, K)
+    st = [0.0] * K if start is None else _crf_check_vector(start, K, "start")
+    ed = [0.0] * K if end is None else _crf_check_vector(end, K, "end")
+    alpha = [[st[k] + emissions[0][k] for k in range(K)]]
+    for t in range(1, T):
+        prev = alpha[-1]
+        row = []
+        for k in range(K):
+            vals = [prev[j] + trans[j][k] for j in range(K)]
+            row.append(emissions[t][k] + _crf_logsumexp(vals))
+        alpha.append(row)
+    return _crf_logsumexp([alpha[-1][k] + ed[k] for k in range(K)])
+
+
+def crf_log_partition(emissions, transitions, start=None, end=None):
+    """对数域前向算法求配分函数 log Z（线性链 CRF）。"""
+    return _crf_log_partition(emissions, transitions, start, end)
+
+
+def crf_viterbi(emissions, transitions, start=None, end=None):
+    """Viterbi 解码最大概率标签序列，返回 {"path", "score"}。"""
+    emissions = _crf_check_matrix(emissions)
+    T = len(emissions)
+    K = len(emissions[0])
+    trans = _crf_check_square(transitions, K)
+    st = [0.0] * K if start is None else _crf_check_vector(start, K, "start")
+    ed = [0.0] * K if end is None else _crf_check_vector(end, K, "end")
+    score = [st[k] + emissions[0][k] for k in range(K)]
+    back = []
+    for t in range(1, T):
+        prev = score
+        cur = []
+        ptr = []
+        for k in range(K):
+            best_j = 0
+            best_v = prev[0] + trans[0][k]
+            for j in range(1, K):
+                v = prev[j] + trans[j][k]
+                if v > best_v:
+                    best_v = v
+                    best_j = j
+            cur.append(best_v + emissions[t][k])
+            ptr.append(best_j)
+        score = cur
+        back.append(ptr)
+    best_k = 0
+    best_final = score[0] + ed[0]
+    for k in range(1, K):
+        v = score[k] + ed[k]
+        if v > best_final:
+            best_final = v
+            best_k = k
+    path = [best_k]
+    for t in range(T - 2, -1, -1):
+        path.append(back[t][path[-1]])
+    path.reverse()
+    return {"path": path, "score": best_final}
+
+
+def _crf_forward_backward(emissions, transitions, start=None, end=None):
+    emissions = _crf_check_matrix(emissions)
+    T = len(emissions)
+    K = len(emissions[0])
+    trans = _crf_check_square(transitions, K)
+    st = [0.0] * K if start is None else _crf_check_vector(start, K, "start")
+    ed = [0.0] * K if end is None else _crf_check_vector(end, K, "end")
+    alpha = [[st[k] + emissions[0][k] for k in range(K)]]
+    for t in range(1, T):
+        prev = alpha[-1]
+        row = []
+        for k in range(K):
+            vals = [prev[j] + trans[j][k] for j in range(K)]
+            row.append(emissions[t][k] + _crf_logsumexp(vals))
+        alpha.append(row)
+    log_z = _crf_logsumexp([alpha[-1][k] + ed[k] for k in range(K)])
+    beta = [[0.0] * K for _ in range(T)]
+    beta[T - 1] = ed[:]
+    for t in range(T - 2, -1, -1):
+        nxt = beta[t + 1]
+        row = []
+        for j in range(K):
+            vals = [trans[j][k] + emissions[t + 1][k] + nxt[k] for k in range(K)]
+            row.append(_crf_logsumexp(vals))
+        beta[t] = row
+    node = [[math.exp(alpha[t][k] + beta[t][k] - log_z) for k in range(K)]
+            for t in range(T)]
+    edges = []
+    for t in range(T - 1):
+        mat = []
+        for j in range(K):
+            row = []
+            for k in range(K):
+                val = (alpha[t][j] + trans[j][k] + emissions[t + 1][k]
+                       + beta[t + 1][k] - log_z)
+                row.append(math.exp(val))
+            mat.append(row)
+        edges.append(mat)
+    return {"log_z": log_z, "alpha": alpha, "beta": beta,
+            "node_marginals": node, "edge_marginals": edges,
+            "start": st, "end": ed}
+
+
+def crf_marginals(emissions, transitions, start=None, end=None):
+    """节点/边后验边缘概率：返回 {"log_z","node","edge"}。"""
+    fb = _crf_forward_backward(emissions, transitions, start, end)
+    return {"log_z": fb["log_z"], "node": fb["node_marginals"],
+            "edge": fb["edge_marginals"]}
+
+
+def crf_log_likelihood(emissions, transitions, tags, start=None, end=None):
+    """给定标签序列的对数似然：路径得分 - log Z。"""
+    rows = _crf_check_matrix(emissions)
+    T = len(rows)
+    K = len(rows[0])
+    trans = _crf_check_square(transitions, K)
+    st = [0.0] * K if start is None else _crf_check_vector(start, K, "start")
+    ed = [0.0] * K if end is None else _crf_check_vector(end, K, "end")
+    if not isinstance(tags, (list, tuple)) or len(tags) != T:
+        raise ValueError("crf: tags 长度必须与序列长度一致")
+    tag_ids = []
+    for t, tag in enumerate(tags):
+        if isinstance(tag, bool) or not isinstance(tag, int):
+            raise ValueError("crf: tags[%d] 必须是整数标签" % t)
+        if tag < 0 or tag >= K:
+            raise ValueError("crf: tags[%d] 越界" % t)
+        tag_ids.append(tag)
+    score = st[tag_ids[0]] + rows[0][tag_ids[0]]
+    for t in range(1, T):
+        score += trans[tag_ids[t - 1]][tag_ids[t]] + rows[t][tag_ids[t]]
+    score += ed[tag_ids[-1]]
+    return score - _crf_log_partition(rows, trans, st, ed)
+
+
+def crf_gradient(emissions, transitions, tags, start=None, end=None):
+    """负对数似然梯度：返回 {"emissions","transitions","start","end"} 四组。"""
+    rows = _crf_check_matrix(emissions)
+    T = len(rows)
+    K = len(rows[0])
+    trans = _crf_check_square(transitions, K)
+    st = [0.0] * K if start is None else _crf_check_vector(start, K, "start")
+    ed = [0.0] * K if end is None else _crf_check_vector(end, K, "end")
+    if not isinstance(tags, (list, tuple)) or len(tags) != T:
+        raise ValueError("crf: tags 长度必须与序列长度一致")
+    tag_ids = []
+    for t, tag in enumerate(tags):
+        if isinstance(tag, bool) or not isinstance(tag, int):
+            raise ValueError("crf: tags[%d] 必须是整数标签" % t)
+        if tag < 0 or tag >= K:
+            raise ValueError("crf: tags[%d] 越界" % t)
+        tag_ids.append(tag)
+    fb = _crf_forward_backward(rows, trans, st, ed)
+    node = fb["node_marginals"]
+    edges = fb["edge_marginals"]
+    g_em = [[node[t][k] for k in range(K)] for t in range(T)]
+    for t in range(T):
+        g_em[t][tag_ids[t]] -= 1.0
+    g_trans = [[0.0] * K for _ in range(K)]
+    for t in range(T - 1):
+        for j in range(K):
+            for k in range(K):
+                g_trans[j][k] += edges[t][j][k]
+        g_trans[tag_ids[t]][tag_ids[t + 1]] -= 1.0
+    g_start = node[0][:]
+    g_start[tag_ids[0]] -= 1.0
+    g_end = node[T - 1][:]
+    g_end[tag_ids[-1]] -= 1.0
+    return {"emissions": g_em, "transitions": g_trans,
+            "start": g_start, "end": g_end}
+
+
+def crf_posterior_decode(emissions, transitions, start=None, end=None):
+    """逐位置取边缘概率最大标签（后验解码）。"""
+    marg = crf_marginals(emissions, transitions, start, end)
+    path = []
+    for row in marg["node"]:
+        best = 0
+        for k in range(1, len(row)):
+            if row[k] > row[best]:
+                best = k
+        path.append(best)
+    return {"path": path, "node_marginals": marg["node"]}
+
+
+class LinearChainCRF:
+    """线性链条件随机场：学习转移/起始/终止对数势，观测势由调用方给出。"""
+
+    def __init__(self, num_tags, seed=None):
+        if isinstance(num_tags, bool) or not isinstance(num_tags, int) or num_tags < 1:
+            raise ValueError("CRF: num_tags 必须是正整数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("CRF: seed 必须是整数或 None")
+        self.num_tags = num_tags
+        rng = random.Random(seed) if seed is not None else random
+        self.transitions = [[rng.gauss(0.0, 0.01) for _ in range(num_tags)]
+                            for _ in range(num_tags)]
+        self.start = [rng.gauss(0.0, 0.01) for _ in range(num_tags)]
+        self.end = [rng.gauss(0.0, 0.01) for _ in range(num_tags)]
+
+    def log_likelihood(self, emissions, tags):
+        return crf_log_likelihood(emissions, self.transitions, tags,
+                                  self.start, self.end)
+
+    def viterbi(self, emissions):
+        return crf_viterbi(emissions, self.transitions, self.start, self.end)
+
+    def marginals(self, emissions):
+        return crf_marginals(emissions, self.transitions, self.start, self.end)
+
+    def gradient(self, emissions, tags):
+        return crf_gradient(emissions, self.transitions, tags,
+                            self.start, self.end)
+
+    def fit(self, emissions_seqs, tags_seqs, epochs=50, lr=0.1):
+        """对给定观测势序列做全批量 SGD（负对数似然）。"""
+        if (not isinstance(emissions_seqs, (list, tuple)) or not emissions_seqs
+                or not isinstance(tags_seqs, (list, tuple))
+                or len(emissions_seqs) != len(tags_seqs)):
+            raise ValueError("CRF: emissions_seqs/tags_seqs 必须非空且等长")
+        if (isinstance(epochs, bool) or not isinstance(epochs, int)
+                or epochs < 1):
+            raise ValueError("CRF: epochs 必须是正整数")
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or not math.isfinite(float(lr)) or float(lr) <= 0.0):
+            raise ValueError("CRF: lr 必须是正数")
+        n = len(emissions_seqs)
+        history = []
+        for _ in range(epochs):
+            g_trans = [[0.0] * self.num_tags for _ in range(self.num_tags)]
+            g_start = [0.0] * self.num_tags
+            g_end = [0.0] * self.num_tags
+            total = 0.0
+            for emissions, tags in zip(emissions_seqs, tags_seqs):
+                total -= self.log_likelihood(emissions, tags)
+                g = self.gradient(emissions, tags)
+                for j in range(self.num_tags):
+                    for k in range(self.num_tags):
+                        g_trans[j][k] += g["transitions"][j][k] / n
+                for k in range(self.num_tags):
+                    g_start[k] += g["start"][k] / n
+                    g_end[k] += g["end"][k] / n
+            for j in range(self.num_tags):
+                for k in range(self.num_tags):
+                    self.transitions[j][k] -= lr * g_trans[j][k]
+            for k in range(self.num_tags):
+                self.start[k] -= lr * g_start[k]
+                self.end[k] -= lr * g_end[k]
+            history.append({"loss": total / n})
+        return history
+
+    def param_count(self):
+        return self.num_tags * self.num_tags + 2 * self.num_tags
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

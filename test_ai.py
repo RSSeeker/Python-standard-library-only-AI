@@ -36250,3 +36250,183 @@ class TestUpliftAtFraction:
         _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 0], [1, 0], 0.0))
         _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 0], [1, 0], 1.5))
         _p10f_raises(lambda: AI.uplift_at_fraction([0.5, 0.4], [1, 1], [1, 0], 0.5))
+
+
+import itertools
+import math
+
+import pytest
+
+import AI
+
+
+def _crf_brute_paths(em, tr, st, ed):
+    T = len(em)
+    K = len(em[0])
+    out = []
+    for path in itertools.product(range(K), repeat=T):
+        s = st[path[0]] + em[0][path[0]]
+        for t in range(1, T):
+            s += tr[path[t - 1]][path[t]] + em[t][path[t]]
+        s += ed[path[-1]]
+        out.append((path, s))
+    return out
+
+
+def _crf_brute_logz(em, tr, st, ed):
+    scores = [s for _, s in _crf_brute_paths(em, tr, st, ed)]
+    m = max(scores)
+    return m + math.log(sum(math.exp(s - m) for s in scores))
+
+
+_EM = [[0.5, -0.2], [-0.1, 0.3], [0.2, 0.1]]
+_TR = [[0.1, -0.2], [0.3, 0.0]]
+_ST = [0.1, -0.1]
+_ED = [0.0, 0.05]
+_TAGS = [1, 0, 1]
+
+
+class TestCRFPartitionAndPath:
+    def test_log_partition_matches_bruteforce(self):
+        logz = AI.crf_log_partition(_EM, _TR, _ST, _ED)
+        assert logz == pytest.approx(_crf_brute_logz(_EM, _TR, _ST, _ED), abs=1e-9)
+
+    def test_viterbi_matches_bruteforce(self):
+        got = AI.crf_viterbi(_EM, _TR, _ST, _ED)
+        best_path, best_score = max(_crf_brute_paths(_EM, _TR, _ST, _ED),
+                                    key=lambda p: (p[1], [-x for x in p[0]]))
+        assert got["path"] == list(best_path)
+        assert got["score"] == pytest.approx(best_score, abs=1e-9)
+
+    def test_default_start_end(self):
+        logz = AI.crf_log_partition(_EM, _TR)
+        brute = _crf_brute_logz(_EM, _TR, [0.0, 0.0], [0.0, 0.0])
+        assert logz == pytest.approx(brute, abs=1e-9)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.crf_log_partition([], _TR))
+        _p10f_raises(lambda: AI.crf_log_partition(_EM, [[0.0]]))
+        _p10f_raises(lambda: AI.crf_log_partition(_EM, _TR, [0.0]))
+        _p10f_raises(lambda: AI.crf_viterbi(_EM, _TR, [float("nan"), 0.0]))
+
+
+class TestCRFMarginals:
+    def _brute_marginals(self):
+        paths = _crf_brute_paths(_EM, _TR, _ST, _ED)
+        logz = _crf_brute_logz(_EM, _TR, _ST, _ED)
+        T, K = len(_EM), len(_EM[0])
+        node = [[0.0] * K for _ in range(T)]
+        edge = [[[0.0] * K for _ in range(K)] for _ in range(T - 1)]
+        for path, score in paths:
+            p = math.exp(score - logz)
+            for t in range(T):
+                node[t][path[t]] += p
+            for t in range(T - 1):
+                edge[t][path[t]][path[t + 1]] += p
+        return node, edge
+
+    def test_node_marginals_match_bruteforce(self):
+        node, _ = self._brute_marginals()
+        got = AI.crf_marginals(_EM, _TR, _ST, _ED)["node"]
+        for t in range(len(_EM)):
+            for k in range(len(_EM[0])):
+                assert got[t][k] == pytest.approx(node[t][k], abs=1e-9)
+
+    def test_edge_marginals_match_bruteforce(self):
+        _, edge = self._brute_marginals()
+        got = AI.crf_marginals(_EM, _TR, _ST, _ED)["edge"]
+        for t in range(len(_EM) - 1):
+            for j in range(len(_EM[0])):
+                for k in range(len(_EM[0])):
+                    assert got[t][j][k] == pytest.approx(edge[t][j][k], abs=1e-9)
+
+    def test_posterior_decode(self):
+        got = AI.crf_posterior_decode(_EM, _TR, _ST, _ED)
+        node = AI.crf_marginals(_EM, _TR, _ST, _ED)["node"]
+        for t, row in enumerate(node):
+            assert got["path"][t] == max(range(len(row)), key=lambda k: row[k])
+
+
+class TestCRFLikelihoodAndGradient:
+    def test_log_likelihood_matches_bruteforce(self):
+        scores = dict(_crf_brute_paths(_EM, _TR, _ST, _ED))
+        logz = _crf_brute_logz(_EM, _TR, _ST, _ED)
+        got = AI.crf_log_likelihood(_EM, _TR, _TAGS, _ST, _ED)
+        assert got == pytest.approx(scores[tuple(_TAGS)] - logz, abs=1e-9)
+
+    def test_gradient_finite_difference(self):
+        g = AI.crf_gradient(_EM, _TR, _TAGS, _ST, _ED)
+        h = 1e-5
+
+        def nll(em, tr, st, ed):
+            return -AI.crf_log_likelihood(em, tr, _TAGS, st, ed)
+
+        for key, idx in (("transitions", (0, 1)), ("emissions", (1, 1)),
+                         ("start", (1,)), ("end", (0,))):
+            container = {"transitions": [r[:] for r in _TR],
+                         "emissions": [r[:] for r in _EM],
+                         "start": _ST[:], "end": _ED[:]}[key]
+            plus = {"transitions": [r[:] for r in _TR], "emissions": [r[:] for r in _EM],
+                    "start": _ST[:], "end": _ED[:]}[key]
+            minus = {"transitions": [r[:] for r in _TR], "emissions": [r[:] for r in _EM],
+                     "start": _ST[:], "end": _ED[:]}[key]
+            if len(idx) == 2:
+                plus[idx[0]][idx[1]] += h
+                minus[idx[0]][idx[1]] -= h
+            else:
+                plus[idx[0]] += h
+                minus[idx[0]] -= h
+            args_plus = {"transitions": _TR, "emissions": _EM, "start": _ST, "end": _ED}
+            args_minus = {"transitions": _TR, "emissions": _EM, "start": _ST, "end": _ED}
+            args_plus[key] = plus
+            args_minus[key] = minus
+            fd = ((nll(args_plus["emissions"], args_plus["transitions"],
+                       args_plus["start"], args_plus["end"])
+                   - nll(args_minus["emissions"], args_minus["transitions"],
+                         args_minus["start"], args_minus["end"])) / (2 * h))
+            analytic = g[key][idx[0]] if len(idx) == 1 else g[key][idx[0]][idx[1]]
+            assert analytic == pytest.approx(fd, abs=1e-6), key
+
+    def test_gradient_sums_to_zero(self):
+        g = AI.crf_gradient(_EM, _TR, _TAGS, _ST, _ED)
+        assert sum(sum(r) for r in g["emissions"]) == pytest.approx(0.0, abs=1e-12)
+        assert sum(sum(r) for r in g["transitions"]) == pytest.approx(0.0, abs=1e-12)
+        assert sum(g["start"]) == pytest.approx(0.0, abs=1e-12)
+        assert sum(g["end"]) == pytest.approx(0.0, abs=1e-12)
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.crf_log_likelihood(_EM, _TR, [0, 1], _ST, _ED))
+        _p10f_raises(lambda: AI.crf_log_likelihood(_EM, _TR, [0, 5, 1], _ST, _ED))
+        _p10f_raises(lambda: AI.crf_log_likelihood(_EM, _TR, [0, "a", 1], _ST, _ED))
+        _p10f_raises(lambda: AI.crf_gradient(_EM, _TR, [0], _ST, _ED))
+
+
+class TestLinearChainCRF:
+    def test_param_count_and_fit(self):
+        crf = AI.LinearChainCRF(2, seed=1)
+        assert crf.param_count() == 8
+        before = crf.log_likelihood(_EM, _TAGS)
+        hist = crf.fit([_EM, _EM], [[1, 0, 1], [0, 1, 0]], epochs=30, lr=0.2)
+        after = crf.log_likelihood(_EM, _TAGS)
+        assert after > before
+        assert len(hist) == 30
+        assert hist[-1]["loss"] < hist[0]["loss"]
+
+    def test_delegates(self):
+        crf = AI.LinearChainCRF(2, seed=2)
+        assert crf.viterbi(_EM)["path"] == AI.crf_viterbi(
+            _EM, crf.transitions, crf.start, crf.end)["path"]
+        ll = crf.log_likelihood(_EM, _TAGS)
+        assert ll == pytest.approx(AI.crf_log_likelihood(
+            _EM, crf.transitions, _TAGS, crf.start, crf.end))
+        g = crf.gradient(_EM, _TAGS)
+        assert len(g["transitions"]) == 2
+
+    def test_errors(self):
+        _p10f_raises(lambda: AI.LinearChainCRF(0))
+        _p10f_raises(lambda: AI.LinearChainCRF(2, seed="x"))
+        crf = AI.LinearChainCRF(2, seed=1)
+        _p10f_raises(lambda: crf.fit([], []))
+        _p10f_raises(lambda: crf.fit([_EM], []))
+        _p10f_raises(lambda: crf.fit([_EM], [[0, 1, 0]], epochs=0))
+        _p10f_raises(lambda: crf.fit([_EM], [[0, 1, 0]], lr=0.0))
