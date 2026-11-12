@@ -4813,6 +4813,132 @@ def dare_merge(weights, base=None, drop_rate: float = 0.5,
     merged = [base_flat[i] + total[i] / n for i in range(size)]
     return _merge_unflatten(merged, shape)
 
+
+def _dedup_stable_hash(value) -> int:
+    """与进程无关的 64-bit 稳定哈希（不用内置 hash()，避免 PYTHONHASHSEED 影响）。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        payload = b"i:" + str(value).encode("utf-8")
+    elif isinstance(value, str):
+        payload = b"s:" + value.encode("utf-8")
+    else:
+        raise ValueError(f"dedup: 只支持 int/str 元素，收到 {value!r}")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _dedup_check_tokens(tokens, name: str = "tokens"):
+    if not isinstance(tokens, (list, tuple)) or not tokens:
+        raise ValueError(f"dedup: {name} 必须是非空列表")
+    return tokens
+
+
+def _dedup_check_pos_int(value, name: str, upper=None) -> int:
+    if (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+        raise ValueError(f"dedup: {name} 必须是正整数，收到 {value!r}")
+    if upper is not None and value > upper:
+        raise ValueError(f"dedup: {name} 不能超过 {upper}，收到 {value!r}")
+    return value
+
+
+def minhash_signature(tokens, num_hashes: int = 64, seed: int = 0):
+    """MinHash 签名：对 num_hashes 个随机置换取「最小元素哈希」，长度 = num_hashes。"""
+    tokens = _dedup_check_tokens(tokens, "minhash tokens")
+    _dedup_check_pos_int(num_hashes, "num_hashes", 4096)
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise ValueError(f"dedup: seed 必须是整数，收到 {seed!r}")
+    modulus = (1 << 61) - 1
+    hashes = [_dedup_stable_hash(t) for t in tokens]
+    sig = []
+    for i in range(int(num_hashes)):
+        rng = random.Random((seed + 1) * 1000003 + i)
+        a = rng.randrange(1, modulus)
+        b = rng.randrange(0, modulus)
+        sig.append(min((a * h + b) % modulus for h in hashes))
+    return sig
+
+
+def minhash_jaccard(sig_a, sig_b):
+    """从两份 MinHash 签名估计 Jaccard 相似度（相等位置的比例）。"""
+    if (not isinstance(sig_a, (list, tuple)) or not isinstance(sig_b, (list, tuple))
+            or not sig_a or len(sig_a) != len(sig_b)):
+        raise ValueError("dedup: 两份 MinHash 签名必须是非空且等长的列表")
+    same = sum(1 for x, y in zip(sig_a, sig_b) if x == y)
+    return same / len(sig_a)
+
+
+def minhash_dedup(items, threshold: float = 0.8, num_hashes: int = 64, seed: int = 0):
+    """贪心 MinHash 去重：按输入顺序保留，与已保留项 Jaccard >= threshold 的丢弃。"""
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ValueError("dedup: items 必须是非空列表")
+    if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+            or not math.isfinite(float(threshold)) or not (0.0 <= float(threshold) <= 1.0)):
+        raise ValueError(f"dedup: threshold 必须在 [0,1]，收到 {threshold!r}")
+    kept = []
+    sigs = []
+    for idx, tokens in enumerate(items):
+        sig = minhash_signature(tokens, num_hashes, seed)
+        duplicate = any(minhash_jaccard(sig, other) >= float(threshold) for other in sigs)
+        if not duplicate:
+            kept.append(idx)
+            sigs.append(sig)
+    return {"indices": kept, "signatures": sigs}
+
+
+def _dedup_popcount(value: int) -> int:
+    return bin(value).count("1")
+
+
+def simhash(tokens, bits: int = 64):
+    """SimHash：按 token 哈希的位投票生成 bits 位整数指纹。"""
+    tokens = _dedup_check_tokens(tokens, "simhash tokens")
+    _dedup_check_pos_int(bits, "bits", 256)
+    counts = [0] * int(bits)
+    for token in tokens:
+        h = _dedup_stable_hash(token)
+        for i in range(int(bits)):
+            if (h >> i) & 1:
+                counts[i] += 1
+            else:
+                counts[i] -= 1
+    out = 0
+    for i in range(int(bits)):
+        if counts[i] > 0:
+            out |= (1 << i)
+    return out
+
+
+def hamming_distance(a: int, b: int):
+    """两个非负整数的 Hamming 距离（不同 bit 数）。"""
+    if (not isinstance(a, int) or isinstance(a, bool) or a < 0
+            or not isinstance(b, int) or isinstance(b, bool) or b < 0):
+        raise ValueError("dedup: hamming_distance 只接受非负整数")
+    return _dedup_popcount(a ^ b)
+
+
+def simhash_similarity(a: int, b: int, bits: int = 64):
+    """SimHash 相似度 = 1 - Hamming 距离 / bits。"""
+    _dedup_check_pos_int(bits, "bits", 256)
+    return 1.0 - hamming_distance(a, b) / int(bits)
+
+
+def simhash_dedup(items, threshold: float = 0.9, bits: int = 64):
+    """贪心 SimHash 去重：按输入顺序保留，与已保留项相似度 >= threshold 的丢弃。"""
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ValueError("dedup: items 必须是非空列表")
+    if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+            or not math.isfinite(float(threshold)) or not (0.0 <= float(threshold) <= 1.0)):
+        raise ValueError(f"dedup: threshold 必须在 [0,1]，收到 {threshold!r}")
+    kept = []
+    hashes = []
+    for idx, tokens in enumerate(items):
+        h = simhash(tokens, bits)
+        duplicate = any(simhash_similarity(h, other, bits) >= float(threshold)
+                        for other in hashes)
+        if not duplicate:
+            kept.append(idx)
+            hashes.append(h)
+    return {"indices": kept, "hashes": hashes}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

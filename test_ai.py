@@ -35379,3 +35379,74 @@ class TestModelMerging:
                                [[1.0, 2.0], [3.0, 4.0]]])
         assert two_d == [[1.0, 2.0], [3.0, 4.0]]
         _p10c_raises(lambda: AI.model_soup([[[]]]))
+
+
+import AI
+
+
+def _p10d_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("未抛出预期异常")
+
+
+class TestDedup:
+    def test_stable_hash(self):
+        h1 = AI._dedup_stable_hash(42)
+        h2 = AI._dedup_stable_hash(42)
+        assert isinstance(h1, int) and h1 == h2
+        assert AI._dedup_stable_hash("abc") != AI._dedup_stable_hash("abd")
+        assert AI._dedup_stable_hash(1) != AI._dedup_stable_hash("1")
+        _p10d_raises(lambda: AI._dedup_stable_hash(3.5))
+        _p10d_raises(lambda: AI._dedup_stable_hash(True))
+        _p10d_raises(lambda: AI._dedup_stable_hash([1, 2]))
+
+    def test_minhash_signature_and_jaccard(self):
+        s1 = AI.minhash_signature([1, 2, 3, 4, 5], 64, 7)
+        s2 = AI.minhash_signature([1, 2, 3, 4, 5], 64, 7)
+        assert s1 == s2 and len(s1) == 64
+        assert AI.minhash_jaccard(s1, s2) == 1.0
+        s3 = AI.minhash_signature([9, 8, 7], 64, 7)
+        assert AI.minhash_jaccard(s1, s3) == 0.0
+        base = list(range(1, 101))
+        near = list(range(1, 91)) + [200 + i for i in range(10)]
+        sig_a = AI.minhash_signature(base, 128, 3)
+        sig_b = AI.minhash_signature(near, 128, 3)
+        assert AI.minhash_jaccard(sig_a, sig_b) > 0.7
+        _p10d_raises(lambda: AI.minhash_signature([], 64, 0))
+        _p10d_raises(lambda: AI.minhash_signature([1], 0, 0))
+        _p10d_raises(lambda: AI.minhash_signature([1], 64, "x"))
+        _p10d_raises(lambda: AI.minhash_jaccard([1], [1, 2]))
+        _p10d_raises(lambda: AI.minhash_jaccard([], []))
+
+    def test_minhash_dedup(self):
+        out = AI.minhash_dedup([[1, 2, 3], [1, 2, 3], [4, 5, 6]], 0.8, 64, 0)
+        assert out["indices"] == [0, 2]
+        assert len(out["signatures"]) == 2
+        _p10d_raises(lambda: AI.minhash_dedup([], 0.8))
+        _p10d_raises(lambda: AI.minhash_dedup([[1]], 1.5))
+        _p10d_raises(lambda: AI.minhash_dedup([[1]], 0.8, 64, 1.5))
+
+    def test_simhash(self):
+        h = AI.simhash([1, 2, 3, 4], 64)
+        assert h == AI.simhash([1, 2, 3, 4], 64)
+        assert 0 <= h < (1 << 64)
+        assert AI.simhash_similarity(h, h) == 1.0
+        assert AI.hamming_distance(0b1011, 0b1001) == 1
+        assert AI.hamming_distance(h, h) == 0
+        assert AI.simhash_similarity(h, h ^ 1) == 1.0 - 1.0 / 64.0
+        hh = AI.simhash([1, 2, 3, 4], 32)
+        assert 0 <= hh < (1 << 32)
+        _p10d_raises(lambda: AI.simhash([], 64))
+        _p10d_raises(lambda: AI.simhash([1], 0))
+        _p10d_raises(lambda: AI.hamming_distance(-1, 0))
+        _p10d_raises(lambda: AI.hamming_distance(1.5, 0))
+
+    def test_simhash_dedup(self):
+        out = AI.simhash_dedup([[1, 2, 3, 4], [1, 2, 3, 4], [9, 9, 9]], 0.9, 64)
+        assert out["indices"] == [0, 2]
+        assert len(out["hashes"]) == 2
+        _p10d_raises(lambda: AI.simhash_dedup([], 0.9))
+        _p10d_raises(lambda: AI.simhash_dedup([[1]], -0.1))

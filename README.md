@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2248 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2253 项）
 
 ## 特性
 
@@ -3465,6 +3465,34 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
   所以注册表里的文件和手动 `model.save()` 的格式完全一致。
 
+### 数据去重（MinHash / SimHash）
+
+预训练语料去重常用两种近似算法：MinHash 估计集合 Jaccard 相似度，SimHash 用
+位投票得到文档指纹，再按 Hamming 距离判断近似重复。
+
+```python
+sig_a = minhash_signature(tokens_a, num_hashes=64, seed=0)
+sig_b = minhash_signature(tokens_b, num_hashes=64, seed=0)
+j = minhash_jaccard(sig_a, sig_b)          # 0..1 近似 Jaccard
+
+kept = minhash_dedup(docs, threshold=0.8)["indices"]   # 贪心保留
+
+h = simhash(tokens, bits=64)               # 64 位指纹
+sim = simhash_similarity(h1, h2, bits=64)  # 1 - Hamming/64
+kept2 = simhash_dedup(docs, threshold=0.9)["indices"]
+```
+
+| API | 说明 |
+| --- | --- |
+| `minhash_signature(tokens, num_hashes=64, seed=0)` | 用稳定的 blake2b 哈希 + 随机置换（`random.Random(seed)`）生成 MinHash 签名 |
+| `minhash_jaccard(sig_a, sig_b)` | 两份签名中相同位置的比例，作为 Jaccard 的无偏估计 |
+| `minhash_dedup(items, threshold=0.8, num_hashes=64, seed=0)` | 按输入顺序贪心去重，返回 `{'indices','signatures'}` |
+| `simhash(tokens, bits=64)` | 按 token 哈希的位投票生成 `bits` 位整数指纹 |
+| `hamming_distance(a, b)` / `simhash_similarity(a, b, bits=64)` | Hamming 距离 / `1 - Hamming/bits` |
+| `simhash_dedup(items, threshold=0.9, bits=64)` | 贪心 SimHash 去重，返回 `{'indices','hashes'}` |
+
+- 边界：token 只支持 int/str（`blake2b` 稳定哈希，不受 `PYTHONHASHSEED` 影响）；Jaccard/相似度都是近似值；贪心去重是 O(n²) 次签名比较，适合教学/小规模语料；`bits` 上限 256，取值超过 64 时高位置零。
+
 ### 命名数据版本库（VersionedStore）
 
 ```python
@@ -4399,7 +4427,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2248 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2253 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -4632,6 +4660,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGSPO` | 序列级重要性比手算对照、logits 数值梯度、clip_ratio 非法输入 |
 | `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
 | `TestModelMerging` | soup 均值、SLERP 端点/保范数/退化、TIES 手算与裁剪、DARE 复现与丢弃、非法输入 |
+| `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
 | `TestMuP` | 目标 std 的宽度缩放、初始化分层标准差、分层学习率、MuPAdam 更新幅度、非法参数 |
 | `TestMCTS` | 高价值分支收敛、自定义 next_state_fn、终局根节点、同分选择、非法输入 |
 | `TestTreeOfThought` | 最高分路径、自定义 next_state_fn、深度限制回退、非法输入 |
@@ -4769,6 +4798,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2248 个单元测试
+├── test_ai.py       # 2253 个单元测试
 └── README.md
 ```
