@@ -5519,9 +5519,11 @@ class TestLossPersistence:
                      loss_kwargs={"gamma": 1.5})
         path = str(tmp_path / "ov.json")
         m.save(path)
-        again = AI.Model.load(path, loss_fn="huber", loss_kwargs={"delta": 2.0})
-        assert again._loss_name == "huber"
-        assert again.loss_kwargs == {"delta": 2.0}
+        # huber 现在要求输出层是 linear，而本文件里的模型是 softmax 分类头；
+        # 这里本意是「显式参数覆盖文件」，改用同样兼容 softmax 的 focal
+        again = AI.Model.load(path, loss_fn="focal", loss_kwargs={"gamma": 2.0})
+        assert again._loss_name == "focal"
+        assert again.loss_kwargs == {"gamma": 2.0}
 
     def test_invalid_loss_field_is_ignored(self, tmp_path):
         random.seed(7)
@@ -36719,3 +36721,71 @@ class TestUMAP:
 
 def _math_dist(a, b):
     return sum((a[i] - b[i]) ** 2 for i in range(len(a))) ** 0.5
+
+
+class TestReviewFixes6:
+    """用户 m11182 审查提出的 6 个问题的回归测试（第二批）"""
+
+    @staticmethod
+    def _t5():
+        return AI.T5Model(src_vocab=8, tgt_vocab=8, d_model=8, num_heads=2,
+                          d_ff=16, num_layers=1, max_len=10, dropout=0.0,
+                          num_buckets=4, max_distance=8)
+
+    def test_t5_save_load_round_trip(self, tmp_path):
+        model = self._t5()
+        path = str(tmp_path / "t5.json")
+        model.save(path)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["kind"] == "t5"
+        assert data["config"]["num_buckets"] == 4
+        assert data["config"]["max_distance"] == 8
+        loaded = AI.T5Model.load(path)
+        assert isinstance(loaded, AI.T5Model)
+        named_a = list(model._named_params())
+        named_b = list(loaded._named_params())
+        assert [x[0] for x in named_a] == [y[0] for y in named_b]
+        assert all(a[1] == b[1] for a, b in zip(named_a, named_b))
+        assert loaded.param_count() == model.param_count()
+        # 通用 / 父类入口加载时也按 kind 分派回 T5Model
+        assert isinstance(AI.Seq2SeqLM.load(path), AI.T5Model)
+
+    def test_mtp_load_is_rejected(self, tmp_path):
+        path = str(tmp_path / "mtp.json")
+        with pytest.raises(ValueError):
+            AI.MTPLanguageModel.load(path)
+        model = AI.MTPLanguageModel(vocab_size=4, d_model=4, num_heads=2,
+                                    d_ff=8, num_layers=1, max_len=8,
+                                    num_future=2)
+        with pytest.raises(ValueError):
+            model.save(path)
+
+    def test_huber_requires_linear_output(self):
+        with pytest.raises(ValueError) as ei:
+            AI.Model(AI.MLP([2, 4, 2], activations=["relu", "sigmoid"]),
+                     loss_fn="huber", task="regression")
+        assert "huber" in str(ei.value)
+        ok = AI.Model(AI.MLP([2, 4, 1], activations=["relu", "linear"]),
+                      loss_fn="huber", task="regression")
+        assert ok._loss_name == "huber"
+
+    def test_dit_helpers_defined_once(self):
+        import inspect
+        src = inspect.getsource(AI)
+        assert src.count("def _dit_check_pos_int") == 1
+        assert src.count("def _dit_sin_cos") == 1
+
+    def test_mtp_extra_loss_has_no_dead_key_mask(self):
+        import inspect
+        params = list(inspect.signature(
+            AI.MTPLanguageModel._mtp_extra_loss_and_backward).parameters)
+        assert params == ["self", "ids", "valid", "grad_scale"]
+
+    def test_matmul_and_transpose_reject_empty(self):
+        with pytest.raises(ValueError):
+            AI._matmul([], [])
+        with pytest.raises(ValueError):
+            AI._matmul([[1.0]], [])
+        with pytest.raises(ValueError):
+            AI._transpose([])

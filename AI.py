@@ -1811,25 +1811,6 @@ def _dit_sin_cos(t, dim):
     return out
 
 
-def _dit_check_pos_int(value, name):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"DiT: {name} 必须是正整数，收到 {value!r}")
-    return value
-
-
-def _dit_sin_cos(t, dim):
-    """时间步 t∈[0,1) 的正弦特征，返回长度 dim 的列表。"""
-    out = []
-    half = dim // 2
-    for i in range(half):
-        freq = math.exp(-math.log(10000.0) * i / max(1, half - 1))
-        out.append(math.sin(t * freq))
-        out.append(math.cos(t * freq))
-    if dim % 2 == 1:
-        out.append(math.sin(t))
-    return out
-
-
 class DiT:
     """扩散 Transformer（Diffusion Transformer）的教学实现。
 
@@ -23265,6 +23246,8 @@ class LSTM:
 
 def _matmul(A, B):
     """矩阵乘法 A(m×n) × B(n×p) → (m×p)，纯 Python 实现"""
+    if not A or not B or not A[0] or not B[0]:
+        raise ValueError("_matmul: A 与 B 必须是非空矩阵")
     m, n = len(A), len(A[0])
     n2, p = len(B), len(B[0])
     if n != n2:
@@ -23278,6 +23261,8 @@ def _matmul(A, B):
 
 def _transpose(M):
     """转置 (m×n) → (n×m)"""
+    if not M or not M[0]:
+        raise ValueError("_transpose: 输入矩阵不能为空")
     m, n = len(M), len(M[0])
     return [[M[i][j] for i in range(m)] for j in range(n)]
 
@@ -28381,7 +28366,7 @@ def _lm_load(filepath, restore_optimizer=False):
     if not isinstance(data, dict) or data.get("format") != "ai_lm_v1":
         raise ValueError(f"load: {filepath} 不是 ai_lm_v1 格式的 LM 存档")
     kind = data.get("kind")
-    classes = {"causal": CausalLM, "seq2seq": Seq2SeqLM}
+    classes = {"causal": CausalLM, "seq2seq": Seq2SeqLM, "t5": T5Model}
     if kind not in classes:
         raise ValueError(f"load: 未知的模型类型 {kind!r}（支持 {sorted(classes)}）")
     cfg = data.get("config") or {}
@@ -29462,7 +29447,7 @@ class MTPLanguageModel(CausalLM):
 
     # ---------- 训练 ----------
 
-    def _mtp_extra_loss_and_backward(self, ids, key_mask, valid, grad_scale):
+    def _mtp_extra_loss_and_backward(self, ids, valid, grad_scale):
         """在已前向的缓存 h 上计算未来头损失并累积梯度；返回未来头平均损失。"""
         if self.num_future <= 0:
             self._mtp_last_loss = 0.0
@@ -29538,7 +29523,7 @@ class MTPLanguageModel(CausalLM):
             valid = _check_pad_mask(pad_mask, len(ids), "MTPLanguageModel._loss_and_backward")
         mtp = self._mtp_extra_loss_and_backward(
             _check_token_ids(ids, self.vocab_size, "MTPLanguageModel._loss_and_backward"),
-            None, valid, grad_scale)
+            valid, grad_scale)
         total = main + self.mtp_weight * mtp
         self._last_main_loss = main
         return total
@@ -29556,6 +29541,10 @@ class MTPLanguageModel(CausalLM):
 
     # 存档：MTP 头与父类存档格式不兼容，显式拒绝而不是静默丢头
     def save(self, filepath: str, include_optimizer: bool = False, quiet: bool = False):
+        raise ValueError("MTPLanguageModel: 暂不支持 save/load（存档格式只覆盖 CausalLM）")
+
+    @staticmethod
+    def load(filepath: str, restore_optimizer: bool = False):
         raise ValueError("MTPLanguageModel: 暂不支持 save/load（存档格式只覆盖 CausalLM）")
 
 class Seq2SeqLM:
@@ -66864,6 +66853,7 @@ class Model:
             'log_cosh': ('linear', "log_cosh_loss 是回归损失，输出层激活请用 'linear'"),
             'quantile': ('linear', "quantile_loss 是回归损失，输出层激活请用 'linear'"),
             'smooth_l1': ('linear', "smooth_l1_loss 是回归损失，输出层激活请用 'linear'"),
+            'huber': ('linear', "huber_loss 是回归损失，输出层激活请用 'linear'"),
             'class_balanced': ('softmax', "class_balanced_loss 期望 softmax 概率，输出层激活请用 'softmax'"),
             'ldam': ('linear', "ldam_loss 直接吃 logits，输出层激活请用 'linear'"),
             'distill': ('linear', "distill_loss 吃学生 logits，输出层激活请用 'linear'"),
@@ -71063,6 +71053,8 @@ class T5Model(Seq2SeqLM):
                                 bidirectional=False)
             layer.self_attn.relative_bias = op
             self.dec_bias.append(op)
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
         self.zero_grad()
 
     def _named_params(self):
@@ -71074,6 +71066,23 @@ class T5Model(Seq2SeqLM):
                 for b in range(op.num_buckets):
                     yield (f"{tag}.L{li}.t5_bias.b{b}",
                            op.table[b], op.grad_table[b])
+
+    def _config(self):
+        """构造参数（存档用；父类字段基础上补相对位置偏置配置）"""
+        cfg = super()._config()
+        cfg.update({"num_buckets": self.num_buckets,
+                    "max_distance": self.max_distance})
+        return cfg
+
+    def save(self, filepath: str, include_optimizer: bool = False,
+             quiet: bool = False):
+        """把结构与参数写成 JSON（kind="t5"，load 时按类分派回 T5Model）"""
+        return _lm_save(self, "t5", filepath, include_optimizer, quiet)
+
+    @staticmethod
+    def load(filepath: str, restore_optimizer: bool = False):
+        """从 `save` 写出的 JSON 恢复 T5Model（参数逐位还原）"""
+        return _lm_load(filepath, restore_optimizer)
 
     def param_count(self):
         """参数总数（标量个数；父类实现已遍历本类的 _named_params，含相对偏置表）"""
