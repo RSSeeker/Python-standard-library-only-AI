@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2478 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2483 项）
 
 ## 特性
 
@@ -2037,11 +2037,29 @@ base = magnitude_prune(weights, sparsity=0.5)      # 幅度剪枝基线
 | `kv_dequantize(quant)` | 按 codes/mins/scales 还原浮点 2D 列表 |
 | `kv_cache_quantize(k_cache, v_cache, key_bits=4, value_bits=4)` | KIVI 风格：key 按通道量化、value 按 token 量化 |
 | `kv_cache_dequantize(quant)` / `kv_cache_quantization_error(...)` | 还原 / 返回 key/value 相对误差与最大绝对误差 |
+| `kv_quantize_row(row, bits=4, eps=1e-12)` | 单行 absmax 对称定点量化后立即反量化（`bits` 2–8），用于逐行数值模拟；零行保持 |
+| `kv_cache_quantize_rows(caches, bits=4)` | 就地量化 KV cache 列表（`[层]["K"/"V"][kv_head][t][d_k]` 的行），返回量化行数 |
+| `generate_kv_quantized(model, prompt_ids, ..., kv_cache_bits=4)` | 生成时每步把全部 KV cache 行量化/反量化（误差模拟）；采样参数与 `CausalLM.generate` 相同，支持窗口滑动 |
 | `wanda_importance(weights, activations)` | `\|W_ij\| × \|\|X_j\|\|`；`activations` 可为每列范数（1D）或 2D 校准数据 |
 | `wanda_prune(weights, activations, sparsity=0.5)` | 每行保留重要性 top-(1-sparsity)，返回 `{'weights','mask','sparsity','keep_per_row'}` |
 | `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `\|w\|` 保留） |
 
 - 边界：量化是逐行/逐列 absmax 区间，非真实 KIVI 的分组/残差；Wanda 用一次校准统计，不含激活感知的迭代补偿或稀疏格式；每行至少保留 1 个权重；只支持 2D 张量/1D 嵌套 list。
+
+#### KV cache 量化生成（generate_kv_quantized）
+
+`generate_kv_quantized` 复用 `CausalLM` 的 KV cache 增量生成循环，在每步 attention 之后
+把 cache 里所有 K/V 行按 `kv_cache_bits` 做 absmax 对称量化再反量化，再参与下一步，
+用来观察「KV cache 低比特量化」对生成结果的数值影响；窗口滑动时会重建 cache 并重新量化。
+
+```python
+lm = CausalLM(vocab_size=8, d_model=32, num_heads=4, num_layers=1, max_len=16)
+ids = generate_kv_quantized(lm, [1, 2, 3], max_new_tokens=8,
+                            temperature=0.8, kv_cache_bits=4)
+```
+
+- 边界：没有真正的位打包/低比特存储，量化后再反量化只是数值模拟；每步都量化全部 cache 行，
+  比真实推理多一次全量量化开销；只支持采样式生成，不支持 beam search；量化误差依赖数据分布（absmax 受离群值影响）。
 
 ### 稀疏检索与混合重排（BM25 / RRF / ColBERT-lite）
 
@@ -5167,7 +5185,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2478 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2483 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5483,6 +5501,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestOnnxImport` | 导出→导入参数/前向逐位一致、softmax 输出往返、写文件路径往返、非法字节与结构校验 |
 | `TestPRMTrainer` | BCE 梯度中心差分、可分离标签拟合并排序、序列聚合复用、便捷函数、非法输入 |
+| `TestKVCacheQuantize` | 行量化误差界与网格、cache 结构就地量化、量化生成长度/词表/复现、窗口滑动、非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
@@ -5605,6 +5624,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2478 个单元测试
+├── test_ai.py       # 2483 个单元测试
 └── README.md
 ```

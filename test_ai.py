@@ -38003,3 +38003,107 @@ class TestPRMTrainer:
         _k_raises(lambda: t.fit(xs, [1.0, 0.0], epochs=0))
         _k_raises(lambda: t.fit(xs, [1.0, 0.0], shuffle=1))
         _k_raises(lambda: t.score_sequence(xs, mode="max"))
+
+
+"""B12 KV cache 量化测试：行误差界、cache 结构、量化生成、窗口滑动、非法输入。"""
+import random
+import AI
+
+
+def _q_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % (exc,))
+
+
+class TestKVCacheQuantize:
+    def test_row_error_bound_and_grid(self):
+        rows = [[0.0, 1.0, -0.5], [3.14159, -2.71828, 0.0, 1e-9], [-1.0] * 8]
+        for bits in (2, 4, 8):
+            qmax = 2 ** (bits - 1) - 1
+            for row in rows:
+                out = AI.kv_quantize_row(row, bits=bits)
+                assert len(out) == len(row)
+                ma = max(abs(v) for v in row)
+                if ma == 0.0:
+                    assert out == row
+                    continue
+                scale = ma / qmax
+                for a, b in zip(row, out):
+                    assert abs(a - b) <= scale / 2.0 + 1e-12
+                for b in out:
+                    assert abs(b - round(b / scale) * scale) < 1e-9
+        assert AI.kv_quantize_row([0.0, 0.0]) == [0.0, 0.0]
+        assert AI.kv_quantize_row([1.0, -1.0], bits=2) == [1.0, -1.0]
+
+    def test_cache_structure(self):
+        caches = [
+            {"K": [[[0.1, 0.2], [0.3, -0.4]], [[0.0, 0.0], [1.0, -1.0]]],
+             "V": [[[2.0, -2.0], [0.5, 0.5]], [[0.0, 0.0], [0.0, 0.0]]]},
+            {"K": [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]],
+             "V": [[[0.0, 0.0]], [[0.0, 0.0]]]},
+            {},
+        ]
+        n = AI.kv_cache_quantize_rows(caches, bits=4)
+        assert n == 14
+        rows = [row for cache in caches for key in ("K", "V")
+                for head in cache.get(key, []) for row in head]
+        for row in rows:
+            ma = max(abs(x) for x in row)
+            if ma == 0.0:
+                assert all(v == 0.0 for v in row)
+                continue
+            scale = ma / 7.0
+            assert all(abs(v - round(v / scale) * scale) < 1e-9 for v in row)
+
+    def test_generate_basic(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        out = AI.generate_kv_quantized(lm, [0, 1, 2], max_new_tokens=5,
+                                       temperature=0.01, rng=random.Random(3))
+        assert len(out) == 8 and out[:3] == [0, 1, 2]
+        assert all(0 <= t < 6 for t in out)
+        again = AI.generate_kv_quantized(lm, [0, 1, 2], max_new_tokens=5,
+                                         temperature=0.01, rng=random.Random(3))
+        assert out == again
+        out8 = AI.generate_kv_quantized(lm, [0, 1, 2], max_new_tokens=5,
+                                        temperature=0.01, rng=random.Random(3),
+                                        kv_cache_bits=8)
+        assert len(out8) == 8
+        plain = lm.generate([0, 1, 2], max_new_tokens=5, temperature=0.01,
+                            rng=random.Random(3))
+        assert len(plain) == 8
+
+    def test_generate_window_sliding(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=4)
+        out = AI.generate_kv_quantized(lm, [0, 1], max_new_tokens=6,
+                                       temperature=0.01, rng=random.Random(5))
+        assert len(out) == 8 and out[:2] == [0, 1]
+        again = AI.generate_kv_quantized(lm, [0, 1], max_new_tokens=6,
+                                         temperature=0.01, rng=random.Random(5))
+        assert out == again
+
+    def test_invalid_inputs(self):
+        _q_raises(lambda: AI.kv_quantize_row([0.0], bits=True))
+        _q_raises(lambda: AI.kv_quantize_row([0.0], bits=0))
+        _q_raises(lambda: AI.kv_quantize_row([0.0], bits=9))
+        _q_raises(lambda: AI.kv_quantize_row([]))
+        _q_raises(lambda: AI.kv_quantize_row([0.0, float("nan")]))
+        _q_raises(lambda: AI.kv_quantize_row("abc"))
+        _q_raises(lambda: AI.kv_quantize_row([1.0], eps=-1.0))
+        _q_raises(lambda: AI.kv_cache_quantize_rows({"K": []}))
+        _q_raises(lambda: AI.kv_cache_quantize_rows([123]))
+        _q_raises(lambda: AI.kv_cache_quantize_rows([{"K": 1}]))
+        _q_raises(lambda: AI.kv_cache_quantize_rows([{"K": [1]}]))
+        _q_raises(lambda: AI.kv_cache_quantize_rows([{"K": [[1.0]]}]))
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        _q_raises(lambda: AI.generate_kv_quantized(object(), [0]))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, []))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0, 99]))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0, True]))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0], max_new_tokens=-1))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0], max_new_tokens=1.5))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0], temperature=0.0))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0], top_p=0.0))
+        _q_raises(lambda: AI.generate_kv_quantized(lm, [0], kv_cache_bits=0))

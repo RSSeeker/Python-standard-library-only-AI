@@ -9459,6 +9459,162 @@ def prm_train(features, labels, feature_dim: int, hidden=(16,), lr: float = 0.01
     return trainer, history
 
 
+"""KV cache 量化生成：把 CausalLM 的 KV cache 按行做对称定点量化（N-bit）
+
+`CausalLM.generate` 的 cache 路径按层、按 KV 头保存 K/V 行；在显存/内存受限时
+可以把这些行压成低比特再反量化回浮点（本库没有位打包，量化收益是「信息损失」
+而非真实内存下降）。`generate_kv_quantized` 是 `generate(use_cache=True)` 的
+量化版：每步前向之后把 cache 里的全部行重新量化到同一网格，因此后续 token 的
+注意力读到的是量化后的历史 K/V。
+
+边界：
+- 量化是逐行 absmax 对称定点（scale = max|v| / qmax），零行保持不变；
+- 没有位打包/自定义 dtype，只模拟数值误差；
+- 不支持 beam search（束搜索有多条 cache，量化路径未实现），需要时用 `num_beams=1`。
+"""
+
+
+def _kvq_row_check_bits(bits):
+    if isinstance(bits, bool) or not isinstance(bits, int):
+        raise ValueError("KV cache 量化: bits 必须是整数，收到 %r" % (bits,))
+    if bits < 2 or bits > 8:
+        raise ValueError("KV cache 量化: bits 必须在 2..8 之间，收到 %r" % (bits,))
+    return bits
+
+
+def kv_quantize_row(row, bits: int = 4, eps: float = 1e-12):
+    """逐行 absmax 对称定点量化后立即反量化，返回 float 列表（误差 ≤ scale/2）。
+
+    零行（全 0）保持原样；`eps` 用于避免 max|v|=0 时除零，并要求为非负有限。
+    """
+    bits = _kvq_row_check_bits(bits)
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(float(eps)) or float(eps) < 0.0):
+        raise ValueError("KV cache 量化: eps 必须是非负有限数字")
+    if not isinstance(row, (list, tuple)) or not row:
+        raise ValueError("KV cache 量化: row 必须是非空数字列表")
+    vals = []
+    for v in row:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("KV cache 量化: row 必须只包含有限数字")
+        vals.append(float(v))
+    max_abs = max(abs(v) for v in vals)
+    if max_abs <= float(eps):
+        return list(vals)
+    qmax = float(2 ** (bits - 1) - 1)
+    scale = max_abs / qmax
+    out = []
+    for v in vals:
+        q = int(round(v / scale))
+        if q > qmax:
+            q = int(qmax)
+        elif q < -qmax:
+            q = -int(qmax)
+        out.append(q * scale)
+    return out
+
+
+def kv_cache_quantize_rows(caches, bits: int = 4):
+    """就地量化 cache 中所有 K/V 行；返回量化的行数。
+
+    `caches` 是 `CausalLM` 的每层 cache 列表（每项 dict，可含 "K"/"V"，
+    结构为 [kv_head][t][d_k]）。没有 K/V 的层跳过（例如尚未前向）。
+    """
+    bits = _kvq_row_check_bits(bits)
+    if not isinstance(caches, (list, tuple)):
+        raise ValueError("KV cache 量化: caches 必须是每层 cache 的列表")
+    count = 0
+    for li, cache in enumerate(caches):
+        if not isinstance(cache, dict):
+            raise ValueError("KV cache 量化: 第 %d 层 cache 必须是 dict" % li)
+        for key in ("K", "V"):
+            if key not in cache:
+                continue
+            heads = cache[key]
+            if not isinstance(heads, list):
+                raise ValueError("KV cache 量化: %s 必须是按头分组的列表" % key)
+            for hi, rows in enumerate(heads):
+                if not isinstance(rows, list):
+                    raise ValueError("KV cache 量化: %s[%d] 必须是行列表" % (key, hi))
+                for ti in range(len(rows)):
+                    if not isinstance(rows[ti], (list, tuple)):
+                        raise ValueError("KV cache 量化: %s[%d][%d] 必须是数字列表"
+                                         % (key, hi, ti))
+                    rows[ti] = kv_quantize_row(rows[ti], bits=bits)
+                    count += 1
+    return count
+
+
+def generate_kv_quantized(model, prompt_ids, max_new_tokens: int = 16,
+                          temperature: float = 1.0, top_k: int = 0, rng=None,
+                          top_p: float = 1.0, min_p: float = 0.0,
+                          repetition_penalty: float = 1.0,
+                          presence_penalty: float = 0.0,
+                          frequency_penalty: float = 0.0,
+                          no_repeat_ngram_size: int = 0,
+                          kv_cache_bits: int = 4):
+    """带量化 KV cache 的自回归生成，返回 prompt + 新 token；语义对齐 `generate(use_cache=True)`。
+
+    与 `CausalLM.generate` 的差别只有：每次前向后把 cache 全部行量化到
+    `kv_cache_bits` 位网格，后续注意力基于量化值计算。语料/随机数全部走传入
+    `rng`，便于复现；调用结束时模型保持 eval 模式。
+    """
+    bits = _kvq_row_check_bits(kv_cache_bits)
+    if not hasattr(model, "_forward_step") or not hasattr(model, "max_len"):
+        raise TypeError("KV cache 量化: model 必须是 CausalLM（需有 _forward_step/max_len）")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 0:
+        raise ValueError("KV cache 量化: max_new_tokens 必须是非负整数")
+    if (not isinstance(temperature, (int, float)) or isinstance(temperature, bool)
+            or not math.isfinite(float(temperature)) or float(temperature) <= 0.0):
+        raise ValueError("KV cache 量化: temperature 必须 > 0")
+    if not (0.0 < float(top_p) <= 1.0):
+        raise ValueError("KV cache 量化: top_p 必须在 (0,1] 内")
+    top_k = _check_top_k(top_k, "generate_kv_quantized")
+    min_p = _check_min_p(min_p, "generate_kv_quantized")
+    _check_penalty_args(repetition_penalty, presence_penalty, frequency_penalty,
+                        no_repeat_ngram_size, "generate_kv_quantized")
+    ids = list(prompt_ids)
+    if not ids:
+        raise ValueError("KV cache 量化: prompt_ids 不能为空")
+    for tok in ids:
+        if isinstance(tok, bool) or not isinstance(tok, int) \
+                or not 0 <= tok < model.vocab_size:
+            raise ValueError("KV cache 量化: prompt token 越界 %r" % (tok,))
+    rng = rng or random
+    model.eval()
+    window = ids[-model.max_len:]
+    caches = [{} for _ in model.encoder.layers]
+    pos = 0
+    logits = None
+    for tok in window:
+        logits = model._forward_step(tok, pos, caches)
+        pos += 1
+        kv_cache_quantize_rows(caches, bits=bits)
+    for _ in range(int(max_new_tokens)):
+        cur = _apply_generation_penalties(logits, ids, repetition_penalty,
+                                          presence_penalty, frequency_penalty,
+                                          no_repeat_ngram_size)
+        pick = model._sample(cur, temperature, top_k, rng, top_p, min_p)
+        ids.append(pick)
+        new_window = ids[-model.max_len:]
+        if len(new_window) == len(window) + 1:
+            logits = model._forward_step(pick, pos, caches)
+            pos += 1
+            kv_cache_quantize_rows(caches, bits=bits)
+        else:
+            # 窗口滑动：位置整体左移，旧 K/V 全部作废，按新窗口重建
+            caches = [{} for _ in model.encoder.layers]
+            pos = 0
+            for tok in new_window:
+                logits = model._forward_step(tok, pos, caches)
+                pos += 1
+                kv_cache_quantize_rows(caches, bits=bits)
+        window = new_window
+    return ids
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
