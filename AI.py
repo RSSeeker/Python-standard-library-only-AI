@@ -13607,6 +13607,216 @@ class BERT4Rec:
         per_layer = 4 * (d * d + d) + (d * self.d_ff + self.d_ff) + (self.d_ff * d + d) + 4 * d
         return self.num_layers * per_layer
 
+"""AutoInt-lite：自注意力特征交互网络（浅层，手写反向）。
+
+简化点：单头注意力、无 LayerNorm、无多头拼接、无残差投影；特征以标量输入经共享线性
+层嵌入成 token，做一次多头自注意力 + 残差 + FFN，再展平接二分类头。用于表格特征交叉的
+教学演示，不是论文完整实现。
+"""
+import math
+import random
+
+
+def _ait_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("AutoInt: %s 必须是正整数" % name)
+    return value
+
+
+def _ait_check_features(feats, num_features):
+    if not isinstance(feats, (list, tuple)) or len(feats) != num_features:
+        raise ValueError("AutoInt: 特征必须是长度为 num_features 的列表")
+    out = []
+    for v in feats:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError("AutoInt: 特征必须是有限数字")
+        out.append(float(v))
+    return out
+
+
+def _ait_softmax(row):
+    m = max(row)
+    exps = [math.exp(v - m) for v in row]
+    total = sum(exps)
+    return [v / total for v in exps]
+
+
+class AutoInt:
+    def __init__(self, num_features, d_model=8, d_ff=16, num_layers=1, seed=None):
+        self.num_features = _ait_check_pos_int(num_features, "num_features")
+        self.d_model = _ait_check_pos_int(d_model, "d_model")
+        self.d_ff = _ait_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _ait_check_pos_int(num_layers, "num_layers")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("AutoInt: seed 必须是 int 或 None")
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.feat_emb = Layer(1, self.d_model, "linear")
+            self.layers = []
+            for _ in range(self.num_layers):
+                self.layers.append({
+                    "Wq": Layer(self.d_model, self.d_model, "linear"),
+                    "Wk": Layer(self.d_model, self.d_model, "linear"),
+                    "Wv": Layer(self.d_model, self.d_model, "linear"),
+                    "Wo": Layer(self.d_model, self.d_model, "linear"),
+                    "W1": Layer(self.d_model, self.d_ff, "relu"),
+                    "W2": Layer(self.d_ff, self.d_model, "linear"),
+                })
+            self.head = Layer(self.num_features * self.d_model, 1, "linear")
+        finally:
+            random.setstate(saved)
+        self.grads = None
+        self._cache = None
+
+    # ---------- 前向 ----------
+
+    def forward(self, feats):
+        x = _ait_check_features(feats, self.num_features)
+        T, feat_cache = _dense_rows_forward(self.feat_emb, [[v] for v in x])
+        layer_caches = []
+        scale = 1.0 / math.sqrt(self.d_model)
+        for layer in self.layers:
+            q, qc = _dense_rows_forward(layer["Wq"], T)
+            k, kc = _dense_rows_forward(layer["Wk"], T)
+            v, vc = _dense_rows_forward(layer["Wv"], T)
+            n = len(T)
+            attn = []
+            for i in range(n):
+                scores = [sum(q[i][t] * k[j][t] for t in range(self.d_model)) * scale
+                          for j in range(n)]
+                attn.append(_ait_softmax(scores))
+            o = [[sum(attn[i][j] * v[j][t] for j in range(n)) for t in range(self.d_model)]
+                 for i in range(n)]
+            out_o, oc = _dense_rows_forward(layer["Wo"], o)
+            h = [[T[i][t] + out_o[i][t] for t in range(self.d_model)] for i in range(n)]
+            a1, a1c = _dense_rows_forward(layer["W1"], h)
+            f2, f2c = _dense_rows_forward(layer["W2"], a1)
+            g = [[h[i][t] + f2[i][t] for t in range(self.d_model)] for i in range(n)]
+            layer_caches.append({"T": T, "q": q, "qc": qc, "k": k, "kc": kc,
+                                 "v": v, "vc": vc, "attn": attn, "o": o, "oc": oc,
+                                 "h": h, "a1": a1, "a1c": a1c, "f2": f2, "f2c": f2c,
+                                 "g": g, "scale": scale})
+            T = g
+        flat = [v for row in T for v in row]
+        logit_row, head_cache = _dense_rows_forward(self.head, [flat])
+        self._cache = {"feat_cache": feat_cache, "layers": layer_caches,
+                       "flat": flat, "T": T, "head_cache": head_cache}
+        return logit_row[0][0]
+
+    def predict(self, feats):
+        return 1.0 / (1.0 + math.exp(-self.forward(feats)))
+
+    # ---------- 损失与反向 ----------
+
+    def loss_and_backward(self, feats, target):
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not (0.0 <= float(target) <= 1.0):
+            raise ValueError("AutoInt: target 必须在 [0, 1] 内")
+        target = float(target)
+        logit = self.forward(feats)
+        # 数值稳定的 sigmoid/BCE
+        if logit >= 0:
+            e = math.exp(-logit)
+            prob = 1.0 / (1.0 + e)
+            loss = logit + math.log1p(e) - target * logit
+        else:
+            e = math.exp(logit)
+            prob = e / (1.0 + e)
+            loss = math.log1p(e) - target * logit
+        dlogit = prob - target
+        gw, gb, d_flat = _dense_rows_backward(self.head, self._cache["head_cache"], [[dlogit]])
+        self._grads = {"head": (gw, gb), "feat_emb": None, "layers": [None] * self.num_layers}
+        d_rows = [d_flat[0][i * self.d_model:(i + 1) * self.d_model]
+                  for i in range(self.num_features)]
+        for li in range(self.num_layers - 1, -1, -1):
+            lc = self._cache["layers"][li]
+            layer = self.layers[li]
+            d_g = d_rows
+            # FFN 分支
+            gw2, gb2, d_a1 = _dense_rows_backward(layer["W2"], lc["f2c"], d_g)
+            d_h = [list(d_g[i]) for i in range(len(d_g))]
+            d_z = [d_a1[i][t] * (1.0 if lc["a1"][i][t] > 0.0 else 0.0)
+                   for i in range(len(d_a1)) for t in range(len(d_a1[i]))]
+            d_z = [d_z[i * self.d_ff:(i + 1) * self.d_ff] for i in range(len(d_a1))]
+            gw1, gb1, d_h_in = _dense_rows_backward(layer["W1"], lc["a1c"], d_z)
+            for i in range(len(d_h)):
+                for t in range(self.d_model):
+                    d_h[i][t] += d_h_in[i][t]
+            # 注意力分支
+            gw_o, gb_o, d_o = _dense_rows_backward(layer["Wo"], lc["oc"], d_h)
+            n = len(d_o)
+            d_q = [[0.0] * self.d_model for _ in range(n)]
+            d_k = [[0.0] * self.d_model for _ in range(n)]
+            d_v = [[0.0] * self.d_model for _ in range(n)]
+            for i in range(n):
+                d_attn = [sum(d_o[i][t] * lc["v"][j][t] for t in range(self.d_model))
+                          for j in range(n)]
+                dot = sum(lc["attn"][i][j] * d_attn[j] for j in range(n))
+                d_scores = [lc["attn"][i][j] * (d_attn[j] - dot) for j in range(n)]
+                for j in range(n):
+                    ds = d_scores[j] * lc["scale"]
+                    for t in range(self.d_model):
+                        d_q[i][t] += ds * lc["k"][j][t]
+                        d_k[j][t] += ds * lc["q"][i][t]
+                        d_v[j][t] += lc["attn"][i][j] * d_o[i][t]
+            gw_q, gb_q, d_q_in = _dense_rows_backward(layer["Wq"], lc["qc"], d_q)
+            gw_k, gb_k, d_k_in = _dense_rows_backward(layer["Wk"], lc["kc"], d_k)
+            gw_v, gb_v, d_v_in = _dense_rows_backward(layer["Wv"], lc["vc"], d_v)
+            d_T = [[d_h[i][t] + d_q_in[i][t] + d_k_in[i][t] + d_v_in[i][t]
+                    for t in range(self.d_model)] for i in range(n)]
+            self._grads["layers"][li] = {
+                "Wq": (gw_q, gb_q), "Wk": (gw_k, gb_k), "Wv": (gw_v, gb_v),
+                "Wo": (gw_o, gb_o), "W1": (gw1, gb1), "W2": (gw2, gb2),
+            }
+            d_rows = d_T
+        gw_e, gb_e, _ = _dense_rows_backward(self.feat_emb, self._cache["feat_cache"], d_rows)
+        self._grads["feat_emb"] = (gw_e, gb_e)
+        self.grads = self._grads
+        return loss
+
+    def zero_grad(self):
+        self.grads = None
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("AutoInt: lr 必须为正数")
+        if self.grads is None:
+            raise RuntimeError("AutoInt: 没有可用的梯度，请先反向传播")
+        _dense_apply_sgd(self.feat_emb, self.grads["feat_emb"], lr)
+        for li, layer in enumerate(self.layers):
+            for name in ("Wq", "Wk", "Wv", "Wo", "W1", "W2"):
+                _dense_apply_sgd(layer[name], self.grads["layers"][li][name], lr)
+        _dense_apply_sgd(self.head, self.grads["head"], lr)
+
+    def fit(self, features, targets, epochs=100, lr=0.05, seed=None, shuffle=True):
+        if (not isinstance(features, (list, tuple)) or not isinstance(targets, (list, tuple))
+                or not features or len(features) != len(targets)):
+            raise ValueError("AutoInt: features 与 targets 必须是非空且等长列表")
+        _ait_check_pos_int(epochs, "epochs")
+        checked = [_ait_check_features(f, self.num_features) for f in features]
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(checked)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(checked[idx], targets[idx])
+                self.sgd_step(lr)
+            history.append(total / len(checked))
+        return history
+
+    def param_count(self):
+        d, f = self.d_model, self.d_ff
+        count = (1 * d + d)  # feat_emb
+        per_layer = 4 * (d * d + d) + (d * f + f) + (f * d + d)
+        count += self.num_layers * per_layer
+        count += self.num_features * d + 1  # head
+        return count
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

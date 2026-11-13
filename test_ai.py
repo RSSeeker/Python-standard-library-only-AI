@@ -40414,3 +40414,87 @@ class TestBERT4Rec(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _ait_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+class TestAutoInt(unittest.TestCase):
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.AutoInt(num_features=3, d_model=4, d_ff=8, seed=1)
+        self.assertEqual(m.param_count(), 177)
+        logit = m.forward([0.5, -0.2, 1.0])
+        self.assertTrue(math.isfinite(logit))
+        prob = m.predict([0.5, -0.2, 1.0])
+        self.assertGreaterEqual(prob, 0.0)
+        self.assertLessEqual(prob, 1.0)
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.AutoInt(num_features=3, d_model=4, d_ff=8, seed=1)
+        feats = [0.5, -0.2, 1.0]
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-6):
+            m.loss_and_backward(feats, 1.0)
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = m.loss_and_backward(feats, 1.0)
+            param_setter(p0 - h)
+            lm = m.loss_and_backward(feats, 1.0)
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 2e-3, tag)
+
+        fd(lambda: m.grads["feat_emb"][0][0][0], lambda: m.feat_emb.weights[0][0],
+           lambda v: m.feat_emb.weights[0].__setitem__(0, v), "feat emb")
+        fd(lambda: m.grads["layers"][0]["Wq"][0][0][0], lambda: m.layers[0]["Wq"].weights[0][0],
+           lambda v: m.layers[0]["Wq"].weights[0].__setitem__(0, v), "Wq")
+        fd(lambda: m.grads["layers"][0]["Wo"][0][0][0], lambda: m.layers[0]["Wo"].weights[0][0],
+           lambda v: m.layers[0]["Wo"].weights[0].__setitem__(0, v), "Wo")
+        fd(lambda: m.grads["layers"][0]["W2"][0][0][0], lambda: m.layers[0]["W2"].weights[0][0],
+           lambda v: m.layers[0]["W2"].weights[0].__setitem__(0, v), "W2")
+        fd(lambda: m.grads["head"][0][0][0], lambda: m.head.weights[0][0],
+           lambda v: m.head.weights[0].__setitem__(0, v), "head")
+
+    def test_fit_xor(self):
+        random.seed(0)
+        data = [[1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]]
+        labels = [0.0, 1.0, 1.0, 0.0]
+        m = AI.AutoInt(num_features=3, d_model=8, d_ff=16, seed=2)
+        hist = m.fit(data, labels, epochs=400, lr=0.05, seed=1)
+        self.assertLess(hist[-1], hist[0] * 0.5)
+        preds = [1 if m.predict(d) > 0.5 else 0 for d in data]
+        self.assertEqual(preds, [0, 1, 1, 0])
+
+    def test_invalid_inputs(self):
+        _ait_raises(lambda: AI.AutoInt(num_features=0))
+        _ait_raises(lambda: AI.AutoInt(num_features=3, d_model=0))
+        _ait_raises(lambda: AI.AutoInt(num_features=3, seed=1.5))
+        m = AI.AutoInt(num_features=3, d_model=4, d_ff=8, seed=1)
+        _ait_raises(lambda: m.forward([1.0, 2.0]))
+        _ait_raises(lambda: m.forward([1.0, float("nan"), 2.0]))
+        _ait_raises(lambda: m.loss_and_backward([1.0, 2.0, 3.0], 2.0))
+        _ait_raises(lambda: m.sgd_step(0.0))
+        _ait_raises(lambda: AI.AutoInt(num_features=3, seed=3).sgd_step(0.01))
+        _ait_raises(lambda: m.fit([], []))
+        _ait_raises(lambda: m.fit([[1.0, 2.0, 3.0]], [0.0, 1.0]))
+        _ait_raises(lambda: m.fit([[1.0, 2.0, 3.0]], [0.5], epochs=0))
+
+
+if __name__ == "__main__":
+    unittest.main()

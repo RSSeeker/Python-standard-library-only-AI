@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2588 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2592 项）
 
 ## 特性
 
@@ -4008,6 +4008,29 @@ print(model.predict(image, start_id=1, max_new_tokens=4))  # 贪心解码
 
 测试：`TestTrOCR` 覆盖前向形状/参数量、卷积核与输出头梯度有限差分、两张图与标题的过拟合训练、非法输入。
 
+### AutoInt（自注意力特征交互）
+
+```python
+from AI import AutoInt
+
+model = AutoInt(num_features=8, d_model=16, d_ff=32, num_layers=1, seed=1)
+loss = model.loss_and_backward([0.5, -0.2, 1.0, 0.0, 0.3, -1.0, 2.0, 0.1], 1.0)
+history = model.fit(features, targets, epochs=100, lr=0.05, seed=1)
+prob = model.predict(features[0])
+```
+
+| API | 说明 |
+| --- | --- |
+| `AutoInt(num_features, d_model=8, d_ff=16, num_layers=1, seed=None)` | 每个标量特征经共享线性层嵌成 token，单头自注意力做特征交互 + 残差 + FFN，展平后接二分类头 |
+| `forward(feats)` | 返回 logit；`predict(feats)` 返回 sigmoid 概率 |
+| `loss_and_backward(feats, target)` | 二分类交叉熵（`target∈[0,1]` 支持软标签），反传注意力/FFN/嵌入/头，返回损失 |
+| `fit(features, targets, epochs, lr, seed, shuffle)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 嵌入 + 每层注意力/FFN + 头参数量 |
+
+边界：简化版 AutoInt——**单头**注意力、没有 LayerNorm/多头拼接/注意力残差投影；特征以标量
+输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
+无 batch/Adam/正则；注意力权重不做可视化导出。
+
 ### 序列推荐（SASRec）
 
 | 接口 | 说明 |
@@ -5642,7 +5665,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2588 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2592 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5841,6 +5864,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFitMixedPrecision` | fp16 批量训练收敛、bf16 逐样本 batch、两种 fp8 格式能跑、无 shuffle 的 batch 数、非法输入（模型/dtype/scale/lr/epochs/batch_size/维度/类型） |
 | `TestBERT4Rec` | 前向形状与 param_count（702）、mask 可复现、输出层/嵌入权重中心差分、固定序列 fit 损失下降、非法 token/长度/参数 |
 | `TestSASRec` | 前向形状与 param_count（226）、因果前缀不变性、输出层/嵌入权重中心差分、固定转移序列可学会、预测排除 padding、非法 token/长度/参数 |
+| `TestAutoInt` | 前向/param_count（177）、嵌入/注意力/FFN/头权重中心差分、XOR 型特征交叉可学会、非法输入 |
 | `TestDCNv2` | logit/概率/损失、交叉层两处权重中心差分、深侧 MLP 与线性项梯度、XOR 型目标可学会、非法输入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
@@ -6105,6 +6129,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2588 个单元测试
+├── test_ai.py       # 2592 个单元测试
 └── README.md
 ```
