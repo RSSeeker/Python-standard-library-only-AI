@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2473 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2478 项）
 
 ## 特性
 
@@ -2120,6 +2120,36 @@ tox = toxicity_score(tokens, banned_words)    # {"score","flagged"}
 | `toxicity_score(tokens, lexicon)` | 命中毒性词表比例与命中下标 |
 
 - 边界：pass@k 为无偏组合估计而非置信区间；PRM 聚合只看逐步分数、不训练 PRM；verifier 排序假设分数已由外部模型给出；毒性只做词表匹配（不做语义/上下文判断）。
+
+### PRM 训练（逐步奖励模型 / PRMTrainer）
+
+`PRMTrainer` 把「逐步特征 + 步级 0/1 标签」训练成可打分的 PRM：内部是单隐层 MLP，
+用 BCE 逐步训练；训练完用 `score_sequence` 复用 `prm_aggregate` 把一段推理的逐步
+概率聚合成一个分数。
+
+```python
+trainer = PRMTrainer(feature_dim=2, hidden=(8,), lr=0.2, seed=1)
+feats = [[1.0, 0.0], [-1.0, 0.0], [0.9, 0.1]]
+labels = [1.0, 0.0, 1.0]
+hist = trainer.fit(feats, labels, epochs=50)
+print(hist[-1]["loss"])
+print(trainer.scores(feats))
+print(trainer.score_sequence(feats, mode="mean"))
+trainer2, hist2 = prm_train(feats, labels, 2, epochs=30)
+```
+
+| API | 说明 |
+| --- | --- |
+| `PRMTrainer(feature_dim, hidden=(16,), lr=0.01, seed=None)` | 构造逐步奖励模型；特征由调用方编码（隐状态/动作特征等） |
+| `PRMTrainer.scores(features)` | 每一步的正确概率（sigmoid） |
+| `PRMTrainer.bce_loss_and_grads(features, labels, eps=1e-12)` | 平均 BCE 与逐层平均梯度（支持软标签） |
+| `PRMTrainer.train_step(features, labels)` | 一步 SGD，返回该步 BCE |
+| `PRMTrainer.fit(features, labels, epochs=50, lr=None, shuffle=False, seed=None)` | 训练并返回每轮 loss 历史 |
+| `PRMTrainer.score_sequence(step_features, mode="mean", discount=1.0)` | 逐步概率聚合成序列分数 |
+| `prm_train(features, labels, feature_dim, ...)` | 便捷函数，返回 `(trainer, history)` |
+
+- 边界：特征编码由调用方决定（不把 token/隐状态接进本片段）；训练目标只是逐步 BCE，
+  不包含与策略的联合训练/奖励回灌；标签支持 [0,1] 软标签，不支持多分类。
 
 ### Agent 工具注册与 ReAct 解析（ToolRegistry / react_episode）
 
@@ -5137,7 +5167,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2473 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2478 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5452,6 +5482,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
 | `TestOnnxImport` | 导出→导入参数/前向逐位一致、softmax 输出往返、写文件路径往返、非法字节与结构校验 |
+| `TestPRMTrainer` | BCE 梯度中心差分、可分离标签拟合并排序、序列聚合复用、便捷函数、非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
@@ -5574,6 +5605,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2473 个单元测试
+├── test_ai.py       # 2478 个单元测试
 └── README.md
 ```

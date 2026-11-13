@@ -9285,6 +9285,180 @@ def import_onnx_mlp(data):
     return model
 
 
+"""PRM（Process Reward Model）训练管道：逐步特征 + 步级标签 → BCE 训练 → 序列打分
+
+现有 `prm_aggregate` 只做「已有一组步分数」的聚合；这里补上从数据到可训练打模型的
+最小闭环：每一步用调用方提供的特征（例如「隐状态 + 动作 token 特征」）作为输入，
+逐步标签 0/1 表示该步正确与否，`PRMTrainer` 用逻辑回归（单隐层 MLP）做 BCE 训练，
+并可用 `score_sequence` 把一步分数聚合成长程分数。策略联合训练（把 PRM 分数当
+奖励回灌策略）不在本片段内，需调用方自行组织 RL 循环。
+"""
+
+
+def _prm_sigmoid(z):
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+def _prm_check_features(features, dim):
+    if not isinstance(features, (list, tuple)) or not features:
+        raise ValueError("PRM: features 必须是非空的行列表")
+    out = []
+    for r, row in enumerate(features):
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("PRM: features 第 %d 行必须是数字列表" % r)
+        if len(row) != dim:
+            raise ValueError("PRM: features 第 %d 行长度必须是 %d" % (r, dim))
+        vals = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(float(v))):
+                raise ValueError("PRM: features 必须只包含有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _prm_check_labels(labels, n):
+    if not isinstance(labels, (list, tuple)) or len(labels) != n:
+        raise ValueError("PRM: labels 长度必须与 features 一致")
+    out = []
+    for v in labels:
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(float(v))):
+            raise ValueError("PRM: labels 必须只包含有限数字")
+        if not (0.0 <= float(v) <= 1.0):
+            raise ValueError("PRM: labels 必须在 [0,1]")
+        out.append(float(v))
+    return out
+
+
+class PRMTrainer:
+    """逐步奖励模型：特征 → sigmoid 正确概率，用加权 BCE 训练单隐层 MLP。
+
+    特征由调用方决定（常用：该步的隐状态、动作 token 的嵌入、前缀长度等）。
+    训练完可对一段推理的逐步概率调用 `score_sequence` 聚合。
+    """
+
+    def __init__(self, feature_dim: int, hidden=(16,), lr: float = 0.01,
+                 seed=None):
+        if (not isinstance(feature_dim, int) or isinstance(feature_dim, bool)
+                or feature_dim < 1):
+            raise ValueError("PRM: feature_dim 必须是正整数")
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("PRM: hidden 必须是非空元组/列表")
+        hid = []
+        for h in hidden:
+            if isinstance(h, bool) or not isinstance(h, int) or h < 1:
+                raise ValueError("PRM: hidden 只能是正整数")
+            hid.append(h)
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or not math.isfinite(float(lr)) or float(lr) <= 0.0):
+            raise ValueError("PRM: lr 必须是正有限数字")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("PRM: seed 必须是整数或 None")
+        self.feature_dim = feature_dim
+        self.hidden = tuple(hid)
+        self.lr = float(lr)
+        sizes = [feature_dim] + hid + [1]
+        acts = ["relu"] * len(hid) + ["linear"]
+        self.model = MLP(sizes, activations=acts)
+        self.loss_history = []
+
+    # ---------- 前向 ----------
+
+    def scores(self, features):
+        """返回每一步的「正确概率」（0~1 的列表）。"""
+        rows = _prm_check_features(features, self.feature_dim)
+        out = []
+        for row in rows:
+            logit = self.model.forward(row)[0]
+            out.append(_prm_sigmoid(logit))
+        return out
+
+    def score_sequence(self, step_features, mode: str = "mean", discount: float = 1.0):
+        """把一段推理的逐步特征聚合成一个分数，复用 `prm_aggregate`。"""
+        return prm_aggregate(self.scores(step_features), mode=mode, discount=discount)
+
+    # ---------- BCE 与梯度 ----------
+
+    def bce_loss_and_grads(self, features, labels, eps: float = 1e-12):
+        """返回（平均 BCE loss, 每层 (grad_w, grad_b) 平均梯度）。
+
+        对每一步：p = sigmoid(logit)，dL/dlogit = (p - y)/n；用 `_mlp_backward_with_input`
+        回传并累加。标签可以是软标签（[0,1] 内任意实数）。
+        """
+        rows = _prm_check_features(features, self.feature_dim)
+        ys = _prm_check_labels(labels, len(rows))
+        if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+                or not math.isfinite(float(eps)) or not (0.0 < float(eps) < 0.5)):
+            raise ValueError("PRM: eps 必须在 (0,0.5) 内")
+        n = len(rows)
+        acc_w = _mlp_zero_grads(self.model)
+        acc_b = _mlp_acc_bias(self.model)
+        total = 0.0
+        for row, y in zip(rows, ys):
+            logit = self.model.forward(row)[0]
+            p = _prm_sigmoid(logit)
+            pc = min(max(p, eps), 1.0 - eps)
+            total += -(y * math.log(pc) + (1.0 - y) * math.log(1.0 - pc))
+            grads, _ = _mlp_backward_with_input(self.model, [(p - y) / n])
+            _mlp_accumulate(acc_w, acc_b, grads)
+        return total / n, [(acc_w[i], acc_b[i]) for i in range(len(self.model.layers))]
+
+    def train_step(self, features, labels):
+        """一步梯度下降；返回该步的 BCE loss。"""
+        loss, grads = self.bce_loss_and_grads(features, labels)
+        for layer, (gw, gb) in zip(self.model.layers, grads):
+            for j in range(layer.fan_out):
+                wrow = layer.weights[j]
+                grow = gw[j]
+                for k in range(layer.fan_in):
+                    wrow[k] -= self.lr * grow[k]
+                layer.biases[j] -= self.lr * gb[j]
+        return loss
+
+    def fit(self, features, labels, epochs: int = 50, lr=None,
+            shuffle: bool = False, seed=None):
+        """训练若干 epoch，返回每轮平均 loss 的历史。"""
+        rows = _prm_check_features(features, self.feature_dim)
+        ys = _prm_check_labels(labels, len(rows))
+        if (not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1):
+            raise ValueError("PRM: epochs 必须是正整数")
+        if lr is not None:
+            if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                    or not math.isfinite(float(lr)) or float(lr) <= 0.0):
+                raise ValueError("PRM: lr 必须是正有限数字")
+            self.lr = float(lr)
+        if not isinstance(shuffle, bool):
+            raise ValueError("PRM: shuffle 必须是布尔值")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("PRM: seed 必须是整数或 None")
+        order = list(range(len(rows)))
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(order)
+        history = []
+        for _ in range(epochs):
+            total = 0.0
+            for i in order:
+                total += self.train_step([rows[i]], [ys[i]])
+            mean_loss = total / len(rows)
+            history.append({"loss": mean_loss})
+        self.loss_history.extend(history)
+        return history
+
+
+def prm_train(features, labels, feature_dim: int, hidden=(16,), lr: float = 0.01,
+              epochs: int = 50, seed=None, shuffle: bool = False):
+    """便捷函数：建 `PRMTrainer` 并训练，返回 (trainer, history)。"""
+    trainer = PRMTrainer(feature_dim, hidden=hidden, lr=lr, seed=seed)
+    history = trainer.fit(features, labels, epochs=epochs, shuffle=shuffle, seed=seed)
+    return trainer, history
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

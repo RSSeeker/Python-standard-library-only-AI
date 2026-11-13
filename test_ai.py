@@ -37898,3 +37898,108 @@ class TestOnnxImport:
                 _j_raises(lambda: AI.import_onnx_mlp(b"stub"))
         finally:
             AI.onnx_mlp_to_dict = real
+
+
+"""B11 PRM 训练管道测试：BCE 梯度、可分离拟合、序列聚合、非法输入。"""
+import math
+import AI
+
+
+def _k_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % exc.__name__)
+
+
+def _k_close(a, b, tol=1e-5):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def _k_make_trainer(lr=0.05, seed=3):
+    t = AI.PRMTrainer(2, hidden=(3,), lr=lr, seed=seed)
+    for li, layer in enumerate(t.model.layers):
+        for r in range(layer.fan_out):
+            for c in range(layer.fan_in):
+                layer.weights[r][c] = 0.2 * (li + 1) * (r + 1) - 0.1 * c
+            layer.biases[r] = 0.03 * (r - 1)
+    return t
+
+
+class TestPRMTrainer:
+    def test_scores_shapes_and_range(self):
+        t = _k_make_trainer()
+        xs = [[0.5, -1.0], [1.2, 0.3], [-0.4, 0.8]]
+        s = t.scores(xs)
+        assert len(s) == 3
+        assert all(0.0 <= v <= 1.0 for v in s)
+        seq_score = t.score_sequence(xs, mode="mean")
+        assert _k_close(seq_score, sum(s) / 3)
+        assert t.score_sequence(xs, mode="min") == min(s)
+        assert t.score_sequence(xs, mode="last") == s[-1]
+        assert 0.0 <= t.score_sequence(xs, mode="discounted", discount=0.9) <= 1.0
+
+    def test_bce_gradient_matches_finite_difference(self):
+        t = _k_make_trainer()
+        xs = [[0.5, -1.0], [1.2, 0.3], [-0.4, 0.8]]
+        ys = [1.0, 0.0, 1.0]
+        loss, grads = t.bce_loss_and_grads(xs, ys)
+        assert loss > 0.0
+        assert len(grads) == 2
+        for li, layer in enumerate(t.model.layers):
+            for (j, k) in [(0, 0), (0, min(1, layer.fan_in - 1))]:
+                old = layer.weights[j][k]
+                layer.weights[j][k] = old + 1e-5
+                lp = t.bce_loss_and_grads(xs, ys)[0]
+                layer.weights[j][k] = old - 1e-5
+                lm = t.bce_loss_and_grads(xs, ys)[0]
+                layer.weights[j][k] = old
+                num = (lp - lm) / 2e-5
+                assert _k_close(grads[li][0][j][k], num, 1e-4)
+        layer = t.model.layers[0]
+        old = layer.biases[0]
+        layer.biases[0] = old + 1e-5
+        lp = t.bce_loss_and_grads(xs, ys)[0]
+        layer.biases[0] = old - 1e-5
+        lm = t.bce_loss_and_grads(xs, ys)[0]
+        layer.biases[0] = old
+        assert _k_close(grads[0][1][0], (lp - lm) / 2e-5, 1e-4)
+
+    def test_fit_separable_labels(self):
+        xs = [[1.0, 0.0], [0.9, 0.1], [1.2, -0.1], [1.1, 0.2],
+              [-1.0, 0.0], [-0.9, -0.1], [-1.2, 0.1], [-1.1, -0.2]]
+        ys = [1.0] * 4 + [0.0] * 4
+        t = AI.PRMTrainer(2, hidden=(8,), lr=0.2, seed=7)
+        hist = t.fit(xs, ys, epochs=120)
+        assert hist[-1]["loss"] < hist[0]["loss"] * 0.25
+        probs = t.scores(xs)
+        assert sum(probs[:4]) / 4 > sum(probs[4:]) / 4 + 0.3
+        assert len(t.loss_history) == 120
+
+    def test_prm_train_convenience(self):
+        xs = [[1.0, 0.0], [0.9, 0.1], [-1.0, 0.0], [-0.9, -0.1]]
+        ys = [1.0, 1.0, 0.0, 0.0]
+        trainer, hist = AI.prm_train(xs, ys, 2, hidden=(4,), lr=0.3,
+                                     epochs=30, seed=1)
+        assert isinstance(trainer, AI.PRMTrainer)
+        assert hist[-1]["loss"] < hist[0]["loss"]
+        assert trainer.model.layers[0].fan_in == 2
+
+    def test_invalid_inputs(self):
+        _k_raises(lambda: AI.PRMTrainer(0))
+        _k_raises(lambda: AI.PRMTrainer(2, hidden=()))
+        _k_raises(lambda: AI.PRMTrainer(2, lr=0.0))
+        _k_raises(lambda: AI.PRMTrainer(2, seed=1.5))
+        t = _k_make_trainer()
+        _k_raises(lambda: t.scores([]))
+        _k_raises(lambda: t.scores([[1.0]]))
+        _k_raises(lambda: t.scores([1.0]))
+        _k_raises(lambda: t.scores([[1.0, float("nan")]]))
+        xs = [[0.5, -1.0], [1.2, 0.3]]
+        _k_raises(lambda: t.bce_loss_and_grads(xs, [1.0]))
+        _k_raises(lambda: t.bce_loss_and_grads(xs, [1.5, 0.0]))
+        _k_raises(lambda: t.bce_loss_and_grads(xs, [1.0, 0.0], eps=0.0))
+        _k_raises(lambda: t.fit(xs, [1.0, 0.0], epochs=0))
+        _k_raises(lambda: t.fit(xs, [1.0, 0.0], shuffle=1))
+        _k_raises(lambda: t.score_sequence(xs, mode="max"))
