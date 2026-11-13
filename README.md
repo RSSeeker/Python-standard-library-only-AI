@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2532 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2536 项）
 
 ## 特性
 
@@ -255,6 +255,8 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 |---|---|
 | `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同**；`release=True` 时每段结束丢弃 `input/z/a`，真正把激活峰值压到 O(段数) |
 | `checkpoint_transformer(encoder, x_seq, dout_seq, segments=2)` | TransformerEncoder 版梯度检查点：前向只保留段边界，段内每层 Q/K/V、注意力权重与 FFN 中间激活全部释放；反向逐段重放并逐层回传，参数梯度累积回各层；与 `encoder.forward`+`backward` 逐位相同 |
+| `checkpoint_causal_lm_backward(model, ids, segments=2)` | 用检查点反传单条序列：输出头/嵌入层与 `CausalLM._loss_and_backward` 相同，中间 Transformer 层走 `checkpoint_transformer`；返回平均交叉熵并累积梯度 |
+| `fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2, seed=None, shuffle=True)` | 把梯度检查点接进 CausalLM 训练循环：逐序列 `zero_grad → checkpoint_causal_lm_backward → adam_step`，返回每个 epoch 的平均损失 |
 | `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`\|v\| > 65504` 返回 `inf`，低于次正规返回 0 |
 | `bf16_round(value)` | 舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even） |
 | `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
@@ -266,7 +268,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 诚实说明三点：本库的 `Layer` 默认只缓存最后一次前向的输入（O(层数) 份），
 `checkpoint_grads(release=False)` 只实现重放机制本身、并不省内存；`release=True`
 会在每段前向结束后清掉段内层的 `input/z/a`，反向重放时再重建，因此峰值激活
-降到 O(段数) 份边界激活 + 当前段缓存——这是真正省内存的路径（仍用时间换空间）。
+降到 O(段数) 份边界激活 + 当前段缓存——这是真正省内存的路径（仍用时间换空间）。`checkpoint_causal_lm_backward` / `fit_causal_lm_checkpointed` 把这一机制接进 CausalLM 的完整训练循环（与 `_loss_and_backward` 数值一致）。
 混合精度部分**只模拟舍入**，不做半精度矩阵乘，因此速度不会变快。
 
 `loss scaling` 的意义可以实测出来：`fp16` 的最小次正规约 `5.96e-8`，梯度 `1e-9` 直接
@@ -5300,7 +5302,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2532 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2536 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5501,6 +5503,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDCNv2` | logit/概率/损失、交叉层两处权重中心差分、深侧 MLP 与线性项梯度、XOR 型目标可学会、非法输入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
+| `TestCheckpointedCausalLM` | 检查点反传与 `CausalLM._loss_and_backward` 的 loss/输出头/嵌入梯度一致、`segments=1/3` 结果相同、`fit_causal_lm_checkpointed` loss 下降、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5749,6 +5752,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2532 个单元测试
+├── test_ai.py       # 2536 个单元测试
 └── README.md
 ```

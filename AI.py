@@ -10728,6 +10728,121 @@ class DeepONet2D:
             history.append(total / len(clean))
         return history
 
+# ---------------------------------------------------------------------------
+# 梯度检查点接入训练循环（CausalLM）
+# ---------------------------------------------------------------------------
+
+
+def _ckpt_fit_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"checkpoint_fit: {name} 必须是正整数")
+    return value
+
+
+def _ckpt_fit_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"checkpoint_fit: {name} 必须是有限数字")
+    return float(value)
+
+
+def _ckpt_fit_check_lm(model, who="model"):
+    required = ("embedding", "pos", "encoder", "W_out", "b_out", "grads",
+                "zero_grad", "forward", "adam_step", "d_model", "vocab_size")
+    for name in required:
+        if not hasattr(model, name):
+            raise ValueError(f"checkpoint_fit: {who} 必须是 CausalLM（缺少 {name}）")
+    return model
+
+
+def checkpoint_causal_lm_backward(model, ids, segments=2):
+    """用梯度检查点反向传播单条序列，返回平均交叉熵并累积全部梯度。
+
+    与 ``CausalLM._loss_and_backward(ids)`` 数值等价：输出头/嵌入层梯度相同，
+    中间 Transformer 层通过 ``checkpoint_transformer`` 分段重放反传。
+    """
+    model = _ckpt_fit_check_lm(model)
+    if not isinstance(ids, list) or len(ids) < 2:
+        raise ValueError("checkpoint_fit: ids 必须是至少 2 个 token 的列表")
+    segments = _ckpt_fit_check_pos_int(segments, "segments")
+    n = len(ids) - 1
+    logits = model.forward(ids[:-1])
+    d_logits = []
+    loss = 0.0
+    for t in range(n):
+        probs = _softmax_row(logits[t])
+        target = ids[t + 1]
+        p = probs[target]
+        loss += -math.log(p if p > 1e-12 else 1e-12)
+        row = list(probs)
+        row[target] -= 1.0
+        d_logits.append(row)
+    loss /= n
+    inv = 1.0 / n
+    d_logits = [[v * inv for v in row] for row in d_logits]
+
+    h = model.h
+    seq_len = len(h)
+    for v in range(model.vocab_size):
+        g_row = model.grads["W_out"][v]
+        gb = 0.0
+        for t in range(seq_len):
+            d = d_logits[t][v]
+            gb += d
+            ht = h[t]
+            for j in range(model.d_model):
+                g_row[j] += d * ht[j]
+        model.grads["b_out"][v] += gb
+    dh = [[0.0] * model.d_model for _ in range(seq_len)]
+    for t in range(seq_len):
+        dl = d_logits[t]
+        for j in range(model.d_model):
+            s = 0.0
+            for v in range(model.vocab_size):
+                s += dl[v] * model.W_out[v][j]
+            dh[t][j] = s
+
+    emb = model.embedding.forward(ids[:-1])
+    x = model.pos.forward(emb) if model.use_abs_pos else emb
+    d_seq = checkpoint_transformer(model.encoder, x, dh, segments=segments)
+    model.embedding.backward(d_seq)
+    return loss
+
+
+def fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2,
+                               seed=None, shuffle=True):
+    """用梯度检查点训练 CausalLM：逐序列反向 + Adam，返回每个 epoch 的平均损失。
+
+    ``segments`` 把 Transformer 层切成几段，前向只保留段边界，反向时逐段重放。
+    """
+    model = _ckpt_fit_check_lm(model)
+    if (not isinstance(sequences, (list, tuple)) or not sequences):
+        raise ValueError("checkpoint_fit: sequences 必须是非空列表")
+    epochs = _ckpt_fit_check_pos_int(epochs, "epochs")
+    lr = _ckpt_fit_check_pos_number(lr, "lr")
+    if lr <= 0.0:
+        raise ValueError("checkpoint_fit: lr 必须为正数")
+    segments = _ckpt_fit_check_pos_int(segments, "segments")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("checkpoint_fit: seed 必须是整数或 None")
+    clean = []
+    for seq in sequences:
+        if not isinstance(seq, (list, tuple)) or len(seq) < 2:
+            raise ValueError("checkpoint_fit: 每条序列至少需要 2 个 token")
+        clean.append(list(seq))
+    rng = random.Random(seed)
+    order = list(range(len(clean)))
+    history = []
+    for _ in range(epochs):
+        if shuffle:
+            rng.shuffle(order)
+        total = 0.0
+        for idx in order:
+            model.zero_grad()
+            total += checkpoint_causal_lm_backward(model, clean[idx], segments=segments)
+            model.adam_step(lr)
+        history.append(total / len(clean))
+    return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

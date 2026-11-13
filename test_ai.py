@@ -39041,3 +39041,75 @@ class TestDeepONet2D:
         assert _don2_raises(lambda: m.fit([([1.0, 1.0, 1.0], [0.5, 0.5], 1.0)], lr=0.0))
         assert _don2_raises(lambda: m.fit([([1.0], [0.5, 0.5], 1.0)]))
         assert _don2_raises(lambda: m.fit([([1.0, 1.0, 1.0], [0.5, 0.5])]))
+
+
+def _ckpt_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestCheckpointedCausalLM:
+    def test_backward_matches_normal(self):
+        random.seed(4)
+        m = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=2, max_len=8)
+        ids = [1, 2, 3, 4]
+        m.zero_grad()
+        loss1 = m._loss_and_backward(ids)
+        w1 = [[v for v in row] for row in m.grads["W_out"]]
+        b1 = list(m.grads["b_out"])
+        e1 = [[v for v in row] for row in m.embedding.grad_weight]
+        m.zero_grad()
+        loss2 = AI.checkpoint_causal_lm_backward(m, ids, segments=2)
+        assert abs(loss1 - loss2) < 1e-12
+        for v in range(6):
+            assert b1[v] == m.grads["b_out"][v]
+            for j in range(8):
+                assert abs(w1[v][j] - m.grads["W_out"][v][j]) < 1e-15
+        for idx in range(len(e1)):
+            for j in range(8):
+                assert abs(e1[idx][j] - m.embedding.grad_weight[idx][j]) < 1e-15
+
+    def test_segments_consistency(self):
+        random.seed(5)
+        m = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=3, max_len=8)
+        ids = [2, 3, 1, 4, 5]
+        m.zero_grad()
+        l1 = AI.checkpoint_causal_lm_backward(m, ids, segments=1)
+        w1 = [[v for v in row] for row in m.grads["W_out"]]
+        m.zero_grad()
+        l2 = AI.checkpoint_causal_lm_backward(m, ids, segments=3)
+        assert abs(l1 - l2) < 1e-12
+        for v in range(6):
+            for j in range(8):
+                assert abs(w1[v][j] - m.grads["W_out"][v][j]) < 1e-15
+
+    def test_fit_reduces_loss(self):
+        random.seed(6)
+        m = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=2, max_len=8)
+        seqs = [[1, 2, 3, 4], [2, 3, 4, 5], [1, 3, 5, 2]]
+        history = AI.fit_causal_lm_checkpointed(m, seqs, epochs=40, lr=0.05,
+                                                segments=2, seed=1)
+        assert len(history) == 40
+        assert history[-1] < history[0] * 0.8
+
+    def test_invalid_inputs(self):
+        m = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=2, max_len=8)
+        assert _ckpt_raises(lambda: AI.checkpoint_causal_lm_backward(m, []))
+        assert _ckpt_raises(lambda: AI.checkpoint_causal_lm_backward(m, [1]))
+        assert _ckpt_raises(lambda: AI.checkpoint_causal_lm_backward(m, [1, 2], segments=0))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, []))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1]]))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], epochs=0))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], lr=0.0))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], lr=float("nan")))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], segments=0))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], seed="a"))
+        assert _ckpt_raises(lambda: AI.checkpoint_causal_lm_backward("x", [1, 2]))
+        assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed("x", [[1, 2]]))
