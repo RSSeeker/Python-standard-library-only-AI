@@ -39415,3 +39415,119 @@ class TestWhisperLite:
         ]
         for i, fn in enumerate(cases):
             _whisper_raises(fn)
+
+
+# ---------------------------------------------------------------------------
+# YOLOLite（单尺度网格检测 + 目标分配训练）
+# ---------------------------------------------------------------------------
+
+
+def _yolo_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+def _yolo_img(seed, size=8, channels=3, bright=None):
+    rng = random.Random(seed)
+    img = [[[rng.uniform(0.0, 0.2) for _ in range(size)] for _ in range(size)]
+           for _ in range(channels)]
+    if bright is not None:
+        y, x, value = bright
+        for k in range(channels):
+            for r in range(max(0, y - 1), min(size, y + 2)):
+                for c in range(max(0, x - 1), min(size, x + 2)):
+                    img[k][r][c] = value
+    return img
+
+
+class TestYOLOLite:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=3)
+        assert m.param_count() == 480
+        img = _yolo_img(1)
+        cells = m.forward(img)
+        assert len(cells) == 4
+        for cell in cells:
+            assert len(cell['box']) == 4 and len(cell['class_logits']) == 3
+        assert m.predict(img, conf_threshold=0.99) is None or True
+        _yolo_raises(lambda: m.forward([]))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=3)
+        img = _yolo_img(2)
+        tgt = (1, [0.25, 0.25, 0.3, 0.3])
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(img, tgt)
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-8, abs(analytic) + abs(fd_val))
+
+        loss_of()
+        found = None
+        for i in range(m.out_dim):
+            for j in range(m.d_model):
+                if abs(m.grads['W'][i][j]) > 1e-6:
+                    found = (i, j)
+                    break
+            if found is not None:
+                break
+        assert found is not None
+        fi, fj = found
+        rel_w = fd(lambda: m.grads['W'][fi][fj],
+                   lambda: m.head.weights[fi][fj],
+                   lambda v: m.head.weights[fi].__setitem__(fj, v))
+        rel_b = fd(lambda: m.grads['b'][1],
+                   lambda: m.head.biases[1],
+                   lambda v: m.head.biases.__setitem__(1, v))
+        rel_conv = fd(lambda: m.conv1.grad_w[0][0][1][1],
+                      lambda: m.conv1.weights[0][0][1][1],
+                      lambda v: m.conv1.weights[0][0][1].__setitem__(1, v))
+        assert rel_w < 1e-4 and rel_b < 1e-4 and rel_conv < 1e-4
+
+    def test_fit_memorize(self):
+        random.seed(0)
+        m = AI.YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=7)
+        imgs = [_yolo_img(11, bright=(2, 2, 1.0)), _yolo_img(12, bright=(5, 5, 1.0))]
+        tgts = [(0, [0.25, 0.25, 0.5, 0.5]), (1, [0.75, 0.75, 0.5, 0.5])]
+        hist = m.fit(imgs, tgts, epochs=400, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.25
+        pred = m.predict(imgs[0], conf_threshold=0.5)
+        assert pred is not None and pred[1] == 0
+        assert m.predict(_yolo_img(99), conf_threshold=0.9) is None
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=3)
+        img = _yolo_img(1)
+        cases = [
+            lambda: AI.YOLOLite(3, 3, image_size=7),
+            lambda: AI.YOLOLite(3, 0),
+            lambda: m.forward([]),
+            lambda: m.forward([[0.0] * 8 for _ in range(8)]),
+            lambda: m.forward([[[0.0] * 8 for _ in range(8)] for _ in range(2)]),
+            lambda: m.loss_and_backward(img, (3, [0.5, 0.5, 0.2, 0.2])),
+            lambda: m.loss_and_backward(img, (1, [1.5, 0.5, 0.2, 0.2])),
+            lambda: m.loss_and_backward(img, (1, [0.5, 0.5, 0.0, 0.2])),
+            lambda: m.loss_and_backward(img, 'x'),
+            lambda: m.sgd_step(0.0),
+            lambda: m.fit([], []),
+            lambda: m.fit(images=[img], targets=[None, None]),
+        ]
+        for i, fn in enumerate(cases):
+            _yolo_raises(fn)

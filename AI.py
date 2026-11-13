@@ -11539,6 +11539,236 @@ class WhisperLite:
             history.append(total / len(mels))
         return history
 
+# ---------------------------------------------------------------------------
+# YOLO-lite（单尺度网格检测 + 目标分配训练循环，简化版）
+# ---------------------------------------------------------------------------
+
+
+def _yolo_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"YOLOLite: {name} 必须是正整数")
+    return value
+
+
+def _yolo_sigmoid(v):
+    if v >= 0:
+        return 1.0 / (1.0 + math.exp(-v))
+    e = math.exp(v)
+    return e / (1.0 + e)
+
+
+def _yolo_log_sigmoid(v):
+    # log(sigmoid(v))，数值稳定
+    if v >= 0:
+        return -math.log1p(math.exp(-v))
+    return v - math.log1p(math.exp(v))
+
+
+class YOLOLite:
+    """两层 stride-2 卷积 backbone + 逐网格单元检测头，训练时只让中心所在单元负责。"""
+
+    def __init__(self, in_channels=3, num_classes=3, image_size=8, base=4, seed=None):
+        self.in_channels = _yolo_check_pos_int(in_channels, "in_channels")
+        self.num_classes = _yolo_check_pos_int(num_classes, "num_classes")
+        self.image_size = _yolo_check_pos_int(image_size, "image_size")
+        self.base = _yolo_check_pos_int(base, "base")
+        if self.image_size % 4 != 0:
+            raise ValueError("YOLOLite: image_size 必须能被 4 整除（两层 stride-2）")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("YOLOLite: seed 必须是整数或 None")
+        self.grid = self.image_size // 4
+        self.cell = self.image_size // self.grid
+        self.d_model = self.base * 2
+        self.out_dim = 5 + self.num_classes
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.conv1 = Conv2d(self.in_channels, self.base, 3, stride=2, padding=1)
+            self.conv2 = Conv2d(self.base, self.d_model, 3, stride=2, padding=1)
+            self.head = Layer(self.d_model, self.out_dim, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.conv1.zero_grad()
+        self.conv2.zero_grad()
+        self.grads = {"W": [[0.0] * self.d_model for _ in range(self.out_dim)],
+                      "b": [0.0 for _ in range(self.out_dim)]}
+
+    def param_count(self):
+        c1 = self.conv1.out_channels * self.conv1.cg * 9 + self.conv1.out_channels
+        c2 = self.conv2.out_channels * self.conv2.cg * 9 + self.conv2.out_channels
+        return c1 + c2 + self.out_dim * (self.d_model + 1)
+
+    def _check_image(self, image):
+        if (not isinstance(image, (list, tuple)) or len(image) != self.in_channels):
+            raise ValueError(f"YOLOLite: image 必须是 {self.in_channels} 通道的 (C,H,W) 列表")
+        for ch in image:
+            if not isinstance(ch, (list, tuple)) or len(ch) != self.image_size:
+                raise ValueError(f"YOLOLite: image 高度必须是 {self.image_size}")
+            for row in ch:
+                if not isinstance(row, (list, tuple)) or len(row) != self.image_size:
+                    raise ValueError(f"YOLOLite: image 宽度必须是 {self.image_size}")
+                for v in row:
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                            or not math.isfinite(v):
+                        raise ValueError("YOLOLite: image 必须只包含有限数字")
+
+    def _check_target(self, target):
+        if target is None:
+            return None
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            raise ValueError("YOLOLite: target 必须是 None 或 (class, [cx,cy,w,h])")
+        label, box = target
+        if isinstance(label, bool) or not isinstance(label, int) or \
+                not 0 <= label < self.num_classes:
+            raise ValueError("YOLOLite: target 类别越界")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            raise ValueError("YOLOLite: target box 必须是 [cx,cy,w,h]")
+        vals = []
+        for v in box:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError("YOLOLite: target box 必须是有限数字")
+            vals.append(float(v))
+        cx, cy, bw, bh = vals
+        if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0) or bw <= 0.0 or bh <= 0.0:
+            raise ValueError("YOLOLite: target box 必须是 [0,1] 中心与正宽高")
+        return (label, vals)
+
+    def _backbone(self, image):
+        self._check_image(image)
+        out1 = self.conv1.forward(image)
+        mask1 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out1]
+        a1 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out1]
+        out2 = self.conv2.forward(a1)
+        mask2 = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out2]
+        a2 = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in out2]
+        feats = [[a2[k][r][c] for k in range(self.d_model)]
+                 for r in range(self.grid) for c in range(self.grid)]
+        raw, cache = _dense_rows_forward(self.head, feats)
+        return a2, mask1, mask2, feats, raw, cache
+
+    def forward(self, image):
+        a2, mask1, mask2, feats, raw, cache = self._backbone(image)
+        cells = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                idx = r * self.grid + c
+                row = raw[idx]
+                cells.append({
+                    "obj_logit": row[0],
+                    "box": [_yolo_sigmoid(row[1 + k]) for k in range(4)],
+                    "class_logits": row[5:],
+                })
+        self._cache = {"a2": a2, "mask1": mask1, "mask2": mask2, "raw": raw,
+                       "cache": cache, "cells": cells}
+        return cells
+
+    def loss_and_backward(self, image, target):
+        target = self._check_target(target)
+        cells = self.forward(image)
+        raw = self._cache["raw"]
+        d_rows = [[0.0] * self.out_dim for _ in range(len(raw))]
+        loss = 0.0
+        if target is None:
+            for idx in range(len(cells)):
+                p = _yolo_sigmoid(raw[idx][0])
+                loss += -0.5 * _yolo_log_sigmoid(-raw[idx][0])
+                d_rows[idx][0] = 0.5 * p
+        else:
+            label, box = target
+            cx, cy, bw, bh = box
+            cell_idx = min(self.grid - 1, int(cy * self.grid)) * self.grid + \
+                min(self.grid - 1, int(cx * self.grid))
+            for idx in range(len(cells)):
+                p = _yolo_sigmoid(raw[idx][0])
+                if idx == cell_idx:
+                    loss += -_yolo_log_sigmoid(raw[idx][0])
+                    d_rows[idx][0] = p - 1.0
+                else:
+                    loss += -0.5 * _yolo_log_sigmoid(-raw[idx][0])
+                    d_rows[idx][0] = 0.5 * p
+            d_box = [0.0] * 4
+            for k in range(4):
+                pred = _yolo_sigmoid(raw[cell_idx][1 + k])
+                loss += 5.0 * abs(pred - box[k])
+                d_box[k] = 5.0 * (1.0 if pred >= box[k] else -1.0)
+                d_rows[cell_idx][1 + k] = d_box[k] * pred * (1.0 - pred)
+            row = raw[cell_idx]
+            m = max(row[5:])
+            exps = [math.exp(v - m) for v in row[5:]]
+            total = sum(exps)
+            probs = [v / total for v in exps]
+            loss += -math.log(max(probs[label], 1e-12))
+            for c in range(self.num_classes):
+                d_rows[cell_idx][5 + c] = probs[c] - (1.0 if c == label else 0.0)
+        gw, gb, dx_rows = _dense_rows_backward(self.head, self._cache["cache"], d_rows)
+        for i in range(self.out_dim):
+            for j in range(self.d_model):
+                self.grads["W"][i][j] += gw[i][j]
+            self.grads["b"][i] += gb[i]
+        d_a2 = [[[0.0] * self.grid for _ in range(self.grid)]
+                for _ in range(self.d_model)]
+        for idx in range(len(cells)):
+            r, c = divmod(idx, self.grid)
+            for k in range(self.d_model):
+                d_a2[k][r][c] = dx_rows[idx][k] * self._cache["mask2"][k][r][c]
+        d_a1 = self.conv2.backward(d_a2)
+        d_out1 = [[[d_a1[k][r][c] * self._cache["mask1"][k][r][c]
+                    for c in range(len(d_a1[k][r]))] for r in range(len(d_a1[k]))]
+                  for k in range(len(d_a1))]
+        self.conv1.backward(d_out1)
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("YOLOLite: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("YOLOLite: lr 必须为正数")
+        _conv_sgd(self.conv1, lr)
+        _conv_sgd(self.conv2, lr)
+        for i in range(self.out_dim):
+            for j in range(self.d_model):
+                self.head.weights[i][j] -= lr * self.grads["W"][i][j]
+            self.head.biases[i] -= lr * self.grads["b"][i]
+
+    def predict(self, image, conf_threshold=0.5):
+        cells = self.forward(image)
+        best = None
+        for idx, cell in enumerate(cells):
+            conf = _yolo_sigmoid(cell["obj_logit"])
+            if conf >= conf_threshold and (best is None or conf > best[0]):
+                cls = max(range(self.num_classes), key=lambda c: cell["class_logits"][c])
+                best = (conf, cls, cell["box"])
+        return best
+
+    def fit(self, images, targets, epochs=20, lr=0.01, seed=None, shuffle=True):
+        if (not isinstance(images, (list, tuple)) or not isinstance(targets, (list, tuple))
+                or not images or len(images) != len(targets)):
+            raise ValueError("YOLOLite: images 与 targets 必须是非空且等长的列表")
+        epochs = _yolo_check_pos_int(epochs, "epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("YOLOLite: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("YOLOLite: lr 必须为正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("YOLOLite: seed 必须是整数或 None")
+        rng = random.Random(seed)
+        order = list(range(len(images)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(images[idx], targets[idx])
+                self.sgd_step(lr)
+            history.append(total / len(images))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
