@@ -39214,3 +39214,102 @@ class TestTrOCR:
         ]
         for i, fn in enumerate(cases):
             _trocr_raises(fn)
+
+
+# ---------------------------------------------------------------------------
+# TimeSformer（时空分离注意力视频分类）
+# ---------------------------------------------------------------------------
+
+
+def _tsf_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+def _tsf_video(seed, frames=2, size=8, channels=1):
+    rng = random.Random(seed)
+    return [[[[rng.random() for _ in range(size)] for _ in range(size)]
+             for _ in range(channels)] for _ in range(frames)]
+
+
+class TestTimeSformer:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.TimeSformer(num_frames=4, in_channels=3, image_size=8, patch_size=4,
+                           d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                           num_classes=3, seed=3)
+        assert m.param_count() == 1651
+        vid = [[[[0.1] * 8 for _ in range(8)] for _ in range(3)] for _ in range(4)]
+        assert len(m.forward(vid)) == 3
+        assert 0 <= m.predict(vid) < 3
+        _tsf_raises(lambda: m._check_video([]))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.TimeSformer(num_frames=4, in_channels=3, image_size=8, patch_size=4,
+                           d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                           num_classes=3, seed=3)
+        vid = [[[[0.1] * 8 for _ in range(8)] for _ in range(3)] for _ in range(4)]
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(vid, 1)
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-8, abs(analytic) + abs(fd_val))
+
+        rel_conv = fd(lambda: m.patch_embed.grad_w[0][0][1][1],
+                      lambda: m.patch_embed.weights[0][0][1][1],
+                      lambda v: m.patch_embed.weights[0][0][1].__setitem__(1, v))
+        rel_pos = fd(lambda: m.grads['temporal_pos'][2][1],
+                     lambda: m.temporal_pos[2][1],
+                     lambda v: m.temporal_pos[2].__setitem__(1, v))
+        rel_cls = fd(lambda: m.grads['W_cls'][1][2],
+                     lambda: m.W_cls[1][2],
+                     lambda v: m.W_cls[1].__setitem__(2, v))
+        assert rel_conv < 1e-4 and rel_pos < 1e-4 and rel_cls < 1e-4
+
+    def test_fit_memorize(self):
+        random.seed(0)
+        m = AI.TimeSformer(num_frames=2, in_channels=1, image_size=8, patch_size=4,
+                           d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                           num_classes=3, seed=7)
+        videos = [_tsf_video(11), _tsf_video(12)]
+        hist = m.fit(videos, [0, 2], epochs=120, lr=0.2, seed=1)
+        assert hist[-1] < hist[0] * 0.3
+        assert m.predict(videos[0]) == 0 and m.predict(videos[1]) == 2
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.TimeSformer(num_frames=2, in_channels=1, image_size=8, patch_size=4,
+                           d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                           num_classes=3, seed=3)
+        vid = [_tsf_video(11)]
+        cases = [
+            lambda: AI.TimeSformer(0),
+            lambda: AI.TimeSformer(2, image_size=8, patch_size=3),
+            lambda: AI.TimeSformer(2, d_model=8, num_heads=3),
+            lambda: m.forward([]),
+            lambda: m.forward([[[0.0] * 8 for _ in range(8)]]),
+            lambda: m.forward([[[0.0] * 8 for _ in range(8)]] * 2),
+            lambda: m.forward([[['x'] * 8 for _ in range(8)]] * 2),
+            lambda: m.loss_and_backward(vid, 3),
+            lambda: m.loss_and_backward(vid, True),
+            lambda: m.sgd_step(0.0),
+            lambda: m.fit([], []),
+            lambda: m.fit(videos=[vid], labels=[1, 2]),
+        ]
+        for i, fn in enumerate(cases):
+            _tsf_raises(fn)

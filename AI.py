@@ -11082,6 +11082,232 @@ class TrOCR:
             history.append(total / len(images))
         return history
 
+# ---------------------------------------------------------------------------
+# TimeSformer（时空分离注意力的视频分类器，简化版）
+# ---------------------------------------------------------------------------
+
+
+def _tsf_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"TimeSformer: {name} 必须是正整数")
+    return value
+
+
+class TimeSformer:
+    """TimeSformer：每帧内做空间注意力，逐 patch 位置跨帧做时间注意力。"""
+
+    def __init__(self, num_frames=4, in_channels=3, image_size=8, patch_size=4,
+                 d_model=16, num_heads=2, d_ff=32, num_layers=1,
+                 num_classes=4, seed=None):
+        self.num_frames = _tsf_check_pos_int(num_frames, "num_frames")
+        self.in_channels = _tsf_check_pos_int(in_channels, "in_channels")
+        self.image_size = _tsf_check_pos_int(image_size, "image_size")
+        self.patch_size = _tsf_check_pos_int(patch_size, "patch_size")
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("TimeSformer: image_size 必须能被 patch_size 整除")
+        self.d_model = _tsf_check_pos_int(d_model, "d_model")
+        self.num_heads = _tsf_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _tsf_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _tsf_check_pos_int(num_layers, "num_layers")
+        self.num_classes = _tsf_check_pos_int(num_classes, "num_classes")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("TimeSformer: d_model 必须能被 num_heads 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("TimeSformer: seed 必须是整数或 None")
+        self.grid = self.image_size // self.patch_size
+        self.num_patches = self.grid * self.grid
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.patch_embed = Conv2d(self.in_channels, self.d_model,
+                                      self.patch_size, stride=self.patch_size)
+            self.spatial_pos = PositionalEncoding(self.d_model, self.num_patches)
+            self.temporal_pos = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                                 for _ in range(self.num_frames)]
+            self.spatial = TransformerEncoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.num_layers, dropout=0.0,
+                                              causal=False)
+            self.temporal = TransformerEncoder(self.d_model, self.num_heads, self.d_ff,
+                                               num_layers=self.num_layers, dropout=0.0,
+                                               causal=False)
+            self.W_cls = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                          for _ in range(self.num_classes)]
+            self.b_cls = [0.0 for _ in range(self.num_classes)]
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.patch_embed.zero_grad()
+        self.spatial.zero_grad()
+        self.temporal.zero_grad()
+        self.grads = {
+            "temporal_pos": [[0.0] * self.d_model for _ in range(self.num_frames)],
+            "W_cls": [[0.0] * self.d_model for _ in range(self.num_classes)],
+            "b_cls": [0.0 for _ in range(self.num_classes)],
+        }
+
+    def param_count(self):
+        conv = self.patch_embed.out_channels * self.patch_embed.cg * \
+            self.patch_embed.kh * self.patch_embed.kw + self.patch_embed.out_channels
+        d, f = self.d_model, self.d_ff
+        layer = 4 * (d * d + d) + (d * f + f) + (f * d + d) + 4 * d
+        return conv + 2 * self.num_layers * layer + self.num_frames * d + \
+            self.num_classes * (d + 1)
+
+    def _check_video(self, video):
+        if (not isinstance(video, (list, tuple)) or len(video) != self.num_frames):
+            raise ValueError(f"TimeSformer: video 必须包含 {self.num_frames} 帧")
+        for frame in video:
+            if (not isinstance(frame, (list, tuple)) or len(frame) != self.in_channels):
+                raise ValueError(f"TimeSformer: 每帧必须是 {self.in_channels} 通道 (C,H,W)")
+            for ch in frame:
+                if not isinstance(ch, (list, tuple)) or len(ch) != self.image_size:
+                    raise ValueError(f"TimeSformer: 帧高度必须是 {self.image_size}")
+                for row in ch:
+                    if not isinstance(row, (list, tuple)) or len(row) != self.image_size:
+                        raise ValueError(f"TimeSformer: 帧宽度必须是 {self.image_size}")
+                    for v in row:
+                        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                                or not math.isfinite(v):
+                            raise ValueError("TimeSformer: 视频必须只包含有限数字")
+        return video
+
+    def _spatial_tokens(self, frame):
+        out = self.patch_embed.forward(frame)
+        tokens = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                tokens.append([out[k][r][c] for k in range(self.d_model)])
+        return self.spatial_pos.forward(tokens)
+
+    def forward(self, video):
+        self._check_video(video)
+        spatial_in = [self._spatial_tokens(frame) for frame in video]
+        spatial_out = [self.spatial.forward(tokens) for tokens in spatial_in]
+        temporal_in = []
+        for pos in range(self.num_patches):
+            seq = [[spatial_out[t][pos][j] + self.temporal_pos[t][j]
+                    for j in range(self.d_model)] for t in range(self.num_frames)]
+            temporal_in.append(seq)
+        temporal_out = [self.temporal.forward(seq) for seq in temporal_in]
+        pooled = [0.0] * self.d_model
+        count = self.num_frames * self.num_patches
+        for t in range(self.num_frames):
+            for pos in range(self.num_patches):
+                row = temporal_out[pos][t]
+                for j in range(self.d_model):
+                    pooled[j] += row[j]
+        pooled = [v / count for v in pooled]
+        logits = [sum(self.W_cls[c][j] * pooled[j] for j in range(self.d_model))
+                  + self.b_cls[c] for c in range(self.num_classes)]
+        self._cache = {"spatial_in": spatial_in, "spatial_out": spatial_out,
+                       "temporal_out": temporal_out, "pooled": pooled}
+        return logits
+
+    def loss_and_backward(self, video, target):
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise ValueError("TimeSformer: target 必须是整数类别")
+        if not 0 <= target < self.num_classes:
+            raise ValueError("TimeSformer: target 越界")
+        logits = self.forward(video)
+        m = max(logits)
+        exps = [math.exp(v - m) for v in logits]
+        total = sum(exps)
+        probs = [v / total for v in exps]
+        loss = -math.log(max(probs[target], 1e-12))
+        d_logits = list(probs)
+        d_logits[target] -= 1.0
+        pooled = self._cache["pooled"]
+        for c in range(self.num_classes):
+            dc = d_logits[c]
+            self.grads["b_cls"][c] += dc
+            grow = self.grads["W_cls"][c]
+            for j in range(self.d_model):
+                grow[j] += dc * pooled[j]
+        d_pooled = [sum(d_logits[c] * self.W_cls[c][j] for c in range(self.num_classes))
+                    for j in range(self.d_model)]
+        count = self.num_frames * self.num_patches
+        d_temporal = [[[d_pooled[j] / count for j in range(self.d_model)]
+                       for _ in range(self.num_frames)] for _ in range(self.num_patches)]
+        d_spatial_out = [[[0.0] * self.d_model for _ in range(self.num_patches)]
+                         for _ in range(self.num_frames)]
+        for pos in range(self.num_patches):
+            seq = [[self._cache["spatial_out"][t][pos][j] + self.temporal_pos[t][j]
+                    for j in range(self.d_model)] for t in range(self.num_frames)]
+            self.temporal.forward(seq)
+            d_seq = self.temporal.backward(d_temporal[pos])
+            for t in range(self.num_frames):
+                for j in range(self.d_model):
+                    d_spatial_out[t][pos][j] = d_seq[t][j]
+                    self.grads["temporal_pos"][t][j] += d_seq[t][j]
+        spatial_grads = [[[0.0] * self.d_model for _ in range(self.num_patches)]
+                         for _ in range(self.num_frames)]
+        for t in range(self.num_frames):
+            self.spatial.forward(self._cache["spatial_in"][t])
+            d_tokens = self.spatial.backward(d_spatial_out[t])
+            for pos in range(self.num_patches):
+                for j in range(self.d_model):
+                    spatial_grads[t][pos][j] = d_tokens[pos][j]
+        for t in range(self.num_frames):
+            self.patch_embed.forward(video[t])
+            conv_d = [[[0.0] * self.grid for _ in range(self.grid)]
+                      for _ in range(self.d_model)]
+            for pos in range(self.num_patches):
+                r, c = divmod(pos, self.grid)
+                for k in range(self.d_model):
+                    conv_d[k][r][c] = spatial_grads[t][pos][k]
+            self.patch_embed.backward(conv_d)
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("TimeSformer: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("TimeSformer: lr 必须为正数")
+        _conv_sgd(self.patch_embed, lr)
+        self.spatial.sgd_step(lr)
+        self.temporal.sgd_step(lr)
+        for t in range(self.num_frames):
+            for j in range(self.d_model):
+                self.temporal_pos[t][j] -= lr * self.grads["temporal_pos"][t][j]
+        for c in range(self.num_classes):
+            grow = self.W_cls[c]
+            gg = self.grads["W_cls"][c]
+            for j in range(self.d_model):
+                grow[j] -= lr * gg[j]
+            self.b_cls[c] -= lr * self.grads["b_cls"][c]
+
+    def predict(self, video):
+        logits = self.forward(video)
+        return max(range(self.num_classes), key=lambda c: logits[c])
+
+    def fit(self, videos, labels, epochs=20, lr=0.01, seed=None, shuffle=True):
+        if (not isinstance(videos, (list, tuple)) or not isinstance(labels, (list, tuple))
+                or not videos or len(videos) != len(labels)):
+            raise ValueError("TimeSformer: videos 与 labels 必须是非空等长列表")
+        epochs = _tsf_check_pos_int(epochs, "epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("TimeSformer: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("TimeSformer: lr 必须为正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("TimeSformer: seed 必须是整数或 None")
+        rng = random.Random(seed)
+        order = list(range(len(videos)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(videos[idx], labels[idx])
+                self.sgd_step(lr)
+            history.append(total / len(videos))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

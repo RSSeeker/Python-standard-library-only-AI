@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2540 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2544 项）
 
 ## 特性
 
@@ -3693,6 +3693,35 @@ print(model.predict([1.0, 0.0, 1.0, 0.0]))
 边界：输入是稠密数值向量，不含稀疏特征哈希/embedding 查表；交叉层为全秩矩阵（无低秩分解）；
 逐样本 SGD（无 mini-batch、无正则项）；只做二分类打分，不含多任务输出与校准。
 
+### TimeSformer（时空分离注意力视频分类）
+
+每帧内做空间注意力、逐 patch 位置跨帧做时间注意力，避免联合时空注意力的 O((T·P)²) 开销：
+
+```python
+import AI
+
+model = AI.TimeSformer(num_frames=4, in_channels=3, image_size=8, patch_size=4,
+                       d_model=16, num_heads=2, d_ff=32,
+                       num_classes=4, seed=0)
+video = [[[[0.1] * 8 for _ in range(8)] for _ in range(3)] for _ in range(4)]
+loss = model.loss_and_backward(video, 1)
+model.sgd_step(0.01)
+print(model.predict(video))
+```
+
+| API | 说明 |
+| --- | --- |
+| `TimeSformer(num_frames=4, in_channels=3, image_size=8, patch_size=4, d_model=16, num_heads=2, d_ff=32, num_layers=1, num_classes=4, seed=None)` | 卷积 patch 嵌入 + 空间编码器 + 时间编码器 + 线性分类头；要求 `image_size % patch_size == 0`、`d_model % num_heads == 0` |
+| `forward(video)` | `video` 为 `num_frames` 帧的 `(C,H,W)` 列表，返回类别 logits |
+| `loss_and_backward(video, target)` | 交叉熵，反向到卷积核/空间与时间编码器/分类头，返回损失 |
+| `predict(video)` | 返回 argmax 类别 |
+| `fit(videos, labels, epochs=20, lr=0.01, seed=None, shuffle=True)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 卷积 patch 核 + 空间/时间编码器 + 时间位置向量 + 分类头 |
+
+边界：简化版 TimeSformer——空间与时间注意力各用一个独立的 `TransformerEncoder` 栈（各 `num_layers` 层），时间位置向量逐帧可学习；不做分帧采样/多尺度 patch，也不含真实视频数据集预训练；反向时按帧重放卷积前向以恢复 im2col 缓存，时间换空间。
+
+测试：`TestTimeSformer` 覆盖前向/参数量、卷积核/时间位置/分类头梯度有限差分、两段视频过拟合训练、非法输入。
+
 ### TrOCR（图像编码器 + 文本解码器 OCR）
 
 卷积 patch 嵌入 + Transformer 编码器 + 因果解码器，把整张图识别成文字序列：
@@ -5330,7 +5359,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2540 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2544 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5533,6 +5562,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
 | `TestCheckpointedCausalLM` | 检查点反传与 `CausalLM._loss_and_backward` 的 loss/输出头/嵌入梯度一致、`segments=1/3` 结果相同、`fit_causal_lm_checkpointed` loss 下降、非法输入 |
 | `TestTrOCR` | 前向/参数量、卷积核与输出头梯度有限差分、合成图过拟合训练、predict 长度/非法输入 |
+| `TestTimeSformer` | 前向/参数量、卷积核/时间位置/分类头梯度有限差分、合成视频过拟合训练、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5781,6 +5811,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2540 个单元测试
+├── test_ai.py       # 2544 个单元测试
 └── README.md
 ```
