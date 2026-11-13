@@ -4462,7 +4462,7 @@ print([(c["name"], c["outcome"]) for c in rep["cases"]])
 `±inf` 默认也不合格，但 `allow_inf=True` 时放行——标量函数的 IEEE 溢出结果 `inf` 是
 可见的，调用方用 `math.isfinite` 就能判断。
 
-本轮据此修掉的静默问题：
+据此修掉的静默问题：
 
 - `_softmax_row` / `_log_softmax_row` 遇到 NaN 现在抛 `ValueError`（原来返回一列 NaN）；
   遇到 `+inf` 把概率均分给所有 `+inf` 项（原来 `exp(inf-inf)=NaN`）。

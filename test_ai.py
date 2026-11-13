@@ -3313,7 +3313,7 @@ class TestKVCache:
 
 
 # ============================================================================
-#  批次 5：训练工程化与评估工具
+#  训练工程化与评估工具
 # ============================================================================
 
 class TestFeedForwardActivation:
@@ -3537,7 +3537,7 @@ class TestGradNormHistory:
 
 
 # ============================================================================
-#  批次 6：优化器状态持久化 + checkpoint
+#  优化器状态持久化 + checkpoint
 # ============================================================================
 
 class TestOptimizerPersistence:
@@ -25489,7 +25489,7 @@ class TestGradCheckAll:
 
 
 class TestNumericalStability:
-    """NaN/Inf 扫描、六类极端输入探针，以及本轮修掉的静默 NaN。"""
+    """NaN/Inf 扫描、六类极端输入探针，以及此前修掉的静默 NaN。"""
 
     def test_numeric_scan(self):
         scan = AI.numeric_scan([1.0, [2, 3.5], {"a": float("nan")}, ("x", True)])
