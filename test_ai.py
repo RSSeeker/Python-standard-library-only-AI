@@ -37418,3 +37418,117 @@ class TestRWKV7:
         assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * len(r), delta=-1.0))
         assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * (len(r) - 1)))
         assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * len(r), delta=float("nan")))
+
+
+
+
+def _pipe_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+def _react_agent():
+    reg = AI.ToolRegistry()
+    reg.register("add", lambda a, b: a + b, "两数相加")
+    return reg
+
+
+def _rag_pipeline():
+    chunks = ["cat likes fish", "dog likes bones", "python is a language"]
+
+    def embed(text):
+        low = text.lower()
+        return [float(low.count("cat")), float(low.count("dog")),
+                float(low.count("python"))]
+
+    return AI.RAGPipeline(chunks, embed, top_k=2)
+
+
+class TestReActAgent:
+    def test_run_loop_and_trace(self):
+        reg = _react_agent()
+        texts = iter([
+            "Thought: 需要加法\nAction: add\nAction Input: a=2,b=3",
+            "Thought: 已得到结果\nFinal Answer: 5",
+        ])
+        prompts = []
+
+        def llm(prompt):
+            prompts.append(prompt)
+            return next(texts)
+
+        agent = AI.ReActAgent(reg, llm, max_steps=3)
+        res = agent.run("2+3 等于几？")
+        assert res["answer"] == "5"
+        assert res["steps"] == 2
+        assert len(res["trace"]) == 2
+        assert res["trace"][0]["observation"] == 5
+        assert res["trace"][1]["parsed"]["final_answer"] == "5"
+        assert "可用工具" in prompts[0] and "add" in prompts[0]
+        assert "问题：2+3 等于几？" in prompts[0]
+
+    def test_tool_error_becomes_observation(self):
+        reg = AI.ToolRegistry()
+        reg.register("boom", lambda: (_ for _ in ()).throw(RuntimeError("炸了")))
+        texts = iter([
+            "Thought: 试一下\nAction: boom\nAction Input: {}",
+            "Thought: 收到错误\nFinal Answer: 失败",
+        ])
+        agent = AI.ReActAgent(reg, lambda p: next(texts), max_steps=2)
+        res = agent.run("测试错误")
+        assert res["trace"][0]["observation"].startswith("ERROR: RuntimeError")
+        assert res["answer"] == "失败"
+
+    def test_max_steps_raises(self):
+        reg = _react_agent()
+        texts = iter(["Thought: 继续\nAction: add\nAction Input: a=1,b=1"] * 3)
+        agent = AI.ReActAgent(reg, lambda p: next(texts), max_steps=2)
+        assert _pipe_raises(lambda: agent.run("永远不结束"))
+
+    def test_json_action_input(self):
+        reg = _react_agent()
+        texts = iter(['Thought: json\nAction: add\nAction Input: {"a": 1, "b": 2}',
+                      "Final Answer: 3"])
+        agent = AI.ReActAgent(reg, lambda p: next(texts), max_steps=2)
+        assert agent.run("json")["answer"] == "3"
+
+    def test_invalid_inputs(self):
+        reg = _react_agent()
+        assert _pipe_raises(lambda: AI.ReActAgent(reg, None))
+        assert _pipe_raises(lambda: AI.ReActAgent("not registry", lambda p: p))
+        assert _pipe_raises(lambda: AI.ReActAgent(reg, lambda p: p, max_steps=0))
+        agent = AI.ReActAgent(reg, lambda p: "Final Answer: x")
+        assert _pipe_raises(lambda: agent.run(""))
+        bad = AI.ReActAgent(reg, lambda p: "Thought: t\nAction: add\nAction Input: 2")
+        assert _pipe_raises(lambda: bad.run("q"))
+        no_action = AI.ReActAgent(reg, lambda p: "Thought: 只有思考")
+        assert _pipe_raises(lambda: no_action.run("q"))
+
+
+class TestRAGPipeline:
+    def test_retrieve_and_query(self):
+        rag = _rag_pipeline()
+        hits = rag.retrieve("cat")
+        assert hits[0]["chunk"] == "cat likes fish"
+        res = rag.query("what does cat like?")
+        assert res["chunks"][0] == "cat likes fish"
+        assert "[1] cat likes fish" in res["prompt"]
+        assert "资料" in res["prompt"]
+        assert len(res["hits"]) == 2
+
+    def test_top_k_override(self):
+        rag = _rag_pipeline()
+        assert len(rag.retrieve("cat", top_k=1)) == 1
+
+    def test_invalid_inputs(self):
+        assert _pipe_raises(lambda: AI.RAGPipeline([], lambda t: [1.0]))
+        assert _pipe_raises(lambda: AI.RAGPipeline(["a"], "not callable"))
+        assert _pipe_raises(lambda: AI.RAGPipeline(["a", "b"],
+                                                   lambda t: [1.0] if t == "a" else [1.0, 2.0]))
+        rag = _rag_pipeline()
+        assert _pipe_raises(lambda: rag.retrieve(""))
+        assert _pipe_raises(lambda: rag.retrieve("cat", top_k=0))
+        assert _pipe_raises(lambda: rag.query(None))

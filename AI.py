@@ -8642,6 +8642,214 @@ def rwkv7_time_mixing(r_rows, k_rows, v_rows, w_logits, delta=1.0):
         out.append(y)
     return out
 
+
+"""ReAct Agent 循环与端到端 RAG 管道（把已有碎片拼成可用流程）
+
+- `ReActAgent`：LLM 生成 → `parse_react_output` 解析 → 调 `ToolRegistry` 工具
+  → 把 Observation 回填到对话 → 迭代，直到得到 `Final Answer` 或超出步数。
+- `RAGPipeline`：文档（chunk）→ 嵌入 → BM25 索引 → 稀疏/稠密混合检索
+  （复用 `BM25Index` / `dense_rerank` / `rrf_fuse` / `hybrid_search`）
+  → 返回命中 chunk 与拼好的 prompt。
+
+两者都通过回调注入「模型」与「嵌入函数」，不依赖真实 LLM，纯 Python 可测。
+"""
+
+import math
+
+
+def _pipe_check_str(value, name):
+    if not isinstance(value, str):
+        raise ValueError(f"pipeline: {name} 必须是字符串")
+    return value
+
+
+def _pipe_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"pipeline: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+class ReActAgent:
+    """ReAct 循环：`llm_fn(history) -> text`，history 为交替的 user/assistant 文本列表。"""
+
+    def __init__(self, registry, llm_fn, max_steps=5, system_prompt="你是一个会使用工具的助手。"):
+        if not isinstance(registry, ToolRegistry):
+            raise ValueError("agent: registry 必须是 ToolRegistry")
+        if not callable(llm_fn):
+            raise ValueError("agent: llm_fn 必须可调用")
+        self.registry = registry
+        self.llm_fn = llm_fn
+        self.max_steps = _pipe_check_pos_int(max_steps, "max_steps")
+        self.system_prompt = _pipe_check_str(system_prompt, "system_prompt")
+        self.trace = []
+
+    def _build_prompt(self, question, history):
+        tool_lines = []
+        for info in self.registry.list_tools():
+            desc = info["description"] or "（无描述）"
+            tool_lines.append(f"- {info['name']}: {desc}")
+        tools = "\n".join(tool_lines) if tool_lines else "（无可用工具）"
+        parts = [self.system_prompt,
+                 "可用工具：\n" + tools,
+                 "问题：" + question,
+                 "请按 ReAct 格式输出 Thought / Action / Action Input，"
+                 "或直接输出 Final Answer。"]
+        parts.extend(history)
+        return "\n".join(parts)
+
+    def run(self, question):
+        """执行完整循环，返回 {"answer","steps","trace"}；超步数或无 final answer 抛错。"""
+        question = _pipe_check_str(question, "question")
+        if not question.strip():
+            raise ValueError("agent: question 不能为空")
+        history = []
+        self.trace = []
+        for step in range(self.max_steps):
+            prompt = self._build_prompt(question, history)
+            text = self.llm_fn(prompt)
+            text = _pipe_check_str(text, "llm_fn 的返回值")
+            parsed = parse_react_output(text)
+            record = {"step": step, "text": text, "parsed": parsed}
+            if parsed["final_answer"] is not None:
+                record["observation"] = None
+                self.trace.append(record)
+                return {"answer": parsed["final_answer"],
+                        "steps": step + 1, "trace": self.trace}
+            action = parsed["action"]
+            if action is None:
+                raise ValueError("agent: 模型输出缺少 Action 与 Final Answer")
+            raw_input = parsed["action_input"]
+            if raw_input is None:
+                args = {}
+            else:
+                args = self._parse_action_input(raw_input)
+            try:
+                observation = self.registry.call(action, **args)
+            except Exception as exc:  # 工具错误作为 Observation 回填，让模型有机会纠正
+                observation = f"ERROR: {type(exc).__name__}: {exc}"
+            record["observation"] = observation
+            self.trace.append(record)
+            history.append(f"Action: {action}\nAction Input: {raw_input or ''}")
+            history.append(f"Observation: {observation}")
+        raise ValueError(f"agent: 超过最大步数 {self.max_steps} 仍未得到 Final Answer")
+
+    @staticmethod
+    def _parse_action_input(raw):
+        """支持 JSON 字典或 `key=value` 形式的 Action Input。"""
+        raw = raw.strip()
+        if not raw:
+            return {}
+        if raw.startswith("{"):
+            import json
+            try:
+                obj = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"agent: Action Input JSON 解析失败：{exc}") from exc
+            if not isinstance(obj, dict):
+                raise ValueError("agent: Action Input JSON 必须是对象")
+            return obj
+        args = {}
+        for part in raw.split(","):
+            if not part.strip():
+                continue
+            if "=" not in part:
+                raise ValueError(f"agent: 无法解析 Action Input 片段：{part!r}")
+            key, _, value = part.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                raise ValueError("agent: Action Input 的 key 不能为空")
+            try:
+                parsed = float(value)
+            except ValueError:
+                parsed = value
+            else:
+                parsed = int(parsed) if parsed.is_integer() else parsed
+            args[key] = parsed
+        return args
+
+
+class RAGPipeline:
+    """端到端 RAG：chunk 列表 + 嵌入函数 + BM25/稠密混合检索 + prompt 拼装。"""
+
+    def __init__(self, chunks, embed_fn, top_k=3, rrf_k=60,
+                 bm25_weight=1.0, dense_weight=1.0):
+        if not isinstance(chunks, (list, tuple)) or not chunks:
+            raise ValueError("rag: chunks 必须是非空字符串列表")
+        self.chunks = []
+        for i, chunk in enumerate(chunks):
+            if not isinstance(chunk, str) or not chunk.strip():
+                raise ValueError(f"rag: chunks[{i}] 必须是非空字符串")
+            self.chunks.append(chunk)
+        if not callable(embed_fn):
+            raise ValueError("rag: embed_fn 必须可调用")
+        self.embed_fn = embed_fn
+        self.top_k = _pipe_check_pos_int(top_k, "top_k")
+        self.index = BM25Index(self.chunks)
+        self.doc_vecs = []
+        for i, chunk in enumerate(self.chunks):
+            vec = embed_fn(chunk)
+            if not isinstance(vec, (list, tuple)) or not vec:
+                raise ValueError(f"rag: embed_fn 对 chunk {i} 返回了非空列表之外的值")
+            clean = []
+            for v in vec:
+                if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                        or not math.isfinite(float(v))):
+                    raise ValueError("rag: 嵌入向量必须只包含有限数字")
+                clean.append(float(v))
+            self.doc_vecs.append(clean)
+        dim = len(self.doc_vecs[0])
+        if any(len(v) != dim for v in self.doc_vecs):
+            raise ValueError("rag: 所有文档嵌入的维度必须一致")
+        self.rrf_k = _pipe_check_pos_int(rrf_k, "rrf_k")
+        for w, name in ((bm25_weight, "bm25_weight"), (dense_weight, "dense_weight")):
+            if (not isinstance(w, (int, float)) or isinstance(w, bool)
+                    or not math.isfinite(float(w)) or float(w) < 0.0):
+                raise ValueError(f"rag: {name} 必须是非负有限数字")
+        self.bm25_weight = float(bm25_weight)
+        self.dense_weight = float(dense_weight)
+
+    def _embed_query(self, question):
+        vec = self.embed_fn(question)
+        if not isinstance(vec, (list, tuple)) or not vec:
+            raise ValueError("rag: embed_fn 对 query 返回了非法值")
+        clean = [float(v) for v in vec]
+        if any(not math.isfinite(v) for v in clean):
+            raise ValueError("rag: query 嵌入必须只包含有限数字")
+        if len(clean) != len(self.doc_vecs[0]):
+            raise ValueError("rag: query 嵌入维度必须与文档嵌入一致")
+        return clean
+
+    def retrieve(self, question, top_k=None):
+        """混合检索，返回 [{"index","chunk","rrf_score","bm25_rank","dense_rank"}]。"""
+        question = _pipe_check_str(question, "question")
+        if not question.strip():
+            raise ValueError("rag: question 不能为空")
+        k = self.top_k if top_k is None else _pipe_check_pos_int(top_k, "top_k")
+        qv = self._embed_query(question)
+        hits = hybrid_search(self.index, question, qv, self.doc_vecs, top_k=k,
+                             rrf_k=self.rrf_k, bm25_weight=self.bm25_weight,
+                             dense_weight=self.dense_weight)
+        out = []
+        for hit in hits:
+            out.append({"index": hit["index"],
+                        "chunk": self.chunks[hit["index"]],
+                        "rrf_score": hit["rrf_score"],
+                        "bm25_rank": hit["bm25_rank"],
+                        "dense_rank": hit["dense_rank"]})
+        return out
+
+    def query(self, question, top_k=None, instruction="根据以下资料回答问题"):
+        """检索并拼 prompt，返回 {"question","chunks","hits","prompt"}。"""
+        hits = self.retrieve(question, top_k=top_k)
+        lines = [f"{instruction}：", "问题：" + question, "", "资料："]
+        for i, hit in enumerate(hits, 1):
+            lines.append(f"[{i}] {hit['chunk']}")
+        lines.append("")
+        lines.append("请给出简洁、基于资料的答案。")
+        return {"question": question, "chunks": [h["chunk"] for h in hits],
+                "hits": hits, "prompt": "\n".join(lines)}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

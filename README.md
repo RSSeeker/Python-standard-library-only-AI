@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2441 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2449 项）
 
 ## 特性
 
@@ -2143,6 +2143,43 @@ obs = react_episode(reg, [{"action": "add", "action_input": {"x": 1, "y": 2}}])
 | `react_episode(registry, steps)` | 按 `[{"action","action_input"}]` 顺序调用工具，返回观测列表 |
 
 - 边界：只做注册/分发与文本解析，不内置 LLM 调用、重试或多轮 ReAct 循环；工具调用不经沙箱与权限检查；`action_input` 是原文字符串，需调用方自行 JSON 解码。
+
+### ReActAgent 循环与 RAGPipeline（端到端管道）
+
+把已有的 `ToolRegistry` / `parse_react_output` / `react_episode` 与
+`BM25Index` / `dense_rerank` / `rrf_fuse` / `hybrid_search` 拼成两条完整流程；
+模型与嵌入都通过回调注入，方便离线测试。
+
+```python
+from ai import AI
+
+registry = AI.ToolRegistry()
+registry.register("add", lambda a, b: a + b, "两数相加")
+
+texts = iter(["Thought: 算一下
+Action: add
+Action Input: a=2,b=3",
+              "Final Answer: 5"])
+agent = AI.ReActAgent(registry, lambda prompt: next(texts), max_steps=3)
+print(agent.run("2+3 等于几？"))       # {'answer': '5', 'steps': 2, 'trace': [...]}
+
+chunks = ["cat likes fish", "dog likes bones"]
+rag = AI.RAGPipeline(chunks, embed_fn=lambda t: [float(t.count("cat")), 1.0])
+print(rag.query("what does cat like?")["prompt"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `ReActAgent(registry, llm_fn, max_steps=5, system_prompt=...)` | 循环：`llm_fn(prompt)` → 解析 Thought/Action/Final Answer → 调工具 → 回填 Observation；工具异常作为 `ERROR: ...` Observation 回填；超步数抛错 |
+| `ReActAgent.run(question)` | 返回 `{"answer","steps","trace"}`，`trace` 每步含 text/parsed/observation |
+| `ReActAgent._parse_action_input(raw)` | 支持 JSON 对象或 `key=value,key2=value2`（数字会转为 int/float） |
+| `RAGPipeline(chunks, embed_fn, top_k=3, rrf_k=60, bm25_weight=1.0, dense_weight=1.0)` | 构造时建 BM25 索引与文档嵌入；校验嵌入维度一致 |
+| `RAGPipeline.retrieve(question, top_k=None)` | 混合检索，返回带 `index/chunk/rrf_score/bm25_rank/dense_rank` 的命中列表 |
+| `RAGPipeline.query(question, top_k=None, instruction=...)` | 检索并拼 prompt，返回 `{"question","chunks","hits","prompt"}` |
+
+边界：`ReActAgent` 不包含真实 LLM 调用与多轮记忆（history 仅本轮的 Action/Observation）；
+`RAGPipeline` 复用 BM25 的 ASCII 分词器（英文/数字），中文资料需先自行切词或改用其他
+检索器；两者都不做训练，prompt 模板是可覆盖的字符串。
 
 ### 部署与推理工具（文本水印 / StreamingLLM 掩码）
 
@@ -4991,7 +5028,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2441 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2449 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5240,6 +5277,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
+| `TestReActAgent` | 完整循环与 trace、工具错误回填、超步数、JSON Action Input、非法输入 |
+| `TestRAGPipeline` | 混合检索排序与 prompt、top_k 覆盖、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5420,6 +5459,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2441 个单元测试
+├── test_ai.py       # 2449 个单元测试
 └── README.md
 ```
