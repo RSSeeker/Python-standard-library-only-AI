@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2423 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2433 项）
 
 ## 特性
 
@@ -2325,6 +2325,39 @@ print(AI.rope_2d_inverse(AI.rope_2d(rows, 1, 1), 1, 1))  # 还原
 边界：ABF / LongRoPE 只返回频率表，不改变位置索引（需调用方与位置缩放配合）；
 2D / 3D RoPE 采用朴素的「轴分段 + 对半旋转」，不做交错频率拼接；逆变换按相反
 顺序取负角度，要求输入未被修改。
+
+### 线性注意力与长卷积（GLA / DeltaNet / Lightning Attention / Hyena 简化版）
+
+常见的「线性注意力」递推都是同一个骨架：维护一个 `d_k × d_v` 的状态矩阵
+`S_t = f(S_{t-1}, k_t, v_t)`，再用 `y_t = q_t @ S_t` 读出——复杂度 O(T·d_k·d_v)，
+不需要 T×T 注意力矩阵。
+
+```python
+from ai import AI
+
+q = [[0.1, -0.2, 0.3], [0.2, 0.1, -0.1]]
+k = [[0.3, 0.1, -0.2], [-0.1, 0.2, 0.1]]
+v = [[1.0, 0.5], [-0.5, 0.2]]
+
+print(AI.lightning_attention(q, k, v, decay=0.9))   # state = decay*S + k⊗v
+print(AI.linear_attention_naive(q, k, v, decay=0.9))  # O(T^2) 参考实现
+print(AI.gla_forward(q, k, v, [0.0, 1.0]))          # 数据相关门 alpha=exp(-exp(g))
+print(AI.deltanet_forward(q, k, v, [0.5, 1.0]))     # delta 规则更新
+print(AI.hyena_forward(q, v, [1.0, 0.5]))           # 长卷积 + 逐元素门控
+```
+
+| API | 说明 |
+| --- | --- |
+| `lightning_attention(q_rows, k_rows, v_rows, decay=1.0)` | 标量衰减递推：`S_t = decay*S_{t-1} + k_t⊗v_t`，`y_t = q_t@S_t` |
+| `linear_attention_naive(q_rows, k_rows, v_rows, decay=1.0)` | O(T²) 展开参考：`y_t = Σ_{j<=t} decay^(t-j)(q_t·k_j)v_j` |
+| `gla_forward(q_rows, k_rows, v_rows, gates)` | Gated Linear Attention：`alpha_t=exp(-exp(g_t))` 的每步标量门控 |
+| `deltanet_forward(q_rows, k_rows, v_rows, betas)` | DeltaNet：`S -= beta*(S k)k^T` 再 `S += beta*v k^T`，`beta∈[0,1]` |
+| `hyena_long_conv(u_rows, kernel)` | 朴素因果长卷积 `y_t=Σ_j kernel[j]u_{t-j}`（不依赖 FFT） |
+| `hyena_forward(u_rows, v_rows, kernel)` | 长卷积结果与 v 逐元素门控 |
+
+边界：全部为**前向推理**实现（无手写反向/训练循环）；lightning/GLA/DeltaNet
+使用标量衰减（非逐通道或逐头）；Hyena 用朴素因果卷积代替 FFT 长卷积，复杂度 O(T·K)；
+需要训练时请用带反向的 `MambaBlock` / `RWKVBlock` / `RetNetBlock` 等。
 
 ### 环形注意力（RingAttention 分块 online softmax）
 
@@ -4928,7 +4961,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2423 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2433 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5170,6 +5203,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLongRoPE` | 仅低频段缩放、low_fraction 影响、非法参数 |
 | `TestRoPE2D` | 保范数与逆变换、行/列轴向语义、零位置恒等、非法输入 |
 | `TestRoPE3D` | 保范数与逆变换、t/h/w 轴向语义、零位置恒等、非法输入 |
+| `TestLightningAttention` | 与 O(T²) 参考一致、decay=1 闭式展开、非法输入 |
+| `TestGLA` | 常数门等价于 lightning、非法输入 |
+| `TestDeltaNet` | beta=0 恒零、首步公式、矩阵参考、非法输入 |
+| `TestHyena` | 长卷积手算、逐元素门控、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5350,6 +5387,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2423 个单元测试
+├── test_ai.py       # 2433 个单元测试
 └── README.md
 ```

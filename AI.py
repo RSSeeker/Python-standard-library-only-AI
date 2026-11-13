@@ -8214,6 +8214,244 @@ def rope_3d_inverse(rows, grid_t, grid_h, grid_w, base=10000.0):
     return out
 
 
+
+"""线性注意力 / 长卷积家族（GLA / DeltaNet / Lightning Attention / Hyena 简化版）
+
+这些实现都是**前向**推理形式（无手写反向），用于理解算法结构与数值行为：
+
+- `lightning_attention`：分块线性注意力的递推核（标量衰减），复杂度 O(T*d_k*d_v)。
+- `gla_forward`：Gated Linear Attention 的数据相关门控版本（每步标量门）。
+- `deltanet_forward`：DeltaNet 的 delta 规则更新（每步 beta 标量）。
+- `hyena_long_conv`：Hyena 的长卷积（朴素因果卷积，不依赖 FFT）。
+- `linear_attention_naive`：lightning attention 的 O(T^2) 展开参考实现。
+"""
+
+
+def _lin_check_matrix(rows, name="rows"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"linear_attn: {name} 必须是非空二维列表")
+    width = None
+    out = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"linear_attn: {name} 的每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"linear_attn: {name} 的行长度必须一致")
+        new_row = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"linear_attn: {name} 必须只包含数字")
+            v = float(v)
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"linear_attn: {name} 必须只包含有限数字")
+            new_row.append(v)
+        out.append(new_row)
+    return out
+
+
+def _lin_check_scalar(value, name, low=None, high=None):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"linear_attn: {name} 必须是数字")
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"linear_attn: {name} 必须是有限数字")
+    if low is not None and value < low:
+        raise ValueError(f"linear_attn: {name} 必须 >= {low}")
+    if high is not None and value > high:
+        raise ValueError(f"linear_attn: {name} 必须 <= {high}")
+    return value
+
+
+def _lin_check_seq(values, length, name):
+    if not isinstance(values, (list, tuple)) or len(values) != length:
+        raise ValueError(f"linear_attn: {name} 长度必须为 {length}")
+    out = []
+    for v in values:
+        out.append(_lin_check_scalar(v, name))
+    return out
+
+
+def linear_attention_naive(q_rows, k_rows, v_rows, decay=1.0):
+    """O(T^2) 展开：y_t = sum_{j<=t} decay^(t-j) * (q_t . k_j) * v_j。"""
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    decay = _lin_check_scalar(decay, "decay", 0.0, 1.0)
+    t_len = len(q)
+    out = []
+    for t in range(t_len):
+        y = [0.0] * len(v[0])
+        for j in range(t + 1):
+            w = decay ** (t - j)
+            dot = sum(q[t][i] * k[j][i] for i in range(len(q[0])))
+            for c in range(len(v[0])):
+                y[c] += w * dot * v[j][c]
+        out.append(y)
+    return out
+
+
+def lightning_attention(q_rows, k_rows, v_rows, decay=1.0):
+    """分块线性注意力的标量衰减递推（O(T*d_k*d_v)）。
+
+    state_t = decay * state_{t-1} + k_t (x) v_t
+    y_t     = q_t @ state_t
+    """
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    decay = _lin_check_scalar(decay, "decay", 0.0, 1.0)
+    dk = len(q[0])
+    dv = len(v[0])
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    for t in range(len(q)):
+        for i in range(dk):
+            row = state[i]
+            kt = k[t][i]
+            for c in range(dv):
+                row[c] = decay * row[c] + kt * v[t][c]
+        y = [0.0] * dv
+        for i in range(dk):
+            qi = q[t][i]
+            if qi == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += qi * row[c]
+        out.append(y)
+    return out
+
+
+def gla_forward(q_rows, k_rows, v_rows, gates):
+    """GLA：alpha_t = exp(-exp(g_t))，state_t = alpha_t*state + k_t (x) v_t。"""
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    gates = _lin_check_seq(gates, len(q), "gates")
+    dk = len(q[0])
+    dv = len(v[0])
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    import math
+    for t in range(len(q)):
+        alpha = math.exp(-math.exp(gates[t]))
+        for i in range(dk):
+            row = state[i]
+            kt = k[t][i]
+            for c in range(dv):
+                row[c] = alpha * row[c] + kt * v[t][c]
+        y = [0.0] * dv
+        for i in range(dk):
+            qi = q[t][i]
+            if qi == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += qi * row[c]
+        out.append(y)
+    return out
+
+
+def deltanet_forward(q_rows, k_rows, v_rows, betas):
+    """DeltaNet：state_t = state_{t-1} - beta*(state k) k^T + beta*v k^T；y=q@state。"""
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    betas = _lin_check_seq(betas, len(q), "betas")
+    for b in betas:
+        if b < 0.0 or b > 1.0:
+            raise ValueError("linear_attn: betas 必须在 [0, 1] 内")
+    dk = len(q[0])
+    dv = len(v[0])
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    for t in range(len(q)):
+        beta = betas[t]
+        sk = [0.0] * dv
+        for i in range(dk):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                sk[c] += ki * row[c]
+        for i in range(dk):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                row[c] -= beta * ki * sk[c]
+        for i in range(dk):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                row[c] += beta * ki * v[t][c]
+        y = [0.0] * dv
+        for i in range(dk):
+            qi = q[t][i]
+            if qi == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += qi * row[c]
+        out.append(y)
+    return out
+
+
+def hyena_long_conv(u_rows, kernel):
+    """Hyena 的因果长卷积：y_t[c] = sum_{j=0}^{K-1} kernel[j] * u_{t-j}[c]。"""
+    u = _lin_check_matrix(u_rows, "u_rows")
+    kernel = _lin_check_seq(kernel, len(kernel), "kernel")
+    if not kernel:
+        raise ValueError("linear_attn: kernel 不能为空")
+    t_len = len(u)
+    d = len(u[0])
+    k_len = len(kernel)
+    out = []
+    for t in range(t_len):
+        y = [0.0] * d
+        for j in range(min(t + 1, k_len)):
+            w = kernel[j]
+            src = u[t - j]
+            for c in range(d):
+                y[c] += w * src[c]
+        out.append(y)
+    return out
+
+
+def hyena_forward(u_rows, v_rows, kernel):
+    """Hyena 块：长卷积后与值向量逐元素门控（实现为 element-wise 乘）。"""
+    u = _lin_check_matrix(u_rows, "u_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(u) != len(v):
+        raise ValueError("linear_attn: u 与 v 的序列长度必须一致")
+    if len(u[0]) != len(v[0]):
+        raise ValueError("linear_attn: u 与 v 的特征维度必须一致")
+    conv = hyena_long_conv(u, kernel)
+    return [[conv[t][c] * v[t][c] for c in range(len(u[0]))]
+            for t in range(len(u))]
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

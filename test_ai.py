@@ -37184,3 +37184,130 @@ class TestRoPE3D:
         _rope_raises(lambda: AI.rope_3d(rows, 0, 1, 1))
         _rope_raises(lambda: AI.rope_3d(rows, 1, 1, 1, base=-1.0))
         _rope_raises(lambda: AI.rope_3d_inverse([[1.0] * 8], 1, 2, 1))
+
+
+
+
+def _lin_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+def _lin_random_case():
+    import random
+    rng = random.Random(11)
+    t_len, dk, dv = 5, 3, 2
+    q = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(t_len)]
+    k = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(t_len)]
+    v = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(t_len)]
+    return q, k, v
+
+
+class TestLightningAttention:
+    def test_matches_naive(self):
+        q, k, v = _lin_random_case()
+        for decay in (1.0, 0.5, 0.9):
+            fast = AI.lightning_attention(q, k, v, decay=decay)
+            slow = AI.linear_attention_naive(q, k, v, decay=decay)
+            err = max(abs(fast[t][c] - slow[t][c])
+                      for t in range(len(q)) for c in range(len(v[0])))
+            assert err < 1e-12
+
+    def test_decay_one_closed_form(self):
+        q, k, v = _lin_random_case()
+        out = AI.lightning_attention(q, k, v, decay=1.0)
+        for t in range(len(q)):
+            ref = [0.0] * len(v[0])
+            for j in range(t + 1):
+                dot = sum(q[t][i] * k[j][i] for i in range(len(q[0])))
+                for c in range(len(v[0])):
+                    ref[c] += dot * v[j][c]
+            assert max(abs(out[t][c] - ref[c]) for c in range(len(v[0]))) < 1e-12
+
+    def test_invalid_inputs(self):
+        q, k, v = _lin_random_case()
+        assert _lin_raises(lambda: AI.lightning_attention([], k, v))
+        assert _lin_raises(lambda: AI.lightning_attention(q, k, v[:-1]))
+        assert _lin_raises(lambda: AI.lightning_attention(q, k, v, decay=1.5))
+        assert _lin_raises(lambda: AI.lightning_attention(q, k, v, decay=-0.1))
+        assert _lin_raises(lambda: AI.lightning_attention([[1.0], [2.0, 3.0]], k[:2], v[:2]))
+        assert _lin_raises(lambda: AI.linear_attention_naive(q, k, v[:-1]))
+
+
+class TestGLA:
+    def test_constant_gate_equals_lightning(self):
+        import math
+        q, k, v = _lin_random_case()
+        g = 0.3
+        alpha = math.exp(-math.exp(g))
+        gate_out = AI.gla_forward(q, k, v, [g] * len(q))
+        light_out = AI.lightning_attention(q, k, v, decay=alpha)
+        err = max(abs(gate_out[t][c] - light_out[t][c])
+                  for t in range(len(q)) for c in range(len(v[0])))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        q, k, v = _lin_random_case()
+        assert _lin_raises(lambda: AI.gla_forward(q, k, v, [0.0] * (len(q) - 1)))
+        assert _lin_raises(lambda: AI.gla_forward(q, k, v, None))
+
+
+class TestDeltaNet:
+    def test_beta_zero_and_first_step(self):
+        q, k, v = _lin_random_case()
+        out0 = AI.deltanet_forward(q, k, v, [0.0] * len(q))
+        assert all(abs(x) < 1e-15 for row in out0 for x in row)
+        out1 = AI.deltanet_forward(q, k, v, [1.0] + [0.0] * (len(q) - 1))
+        ref = [sum(q[0][i] * v[0][c] * k[0][i] for i in range(len(q[0])))
+               for c in range(len(v[0]))]
+        assert max(abs(out1[0][c] - ref[c]) for c in range(len(v[0]))) < 1e-12
+
+    def test_matrix_reference(self):
+        q, k, v = _lin_random_case()
+        betas = [0.2, 0.7, 1.0, 0.0, 0.5]
+        dk = len(q[0])
+        dv = len(v[0])
+        state = [[0.0] * dv for _ in range(dk)]
+        ref = []
+        for t in range(len(q)):
+            beta = betas[t]
+            sk = [sum(state[i][c] * k[t][i] for i in range(dk)) for c in range(dv)]
+            for i in range(dk):
+                for c in range(dv):
+                    state[i][c] = (state[i][c] - beta * k[t][i] * sk[c]
+                                   + beta * v[t][c] * k[t][i])
+            ref.append([sum(q[t][i] * state[i][c] for i in range(dk))
+                        for c in range(dv)])
+        got = AI.deltanet_forward(q, k, v, betas)
+        err = max(abs(got[t][c] - ref[t][c]) for t in range(len(q)) for c in range(dv))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        q, k, v = _lin_random_case()
+        assert _lin_raises(lambda: AI.deltanet_forward(q, k, v, [1.5] * len(q)))
+        assert _lin_raises(lambda: AI.deltanet_forward(q, k, v, [0.0] * (len(q) - 1)))
+
+
+class TestHyena:
+    def test_long_conv_and_gate(self):
+        u = [[float(i + c) for c in range(3)] for i in range(4)]
+        kernel = [1.0, -0.5, 0.25]
+        conv = AI.hyena_long_conv(u, kernel)
+        for t in range(4):
+            for c in range(3):
+                ref = 0.0
+                for j in range(min(t + 1, len(kernel))):
+                    ref += kernel[j] * u[t - j][c]
+                assert abs(conv[t][c] - ref) < 1e-12
+        gated = AI.hyena_forward(u, [[2.0, 3.0, -1.0]] * 4, kernel)
+        assert abs(gated[2][0] - conv[2][0] * 2.0) < 1e-12
+
+    def test_invalid_inputs(self):
+        u = [[1.0, 2.0], [3.0, 4.0]]
+        assert _lin_raises(lambda: AI.hyena_long_conv(u, []))
+        assert _lin_raises(lambda: AI.hyena_long_conv([], [1.0]))
+        assert _lin_raises(lambda: AI.hyena_forward(u, u[:-1], [1.0]))
+        assert _lin_raises(lambda: AI.hyena_forward(u, [[1.0]], [1.0]))
