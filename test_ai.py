@@ -39531,3 +39531,96 @@ class TestYOLOLite:
         ]
         for i, fn in enumerate(cases):
             _yolo_raises(fn)
+
+
+# ---------------------------------------------------------------------------
+# NeRF-lite（体渲染神经辐射场）
+# ---------------------------------------------------------------------------
+
+
+def _nerf_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+class TestNeRF:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.NeRF(pos_freqs=3, dir_freqs=1, hidden=(8, 8), seed=3)
+        assert m.param_count() == 439
+        rays = [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                ((0.1, 0.0, 0.0), (0.0, 0.1, 1.0))]
+        outs = m.forward(rays, num_samples=4)
+        assert len(outs) == 2
+        for out in outs:
+            assert len(out['rgb']) == 3
+            assert len(out['weights']) == 4
+            assert 0.0 <= out['depth'] <= 1.0
+        _nerf_raises(lambda: m.forward([]))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.NeRF(pos_freqs=3, dir_freqs=1, hidden=(8, 8), seed=3)
+        rays = [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                ((0.1, 0.0, 0.0), (0.0, 0.1, 1.0))]
+        targets = [[1.0, 0.2, 0.1], [0.1, 0.9, 0.3]]
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(rays, targets, num_samples=4)
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-8, abs(analytic) + abs(fd_val))
+
+        rel_w = fd(lambda: m.acc_w_sigma[0][1][2],
+                   lambda: m.sigma_net.layers[0].weights[1][2],
+                   lambda v: m.sigma_net.layers[0].weights[1].__setitem__(2, v))
+        rel_b = fd(lambda: m.acc_b_sigma[-1][0],
+                   lambda: m.sigma_net.layers[-1].biases[0],
+                   lambda v: m.sigma_net.layers[-1].biases.__setitem__(0, v))
+        rel_rgb = fd(lambda: m.acc_w_rgb[0][1][2],
+                     lambda: m.rgb_net.layers[0].weights[1][2],
+                     lambda v: m.rgb_net.layers[0].weights[1].__setitem__(2, v))
+        assert rel_w < 1e-4 and rel_b < 1e-4 and rel_rgb < 1e-4
+
+    def test_fit_memorize(self):
+        random.seed(0)
+        m = AI.NeRF(pos_freqs=2, dir_freqs=1, hidden=(8, 8), seed=7)
+        rays = [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))]
+        hist = m.fit(rays, [[0.9, 0.2, 0.1]], epochs=80, lr=0.1, num_samples=4)
+        assert hist[-1] < hist[0] * 0.3
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.NeRF(pos_freqs=3, dir_freqs=1, hidden=(8, 8), seed=3)
+        rays = [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                ((0.1, 0.0, 0.0), (0.0, 0.1, 1.0))]
+        targets = [[1.0, 0.2, 0.1], [0.1, 0.9, 0.3]]
+        cases = [
+            lambda: AI.NeRF(0),
+            lambda: AI.NeRF(3, 1, (0,)),
+            lambda: AI.NeRF(3, 1, ()),
+            lambda: m.forward([]),
+            lambda: m.forward([((0.0, 0.0), (0.0, 0.0, 1.0))]),
+            lambda: m.forward(rays, far=-1.0),
+            lambda: m.forward(rays, num_samples=0),
+            lambda: m.loss_and_backward(rays, [[1.0, 0.0, 0.0]]),
+            lambda: m.loss_and_backward(rays, [[1.0, 0.0], [0.0, 1.0, 0.0]]),
+            lambda: m.sgd_step(0.0),
+            lambda: m.fit([], []),
+            lambda: m.fit(rays=[rays[0]], targets=targets),
+        ]
+        for i, fn in enumerate(cases):
+            _nerf_raises(fn)

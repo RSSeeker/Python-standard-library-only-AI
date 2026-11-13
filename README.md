@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2552 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2556 项）
 
 ## 特性
 
@@ -3667,6 +3667,33 @@ grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
   只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
 - 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
 
+### NeRF-lite（体渲染神经辐射场）
+
+位置编码 + 密度/颜色双 MLP + 固定步长体渲染（解析反向到两个 MLP）：
+
+```python
+import AI
+
+model = AI.NeRF(pos_freqs=3, dir_freqs=1, hidden=(16, 16), seed=0)
+rays = [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))]
+loss = model.loss_and_backward(rays, [[1.0, 0.1, 0.05]], num_samples=8)
+model.sgd_step(0.01)
+print(model.forward(rays, num_samples=8)[0]["rgb"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `NeRF(pos_freqs=3, dir_freqs=1, hidden=(16, 16), seed=None)` | 位置 `sin/cos` 编码（`pos_freqs` 组频率）+ `sigma_net`（密度 + 3 维特征）+ `rgb_net`（特征 + 方向编码 → RGB） |
+| `forward(rays, near=0.0, far=1.0, num_samples=8)` | `rays` 为 `(origin[3], direction[3])` 列表；固定步长采样，返回每 ray 的 `rgb`、`depth` 与采样权重/alpha 等中间量 |
+| `loss_and_backward(rays, target_rgb, near=0.0, far=1.0, num_samples=8)` | 颜色 MSE；按 `d_alpha_i = d_w_i*T_i - Σ_{k>i} d_w_k*w_k/(1-alpha_i)` 反传到 sigma 与颜色 MLP |
+| `sgd_step(lr)` / `fit(rays, target_rgb, epochs=20, lr=0.01, ...)` | 手写 SGD；`fit` 逐 epoch 前向 + 反向 + 更新，返回损失历史 |
+| `param_count()` | `sigma_net` + `rgb_net` 参数总数 |
+
+边界：固定步长、不做分层/重要性采样；每 ray 用 Python 循环，无批量张量化与射线-包围盒求交加速；
+只对颜色做监督（可选深度来自权重加权），不含真实数据管线、体素网格与 NeRF 的 coarse/fine 双网络。
+
+测试：`TestNeRF` 覆盖前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入。
+
 ### YOLOLite（单尺度网格检测训练循环）
 
 两层 stride-2 卷积 backbone + 逐网格单元检测头；训练时只让目标中心所在单元负责：
@@ -5414,7 +5441,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2552 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2556 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5620,6 +5647,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTimeSformer` | 前向/参数量、卷积核/时间位置/分类头梯度有限差分、合成视频过拟合训练、非法输入 |
 | `TestWhisperLite` | 前向/参数量、投影层与输出头梯度有限差分、合成 mel 过拟合训练、predict 长度/非法输入 |
 | `TestYOLOLite` | 前向/参数量、检测头与卷积核梯度有限差分、合成图目标分配训练、非法输入 |
+| `TestNeRF` | 前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5868,6 +5896,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2552 个单元测试
+├── test_ai.py       # 2556 个单元测试
 └── README.md
 ```

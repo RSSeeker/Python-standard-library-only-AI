@@ -11769,6 +11769,226 @@ class YOLOLite:
             history.append(total / len(images))
         return history
 
+# ---------------------------------------------------------------------------
+# NeRF-lite（位置编码 + 密度/颜色 MLP + 体渲染，简化版）
+# ---------------------------------------------------------------------------
+
+
+def _nerf_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"NeRF: {name} 必须是正整数")
+    return value
+
+
+def _nerf_check_ray(ray):
+    if not isinstance(ray, (list, tuple)) or len(ray) != 2:
+        raise ValueError("NeRF: ray 必须是 (origin, direction) 二元组")
+    out = []
+    for vec in ray:
+        if not isinstance(vec, (list, tuple)) or len(vec) != 3:
+            raise ValueError("NeRF: ray 的 origin/direction 必须是三维向量")
+        row = []
+        for v in vec:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError("NeRF: ray 必须只包含有限数字")
+            row.append(float(v))
+        out.append(row)
+    return out
+
+
+def _nerf_encode(vals, freqs):
+    out = []
+    for v in vals:
+        for k in range(freqs):
+            ang = (2.0 ** k) * math.pi * v
+            out.append(math.sin(ang))
+            out.append(math.cos(ang))
+    return out
+
+
+def _nerf_softplus(z):
+    if z > 20.0:
+        return z
+    return math.log1p(math.exp(z))
+
+
+def _nerf_sigmoid(z):
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+class NeRF:
+    """极简 NeRF：密度/颜色两个 MLP，固定步长体渲染。"""
+
+    def __init__(self, pos_freqs=3, dir_freqs=1, hidden=(16, 16), seed=None):
+        self.pos_freqs = _nerf_check_pos_int(pos_freqs, "pos_freqs")
+        self.dir_freqs = _nerf_check_pos_int(dir_freqs, "dir_freqs")
+        if (not isinstance(hidden, (list, tuple)) or not hidden
+                or any(isinstance(h, bool) or not isinstance(h, int) or h <= 0
+                       for h in hidden)):
+            raise ValueError("NeRF: hidden 必须是正整数元组")
+        self.hidden = tuple(hidden)
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("NeRF: seed 必须是整数或 None")
+        self.pos_dim = 3 * 2 * self.pos_freqs
+        self.dir_dim = 3 * 2 * self.dir_freqs
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.sigma_net = MLP([self.pos_dim] + list(hidden) + [4],
+                                 ["relu"] * len(hidden) + ["linear"])
+            self.rgb_net = MLP([3 + self.dir_dim] + list(hidden) + [3],
+                               ["relu"] * len(hidden) + ["linear"])
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.acc_w_sigma = _mlp_zero_grads(self.sigma_net)
+        self.acc_b_sigma = _mlp_acc_bias(self.sigma_net)
+        self.acc_w_rgb = _mlp_zero_grads(self.rgb_net)
+        self.acc_b_rgb = _mlp_acc_bias(self.rgb_net)
+
+    def param_count(self):
+        return sum(l.fan_in * l.fan_out + l.fan_out
+                   for l in self.sigma_net.layers) + \
+            sum(l.fan_in * l.fan_out + l.fan_out for l in self.rgb_net.layers)
+
+    def _render_ray(self, ray, near, far, num_samples):
+        origin, direction = ray
+        delta = (far - near) / num_samples
+        ts = [near + delta * (i + 0.5) for i in range(num_samples)]
+        enc_dir = _nerf_encode(direction, self.dir_freqs)
+        raw_rows = []
+        enc_points = []
+        color_inputs = []
+        for t in ts:
+            point = [origin[j] + t * direction[j] for j in range(3)]
+            enc = _nerf_encode(point, self.pos_freqs)
+            enc_points.append(enc)
+            raw = self.sigma_net.forward(enc)
+            raw_rows.append(raw)
+            color_inputs.append(raw[1:4] + enc_dir)
+        sigmas = [_nerf_softplus(row[0]) for row in raw_rows]
+        alphas = [1.0 - math.exp(-sigmas[i] * delta) for i in range(num_samples)]
+        trans = []
+        weights = []
+        running = 1.0
+        for i in range(num_samples):
+            trans.append(running)
+            weights.append(running * alphas[i])
+            running *= (1.0 - alphas[i])
+        colors_pre = [self.rgb_net.forward(inp) for inp in color_inputs]
+        colors = [[_nerf_sigmoid(c) for c in pre] for pre in colors_pre]
+        rgb = [sum(weights[i] * colors[i][c] for i in range(num_samples))
+               for c in range(3)]
+        depth = sum(weights[i] * ts[i] for i in range(num_samples))
+        return {
+            "rgb": rgb, "depth": depth, "weights": weights, "trans": trans,
+            "ts": ts, "sigmas": sigmas, "alphas": alphas, "colors": colors,
+            "raw_rows": raw_rows, "color_inputs": color_inputs,
+            "enc_points": enc_points, "delta": delta,
+        }
+
+    def forward(self, rays, near=0.0, far=1.0, num_samples=8):
+        if not isinstance(rays, (list, tuple)) or not rays:
+            raise ValueError("NeRF: rays 必须是非空列表")
+        if isinstance(near, bool) or not isinstance(near, (int, float)) \
+                or not math.isfinite(near):
+            raise ValueError("NeRF: near 必须是有限数字")
+        if isinstance(far, bool) or not isinstance(far, (int, float)) \
+                or not math.isfinite(far) or far <= near:
+            raise ValueError("NeRF: far 必须大于 near")
+        num_samples = _nerf_check_pos_int(num_samples, "num_samples")
+        outs = [self._render_ray(_nerf_check_ray(ray), near, far, num_samples)
+                for ray in rays]
+        return outs
+
+    def loss_and_backward(self, rays, target_rgb, near=0.0, far=1.0, num_samples=8):
+        if (not isinstance(target_rgb, (list, tuple)) or not target_rgb
+                or len(target_rgb) != len(rays)):
+            raise ValueError("NeRF: target_rgb 必须与 rays 等长")
+        outs = self.forward(rays, near, far, num_samples)
+        n_rays = len(rays)
+        loss = 0.0
+        for idx, out in enumerate(outs):
+            target = target_rgb[idx]
+            if (not isinstance(target, (list, tuple)) or len(target) != 3):
+                raise ValueError("NeRF: 每个 target_rgb 必须是 3 通道")
+            rgb = out["rgb"]
+            vals = []
+            for c in range(3):
+                if (not isinstance(target[c], (int, float))
+                        or isinstance(target[c], bool) or not math.isfinite(target[c])):
+                    raise ValueError("NeRF: target_rgb 必须是有限数字")
+                vals.append(float(target[c]))
+            loss += sum((rgb[c] - vals[c]) ** 2 for c in range(3))
+            d_rgb = [2.0 * (rgb[c] - vals[c]) / n_rays for c in range(3)]
+            weights = out["weights"]
+            colors = out["colors"]
+            n_samples = len(weights)
+            d_w = [sum(d_rgb[c] * colors[i][c] for c in range(3))
+                   for i in range(n_samples)]
+            d_color = [[d_rgb[c] * weights[i] for c in range(3)]
+                       for i in range(n_samples)]
+            alphas = out["alphas"]
+            trans = out["trans"]
+            sigmas = out["sigmas"]
+            raw_rows = out["raw_rows"]
+            enc_points = out["enc_points"]
+            for i in range(n_samples):
+                alpha_i = alphas[i]
+                suffix = 0.0
+                if 1.0 - alpha_i > 1e-12:
+                    for k in range(i + 1, n_samples):
+                        suffix += d_w[k] * weights[k] / (1.0 - alpha_i)
+                d_alpha_i = d_w[i] * trans[i] - suffix
+                d_sigma = d_alpha_i * out["delta"] * (1.0 - alpha_i)
+                d_raw = d_sigma * _nerf_sigmoid(raw_rows[i][0])
+                p = colors[i]
+                d_pre = [d_color[i][c] * p[c] * (1.0 - p[c]) for c in range(3)]
+                # rgb 网络：颜色头 + 取出特征梯度
+                self.rgb_net.forward(out["color_inputs"][i])
+                grads_rgb, dx = _mlp_backward_with_input(self.rgb_net, d_pre)
+                _mlp_accumulate(self.acc_w_rgb, self.acc_b_rgb, grads_rgb)
+                d_feat = dx[:3]
+                # sigma 网络：同时接收 raw 与特征梯度
+                self.sigma_net.forward(enc_points[i])
+                grads_sigma, _ = _mlp_backward_with_input(
+                    self.sigma_net, [d_raw, d_feat[0], d_feat[1], d_feat[2]])
+                _mlp_accumulate(self.acc_w_sigma, self.acc_b_sigma, grads_sigma)
+        return loss / n_rays
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("NeRF: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("NeRF: lr 必须为正数")
+        for li, layer in enumerate(self.sigma_net.layers):
+            _dense_apply_sgd(layer, (self.acc_w_sigma[li], self.acc_b_sigma[li]), lr)
+        for li, layer in enumerate(self.rgb_net.layers):
+            _dense_apply_sgd(layer, (self.acc_w_rgb[li], self.acc_b_rgb[li]), lr)
+
+    def fit(self, rays, targets, epochs=20, lr=0.01, near=0.0, far=1.0,
+            num_samples=8, seed=None):
+        if (not isinstance(rays, (list, tuple)) or not isinstance(targets, (list, tuple))
+                or not rays or len(rays) != len(targets)):
+            raise ValueError("NeRF: rays 与 targets 必须是非空等长列表")
+        epochs = _nerf_check_pos_int(epochs, "epochs")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("NeRF: seed 必须是整数或 None")
+        history = []
+        for _ in range(epochs):
+            self.zero_grad()
+            loss = self.loss_and_backward(rays, targets, near, far, num_samples)
+            self.sgd_step(lr)
+            history.append(loss)
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
