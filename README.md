@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2528 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2532 项）
 
 ## 特性
 
@@ -3445,8 +3445,9 @@ hist = fno.fit(functions, derivatives, epochs=200, lr=0.05)
 | --- | --- |
 | `DeepONet(sensor_dim, coord_dim=1, branch_hidden=(32, 32), trunk_hidden=(32, 32), latent_dim=8, seed=None)` | `forward(branch_input, coords)` 返回每个坐标处的标量；`loss_and_backward(branch_inputs, coords, targets)` 用 MSE（返回 float）；`fit(epochs=200, lr=0.01)`、`predict`、`param_count` |
 | `FNO1d(in_channels=1, out_channels=1, width=16, modes=4, num_layers=2, grid_size=16, seed=None)` | 谱卷积用复数权重 `W=A+iB` 与输入谱 `X=C-iS` 相乘（让 sin 分量可以旋转成 cos，例如求导算子），再逆变换回时域；`forward`/`loss_and_backward`/`fit`/`predict`/`param_count` |
+| `DeepONet2D(sensor_dim, p=8, branch_hidden=(16,), trunk_hidden=(16,), seed=None)` | 二维坐标 `(x, y)` 的 DeepONet：branch 网络编码传感器向量、trunk 网络编码坐标，输出为 `p` 维内积；`forward(sensors, xy)`/`loss_and_backward`/`fit`/`predict`/`param_count` |
 
-边界：DeepONet 的 branch/trunk 都是小型 MLP（不是 CNN/Transformer），loss 为逐点 MSE；FNO1d 只用固定 cos/sin 基的朴素离散变换（无 FFT、无更高阶模式处理、`modes ≤ grid_size//2`），只支持一维、规则网格，且用全批量 SGD（无 mini-batch / Adam）。
+边界：DeepONet 的 branch/trunk 都是小型 MLP（不是 CNN/Transformer），loss 为逐点 MSE；FNO1d 只用固定 cos/sin 基的朴素离散变换（无 FFT、无更高阶模式处理、`modes ≤ grid_size//2`），只支持一维、规则网格，且用全批量 SGD（无 mini-batch / Adam）。DeepONet2D 是其二维坐标版本（trunk 输入为 2 维 `(x, y)`），同为小型 MLP、逐点 MSE、逐样本 SGD。
 
 ### 神经 ODE 与物理信息网络（Neural ODE / PINN）
 
@@ -5299,7 +5300,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2528 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2532 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5501,6 +5502,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
+| `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
 | `TestDiT` | 前向/参数计数/采样可复现、conv/head/时间 MLP 梯度中心差分、拟合降 loss、时间调制改变输出、非法输入 |
 | `TestSafetensors` | 1D/2D 往返、header 偏移/8 字节对齐、float32 精度、`__metadata__` 跳过、非法张量、截断/坏 JSON/坏 dtype/offsets 不匹配 |
@@ -5747,6 +5749,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2528 个单元测试
+├── test_ai.py       # 2532 个单元测试
 └── README.md
 ```

@@ -38932,3 +38932,112 @@ class TestDCNv2:
         assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], []))
         assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], [1.0], epochs=0))
         assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], [1.0], lr=0.0))
+
+
+def _don2_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _don2_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def _don2_fd(net, sensors, xy, tgt, grad_getter, param_getter, param_setter, h=1e-5):
+    net.zero_grad()
+    net.loss_and_backward(sensors, xy, tgt)
+    ana = grad_getter()
+    old = param_getter()
+    param_setter(old + h)
+    net.zero_grad()
+    lp = net.loss_and_backward(sensors, xy, tgt)
+    param_setter(old - h)
+    net.zero_grad()
+    lm = net.loss_and_backward(sensors, xy, tgt)
+    param_setter(old)
+    return (lp - lm) / (2 * h), ana
+
+
+class TestDeepONet2D:
+    def test_forward_and_param_count(self):
+        random.seed(7)
+        m = AI.DeepONet2D(3, p=4, branch_hidden=(6,), trunk_hidden=(6,), seed=1)
+        assert m.param_count() == 98
+        out = m.forward([0.1, 0.2, 0.3], [0.5, 0.5])
+        assert isinstance(out, float) and math.isfinite(out)
+        assert isinstance(m.predict([0.1, 0.2, 0.3], [0.5, 0.5]), float)
+        assert m.loss_and_backward([0.1, 0.2, 0.3], [0.5, 0.5], 1.0) >= 0.0
+
+    def test_branch_and_trunk_gradients(self):
+        random.seed(8)
+        m = AI.DeepONet2D(3, p=4, branch_hidden=(6,), trunk_hidden=(6,), seed=2)
+        sensors = [0.1, 0.2, 0.3]
+        xy = [0.5, 0.5]
+        found = False
+        for i in range(6):
+            for j in range(3):
+                num, ana = _don2_fd(m, sensors, xy, 1.0,
+                                    lambda i=i, j=j: m.grad_branch_w[0][i][j],
+                                    lambda i=i, j=j: m.branch.layers[0].weights[i][j],
+                                    lambda v, i=i, j=j: m.branch.layers[0].weights[i].__setitem__(j, v))
+                if abs(ana) > 1e-8:
+                    assert _don2_close(num, ana, 1e-4)
+                    found = True
+                    break
+            if found:
+                break
+        assert found
+        found = False
+        for i in range(6):
+            for j in range(2):
+                num, ana = _don2_fd(m, sensors, xy, 1.0,
+                                    lambda i=i, j=j: m.grad_trunk_w[0][i][j],
+                                    lambda i=i, j=j: m.trunk.layers[0].weights[i][j],
+                                    lambda v, i=i, j=j: m.trunk.layers[0].weights[i].__setitem__(j, v))
+                if abs(ana) > 1e-8:
+                    assert _don2_close(num, ana, 1e-4)
+                    found = True
+                    break
+            if found:
+                break
+        assert found
+
+    def test_fit_2d_function(self):
+        random.seed(21)
+        m = AI.DeepONet2D(2, p=8, branch_hidden=(16,), trunk_hidden=(16,), seed=2)
+        sensors = [0.5, 0.5]
+        samples = []
+        for i in range(5):
+            for j in range(5):
+                x = i / 4.0
+                y = j / 4.0
+                samples.append((sensors, [x, y],
+                                math.sin(math.pi * x) * math.cos(math.pi * y)))
+        history = m.fit(samples, epochs=300, lr=0.02, seed=1)
+        assert history[-1] < history[0] * 0.5
+        assert abs(m.predict(sensors, [0.0, 0.0]) - 0.0) < 0.5
+        assert abs(m.predict(sensors, [0.5, 0.5]) - 0.0) < 0.5
+
+    def test_invalid_inputs(self):
+        m = AI.DeepONet2D(3, p=4, branch_hidden=(6,), trunk_hidden=(6,), seed=1)
+        assert _don2_raises(lambda: AI.DeepONet2D(0))
+        assert _don2_raises(lambda: AI.DeepONet2D(2, p=0))
+        assert _don2_raises(lambda: AI.DeepONet2D(2, branch_hidden=()))
+        assert _don2_raises(lambda: AI.DeepONet2D(2, trunk_hidden=(0,)))
+        assert _don2_raises(lambda: AI.DeepONet2D(2, branch_hidden=("a",)))
+        assert _don2_raises(lambda: AI.DeepONet2D(2, seed="a"))
+        assert _don2_raises(lambda: m.forward([], [0.5, 0.5]))
+        assert _don2_raises(lambda: m.forward([1.0], [0.5, 0.5]))
+        assert _don2_raises(lambda: m.forward([1.0, 1.0, 1.0], [0.5]))
+        assert _don2_raises(lambda: m.forward([1.0, 1.0, 1.0], [0.5, float("nan")]))
+        assert _don2_raises(lambda: m.forward([1.0, 1.0, 1.0], [0.5, True]))
+        assert _don2_raises(lambda: m.loss_and_backward([1.0, 1.0, 1.0], [0.5, 0.5], float("inf")))
+        assert _don2_raises(lambda: m.sgd_step(0.0))
+        assert _don2_raises(lambda: m.fit([]))
+        assert _don2_raises(lambda: m.fit([([1.0, 1.0, 1.0], [0.5, 0.5], 1.0)], epochs=0))
+        assert _don2_raises(lambda: m.fit([([1.0, 1.0, 1.0], [0.5, 0.5], 1.0)], lr=0.0))
+        assert _don2_raises(lambda: m.fit([([1.0], [0.5, 0.5], 1.0)]))
+        assert _don2_raises(lambda: m.fit([([1.0, 1.0, 1.0], [0.5, 0.5])]))

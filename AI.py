@@ -10576,6 +10576,158 @@ class DCNv2:
             history.append(total / len(xs))
         return history
 
+# ---------------------------------------------------------------------------
+# DeepONet2D（二维算子学习：branch 编码输入函数 + trunk 编码坐标）
+# ---------------------------------------------------------------------------
+
+
+def _don2_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"DeepONet2D: {name} 必须是正整数")
+    return value
+
+
+def _don2_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"DeepONet2D: {name} 必须是有限数字")
+    return float(value)
+
+
+def _don2_check_vector(values, expected, who):
+    if not isinstance(values, (list, tuple)) or len(values) != expected:
+        raise ValueError(f"DeepONet2D: {who} 必须是长度为 {expected} 的列表")
+    out = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"DeepONet2D: {who} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+class DeepONet2D:
+    """二维 DeepONet：branch 网络接收传感器值 u，trunk 网络接收坐标 (x, y)，输出为点积。"""
+
+    def __init__(self, sensor_dim, p=8, branch_hidden=(16,), trunk_hidden=(16,), seed=None):
+        self.sensor_dim = _don2_check_pos_int(sensor_dim, "sensor_dim")
+        self.p = _don2_check_pos_int(p, "p")
+        for hidden, name in ((branch_hidden, "branch_hidden"), (trunk_hidden, "trunk_hidden")):
+            if (not isinstance(hidden, (list, tuple)) or not hidden
+                    or any(isinstance(h, bool) or not isinstance(h, int) or h <= 0 for h in hidden)):
+                raise ValueError(f"DeepONet2D: {name} 必须是非空正整数列表")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("DeepONet2D: seed 必须是整数或 None")
+        self.branch_hidden = list(branch_hidden)
+        self.trunk_hidden = list(trunk_hidden)
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.branch = MLP([self.sensor_dim] + self.branch_hidden + [self.p],
+                              ["relu"] * len(self.branch_hidden) + ["linear"])
+            self.trunk = MLP([2] + self.trunk_hidden + [self.p],
+                             ["relu"] * len(self.trunk_hidden) + ["linear"])
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_branch_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                              for layer in self.branch.layers]
+        self.grad_branch_b = [[0.0] * layer.fan_out for layer in self.branch.layers]
+        self.grad_trunk_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                             for layer in self.trunk.layers]
+        self.grad_trunk_b = [[0.0] * layer.fan_out for layer in self.trunk.layers]
+
+    def param_count(self):
+        total = 0
+        for net in (self.branch, self.trunk):
+            for layer in net.layers:
+                total += layer.fan_in * layer.fan_out + layer.fan_out
+        return total
+
+    def forward(self, sensors, xy):
+        u = _don2_check_vector(sensors, self.sensor_dim, "sensors")
+        xyt = _don2_check_vector(xy, 2, "xy")
+        b = self.branch.forward(u)
+        t = self.trunk.forward(xyt)
+        out = sum(b[k] * t[k] for k in range(self.p))
+        self._cache = {"b": b, "t": t}
+        return out
+
+    def predict(self, sensors, xy):
+        return self.forward(sensors, xy)
+
+    def loss_and_backward(self, sensors, xy, target):
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target):
+            raise ValueError("DeepONet2D: target 必须是有限数字")
+        target = float(target)
+        out = self.forward(sensors, xy)
+        pred = out
+        diff = pred - target
+        loss = diff * diff
+        d_out = 2.0 * diff
+        b = self._cache["b"]
+        t = self._cache["t"]
+        d_branch = [d_out * t[k] for k in range(self.p)]
+        d_trunk = [d_out * b[k] for k in range(self.p)]
+        branch_grads, _ = _mlp_backward_with_input(self.branch, d_branch)
+        trunk_grads, _ = _mlp_backward_with_input(self.trunk, d_trunk)
+        for li, (gw, gb) in enumerate(branch_grads):
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_branch_w[li][i][j] += gw[i][j]
+                self.grad_branch_b[li][i] += gb[i]
+        for li, (gw, gb) in enumerate(trunk_grads):
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_trunk_w[li][i][j] += gw[i][j]
+                self.grad_trunk_b[li][i] += gb[i]
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        lr = _don2_check_pos_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("DeepONet2D: lr 必须为正数")
+        for net, gw_all, gb_all in ((self.branch, self.grad_branch_w, self.grad_branch_b),
+                                    (self.trunk, self.grad_trunk_w, self.grad_trunk_b)):
+            for li, layer in enumerate(net.layers):
+                for i in range(layer.fan_out):
+                    for j in range(layer.fan_in):
+                        layer.weights[i][j] -= lr * gw_all[li][i][j]
+                    layer.biases[i] -= lr * gb_all[li][i]
+
+    def fit(self, samples, epochs=50, lr=0.01, seed=None, shuffle=True):
+        if (not isinstance(samples, (list, tuple)) or not samples):
+            raise ValueError("DeepONet2D: samples 必须是非空列表")
+        epochs = _don2_check_pos_int(epochs, "epochs")
+        lr = _don2_check_pos_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("DeepONet2D: lr 必须为正数")
+        clean = []
+        for item in samples:
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                raise ValueError("DeepONet2D: 每个样本必须是 (sensors, xy, target)")
+            sensors, xy, target = item
+            u = _don2_check_vector(sensors, self.sensor_dim, "sensors")
+            xyt = _don2_check_vector(xy, 2, "xy")
+            if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target):
+                raise ValueError("DeepONet2D: target 必须是有限数字")
+            clean.append((u, xyt, float(target)))
+        rng = random.Random(seed)
+        order = list(range(len(clean)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                u, xyt, target = clean[idx]
+                self.zero_grad()
+                total += self.loss_and_backward(u, xyt, target)
+                self.sgd_step(lr)
+            history.append(total / len(clean))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
