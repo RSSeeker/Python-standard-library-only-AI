@@ -39313,3 +39313,105 @@ class TestTimeSformer:
         ]
         for i, fn in enumerate(cases):
             _tsf_raises(fn)
+
+
+# ---------------------------------------------------------------------------
+# WhisperLite（mel 编码器 + 文本解码器语音识别）
+# ---------------------------------------------------------------------------
+
+
+def _whisper_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+def _whisper_mel(seed, frames=4, n_mels=8):
+    rng = random.Random(seed)
+    return [[rng.random() for _ in range(n_mels)] for _ in range(frames)]
+
+
+class TestWhisperLite:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.WhisperLite(n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16,
+                           enc_layers=1, dec_layers=1, max_audio_len=16,
+                           max_text_len=6, seed=3)
+        assert m.param_count() == 1678
+        mel = _whisper_mel(1)
+        logits = m.forward(mel, [1, 2])
+        assert len(logits) == 2 and len(logits[0]) == 6
+        out = m.predict(mel, start_id=1, max_new_tokens=2)
+        assert out[0] == 1 and len(out) <= 4
+        _whisper_raises(lambda: m.forward(mel, [1, True]))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.WhisperLite(n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16,
+                           enc_layers=1, dec_layers=1, max_audio_len=16,
+                           max_text_len=6, seed=5)
+        mel = _whisper_mel(2)
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(mel, [1, 2, 3])
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-8, abs(analytic) + abs(fd_val))
+
+        rel_w = fd(lambda: m.grads['proj_w'][2][1],
+                   lambda: m.audio_proj.weights[2][1],
+                   lambda v: m.audio_proj.weights[2].__setitem__(1, v))
+        rel_b = fd(lambda: m.grads['proj_b'][3],
+                   lambda: m.audio_proj.biases[3],
+                   lambda v: m.audio_proj.biases.__setitem__(3, v))
+        rel_out = fd(lambda: m.grads['W_out'][2][1],
+                     lambda: m.W_out[2][1],
+                     lambda v: m.W_out[2].__setitem__(1, v))
+        assert rel_w < 1e-4 and rel_b < 1e-4 and rel_out < 1e-4
+
+    def test_fit_memorize(self):
+        random.seed(0)
+        m = AI.WhisperLite(n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16,
+                           enc_layers=1, dec_layers=1, max_audio_len=16,
+                           max_text_len=6, seed=7)
+        mels = [_whisper_mel(11), _whisper_mel(12)]
+        hist = m.fit(mels, [[1, 2, 3], [1, 2, 4]], epochs=60, lr=0.1, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+        assert m.predict(mels[0], start_id=1, max_new_tokens=2)[:2] == [1, 2]
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.WhisperLite(n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16,
+                           enc_layers=1, dec_layers=1, max_audio_len=16,
+                           max_text_len=6, seed=3)
+        mel = _whisper_mel(1)
+        cases = [
+            lambda: AI.WhisperLite(0),
+            lambda: AI.WhisperLite(8, d_model=8, num_heads=3),
+            lambda: m.forward([], [1, 2]),
+            lambda: m.forward([[0.1] * 8] * 17, [1, 2]),
+            lambda: m.forward([[0.1] * 7] * 4, [1, 2]),
+            lambda: m.forward(mel, []),
+            lambda: m.forward(mel, [1, 6]),
+            lambda: m.forward(mel, [1, True]),
+            lambda: m.loss_and_backward(mel, [1]),
+            lambda: m.sgd_step(0.0),
+            lambda: m.predict(mel, start_id=99),
+            lambda: m.predict(mel, start_id=1, max_new_tokens=0),
+            lambda: m.fit([], []),
+            lambda: m.fit(mels=[mel], captions=[[1, 2], [3, 4]]),
+        ]
+        for i, fn in enumerate(cases):
+            _whisper_raises(fn)

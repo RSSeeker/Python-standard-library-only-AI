@@ -11308,6 +11308,237 @@ class TimeSformer:
             history.append(total / len(videos))
         return history
 
+# ---------------------------------------------------------------------------
+# Whisper（音频编码器 + 文本解码器的语音识别模型，简化版）
+# ---------------------------------------------------------------------------
+
+
+def _whisper_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Whisper: {name} 必须是正整数")
+    return value
+
+
+def _whisper_check_frames(frames, n_mels, max_len, who="mel"):
+    if not isinstance(frames, (list, tuple)) or not frames:
+        raise ValueError(f"Whisper: {who} 必须是非空帧列表")
+    if len(frames) > max_len:
+        raise ValueError(f"Whisper: {who} 帧数不能超过 {max_len}")
+    out = []
+    for frame in frames:
+        if not isinstance(frame, (list, tuple)) or len(frame) != n_mels:
+            raise ValueError(f"Whisper: {who} 每帧必须是 {n_mels} 维")
+        row = []
+        for v in frame:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"Whisper: {who} 必须只包含有限数字")
+            row.append(float(v))
+        out.append(row)
+    return out
+
+
+def _whisper_check_ids(ids, vocab_size, max_len, who="text"):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"Whisper: {who} 必须是非空 token 列表")
+    if len(ids) > max_len:
+        raise ValueError(f"Whisper: {who} 长度不能超过 {max_len}")
+    out = []
+    for idx in ids:
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise ValueError(f"Whisper: {who} 必须只包含整数 token")
+        if not 0 <= idx < vocab_size:
+            raise ValueError(f"Whisper: {who} token 必须在 [0, {vocab_size}) 内")
+        out.append(idx)
+    return out
+
+
+class WhisperLite:
+    """Whisper 式语音识别：mel 帧线性投影 → 编码器 → 因果解码器。"""
+
+    def __init__(self, n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16,
+                 enc_layers=1, dec_layers=1, max_audio_len=16, max_text_len=8,
+                 seed=None):
+        self.n_mels = _whisper_check_pos_int(n_mels, "n_mels")
+        self.vocab_size = _whisper_check_pos_int(vocab_size, "vocab_size")
+        self.d_model = _whisper_check_pos_int(d_model, "d_model")
+        self.num_heads = _whisper_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _whisper_check_pos_int(d_ff, "d_ff")
+        self.enc_layers = _whisper_check_pos_int(enc_layers, "enc_layers")
+        self.dec_layers = _whisper_check_pos_int(dec_layers, "dec_layers")
+        self.max_audio_len = _whisper_check_pos_int(max_audio_len, "max_audio_len")
+        self.max_text_len = _whisper_check_pos_int(max_text_len, "max_text_len")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("Whisper: d_model 必须能被 num_heads 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("Whisper: seed 必须是整数或 None")
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.audio_proj = Layer(self.n_mels, self.d_model, "linear")
+            self.audio_pos = PositionalEncoding(self.d_model, self.max_audio_len)
+            self.encoder = TransformerEncoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.enc_layers, dropout=0.0,
+                                              causal=False)
+            self.token_emb = Embedding(self.vocab_size, self.d_model)
+            self.text_pos = PositionalEncoding(self.d_model, self.max_text_len)
+            self.decoder = TransformerDecoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.dec_layers, dropout=0.0,
+                                              causal=True)
+            self.W_out = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                          for _ in range(self.vocab_size)]
+            self.b_out = [0.0 for _ in range(self.vocab_size)]
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.encoder.zero_grad()
+        self.decoder.zero_grad()
+        self.token_emb.zero_grad()
+        self.grads = {
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0 for _ in range(self.vocab_size)],
+            "proj_w": [[0.0] * self.n_mels for _ in range(self.d_model)],
+            "proj_b": [0.0 for _ in range(self.d_model)],
+        }
+
+    def param_count(self):
+        proj = self.n_mels * self.d_model + self.d_model
+        d, f = self.d_model, self.d_ff
+        enc_layer = 4 * (d * d + d) + (d * f + f) + (f * d + d) + 4 * d
+        dec_layer = 8 * (d * d + d) + (d * f + f) + (f * d + d) + 6 * d
+        return proj + self.enc_layers * enc_layer + self.dec_layers * dec_layer + \
+            self.vocab_size * d + self.vocab_size * (d + 1)
+
+    def _encode_audio(self, mel):
+        rows = _whisper_check_frames(mel, self.n_mels, self.max_audio_len)
+        projected, cache = _dense_rows_forward(self.audio_proj, rows)
+        pos = self.audio_pos.forward(projected)
+        memory = self.encoder.forward(pos)
+        return memory, cache
+
+    def forward(self, mel, input_ids):
+        ids = _whisper_check_ids(input_ids, self.vocab_size, self.max_text_len, "input_ids")
+        memory, proj_cache = self._encode_audio(mel)
+        emb = self.token_emb.forward(ids)
+        x = self.text_pos.forward(emb)
+        h = self.decoder.forward(x, memory)
+        logits = [[sum(self.W_out[v][j] * h[t][j] for j in range(self.d_model))
+                   + self.b_out[v] for v in range(self.vocab_size)]
+                  for t in range(len(ids))]
+        self._cache = {"memory": memory, "proj_cache": proj_cache, "h": h, "ids": ids}
+        return logits
+
+    def loss_and_backward(self, mel, caption):
+        if (not isinstance(caption, (list, tuple)) or len(caption) < 2):
+            raise ValueError("Whisper: caption 至少需要 2 个 token")
+        cap = _whisper_check_ids(caption, self.vocab_size, self.max_text_len, "caption")
+        logits = self.forward(mel, cap[:-1])
+        n = len(cap) - 1
+        d_logits = []
+        loss = 0.0
+        for t in range(n):
+            row = logits[t]
+            m = max(row)
+            exps = [math.exp(v - m) for v in row]
+            total = sum(exps)
+            probs = [v / total for v in exps]
+            target = cap[t + 1]
+            loss += -math.log(max(probs[target], 1e-12))
+            d = list(probs)
+            d[target] -= 1.0
+            d_logits.append([v / n for v in d])
+        h = self._cache["h"]
+        seq_len = len(h)
+        for v in range(self.vocab_size):
+            grow = self.grads["W_out"][v]
+            gb = 0.0
+            for t in range(seq_len):
+                dv = d_logits[t][v]
+                gb += dv
+                ht = h[t]
+                for j in range(self.d_model):
+                    grow[j] += dv * ht[j]
+            self.grads["b_out"][v] += gb
+        dh = [[0.0] * self.d_model for _ in range(seq_len)]
+        for t in range(seq_len):
+            dl = d_logits[t]
+            for j in range(self.d_model):
+                s = 0.0
+                for v in range(self.vocab_size):
+                    s += dl[v] * self.W_out[v][j]
+                dh[t][j] = s
+        d_dec, d_mem = self.decoder.backward(dh)
+        self.token_emb.backward(d_dec)
+        d_rows = self.encoder.backward(d_mem)
+        gw, gb, dx = _dense_rows_backward(self.audio_proj, self._cache["proj_cache"], d_rows)
+        for i in range(self.d_model):
+            for j in range(self.n_mels):
+                self.grads["proj_w"][i][j] += gw[i][j]
+        for j in range(self.d_model):
+            self.grads["proj_b"][j] += gb[j]
+        return loss / n
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("Whisper: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("Whisper: lr 必须为正数")
+        self.encoder.sgd_step(lr)
+        self.decoder.sgd_step(lr)
+        self.token_emb.sgd_step(lr)
+        for i in range(self.d_model):
+            for j in range(self.n_mels):
+                self.audio_proj.weights[i][j] -= lr * self.grads["proj_w"][i][j]
+        for j in range(self.d_model):
+            self.audio_proj.biases[j] -= lr * self.grads["proj_b"][j]
+        for v in range(self.vocab_size):
+            for j in range(self.d_model):
+                self.W_out[v][j] -= lr * self.grads["W_out"][v][j]
+            self.b_out[v] -= lr * self.grads["b_out"][v]
+
+    def predict(self, mel, start_id=0, max_new_tokens=6, end_id=None):
+        if isinstance(start_id, bool) or not isinstance(start_id, int) or \
+                not 0 <= start_id < self.vocab_size:
+            raise ValueError("Whisper: start_id 越界")
+        max_new_tokens = _whisper_check_pos_int(max_new_tokens, "max_new_tokens")
+        out = [start_id]
+        for _ in range(max_new_tokens):
+            logits = self.forward(mel, out)
+            nxt = max(range(self.vocab_size), key=lambda v: logits[-1][v])
+            out.append(nxt)
+            if end_id is not None and nxt == end_id:
+                break
+            if len(out) >= self.max_text_len:
+                break
+        return out
+
+    def fit(self, mels, captions, epochs=20, lr=0.01, seed=None, shuffle=True):
+        if (not isinstance(mels, (list, tuple)) or not isinstance(captions, (list, tuple))
+                or not mels or len(mels) != len(captions)):
+            raise ValueError("Whisper: mels 与 captions 必须是非空且等长的列表")
+        epochs = _whisper_check_pos_int(epochs, "epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("Whisper: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("Whisper: lr 必须为正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("Whisper: seed 必须是整数或 None")
+        rng = random.Random(seed)
+        order = list(range(len(mels)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(mels[idx], captions[idx])
+                self.sgd_step(lr)
+            history.append(total / len(mels))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

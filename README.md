@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2544 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2548 项）
 
 ## 特性
 
@@ -3693,6 +3693,34 @@ print(model.predict([1.0, 0.0, 1.0, 0.0]))
 边界：输入是稠密数值向量，不含稀疏特征哈希/embedding 查表；交叉层为全秩矩阵（无低秩分解）；
 逐样本 SGD（无 mini-batch、无正则项）；只做二分类打分，不含多任务输出与校准。
 
+### WhisperLite（语音识别：mel 编码器 + 文本解码器）
+
+mel 帧经线性投影 + 位置编码送进 Transformer 编码器，解码器以因果方式生成转写文本：
+
+```python
+import AI
+
+model = AI.WhisperLite(n_mels=8, vocab_size=6, d_model=16, num_heads=2, d_ff=32,
+                       max_audio_len=16, max_text_len=8, seed=0)
+mel = [[0.1] * 8 for _ in range(4)]     # 4 帧、每帧 8 个 mel bin
+loss = model.loss_and_backward(mel, [1, 2, 3])
+model.sgd_step(0.01)
+print(model.predict(mel, start_id=1, max_new_tokens=4))
+```
+
+| API | 说明 |
+| --- | --- |
+| `WhisperLite(n_mels=8, vocab_size=6, d_model=8, num_heads=1, d_ff=16, enc_layers=1, dec_layers=1, max_audio_len=16, max_text_len=8, seed=None)` | mel 线性投影 + `TransformerEncoder` + `TransformerDecoder` + 词表输出头；要求 `d_model % num_heads == 0` |
+| `forward(mel, input_ids)` | `mel` 为帧列表（每帧 `n_mels` 维），返回逐位置词表 logits |
+| `loss_and_backward(mel, caption)` | teacher forcing 交叉熵（`caption[:-1]` 预测 `caption[1:]`），反向到投影层/编码器/解码器/输出头，返回平均损失 |
+| `predict(mel, start_id=0, max_new_tokens=6, end_id=None)` | 贪心自回归解码 |
+| `fit(mels, captions, epochs=20, lr=0.01, seed=None, shuffle=True)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 投影层 + 编码/解码层 + token 嵌入 + 输出头 |
+
+边界：这是 Whisper 结构的简化版——不做 log-mel 特征提取（调用方传入 mel 帧），不含卷积前端/语言 ID/时间戳 token，也不做真实的语音-文本数据预训练；解码为贪心，不支持 beam search。
+
+测试：`TestWhisperLite` 覆盖前向/参数量、投影层与输出头梯度有限差分、两段 mel 与转写文本的过拟合训练、非法输入。
+
 ### TimeSformer（时空分离注意力视频分类）
 
 每帧内做空间注意力、逐 patch 位置跨帧做时间注意力，避免联合时空注意力的 O((T·P)²) 开销：
@@ -5359,7 +5387,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2544 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2548 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5563,6 +5591,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointedCausalLM` | 检查点反传与 `CausalLM._loss_and_backward` 的 loss/输出头/嵌入梯度一致、`segments=1/3` 结果相同、`fit_causal_lm_checkpointed` loss 下降、非法输入 |
 | `TestTrOCR` | 前向/参数量、卷积核与输出头梯度有限差分、合成图过拟合训练、predict 长度/非法输入 |
 | `TestTimeSformer` | 前向/参数量、卷积核/时间位置/分类头梯度有限差分、合成视频过拟合训练、非法输入 |
+| `TestWhisperLite` | 前向/参数量、投影层与输出头梯度有限差分、合成 mel 过拟合训练、predict 长度/非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5811,6 +5840,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2544 个单元测试
+├── test_ai.py       # 2548 个单元测试
 └── README.md
 ```
