@@ -8850,6 +8850,234 @@ def hyena_forward_backward(u_rows, v_rows, kernel, d_out_rows):
     return du, dv, d_kernel
 
 
+def _hyena_check_pos_int(value, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("HyenaBlock: %s 必须是整数，收到 %r" % (name, value))
+    if value <= 0:
+        raise ValueError("HyenaBlock: %s 必须为正整数，收到 %r" % (name, value))
+    return value
+
+
+def _hyena_check_positive(value, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("HyenaBlock: %s 必须是数字，收到 %r" % (name, value))
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("HyenaBlock: %s 必须是有限正数，收到 %r" % (name, value))
+    return value
+
+
+class HyenaBlock:
+    """Hyena 完整 block：短卷积 + 全局长卷积 + 门控 + 输出投影 + 残差。
+
+    结构（pre-LN）：``h = LN(x)``；``u = W_u h``、``v = W_v h``；
+    ``u_s = short_conv(u)``（逐通道因果深度卷积，长度 ``short_kernel``）；
+    ``u_l = long_conv(u_s)``（逐通道因果深度卷积，长度 ``long_kernel``，充当
+    全局长卷积的纯 Python 版本）；``g = v ⊙ u_l``；``y = W_o g``；``out = x + y``。
+    反向覆盖三个投影、两个卷积核、LayerNorm 与输入梯度。
+    """
+
+    def __init__(self, d_model: int, short_kernel: int = 3, long_kernel: int = 4,
+                 eps: float = 1e-5, seed=None):
+        d_model = _hyena_check_pos_int(d_model, "d_model")
+        short_kernel = _hyena_check_pos_int(short_kernel, "short_kernel")
+        long_kernel = _hyena_check_pos_int(long_kernel, "long_kernel")
+        eps = _hyena_check_positive(eps, "eps")
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise ValueError("HyenaBlock: seed 必须是整数或 None")
+        self.d_model = d_model
+        self.short_kernel = short_kernel
+        self.long_kernel = long_kernel
+        state = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            std = math.sqrt(2.0 / d_model)
+            self.ln1 = LayerNorm(d_model, eps)
+            self.W_u = Layer(d_model, d_model, "linear")
+            self.W_v = Layer(d_model, d_model, "linear")
+            self.W_o = Layer(d_model, d_model, "linear")
+            self.short_w = [[random.gauss(0.0, std) for _ in range(short_kernel)]
+                            for _ in range(d_model)]
+            self.long_w = [[random.gauss(0.0, std) for _ in range(long_kernel)]
+                           for _ in range(d_model)]
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_u = None
+        self.grad_v = None
+        self.grad_o = None
+        self.grad_ln = None
+        self.grad_short = [[0.0] * self.short_kernel for _ in range(self.d_model)]
+        self.grad_long = [[0.0] * self.long_kernel for _ in range(self.d_model)]
+        self._cache = None
+
+    def param_count(self):
+        return (3 * _dense_param_count(self.W_u)
+                + _norm_param_count(self.ln1)
+                + self.d_model * self.short_kernel
+                + self.d_model * self.long_kernel)
+
+    def _check_seq(self, seq, who):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError("HyenaBlock.%s: 输入序列不能为空" % who)
+        out = []
+        for t, row in enumerate(seq):
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(
+                    "HyenaBlock.%s: 第 %d 个 token 必须是长度 %d 的列表"
+                    % (who, t, self.d_model))
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError("HyenaBlock.%s: token 元素必须是数字" % who)
+                v = float(v)
+                if not math.isfinite(v):
+                    raise ValueError("HyenaBlock.%s: token 元素必须是有限数字" % who)
+                vals.append(v)
+            out.append(vals)
+        return out
+
+    @staticmethod
+    def _causal_conv(rows, kernels):
+        t_len = len(rows)
+        d = len(kernels)
+        k_len = len(kernels[0])
+        out = [[0.0] * d for _ in range(t_len)]
+        for t in range(t_len):
+            for c in range(d):
+                acc = 0.0
+                ker = kernels[c]
+                for k in range(k_len):
+                    if t - k >= 0:
+                        acc += ker[k] * rows[t - k][c]
+                out[t][c] = acc
+        return out
+
+    @staticmethod
+    def _causal_conv_backward(dout, rows, kernels):
+        t_len = len(dout)
+        d = len(kernels)
+        k_len = len(kernels[0])
+        d_rows = [[0.0] * d for _ in range(t_len)]
+        d_kernels = [[0.0] * k_len for _ in range(d)]
+        for t in range(t_len):
+            for c in range(d):
+                g = dout[t][c]
+                if g == 0.0:
+                    continue
+                ker = kernels[c]
+                for k in range(k_len):
+                    if t - k >= 0:
+                        d_kernels[c][k] += g * rows[t - k][c]
+                        d_rows[t - k][c] += g * ker[k]
+        return d_rows, d_kernels
+
+    def forward(self, x_seq):
+        x_seq = self._check_seq(x_seq, "forward")
+        t_len = len(x_seq)
+        h, c_ln = _norm_rows_forward(self.ln1, x_seq)
+        u, c_u = _dense_rows_forward(self.W_u, h)
+        v, c_v = _dense_rows_forward(self.W_v, h)
+        u_s = self._causal_conv(u, self.short_w)
+        u_l = self._causal_conv(u_s, self.long_w)
+        g = [[v[t][c] * u_l[t][c] for c in range(self.d_model)]
+             for t in range(t_len)]
+        y, c_o = _dense_rows_forward(self.W_o, g)
+        out = [[x_seq[t][c] + y[t][c] for c in range(self.d_model)]
+               for t in range(t_len)]
+        self._cache = {"x_seq": x_seq, "h": h, "c_ln": c_ln,
+                       "u": u, "c_u": c_u, "v": v, "c_v": c_v,
+                       "u_s": u_s, "u_l": u_l, "g": g, "c_o": c_o}
+        return out
+
+    def backward(self, dout_seq):
+        if self._cache is None:
+            raise RuntimeError("HyenaBlock.backward: 必须先 forward")
+        cache = self._cache
+        t_len = len(cache["x_seq"])
+        d = self.d_model
+        if not isinstance(dout_seq, (list, tuple)) or len(dout_seq) != t_len:
+            raise ValueError("HyenaBlock.backward: dout 长度必须与 forward 输入一致")
+        dout = []
+        for t, row in enumerate(dout_seq):
+            if not isinstance(row, (list, tuple)) or len(row) != d:
+                raise ValueError(
+                    "HyenaBlock.backward: 第 %d 行 dout 维度必须是 %d" % (t, d))
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError("HyenaBlock.backward: dout 元素必须是数字")
+                v = float(v)
+                if not math.isfinite(v):
+                    raise ValueError("HyenaBlock.backward: dout 元素必须是有限数字")
+                vals.append(v)
+            dout.append(vals)
+
+        dx = [row[:] for row in dout]
+        gw_o, gb_o, d_g = _dense_rows_backward(self.W_o, cache["c_o"], dout)
+        self.grad_o = (gw_o, gb_o)
+        dv = [[d_g[t][c] * cache["u_l"][t][c] for c in range(d)]
+              for t in range(t_len)]
+        d_u_l = [[d_g[t][c] * cache["v"][t][c] for c in range(d)]
+                 for t in range(t_len)]
+        d_u_s, d_long = self._causal_conv_backward(
+            d_u_l, cache["u_s"], self.long_w)
+        d_u, d_short = self._causal_conv_backward(
+            d_u_s, cache["u"], self.short_w)
+        gw_u, gb_u, d_h_u = _dense_rows_backward(self.W_u, cache["c_u"], d_u)
+        gw_v, gb_v, d_h_v = _dense_rows_backward(self.W_v, cache["c_v"], dv)
+        self.grad_u = (gw_u, gb_u)
+        self.grad_v = (gw_v, gb_v)
+        d_h = [[d_h_u[t][c] + d_h_v[t][c] for c in range(d)]
+               for t in range(t_len)]
+        gg, gb, d_x_ln = _norm_rows_backward(self.ln1, cache["c_ln"], d_h)
+        self.grad_ln = (gg, gb)
+        for t in range(t_len):
+            for c in range(d):
+                dx[t][c] += d_x_ln[t][c]
+        self.grad_short = d_short
+        self.grad_long = d_long
+        return dx
+
+    def sgd_step(self, lr=0.01):
+        if self.grad_o is None:
+            raise RuntimeError("HyenaBlock.sgd_step: 必须先 backward")
+        lr = _hyena_check_positive(lr, "lr")
+        _dense_apply_sgd(self.W_o, self.grad_o, lr)
+        _dense_apply_sgd(self.W_u, self.grad_u, lr)
+        _dense_apply_sgd(self.W_v, self.grad_v, lr)
+        _norm_apply_sgd(self.ln1, self.grad_ln, lr)
+        for c in range(self.d_model):
+            for k in range(self.short_kernel):
+                self.short_w[c][k] -= lr * self.grad_short[c][k]
+            for k in range(self.long_kernel):
+                self.long_w[c][k] -= lr * self.grad_long[c][k]
+
+    def adam_step(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        if self.grad_o is None:
+            raise RuntimeError("HyenaBlock.adam_step: 必须先 backward")
+        lr = _hyena_check_positive(lr, "lr")
+        _dense_apply_adam(self.W_o, self.grad_o, lr)
+        _dense_apply_adam(self.W_u, self.grad_u, lr)
+        _dense_apply_adam(self.W_v, self.grad_v, lr)
+        _norm_apply_adam(self.ln1, self.grad_ln, lr)
+        # 卷积核用 SGD 更新（Adam 版本只覆盖投影/LN，避免重复实现矩状态）
+        for c in range(self.d_model):
+            for k in range(self.short_kernel):
+                self.short_w[c][k] -= lr * self.grad_short[c][k]
+            for k in range(self.long_kernel):
+                self.long_w[c][k] -= lr * self.grad_long[c][k]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 """RWKV-5 / RWKV-6 / RWKV-7 的 time-mixing 递推（简化前向实现）
 
 RWKV-4 的 time-mixing 用**向量**状态；RWKV-5（Eagle）把状态升级为**矩阵**

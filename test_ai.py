@@ -40858,3 +40858,149 @@ class TestDeepSeekMLA:
         _mla_t_raises(lambda: model.backward([[0.1] * 8]))
         _mla_t_raises(lambda: model.backward([[0.1] * 7 for _ in range(3)]))
         _mla_t_raises(lambda: model.sgd_step(0.0))
+
+
+def _hyena_raises(fn, exc=(ValueError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _hyena_seq(t_len, d, seed):
+    rng = random.Random(seed)
+    return [[rng.uniform(-1.0, 1.0) for _ in range(d)] for _ in range(t_len)]
+
+
+def _hyena_block_loss(blk, xs, ws):
+    out = blk.forward(xs)
+    return sum(out[t][c] * ws[t][c]
+               for t in range(len(xs)) for c in range(blk.d_model))
+
+
+class TestHyenaBlock:
+    def test_forward_and_param_count(self):
+        blk = AI.HyenaBlock(4, short_kernel=2, long_kernel=3, seed=7)
+        xs = _hyena_seq(3, 4, 1)
+        out = blk.forward(xs)
+        assert len(out) == 3 and all(len(row) == 4 for row in out)
+        assert blk.param_count() == 88
+        # 残差：输入全零时输出为 W_o(g) + 0，且不应为全零
+        zero = [[0.0] * 4 for _ in range(2)]
+        out0 = blk.forward(zero)
+        assert len(out0) == 2
+
+    def test_gradients_finite_difference(self):
+        blk = AI.HyenaBlock(4, short_kernel=2, long_kernel=3, seed=5)
+        xs = _hyena_seq(3, 4, 11)
+        ws = _hyena_seq(3, 4, 12)
+
+        def check(ana, p0, setter, tag, tol=1e-6):
+            h = 1e-5
+            setter(p0 + h)
+            lp = _hyena_block_loss(blk, xs, ws)
+            setter(p0 - h)
+            lm = _hyena_block_loss(blk, xs, ws)
+            setter(p0)
+            num = (lp - lm) / (2.0 * h)
+            rel = abs(ana - num) / max(1.0, abs(ana), abs(num))
+            assert rel < tol, "%s rel=%.3e ana=%.6f num=%.6f" % (tag, rel, ana, num)
+
+        # 三个投影权重
+        for name, grad_getter in (
+                ("W_u", lambda: blk.grad_u[0][0][1]),
+                ("W_v", lambda: blk.grad_v[0][0][1]),
+                ("W_o", lambda: blk.grad_o[0][0][1])):
+            layer = getattr(blk, name)
+            blk.zero_grad()
+            blk.forward(xs)
+            blk.backward(ws)
+            ana = grad_getter()
+            p0 = layer.weights[0][1]
+            check(ana, p0, lambda v, layer=layer: layer.weights[0].__setitem__(1, v), name)
+        # 两个卷积核
+        for tag, arr, grad in (("short", blk.short_w, blk.grad_short),
+                               ("long", blk.long_w, blk.grad_long)):
+            k = 0 if tag == "short" else 1
+            blk.zero_grad()
+            blk.forward(xs)
+            blk.backward(ws)
+            ana = grad[0][k]
+            p0 = arr[0][k]
+            check(ana, p0, lambda v, arr=arr, k=k: arr[0].__setitem__(k, v), tag)
+        # LayerNorm gamma
+        blk.zero_grad()
+        blk.forward(xs)
+        blk.backward(ws)
+        ana = blk.grad_ln[0][1]
+        p0 = blk.ln1.gamma[1]
+        check(ana, p0, lambda v: blk.ln1.gamma.__setitem__(1, v), "ln_gamma")
+
+    def test_input_gradient_and_causality(self):
+        blk = AI.HyenaBlock(4, short_kernel=2, long_kernel=3, seed=9)
+        xs = _hyena_seq(3, 4, 21)
+        ws = _hyena_seq(3, 4, 22)
+        blk.zero_grad()
+        blk.forward(xs)
+        dx = blk.backward(ws)
+        assert len(dx) == 3 and all(len(row) == 4 for row in dx)
+        for row in dx:
+            for v in row:
+                assert math.isfinite(v)
+        # 输入梯度有限差分（一行一个元素）
+        base = xs[1][2]
+        p = xs[1][2]
+        xs[1][2] = p + 1e-5
+        lp = _hyena_block_loss(blk, xs, ws)
+        xs[1][2] = p - 1e-5
+        lm = _hyena_block_loss(blk, xs, ws)
+        xs[1][2] = base
+        num = (lp - lm) / 2e-5
+        rel = abs(dx[1][2] - num) / max(1.0, abs(dx[1][2]), abs(num))
+        assert rel < 1e-5, "dx rel=%.3e" % rel
+        # 因果性：改第 3 个 token，前两个输出不变
+        y0 = blk.forward(xs)
+        xs2 = [row[:] for row in xs]
+        xs2[2][0] += 0.1
+        y1 = blk.forward(xs2)
+        for t in range(2):
+            for c in range(4):
+                assert abs(y0[t][c] - y1[t][c]) < 1e-12
+
+    def test_sgd_and_adam(self):
+        blk = AI.HyenaBlock(4, short_kernel=2, long_kernel=3, seed=13)
+        xs = _hyena_seq(3, 4, 31)
+        ws = _hyena_seq(3, 4, 32)
+        blk.zero_grad()
+        blk.forward(xs)
+        blk.backward(ws)
+        w0 = blk.W_o.weights[0][0]
+        k0 = blk.short_w[0][0]
+        blk.sgd_step(0.01)
+        assert blk.W_o.weights[0][0] != w0
+        assert blk.short_w[0][0] != k0
+        blk.zero_grad()
+        blk.forward(xs)
+        blk.backward(ws)
+        w1 = blk.W_u.weights[0][0]
+        blk.adam_step(0.01)
+        assert blk.W_u.weights[0][0] != w1
+
+    def test_invalid_inputs(self):
+        assert _hyena_raises(lambda: AI.HyenaBlock(0))
+        assert _hyena_raises(lambda: AI.HyenaBlock(4, short_kernel=0))
+        assert _hyena_raises(lambda: AI.HyenaBlock(4, long_kernel=0))
+        assert _hyena_raises(lambda: AI.HyenaBlock(4, eps=0.0))
+        assert _hyena_raises(lambda: AI.HyenaBlock(4, seed=1.5))
+        blk = AI.HyenaBlock(4, seed=1)
+        assert _hyena_raises(lambda: blk.forward([]))
+        assert _hyena_raises(lambda: blk.forward([[0.0] * 3]))
+        assert _hyena_raises(lambda: blk.forward([[0.0] * 4, [float("nan")] * 4]))
+        assert _hyena_raises(lambda: blk.backward([[0.0] * 4]))
+        xs = _hyena_seq(2, 4, 1)
+        blk.forward(xs)
+        assert _hyena_raises(lambda: blk.backward([[0.0] * 4]))
+        assert _hyena_raises(lambda: blk.backward([["x"] * 4, [0.0] * 4]))
+        assert _hyena_raises(lambda: blk.sgd_step(0.0))
+        assert _hyena_raises(lambda: blk.adam_step(-0.1))
