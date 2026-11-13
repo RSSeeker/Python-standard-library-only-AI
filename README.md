@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2483 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2485 项）
 
 ## 特性
 
@@ -2060,6 +2060,9 @@ ids = generate_kv_quantized(lm, [1, 2, 3], max_new_tokens=8,
 
 - 边界：没有真正的位打包/低比特存储，量化后再反量化只是数值模拟；每步都量化全部 cache 行，
   比真实推理多一次全量量化开销；只支持采样式生成，不支持 beam search；量化误差依赖数据分布（absmax 受离群值影响）。
+- `CausalLM.generate(..., kv_cache_bits=4)` 是同一功能的常用入口：内部直接转调
+  `generate_kv_quantized`，因此支持同样的温度/top-k/top-p/min-p/惩罚参数；
+  要求 `use_cache=True` 且 `num_beams=1`，否则抛 ValueError。
 
 ### 稀疏检索与混合重排（BM25 / RRF / ColBERT-lite）
 
@@ -5185,7 +5188,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2483 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2485 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5502,6 +5505,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestOnnxImport` | 导出→导入参数/前向逐位一致、softmax 输出往返、写文件路径往返、非法字节与结构校验 |
 | `TestPRMTrainer` | BCE 梯度中心差分、可分离标签拟合并排序、序列聚合复用、便捷函数、非法输入 |
 | `TestKVCacheQuantize` | 行量化误差界与网格、cache 结构就地量化、量化生成长度/词表/复现、窗口滑动、非法输入 |
+| `TestGenerateKVBits` | `CausalLM.generate(kv_cache_bits=...)` 与 generate_kv_quantized 逐位一致、束搜索/use_cache/非法 bits 报错 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
@@ -5624,6 +5628,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2483 个单元测试
+├── test_ai.py       # 2485 个单元测试
 └── README.md
 ```

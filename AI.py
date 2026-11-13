@@ -31271,7 +31271,8 @@ class CausalLM:
                  top_k: int = 0, rng=None, use_cache: bool = True, top_p: float = 1.0,
                  num_beams: int = 1, min_p: float = 0.0,
                  repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
-                 frequency_penalty: float = 0.0, no_repeat_ngram_size: int = 0):
+                 frequency_penalty: float = 0.0, no_repeat_ngram_size: int = 0,
+                 kv_cache_bits: int = None):
         """自回归生成：返回 prompt + 新 token 的索引列表（调用后保持 eval 模式）
 
         temperature: >1 更随机，<1 更确定；top_k>0 时只在最可能的 k 个里采样。
@@ -31287,6 +31288,10 @@ class CausalLM:
         重复 token）、presence_penalty / frequency_penalty（按出现与否/次数扣分）、
         no_repeat_ngram_size（禁止 n-gram 立刻重复）。默认值全部等于「不干预」，
         与旧行为逐位相同。
+
+        kv_cache_bits：设成 2–8 的整数时，每一步生成都把全部 KV cache 行做
+        absmax 对称量化再反量化（数值模拟低比特 KV cache），内部复用
+        generate_kv_quantized；要求 use_cache=True 且 num_beams=1。
         """
         if max_new_tokens < 0:
             raise ValueError(f"CausalLM.generate: max_new_tokens 不能为负，收到 {max_new_tokens!r}")
@@ -31301,6 +31306,19 @@ class CausalLM:
         min_p = _check_min_p(min_p, "CausalLM.generate")
         _check_penalty_args(repetition_penalty, presence_penalty, frequency_penalty,
                             no_repeat_ngram_size, "CausalLM.generate")
+        if kv_cache_bits is not None:
+            if num_beams > 1:
+                raise ValueError("CausalLM.generate: kv_cache_bits 不支持 num_beams > 1")
+            if not use_cache:
+                raise ValueError("CausalLM.generate: kv_cache_bits 需要 use_cache=True")
+            return generate_kv_quantized(
+                self, prompt_ids, max_new_tokens=max_new_tokens,
+                temperature=temperature, top_k=top_k, rng=rng, top_p=top_p,
+                min_p=min_p, repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                kv_cache_bits=kv_cache_bits)
         ids = list(prompt_ids)
         if not ids:
             raise ValueError("CausalLM.generate: prompt_ids 不能为空")

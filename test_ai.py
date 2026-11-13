@@ -38107,3 +38107,41 @@ class TestKVCacheQuantize:
         _q_raises(lambda: AI.generate_kv_quantized(lm, [0], temperature=0.0))
         _q_raises(lambda: AI.generate_kv_quantized(lm, [0], top_p=0.0))
         _q_raises(lambda: AI.generate_kv_quantized(lm, [0], kv_cache_bits=0))
+
+
+"""B13：CausalLM.generate 的 kv_cache_bits 快捷入口。"""
+import random
+import AI
+
+
+def _raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % (exc,))
+
+
+class TestGenerateKVBits:
+    def test_delegates_to_generate_kv_quantized(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        a = lm.generate([0, 1, 2], max_new_tokens=4, temperature=0.5,
+                        rng=random.Random(1), kv_cache_bits=4)
+        b = AI.generate_kv_quantized(lm, [0, 1, 2], max_new_tokens=4,
+                                     temperature=0.5, rng=random.Random(1),
+                                     kv_cache_bits=4)
+        assert a == b
+        assert len(a) == 7 and a[:3] == [0, 1, 2]
+        plain = lm.generate([0, 1, 2], max_new_tokens=4, temperature=0.5,
+                            rng=random.Random(1))
+        assert len(plain) == 7
+
+    def test_errors(self):
+        lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=1, max_len=4)
+        _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=4,
+                                    num_beams=2))
+        _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=4,
+                                    use_cache=False))
+        _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=0))
+        _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=9))
+        _raises(lambda: lm.generate([], max_new_tokens=2, kv_cache_bits=4))
