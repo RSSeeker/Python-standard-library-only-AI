@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2548 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2552 项）
 
 ## 特性
 
@@ -3667,6 +3667,33 @@ grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
   只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
 - 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
 
+### YOLOLite（单尺度网格检测训练循环）
+
+两层 stride-2 卷积 backbone + 逐网格单元检测头；训练时只让目标中心所在单元负责：
+
+```python
+import AI
+
+model = AI.YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=0)
+image = [[[0.1] * 8 for _ in range(8)] for _ in range(3)]
+loss = model.loss_and_backward(image, (1, [0.25, 0.25, 0.5, 0.5]))  # (class, [cx,cy,w,h])
+model.sgd_step(0.01)
+print(model.predict(image, conf_threshold=0.5))
+```
+
+| API | 说明 |
+| --- | --- |
+| `YOLOLite(in_channels=3, num_classes=3, image_size=8, base=4, seed=None)` | 两层 `Conv2d(stride=2)` + ReLU（手写 mask）+ 逐网格单元线性检测头；要求 `image_size % 4 == 0`，网格为 `image_size/4` |
+| `forward(image)` | 返回每个网格单元的 `{obj_logit, box[4], class_logits[C]}` |
+| `loss_and_backward(image, target)` | `target=None` 视为背景；否则 `(class, [cx,cy,w,h])`；损失 = 负责单元 objectness BCE + 5×框 L1 + 类别 CE，其余单元 0.5 权重背景 BCE；反向到卷积核/检测头 |
+| `predict(image, conf_threshold=0.5)` | 返回 `(confidence, class, box)` 或 `None`（取最高置信度且过阈值） |
+| `fit(images, targets, epochs=20, lr=0.01, seed=None, shuffle=True)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 卷积核 + 检测头 |
+
+边界：这是 YOLO 训练循环的最小演示——单尺度网格、无 anchor/多尺度 FPN、无数据增强与 NMS，正样本分配按「中心点落入的单元」硬分配；`predict` 只返回全局最高置信度的一个框。
+
+测试：`TestYOLOLite` 覆盖前向/参数量、检测头与卷积核梯度有限差分、两张合成图目标分配训练（objectness/框/类别）、非法输入。
+
 ### DCN-v2（Deep & Cross Network v2）
 
 | 接口 | 说明 |
@@ -5387,7 +5414,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2548 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2552 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5592,6 +5619,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrOCR` | 前向/参数量、卷积核与输出头梯度有限差分、合成图过拟合训练、predict 长度/非法输入 |
 | `TestTimeSformer` | 前向/参数量、卷积核/时间位置/分类头梯度有限差分、合成视频过拟合训练、非法输入 |
 | `TestWhisperLite` | 前向/参数量、投影层与输出头梯度有限差分、合成 mel 过拟合训练、predict 长度/非法输入 |
+| `TestYOLOLite` | 前向/参数量、检测头与卷积核梯度有限差分、合成图目标分配训练、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5840,6 +5868,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2548 个单元测试
+├── test_ai.py       # 2552 个单元测试
 └── README.md
 ```
