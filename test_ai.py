@@ -40579,3 +40579,133 @@ class TestEngineering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _linb_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as err:  # noqa: BLE001
+        raise AssertionError(f"expected {exc}, got {type(err).__name__}: {err}")
+    raise AssertionError(f"expected {exc}, nothing raised")
+
+
+def _linb_mat(t_len, d, seed=1, lo=-1.0, hi=1.0):
+    rng = random.Random(seed)
+    return [[rng.uniform(lo, hi) for _ in range(d)] for _ in range(t_len)]
+
+
+def _linb_loss(out, w):
+    return sum(out[t][c] * w[t][c] for t in range(len(out)) for c in range(len(out[0])))
+
+
+def _linb_fd_mat(fn, mat, h=1e-5):
+    rows = []
+    for i in range(len(mat)):
+        row = []
+        for j in range(len(mat[0])):
+            old = mat[i][j]
+            mat[i][j] = old + h
+            fp = fn()
+            mat[i][j] = old - h
+            fm = fn()
+            mat[i][j] = old
+            row.append((fp - fm) / (2 * h))
+        rows.append(row)
+    return rows
+
+
+def _linb_close(analytic, numeric, tol=2e-6):
+    for i in range(len(analytic)):
+        for j in range(len(analytic[0])):
+            scale = max(1.0, abs(analytic[i][j]), abs(numeric[i][j]))
+            assert abs(analytic[i][j] - numeric[i][j]) / scale < tol
+
+
+def _linb_fd_scalar(fn, h=1e-5):
+    return (fn(h) - fn(-h)) / (2 * h)
+
+
+class TestLinearAttentionBackward:
+    def test_naive_and_lightning_backward(self):
+        q = _linb_mat(4, 3, 11)
+        k = _linb_mat(4, 3, 12)
+        v = _linb_mat(4, 2, 13)
+        w = _linb_mat(4, 2, 14)
+        decay = 0.7
+        dq, dk, dv, d_decay = AI.linear_attention_naive_backward(q, k, v, decay, w)
+        _linb_close(dq, _linb_fd_mat(lambda: _linb_loss(AI.linear_attention_naive(q, k, v, decay), w), q))
+        _linb_close(dk, _linb_fd_mat(lambda: _linb_loss(AI.linear_attention_naive(q, k, v, decay), w), k))
+        _linb_close(dv, _linb_fd_mat(lambda: _linb_loss(AI.linear_attention_naive(q, k, v, decay), w), v))
+        fd_decay = _linb_fd_scalar(lambda h: _linb_loss(
+            AI.linear_attention_naive(q, k, v, decay + h), w))
+        assert abs(d_decay - fd_decay) < 1e-6
+
+        lq, lk, lv, ldecay = AI.lightning_attention_backward(q, k, v, decay, w)
+        _linb_close(lq, dq)
+        _linb_close(lk, dk)
+        _linb_close(lv, dv)
+        assert abs(ldecay - d_decay) < 1e-9
+
+    def test_gla_backward(self):
+        q = _linb_mat(4, 3, 21)
+        k = _linb_mat(4, 3, 22)
+        v = _linb_mat(4, 2, 23)
+        w = _linb_mat(4, 2, 24)
+        gates = [0.2, -0.1, 0.4, -0.3]
+        dq, dk, dv, d_gates = AI.gla_backward(q, k, v, gates, w)
+        _linb_close(dq, _linb_fd_mat(lambda: _linb_loss(AI.gla_forward(q, k, v, gates), w), q))
+        _linb_close(dk, _linb_fd_mat(lambda: _linb_loss(AI.gla_forward(q, k, v, gates), w), k))
+        _linb_close(dv, _linb_fd_mat(lambda: _linb_loss(AI.gla_forward(q, k, v, gates), w), v))
+        for t in range(4):
+            def fn(h, t=t):
+                g = list(gates)
+                g[t] += h
+                return _linb_loss(AI.gla_forward(q, k, v, g), w)
+            assert abs(d_gates[t] - _linb_fd_scalar(fn)) < 1e-6
+
+    def test_deltanet_backward(self):
+        q = _linb_mat(4, 3, 31)
+        k = _linb_mat(4, 3, 32)
+        v = _linb_mat(4, 2, 33)
+        w = _linb_mat(4, 2, 34)
+        betas = [0.9, 0.6, 0.3, 0.8]
+        dq, dk, dv, d_betas = AI.deltanet_backward(q, k, v, betas, w)
+        _linb_close(dq, _linb_fd_mat(lambda: _linb_loss(AI.deltanet_forward(q, k, v, betas), w), q))
+        _linb_close(dk, _linb_fd_mat(lambda: _linb_loss(AI.deltanet_forward(q, k, v, betas), w), k))
+        _linb_close(dv, _linb_fd_mat(lambda: _linb_loss(AI.deltanet_forward(q, k, v, betas), w), v))
+        for t in range(4):
+            def fn(h, t=t):
+                b = list(betas)
+                b[t] += h
+                return _linb_loss(AI.deltanet_forward(q, k, v, b), w)
+            assert abs(d_betas[t] - _linb_fd_scalar(fn)) < 1e-6
+
+    def test_hyena_backward(self):
+        u = _linb_mat(4, 3, 41)
+        v = _linb_mat(4, 3, 42)
+        kernel = [0.5, -0.3, 0.2]
+        w = _linb_mat(4, 3, 43)
+        du, dv, d_kernel = AI.hyena_forward_backward(u, v, kernel, w)
+        _linb_close(du, _linb_fd_mat(lambda: _linb_loss(AI.hyena_forward(u, v, kernel), w), u))
+        _linb_close(dv, _linb_fd_mat(lambda: _linb_loss(AI.hyena_forward(u, v, kernel), w), v))
+        for j in range(3):
+            def fn(h, j=j):
+                ker = list(kernel)
+                ker[j] += h
+                return _linb_loss(AI.hyena_forward(u, v, ker), w)
+            assert abs(d_kernel[j] - _linb_fd_scalar(fn)) < 1e-6
+
+    def test_invalid_inputs(self):
+        q = _linb_mat(3, 2, 51)
+        k = _linb_mat(3, 2, 52)
+        v = _linb_mat(3, 2, 53)
+        good_out = _linb_mat(3, 2, 54)
+        _linb_raises(lambda: AI.lightning_attention_backward(q, k, v, 0.5, good_out[:2]))
+        _linb_raises(lambda: AI.lightning_attention_backward(q, k, v, 0.5, [[0.0]] * 3))
+        _linb_raises(lambda: AI.linear_attention_naive_backward(q, k, v, 1.5, good_out))
+        _linb_raises(lambda: AI.gla_backward(q, k, v, [0.1], good_out))
+        _linb_raises(lambda: AI.deltanet_backward(q, k, v, [0.1, 0.2, 1.5], good_out))
+        _linb_raises(lambda: AI.hyena_long_conv_backward(q, [], good_out))
+        _linb_raises(lambda: AI.hyena_forward_backward(q, _linb_mat(2, 2, 55), [0.5], good_out))

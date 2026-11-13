@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2597 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2602 项）
 
 ## 特性
 
@@ -2583,6 +2583,10 @@ print(AI.linear_attention_naive(q, k, v, decay=0.9))  # O(T^2) 参考实现
 print(AI.gla_forward(q, k, v, [0.0, 1.0]))          # 数据相关门 alpha=exp(-exp(g))
 print(AI.deltanet_forward(q, k, v, [0.5, 1.0]))     # delta 规则更新
 print(AI.hyena_forward(q, v, [1.0, 0.5]))           # 长卷积 + 逐元素门控
+
+d_out = [[0.1, -0.2], [0.3, 0.2]]
+dq, dk, dv, d_decay = AI.lightning_attention_backward(q, k, v, 0.9, d_out)
+dq, dk, dv, dg = AI.gla_backward(q, k, v, [0.0, 1.0], d_out)
 ```
 
 | API | 说明 |
@@ -2593,10 +2597,17 @@ print(AI.hyena_forward(q, v, [1.0, 0.5]))           # 长卷积 + 逐元素门�
 | `deltanet_forward(q_rows, k_rows, v_rows, betas)` | DeltaNet：`S -= beta*(S k)k^T` 再 `S += beta*v k^T`，`beta∈[0,1]` |
 | `hyena_long_conv(u_rows, kernel)` | 朴素因果长卷积 `y_t=Σ_j kernel[j]u_{t-j}`（不依赖 FFT） |
 | `hyena_forward(u_rows, v_rows, kernel)` | 长卷积结果与 v 逐元素门控 |
+| `linear_attention_naive_backward(q, k, v, decay, d_out)` | 返回 `(dq, dk, dv, d_decay)`；O(T²) 参考反传 |
+| `lightning_attention_backward(q, k, v, decay, d_out)` | 状态矩阵递推的手写反传，返回 `(dq, dk, dv, d_decay)` |
+| `gla_backward(q, k, v, gates, d_out)` | 门控 `alpha=exp(-exp(g))` 的手写反传，返回 `(dq, dk, dv, dgates)` |
+| `deltanet_backward(q, k, v, betas, d_out)` | delta 规则更新的手写反传，返回 `(dq, dk, dv, dbetas)` |
+| `hyena_long_conv_backward(u_rows, kernel, d_out)` | 因果长卷积反传，返回 `(du, d_kernel)` |
+| `hyena_forward_backward(u_rows, v_rows, kernel, d_out)` | 长卷积 + 门控反传，返回 `(du, dv, d_kernel)` |
 
-边界：全部为**前向推理**实现（无手写反向/训练循环）；lightning/GLA/DeltaNet
+边界：前向与手写反向都以**独立函数**提供（反向返回各输入与衰减/门控/`beta` 的梯度），
+可以直接嵌进调用方的训练循环；本库没有把它们封装成完整的线性注意力 LM。lightning/GLA/DeltaNet
 使用标量衰减（非逐通道或逐头）；Hyena 用朴素因果卷积代替 FFT 长卷积，复杂度 O(T·K)；
-需要训练时请用带反向的 `MambaBlock` / `RWKVBlock` / `RetNetBlock` 等。
+需要现成的、带训练循环的循环/状态模型时用 `MambaBlock` / `RWKVBlock` / `RetNetBlock` 等。
 
 ### 环形注意力（RingAttention 分块 online softmax）
 
@@ -5690,7 +5701,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2597 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2602 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5958,6 +5969,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGLA` | 常数门等价于 lightning、非法输入 |
 | `TestDeltaNet` | beta=0 恒零、首步公式、矩阵参考、非法输入 |
 | `TestHyena` | 长卷积手算、逐元素门控、非法输入 |
+| `TestLinearAttentionBackward` | naive/lightning/GLA/DeltaNet/Hyena 的 dq/dk/dv 与门控/衰减/卷积核梯度中心差分、lightning 与 naive 梯度一致、非法输入 |
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
@@ -6155,6 +6167,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2597 个单元测试
+├── test_ai.py       # 2602 个单元测试
 └── README.md
 ```

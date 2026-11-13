@@ -8499,6 +8499,357 @@ def hyena_forward(u_rows, v_rows, kernel):
             for t in range(len(u))]
 
 
+def _linattn_backward_check_out(d_out_rows, t_len, d_v, name="d_out_rows"):
+    if not isinstance(d_out_rows, (list, tuple)) or len(d_out_rows) != t_len:
+        raise ValueError(f"linear_attn: {name} 长度必须为 {t_len}")
+    out = []
+    for row in d_out_rows:
+        if not isinstance(row, (list, tuple)) or len(row) != d_v:
+            raise ValueError(f"linear_attn: {name} 每行长度必须为 {d_v}")
+        out.append([_lin_check_scalar(v, name) for v in row])
+    return out
+
+
+def linear_attention_naive_backward(q_rows, k_rows, v_rows, decay, d_out_rows):
+    """`linear_attention_naive` 的手写反向。
+
+    返回 `(dq, dk, dv, d_decay)`；其中 d_decay 为标量，`decay=0` 时指数项
+    只在 t==j 处按 0**0=1 处理，导数按 0 计。
+    """
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    decay = _lin_check_scalar(decay, "decay", 0.0, 1.0)
+    t_len = len(q)
+    dk_dim = len(q[0])
+    dv_dim = len(v[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, dv_dim)
+
+    dq = [[0.0] * dk_dim for _ in range(t_len)]
+    dk = [[0.0] * dk_dim for _ in range(t_len)]
+    dv = [[0.0] * dv_dim for _ in range(t_len)]
+    d_decay = 0.0
+    for t in range(t_len):
+        for j in range(t + 1):
+            w = decay ** (t - j)
+            dot = sum(q[t][i] * k[j][i] for i in range(dk_dim))
+            d_dot = sum(d_out[t][c] * v[j][c] for c in range(dv_dim))
+            for i in range(dk_dim):
+                if w != 0.0:
+                    dq[t][i] += w * d_dot * k[j][i]
+                    dk[j][i] += w * d_dot * q[t][i]
+            for c in range(dv_dim):
+                dv[j][c] += w * dot * d_out[t][c]
+            if t > j and decay > 0.0:
+                d_decay += ((t - j) * (decay ** (t - j - 1))
+                            * dot * sum(d_out[t][c] * v[j][c]
+                                        for c in range(dv_dim)))
+    return dq, dk, dv, d_decay
+
+
+def lightning_attention_backward(q_rows, k_rows, v_rows, decay, d_out_rows):
+    """`lightning_attention` 的手写反向，返回 `(dq, dk, dv, d_decay)`。
+
+    反向递推（S_t 为 t 步递推后的矩阵状态）：
+
+        dq_t       = S_t @ d_out_t
+        dS_t      += q_t (x) d_out_t
+        dk_t[i]    = sum_c dS_t[i][c] * v_t[c]
+        dv_t[c]    = sum_i k_t[i] * dS_t[i][c]
+        d_decay   += sum_{i,c} dS_t[i][c] * S_{t-1}[i][c]
+        dS_{t-1}   = decay * dS_t
+    """
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    decay = _lin_check_scalar(decay, "decay", 0.0, 1.0)
+    t_len = len(q)
+    dk_dim = len(q[0])
+    dv_dim = len(v[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, dv_dim)
+
+    states = []
+    state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    for t in range(t_len):
+        for i in range(dk_dim):
+            row = state[i]
+            kt = k[t][i]
+            for c in range(dv_dim):
+                row[c] = decay * row[c] + kt * v[t][c]
+        states.append([row[:] for row in state])
+
+    dq = [[0.0] * dk_dim for _ in range(t_len)]
+    dk = [[0.0] * dk_dim for _ in range(t_len)]
+    dv = [[0.0] * dv_dim for _ in range(t_len)]
+    d_state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    d_decay = 0.0
+    for t in range(t_len - 1, -1, -1):
+        s_t = states[t]
+        s_prev = states[t - 1] if t > 0 else None
+        out_grad = d_out[t]
+        for i in range(dk_dim):
+            qi = q[t][i]
+            s_row = s_t[i]
+            ds_row = d_state[i]
+            dq_val = 0.0
+            for c in range(dv_dim):
+                dq_val += s_row[c] * out_grad[c]
+                ds_row[c] += qi * out_grad[c]
+            dq[t][i] = dq_val
+        for i in range(dk_dim):
+            ds_row = d_state[i]
+            kt = k[t][i]
+            dk_val = 0.0
+            for c in range(dv_dim):
+                dk_val += ds_row[c] * v[t][c]
+                dv[t][c] += kt * ds_row[c]
+            dk[t][i] = dk_val
+        if s_prev is not None:
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                s_row = s_prev[i]
+                for c in range(dv_dim):
+                    d_decay += ds_row[c] * s_row[c]
+                    ds_row[c] *= decay
+        else:
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                for c in range(dv_dim):
+                    ds_row[c] = 0.0
+    return dq, dk, dv, d_decay
+
+
+def gla_backward(q_rows, k_rows, v_rows, gates, d_out_rows):
+    """`gla_forward` 的手写反向，返回 `(dq, dk, dv, dgates)`。
+
+    门控 `alpha_t = exp(-exp(g_t))`，因此 `dalpha/dg = -alpha * exp(g)`。
+    """
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    gates = _lin_check_seq(gates, len(q), "gates")
+    import math
+    t_len = len(q)
+    dk_dim = len(q[0])
+    dv_dim = len(v[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, dv_dim)
+
+    alphas = []
+    states = []
+    state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    for t in range(t_len):
+        alpha = math.exp(-math.exp(gates[t]))
+        alphas.append(alpha)
+        for i in range(dk_dim):
+            row = state[i]
+            kt = k[t][i]
+            for c in range(dv_dim):
+                row[c] = alpha * row[c] + kt * v[t][c]
+        states.append([row[:] for row in state])
+
+    dq = [[0.0] * dk_dim for _ in range(t_len)]
+    dk = [[0.0] * dk_dim for _ in range(t_len)]
+    dv = [[0.0] * dv_dim for _ in range(t_len)]
+    d_gates = [0.0] * t_len
+    d_state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    for t in range(t_len - 1, -1, -1):
+        s_t = states[t]
+        s_prev = states[t - 1] if t > 0 else None
+        out_grad = d_out[t]
+        for i in range(dk_dim):
+            qi = q[t][i]
+            s_row = s_t[i]
+            ds_row = d_state[i]
+            dq_val = 0.0
+            for c in range(dv_dim):
+                dq_val += s_row[c] * out_grad[c]
+                ds_row[c] += qi * out_grad[c]
+            dq[t][i] = dq_val
+        for i in range(dk_dim):
+            ds_row = d_state[i]
+            kt = k[t][i]
+            dk_val = 0.0
+            for c in range(dv_dim):
+                dk_val += ds_row[c] * v[t][c]
+                dv[t][c] += kt * ds_row[c]
+            dk[t][i] = dk_val
+        if s_prev is not None:
+            d_alpha = 0.0
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                s_row = s_prev[i]
+                for c in range(dv_dim):
+                    d_alpha += ds_row[c] * s_row[c]
+            d_gates[t] = d_alpha * (-alphas[t] * math.exp(gates[t]))
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                for c in range(dv_dim):
+                    ds_row[c] *= alphas[t]
+        else:
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                for c in range(dv_dim):
+                    ds_row[c] = 0.0
+    return dq, dk, dv, d_gates
+
+
+def deltanet_backward(q_rows, k_rows, v_rows, betas, d_out_rows):
+    """`deltanet_forward` 的手写反向，返回 `(dq, dk, dv, dbetas)`。
+
+    状态更新：`S_t = S_{t-1} - beta k_t (S_{t-1}^T k_t)^T + beta k_t v_t^T`，
+    其中 `sk_t = S_{t-1}^T k_t`（长度为 d_v）。
+    """
+    q = _lin_check_matrix(q_rows, "q_rows")
+    k = _lin_check_matrix(k_rows, "k_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(q) != len(k) or len(q) != len(v):
+        raise ValueError("linear_attn: q/k/v 的序列长度必须一致")
+    if len(q[0]) != len(k[0]):
+        raise ValueError("linear_attn: q 与 k 的特征维度必须一致")
+    betas = _lin_check_seq(betas, len(q), "betas")
+    for b in betas:
+        if b < 0.0 or b > 1.0:
+            raise ValueError("linear_attn: betas 必须在 [0, 1] 内")
+    t_len = len(q)
+    dk_dim = len(q[0])
+    dv_dim = len(v[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, dv_dim)
+
+    sk_list = []
+    states = []
+    state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    for t in range(t_len):
+        beta = betas[t]
+        sk = [0.0] * dv_dim
+        for i in range(dk_dim):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv_dim):
+                sk[c] += ki * row[c]
+        for i in range(dk_dim):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv_dim):
+                row[c] -= beta * ki * sk[c]
+        for i in range(dk_dim):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv_dim):
+                row[c] += beta * ki * v[t][c]
+        sk_list.append(sk)
+        states.append([row[:] for row in state])
+
+    dq = [[0.0] * dk_dim for _ in range(t_len)]
+    dk = [[0.0] * dk_dim for _ in range(t_len)]
+    dv = [[0.0] * dv_dim for _ in range(t_len)]
+    d_betas = [0.0] * t_len
+    d_state = [[0.0] * dv_dim for _ in range(dk_dim)]
+    for t in range(t_len - 1, -1, -1):
+        s_t = states[t]
+        s_prev = states[t - 1] if t > 0 else None
+        out_grad = d_out[t]
+        for i in range(dk_dim):
+            qi = q[t][i]
+            s_row = s_t[i]
+            ds_row = d_state[i]
+            dq_val = 0.0
+            for c in range(dv_dim):
+                dq_val += s_row[c] * out_grad[c]
+                ds_row[c] += qi * out_grad[c]
+            dq[t][i] = dq_val
+        beta = betas[t]
+        sk = sk_list[t]
+        g = [0.0] * dv_dim
+        for i in range(dk_dim):
+            ds_row = d_state[i]
+            ki = k[t][i]
+            for c in range(dv_dim):
+                g[c] += ki * ds_row[c]
+        for i in range(dk_dim):
+            ds_row = d_state[i]
+            ki = k[t][i]
+            dk_val = 0.0
+            for c in range(dv_dim):
+                dv[t][c] += beta * ki * ds_row[c]
+                dk_val += (ds_row[c] * (-beta * sk[c])
+                           + ds_row[c] * (beta * v[t][c]))
+                d_betas[t] += ds_row[c] * (ki * v[t][c] - ki * sk[c])
+            dk[t][i] = dk_val
+        if s_prev is not None:
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                s_row = s_prev[i]
+                dk_extra = 0.0
+                for c in range(dv_dim):
+                    dk_extra += g[c] * s_row[c]
+                    ds_row[c] = ds_row[c] - beta * k[t][i] * g[c]
+                dk[t][i] -= beta * dk_extra
+        else:
+            for i in range(dk_dim):
+                ds_row = d_state[i]
+                for c in range(dv_dim):
+                    ds_row[c] = 0.0
+    return dq, dk, dv, d_betas
+
+
+def hyena_long_conv_backward(u_rows, kernel, d_out_rows):
+    """`hyena_long_conv` 的手写反向，返回 `(du, d_kernel)`。"""
+    u = _lin_check_matrix(u_rows, "u_rows")
+    kernel = _lin_check_seq(kernel, len(kernel), "kernel")
+    if not kernel:
+        raise ValueError("linear_attn: kernel 不能为空")
+    t_len = len(u)
+    d = len(u[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, d, "d_out_rows")
+    du = [[0.0] * d for _ in range(t_len)]
+    d_kernel = [0.0] * len(kernel)
+    for t in range(t_len):
+        for j in range(min(t + 1, len(kernel))):
+            w = kernel[j]
+            src = u[t - j]
+            dy = d_out[t]
+            for c in range(d):
+                du[t - j][c] += w * dy[c]
+                d_kernel[j] += dy[c] * src[c]
+    return du, d_kernel
+
+
+def hyena_forward_backward(u_rows, v_rows, kernel, d_out_rows):
+    """`hyena_forward` 的手写反向，返回 `(du, dv, d_kernel)`。"""
+    u = _lin_check_matrix(u_rows, "u_rows")
+    v = _lin_check_matrix(v_rows, "v_rows")
+    if len(u) != len(v):
+        raise ValueError("linear_attn: u 与 v 的序列长度必须一致")
+    if len(u[0]) != len(v[0]):
+        raise ValueError("linear_attn: u 与 v 的特征维度必须一致")
+    t_len = len(u)
+    d = len(u[0])
+    d_out = _linattn_backward_check_out(d_out_rows, t_len, d, "d_out_rows")
+    conv = hyena_long_conv(u, kernel)
+    d_conv = [[d_out[t][c] * v[t][c] for c in range(d)] for t in range(t_len)]
+    dv = [[d_out[t][c] * conv[t][c] for c in range(d)] for t in range(t_len)]
+    du, d_kernel = hyena_long_conv_backward(u, kernel, d_conv)
+    return du, dv, d_kernel
+
+
 """RWKV-5 / RWKV-6 / RWKV-7 的 time-mixing 递推（简化前向实现）
 
 RWKV-4 的 time-mixing 用**向量**状态；RWKV-5（Eagle）把状态升级为**矩阵**
