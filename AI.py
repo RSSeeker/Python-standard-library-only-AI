@@ -42045,6 +42045,44 @@ def _sym_inv_root4(m, eps=1e-12):
     return out
 
 
+def _newton_inv_root4(m, eps=1e-12, iters=6):
+    """对称半正定矩阵的 ``M^{-1/4}``：Newton-Schulz 迭代（无需特征分解）
+
+    对 ``Y = A^{-1/4}`` 做 Newton 迭代：``X_{k+1} = (1/4) X_k (5I - A X_k^4)``；
+    初值取 Gershgorin 上界 ``c = bound^{-1/4}``（保证初始谱半径 < 1），
+    对对角加 ``eps`` 处理奇异/近奇异矩阵。``iters`` 默认 6，误差量级约 1e-6。
+    """
+    n = len(m)
+    if n == 0:
+        return []
+    A = [[0.5 * (m[i][j] + m[j][i]) for j in range(n)] for i in range(n)]
+    for i in range(n):
+        A[i][i] += eps
+    bound = 0.0
+    for i in range(n):
+        s = abs(A[i][i])
+        for j in range(n):
+            if j != i:
+                s += abs(A[i][j])
+        if s > bound:
+            bound = s
+    if bound <= 0.0:
+        bound = eps
+    c = bound ** (-0.25)
+    X = [[c if i == j else 0.0 for j in range(n)] for i in range(n)]
+    eye = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for _ in range(iters):
+        X2 = _mat_mul(X, X)
+        X4 = _mat_mul(X2, X2)
+        AX4 = _mat_mul(A, X4)
+        M = [[5.0 * eye[i][j] - AX4[i][j] for j in range(n)] for i in range(n)]
+        XM = _mat_mul(X, M)
+        X = [[0.25 * XM[i][j] for j in range(n)] for i in range(n)]
+        # 保持对称（数值上略微反对称的部分丢掉，避免误差累积）
+        X = [[0.5 * (X[i][j] + X[j][i]) for j in range(n)] for i in range(n)]
+    return X
+
+
 class Shampoo(_LayerwiseOptimizer):
     """Shampoo（2018）：对每层梯度矩阵做 ``L^{-1/4} G R^{-1/4}`` 预条件
 
@@ -42062,7 +42100,8 @@ class Shampoo(_LayerwiseOptimizer):
     name = "shampoo"
 
     def __init__(self, model, lr=1e-2, beta1=0.9, beta2=0.999, eps=1e-8,
-                 precondition_every=1, max_dim=64, weight_decay=0.0):
+                 precondition_every=1, max_dim=64, weight_decay=0.0,
+                 inverse_root="eig", newton_iters=6, grafting=False):
         _w9_check("Shampoo", lr, betas=(("beta1", beta1), ("beta2", beta2)), eps=eps)
         _w9b_check("Shampoo", "weight_decay", weight_decay, 0.0)
         if isinstance(precondition_every, bool) or not isinstance(precondition_every, int):
@@ -42082,6 +42121,20 @@ class Shampoo(_LayerwiseOptimizer):
         self.precondition_every = precondition_every
         self.max_dim = max_dim
         self.weight_decay = float(weight_decay)
+        if not isinstance(inverse_root, str) or inverse_root not in ("eig", "newton"):
+            raise ValueError(
+                f"Shampoo: inverse_root 必须是 'eig' 或 'newton'，收到 {inverse_root!r}")
+        if isinstance(newton_iters, bool) or not isinstance(newton_iters, int):
+            raise TypeError(f"Shampoo: newton_iters 必须是整数，收到 "
+                            f"{type(newton_iters).__name__}")
+        if newton_iters < 1:
+            raise ValueError(f"Shampoo: newton_iters 必须 >= 1，收到 {newton_iters!r}")
+        if not isinstance(grafting, bool):
+            raise TypeError(f"Shampoo: grafting 必须是 bool，收到 "
+                            f"{type(grafting).__name__}")
+        self.inverse_root = inverse_root
+        self.newton_iters = newton_iters
+        self.grafting = grafting
         self._inv = {}          # idx -> (L^{-1/4}, R^{-1/4})
 
     def _use_matrix(self, layer):
@@ -42089,8 +42142,12 @@ class Shampoo(_LayerwiseOptimizer):
 
     def _new_state(self, layer, kind):
         if kind == "w" and self._use_matrix(layer):
-            return {"L": _w9_sq_zeros(layer.fan_out),
-                    "R": _w9_sq_zeros(layer.fan_in)}
+            st = {"L": _w9_sq_zeros(layer.fan_out),
+                  "R": _w9_sq_zeros(layer.fan_in)}
+            if self.grafting:
+                st["m"] = _w9_zeros(layer, kind)
+                st["v"] = _w9_zeros(layer, kind)
+            return st
         return {"m": _w9_zeros(layer, kind), "v": _w9_zeros(layer, kind)}
 
     def _check_state_field(self, key, field, arr, layer, kind):
@@ -42140,10 +42197,37 @@ class Shampoo(_LayerwiseOptimizer):
                     Ra[b] += s
                     R[b][a] = Ra[b]
             if idx not in self._inv or (self.step_count - 1) % self.precondition_every == 0:
-                self._inv[idx] = (_sym_inv_root4(L, self.eps),
-                                  _sym_inv_root4(R, self.eps))
+                if self.inverse_root == "newton":
+                    self._inv[idx] = (
+                        _newton_inv_root4(L, self.eps, self.newton_iters),
+                        _newton_inv_root4(R, self.eps, self.newton_iters))
+                else:
+                    self._inv[idx] = (_sym_inv_root4(L, self.eps),
+                                      _sym_inv_root4(R, self.eps))
             Li, Ri = self._inv[idx]
             U = _mat_mul(_mat_mul(Li, G), Ri)
+            if self.grafting:
+                m, v = st_w["m"], st_w["v"]
+                adam_sq = 0.0
+                for i in range(n):
+                    mi, vi, gi = m[i], v[i], G[i]
+                    for j in range(k):
+                        g = gi[j]
+                        mi[j] = self.beta1 * mi[j] + (1.0 - self.beta1) * g
+                        vi[j] = self.beta2 * vi[j] + (1.0 - self.beta2) * g * g
+                        ai = (mi[j] / c1) / (math.sqrt(vi[j] / c2) + self.eps)
+                        adam_sq += ai * ai
+                u_sq = 0.0
+                for i in range(n):
+                    Ui = U[i]
+                    for j in range(k):
+                        u_sq += Ui[j] * Ui[j]
+                if adam_sq > 0.0 and u_sq > 0.0:
+                    gamma = math.sqrt(adam_sq) / math.sqrt(u_sq)
+                    for i in range(n):
+                        Ui = U[i]
+                        for j in range(k):
+                            Ui[j] *= gamma
             for i in range(n):
                 Wi, Ui = layer.weights[i], U[i]
                 for j in range(k):

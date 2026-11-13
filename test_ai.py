@@ -41229,3 +41229,152 @@ class TestSophiaHutchinson:
         preds = [mlp.forward(x) for x in xs]
         last = sum((preds[i][0] - ys[i][0]) ** 2 for i in range(4)) / 4.0
         assert last < first, (first, last)
+
+
+# -*- coding: utf-8 -*-
+"""Shampoo Newton 逆根 + Adam grafting 的数值校验。"""
+import math
+import random
+
+import AI
+
+
+def _shampoo_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+def _shampoo_forward(model, xs):
+    rows = xs
+    for layer in model.layers:
+        rows, _cache = AI._dense_rows_forward(layer, rows)
+    return rows
+
+
+def _shampoo_sample_grads(model, x, d_out):
+    rows = [x]
+    caches = []
+    for layer in model.layers:
+        rows, cache = AI._dense_rows_forward(layer, rows)
+        caches.append(cache)
+    d = [d_out]
+    grads = []
+    for li in range(len(model.layers) - 1, -1, -1):
+        gw, gb, d = AI._dense_rows_backward(model.layers[li], caches[li], d)
+        grads.append((gw, gb))
+    grads.reverse()
+    return grads
+
+
+def _shampoo_mse_grads(model, xs, ys):
+    pred = _shampoo_forward(model, xs)
+    n = len(xs)
+    out = len(pred[0])
+    dlogits = [[2.0 * (pred[i][j] - ys[i][j]) / (n * out) for j in range(out)]
+               for i in range(n)]
+    acc = []
+    for i in range(n):
+        grads = _shampoo_sample_grads(model, xs[i], dlogits[i])
+        if not acc:
+            acc = [([row[:] for row in gw], gb[:]) for gw, gb in grads]
+        else:
+            for li, (gw, gb) in enumerate(grads):
+                aw, ab = acc[li]
+                for r in range(len(gw)):
+                    for c in range(len(gw[r])):
+                        aw[r][c] += gw[r][c]
+                    ab[r] += gb[r]
+    loss = sum((pred[i][j] - ys[i][j]) ** 2
+               for i in range(n) for j in range(out)) / (n * out)
+    return loss, acc
+
+
+class TestShampooNewtonGrafting:
+    def test_newton_inv_root_matches_eig(self):
+        random.seed(0)
+        worst = 0.0
+        for n in (2, 3, 4):
+            for _ in range(2):
+                b = [[random.uniform(-1, 1) for _ in range(n)] for _ in range(n)]
+                a = [[sum(b[i][k] * b[j][k] for k in range(n))
+                      + (0.5 if i == j else 0.0) for j in range(n)]
+                     for i in range(n)]
+                ref = AI._sym_inv_root4(a, 1e-8)
+                got = AI._newton_inv_root4(a, 1e-8, 8)
+                err = max(abs(ref[i][j] - got[i][j])
+                          for i in range(n) for j in range(n))
+                worst = max(worst, err)
+        assert worst < 1e-6
+
+    def test_newton_training_converges(self):
+        random.seed(123)
+        xs = [[(i % 4) / 4.0, ((i // 4) % 4) / 4.0, (i % 3) / 3.0]
+              for i in range(16)]
+        ys = [[2.0 * x[0] - x[1] + 0.5 * x[2] + 0.3] for x in xs]
+        model = AI.MLP([3, 1], ["linear"])
+        opt = AI.Shampoo(model, lr=0.3, inverse_root="newton", newton_iters=6)
+        first = None
+        last = None
+        for _ in range(120):
+            loss, grads = _shampoo_mse_grads(model, xs, ys)
+            first = loss if first is None else first
+            last = loss
+            opt.step(grads)
+        assert first is not None and last < first * 0.1
+
+    def test_grafting_matches_adam_magnitude(self):
+        random.seed(7)
+        model = AI.MLP([3, 2], ["linear"])
+        grads = _shampoo_mse_grads(
+            model, [[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]], [[1.0, 0.0], [0.0, 1.0]]
+        )[1]
+        model2 = AI.MLP([3, 2], ["linear"])
+        for l1, l2 in zip(model.layers, model2.layers):
+            for r in range(l1.fan_out):
+                l2.weights[r] = l1.weights[r][:]
+                l2.biases[r] = l1.biases[r]
+        opt = AI.Shampoo(model, lr=1.0, grafting=True)
+        before = [row[:] for row in model.layers[0].weights]
+        opt.step(grads)
+        nrows = len(before)
+        ncols = len(before[0])
+        delta = math.sqrt(sum((model.layers[0].weights[r][c] - before[r][c]) ** 2
+                              for r in range(nrows) for c in range(ncols)))
+        adam = AI.Adam(model2, lr=1.0)
+        adam.step(grads)
+        delta2 = math.sqrt(sum((model2.layers[0].weights[r][c]
+                                - before[r][c]) ** 2
+                               for r in range(nrows) for c in range(ncols)))
+        assert abs(delta - delta2) < 1e-9
+
+    def test_state_dict_roundtrip(self):
+        random.seed(11)
+        model = AI.MLP([3, 2], ["linear"])
+        opt = AI.Shampoo(model, lr=0.01, newton_iters=4, grafting=True)
+        _, grads = _shampoo_mse_grads(
+            model, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]])
+        opt.step(grads)
+        blob = opt.state_dict()
+        assert "0:w" in blob["state"] and "0:b" in blob["state"]
+        for key in ("L", "R", "m", "v"):
+            assert key in blob["state"]["0:w"], f"missing {key}"
+        model2 = AI.MLP([3, 2], ["linear"])
+        opt2 = AI.Shampoo(model2, lr=0.01, newton_iters=4, grafting=True)
+        opt2.load_state_dict(blob)
+        blob2 = opt2.state_dict()
+        assert blob2["state"]["0:w"]["m"] == blob["state"]["0:w"]["m"]
+        assert blob2["state"]["0:w"]["L"] == blob["state"]["0:w"]["L"]
+
+    def test_invalid_params(self):
+        model = AI.MLP([3, 2], ["linear"])
+        _shampoo_raises(lambda: AI.Shampoo(model, lr=0.01, inverse_root="qr"))
+        _shampoo_raises(lambda: AI.Shampoo(model, lr=0.01, inverse_root="newton",
+                                           newton_iters=0))
+        _shampoo_raises(lambda: AI.Shampoo(model, lr=0.01, inverse_root="newton",
+                                           newton_iters=2.5), (ValueError, TypeError))
+        _shampoo_raises(lambda: AI.Shampoo(model, lr=0.01, grafting="yes"),
+                        (ValueError, TypeError))
+        _shampoo_raises(lambda: AI.Shampoo(model, lr=-0.01))
