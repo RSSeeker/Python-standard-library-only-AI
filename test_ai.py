@@ -41378,3 +41378,92 @@ class TestShampooNewtonGrafting:
         _shampoo_raises(lambda: AI.Shampoo(model, lr=0.01, grafting="yes"),
                         (ValueError, TypeError))
         _shampoo_raises(lambda: AI.Shampoo(model, lr=-0.01))
+
+
+import math
+
+
+def _gsf_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestGradScalerFit:
+    def _data(self):
+        return [[float(i) / 5.0] for i in range(-6, 7)]
+
+    def _targets(self, xs):
+        return [[2.0 * x[0] + 0.5] for x in xs]
+
+    def test_normal_training_converges(self):
+        xs = self._data()
+        ys = self._targets(xs)
+        model = AI.MLP([1, 1], ["linear"])
+        result = AI.fit_grad_scaler(
+            model, xs, ys, dtype="fp16", init_scale=8.0,
+            growth_interval=100, epochs=40, lr=0.02, batch_size=4, seed=1)
+        assert result["loss_history"][-1] < result["loss_history"][0]
+        assert result["skipped_steps"] == 0
+        assert result["steps_taken"] == result["epochs"] * result["batches"]
+        # 160 步 >= growth_interval(100)，第 100 步时 scale 从 8 翻倍到 16
+        assert result["scaler_state"]["scale"] == 16.0
+
+    def test_overflow_skips_update(self):
+        model = AI.MLP([1, 1], ["linear"])
+        before = [row[:] for row in model.layers[0].weights]
+        result = AI.fit_grad_scaler(
+            model, [[1.0]], [[1.0e6]], dtype="fp16", init_scale=65536.0,
+            growth_interval=100, epochs=2, lr=0.01, batch_size=1)
+        assert result["skipped_steps"] >= 1
+        assert result["steps_taken"] == 0
+        assert result["scaler_state"]["scale"] < 65536.0
+        assert model.layers[0].weights == before
+
+    def test_scale_growth(self):
+        xs = self._data()
+        ys = self._targets(xs)
+        model = AI.MLP([1, 1], ["linear"])
+        result = AI.fit_grad_scaler(
+            model, xs, ys, dtype="bf16", init_scale=8.0, growth_interval=2,
+            epochs=2, lr=0.01, batch_size=len(xs))
+        assert result["scaler_state"]["scale"] == 16.0
+        assert result["steps_taken"] == result["epochs"] * result["batches"]
+        assert all(math.isfinite(v) for v in result["loss_history"])
+
+    def test_scaler_state_roundtrip(self):
+        xs = self._data()
+        ys = self._targets(xs)
+        model = AI.MLP([1, 1], ["linear"])
+        result = AI.fit_grad_scaler(
+            model, xs, ys, dtype="bf16", init_scale=8.0, growth_interval=2,
+            epochs=2, lr=0.01, batch_size=len(xs))
+        scaler = AI.GradScaler(init_scale=8.0, growth_interval=2)
+        scaler.load_state_dict(result["scaler_state"])
+        assert scaler.scale == result["scaler_state"]["scale"]
+        assert scaler.state_dict() == result["scaler_state"]
+
+    def test_invalid_inputs(self):
+        xs = self._data()
+        ys = self._targets(xs)
+        model = AI.MLP([1, 1], ["linear"])
+        bad = [
+            lambda: AI.fit_grad_scaler("nope", xs, ys),
+            lambda: AI.fit_grad_scaler(model, [], []),
+            lambda: AI.fit_grad_scaler(model, xs, ys[:3]),
+            lambda: AI.fit_grad_scaler(model, [[1.0, 2.0]] * 2, ys),
+            lambda: AI.fit_grad_scaler(model, xs, ys, dtype="int8"),
+            lambda: AI.fit_grad_scaler(model, xs, ys, init_scale=0.0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, growth_factor=1.0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, backoff_factor=1.5),
+            lambda: AI.fit_grad_scaler(model, xs, ys, growth_interval=0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, epochs=0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, lr=0.0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, batch_size=0),
+            lambda: AI.fit_grad_scaler(model, xs, ys, shuffle="yes"),
+            lambda: AI.fit_grad_scaler(model, xs, ys, seed=1.5),
+            lambda: AI.fit_grad_scaler(model, xs, [[1.0, 2.0]] * len(xs)),
+        ]
+        assert all(_gsf_raises(fn) for fn in bad)

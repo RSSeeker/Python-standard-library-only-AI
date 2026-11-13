@@ -73488,6 +73488,159 @@ def quantize_model(model, dtype="fp16"):
     return model
 
 
+# ---- GradScaler 动态 loss scaling 训练循环（fit_grad_scaler） ----
+
+
+def _gsf_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"fit_grad_scaler: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _gsf_check_pos_number(value, name):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) <= 0.0):
+        raise ValueError(
+            f"fit_grad_scaler: {name} 必须是正的有限实数，收到 {value!r}")
+    return float(value)
+
+
+def _gsf_round_fn(dtype):
+    if dtype == "fp16":
+        return fp16_round
+    if dtype == "bf16":
+        return bf16_round
+    return lambda v, _fmt=dtype: fp8_round(v, _fmt)
+
+
+def _gsf_scaled_grads(model, xs, ys, scale, dtype):
+    """一次 batch 的「放大后的低精度梯度」（乘 scale 后按 dtype 舍入，不除回）
+
+    与 ``mixed_precision_grads`` 的区别：这里保留放大后的梯度，交给
+    ``GradScaler.unscale`` 除回并检测 inf/nan，这才是 AMP 的真实流程。
+    """
+    net = model.model
+    fn = _gsf_round_fn(dtype)
+    acc = [(None, None) for _ in net.layers]
+    total = 0.0
+    for x, y in zip(xs, ys):
+        pred = net.forward(list(x))
+        loss, grad = model._loss(pred, y)
+        total += loss
+        delta = list(grad)
+        for i in range(len(net.layers) - 1, -1, -1):
+            gw, gb, delta = net.layers[i].backward(delta)
+            if gw is None and gb is None:
+                continue
+            aw, ab = acc[i]
+            if gw is not None:
+                if aw is None:
+                    aw = [[0.0] * len(r) for r in gw]
+                for j, row in enumerate(gw):
+                    for k, v in enumerate(row):
+                        aw[j][k] += v
+            if gb is not None:
+                if ab is None:
+                    ab = [0.0] * len(gb)
+                for j, v in enumerate(gb):
+                    ab[j] += v
+            acc[i] = (aw, ab)
+    n = float(len(xs))
+    grads = []
+    for gw, gb in acc:
+        if gw is not None:
+            gw = [[fn(v * scale / n) for v in row] for row in gw]
+        if gb is not None:
+            gb = [fn(v * scale / n) for v in gb]
+        grads.append((gw, gb))
+    return total / n, grads
+
+
+def fit_grad_scaler(model, xs, ys, dtype="fp16", init_scale=65536.0,
+                    growth_factor=2.0, backoff_factor=0.5,
+                    growth_interval=2000, epochs=20, lr=0.01,
+                    batch_size=32, seed=None, shuffle=True):
+    """用 GradScaler 动态 loss scaling 的模拟混合精度训练循环
+
+    每个 batch：``_gsf_scaled_grads`` 得到「乘过 scale 的低精度梯度」→
+    ``scaler.unscale`` 检查 inf/nan 并除回 → ``scaler.update`` 决定本步是否
+    真的 SGD 更新；溢出步被跳过、scale 减半；连续 ``growth_interval`` 步没溢出
+    则 scale 翻倍。
+
+    只模拟梯度舍入与缩放，不做真正的半精度矩阵乘，因此**没有速度收益**。
+    ``model`` 可以是 ``Model``（用其 ``loss_fn``）或 ``MLP``（默认均方误差）。
+    返回 ``{"loss_history", "scale_history", "skipped_steps", "steps_taken",
+    "epochs", "batches", "scaler_state"}``。
+    """
+    if isinstance(model, MLP):
+        model = Model(model)
+    elif not isinstance(model, Model):
+        raise TypeError("fit_grad_scaler: model 必须是 Model 或 MLP 实例")
+    if dtype not in ("fp16", "bf16", "fp8_e4m3", "fp8_e5m2"):
+        raise ValueError(
+            "fit_grad_scaler: dtype 只能是 'fp16' / 'bf16' / 'fp8_e4m3' / "
+            f"'fp8_e5m2'，收到 {dtype!r}")
+    scaler = GradScaler(init_scale=init_scale, growth_factor=growth_factor,
+                        backoff_factor=backoff_factor,
+                        growth_interval=growth_interval)
+    lr = _gsf_check_pos_number(lr, "学习率")
+    epochs = _gsf_check_pos_int(epochs, "epochs")
+    batch_size = _gsf_check_pos_int(batch_size, "batch_size")
+    if not isinstance(shuffle, bool):
+        raise TypeError("fit_grad_scaler: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("fit_grad_scaler: seed 必须是 int 或 None")
+    if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+        raise ValueError("fit_grad_scaler: xs 与 ys 必须是列表")
+    if not xs or len(xs) != len(ys):
+        raise ValueError("fit_grad_scaler: xs 与 ys 必须非空且等长")
+    in_dim = model.model.layers[0].fan_in
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(
+                f"fit_grad_scaler: 每个输入必须是长度 {in_dim} 的列表")
+    for row in ys:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("fit_grad_scaler: 每个目标必须是非空列表")
+    out_dim = model.model.layers[-1].fan_out
+    for row in ys:
+        if len(row) != out_dim:
+            raise ValueError(
+                f"fit_grad_scaler: 每个目标长度必须是 {out_dim}")
+    n = len(xs)
+    rng = random.Random(seed)
+    order = list(range(n))
+    loss_history = []
+    batch_losses = []
+    for _ in range(epochs):
+        if shuffle:
+            rng.shuffle(order)
+        total = 0.0
+        batches = 0
+        for start in range(0, n, batch_size):
+            batch_idx = order[start:start + batch_size]
+            bx = [xs[i] for i in batch_idx]
+            by = [ys[i] for i in batch_idx]
+            loss, scaled = _gsf_scaled_grads(model, bx, by, scaler.scale, dtype)
+            unscaled = scaler.unscale(scaled)
+            if scaler.update():
+                _amp_apply_sgd(model.model.layers, unscaled, lr)
+            total += loss
+            batches += 1
+        avg = total / batches
+        loss_history.append(avg)
+        batch_losses.append(avg)
+    return {
+        "loss_history": loss_history,
+        "scale_history": [scaler.scale],
+        "skipped_steps": scaler.steps_skipped,
+        "steps_taken": scaler.steps_taken,
+        "epochs": epochs,
+        "batches": batches,
+        "scaler_state": scaler.state_dict(),
+    }
+
+
 class GradScaler:
     """动态损失缩放（混合精度训练里 GradScaler 的教学实现）。
 

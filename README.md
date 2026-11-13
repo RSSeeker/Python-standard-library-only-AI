@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2627 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2632 项）
 
 ## 特性
 
@@ -265,6 +265,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `quantize_model(model, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | 把权重与偏置**原地**舍入到低精度，用于模拟部署 |
 | `mixed_precision_grads(model, xs, ys, scale=1024.0, dtype='fp16'\|'bf16'\|'fp8_e4m3'\|'fp8_e5m2')` | fp32 反传 → 梯度乘 `scale` → 舍入 → 除回，即 AMP 里 `GradScaler` 的做法 |
 | `fit_mixed_precision(model, xs, ys, dtype='fp16', scale=1024.0, epochs=20, lr=0.01, batch_size=32, seed=None, shuffle=True)` | 模拟混合精度训练循环：每个 batch 复用 `mixed_precision_grads` 做梯度缩放+低精度舍入，再用 SGD 更新；返回 `loss_history`/`dtype`/`scale`/`batches`，不做真正低精度矩阵乘 |
+| `fit_grad_scaler(model, xs, ys, dtype='fp16', init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000, epochs=20, lr=0.01, batch_size=32, seed=None, shuffle=True)` | 把 `GradScaler` 接进训练循环：每 batch 保留放大后的低精度梯度 → `unscale` 检 inf/nan → `update` 决定是否做 SGD；溢出步跳过且 scale 减半，连续 `growth_interval` 步正常后翻倍；返回 `loss_history`/`scale_history`/`skipped_steps`/`steps_taken`/`scaler_state` |
 | `GradScaler(init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000)` | 动态 loss scaling：`scale_loss` 放大损失、`unscale` 检非有限值并除回、`update` 在溢出时退半、连续 `growth_interval` 步正常后翻倍；`state_dict`/`load_state_dict` 保存状态 |
 
 诚实说明三点：本库的 `Layer` 默认只缓存最后一次前向的输入（O(层数) 份），
@@ -272,6 +273,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 会在每段前向结束后清掉段内层的 `input/z/a`，反向重放时再重建，因此峰值激活
 降到 O(段数) 份边界激活 + 当前段缓存——这是真正省内存的路径（仍用时间换空间）。`checkpoint_causal_lm_backward` / `fit_causal_lm_checkpointed` 把这一机制接进 CausalLM 的完整训练循环（与 `_loss_and_backward` 数值一致）。
 混合精度部分**只模拟舍入**，不做半精度矩阵乘，因此速度不会变快。
+`fit_grad_scaler` 则把真正的动态缩放接进循环：溢出步不更新参数并让 scale 退半，正常步按逆缩放后的梯度更新，连续 `growth_interval` 步后 scale 翻倍——与 `fit_mixed_precision` 的固定 scale 形成对照。
 
 `loss scaling` 的意义可以实测出来：`fp16` 的最小次正规约 `5.96e-8`，梯度 `1e-9` 直接
 舍入就是 0；乘 8192 后落在 `8.19e-6`，舍回后仍是 `1.0e-9` 量级（`9.968e-10`）。
@@ -5722,7 +5724,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2627 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2632 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5747,6 +5749,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMoEAdvanced` | 负载均衡损失对门控权重/偏置/输入的中心差分、`capacity_factor` 的容量计算与 token dropping（输出与梯度为 0）、非法容量参数、辅助损失梯度累加与 `coefficient=0` 边界 |
 | `TestSophiaHutchinson` | 正交零和输入下线性模型 Hessian 对角精确为 2、两层 MLP 返回形状、与逐参数中心差分精确对角的近似（max abs diff < 0.4）、Sophia + Hutchinson 训练 loss 下降、非法输入 |
 | `TestShampooNewtonGrafting` | Newton–Schulz 逆根与 Jacobi 特征分解结果一致（max_abs < 1e-6）、Newton 路径训练收敛、grafting 一步更新范数与 Adam 一致、`state_dict` 往返（含 `L/R/m/v` 字段）、非法超参 |
+| `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
 | `TestDDPM` | `q_sample` 与公式逐位一致、`t`/`x0`/`noise` 三类校验、噪声预测层梯度中心差分、150 轮训练降 2.5 倍、反向采样有限且均值在数据尺度内 |
@@ -6193,6 +6196,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2627 个单元测试
+├── test_ai.py       # 2632 个单元测试
 └── README.md
 ```
