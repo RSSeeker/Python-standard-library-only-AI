@@ -7599,6 +7599,197 @@ def umap_knn_overlap(points, embedding, n_neighbors=5):
         total += len(hi_set & lo_set) / float(len(hi_set))
     return total / len(pts)
 
+# ============================================================================
+#  训练目标：FIM（Fill-in-the-Middle）与 T5 span corruption
+# ============================================================================
+
+FIM_SENTINEL_IDS = {"prefix": 0, "suffix": 1, "middle": 2}
+
+
+def _fim_check_ids(ids, vocab_size, who):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(who + ": 序列必须是非空列表")
+    if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size <= 1:
+        raise ValueError(who + ": vocab_size 必须是大于 1 的整数")
+    out = []
+    for v in ids:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(who + ": token id 必须是整数")
+        if v < 0 or v >= vocab_size:
+            raise ValueError(who + ": token id 越界（应为 [0, %d)）" % vocab_size)
+        out.append(int(v))
+    return out
+
+
+def _fim_check_seed(seed, who):
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+        raise ValueError(who + ": seed 必须是整数或 None")
+    return seed
+
+
+def fim_transform(ids, vocab_size, mode="psm", prefix_ratio=0.5,
+                  middle_ratio=0.5, seed=None):
+    """把一条序列改写成 FIM 训练样本。
+
+    PSM：<prefix> P <suffix> S <middle> M
+    SPM：<suffix> S <prefix> P <middle> M
+
+    三个哨兵 id 固定为 vocab_size / vocab_size+1 / vocab_size+2（依次
+    prefix / suffix / middle），因此词表实际需要 vocab_size+3 行。
+    返回 dict：input_ids、prefix、middle、suffix、middle_start、mode。
+    seed 只影响区间划分（本函数按比例固定划分，保留参数用于将来随机采样）。
+    """
+    seq = _fim_check_ids(ids, vocab_size, "fim_transform")
+    if mode not in ("psm", "spm"):
+        raise ValueError("fim_transform: mode 必须是 'psm' 或 'spm'")
+    if not isinstance(prefix_ratio, (int, float)) or isinstance(prefix_ratio, bool) \
+            or not (0.0 < prefix_ratio < 1.0):
+        raise ValueError("fim_transform: prefix_ratio 必须在 (0, 1) 内")
+    if not isinstance(middle_ratio, (int, float)) or isinstance(middle_ratio, bool) \
+            or not (0.0 < middle_ratio < 1.0):
+        raise ValueError("fim_transform: middle_ratio 必须在 (0, 1) 内")
+    _fim_check_seed(seed, "fim_transform")
+    n = len(seq)
+    if n < 3:
+        raise ValueError("fim_transform: 序列至少需要 3 个 token 才能切出 prefix/middle/suffix")
+    p = int(round(n * prefix_ratio))
+    p = min(max(p, 1), n - 2)
+    rest = n - p
+    m = int(round(rest * middle_ratio))
+    m = min(max(m, 1), rest - 1)
+    prefix = seq[:p]
+    middle = seq[p:p + m]
+    suffix = seq[p + m:]
+    s = FIM_SENTINEL_IDS
+    if mode == "psm":
+        input_ids = [vocab_size + s["prefix"]] + prefix \
+            + [vocab_size + s["suffix"]] + suffix \
+            + [vocab_size + s["middle"]] + middle
+    else:
+        input_ids = [vocab_size + s["suffix"]] + suffix \
+            + [vocab_size + s["prefix"]] + prefix \
+            + [vocab_size + s["middle"]] + middle
+    return {
+        "input_ids": input_ids,
+        "prefix": prefix,
+        "middle": middle,
+        "suffix": suffix,
+        "middle_start": len(input_ids) - len(middle),
+        "mode": mode,
+    }
+
+
+def fim_target_mask(example):
+    """FIM 样本的逐位置损失掩码（长度 len(input_ids)-1，对应 causal shift）。
+
+    只有预测 middle token 的位置为 True；prefix/suffix 部分不计算损失，
+    避免模型把前缀复制当成答案。
+    """
+    if not isinstance(example, dict) or "input_ids" not in example \
+            or "middle_start" not in example:
+        raise ValueError("fim_target_mask: 需要 fim_transform 返回的样本")
+    ids = example["input_ids"]
+    start = example["middle_start"]
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("fim_target_mask: input_ids 不能为空")
+    if not isinstance(start, int) or start < 0 or start >= len(ids):
+        raise ValueError("fim_target_mask: middle_start 越界")
+    mask = []
+    for t in range(len(ids) - 1):
+        mask.append(t + 1 >= start)
+    return mask
+
+
+def fim_batch(sequences, vocab_size, mode="psm", prefix_ratio=0.5,
+              middle_ratio=0.5, seed=None):
+    """批量 FIM 改写；seed 非 None 时由 random.Random 保留但当前划分是确定性的。"""
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError("fim_batch: sequences 必须是非空列表")
+    return [fim_transform(seq, vocab_size, mode=mode,
+                          prefix_ratio=prefix_ratio,
+                          middle_ratio=middle_ratio, seed=seed)
+            for seq in sequences]
+
+
+def span_corruption_mask(seq_len, mask_ratio=0.15, mean_span=3.0, seed=None):
+    """生成 T5 风格的随机 span 掩码，返回按起点排序的 [(start, length), ...]。"""
+    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
+        raise ValueError("span_corruption_mask: seq_len 必须是正整数")
+    if not isinstance(mask_ratio, (int, float)) or isinstance(mask_ratio, bool) \
+            or not (0.0 < mask_ratio <= 1.0):
+        raise ValueError("span_corruption_mask: mask_ratio 必须在 (0, 1] 内")
+    if not isinstance(mean_span, (int, float)) or isinstance(mean_span, bool) \
+            or mean_span < 1.0:
+        raise ValueError("span_corruption_mask: mean_span 必须 >= 1")
+    _fim_check_seed(seed, "span_corruption_mask")
+    rng = random.Random(seed)
+    target = max(1, int(round(seq_len * mask_ratio)))
+    chosen = set()
+    spans = []
+    attempts = 0
+    max_attempts = max(20, seq_len * 4)
+    while _fim_targets_remaining(target, spans) and attempts < max_attempts:
+        attempts += 1
+        length = 1
+        # 指数分布取整，均值约 mean_span，上限 3*mean_span（避免整条被吞）
+        extra = rng.expovariate(1.0 / mean_span)
+        length = max(1, min(int(round(1 + extra)), int(round(3 * mean_span))))
+        length = min(length, seq_len)
+        start = rng.randrange(0, seq_len - length + 1)
+        cells = set(range(start, start + length))
+        if chosen & cells:
+            continue
+        chosen |= cells
+        spans.append((start, length))
+    spans.sort()
+    return spans
+
+
+def _fim_targets_remaining(target, spans):
+    """内部工具：已选 span 覆盖数是否仍小于目标覆盖数。"""
+    return sum(length for _, length in spans) < target
+
+
+def span_corruption_ids(ids, vocab_size, mask_ratio=0.15, mean_span=3.0,
+                        sentinel_id=None, seed=None):
+    """把序列改写成 T5 span corruption 的 input_ids / target_ids。
+
+    - input_ids：每个 span 用同一个哨兵 token 替换（span 内 token 全部丢弃）；
+    - target_ids：每个 span 前加一个哨兵，再跟上该 span 的原始 token。
+    sentinel_id 缺省为 vocab_size（词表实际需要 vocab_size+1 行）。
+    """
+    seq = _fim_check_ids(ids, vocab_size, "span_corruption_ids")
+    explicit_sentinel = sentinel_id is not None
+    if sentinel_id is None:
+        sentinel_id = vocab_size
+    if not isinstance(sentinel_id, int) or isinstance(sentinel_id, bool)             or sentinel_id < 0 or (explicit_sentinel and sentinel_id >= vocab_size):
+        raise ValueError("span_corruption_ids: sentinel_id 必须是 [0, vocab_size) 内的整数（缺省为 vocab_size）")
+    spans = span_corruption_mask(len(seq), mask_ratio=mask_ratio,
+                                 mean_span=mean_span, seed=seed)
+    span_map = {}
+    for start, length in spans:
+        span_map[start] = length
+    input_ids = []
+    target_ids = []
+    i = 0
+    while i < len(seq):
+        if i in span_map:
+            length = span_map[i]
+            target_ids.append(sentinel_id)
+            target_ids.extend(seq[i:i + length])
+            input_ids.append(sentinel_id)
+            i += length
+        else:
+            input_ids.append(seq[i])
+            i += 1
+    return {
+        "input_ids": input_ids,
+        "target_ids": target_ids,
+        "spans": spans,
+        "sentinel_id": sentinel_id,
+    }
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

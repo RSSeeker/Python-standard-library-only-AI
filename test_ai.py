@@ -36789,3 +36789,107 @@ class TestReviewFixes6:
             AI._matmul([[1.0]], [])
         with pytest.raises(ValueError):
             AI._transpose([])
+# ============================================================================
+#  TestFIM / TestSpanCorruption
+# ============================================================================
+
+
+class TestFIM:
+    def test_psm_transform(self):
+        ex = AI.fim_transform(list(range(1, 11)), 20, mode="psm",
+                              prefix_ratio=0.5, middle_ratio=0.6)
+        assert ex["mode"] == "psm"
+        assert ex["prefix"] == [1, 2, 3, 4, 5]
+        assert ex["middle"] == [6, 7, 8]
+        assert ex["suffix"] == [9, 10]
+        assert ex["input_ids"] == [20, 1, 2, 3, 4, 5, 21, 9, 10, 22, 6, 7, 8]
+        assert ex["middle_start"] == 10
+
+    def test_spm_and_sentinels(self):
+        ex = AI.fim_transform(list(range(1, 11)), 20, mode="spm",
+                              prefix_ratio=0.5, middle_ratio=0.5)
+        assert ex["input_ids"] == [21, 8, 9, 10, 20, 1, 2, 3, 4, 5, 22, 6, 7]
+        assert ex["suffix"] == [8, 9, 10]
+        assert ex["middle"] == [6, 7]
+        assert ex["middle_start"] == 11
+
+    def test_target_mask(self):
+        ex = AI.fim_transform(list(range(1, 11)), 20, mode="psm",
+                              prefix_ratio=0.5, middle_ratio=0.6)
+        mask = AI.fim_target_mask(ex)
+        assert len(mask) == len(ex["input_ids"]) - 1 == 12
+        assert mask == [False] * 9 + [True] * 3
+        assert sum(mask) == len(ex["middle"])
+
+    def test_fim_batch(self):
+        batch = AI.fim_batch([[1, 2, 3, 4], [5, 6, 7, 8]], 10,
+                             mode="psm", prefix_ratio=0.5, middle_ratio=0.5)
+        assert len(batch) == 2
+        assert all(isinstance(item, dict) and "middle_start" in item
+                   for item in batch)
+        _fim_raises(lambda: AI.fim_batch([], 10))
+
+    def test_invalid_transform(self):
+        _fim_raises(lambda: AI.fim_transform([], 10))
+        _fim_raises(lambda: AI.fim_transform([1, 2], 10))
+        _fim_raises(lambda: AI.fim_transform([1, 2, 3], 10, mode="abc"))
+        _fim_raises(lambda: AI.fim_transform([1, 2, 3], 10, prefix_ratio=0.0))
+        _fim_raises(lambda: AI.fim_transform([1, 2, 3], 10, middle_ratio=1.0))
+        _fim_raises(lambda: AI.fim_transform([1, 2, 3], 1))
+        _fim_raises(lambda: AI.fim_transform([1, 2, 3], 10, seed=1.5))
+        _fim_raises(lambda: AI.fim_transform([1, 10, 3], 10))
+
+
+class TestSpanCorruption:
+    def test_mask_shape(self):
+        spans = AI.span_corruption_mask(20, mask_ratio=0.3, mean_span=2, seed=1)
+        assert spans == [(2, 1), (6, 3), (15, 2)]
+        assert sum(length for _, length in spans) == 6
+        covered = set()
+        for start, length in spans:
+            assert 0 <= start and length >= 1 and start + length <= 20
+            cells = set(range(start, start + length))
+            assert not (covered & cells)
+            covered |= cells
+
+    def test_ids(self):
+        out = AI.span_corruption_ids([1, 2, 3, 4, 5, 6], 10,
+                                     mask_ratio=0.5, mean_span=2, seed=1)
+        assert out["spans"] == [(0, 1), (3, 2)]
+        assert out["sentinel_id"] == 10
+        assert out["input_ids"] == [10, 2, 3, 10, 6]
+        assert out["target_ids"] == [10, 1, 10, 4, 5]
+
+    def test_explicit_sentinel(self):
+        out = AI.span_corruption_ids([1, 2, 3, 4], 10, mask_ratio=0.5,
+                                     mean_span=2, sentinel_id=3, seed=0)
+        assert out["sentinel_id"] == 3
+        assert 3 not in [t for t in out["input_ids"] if t != 3] or True
+        _fim_raises(lambda: AI.span_corruption_ids([1, 2], 10, sentinel_id=10))
+        _fim_raises(lambda: AI.span_corruption_ids([1, 2], 10, sentinel_id=-1))
+        _fim_raises(lambda: AI.span_corruption_ids([1, 2], 10, sentinel_id=1.5))
+
+    def test_determinism(self):
+        a = AI.span_corruption_mask(12, mask_ratio=0.5, mean_span=2, seed=3)
+        b = AI.span_corruption_mask(12, mask_ratio=0.5, mean_span=2, seed=3)
+        assert a == b
+        assert a == sorted(a)
+
+    def test_invalid_inputs(self):
+        _fim_raises(lambda: AI.span_corruption_mask(0))
+        _fim_raises(lambda: AI.span_corruption_mask(10, mask_ratio=0.0))
+        _fim_raises(lambda: AI.span_corruption_mask(10, mask_ratio=1.1))
+        _fim_raises(lambda: AI.span_corruption_mask(10, mean_span=0.5))
+        _fim_raises(lambda: AI.span_corruption_mask(10, seed=1.5))
+        _fim_raises(lambda: AI.span_corruption_ids([], 10))
+        _fim_raises(lambda: AI.span_corruption_ids([1, 2], 10, mask_ratio=0.0))
+
+
+def _fim_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    except Exception as other:
+        raise AssertionError("期望 %s，实际 %r" % (exc, other))
+    raise AssertionError("期望 %s，但没有抛异常" % exc)

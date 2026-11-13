@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2391 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2401 项）
 
 ## 特性
 
@@ -3874,6 +3874,37 @@ version, model = reg.get("xor", 1)             # 取回指定版本（rollback �
   （含 `sha256`），旧版本不删；`Model` 实例先经 `save` 落临时文件再复制，
   所以注册表里的文件和手动 `model.save()` 的格式完全一致。
 
+### 预训练目标：FIM 与 T5 span corruption
+
+FIM（Fill-in-the-Middle）把文档切成 prefix / middle / suffix 三段重排，让因果语言模型
+学会根据前后文补全中间内容；`span_corruption` 生成 T5 式的随机连续片段遮蔽，输入中被遮
+片段替换为哨兵，目标为「哨兵 + 原始片段」。
+
+```python
+from ai import AI
+
+ids = list(range(1, 11))
+ex = AI.fim_transform(ids, 20, mode="psm", prefix_ratio=0.5, middle_ratio=0.6)
+print(ex["input_ids"])          # [20, 1, 2, 3, 4, 5, 21, 9, 10, 22, 6, 7, 8]
+print(AI.fim_target_mask(ex))   # 只有 middle 的 causal-shift 位置为 True
+
+corrupted = AI.span_corruption_ids([1, 2, 3, 4, 5, 6], 10, mask_ratio=0.5,
+                                   mean_span=2, seed=1)
+print(corrupted["input_ids"], corrupted["target_ids"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `fim_transform(ids, vocab_size, mode="psm", prefix_ratio=0.5, middle_ratio=0.5, seed=None)` | 'psm' / 'spm' 两种切分；哨兵为额外词表行 `vocab_size+0/1/2`；返回 input_ids/prefix/middle/suffix/middle_start/mode |
+| `fim_target_mask(example)` | 长度 `len(input_ids)-1`，仅预测 middle 的 causal-shift 位置为 True |
+| `fim_batch(sequences, vocab_size, ...)` | 批量版本 |
+| `span_corruption_mask(seq_len, mask_ratio=0.15, mean_span=3.0, seed=None)` | 随机非重叠 span（指数分布长度，无放回），返回排序后的 `(start, length)` |
+| `span_corruption_ids(ids, vocab_size, mask_ratio=0.15, mean_span=3.0, sentinel_id=None, seed=None)` | 输入中 span 替换为哨兵，target 为 `[哨兵] + span tokens`；缺省哨兵 `vocab_size` 合法，显式传入须 `< vocab_size` |
+
+边界：FIM 的三种哨兵固定占用词表最后三行（调用方需保证 `vocab_size` 预留）；
+span 长度为指数分布采样且互不重叠，可能因整段长度不足而在小序列上覆盖全部 token；
+两者只负责生成训练样本，不包含预训练循环本身。
+
 ### 数据去重（MinHash / SimHash）
 
 预训练语料去重常用两种近似算法：MinHash 估计集合 Jaccard 相似度，SimHash 用
@@ -4836,7 +4867,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2391 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2401 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5070,6 +5101,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
 | `TestModelMerging` | soup 均值、SLERP 端点/保范数/退化、TIES 手算与裁剪、DARE 复现与丢弃、非法输入 |
 | `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
+| `TestFIM` | PSM/SPM 重排结构、target mask、批量、非法输入 |
+| `TestSpanCorruption` | span 非重叠与边界、输入/目标替换、显式哨兵、种子确定性、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5250,6 +5283,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2391 个单元测试
+├── test_ai.py       # 2401 个单元测试
 └── README.md
 ```
