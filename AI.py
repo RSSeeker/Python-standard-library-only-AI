@@ -28,119 +28,153 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 110 个顶层分节
-# （1359 个 def / 373 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 144 个顶层分节
+# （1494 个 def / 397 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
 #   3. KAN（Kolmogorov-Arnold Network：B 样条边函数）
-#   4. CNN: Conv2d / MaxPool2d / Flatten
-#   5. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
-#   6. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
-#   7. GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
-#   8. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
-#   9. Regularization: Dropout / BatchNorm1d / LayerNorm
-#   10. RNN / LSTM
-#   11. Matrix helpers (用于 Transformer)
-#   12. GRU (Gated Recurrent Unit)
-#   13. Transformer 组件
-#   14. Embedding / Residual / Sequential
-#   15. Loss Functions
-#   16. Optimizer: Adam
-#   17. More Optimizers: SGD / SGD+Momentum / RMSprop
-#   18. SGDW / Nesterov / Lookahead / SWA / EMA
-#   19. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
-#   20. Layer-wise Optimizers: LARS / LAMB / Ranger
-#   21. Advanced Optimizers: Adan / Prodigy / CAME
-#   22. 进阶优化器：Shampoo / Sophia / L-BFGS
-#   23. Gradient Clipping / LR Scheduler
-#   24. 学习率调度器族
-#   25. Data Utilities
-#   26. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
-#   27. 图像增强管道（Compose / RandomCrop / RandomResizedCrop / RandomRotation / ColorJitter / GaussianBlur / Normalize）
-#   28. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
-#   29. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
-#   30. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
-#   31. 降维 / 不平衡采样 / 特征选择
-#   32. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
-#   33. Scaler 族（RobustScaler / MaxAbsScaler / QuantileTransformer / PowerTransformer）
-#   34. Text Processing（分词与文本工具）
-#   35. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
-#   36. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
-#   37. Trainer
-#   38. 评估指标（分类 / 回归 / 序列 / 生成）
-#   39. 校准指标（ECE / MCE / Reliability Diagram）
-#   40. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
-#   41. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
-#   42. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#   43. 多模态：CLIP 双塔 + 跨模态融合
-#   44. 自监督：预测式任务（Rotation / Jigsaw）
-#   45. RL 算法（DQN 族）
-#   46. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#   47. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
-#   48. ELECTRA：生成器 + 判别器的预训练框架
-#   49. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
-#   50. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
-#   51. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
-#   52. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
-#   53. DETR（DEtection TRansformer，简化版）
-#   54. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
-#   55. E(3) 等变图神经网络（EGNN，教学版）
-#   56. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
-#   57. 全模块梯度自检（grad_check_all）
-#   58. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#   59. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#   60. 研究前沿：神经符号（规则约束的候选过滤）
-#   61. 研究前沿：Mixture-of-Depths 路由与 Early Exit
-#   62. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#   63. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#   64. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
-#   65. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
-#   66. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
-#   67. 集成测试 / doctest / 属性测试的运行时支撑
-#   68. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-#   69. 领域应用：视频（3D-CNN / Two-Stream 融合）
-#   70. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#   71. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#   72. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
-#   73. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#   74. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#   75. 领域应用：DeepFM / DIN
-#   76. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-#   77. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
-#   78. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
-#   79. RL 环境（GridWorld / CartPole）
-#   80. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
-#   81. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#   82. 推理与部署：批内打包与投机解码
-#   83. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
-#   84. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#   85. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#   86. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#   87. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#   88. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
-#   89. 可解释性：置换重要性 / 特征图字符画
-#   90. 可解释性：注意力 Rollout / Flow
-#   91. 可解释性：输入归因
-#   92. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
-#   93. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
-#   94. 语音识别指标（WER / CER / SER）
-#   95. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#   96. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
-#   97. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#   98. 模型保存 / 加载 (JSON)
-#   99. 序列标注 / 多标签分类头
-#   100. PyTorch 数值对齐对比
-#   101. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#   102. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#   103. 梯度检查点（activation checkpointing）与混合精度模拟
-#   104. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#   105. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#   106. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#   107. 生成模型：VAE / GAN / DDPM
-#   108. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
-#   109. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#   110. Main: 回归 + 分类 + CNN 完整示例
+#   4. 训练目标：FIM（Fill-in-the-Middle）与 T5 span corruption
+#   5. 注意力扩展：QK-Norm 与 DynamicTanh
+#   6. RoPE 扩展（ABF / LongRoPE / 2D / 3D）
+#   7. 线性注意力与长卷积（GLA / DeltaNet / Lightning Attention / Hyena）
+#   8. RWKV-5 / 6 / 7 time-mixing
+#   9. ReActAgent 与 RAGPipeline
+#   10. test-time compute 与 Constitutional AI
+#   11. LLMSearch（MCTS + LLM 推理搜索）
+#   12. Prefix Tuning（注意力 K/V 前缀）
+#   13. ONNX 导入（import_onnx_mlp）
+#   14. PRM 训练（逐步奖励模型 / PRMTrainer）
+#   15. KV 量化与分页生成（generate_kv_quantized / generate_paged）
+#   16. 偏好对齐训练循环（RLHFTrainer）
+#   17. LoRA 一键微调（finetune_lora）
+#   18. Medusa 多头训练循环（train_medusa_heads）
+#   19. 模拟混合精度训练循环（fit_mixed_precision）
+#   20. 序列推荐（SASRec）
+#   21. DCN-v2（Deep & Cross Network v2）
+#   22. 二维 DeepONet 神经算子
+#   23. 梯度检查点训练循环（CausalLM）
+#   24. TrOCR（图像编码器 + 文本解码器 OCR）
+#   25. TimeSformer（时空分离注意力视频分类）
+#   26. WhisperLite（语音识别：mel 编码器 + 文本解码器）
+#   27. YOLOLite（单尺度网格检测训练）
+#   28. NeRF-lite（体渲染神经辐射场）
+#   29. AlphaFold-lite（三角乘法更新 + 简化 IPA）
+#   30. VideoMAE-lite（视频掩码自编码器）
+#   31. Wav2Vec2-lite（掩码对比学习 + 码本量化）
+#   32. Gaussian Splatting-lite（正交投影 + alpha 合成）
+#   33. 3D 检测头（PointNetDetector）
+#   34. 分子性质预测 GNN（MoleculeGNN）
+#   35. BERT4Rec（双向序列推荐 + 掩码物品预测）
+#   36. AutoInt（自注意力特征交互）
+#   37. 工程便利件（unwrap_model / Trainer / benchmark_forward）
+#   38. CNN: Conv2d / MaxPool2d / Flatten
+#   39. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
+#   40. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#   41. GAN 变体族（DCGAN / WGAN-GP / StyleGAN 简化 / CycleGAN 简化 / Pix2Pix / Progressive Growing）
+#   42. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#   43. Regularization: Dropout / BatchNorm1d / LayerNorm
+#   44. RNN / LSTM
+#   45. Matrix helpers (用于 Transformer)
+#   46. GRU (Gated Recurrent Unit)
+#   47. Transformer 组件
+#   48. Embedding / Residual / Sequential
+#   49. Loss Functions
+#   50. Optimizer: Adam
+#   51. More Optimizers: SGD / SGD+Momentum / RMSprop
+#   52. SGDW / Nesterov / Lookahead / SWA / EMA
+#   53. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#   54. Layer-wise Optimizers: LARS / LAMB / Ranger
+#   55. Advanced Optimizers: Adan / Prodigy / CAME
+#   56. 进阶优化器：Shampoo / Sophia / L-BFGS
+#   57. Gradient Clipping / LR Scheduler
+#   58. 学习率调度器族
+#   59. Data Utilities
+#   60. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#   61. 图像增强管道（Compose / RandomCrop / RandomResizedCrop / RandomRotation / ColorJitter / GaussianBlur / Normalize）
+#   62. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+#   63. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#   64. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#   65. 降维 / 不平衡采样 / 特征选择
+#   66. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#   67. Scaler 族（RobustScaler / MaxAbsScaler / QuantileTransformer / PowerTransformer）
+#   68. Text Processing（分词与文本工具）
+#   69. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#   70. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#   71. Trainer
+#   72. 评估指标（分类 / 回归 / 序列 / 生成）
+#   73. 校准指标（ECE / MCE / Reliability Diagram）
+#   74. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#   75. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#   76. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#   77. 多模态：CLIP 双塔 + 跨模态融合
+#   78. 自监督：预测式任务（Rotation / Jigsaw）
+#   79. RL 算法（DQN 族）
+#   80. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#   81. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#   82. ELECTRA：生成器 + 判别器的预训练框架
+#   83. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+#   84. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+#   85. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
+#   86. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+#   87. DETR（DEtection TRansformer，简化版）
+#   88. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+#   89. E(3) 等变图神经网络（EGNN，教学版）
+#   90. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#   91. 全模块梯度自检（grad_check_all）
+#   92. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#   93. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#   94. 研究前沿：神经符号（规则约束的候选过滤）
+#   95. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#   96. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#   97. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#   98. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#   99. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+#   100. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+#   101. 集成测试 / doctest / 属性测试的运行时支撑
+#   102. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#   103. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#   104. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#   105. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#   106. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
+#   107. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#   108. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#   109. 领域应用：DeepFM / DIN
+#   110. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#   111. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#   112. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#   113. RL 环境（GridWorld / CartPole）
+#   114. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#   115. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#   116. 推理与部署：批内打包与投机解码
+#   117. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#   118. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#   119. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#   120. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#   121. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#   122. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#   123. 可解释性：置换重要性 / 特征图字符画
+#   124. 可解释性：注意力 Rollout / Flow
+#   125. 可解释性：输入归因
+#   126. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#   127. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#   128. 语音识别指标（WER / CER / SER）
+#   129. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#   130. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#   131. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#   132. 模型保存 / 加载 (JSON)
+#   133. 序列标注 / 多标签分类头
+#   134. PyTorch 数值对齐对比
+#   135. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#   136. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#   137. 梯度检查点（activation checkpointing）与混合精度模拟
+#   138. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#   139. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#   140. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#   141. 生成模型：VAE / GAN / DDPM
+#   142. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#   143. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#   144. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -7835,6 +7869,10 @@ def _ns_check_eps(eps):
     return float(eps)
 
 
+# ============================================================================
+#  注意力扩展：QK-Norm 与 DynamicTanh
+# ============================================================================
+
 def qk_norm(rows, gamma, eps=1e-6):
     """逐行 RMSNorm（QK-Norm 的核心），返回 out/rms/xhat。"""
     width = _ns_check_matrix(rows)
@@ -8103,6 +8141,10 @@ def longrope_inv_freqs(d_k, base=10000.0, factor=4.0,
     return freqs
 
 
+# ============================================================================
+#  RoPE 扩展（ABF / LongRoPE / 2D / 3D）
+# ============================================================================
+
 def rope_2d(rows, grid_h, grid_w, base=10000.0):
     """2D RoPE：把一半维度按行位置旋转、另一半按列位置旋转。
 
@@ -8226,6 +8268,10 @@ def rope_3d_inverse(rows, grid_t, grid_h, grid_w, base=10000.0):
 - `linear_attention_naive`：lightning attention 的 O(T^2) 展开参考实现。
 """
 
+
+# ============================================================================
+#  线性注意力与长卷积（GLA / DeltaNet / Lightning Attention / Hyena）
+# ============================================================================
 
 def _lin_check_matrix(rows, name="rows"):
     if not isinstance(rows, (list, tuple)) or not rows:
@@ -8473,6 +8519,10 @@ RWKV-4 的 time-mixing 用**向量**状态；RWKV-5（Eagle）把状态升级为
 import math
 
 
+# ============================================================================
+#  RWKV-5 / 6 / 7 time-mixing
+# ============================================================================
+
 def _rwkv_check_matrix(rows, name="rows"):
     if not isinstance(rows, (list, tuple)) or not rows:
         raise ValueError(f"rwkv567: {name} 必须是非空二维列表")
@@ -8656,6 +8706,10 @@ def rwkv7_time_mixing(r_rows, k_rows, v_rows, w_logits, delta=1.0):
 
 import math
 
+
+# ============================================================================
+#  ReActAgent 与 RAGPipeline
+# ============================================================================
 
 def _pipe_check_str(value, name):
     if not isinstance(value, str):
@@ -8861,6 +8915,10 @@ class RAGPipeline:
 """
 
 
+# ============================================================================
+#  test-time compute 与 Constitutional AI
+# ============================================================================
+
 def _ttc_check_str(value, name):
     if not isinstance(value, str):
         raise ValueError(f"ttc: {name} 必须是字符串")
@@ -8967,6 +9025,10 @@ def constitutional_ai(initial_answer, critique_fn, revise_fn, rounds=1):
 """
 
 
+# ============================================================================
+#  LLMSearch（MCTS + LLM 推理搜索）
+# ============================================================================
+
 def _llm_search_check_int(value, name, minimum=1):
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
         raise ValueError(f"llm_search: {name} 必须是 >= {minimum} 的整数，收到 {value!r}")
@@ -9061,6 +9123,10 @@ def llm_search(propose_fn, value_fn, max_depth=8, num_simulations=32,
 （前缀参数的梯度需要接在具体注意力实现上，属于调用方的训练框架）。
 """
 
+
+# ============================================================================
+#  Prefix Tuning（注意力 K/V 前缀）
+# ============================================================================
 
 def _prefix_check_pos_int(value, name):
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -9215,6 +9281,10 @@ ONNX 全量导入器需要 protobuf 语义、算子集与形状推导；本函�
 """
 
 
+# ============================================================================
+#  ONNX 导入（import_onnx_mlp）
+# ============================================================================
+
 def import_onnx_mlp(data):
     """解析导出字节并返回参数逐位相同的 `MLP`；不支持的结构抛 ValueError。"""
     if not isinstance(data, (bytes, bytearray)):
@@ -9294,6 +9364,10 @@ def import_onnx_mlp(data):
 奖励回灌策略）不在本片段内，需调用方自行组织 RL 循环。
 """
 
+
+# ============================================================================
+#  PRM 训练（逐步奖励模型 / PRMTrainer）
+# ============================================================================
 
 def _prm_sigmoid(z):
     if z >= 0:
@@ -9473,6 +9547,10 @@ def prm_train(features, labels, feature_dim: int, hidden=(16,), lr: float = 0.01
 - 不支持 beam search（束搜索有多条 cache，量化路径未实现），需要时用 `num_beams=1`。
 """
 
+
+# ============================================================================
+#  KV 量化与分页生成（generate_kv_quantized / generate_paged）
+# ============================================================================
 
 def _kvq_row_check_bits(bits):
     if isinstance(bits, bool) or not isinstance(bits, int):
@@ -9724,6 +9802,10 @@ def generate_paged(model, prompt_ids, max_new_tokens: int = 16,
     return ids
 
 
+# ============================================================================
+#  偏好对齐训练循环（RLHFTrainer）
+# ============================================================================
+
 def _rlhf_check_lm(model, name):
     if not isinstance(model, CausalLM):
         raise TypeError("%s: 必须是 CausalLM 实例，收到 %r" % (name, type(model).__name__))
@@ -9880,6 +9962,10 @@ def rlhf_align(policy, pairs, reference=None, method: str = "dpo",
                           margin=margin, sft_weight=sft_weight, lr=lr)
     return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
 
+
+# ============================================================================
+#  LoRA 一键微调（finetune_lora）
+# ============================================================================
 
 def _lora_ft_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -10055,6 +10141,10 @@ def finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50,
         "total_params": base_params + trainable_params,
     }
 
+# ============================================================================
+#  Medusa 多头训练循环（train_medusa_heads）
+# ============================================================================
+
 def _mt_check_int(value, name, minimum=1):
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"train_medusa_heads: {name} 必须是 >= {minimum} 的整数，收到 {value!r}")
@@ -10136,6 +10226,10 @@ def train_medusa_heads(target, heads, sequences, epochs=10, lr=0.01):
         "num_sequences": len(sequences),
         "num_heads": num_heads,
     }
+
+# ============================================================================
+#  模拟混合精度训练循环（fit_mixed_precision）
+# ============================================================================
 
 def _amp_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -10228,6 +10322,10 @@ def fit_mixed_precision(model, xs, ys, dtype="fp16", scale=1024.0, epochs=20,
 # SASRec（自注意力序列推荐）
 # ---------------------------------------------------------------------------
 
+
+# ============================================================================
+#  序列推荐（SASRec）
+# ============================================================================
 
 def _sasrec_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -10391,6 +10489,10 @@ class SASRec:
 # DCN-v2（Deep & Cross Network v2，推荐排序）
 # ---------------------------------------------------------------------------
 
+
+# ============================================================================
+#  DCN-v2（Deep & Cross Network v2）
+# ============================================================================
 
 def _dcn_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -10581,6 +10683,10 @@ class DCNv2:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  二维 DeepONet 神经算子
+# ============================================================================
+
 def _don2_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"DeepONet2D: {name} 必须是正整数")
@@ -10733,6 +10839,10 @@ class DeepONet2D:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  梯度检查点训练循环（CausalLM）
+# ============================================================================
+
 def _ckpt_fit_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"checkpoint_fit: {name} 必须是正整数")
@@ -10847,6 +10957,10 @@ def fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2,
 # TrOCR（图像编码器 + 文本解码器的 OCR 模型，简化版）
 # ---------------------------------------------------------------------------
 
+
+# ============================================================================
+#  TrOCR（图像编码器 + 文本解码器 OCR）
+# ============================================================================
 
 def _trocr_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -11087,6 +11201,10 @@ class TrOCR:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  TimeSformer（时空分离注意力视频分类）
+# ============================================================================
+
 def _tsf_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"TimeSformer: {name} 必须是正整数")
@@ -11312,6 +11430,10 @@ class TimeSformer:
 # Whisper（音频编码器 + 文本解码器的语音识别模型，简化版）
 # ---------------------------------------------------------------------------
 
+
+# ============================================================================
+#  WhisperLite（语音识别：mel 编码器 + 文本解码器）
+# ============================================================================
 
 def _whisper_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -11544,6 +11666,10 @@ class WhisperLite:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  YOLOLite（单尺度网格检测训练）
+# ============================================================================
+
 def _yolo_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"YOLOLite: {name} 必须是正整数")
@@ -11774,6 +11900,10 @@ class YOLOLite:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  NeRF-lite（体渲染神经辐射场）
+# ============================================================================
+
 def _nerf_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"NeRF: {name} 必须是正整数")
@@ -11993,6 +12123,10 @@ class NeRF:
 # AlphaFold 简化组件：Triangle multiplicative update + Invariant Point Attention（简化）
 # ---------------------------------------------------------------------------
 
+
+# ============================================================================
+#  AlphaFold-lite（三角乘法更新 + 简化 IPA）
+# ============================================================================
 
 def _af_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -12340,6 +12474,10 @@ class IPALite:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  VideoMAE-lite（视频掩码自编码器）
+# ============================================================================
+
 def _vmae_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"VideoMAE: {name} 必须是正整数")
@@ -12569,6 +12707,10 @@ class VideoMAE:
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+#  Wav2Vec2-lite（掩码对比学习 + 码本量化）
+# ============================================================================
+
 def _wv2_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"Wav2Vec2: {name} 必须是正整数")
@@ -12789,6 +12931,10 @@ class Wav2Vec2Lite:
 import math
 import random
 
+
+# ============================================================================
+#  Gaussian Splatting-lite（正交投影 + alpha 合成）
+# ============================================================================
 
 def _gs_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -13078,6 +13224,10 @@ import math
 import random
 
 
+# ============================================================================
+#  3D 检测头（PointNetDetector）
+# ============================================================================
+
 def _pnd_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("PointNetDetector: %s 必须是正整数" % name)
@@ -13284,6 +13434,10 @@ import math
 import random
 
 
+# ============================================================================
+#  分子性质预测 GNN（MoleculeGNN）
+# ============================================================================
+
 def _mg_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("MoleculeGNN: %s 必须是正整数" % name)
@@ -13446,6 +13600,10 @@ class MoleculeGNN:
 import math
 import random
 
+
+# ============================================================================
+#  BERT4Rec（双向序列推荐 + 掩码物品预测）
+# ============================================================================
 
 def _b4r_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -13616,6 +13774,10 @@ class BERT4Rec:
 import math
 import random
 
+
+# ============================================================================
+#  AutoInt（自注意力特征交互）
+# ============================================================================
 
 def _ait_check_pos_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -13820,6 +13982,10 @@ class AutoInt:
 """工程便利件：模型解包、统一 Trainer 包装、前向基准计时。"""
 import time
 
+
+# ============================================================================
+#  工程便利件（unwrap_model / Trainer / benchmark_forward）
+# ============================================================================
 
 def unwrap_model(model, name="model"):
     """把 Model 包装器解包成内部 MLP；普通 MLP 原样返回。"""

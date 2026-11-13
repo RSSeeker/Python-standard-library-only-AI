@@ -25,6 +25,8 @@
   `record_layer_norms` 逐层梯度范数 / `fit(mixup_alpha=)`
 - **评估与诊断**: 14 个纯标准库指标（含混淆矩阵 / PRF / MCC / AUC / BLEU / ROUGE-L）、`grad_check` 梯度自检、`estimate_flops`、`ascii_plot`、注意力可视化
 - **更多模型**: 序列标注头与多标签头、`MoE` 专家混合、VAE / GAN / DDPM 三个生成模型
+- **扩展能力**: FlashAttention 接入（`attn_impl='flash'`）、KV cache 量化与分页生成、线性注意力（GLA / DeltaNet / Lightning / Hyena）、RWKV-5/6/7、FIM/span corruption、QK-Norm/DyT、2D/3D RoPE、LoRA 一键微调、RLHF（DPO/IPO/SimPO/CPO/ORPO）、Medusa/前缀调优/PRM 训练、ReActAgent 与 RAGPipeline、LLMSearch；领域模型覆盖序列推荐（SASRec/BERT4Rec/AutoInt/DCN-v2）、OCR（TrOCR）、视频（TimeSformer/VideoMAE）、语音（WhisperLite/Wav2Vec2Lite）、3D（NeRF / Gaussian Splatting / PointNetDetector）、分子（MoleculeGNN/AlphaFold-lite）与 YOLOLite
+- **工程便利件**: `unwrap_model` / `Trainer` / `benchmark_forward`
 - **分词器**: 字节级 BPE（任意 UTF-8 无损）与 WordPiece（`##` 子词 + 最长前缀匹配）
 
 ## 快速开始
