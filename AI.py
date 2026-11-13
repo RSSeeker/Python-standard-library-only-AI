@@ -42168,6 +42168,149 @@ class Shampoo(_LayerwiseOptimizer):
                 math.sqrt(vb[j] / c2) + self.eps)
 
 
+"""Sophia 的 Hutchinson Hessian 对角估计（教学实现）。
+
+思路：Hutchinson 估计 ``diag(H) ≈ E[v ⊙ (H v)]``，其中 ``v`` 取 Rademacher
+（±1）随机向量。H·v 用解析梯度做中心差分：``H v ≈ (g(w+εv) − g(w−εv)) / (2ε)``。
+这里只支持 ``MLP`` + MSE 损失（输出为向量），对角估计逐层返回：
+
+    [(diag_w_0, diag_b_0), (diag_w_1, diag_b_1), ...]
+
+得到的结构可以直接传给 ``Sophia.step(grads, hessian_diags=...)``：
+
+    opt = AI.Sophia(mlp, lr=1e-3)
+    diags = AI.sophia_hutchinson_diag(mlp, xs, ys, num_samples=8, seed=0)
+    opt.step(grads, hessian_diags=diags)
+
+边界：
+- 中心差分对 ReLU 拐点附近不精确，``eps`` 默认 1e-3，可按参数量级调整；
+- 随机估计有方差，``num_samples`` 越大越接近真实对角（本实现无方差缩减）；
+- 只支持 MSE 与 ``MLP``，不支持卷积/注意力层与交叉熵目标。
+"""
+
+
+def _soph_ht_check_model(model):
+    if not isinstance(model, MLP):
+        raise TypeError("sophia_hutchinson_diag: model 必须是 MLP")
+    return model
+
+
+def _soph_ht_check_data(model, xs, ys):
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("sophia_hutchinson_diag: xs 必须是非空列表")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("sophia_hutchinson_diag: ys 必须与 xs 等长")
+    in_dim = model.layers[0].fan_in
+    out_dim = model.layers[-1].fan_out
+    x_out = []
+    for i, row in enumerate(xs):
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(
+                f"sophia_hutchinson_diag: xs[{i}] 长度应为 {in_dim}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError(f"sophia_hutchinson_diag: xs[{i}] 必须只包含有限数字")
+            vals.append(float(v))
+        x_out.append(vals)
+    y_out = []
+    for i, row in enumerate(ys):
+        if not isinstance(row, (list, tuple)) or len(row) != out_dim:
+            raise ValueError(
+                f"sophia_hutchinson_diag: ys[{i}] 长度应为 {out_dim}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError(f"sophia_hutchinson_diag: ys[{i}] 必须只包含有限数字")
+            vals.append(float(v))
+        y_out.append(vals)
+    return x_out, y_out
+
+
+def _soph_ht_batch_grads(model, xs, ys):
+    """MSE 损失（对样本与输出维度取平均）的解析梯度，按样本累加。"""
+    n = len(xs)
+    out_dim = model.layers[-1].fan_out
+    acc_w = _mlp_zero_grads(model)
+    acc_b = _mlp_acc_bias(model)
+    for i in range(n):
+        pred = model.forward(xs[i])
+        loss_grad = [2.0 * (pred[k] - ys[i][k]) / (n * out_dim)
+                     for k in range(out_dim)]
+        grads, _dx = _mlp_backward_with_input(model, loss_grad)
+        _mlp_accumulate(acc_w, acc_b, grads)
+    return acc_w, acc_b
+
+
+def _soph_ht_apply(model, dirs_w, dirs_b, delta):
+    for layer, dw, db in zip(model.layers, dirs_w, dirs_b):
+        for i in range(layer.fan_out):
+            row = layer.weights[i]
+            prow = dw[i]
+            for j in range(layer.fan_in):
+                row[j] += delta * prow[j]
+            layer.biases[i] += delta * db[i]
+
+
+def sophia_hutchinson_diag(model, xs, ys, num_samples=8, eps=1e-3, seed=None):
+    """用 Hutchinson 方法估计 MSE 损失对 MLP 参数的 Hessian 对角。
+
+    返回 ``[(diag_w, diag_b), ...]``，形状与每层 ``weights``/``biases`` 相同。
+    """
+    model = _soph_ht_check_model(model)
+    xs, ys = _soph_ht_check_data(model, xs, ys)
+    if isinstance(num_samples, bool) or not isinstance(num_samples, int) \
+            or num_samples < 1:
+        raise ValueError(
+            f"sophia_hutchinson_diag: num_samples 必须是 >=1 的整数，收到 {num_samples!r}")
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) \
+            or not math.isfinite(float(eps)) or float(eps) <= 0.0:
+        raise ValueError(f"sophia_hutchinson_diag: eps 必须是正数，收到 {eps!r}")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError(f"sophia_hutchinson_diag: seed 必须是整数或 None，收到 {seed!r}")
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+             for layer in model.layers]
+    acc_b = [[0.0] * layer.fan_out for layer in model.layers]
+    eps = float(eps)
+
+    for _ in range(num_samples):
+        dirs_w = [[[1.0 if rng.random() < 0.5 else -1.0
+                    for _ in range(layer.fan_in)]
+                   for _ in range(layer.fan_out)] for layer in model.layers]
+        dirs_b = [[1.0 if rng.random() < 0.5 else -1.0
+                   for _ in range(layer.fan_out)] for layer in model.layers]
+
+        _soph_ht_apply(model, dirs_w, dirs_b, eps)
+        gp_w, gp_b = _soph_ht_batch_grads(model, xs, ys)
+        _soph_ht_apply(model, dirs_w, dirs_b, -2.0 * eps)
+        gm_w, gm_b = _soph_ht_batch_grads(model, xs, ys)
+        _soph_ht_apply(model, dirs_w, dirs_b, eps)  # 恢复原参数
+
+        for li, layer in enumerate(model.layers):
+            for i in range(layer.fan_out):
+                dwi = dirs_w[li][i]
+                hp = gp_w[li][i]
+                hm = gm_w[li][i]
+                ai = acc_w[li][i]
+                for j in range(layer.fan_in):
+                    hv = (hp[j] - hm[j]) / (2.0 * eps)
+                    ai[j] += dwi[j] * hv
+                hb = (gp_b[li][i] - gm_b[li][i]) / (2.0 * eps)
+                acc_b[li][i] += dirs_b[li][i] * hb
+
+    out = []
+    for li, layer in enumerate(model.layers):
+        diag_w = [[acc_w[li][i][j] / num_samples for j in range(layer.fan_in)]
+                  for i in range(layer.fan_out)]
+        diag_b = [acc_b[li][i] / num_samples for i in range(layer.fan_out)]
+        out.append((diag_w, diag_b))
+    return out
+
+
 class Sophia(_LayerwiseOptimizer):
     """Sophia-G（2023）：按曲率裁剪动量后再更新
 

@@ -41113,3 +41113,119 @@ class TestMoEAdvanced:
         m.forward(xs)
         assert _moe_aux_raises(lambda: m.load_balancing_loss(-0.01))
         assert _moe_aux_raises(lambda: m.load_balancing_loss_and_backward(-0.5))
+
+
+class TestSophiaHutchinson:
+    """Sophia 优化器的 Hutchinson Hessian 对角估计。"""
+
+    def test_linear_model_exact_diagonal(self):
+        # 正交零和输入 -> Hessian 对角且无交叉项，Hutchinson 估计对任意 v 都精确
+        mlp = AI.MLP([2, 1], ["linear"])
+        xs = [[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]]
+        ys = [[0.0]] * 4
+        diags = AI.sophia_hutchinson_diag(
+            mlp, xs, ys, num_samples=3, eps=1e-4, seed=0)
+        assert len(diags) == 1
+        dw, db = diags[0]
+        assert len(dw) == 1 and len(dw[0]) == 2
+        for j in range(2):
+            assert abs(dw[0][j] - 2.0) < 1e-6, (j, dw[0][j])
+        assert abs(db[0] - 2.0) < 1e-6, db[0]
+
+    def test_shapes_and_input_validation(self):
+        mlp = AI.MLP([2, 2, 1], ["relu", "linear"])
+        xs = [[0.3, 0.4]]
+        ys = [[0.1]]
+        diags = AI.sophia_hutchinson_diag(mlp, xs, ys, num_samples=2, seed=1)
+        assert len(diags) == 2
+        assert len(diags[0][0]) == 2 and len(diags[0][0][0]) == 2
+        assert len(diags[0][1]) == 2
+        assert len(diags[1][0]) == 1 and len(diags[1][0][0]) == 2
+        assert len(diags[1][1]) == 1
+
+        def _bad(fn, exc=(TypeError, ValueError)):
+            try:
+                fn()
+            except exc:
+                return
+            raise AssertionError("expected error")
+
+        _bad(lambda: AI.sophia_hutchinson_diag("not-mlp", xs, ys))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, [], ys))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, [[0.1], [0.2]]))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, [[0.3]], ys))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, [[0.1, 0.2]]))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, ys, num_samples=0))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, ys, num_samples=True))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, ys, eps=0.0))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, ys, eps=float("nan")))
+        _bad(lambda: AI.sophia_hutchinson_diag(mlp, xs, ys, seed=1.5))
+
+    def test_approximates_exact_diagonal(self):
+        AI.random.seed(0)
+        mlp = AI.MLP([2, 2, 1], ["relu", "linear"])
+        rng = AI.random.Random(7)
+        for layer in mlp.layers:
+            for i in range(layer.fan_out):
+                for j in range(layer.fan_in):
+                    layer.weights[i][j] = rng.uniform(-0.5, 0.5)
+                layer.biases[i] = rng.uniform(-0.5, 0.5)
+        xs = [[0.4, 0.7], [-0.3, 0.2], [0.9, -0.1], [0.1, 0.5]]
+        ys = [[0.3], [-0.2], [0.6], [0.1]]
+        est = AI.sophia_hutchinson_diag(
+            mlp, xs, ys, num_samples=1200, eps=1e-4, seed=3)
+
+        h = 1e-4
+        exact = []
+        for li, layer in enumerate(mlp.layers):
+            dw = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+            db = [0.0] * layer.fan_out
+            for i in range(layer.fan_out):
+                for j in range(layer.fan_in):
+                    orig = layer.weights[i][j]
+                    layer.weights[i][j] = orig + h
+                    gp_w, _ = AI._soph_ht_batch_grads(mlp, xs, ys)
+                    layer.weights[i][j] = orig - h
+                    gm_w, _ = AI._soph_ht_batch_grads(mlp, xs, ys)
+                    layer.weights[i][j] = orig
+                    dw[i][j] = (gp_w[li][i][j] - gm_w[li][i][j]) / (2.0 * h)
+                orig_b = layer.biases[i]
+                layer.biases[i] = orig_b + h
+                _, gp_b = AI._soph_ht_batch_grads(mlp, xs, ys)
+                layer.biases[i] = orig_b - h
+                _, gm_b = AI._soph_ht_batch_grads(mlp, xs, ys)
+                layer.biases[i] = orig_b
+                db[i] = (gp_b[li][i] - gm_b[li][i]) / (2.0 * h)
+            exact.append((dw, db))
+
+        max_w = 0.0
+        max_b = 0.0
+        for li in range(len(exact)):
+            ew, eb = exact[li]
+            aw, ab = est[li]
+            for i in range(len(ew)):
+                for j in range(len(ew[i])):
+                    max_w = max(max_w, abs(ew[i][j] - aw[i][j]))
+                max_b = max(max_b, abs(eb[i] - ab[i]))
+        assert max_w < 0.4, max_w
+        assert max_b < 0.4, max_b
+
+    def test_sophia_training_with_hutchinson(self):
+        AI.random.seed(0)
+        mlp = AI.MLP([2, 6, 1], ["sigmoid", "linear"])
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [[0.0], [1.0], [1.0], [0.0]]
+        opt = AI.Sophia(mlp, lr=0.1, rho=0.04)
+        first = None
+        for step in range(60):
+            diags = AI.sophia_hutchinson_diag(
+                mlp, xs, ys, num_samples=6, eps=1e-3, seed=step)
+            grads_w, grads_b = AI._soph_ht_batch_grads(mlp, xs, ys)
+            preds = [mlp.forward(x) for x in xs]
+            loss = sum((preds[i][0] - ys[i][0]) ** 2 for i in range(4)) / 4.0
+            if first is None:
+                first = loss
+            opt.step(list(zip(grads_w, grads_b)), hessian_diags=diags)
+        preds = [mlp.forward(x) for x in xs]
+        last = sum((preds[i][0] - ys[i][0]) ** 2 for i in range(4)) / 4.0
+        assert last < first, (first, last)
