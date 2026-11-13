@@ -12335,6 +12335,235 @@ class IPALite:
             _dense_apply_sgd(getattr(self, name), (gw, gb), lr)
         self.reset_grads()
 
+# ---------------------------------------------------------------------------
+# VideoMAE-lite：视频 patch 掩码自编码器（逐帧网格 patch）
+# ---------------------------------------------------------------------------
+
+
+def _vmae_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"VideoMAE: {name} 必须是正整数")
+    return value
+
+
+def _vmae_check_video(video, in_channels, num_frames, image_size):
+    if not isinstance(video, (list, tuple)) or len(video) != num_frames:
+        raise ValueError(f"VideoMAE: video 必须是 {num_frames} 帧的列表")
+    out = []
+    for frame in video:
+        if not isinstance(frame, (list, tuple)) or len(frame) != in_channels:
+            raise ValueError(f"VideoMAE: 每帧必须是 {in_channels} 通道")
+        chans = []
+        for ch in frame:
+            if not isinstance(ch, (list, tuple)) or len(ch) != image_size:
+                raise ValueError(f"VideoMAE: 每帧高必须是 {image_size}")
+            rows = []
+            for row in ch:
+                if not isinstance(row, (list, tuple)) or len(row) != image_size:
+                    raise ValueError(f"VideoMAE: 每帧宽必须是 {image_size}")
+                vals = []
+                for v in row:
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                            or not math.isfinite(v):
+                        raise ValueError("VideoMAE: 像素必须是有限数字")
+                    vals.append(float(v))
+                rows.append(vals)
+            chans.append(rows)
+        out.append(chans)
+    return out
+
+
+class VideoMAE:
+    def __init__(self, num_frames=4, in_channels=1, image_size=8, patch_size=4,
+                 d_model=16, num_heads=2, d_ff=32, num_layers=1,
+                 mask_ratio=0.5, seed=None):
+        self.num_frames = _vmae_check_pos_int(num_frames, "num_frames")
+        self.in_channels = _vmae_check_pos_int(in_channels, "in_channels")
+        self.image_size = _vmae_check_pos_int(image_size, "image_size")
+        self.patch_size = _vmae_check_pos_int(patch_size, "patch_size")
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("VideoMAE: image_size 必须能被 patch_size 整除")
+        self.d_model = _vmae_check_pos_int(d_model, "d_model")
+        self.num_heads = _vmae_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _vmae_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _vmae_check_pos_int(num_layers, "num_layers")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("VideoMAE: d_model 必须能被 num_heads 整除")
+        if (isinstance(mask_ratio, bool) or not isinstance(mask_ratio, (int, float))
+                or not math.isfinite(float(mask_ratio))
+                or not (0.0 < float(mask_ratio) < 1.0)):
+            raise ValueError("VideoMAE: mask_ratio 必须在 (0, 1) 内")
+        self.mask_ratio = float(mask_ratio)
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VideoMAE: seed 必须是整数或 None")
+        self.grid = self.image_size // self.patch_size
+        self.num_patches = self.grid * self.grid
+        self.num_tokens = self.num_patches * self.num_frames
+        self.patch_pixels = self.patch_size * self.patch_size * self.in_channels
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.patch_embed = Conv2d(self.in_channels, self.d_model,
+                                      self.patch_size, stride=self.patch_size)
+            self.encoder = TransformerEncoder(
+                self.d_model, self.num_heads, self.d_ff,
+                num_layers=self.num_layers, dropout=0.0, causal=False)
+            self.spatial_pos = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                                for _ in range(self.num_patches)]
+            self.temporal_pos = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                                 for _ in range(self.num_frames)]
+            self.mask_token = [random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+            self.W_dec = Layer(self.d_model, self.patch_pixels, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def param_count(self):
+        conv = (self.patch_embed.out_channels * self.patch_embed.in_channels *
+                self.patch_embed.kh * self.patch_embed.kw +
+                self.patch_embed.out_channels)
+        enc_layer = 4 * (self.d_model * self.d_model + self.d_model) + \
+            2 * (self.d_model * self.d_ff + self.d_ff) + 4 * self.d_model
+        dec = self.d_model * self.patch_pixels + self.patch_pixels
+        return (conv + self.num_layers * enc_layer + dec +
+                self.num_patches * self.d_model + self.num_frames * self.d_model +
+                self.d_model)
+
+    def zero_grad(self):
+        self.patch_embed.zero_grad()
+        self.encoder.zero_grad()
+        self.grad_w_dec = [[0.0] * self.d_model for _ in range(self.patch_pixels)]
+        self.grad_b_dec = [0.0] * self.patch_pixels
+        self.grad_spatial = [[0.0] * self.d_model for _ in range(self.num_patches)]
+        self.grad_temporal = [[0.0] * self.d_model for _ in range(self.num_frames)]
+        self.grad_mask = [0.0] * self.d_model
+
+    def _mask_indices(self, seed):
+        rng = random.Random(seed)
+        k = max(1, int(round(self.num_tokens * self.mask_ratio)))
+        k = min(k, self.num_tokens - 1)
+        idx = list(range(self.num_tokens))
+        rng.shuffle(idx)
+        return sorted(idx[:k])
+
+    def _token_rows(self, video):
+        rows = []
+        targets = []
+        for f in range(self.num_frames):
+            out = self.patch_embed.forward(video[f])
+            for r in range(self.grid):
+                for c in range(self.grid):
+                    rows.append([out[k][r][c] for k in range(self.d_model)])
+                    tgt = []
+                    for k in range(self.in_channels):
+                        for dr in range(self.patch_size):
+                            for dc in range(self.patch_size):
+                                tgt.append(video[f][k][r * self.patch_size + dr]
+                                           [c * self.patch_size + dc])
+                    targets.append(tgt)
+        return rows, targets
+
+    def _encode(self, rows, mask_indices):
+        mask_set = set(mask_indices)
+        seq = []
+        for t, row in enumerate(rows):
+            f = t // self.num_patches
+            p = t % self.num_patches
+            pos = self.spatial_pos[p]
+            tpos = self.temporal_pos[f]
+            base = self.mask_token if t in mask_set else row
+            seq.append([base[j] + pos[j] + tpos[j] for j in range(self.d_model)])
+        encoded = self.encoder.forward(seq)
+        return encoded, mask_set
+
+    def forward(self, video, mask_seed=None):
+        video = _vmae_check_video(video, self.in_channels, self.num_frames,
+                                  self.image_size)
+        if mask_seed is not None and (isinstance(mask_seed, bool)
+                                      or not isinstance(mask_seed, int)):
+            raise ValueError("VideoMAE: mask_seed 必须是整数或 None")
+        rows, targets = self._token_rows(video)
+        mask = self._mask_indices(mask_seed)
+        encoded, mask_set = self._encode(rows, mask)
+        dec_rows, dec_cache = _dense_rows_forward(self.W_dec, encoded)
+        return {"recon": dec_rows, "mask": mask, "targets": targets,
+                "encoded": encoded, "rows": rows, "mask_set": mask_set,
+                "dec_cache": dec_cache}
+
+    def loss_and_backward(self, video, mask_seed=None):
+        out = self.forward(video, mask_seed)
+        mask = out["mask"]
+        if not mask:
+            raise ValueError("VideoMAE: 至少需要遮罩一个 token")
+        n_masked = len(mask)
+        d_rows = [[0.0] * self.patch_pixels for _ in range(self.num_tokens)]
+        loss = 0.0
+        mask_set = set(mask)
+        for t in range(self.num_tokens):
+            if t not in mask_set:
+                continue
+            drow = d_rows[t]
+            for j in range(self.patch_pixels):
+                diff = out["recon"][t][j] - out["targets"][t][j]
+                loss += diff * diff
+                drow[j] = 2.0 * diff / n_masked
+        loss /= n_masked
+        gw, gb, d_enc = _dense_rows_backward(self.W_dec, out["dec_cache"], d_rows)
+        self.grad_w_dec = gw
+        self.grad_b_dec = gb
+        d_seq = self.encoder.backward(d_enc)
+        d_grid = [[[0.0] * self.d_model for _ in range(self.grid)]
+                  for _ in range(self.grid)]
+        d_frames = [[[[0.0] * self.grid for _ in range(self.grid)]
+                     for _ in range(self.d_model)] for _ in range(self.num_frames)]
+        for t in range(self.num_tokens):
+            f = t // self.num_patches
+            p = t % self.num_patches
+            r, c = divmod(p, self.grid)
+            for i in range(self.d_model):
+                self.grad_spatial[p][i] += d_seq[t][i]
+                self.grad_temporal[f][i] += d_seq[t][i]
+                if t in mask_set:
+                    self.grad_mask[i] += d_seq[t][i]
+                else:
+                    d_frames[f][i][r][c] = d_seq[t][i]
+        for f in range(self.num_frames):
+            self.patch_embed.forward(video[f])
+            self.patch_embed.backward(d_frames[f])
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("VideoMAE: lr 必须是正有限数字")
+        _conv_sgd(self.patch_embed, lr)
+        self.encoder.sgd_step(lr)
+        _dense_apply_sgd(self.W_dec, (self.grad_w_dec, self.grad_b_dec), lr)
+        for p in range(self.num_patches):
+            for i in range(self.d_model):
+                self.spatial_pos[p][i] -= lr * self.grad_spatial[p][i]
+        for f in range(self.num_frames):
+            for i in range(self.d_model):
+                self.temporal_pos[f][i] -= lr * self.grad_temporal[f][i]
+        for i in range(self.d_model):
+            self.mask_token[i] -= lr * self.grad_mask[i]
+
+    def fit(self, videos, epochs=20, lr=0.01, seed=None):
+        if not isinstance(videos, (list, tuple)) or not videos:
+            raise ValueError("VideoMAE: videos 必须是非空列表")
+        epochs = _vmae_check_pos_int(epochs, "epochs")
+        history = []
+        for e in range(epochs):
+            self.zero_grad()
+            total = 0.0
+            for idx, video in enumerate(videos):
+                total += self.loss_and_backward(
+                    video, None if seed is None else seed + e * len(videos) + idx)
+            self.sgd_step(lr)
+            history.append(total / len(videos))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

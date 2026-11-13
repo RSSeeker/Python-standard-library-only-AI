@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2564 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2568 项）
 
 ## 特性
 
@@ -3834,6 +3834,36 @@ print(model.predict(video))
 
 测试：`TestTimeSformer` 覆盖前向/参数量、卷积核/时间位置/分类头梯度有限差分、两段视频过拟合训练、非法输入。
 
+### VideoMAE-lite（视频掩码自编码器）
+
+随机遮住视频中的部分 patch token（用可学习 mask token 替换），只对遮住的 patch 重建像素：
+
+```python
+import AI
+
+model = AI.VideoMAE(num_frames=2, in_channels=1, image_size=4, patch_size=2,
+                    d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                    mask_ratio=0.5, seed=0)
+video = [[[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8],
+           [0.9, 1.0, 0.1, 0.2], [0.3, 0.4, 0.5, 0.6]]] for _ in range(2)]
+out = model.forward(video, mask_seed=1)
+loss = model.loss_and_backward(video, mask_seed=1)
+model.sgd_step(0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `VideoMAE(num_frames=4, in_channels=1, image_size=8, patch_size=4, d_model=16, num_heads=2, d_ff=32, num_layers=1, mask_ratio=0.5, seed=None)` | 逐帧卷积 patch 嵌入 + 空间/时间位置向量 + Transformer 编码器 + 线性像素解码器；要求 `image_size % patch_size == 0`、`d_model % num_heads == 0`、`0 < mask_ratio < 1` |
+| `forward(video, mask_seed=None)` | 返回 `{recon, mask, targets, encoded, rows, mask_set, dec_cache}`；`mask` 为被遮 token 下标（帧主序），`mask_seed` 控制遮罩可复现 |
+| `loss_and_backward(video, mask_seed=None)` | 只对 mask token 的像素重建算 MSE；反传到解码器/编码器/卷积核/位置向量/mask token |
+| `sgd_step(lr)` / `fit(videos, epochs=20, lr=0.01, seed=None)` | 手写 SGD；`fit` 逐 epoch 前向 + 反向 + 更新，返回平均损失 |
+| `param_count()` | 卷积核 + 编码层 + 解码器 + 空间/时间位置向量 + mask token |
+
+边界：这是 VideoMAE 的最小演示——逐帧网格 patch（无 tube masking）、固定遮罩比例（无 curriculum masking）、
+重建目标是原始像素 MSE（无归一化目标/感知损失），不做真实视频预训练；反向时按帧重放卷积前向以恢复 im2col 缓存。
+
+测试：`TestVideoMAE` 覆盖前向/遮罩可复现/参数量、卷积核与解码器及 mask token 梯度有限差分、两段视频重建过拟合、非法输入。
+
 ### TrOCR（图像编码器 + 文本解码器 OCR）
 
 卷积 patch 嵌入 + Transformer 编码器 + 因果解码器，把整张图识别成文字序列：
@@ -5471,7 +5501,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2564 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2568 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5680,6 +5710,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestNeRF` | 前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入 |
 | `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
 | `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
+| `TestVideoMAE` | 前向/遮罩可复现/参数量、卷积核/解码器/mask token 梯度有限差分、重建过拟合、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5928,6 +5959,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2564 个单元测试
+├── test_ai.py       # 2568 个单元测试
 └── README.md
 ```

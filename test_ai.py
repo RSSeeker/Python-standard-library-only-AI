@@ -39834,3 +39834,105 @@ class TestIPALite:
         _af_raises(lambda: ipa.forward([[0.0] * 3] * 3, pair))
         _af_raises(lambda: ipa.backward([[0.0] * 4]))
         _af_raises(lambda: ipa.sgd_step(0.0))
+
+
+# ---------------------------------------------------------------------------
+# VideoMAE-lite（视频 patch 掩码自编码器）
+# ---------------------------------------------------------------------------
+
+
+def _vmae_make_video(offset=0.0):
+    return [[[[offset + 0.1, 0.2, 0.3, 0.4],
+              [0.5, 0.6, 0.7, 0.8],
+              [0.9, 1.0, 0.1, 0.2],
+              [0.3, 0.4, 0.5, 0.6]]] for _ in range(2)]
+
+
+def _vmae_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+class TestVideoMAE:
+    def test_forward_mask_and_param_count(self):
+        random.seed(0)
+        m = AI.VideoMAE(num_frames=2, in_channels=1, image_size=4, patch_size=2,
+                        d_model=4, num_heads=1, d_ff=8, num_layers=1,
+                        mask_ratio=0.5, seed=1)
+        assert m.param_count() == 244
+        video = _vmae_make_video()
+        out = m.forward(video, mask_seed=3)
+        assert out['mask'] == [0, 2, 5, 7]
+        assert len(out['recon']) == 8 and len(out['recon'][0]) == 4
+        out2 = m.forward(video, mask_seed=3)
+        assert out2['mask'] == out['mask']
+        _vmae_raises(lambda: m.forward(video[:1]))
+        _vmae_raises(lambda: AI.VideoMAE(image_size=5, patch_size=2))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.VideoMAE(num_frames=2, in_channels=1, image_size=4, patch_size=2,
+                        d_model=4, num_heads=1, d_ff=8, num_layers=1,
+                        mask_ratio=0.5, seed=1)
+        video = _vmae_make_video()
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(video, mask_seed=3)
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+
+        rels = [
+            fd(lambda: m.patch_embed.grad_w[0][0][0][1],
+               lambda: m.patch_embed.weights[0][0][0][1],
+               lambda v: m.patch_embed.weights[0][0][0].__setitem__(1, v)),
+            fd(lambda: m.grad_w_dec[0][1],
+               lambda: m.W_dec.weights[0][1],
+               lambda v: m.W_dec.weights[0].__setitem__(1, v)),
+            fd(lambda: m.grad_mask[1],
+               lambda: m.mask_token[1],
+               lambda v: m.mask_token.__setitem__(1, v)),
+        ]
+        assert all(r < 1e-4 for r in rels)
+
+    def test_fit_reconstructs(self):
+        random.seed(0)
+        m = AI.VideoMAE(num_frames=2, in_channels=1, image_size=4, patch_size=2,
+                        d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                        mask_ratio=0.5, seed=2)
+        videos = [_vmae_make_video(0.0), _vmae_make_video(0.5)]
+        hist = m.fit(videos, epochs=100, lr=0.05, seed=11)
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.VideoMAE(num_frames=2, in_channels=1, image_size=4, patch_size=2,
+                        d_model=4, num_heads=1, d_ff=8, num_layers=1,
+                        mask_ratio=0.5, seed=1)
+        video = _vmae_make_video()
+        cases = [
+            lambda: AI.VideoMAE(mask_ratio=0.0),
+            lambda: AI.VideoMAE(mask_ratio=1.5),
+            lambda: AI.VideoMAE(d_model=5, num_heads=2),
+            lambda: m.forward([[[]] for _ in range(2)]),
+            lambda: m.forward(video, mask_seed=1.5),
+            lambda: m.loss_and_backward(video[:1]),
+            lambda: m.sgd_step(0.0),
+            lambda: m.fit([]),
+            lambda: m.fit(videos=[video], epochs=0),
+        ]
+        for i, fn in enumerate(cases):
+            _vmae_raises(fn)
