@@ -9207,6 +9207,84 @@ class PrefixTuning:
                         self.P_k[layer][head][p][i] -= lr * self.grad_P_k[layer][head][p][i]
                         self.P_v[layer][head][p][i] -= lr * self.grad_P_v[layer][head][p][i]
 
+"""import_onnx_mlp：把 `export_onnx_mlp` 导出的字节重新解析成 `MLP`（仅支持本库子集）
+
+ONNX 全量导入器需要 protobuf 语义、算子集与形状推导；本函数只处理
+「Gemm → 激活」交替堆叠的 MLP 子集（即 `export_onnx_mlp` 的输出），
+用于验证导出/导入闭环与序列化格式，不覆盖外部 ONNX 模型。
+"""
+
+
+def import_onnx_mlp(data):
+    """解析导出字节并返回参数逐位相同的 `MLP`；不支持的结构抛 ValueError。"""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("import_onnx_mlp: data 必须是 bytes")
+    parsed = onnx_mlp_to_dict(bytes(data))
+    graph = parsed.get("graph")
+    if not isinstance(graph, dict):
+        raise ValueError("import_onnx_mlp: 缺少 graph")
+    nodes = graph.get("nodes")
+    inits = graph.get("initializers")
+    inputs = graph.get("inputs")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("import_onnx_mlp: graph 没有节点")
+    if not isinstance(inits, dict) or not isinstance(inputs, list) or not inputs:
+        raise ValueError("import_onnx_mlp: graph 缺少 initializers/inputs")
+    if len(nodes) % 2 != 0:
+        raise ValueError("import_onnx_mlp: 节点必须成对出现（Gemm + 激活）")
+    op_to_act = {}
+    for act, op in _OX_ACT_OPS.items():
+        op_to_act.setdefault(op, act)
+    layer_sizes = []
+    weights = []
+    biases = []
+    activations = []
+    in_dim = inputs[0].get("dims")
+    if not isinstance(in_dim, list) or not in_dim:
+        raise ValueError("import_onnx_mlp: 输入维度缺失")
+    layer_sizes.append(int(in_dim[-1]))
+    for i in range(0, len(nodes), 2):
+        gemm = nodes[i]
+        act_node = nodes[i + 1]
+        if gemm.get("op_type") != "Gemm":
+            raise ValueError("import_onnx_mlp: 第 %d 个节点不是 Gemm" % i)
+        if gemm.get("attributes", {}).get("transB", 0) != 1:
+            raise ValueError("import_onnx_mlp: 仅支持 transB=1 的 Gemm")
+        act_op = act_node.get("op_type")
+        act = op_to_act.get(act_op)
+        if act is None:
+            raise ValueError("import_onnx_mlp: 不支持的激活算子 %r" % (act_op,))
+        w_name = "W%d" % (i // 2)
+        b_name = "b%d" % (i // 2)
+        if w_name not in inits or b_name not in inits:
+            raise ValueError("import_onnx_mlp: 缺少权重 %r/%r" % (w_name, b_name))
+        wt = inits[w_name]
+        bt = inits[b_name]
+        dims = wt.get("dims")
+        if not isinstance(dims, list) or len(dims) != 2:
+            raise ValueError("import_onnx_mlp: 权重 %r 必须是二维" % w_name)
+        out_dim, fan_in = int(dims[0]), int(dims[1])
+        if fan_in != layer_sizes[-1]:
+            raise ValueError("import_onnx_mlp: 权重 %r 的输入维度不连续" % w_name)
+        vals = wt.get("values", [])
+        if len(vals) != out_dim * fan_in:
+            raise ValueError("import_onnx_mlp: 权重 %r 的元素数不匹配" % w_name)
+        rows = [list(vals[r * fan_in:(r + 1) * fan_in]) for r in range(out_dim)]
+        bvals = bt.get("values", [])
+        if len(bvals) != out_dim:
+            raise ValueError("import_onnx_mlp: 偏置 %r 的元素数不匹配" % b_name)
+        layer_sizes.append(out_dim)
+        weights.append(rows)
+        biases.append([float(v) for v in bvals])
+        activations.append(act)
+
+    model = MLP(layer_sizes, activations=activations)
+    for layer, w, b in zip(model.layers, weights, biases):
+        layer.weights = [[float(v) for v in row] for row in w]
+        layer.biases = [float(v) for v in b]
+    return model
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

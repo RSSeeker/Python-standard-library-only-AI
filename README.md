@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2468 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2473 项）
 
 ## 特性
 
@@ -4657,6 +4657,7 @@ print(logdet, glow.log_prob(x), max(abs(a - b) for a, b in zip(glow.inverse(zs),
 | `save_conv_model(conv, fc, path)` / `load_conv_model(path, default_output_activation=None)` | CNN + MLP 的 JSON 持久化，旧格式同上；会保存 `groups`（分组/深度卷积可原样加载，没有该字段的旧存档按 1 处理） |
 | `export_onnx_mlp(model, path=None)` | 把 `MLP` 导出为 ONNX（手写 protobuf 子集：`Gemm`(transB=1) + 单目激活）；返回 bytes，传 `path` 时同时写文件 |
 | `onnx_mlp_to_dict(data)` | 解析导出的 ONNX ModelProto，返回 `{ir_version, opset, producer, graph}` 嵌套 dict |
+| `import_onnx_mlp(data)` | 把 `export_onnx_mlp` 导出的字节还原成参数相同的 `MLP`；只支持本库导出子集，结构不符抛 `ValueError` |
 | `onnx_mlp_forward(data, rows)` | 在纯 Python 里执行导出的图（无 `onnxruntime` 依赖），返回每行输出 |
 | `_optimizer_state(optimizer)` / `load_optimizer_state(optimizer, state)` | 读取 / 还原 Adam、AdamW 的动量与步数（其它优化器返回 `None`）；四个经典优化器用各自的 `state_dict()` / `load_state_dict()`，状态在优化器实例上（`state_dict` 交的是深拷贝快照） |
 | `Lookahead(optimizer, k=6, alpha=0.5)` | 包在任意优化器外面：每 `k` 步把快权重与慢权重按 `alpha` 混合再同步；`state_dict()` 含内层状态与慢权重 |
@@ -4746,6 +4747,26 @@ rows = AI.onnx_mlp_forward(data, [[0.1, 0.2, 0.3]])   # 纯 Python 执行导出�
   会直接报错。
 - protobuf 编码是手写的子集（`ir_version=8`、`opset=13`），只覆盖本模块会生成的字段；不是通用 ONNX 库。
 - 导出图里的 batch 维写成 `dim_param="batch"`，执行器按传入行数工作；导出与执行都没有调用 `onnxruntime`。
+
+#### 导入 ONNX（import_onnx_mlp）
+
+导出的字节可以重新解析成 `MLP`，用于验证导出/导入闭环或把旧模型从磁盘救回来：
+
+```python
+model = AI.MLP([3, 8, 2], ["relu", "softmax"])
+data = AI.export_onnx_mlp(model)
+restored = AI.import_onnx_mlp(data)
+print(restored.layer_sizes)                    # [3, 8, 2]
+print(restored.forward([0.1, 0.2, 0.3]))       # 与原模型逐位一致
+```
+
+边界与口径：
+
+- 只接受本库 `export_onnx_mlp` 的产物：`Gemm`(transB=1) + 单目激活交替堆叠，激活限
+  `linear` / `relu` / `leaky_relu` / `tanh` / `sigmoid` / `softmax`。
+- 会校验节点成对、`transB=1`、`W{i}`/`b{i}` 的维度与元素数、输入维度连续；不满足时抛
+  `ValueError`，不是 bytes 时抛 `TypeError`。
+- 不是通用 ONNX 导入器：不支持外部框架生成的多分支图、常量折叠、初始值以外的属性。
 
 ### 多任务权重
 
@@ -5116,7 +5137,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2468 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2473 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5430,6 +5451,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAudioMetrics` | STOI 对加噪等级的单调性、极性反转与长度裁剪、PESQ 单调性与 [1,4.5] 边界、两项指标的非法输入 |
 | `TestVisualMetrics` | LPIPS 代理对加噪强度的单调性、多通道与尺度权重、FVD 代理的零距离/分布差异/自定义 embed_fn、两项指标的非法输入 |
 | `TestOnnxExport` | ONNX 导出字段（ir_version/opset/节点/initializer 形状/transB）、Gemm+Relu 数值往返、leaky_relu alpha 与 softmax 行和、写文件、导出/解析/执行非法输入 |
+| `TestOnnxImport` | 导出→导入参数/前向逐位一致、softmax 输出往返、写文件路径往返、非法字节与结构校验 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
@@ -5552,6 +5574,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2468 个单元测试
+├── test_ai.py       # 2473 个单元测试
 └── README.md
 ```

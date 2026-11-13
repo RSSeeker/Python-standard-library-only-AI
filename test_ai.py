@@ -37769,3 +37769,132 @@ class TestPrefixTuning:
         pt = AI.PrefixTuning()
         assert _prefix_raises(lambda: pt.prefix_kv(1, 0))
         assert _prefix_raises(lambda: pt.prefix_kv(0, 99))
+
+
+"""B10 ONNX 导入测试：export_onnx_mlp → import_onnx_mlp 往返与校验分支。"""
+import math
+import tempfile
+import os
+
+import AI
+
+
+def _j_close(a, b, tol=1e-6):
+    return abs(a - b) <= tol
+
+
+def _j_make_mlp(layer_sizes, activations):
+    m = AI.MLP(layer_sizes, activations=activations)
+    for li, layer in enumerate(m.layers):
+        for r in range(layer.fan_out):
+            for c in range(layer.fan_in):
+                layer.weights[r][c] = 0.1 * (li + 1) * (r + 1) - 0.05 * c
+            layer.biases[r] = 0.01 * (r - 1)
+    return m
+
+
+def _j_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % exc.__name__)
+
+
+class _Stub:
+    def __init__(self, parsed):
+        self.parsed = parsed
+
+    def __call__(self, data):
+        return self.parsed
+
+
+class TestOnnxImport:
+    def test_roundtrip_parameters_and_forward(self):
+        m = _j_make_mlp([3, 5, 2], ["relu", "linear"])
+        data = AI.export_onnx_mlp(m)
+        back = AI.import_onnx_mlp(data)
+        assert back.layer_sizes == [3, 5, 2]
+        assert [l.activation_name for l in back.layers] == ["relu", "linear"]
+        for la, lb in zip(m.layers, back.layers):
+            for ra, rb in zip(la.weights, lb.weights):
+                for a, b in zip(ra, rb):
+                    assert _j_close(a, b)
+            for a, b in zip(la.biases, lb.biases):
+                assert _j_close(a, b)
+        rows = [[0.5, -1.0, 2.0], [0.0, 0.25, -0.75]]
+        for r in rows:
+            for a, b in zip(m.forward(r), back.forward(r)):
+                assert _j_close(a, b)
+
+    def test_softmax_output_and_executor_consistency(self):
+        m = AI.MLP([4, 6, 3], activations=["leaky_relu", "softmax"])
+        for r in range(6):
+            for c in range(4):
+                m.layers[0].weights[r][c] = math.sin(r * 4 + c) * 0.3
+        data = AI.export_onnx_mlp(m)
+        back = AI.import_onnx_mlp(data)
+        assert [l.activation_name for l in back.layers] == ["leaky_relu", "softmax"]
+        row = [1.0, 0.5, -0.5, 2.0]
+        assert _j_close(sum(back.forward(row)), 1.0)
+        out_onnx = AI.onnx_mlp_forward(data, [row])
+        out_model = back.forward(row)
+        for a, b in zip(out_onnx[0], out_model):
+            assert _j_close(a, b)
+
+    def test_chain_and_path_roundtrip(self):
+        m = _j_make_mlp([2, 3, 1], ["linear", "linear"])
+        fd, path = tempfile.mkstemp(suffix=".onnx")
+        os.close(fd)
+        try:
+            data = AI.export_onnx_mlp(m, path=path)
+            assert os.path.getsize(path) > 0
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        back = AI.import_onnx_mlp(data)
+        assert back.layer_sizes == [2, 3, 1]
+        row = [1.5, -2.0]
+        for a, b in zip(m.forward(row), back.forward(row)):
+            assert _j_close(a, b)
+
+    def test_invalid_bytes(self):
+        _j_raises(lambda: AI.import_onnx_mlp("not bytes"), TypeError)
+        _j_raises(lambda: AI.import_onnx_mlp(b"\x08\x07"), ValueError)
+
+    def test_invalid_structures(self):
+        real = AI.onnx_mlp_to_dict
+        cases = []
+        cases.append({"ir_version": 7, "opset": 13, "producer": "x"})
+        base_nodes = [{"op_type": "Gemm", "attributes": {"transB": 1}}, {"op_type": "Relu"}]
+        base_inits = {"W0": {"dims": [2, 2], "values": [0.0] * 4},
+                      "b0": {"dims": [2], "values": [0.0, 0.0]}}
+        good_inputs = [{"name": "input", "dims": [2]}]
+        cases.append({"graph": {"nodes": [], "initializers": base_inits, "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": [{"op_type": "Gemm"}], "initializers": {}, "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": [{"op_type": "Identity"}, {"op_type": "Relu"}],
+                                "initializers": {}, "inputs": good_inputs}})
+        bad_transb = [{"op_type": "Gemm", "attributes": {"transB": 0}}, {"op_type": "Relu"}]
+        cases.append({"graph": {"nodes": bad_transb, "initializers": base_inits, "inputs": good_inputs}})
+        bad_act = [{"op_type": "Gemm", "attributes": {"transB": 1}}, {"op_type": "Gelu"}]
+        cases.append({"graph": {"nodes": bad_act, "initializers": base_inits, "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": base_nodes, "initializers": {}, "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": base_nodes, "initializers": {
+            "W0": {"dims": [2], "values": [0.0, 0.0]}, "b0": {"dims": [2], "values": [0.0, 0.0]}},
+            "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": base_nodes, "initializers": {
+            "W0": {"dims": [2, 3], "values": [0.0] * 6}, "b0": {"dims": [2], "values": [0.0, 0.0]}},
+            "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": base_nodes, "initializers": {
+            "W0": {"dims": [2, 2], "values": [0.0] * 4}, "b0": {"dims": [3], "values": [0.0] * 3}},
+            "inputs": good_inputs}})
+        cases.append({"graph": {"nodes": base_nodes, "initializers": base_inits,
+                                "inputs": [{"name": "input"}]}})
+        try:
+            for parsed in cases:
+                AI.onnx_mlp_to_dict = _Stub(parsed)
+                _j_raises(lambda: AI.import_onnx_mlp(b"stub"))
+        finally:
+            AI.onnx_mlp_to_dict = real
