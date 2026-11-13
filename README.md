@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2568 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2572 项）
 
 ## 特性
 
@@ -3805,6 +3805,37 @@ print(model.predict(mel, start_id=1, max_new_tokens=4))
 
 测试：`TestWhisperLite` 覆盖前向/参数量、投影层与输出头梯度有限差分、两段 mel 与转写文本的过拟合训练、非法输入。
 
+### Wav2Vec2-lite（掩码对比学习 + 码本量化）
+
+语音帧先做线性投影，随机遮住部分帧后送进 Transformer 编码器；目标是对遮罩帧预测「未遮罩特征」最近邻的码本条目，
+形成可自我监督的对比损失（stop-gradient 目标，无负采样队列）：
+
+```python
+import AI
+
+model = AI.Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                        codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=0)
+feats = [[0.1 + 0.01 * t for t in range(4)] for _ in range(6)]   # 6 帧、每帧 4 维
+out = model.forward(feats, mask_seed=1)
+loss = model.loss_and_backward(feats, mask_seed=1)
+model.sgd_step(0.05)
+print(out["mask"], model.param_count())
+```
+
+| API | 说明 |
+| --- | --- |
+| `Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1, codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=None)` | 线性特征投影 + 非因果 `TransformerEncoder` + 可学习码本 + 可学习 `mask_token`；要求 `d_model % num_heads == 0`、`0 < mask_ratio < 1`、`temperature > 0` |
+| `forward(feats, mask_seed=None)` | `feats` 为帧列表（每帧 `in_dim` 维）；遮罩帧用 `mask_token` 替换；返回 `{mask, codes, encoded, code_scores}`，`codes` 为未遮罩特征投影的最近邻码本下标（stop-grad 目标） |
+| `loss_and_backward(feats, mask_seed=None)` | 只对遮罩帧计算 `-log softmax(scores / temperature)[code]`，返回平均对比损失；梯度反传到编码器/投影层/码本/`mask_token`/位置 |
+| `sgd_step(lr)` | 手写 SGD（投影层/编码器/码本/`mask_token`/位置） |
+| `fit(sequences, epochs=20, lr=0.01, seed=None, shuffle=True)` | 逐序列 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 投影层 + 编码层 + 码本 + `mask_token` + 位置表 |
+
+边界：这是 wav2vec 2.0 的简化版——不做 log-mel 前端与卷积特征编码器，没有负采样/多样性损失、码本 EMA 更新，
+也没有掩码 span 策略；目标码来自「未遮罩投影特征的最近邻码本」，属于自我蒸馏式目标而非真实量化器。
+
+测试：`TestWav2Vec2` 覆盖前向/遮罩位置与参数量、投影层/码本/`mask_token` 梯度有限差分、两段帧序列的对比训练收敛、非法输入。
+
 ### TimeSformer（时空分离注意力视频分类）
 
 每帧内做空间注意力、逐 patch 位置跨帧做时间注意力，避免联合时空注意力的 O((T·P)²) 开销：
@@ -5501,7 +5532,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2568 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2572 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5711,6 +5742,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
 | `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
 | `TestVideoMAE` | 前向/遮罩可复现/参数量、卷积核/解码器/mask token 梯度有限差分、重建过拟合、非法输入 |
+| `TestWav2Vec2` | 前向/遮罩可复现/参数量、投影层/码本/mask token 梯度有限差分、对比训练收敛、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5959,6 +5991,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2568 个单元测试
+├── test_ai.py       # 2572 个单元测试
 └── README.md
 ```

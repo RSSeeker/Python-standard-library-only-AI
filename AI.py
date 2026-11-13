@@ -12564,6 +12564,221 @@ class VideoMAE:
             history.append(total / len(videos))
         return history
 
+# ---------------------------------------------------------------------------
+# Wav2Vec2-lite：特征编码器 + 掩码对比学习 + 码本量化（Gumbel 无）
+# ---------------------------------------------------------------------------
+
+
+def _wv2_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Wav2Vec2: {name} 必须是正整数")
+    return value
+
+
+def _wv2_check_seq(feats, in_dim):
+    if not isinstance(feats, (list, tuple)) or not feats:
+        raise ValueError("Wav2Vec2: 特征序列必须是非空列表")
+    out = []
+    for row in feats:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(f"Wav2Vec2: 每帧特征必须是 {in_dim} 维")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError("Wav2Vec2: 特征必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+class Wav2Vec2Lite:
+    def __init__(self, in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                 codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=None):
+        self.in_dim = _wv2_check_pos_int(in_dim, "in_dim")
+        self.d_model = _wv2_check_pos_int(d_model, "d_model")
+        self.num_heads = _wv2_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _wv2_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _wv2_check_pos_int(num_layers, "num_layers")
+        self.codebook_size = _wv2_check_pos_int(codebook_size, "codebook_size")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("Wav2Vec2: d_model 必须能被 num_heads 整除")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not math.isfinite(float(temperature)) or temperature <= 0:
+            raise ValueError("Wav2Vec2: temperature 必须是正有限数字")
+        self.temperature = float(temperature)
+        if (isinstance(mask_ratio, bool) or not isinstance(mask_ratio, (int, float))
+                or not (0.0 < float(mask_ratio) < 1.0)):
+            raise ValueError("Wav2Vec2: mask_ratio 必须在 (0, 1) 内")
+        self.mask_ratio = float(mask_ratio)
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("Wav2Vec2: seed 必须是整数或 None")
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.feature_proj = Layer(self.in_dim, self.d_model, "linear")
+            self.pos = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                        for _ in range(64)]
+            self.mask_token = [random.gauss(0.0, 0.02) for _ in range(self.in_dim)]
+            self.encoder = TransformerEncoder(
+                self.d_model, self.num_heads, self.d_ff,
+                num_layers=self.num_layers, dropout=0.0, causal=False)
+            self.codebook = [[random.gauss(0.0, 0.1) for _ in range(self.d_model)]
+                             for _ in range(self.codebook_size)]
+        finally:
+            random.setstate(state)
+        self._cache = None
+
+    def zero_grad(self):
+        self.feature_proj.zero_grad() if hasattr(self.feature_proj, "zero_grad") else None
+        self.grad_proj_w = None
+        self.grad_proj_b = None
+        self.encoder.zero_grad()
+        self.grad_codebook = [[0.0] * self.d_model for _ in range(self.codebook_size)]
+        self.grad_mask = [0.0] * self.in_dim
+        self.grad_pos = [[0.0] * self.d_model for _ in range(64)]
+
+    def param_count(self):
+        proj = self.in_dim * self.d_model + self.d_model
+        enc_layer = 4 * (self.d_model * self.d_model + self.d_model) + \
+            (self.d_model * self.d_ff + self.d_ff) + \
+            (self.d_ff * self.d_model + self.d_model) + 4 * self.d_model
+        return (proj + self.num_layers * enc_layer +
+                self.codebook_size * self.d_model + len(self.mask_token) +
+                len(self.pos) * self.d_model)
+
+    def _mask_indices(self, n, seed):
+        rng = random.Random(seed)
+        k = max(1, int(round(n * self.mask_ratio)))
+        k = min(k, n - 1) if n > 1 else n
+        idx = list(range(n))
+        rng.shuffle(idx)
+        return sorted(idx[:k])
+
+    def _quantize(self, rows):
+        codes = []
+        targets = []
+        for row in rows:
+            best = None
+            best_i = 0
+            for i, code in enumerate(self.codebook):
+                d = sum((row[j] - code[j]) ** 2 for j in range(self.d_model))
+                if best is None or d < best:
+                    best = d
+                    best_i = i
+            codes.append(best_i)
+            targets.append([self.codebook[best_i][j] for j in range(self.d_model)])
+        return codes, targets
+
+    def forward(self, feats, mask_seed=None):
+        feats = _wv2_check_seq(feats, self.in_dim)
+        n = len(feats)
+        if n > 64:
+            raise ValueError("Wav2Vec2: 序列长度不能超过 64")
+        if mask_seed is not None and (isinstance(mask_seed, bool)
+                                      or not isinstance(mask_seed, int)):
+            raise ValueError("Wav2Vec2: mask_seed 必须是整数或 None")
+        mask = self._mask_indices(n, mask_seed)
+        mask_set = set(mask)
+        input_rows = [self.mask_token if t in mask_set else feats[t] for t in range(n)]
+        proj, proj_cache = _dense_rows_forward(self.feature_proj, input_rows)
+        seq = [[proj[t][j] + self.pos[t][j] for j in range(self.d_model)]
+               for t in range(n)]
+        enc = self.encoder.forward(seq)
+        # 目标码：用未遮罩特征的投影量化（stop-gradient）
+        clean_proj = [[feats[t][j] for j in range(self.in_dim)] for t in range(n)]
+        clean_proj, _ = _dense_rows_forward(self.feature_proj, clean_proj)
+        codes, targets = self._quantize(clean_proj)
+        code_scores = [[0.0] * self.codebook_size for _ in range(n)]
+        for t in range(n):
+            for c in range(self.codebook_size):
+                code_scores[t][c] = sum(enc[t][j] * self.codebook[c][j]
+                                        for j in range(self.d_model))
+        self._cache = {"feats": feats, "mask": mask, "mask_set": mask_set,
+                       "proj": proj, "proj_cache": proj_cache, "seq": seq,
+                       "enc": enc, "codes": codes, "targets": targets,
+                       "code_scores": code_scores, "n": n}
+        return {"mask": mask, "codes": codes, "encoded": enc, "code_scores": code_scores}
+
+    def loss_and_backward(self, feats, mask_seed=None):
+        out = self.forward(feats, mask_seed)
+        cache = self._cache
+        n = cache["n"]
+        mask = cache["mask"]
+        if not mask:
+            raise ValueError("Wav2Vec2: 至少需要遮罩一帧")
+        temp = self.temperature
+        loss = 0.0
+        d_enc = [[0.0] * self.d_model for _ in range(n)]
+        d_scores = [[0.0] * self.codebook_size for _ in range(n)]
+        for t in mask:
+            scores = [s / temp for s in cache["code_scores"][t]]
+            m = max(scores)
+            ex = [math.exp(s - m) for s in scores]
+            tot = sum(ex)
+            probs = [e / tot for e in ex]
+            target = cache["codes"][t]
+            loss += -math.log(max(1e-300, probs[target]))
+            for c in range(self.codebook_size):
+                d_scores[t][c] = (probs[c] - (1.0 if c == target else 0.0)) / temp / len(mask)
+        loss /= len(mask)
+        for t in range(n):
+            for c in range(self.codebook_size):
+                g = d_scores[t][c]
+                if g == 0.0:
+                    continue
+                for j in range(self.d_model):
+                    self.grad_codebook[c][j] += g * cache["enc"][t][j]
+                    d_enc[t][j] += g * self.codebook[c][j]
+        d_seq = self.encoder.backward(d_enc)
+        d_proj_rows = d_seq
+        gw, gb, d_input = _dense_rows_backward(
+            self.feature_proj, cache["proj_cache"], d_proj_rows)
+        self.grad_proj_w = gw
+        self.grad_proj_b = gb
+        mask_set = cache["mask_set"]
+        for t in range(n):
+            for j in range(self.d_model):
+                self.grad_pos[t][j] += d_seq[t][j]
+            if t in mask_set:
+                for j in range(self.in_dim):
+                    self.grad_mask[j] += d_input[t][j]
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("Wav2Vec2: lr 必须是正有限数字")
+        if self.grad_proj_w is None:
+            raise RuntimeError("Wav2Vec2: 没有梯度，先反向")
+        _dense_apply_sgd(self.feature_proj, (self.grad_proj_w, self.grad_proj_b), lr)
+        self.encoder.sgd_step(lr)
+        for c in range(self.codebook_size):
+            for j in range(self.d_model):
+                self.codebook[c][j] -= lr * self.grad_codebook[c][j]
+        n = self._cache["n"] if self._cache else 0
+        for t in range(n):
+            for j in range(self.d_model):
+                self.pos[t][j] -= lr * self.grad_pos[t][j]
+        for j in range(self.in_dim):
+            self.mask_token[j] -= lr * self.grad_mask[j]
+
+    def fit(self, sequences, epochs=20, lr=0.01, seed=None):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("Wav2Vec2: sequences 必须是非空列表")
+        epochs = _wv2_check_pos_int(epochs, "epochs")
+        history = []
+        for e in range(epochs):
+            self.zero_grad()
+            total = 0.0
+            for idx, seq in enumerate(sequences):
+                total += self.loss_and_backward(
+                    seq, None if seed is None else seed + e * len(sequences) + idx)
+            self.sgd_step(lr)
+            history.append(total / len(sequences))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

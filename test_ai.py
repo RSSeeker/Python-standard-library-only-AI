@@ -39936,3 +39936,97 @@ class TestVideoMAE:
         ]
         for i, fn in enumerate(cases):
             _vmae_raises(fn)
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _wv2_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+def _wv2_feats(n=6, in_dim=4, offset=0.0):
+    return [[offset + 0.1 * i + 0.01 * t for t in range(in_dim)] for i in range(n)]
+
+
+class TestWav2Vec2(unittest.TestCase):
+    def test_forward_mask_and_param_count(self):
+        random.seed(0)
+        m = AI.Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                            codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=2)
+        self.assertEqual(m.param_count(), 1188)
+        seq = _wv2_feats()
+        out = m.forward(seq, mask_seed=1)
+        self.assertEqual(out["mask"], [2, 3, 5])
+        self.assertEqual(len(out["codes"]), 6)
+        self.assertEqual(len(out["encoded"]), 6)
+        self.assertEqual(len(out["code_scores"]), 6)
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                            codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=2)
+        seq = _wv2_feats()
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(seq, mask_seed=1)
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 1e-4, tag)
+
+        fd(lambda: m.grad_proj_w[0][1],
+           lambda: m.feature_proj.weights[0][1],
+           lambda v: m.feature_proj.weights[0].__setitem__(1, v), "proj w")
+        fd(lambda: m.grad_codebook[0][3],
+           lambda: m.codebook[0][3],
+           lambda v: m.codebook[0].__setitem__(3, v), "codebook")
+        fd(lambda: m.grad_mask[1],
+           lambda: m.mask_token[1],
+           lambda v: m.mask_token.__setitem__(1, v), "mask token")
+
+    def test_fit(self):
+        random.seed(0)
+        m = AI.Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                            codebook_size=4, temperature=0.1, mask_ratio=0.5, seed=3)
+        seqs = [_wv2_feats(6, 4, 0.0), _wv2_feats(6, 4, 0.3)]
+        hist = m.fit(seqs, epochs=150, lr=0.05, seed=7)
+        self.assertGreater(len(hist), 0)
+        self.assertLess(hist[-1], hist[0] * 0.5)
+
+    def test_invalid_inputs(self):
+        _wv2_raises(lambda: AI.Wav2Vec2Lite(in_dim=0))
+        _wv2_raises(lambda: AI.Wav2Vec2Lite(d_model=5, num_heads=2))
+        _wv2_raises(lambda: AI.Wav2Vec2Lite(temperature=0.0))
+        _wv2_raises(lambda: AI.Wav2Vec2Lite(mask_ratio=1.0))
+        m = AI.Wav2Vec2Lite(in_dim=4, d_model=8, num_heads=1, d_ff=16, num_layers=1,
+                            codebook_size=4, temperature=0.1, seed=2)
+        seq = _wv2_feats()
+        _wv2_raises(lambda: m.forward([]))
+        _wv2_raises(lambda: m.forward([[0.0] * 5 for _ in range(3)]))
+        _wv2_raises(lambda: m.forward(seq, mask_seed=1.5))
+        _wv2_raises(lambda: m.sgd_step(0.0))
+        _wv2_raises(lambda: m.fit([]))
+        _wv2_raises(lambda: m.fit([seq], epochs=0))
+
+
+if __name__ == "__main__":
+    unittest.main()
