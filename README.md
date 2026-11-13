@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2572 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2576 项）
 
 ## 特性
 
@@ -3724,6 +3724,35 @@ print(model.forward(rays, num_samples=8)[0]["rgb"])
 
 测试：`TestNeRF` 覆盖前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入。
 
+### Gaussian Splatting-lite（正交投影 + alpha 合成）
+
+把场景表示为一组可学习的 3D 高斯（位置/尺度/不透明度/颜色），用固定 2x3 正交投影投到图像平面，
+按深度排序做标准的 over 合成；训练只用渲染图像与目标图像的像素 MSE：
+
+```python
+import AI
+
+model = AI.GaussianSplatLite(num_points=12, image_size=8, seed=0)
+target = [[[0.0] * 3 for _ in range(8)] for _ in range(8)]
+hist = model.fit([target], epochs=100, lr=0.2, seed=1)
+print(model.param_count(), hist[-1])
+```
+
+| API | 说明 |
+| --- | --- |
+| `GaussianSplatLite(num_points=8, image_size=8, proj=None, seed=None)` | 每点参数位置 (3)、`log_scale` (1)、`opacity_logit` (1)、颜色 (3)；`proj` 为 2x3 正交投影矩阵，默认取 x/y 轴 |
+| `forward(image_size=None)` | 返回 `image_size`×`image_size`×3 的 RGB 图像；按 `z` 排序后 `C += T·alpha·color`、`T *= 1-alpha`，`alpha = sigmoid(opacity_logit)·exp(-d²/2σ²)` |
+| `loss_and_backward(target)` | 像素 MSE，反向解析到颜色/不透明度/尺度/位置（`d_alpha = T·c - suffix/(1-alpha)`，位置梯度经投影矩阵回传） |
+| `sgd_step(lr)` | 手写 SGD 更新位置/尺度/不透明度/颜色 |
+| `fit(images, epochs=20, lr=0.05, seed=None, shuffle=True)` | 逐图像渲染色差并更新，返回每 epoch 平均损失 |
+| `param_count()` | `num_points * 8` |
+
+边界：这是 3DGS 的教学简化版——各向同性 2D 足迹而非完整的 3D 协方差投影，没有球谐颜色、
+瓦片可微光栅化、自适应密度控制（clone/split/prune）、相机位姿优化或深度正则；深度排序在反向时
+视为分段常数，只优化高斯参数本身。
+
+测试：`TestGaussianSplat` 覆盖前向/参数量、颜色/不透明度/尺度/位置梯度有限差分、单目标图渲染收敛、非法输入。
+
 ### YOLOLite（单尺度网格检测训练循环）
 
 两层 stride-2 卷积 backbone + 逐网格单元检测头；训练时只让目标中心所在单元负责：
@@ -5532,7 +5561,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2572 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2576 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5739,6 +5768,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestWhisperLite` | 前向/参数量、投影层与输出头梯度有限差分、合成 mel 过拟合训练、predict 长度/非法输入 |
 | `TestYOLOLite` | 前向/参数量、检测头与卷积核梯度有限差分、合成图目标分配训练、非法输入 |
 | `TestNeRF` | 前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入 |
+| `TestGaussianSplat` | 前向/参数量、颜色/不透明度/尺度/位置梯度有限差分、渲染收敛、非法输入 |
 | `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
 | `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
 | `TestVideoMAE` | 前向/遮罩可复现/参数量、卷积核/解码器/mask token 梯度有限差分、重建过拟合、非法输入 |
@@ -5991,6 +6021,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2572 个单元测试
+├── test_ai.py       # 2576 个单元测试
 └── README.md
 ```

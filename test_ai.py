@@ -40030,3 +40030,108 @@ class TestWav2Vec2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _gs_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+def _gs_target(n=8, color=(1.0, 0.5, 0.2), center=(4, 4), radius=2.0):
+    img = []
+    for r in range(n):
+        row = []
+        for c in range(n):
+            d2 = (r - center[0]) ** 2 + (c - center[1]) ** 2
+            w = math.exp(-d2 / (2.0 * radius * radius))
+            row.append([w * v for v in color])
+        img.append(row)
+    return img
+
+
+class TestGaussianSplat(unittest.TestCase):
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.GaussianSplatLite(num_points=8, image_size=8, seed=1)
+        self.assertEqual(m.param_count(), 64)
+        img = m.forward()
+        self.assertEqual(len(img), 8)
+        self.assertEqual(len(img[0]), 8)
+        self.assertEqual(len(img[0][0]), 3)
+        for row in img:
+            for px in row:
+                for v in px:
+                    self.assertGreaterEqual(v, 0.0)
+                    self.assertLessEqual(v, 1.0)
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.GaussianSplatLite(num_points=8, image_size=8, seed=1)
+        tgt = _gs_target()
+
+        def loss_of():
+            m.zero_grad()
+            m.forward()
+            return m.loss_and_backward(tgt)
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 2e-3, tag)
+
+        i = 3
+        fd(lambda: m.grad_color[i][1], lambda: m.color[i][1],
+           lambda v: m.color[i].__setitem__(1, v), "color")
+        fd(lambda: m.grad_opacity_logit[i], lambda: m.opacity_logit[i],
+           lambda v: m.opacity_logit.__setitem__(i, v), "opacity")
+        fd(lambda: m.grad_log_scale[i], lambda: m.log_scale[i],
+           lambda v: m.log_scale.__setitem__(i, v), "log_scale")
+        fd(lambda: m.grad_pos[i][0], lambda: m.pos[i][0],
+           lambda v: m.pos[i].__setitem__(0, v), "pos x")
+        fd(lambda: m.grad_pos[i][1], lambda: m.pos[i][1],
+           lambda v: m.pos[i].__setitem__(1, v), "pos y")
+
+    def test_fit(self):
+        random.seed(0)
+        m = AI.GaussianSplatLite(num_points=12, image_size=8, seed=2)
+        tgt = _gs_target()
+        hist = m.fit([tgt], epochs=200, lr=0.2, seed=1, shuffle=False)
+        self.assertGreater(len(hist), 0)
+        self.assertLess(hist[-1], hist[0] * 0.3)
+
+    def test_invalid_inputs(self):
+        _gs_raises(lambda: AI.GaussianSplatLite(num_points=0))
+        _gs_raises(lambda: AI.GaussianSplatLite(image_size=0))
+        _gs_raises(lambda: AI.GaussianSplatLite(proj=[[1.0, 0.0], [0.0, 1.0]]))
+        _gs_raises(lambda: AI.GaussianSplatLite(seed=1.5))
+        m = AI.GaussianSplatLite(num_points=8, image_size=8, seed=1)
+        tgt = _gs_target()
+        _gs_raises(lambda: m.forward(image_size=4))
+        _gs_raises(lambda: m.loss_and_backward([[0.0] * 8] * 8))
+        _gs_raises(lambda: m.loss_and_backward([[[0.0, 0.0]] * 8] * 8))
+        _gs_raises(lambda: m.sgd_step(0.0))
+        _gs_raises(lambda: m.fit([]))
+        _gs_raises(lambda: m.fit([tgt], epochs=0))
+        _gs_raises(lambda: m.fit([tgt], lr=0.0))
+
+
+if __name__ == "__main__":
+    unittest.main()

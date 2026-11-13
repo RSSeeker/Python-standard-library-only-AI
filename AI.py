@@ -12779,6 +12779,296 @@ class Wav2Vec2Lite:
             history.append(total / len(sequences))
         return history
 
+"""简化版 3D Gaussian Splatting：正交投影 + 各向同性高斯泼溅 + alpha 合成。
+
+这不是完整的 3DGS 实现：没有各向异性 3D 协方差、球谐颜色、可微光栅化/瓦片、
+自适应密度控制（clone/split/prune），也没有真实的相机位姿优化；这里用固定
+2x3 正交投影把 3D 高斯投到图像平面，用单个可学习 log 尺度控制足迹，再按
+深度排序做标准的 over 合成，训练只优化高斯的位置/尺度/不透明度/颜色。
+"""
+import math
+import random
+
+
+def _gs_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("GaussianSplatLite: %s 必须是正整数" % name)
+    return value
+
+
+def _gs_check_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("GaussianSplatLite: %s 必须是有限数字" % name)
+    return float(value)
+
+
+def _gs_check_proj(proj):
+    if not isinstance(proj, (list, tuple)) or len(proj) != 2:
+        raise ValueError("GaussianSplatLite: proj 必须是 2x3 矩阵")
+    out = []
+    for row in proj:
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError("GaussianSplatLite: proj 必须是 2x3 矩阵")
+        out.append([_gs_check_number(v, "proj") for v in row])
+    return out
+
+
+def _gs_check_image(img, image_size):
+    if not isinstance(img, (list, tuple)) or len(img) != image_size:
+        raise ValueError("GaussianSplatLite: 图像必须是 %d 行的列表" % image_size)
+    out = []
+    for row in img:
+        if not isinstance(row, (list, tuple)) or len(row) != image_size:
+            raise ValueError("GaussianSplatLite: 图像每行必须是 %d 列" % image_size)
+        cells = []
+        for pixel in row:
+            if not isinstance(pixel, (list, tuple)) or len(pixel) != 3:
+                raise ValueError("GaussianSplatLite: 每个像素必须是 RGB 三元组")
+            cells.append([_gs_check_number(v, "像素") for v in pixel])
+        out.append(cells)
+    return out
+
+
+def _gs_sigmoid(v):
+    if v >= 0:
+        return 1.0 / (1.0 + math.exp(-v))
+    e = math.exp(v)
+    return e / (1.0 + e)
+
+
+class GaussianSplatLite:
+    def __init__(self, num_points=8, image_size=8, proj=None, seed=None):
+        self.num_points = _gs_check_pos_int(num_points, "num_points")
+        self.image_size = _gs_check_pos_int(image_size, "image_size")
+        self.proj = _gs_check_proj(proj if proj is not None
+                                   else [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("GaussianSplatLite: seed 必须是 int 或 None")
+        rng = random.Random(seed)
+        # 位置 x,y 在 [-0.9,0.9]，深度 z 在 [0,1]（决定合成顺序）
+        self.pos = [[rng.uniform(-0.9, 0.9), rng.uniform(-0.9, 0.9), rng.uniform(0.0, 1.0)]
+                    for _ in range(num_points)]
+        self.log_scale = [rng.uniform(-2.0, -1.0) for _ in range(num_points)]
+        self.opacity_logit = [rng.uniform(-1.0, 1.0) for _ in range(num_points)]
+        self.color = [[rng.uniform(0.0, 1.0) for _ in range(3)] for _ in range(num_points)]
+        self.grad_pos = [[0.0] * 3 for _ in range(num_points)]
+        self.grad_log_scale = [0.0] * num_points
+        self.grad_opacity_logit = [0.0] * num_points
+        self.grad_color = [[0.0] * 3 for _ in range(num_points)]
+        self._cache = None
+
+    # ---------- 前向 ----------
+
+    def _project(self):
+        """把 3D 点投影到像素坐标，返回每个高斯的像素参数。"""
+        s = (self.image_size - 1) / 2.0
+        info = []
+        for i in range(self.num_points):
+            p = self.pos[i]
+            u = self.proj[0][0] * p[0] + self.proj[0][1] * p[1] + self.proj[0][2] * p[2]
+            v = self.proj[1][0] * p[0] + self.proj[1][1] * p[1] + self.proj[1][2] * p[2]
+            sigma = math.exp(self.log_scale[i]) * s
+            opacity = _gs_sigmoid(self.opacity_logit[i])
+            info.append({
+                "px": (u + 1.0) * s,
+                "py": (v + 1.0) * s,
+                "sigma": sigma,
+                "opacity": opacity,
+                "u": u,
+                "v": v,
+            })
+        return info
+
+    def forward(self, image_size=None):
+        """渲染一张图像；返回 HxWx3 的 RGB 列表（每个像素 [r,g,b]）。"""
+        n = image_size if image_size is not None else self.image_size
+        if n != self.image_size:
+            raise ValueError("GaussianSplatLite: 渲染尺寸必须等于 image_size")
+        info = self._project()
+        # 深度排序（z 小的在前）；排序变化不参与梯度
+        order = sorted(range(self.num_points), key=lambda i: self.pos[i][2])
+        s = (n - 1) / 2.0
+        sigma_sq = [max(info[i]["sigma"] ** 2, 1e-12) for i in range(self.num_points)]
+        acc = [[0.0, 0.0, 0.0] for _ in range(n * n)]  # 每个像素的当前累计颜色
+        trans = [1.0] * (n * n)                        # 前缀透射率
+        # 为反向缓存每层每像素的 alpha / T / G / 距离
+        layer_T = []
+        layer_alpha = []
+        layer_G = []
+        layer_d2 = []
+        for i in order:
+            g_vals = []
+            a_vals = []
+            t_vals = []
+            d2_vals = []
+            for r in range(n):
+                for c in range(n):
+                    idx = r * n + c
+                    dx = c - info[i]["px"]
+                    dy = r - info[i]["py"]
+                    d2 = dx * dx + dy * dy
+                    G = math.exp(-d2 / (2.0 * sigma_sq[i]))
+                    a = info[i]["opacity"] * G
+                    t_vals.append(trans[idx])
+                    g_vals.append(G)
+                    a_vals.append(a)
+                    d2_vals.append(d2)
+                    ci = self.color[i]
+                    for k in range(3):
+                        acc[idx][k] += trans[idx] * a * ci[k]
+                    trans[idx] *= (1.0 - a)
+            layer_T.append(t_vals)
+            layer_alpha.append(a_vals)
+            layer_G.append(g_vals)
+            layer_d2.append(d2_vals)
+        self._cache = {
+            "n": n,
+            "order": order,
+            "info": info,
+            "sigma_sq": sigma_sq,
+            "layer_T": layer_T,
+            "layer_alpha": layer_alpha,
+            "layer_G": layer_G,
+            "layer_d2": layer_d2,
+            "out": [[acc[r * n + c][k] for k in range(3)] for r in range(n) for c in range(n)],
+        }
+        return [[acc[r * n + c][: ] for c in range(n)] for r in range(n)]
+
+    # ---------- 反向 ----------
+
+    def loss_and_backward(self, target):
+        """颜色 MSE，返回损失并累积各参数梯度。"""
+        if self._cache is None or self._cache["n"] != self.image_size:
+            self.forward()
+        n = self.image_size
+        tgt = _gs_check_image(target, n)
+        out = self._cache["out"]
+        total = 0.0
+        d_out = [[[0.0, 0.0, 0.0] for _ in range(n)] for _ in range(n)]
+        for r in range(n):
+            for c in range(n):
+                idx = r * n + c
+                for k in range(3):
+                    diff = out[idx][k] - tgt[r][c][k]
+                    total += diff * diff
+                    d_out[r][c][k] = 2.0 * diff / (n * n * 3)
+        # 按反向顺序回放每一层，计算 d_color / d_alpha
+        order = self._cache["order"]
+        layer_T = self._cache["layer_T"]
+        layer_alpha = self._cache["layer_alpha"]
+        # 需要每层之后的 suffix 贡献：从最后一层往前累加
+        suffix = [[0.0, 0.0, 0.0] for _ in range(n * n)]  # 已渲染层（在 i 之后）的贡献
+        gcolor = [[0.0, 0.0, 0.0] for _ in range(self.num_points)]
+        g_alpha_pix = []  # 与 order 对齐：每层每像素 dL/dalpha
+        for li in range(len(order) - 1, -1, -1):
+            i = order[li]
+            ci = self.color[i]
+            da = [0.0] * (n * n)
+            for r in range(n):
+                for c in range(n):
+                    idx = r * n + c
+                    T = layer_T[li][idx]
+                    a = layer_alpha[li][idx]
+                    doc = d_out[r][c]
+                    for k in range(3):
+                        gcolor[i][k] += doc[k] * T * a
+                    # dC/dalpha_i = T*c_i - suffix_contribution/(1-a)
+                    per = 0.0
+                    for k in range(3):
+                        per += doc[k] * (T * ci[k] - suffix[idx][k] / max(1e-9, 1.0 - a))
+                    da[idx] = per
+            g_alpha_pix.append(da)
+            # 更新 suffix：把本层贡献加进去（供更早层使用）
+            for r in range(n):
+                for c in range(n):
+                    idx = r * n + c
+                    T = layer_T[li][idx]
+                    a = layer_alpha[li][idx]
+                    for k in range(3):
+                        suffix[idx][k] += T * a * ci[k]
+        g_alpha_pix.reverse()  # 对齐回 order
+
+        s = (self.image_size - 1) / 2.0
+        for li, i in enumerate(order):
+            info = self._cache["info"][i]
+            sigma_sq = self._cache["sigma_sq"][i]
+            opacity = info["opacity"]
+            op_deriv = opacity * (1.0 - opacity)
+            d_scale = 0.0
+            du = 0.0
+            dv = 0.0
+            d_op = 0.0
+            for r in range(n):
+                for c in range(n):
+                    idx = r * n + c
+                    dalpha = g_alpha_pix[li][idx]
+                    if dalpha == 0.0:
+                        continue
+                    G = self._cache["layer_G"][li][idx]
+                    d2 = self._cache["layer_d2"][li][idx]
+                    dx = c - info["px"]
+                    dy = r - info["py"]
+                    d_op += dalpha * G
+                    d_scale += dalpha * opacity * G * d2 / sigma_sq
+                    du += dalpha * opacity * G * dx * s / sigma_sq
+                    dv += dalpha * opacity * G * dy * s / sigma_sq
+            self.grad_opacity_logit[i] += d_op * op_deriv
+            self.grad_log_scale[i] += d_scale
+            P = self.proj
+            self.grad_pos[i][0] += du * P[0][0] + dv * P[1][0]
+            self.grad_pos[i][1] += du * P[0][1] + dv * P[1][1]
+            self.grad_pos[i][2] += du * P[0][2] + dv * P[1][2]
+            for k in range(3):
+                self.grad_color[i][k] += gcolor[i][k]
+        return total / (n * n * 3)
+
+    # ---------- 优化 ----------
+
+    def zero_grad(self):
+        self.grad_pos = [[0.0] * 3 for _ in range(self.num_points)]
+        self.grad_log_scale = [0.0] * self.num_points
+        self.grad_opacity_logit = [0.0] * self.num_points
+        self.grad_color = [[0.0] * 3 for _ in range(self.num_points)]
+
+    def sgd_step(self, lr=0.01):
+        lr = _gs_check_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("GaussianSplatLite: lr 必须为正数")
+        for i in range(self.num_points):
+            for k in range(3):
+                self.pos[i][k] -= lr * self.grad_pos[i][k]
+                self.color[i][k] -= lr * self.grad_color[i][k]
+            self.log_scale[i] -= lr * self.grad_log_scale[i]
+            self.opacity_logit[i] -= lr * self.grad_opacity_logit[i]
+
+    def fit(self, images, epochs=20, lr=0.05, seed=None, shuffle=True):
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("GaussianSplatLite: images 必须是非空列表")
+        _gs_check_pos_int(epochs, "epochs")
+        lr = _gs_check_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("GaussianSplatLite: lr 必须为正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("GaussianSplatLite: seed 必须是 int 或 None")
+        checked = [_gs_check_image(img, self.image_size) for img in images]
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(checked)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                self.forward()
+                total += self.loss_and_backward(checked[idx])
+                self.sgd_step(lr)
+            history.append(total / len(checked))
+        return history
+
+    def param_count(self):
+        return self.num_points * (3 + 1 + 1 + 3)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
