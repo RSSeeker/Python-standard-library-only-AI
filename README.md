@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2461 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2468 项）
 
 ## 特性
 
@@ -2212,6 +2212,39 @@ print(res["answer"])
 
 边界：`test_time_scaling` 只做采样内的选择与投票，不做过程奖励/搜索树扩展；
 `constitutional_ai` 的批评与修订质量完全由注入回调决定，不包含规则库或训练。
+
+### Prefix Tuning（注意力 K/V 前缀）
+
+每层、每头维护一段可学习前缀 `P_k, P_v`，前向时拼到 K/V 前面，使每个 token 都能
+关注到前缀；参数不来自输入，属于软提示的一种。
+
+```python
+from ai import AI
+
+q = [[0.1, 0.2, 0.3, 0.4]]
+k = [[0.3, -0.2, 0.1, 0.0]]
+v = [[1.0, 0.0, 0.0, 0.0]]
+pk = [[0.1, 0.1, 0.1, 0.1]]
+pv = [[1.0, 2.0, 3.0, 4.0]]
+print(AI.prefix_attention(q, k, v, pk, pv))   # 前缀参与注意力
+
+pt = AI.PrefixTuning(num_layers=1, num_heads=2, prefix_len=3, d_model=4, seed=1)
+print(pt.param_count())                       # 24
+print(pt.prefix_kv(0, 0)[0][:1])              # 第 0 层第 0 头的前缀 K 首行
+print(pt.forward_attention(q, k, v, layer=0, head=0))
+```
+
+| API | 说明 |
+| --- | --- |
+| `prefix_attention(q_rows, k_rows, v_rows, prefix_k, prefix_v, scale=None)` | 单头 prefix attention：K/V 前置拼接，空前缀等价标准 attention |
+| `PrefixTuning(num_layers=1, num_heads=2, prefix_len=4, d_model=8, seed=None)` | 参数容器；要求 `d_model % num_heads == 0`，gauss 初始化 |
+| `PrefixTuning.prefix_kv(layer=0, head=0)` | 返回该层该头的 `(P_k, P_v)` |
+| `PrefixTuning.forward_attention(q, k, v, layer=0, head=0, scale=None)` | 注入指定层/头前缀后做单头注意力 |
+| `PrefixTuning.param_count()` | `num_layers*num_heads*2*prefix_len*d_head` |
+| `PrefixTuning.zero_grad()` / `sgd_step(lr=0.01)` | 占位梯度清零与更新（真实训练需先填充 grad_P_k/grad_P_v） |
+
+边界：只提供单头前向与参数容器，不包含把前缀接入 `MultiHeadAttention`/`CausalLM`
+的自动包装，也不含反向传播；训练前缀参数需要调用方把梯度写回 `grad_P_k`/`grad_P_v`。
 
 ### LLMSearch（MCTS + LLM 推理搜索）
 
@@ -5083,7 +5116,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2461 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2468 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5337,6 +5370,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTimeScaling` | best_of_n 选择、self_consistency 投票/规范化/并列、非法输入 |
 | `TestConstitutionalAI` | 多轮批评-修订链、非法输入 |
 | `TestLLMSearch` | 深度 1/多步路径、terminal 提前停止、状态相关候选、非法输入 |
+| `TestPrefixAttention` | 空前缀等价标准注意力、手工拼接对照、非法输入 |
+| `TestPrefixTuning` | 参数计数/前缀形状、前向形状、zero_grad+sgd、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5517,6 +5552,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2461 个单元测试
+├── test_ai.py       # 2468 个单元测试
 └── README.md
 ```

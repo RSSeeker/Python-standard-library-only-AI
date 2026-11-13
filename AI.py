@@ -9049,6 +9049,164 @@ def llm_search(propose_fn, value_fn, max_depth=8, num_simulations=32,
     return {"tokens": list(state), "score": _value(state),
             "steps": len(state), "visits_per_step": visits_per_step}
 
+
+"""Prefix Tuning（在每层注意力 K/V 前拼接可学习前缀）
+
+现有仓库已有 Prompt Tuning / P-Tuning，这里补 **Prefix Tuning**：
+每层、每头各维护一段可学习前缀 `P_k, P_v ∈ R^{prefix_len × d_head}`，
+注意力计算时把前缀拼到 K/V 前面（因此每个 token 都能关注到前缀），
+前缀参数不来自输入，只在前向时注入。
+
+本实现提供参数容器与单头前向计算；不包含训练循环/反向传播
+（前缀参数的梯度需要接在具体注意力实现上，属于调用方的训练框架）。
+"""
+
+
+def _prefix_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"prefix: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _prefix_check_rows(rows, d_model, name, allow_empty=False):
+    if not isinstance(rows, (list, tuple)) or (not rows and not allow_empty):
+        raise ValueError(f"prefix: {name} 必须是非空二维列表")
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"prefix: {name}[{i}] 的长度必须是 {d_model}")
+        clean = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or v != v or v in (float("inf"), float("-inf"))):
+                raise ValueError(f"prefix: {name} 必须只包含有限数字")
+            clean.append(float(v))
+        out.append(clean)
+    return out
+
+
+def _prefix_softmax(row):
+    m = max(row)
+    exps = [math.exp(v - m) for v in row]
+    total = sum(exps)
+    return [v / total for v in exps]
+
+
+def prefix_attention(q_rows, k_rows, v_rows, prefix_k, prefix_v, scale=None):
+    """单头 prefix attention：K/V 前置拼接 prefix_k / prefix_v 后做标准 attention。
+
+    q_rows: T×d；k/v: S×d；prefix_k/prefix_v: P×d。
+    返回 T×d 的输出（不返回注意力权重）。
+    """
+    if not isinstance(q_rows, (list, tuple)) or not q_rows:
+        raise ValueError("prefix: q_rows 必须是非空二维列表")
+    q = _prefix_check_rows(q_rows, len(q_rows[0]), "q_rows")
+    d = len(q[0])
+    k = _prefix_check_rows(k_rows, d, "k_rows")
+    v = _prefix_check_rows(v_rows, d, "v_rows")
+    if len(k) != len(v):
+        raise ValueError("prefix: k_rows 与 v_rows 的序列长度必须一致")
+    pk = _prefix_check_rows(prefix_k, d, "prefix_k", allow_empty=True)
+    pv = _prefix_check_rows(prefix_v, d, "prefix_v", allow_empty=True)
+    if len(pk) != len(pv):
+        raise ValueError("prefix: prefix_k 与 prefix_v 的序列长度必须一致")
+    if scale is None:
+        scale = 1.0 / math.sqrt(d)
+    else:
+        if (not isinstance(scale, (int, float)) or isinstance(scale, bool)
+                or scale != scale or scale in (float("inf"), float("-inf"))):
+            raise ValueError("prefix: scale 必须是有限数字")
+        scale = float(scale)
+    keys = pk + k
+    values = pv + v
+    out = []
+    for t in range(len(q)):
+        scores = [scale * sum(q[t][i] * keys[j][i] for i in range(d))
+                  for j in range(len(keys))]
+        weights = _prefix_softmax(scores)
+        y = [0.0] * d
+        for j, w in enumerate(weights):
+            if w == 0.0:
+                continue
+            for i in range(d):
+                y[i] += w * values[j][i]
+        out.append(y)
+    return out
+
+
+class PrefixTuning:
+    """每层每头的可学习前缀参数容器（`P_k`/`P_v`，gauss 初始化）。"""
+
+    def __init__(self, num_layers=1, num_heads=2, prefix_len=4, d_model=8, seed=None):
+        num_layers = _prefix_check_pos_int(num_layers, "num_layers")
+        num_heads = _prefix_check_pos_int(num_heads, "num_heads")
+        prefix_len = _prefix_check_pos_int(prefix_len, "prefix_len")
+        d_model = _prefix_check_pos_int(d_model, "d_model")
+        if d_model % num_heads != 0:
+            raise ValueError("prefix: d_model 必须能被 num_heads 整除")
+        if seed is not None:
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                raise ValueError("prefix: seed 必须是整数或 None")
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.prefix_len = prefix_len
+        self.d_model = d_model
+        self.d_head = d_model // num_heads
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / self.d_head)
+        self.P_k = [[[[rng.gauss(0.0, std) for _ in range(self.d_head)]
+                      for _ in range(prefix_len)]
+                     for _ in range(num_heads)]
+                    for _ in range(num_layers)]
+        self.P_v = [[[[rng.gauss(0.0, std) for _ in range(self.d_head)]
+                      for _ in range(prefix_len)]
+                     for _ in range(num_heads)]
+                    for _ in range(num_layers)]
+
+    def _check_layer_head(self, layer, head):
+        if not isinstance(layer, int) or isinstance(layer, bool) or not (0 <= layer < self.num_layers):
+            raise ValueError(f"prefix: layer 越界：{layer!r}")
+        if not isinstance(head, int) or isinstance(head, bool) or not (0 <= head < self.num_heads):
+            raise ValueError(f"prefix: head 越界：{head!r}")
+
+    def prefix_kv(self, layer=0, head=0):
+        """返回该层该头的前缀 (P_k, P_v)，各为 prefix_len × d_head 的嵌套列表。"""
+        self._check_layer_head(layer, head)
+        return ([list(row) for row in self.P_k[layer][head]],
+                [list(row) for row in self.P_v[layer][head]])
+
+    def forward_attention(self, q_rows, k_rows, v_rows, layer=0, head=0, scale=None):
+        """把第 layer/head 的前缀注入单头注意力。"""
+        pk, pv = self.prefix_kv(layer, head)
+        return prefix_attention(q_rows, k_rows, v_rows, pk, pv, scale=scale)
+
+    def param_count(self):
+        return self.num_layers * self.num_heads * 2 * self.prefix_len * self.d_head
+
+    def zero_grad(self):
+        """为将来的训练预留：清零占位梯度。"""
+        self.grad_P_k = [[[[0.0] * self.d_head for _ in range(self.prefix_len)]
+                          for _ in range(self.num_heads)]
+                         for _ in range(self.num_layers)]
+        self.grad_P_v = [[[[0.0] * self.d_head for _ in range(self.prefix_len)]
+                          for _ in range(self.num_heads)]
+                         for _ in range(self.num_layers)]
+
+    def sgd_step(self, lr=0.01):
+        """按占位梯度（默认 0）更新前缀参数；真实训练需先填充 grad_P_k/grad_P_v。"""
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or lr != lr or lr in (float("inf"), float("-inf")) or lr <= 0.0):
+            raise ValueError("prefix: lr 必须是正有限数字")
+        if not hasattr(self, "grad_P_k"):
+            raise RuntimeError("prefix: 请先调用 zero_grad")
+        lr = float(lr)
+        for layer in range(self.num_layers):
+            for head in range(self.num_heads):
+                for p in range(self.prefix_len):
+                    for i in range(self.d_head):
+                        self.P_k[layer][head][p][i] -= lr * self.grad_P_k[layer][head][p][i]
+                        self.P_v[layer][head][p][i] -= lr * self.grad_P_v[layer][head][p][i]
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

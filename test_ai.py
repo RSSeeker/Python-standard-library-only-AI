@@ -37668,3 +37668,104 @@ class TestLLMSearch:
         assert _llm_search_raises(lambda: AI.llm_search(lambda s: [("a", -1.0)], good_value))
         assert _llm_search_raises(lambda: AI.llm_search(good_propose, lambda s: "bad"))
         assert _llm_search_raises(lambda: AI.llm_search(good_propose, good_value, is_terminal=lambda s: "yes"))
+
+
+
+
+def _prefix_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+def _prefix_attn_ref(q, k, v):
+    import math
+    d = len(q[0])
+    scale = 1.0 / math.sqrt(d)
+    out = []
+    for t in range(len(q)):
+        scores = [scale * sum(q[t][i] * k[j][i] for i in range(d))
+                  for j in range(len(k))]
+        m = max(scores)
+        exps = [math.exp(s - m) for s in scores]
+        tot = sum(exps)
+        weights = [e / tot for e in exps]
+        y = [0.0] * d
+        for j, w in enumerate(weights):
+            for i in range(d):
+                y[i] += w * v[j][i]
+        out.append(y)
+    return out
+
+
+def _prefix_case():
+    q = [[0.1, 0.2, 0.3, 0.4], [-0.1, 0.0, 0.2, 0.1]]
+    k = [[0.3, -0.2, 0.1, 0.0], [0.0, 0.4, -0.1, 0.2], [0.2, 0.1, 0.0, -0.3]]
+    v = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    return q, k, v
+
+
+class TestPrefixAttention:
+    def test_empty_prefix_equals_standard(self):
+        q, k, v = _prefix_case()
+        out = AI.prefix_attention(q, k, v, [], [])
+        ref = _prefix_attn_ref(q, k, v)
+        err = max(abs(out[t][i] - ref[t][i])
+                  for t in range(len(q)) for i in range(len(q[0])))
+        assert err < 1e-12
+
+    def test_manual_prefix_concat(self):
+        q, k, v = _prefix_case()
+        pk = [[0.1] * 4, [0.2] * 4]
+        pv = [[1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5]]
+        ref = _prefix_attn_ref(q, pk + k, pv + v)
+        out = AI.prefix_attention(q, k, v, pk, pv)
+        err = max(abs(out[t][i] - ref[t][i])
+                  for t in range(len(q)) for i in range(len(q[0])))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        q, k, v = _prefix_case()
+        assert _prefix_raises(lambda: AI.prefix_attention(q, k, v[:-1], [], []))
+        assert _prefix_raises(lambda: AI.prefix_attention(q, k, v, [[0.1] * 3], [[0.1] * 3]))
+        assert _prefix_raises(lambda: AI.prefix_attention(q, k, v, [], [], scale=float("nan")))
+        assert _prefix_raises(lambda: AI.prefix_attention(q, [], [], [], []))
+        assert _prefix_raises(lambda: AI.prefix_attention([], k, v, [], []))
+
+
+class TestPrefixTuning:
+    def test_param_count_and_prefix_kv(self):
+        pt = AI.PrefixTuning(num_layers=1, num_heads=2, prefix_len=3, d_model=4, seed=1)
+        assert pt.param_count() == 24
+        pk, pv = pt.prefix_kv(0, 0)
+        assert len(pk) == 3 and len(pk[0]) == 2
+        assert len(pv) == 3 and len(pv[0]) == 2
+
+    def test_forward_attention_shape(self):
+        pt = AI.PrefixTuning(num_layers=1, num_heads=2, prefix_len=3, d_model=4, seed=1)
+        q = [[0.1, 0.2], [-0.1, 0.0]]
+        k = [[0.3, -0.2], [0.0, 0.4], [0.2, 0.1]]
+        v = [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]
+        y = pt.forward_attention(q, k, v, layer=0, head=0)
+        assert len(y) == 2 and len(y[0]) == 2
+
+    def test_zero_grad_sgd_step(self):
+        pt = AI.PrefixTuning(num_layers=1, num_heads=1, prefix_len=2, d_model=2, seed=2)
+        assert _prefix_raises(pt.sgd_step)  # 未 zero_grad 前抛 RuntimeError
+        pt.zero_grad()
+        before = pt.P_k[0][0][0][0]
+        pt.sgd_step(0.1)
+        assert abs(pt.P_k[0][0][0][0] - before) < 1e-15
+        assert _prefix_raises(lambda: pt.sgd_step(0.0))
+
+    def test_invalid_inputs(self):
+        assert _prefix_raises(lambda: AI.PrefixTuning(num_layers=0))
+        assert _prefix_raises(lambda: AI.PrefixTuning(num_heads=0))
+        assert _prefix_raises(lambda: AI.PrefixTuning(prefix_len=0))
+        assert _prefix_raises(lambda: AI.PrefixTuning(d_model=5, num_heads=2))
+        assert _prefix_raises(lambda: AI.PrefixTuning(seed=1.5))
+        pt = AI.PrefixTuning()
+        assert _prefix_raises(lambda: pt.prefix_kv(1, 0))
+        assert _prefix_raises(lambda: pt.prefix_kv(0, 99))
