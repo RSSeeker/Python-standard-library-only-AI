@@ -7981,6 +7981,239 @@ class DynamicTanh:
     def param_count(self):
         """可训练参数数：alpha + gamma + beta。"""
         return 1 + 2 * self.d_model
+"""B3：RoPE 外推扩展（ABF / LongRoPE）与 2D/3D RoPE。
+
+只依赖标准库 math；函数均为纯函数，便于与 C 侧逐位对拍。
+"""
+
+import math
+
+
+def _rope_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"RoPE: {name} 必须是正整数，收到 {value!r}")
+    if value < 1:
+        raise ValueError(f"RoPE: {name} 必须 >= 1，收到 {value}")
+    return value
+
+
+def _rope_check_num(value, name, minimum=None):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"RoPE: {name} 必须是数字，收到 {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"RoPE: {name} 必须是有限数字，收到 {value!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"RoPE: {name} 必须 >= {minimum}，收到 {value}")
+    return value
+
+
+def _rope_check_rows(rows, name="rows"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"RoPE: {name} 必须是非空的行列表")
+    out = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"RoPE: {name} 中每行必须是非空数字列表")
+        cleaned = []
+        for x in row:
+            if (isinstance(x, bool) or not isinstance(x, (int, float))
+                    or not math.isfinite(float(x))):
+                raise ValueError(f"RoPE: {name} 必须只包含有限数字")
+            cleaned.append(float(x))
+        out.append(cleaned)
+    width = len(out[0])
+    for row in out:
+        if len(row) != width:
+            raise ValueError(f"RoPE: {name} 每行长度必须一致")
+    return out
+
+
+def _rope_inv_pairs(seg, base):
+    """段内逐对逆频率：seg 必须是偶数，返回 seg//2 个频率。"""
+    return [1.0 / (base ** (2.0 * j / seg)) for j in range(seg // 2)]
+
+
+def _rope_rotate_section(rows, start, seg, position_fn, base, sign):
+    if seg % 2 != 0:
+        raise ValueError("RoPE: 每段维度必须是偶数")
+    inv = _rope_inv_pairs(seg, base)
+    out = [row[:] for row in rows]
+    for t, row in enumerate(out):
+        pos = position_fn(t)
+        for j, freq in enumerate(inv):
+            angle = sign * pos * freq
+            c = math.cos(angle)
+            s = math.sin(angle)
+            i0 = start + 2 * j
+            x0 = row[i0]
+            x1 = row[i0 + 1]
+            row[i0] = x0 * c - x1 * s
+            row[i0 + 1] = x0 * s + x1 * c
+    return out
+
+
+def abf_inv_freqs(d_k, base=10000.0, factor=8.0):
+    """ABF（Adjusted Base Frequency）的逐对逆频率。
+
+    ABF 不做位置插值，而是把底数放大 factor 倍：
+    `base_eff = base * factor`，随后按原始 RoPE 公式取逆频率。
+    相比 NTK-aware（指数 `d_k/(d_k-2)` 的底数放大），ABF 的低频被拉长、
+    高频也被轻微压缩，实现更简单。
+    """
+    _rope_check_pos_int(d_k, "d_k")
+    if d_k < 2:
+        raise ValueError(f"RoPE: d_k 至少为 2，收到 {d_k}")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    factor = _rope_check_num(factor, "factor")
+    if factor < 1.0:
+        raise ValueError(f"RoPE: factor 必须 >= 1，收到 {factor}")
+    base_eff = base * factor
+    return [1.0 / (base_eff ** (2.0 * i / d_k)) for i in range(d_k // 2)]
+
+
+def longrope_inv_freqs(d_k, base=10000.0, factor=4.0,
+                       original_max=512, low_fraction=0.25):
+    """LongRoPE 风格的非均匀频率缩放（简化版）。
+
+    只缩放最低频的一小段（`low_fraction` 比例的维度，对应长波长分量），
+    高频维度保持不变。真实 LongRoPE 的缩放因子来自短/长上下文上的搜索，
+    这里用统一 `factor` 代替因子列表，用于演示非均匀外推的行为。
+    """
+    _rope_check_pos_int(d_k, "d_k")
+    if d_k < 2:
+        raise ValueError(f"RoPE: d_k 至少为 2，收到 {d_k}")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    factor = _rope_check_num(factor, "factor")
+    if factor < 1.0:
+        raise ValueError(f"RoPE: factor 必须 >= 1，收到 {factor}")
+    _rope_check_pos_int(original_max, "original_max")
+    low_fraction = _rope_check_num(low_fraction, "low_fraction")
+    if not (0.0 < low_fraction < 1.0):
+        raise ValueError(f"RoPE: low_fraction 必须在 (0, 1) 内，收到 {low_fraction}")
+    n = d_k // 2
+    freqs = [1.0 / (base ** (2.0 * i / d_k)) for i in range(n)]
+    k = max(1, int(round(n * low_fraction)))
+    for i in range(n - k, n):
+        freqs[i] /= factor
+    return freqs
+
+
+def rope_2d(rows, grid_h, grid_w, base=10000.0):
+    """2D RoPE：把一半维度按行位置旋转、另一半按列位置旋转。
+
+    rows 按行主序展开（t = r*grid_w + c）；要求 d_model 被 4 整除。
+    返回旋转后的新行列表（不修改入参）。
+    """
+    grid_h = _rope_check_pos_int(grid_h, "grid_h")
+    grid_w = _rope_check_pos_int(grid_w, "grid_w")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    data = _rope_check_rows(rows)
+    if len(data) != grid_h * grid_w:
+        raise ValueError("RoPE: 行数必须等于 grid_h * grid_w")
+    d = len(data[0])
+    if d % 4 != 0:
+        raise ValueError(f"RoPE: 2D RoPE 要求 d_model 被 4 整除，收到 {d}")
+    half = d // 2
+    out = _rope_rotate_section(data, 0, half,
+                               lambda t: t // grid_w, base, 1.0)
+    out = _rope_rotate_section(out, half, half,
+                               lambda t: t % grid_w, base, 1.0)
+    return out
+
+
+def rope_2d_inverse(rows, grid_h, grid_w, base=10000.0):
+    """2D RoPE 的逆旋转（角度取负），用于验证旋转正交性。"""
+    grid_h = _rope_check_pos_int(grid_h, "grid_h")
+    grid_w = _rope_check_pos_int(grid_w, "grid_w")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    data = _rope_check_rows(rows)
+    if len(data) != grid_h * grid_w:
+        raise ValueError("RoPE: 行数必须等于 grid_h * grid_w")
+    d = len(data[0])
+    if d % 4 != 0:
+        raise ValueError(f"RoPE: 2D RoPE 要求 d_model 被 4 整除，收到 {d}")
+    half = d // 2
+    out = _rope_rotate_section(data, half, half,
+                               lambda t: t % grid_w, base, -1.0)
+    out = _rope_rotate_section(out, 0, half,
+                               lambda t: t // grid_w, base, -1.0)
+    return out
+
+
+def rope_3d(rows, grid_t, grid_h, grid_w, base=10000.0):
+    """3D RoPE：时间/行/列各占 d_model/3 个维度（要求 d 被 6 整除）。
+
+    rows 按 (t, h, w) 行主序展开；返回旋转后的新行列表。
+    """
+    grid_t = _rope_check_pos_int(grid_t, "grid_t")
+    grid_h = _rope_check_pos_int(grid_h, "grid_h")
+    grid_w = _rope_check_pos_int(grid_w, "grid_w")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    data = _rope_check_rows(rows)
+    if len(data) != grid_t * grid_h * grid_w:
+        raise ValueError("RoPE: 行数必须等于 grid_t * grid_h * grid_w")
+    d = len(data[0])
+    if d % 6 != 0:
+        raise ValueError(f"RoPE: 3D RoPE 要求 d_model 被 6 整除，收到 {d}")
+    seg = d // 3
+
+    def pos_t(t):
+        return t // (grid_h * grid_w)
+
+    def pos_h(t):
+        return (t // grid_w) % grid_h
+
+    def pos_w(t):
+        return t % grid_w
+
+    out = _rope_rotate_section(data, 0, seg, pos_t, base, 1.0)
+    out = _rope_rotate_section(out, seg, seg, pos_h, base, 1.0)
+    out = _rope_rotate_section(out, 2 * seg, seg, pos_w, base, 1.0)
+    return out
+
+
+def rope_3d_inverse(rows, grid_t, grid_h, grid_w, base=10000.0):
+    """3D RoPE 的逆旋转。"""
+    grid_t = _rope_check_pos_int(grid_t, "grid_t")
+    grid_h = _rope_check_pos_int(grid_h, "grid_h")
+    grid_w = _rope_check_pos_int(grid_w, "grid_w")
+    base = _rope_check_num(base, "base")
+    if base <= 0.0:
+        raise ValueError(f"RoPE: base 必须是正数，收到 {base}")
+    data = _rope_check_rows(rows)
+    if len(data) != grid_t * grid_h * grid_w:
+        raise ValueError("RoPE: 行数必须等于 grid_t * grid_h * grid_w")
+    d = len(data[0])
+    if d % 6 != 0:
+        raise ValueError(f"RoPE: 3D RoPE 要求 d_model 被 6 整除，收到 {d}")
+    seg = d // 3
+
+    def pos_t(t):
+        return t // (grid_h * grid_w)
+
+    def pos_h(t):
+        return (t // grid_w) % grid_h
+
+    def pos_w(t):
+        return t % grid_w
+
+    out = _rope_rotate_section(data, 2 * seg, seg, pos_w, base, -1.0)
+    out = _rope_rotate_section(out, seg, seg, pos_h, base, -1.0)
+    out = _rope_rotate_section(out, 0, seg, pos_t, base, -1.0)
+    return out
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

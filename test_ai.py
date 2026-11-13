@@ -37031,3 +37031,156 @@ class TestDynamicTanh:
         _ns_raises(lambda: d.forward([[1.0]]))
         _ns_raises(lambda: d.backward([[1.0]]))
         _ns_raises(lambda: d.sgd_step(0.0))
+
+
+"""B3 测试：ABF / LongRoPE 频率缩放与 2D / 3D RoPE。"""
+
+import math
+import random
+
+import AI
+
+
+def _rope_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected exception")
+
+
+class TestABF:
+    def test_formula_matches_adjusted_base(self):
+        for d_k in (4, 8, 16):
+            got = AI.abf_inv_freqs(d_k, base=10000.0, factor=8.0)
+            ref = [1.0 / ((10000.0 * 8.0) ** (2.0 * i / d_k))
+                   for i in range(d_k // 2)]
+            assert len(got) == d_k // 2
+            for a, b in zip(got, ref):
+                assert abs(a - b) < 1e-18
+
+    def test_differs_from_ntk(self):
+        abf = AI.abf_inv_freqs(16, factor=8.0)
+        ntk = AI.rope_inv_freqs(16, scaling="ntk", factor=8.0)
+        assert abf != ntk
+        # ABF 等价于把底数乘 factor，因此第一对频率恒为 1
+        assert abf[0] == 1.0
+
+    def test_invalid_inputs(self):
+        _rope_raises(lambda: AI.abf_inv_freqs(1))
+        _rope_raises(lambda: AI.abf_inv_freqs(4.0))
+        _rope_raises(lambda: AI.abf_inv_freqs(4, base=0.0))
+        _rope_raises(lambda: AI.abf_inv_freqs(4, base=float("inf")))
+        _rope_raises(lambda: AI.abf_inv_freqs(4, factor=0.5))
+        _rope_raises(lambda: AI.abf_inv_freqs(4, factor=float("nan")))
+
+
+class TestLongRoPE:
+    def test_only_low_frequency_scaled(self):
+        for d_k in (8, 16, 32):
+            n = d_k // 2
+            for low_fraction in (0.25, 0.5):
+                got = AI.longrope_inv_freqs(d_k, factor=4.0,
+                                            low_fraction=low_fraction)
+                k = max(1, int(round(n * low_fraction)))
+                base_f = [1.0 / (10000.0 ** (2.0 * i / d_k)) for i in range(n)]
+                for i in range(n):
+                    expect = base_f[i] / 4.0 if i >= n - k else base_f[i]
+                    assert abs(got[i] - expect) < 1e-18
+
+    def test_more_low_fraction_scales_more_dims(self):
+        small = AI.longrope_inv_freqs(32, low_fraction=0.25)
+        large = AI.longrope_inv_freqs(32, low_fraction=0.5)
+        n = 16
+        small_k = max(1, int(round(n * 0.25)))
+        large_k = max(1, int(round(n * 0.5)))
+        assert small_k < large_k
+        assert small != large
+
+    def test_invalid_inputs(self):
+        _rope_raises(lambda: AI.longrope_inv_freqs(1))
+        _rope_raises(lambda: AI.longrope_inv_freqs(8, base=-1.0))
+        _rope_raises(lambda: AI.longrope_inv_freqs(8, factor=0.5))
+        _rope_raises(lambda: AI.longrope_inv_freqs(8, low_fraction=0.0))
+        _rope_raises(lambda: AI.longrope_inv_freqs(8, low_fraction=1.0))
+        _rope_raises(lambda: AI.longrope_inv_freqs(8, original_max=0))
+
+
+class TestRoPE2D:
+    def test_norm_and_inverse(self):
+        rng = random.Random(0)
+        rows = [[rng.uniform(-2.0, 2.0) for _ in range(8)] for _ in range(12)]
+        out = AI.rope_2d(rows, 3, 4)
+        for a, b in zip(rows, out):
+            for j in range(0, 8, 2):
+                assert abs(math.hypot(a[j], a[j + 1])
+                           - math.hypot(b[j], b[j + 1])) < 1e-12
+        back = AI.rope_2d_inverse(out, 3, 4)
+        for a, b in zip(rows, back):
+            assert all(abs(x - y) < 1e-12 for x, y in zip(a, b))
+
+    def test_axis_semantics(self):
+        # 前半维度按行号旋转：只有行号变化时结果不同
+        v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        row_diff = AI.rope_2d([v[:], v[:]], 2, 1)
+        assert row_diff[0][:4] != row_diff[1][:4]
+        # 后半维度按列号旋转：只有列号变化时结果不同
+        w = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        col_diff = AI.rope_2d([w[:], w[:]], 1, 2)
+        assert col_diff[0][4:] != col_diff[1][4:]
+        assert col_diff[0][:4] == col_diff[1][:4] == [0.0, 0.0, 0.0, 0.0]
+
+    def test_identity_at_zero_position(self):
+        rows = [[1.0, 2.0, 3.0, 4.0]]
+        assert AI.rope_2d(rows, 1, 1) == [rows[0]]
+
+    def test_invalid_inputs(self):
+        rows = [[1.0, 2.0, 3.0, 4.0]]
+        _rope_raises(lambda: AI.rope_2d(rows, 0, 1))
+        _rope_raises(lambda: AI.rope_2d(rows, 2, 1))
+        _rope_raises(lambda: AI.rope_2d([[1.0, 2.0]], 1, 1))
+        _rope_raises(lambda: AI.rope_2d([], 1, 1))
+        _rope_raises(lambda: AI.rope_2d([[]], 1, 1))
+        _rope_raises(lambda: AI.rope_2d([[1.0, "x", 0.0, 0.0]], 1, 1))
+        _rope_raises(lambda: AI.rope_2d(rows, 1, 1, base=0.0))
+        _rope_raises(lambda: AI.rope_2d_inverse(rows, 2, 1))
+
+
+class TestRoPE3D:
+    def test_norm_and_inverse(self):
+        rng = random.Random(1)
+        rows = [[rng.uniform(-1.0, 1.0) for _ in range(12)]
+                for _ in range(2 * 2 * 3)]
+        out = AI.rope_3d(rows, 2, 2, 3)
+        for a, b in zip(rows, out):
+            for j in range(0, 12, 2):
+                assert abs(math.hypot(a[j], a[j + 1])
+                           - math.hypot(b[j], b[j + 1])) < 1e-12
+        back = AI.rope_3d_inverse(out, 2, 2, 3)
+        for a, b in zip(rows, back):
+            assert all(abs(x - y) < 1e-12 for x, y in zip(a, b))
+
+    def test_axis_semantics(self):
+        base = [0.0] * 12
+        t_vec = base[:]
+        t_vec[0] = 1.0
+        out = AI.rope_3d([t_vec[:], [1.0, 0.0] + [0.0] * 10], 2, 1, 1)
+        # 只有 t 不同：第一段不同，后两段相同
+        assert out[0][:2] != out[1][:2]
+        assert out[0][2:] == out[1][2:]
+        h_vec = base[:]
+        h_vec[4] = 1.0
+        out2 = AI.rope_3d([h_vec[:], h_vec[:]], 1, 2, 1)
+        assert out2[0][4:6] != out2[1][4:6]
+
+    def test_zero_position_is_identity(self):
+        rows = [[float(i) for i in range(12)]]
+        assert AI.rope_3d(rows, 1, 1, 1) == [rows[0]]
+
+    def test_invalid_inputs(self):
+        rows = [[1.0] * 6]
+        _rope_raises(lambda: AI.rope_3d([[1.0] * 8], 1, 2, 1))  # d%6 != 0
+        _rope_raises(lambda: AI.rope_3d([], 1, 1, 1))
+        _rope_raises(lambda: AI.rope_3d(rows, 0, 1, 1))
+        _rope_raises(lambda: AI.rope_3d(rows, 1, 1, 1, base=-1.0))
+        _rope_raises(lambda: AI.rope_3d_inverse([[1.0] * 8], 1, 2, 1))

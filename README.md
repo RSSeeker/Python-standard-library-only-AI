@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2409 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2423 项）
 
 ## 特性
 
@@ -2294,6 +2294,37 @@ mask = moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=s
 | `moba_attention_mask(seq_len, block_size=4, top_k_blocks=2, block_scores=None)` | 当前块因果 + 按块相关度选 top-k 历史整块，返回布尔矩阵 |
 
 - 边界：只构造布尔掩码，不执行注意力；NSA 的选块是随机模拟（真实实现按学习到的块重要性）；MoBA 未提供 block_scores 时用 `1/(1+|qb-kb|)` 的启发式；均要求 seq_len/block_size 为正整数，且因果屏蔽未来位置。
+
+### RoPE 外推与 2D / 3D RoPE（ABF / LongRoPE）
+
+在 `rope_inv_freqs` 的 linear / NTK / YaRN 之外补充两种长上下文外推：
+
+- **ABF（Adjusted Base Frequency）**：把底数直接乘 `factor`，低频拉长、高频几乎不动。
+- **LongRoPE（简化）**：只对最低频的 `low_fraction` 比例维度做 `factor` 缩放，其余频率保持不变，模拟非均匀插值。
+
+另外提供 2D / 3D RoPE：把 `d_model` 按轴分段（每轴占 `d/n_axes` 维），
+每段对半旋转，位置分别取行/列或 t/h/w 坐标——用于视觉/视频 Transformer。
+
+```python
+from ai import AI
+
+print(AI.abf_inv_freqs(16, factor=8.0)[:3])
+print(AI.longrope_inv_freqs(16, factor=4.0, low_fraction=0.25)[:3])
+
+rows = [[0.1, 0.2, 0.3, 0.4]]
+print(AI.rope_2d_inverse(AI.rope_2d(rows, 1, 1), 1, 1))  # 还原
+```
+
+| API | 说明 |
+| --- | --- |
+| `abf_inv_freqs(d_k, base=10000.0, factor=8.0)` | 底数乘 factor 的逐对逆频率（长度 `d_k//2`） |
+| `longrope_inv_freqs(d_k, base=10000.0, factor=4.0, original_max=512, low_fraction=0.25)` | 仅最低频 `k=max(1,round(n*low_fraction))` 个维度除以 factor |
+| `rope_2d(rows, grid_h, grid_w, base=10000.0)` / `rope_2d_inverse(...)` | 要求 `d_model%4==0`；前半按行号、后半按列号旋转；行主序网格 |
+| `rope_3d(rows, grid_t, grid_h, grid_w, base=10000.0)` / `rope_3d_inverse(...)` | 要求 `d_model%6==0`；三段分别按 t/h/w 旋转 |
+
+边界：ABF / LongRoPE 只返回频率表，不改变位置索引（需调用方与位置缩放配合）；
+2D / 3D RoPE 采用朴素的「轴分段 + 对半旋转」，不做交错频率拼接；逆变换按相反
+顺序取负角度，要求输入未被修改。
 
 ### 环形注意力（RingAttention 分块 online softmax）
 
@@ -4897,7 +4928,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2409 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2423 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5135,6 +5166,10 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSpanCorruption` | span 非重叠与边界、输入/目标替换、显式哨兵、种子确定性、非法输入 |
 | `TestQKNorm` | 逐行 RMSNorm 手算、gamma/输入梯度数值校验、Q/K 同时归一化、非法输入 |
 | `TestDynamicTanh` | 前向/参数计数、alpha/gamma/输入梯度数值校验、SGD 更新、非法输入 |
+| `TestABF` | ABF 频率手算、与 NTK 差异、非法参数 |
+| `TestLongRoPE` | 仅低频段缩放、low_fraction 影响、非法参数 |
+| `TestRoPE2D` | 保范数与逆变换、行/列轴向语义、零位置恒等、非法输入 |
+| `TestRoPE3D` | 保范数与逆变换、t/h/w 轴向语义、零位置恒等、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5315,6 +5350,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2409 个单元测试
+├── test_ai.py       # 2423 个单元测试
 └── README.md
 ```
