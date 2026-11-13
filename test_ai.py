@@ -38460,3 +38460,95 @@ class TestRLHFTrainer:
                 .pair_step([0, 1], [], [5, 6, 7]))
         _raises(lambda: AI._rlhf_seq_logprob(policy, [11], [2, 3, 4]))
         _raises(lambda: AI._rlhf_seq_logprob(policy, [0], []))
+
+
+def _fl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestFinetuneLoRA:
+    def test_mse_freezes_base_and_drops_loss(self):
+        random.seed(7)
+        model = AI.Model(AI.MLP([2, 3, 1], ["relu", "linear"]), loss_fn="mse")
+        base_before = [[[v for v in row] for row in layer.weights]
+                       for layer in model.model.layers]
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [[0.0], [1.0], [1.0], [2.0]]
+        result = AI.finetune_lora(model, xs, ys, rank=2, lr=0.1, epochs=200, seed=7)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.2
+        assert result["trainable_params"] == 18
+        assert result["base_params"] == 13
+        assert len(result["adapters"]) == 2
+        base_after = [[[v for v in row] for row in layer.weights]
+                      for layer in model.model.layers]
+        assert base_before == base_after
+
+    def test_accepts_raw_mlp(self):
+        random.seed(11)
+        mlp = AI.MLP([1, 4, 1], ["relu", "linear"])
+        result = AI.finetune_lora(mlp, [[0.0], [1.0], [2.0]],
+                                  [[0.0], [1.0], [2.0]], rank=1, lr=0.05,
+                                  epochs=300, seed=1)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.2
+        assert result["trainable_params"] == 1 * 1 + 4 + (4 + 1)
+
+    def test_cross_entropy_logits(self):
+        random.seed(3)
+        mlp = AI.MLP([2, 8, 2], ["relu", "linear"])
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [0, 0, 1, 1]
+        result = AI.finetune_lora(mlp, xs, ys, rank=2, lr=0.1, epochs=300,
+                                  seed=3, loss="cross_entropy", shuffle=True)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.5
+        preds = []
+        for row in xs:
+            out = AI._lora_ft_forward_chain(result["adapters"], row)
+            preds.append(0 if out[0] >= out[1] else 1)
+        assert preds == ys
+
+    def test_alpha_and_seed(self):
+        random.seed(2)
+        model = AI.Model(AI.MLP([2, 2]))
+        xs = [[0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]
+        rows = [[0.0, 1.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        result = AI.finetune_lora(model, xs, rows, rank=1, alpha=2.0, lr=0.1,
+                                  epochs=3, seed=2, shuffle=True)
+        assert result["adapters"][0].scaling == 2.0
+        assert len(result["loss_history"]) == 3
+
+    def test_softmax_output_rejected(self):
+        model = AI.Model(AI.MLP([2, 2], ["softmax"]),
+                         loss_fn="cross_entropy")
+        assert _fl_raises(lambda: AI.finetune_lora(
+            model, [[0.0, 1.0], [1.0, 0.0]], [0, 1], loss="cross_entropy"))
+
+    def test_invalid_inputs(self):
+        m = AI.Model(AI.MLP([2, 2]))
+        xs = [[0.0, 1.0], [1.0, 0.0]]
+        assert _fl_raises(lambda: AI.finetune_lora("x", xs, xs))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, loss="l1"))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, rank=0))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, rank=True))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, alpha=-1.0))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, lr=0.0))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, epochs=0))
+        assert _fl_raises(lambda: AI.finetune_lora(m, [], []))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs[:1]))
+        assert _fl_raises(lambda: AI.finetune_lora(m, [[0.0], [0.0]], xs))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, [[0.0]] * 2))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, [0, 1.5], loss="cross_entropy"))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, [0, 2], loss="cross_entropy"))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, shuffle=1))
+        assert _fl_raises(lambda: AI.finetune_lora(m, xs, xs, seed="a"))
+        assert _fl_raises(lambda: AI.finetune_lora(
+            m, [[float("nan"), 0.0]] + xs[1:], xs))
+        m2 = AI.Model(AI.MLP([2, 2]))
+        m2.model.layers[0] = AI.LoRA(m2.model.layers[0], rank=1)
+        assert _fl_raises(lambda: AI.finetune_lora(m2, xs, xs))

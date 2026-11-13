@@ -9881,6 +9881,180 @@ def rlhf_align(policy, pairs, reference=None, method: str = "dpo",
     return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
 
 
+def _lora_ft_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"finetune_lora: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _lora_ft_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"finetune_lora: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"finetune_lora: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def _lora_ft_forward_chain(adapters, row):
+    """逐层前向：每层先走 LoRA 包装（含原层激活），再进入下一层。"""
+    h = row
+    for adapter in adapters:
+        h = adapter.forward(h)
+    return h
+
+
+def _lora_ft_loss_and_dlogits(outputs, ys, loss):
+    """计算平均损失与输出层梯度（mse 或 cross_entropy）。"""
+    n = len(outputs)
+    if loss == "mse":
+        out_dim = len(outputs[0])
+        total = 0.0
+        d_rows = []
+        for i in range(n):
+            pred, target = outputs[i], ys[i]
+            if len(target) != out_dim:
+                raise ValueError(
+                    f"finetune_lora: 目标维度 {len(target)} 与输出维度 {out_dim} 不一致")
+            row = []
+            for k in range(out_dim):
+                diff = pred[k] - float(target[k])
+                total += diff * diff
+                row.append(2.0 * diff / (n * out_dim))
+            d_rows.append(row)
+        return total / (n * out_dim), d_rows
+    out_dim = len(outputs[0])
+    total = 0.0
+    d_rows = []
+    for i in range(n):
+        target = ys[i]
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise ValueError("finetune_lora: cross_entropy 的目标必须是整数类别下标")
+        if target < 0 or target >= out_dim:
+            raise ValueError(
+                f"finetune_lora: 类别下标 {target} 超出 [0, {out_dim})")
+        logits = outputs[i]
+        m = max(logits)
+        exps = [math.exp(v - m) for v in logits]
+        denom = sum(exps)
+        probs = [v / denom for v in exps]
+        total += -math.log(max(probs[target], 1e-300))
+        row = [probs[k] / n for k in range(out_dim)]
+        row[target] -= 1.0 / n
+        d_rows.append(row)
+    return total / n, d_rows
+
+
+def finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50,
+                  loss="mse", seed=None, shuffle=False):
+    """冻结基座、只训练 LoRA 适配器的一键微调。
+
+    ``model`` 可以是 ``Model``（内部 ``.model`` 为 ``MLP``）或直接传 ``MLP``。
+    对 MLP 的每一层套一层 ``LoRA``，基座权重冻结；``loss`` 支持 ``"mse"``
+    与 ``"cross_entropy"``。返回损失历史、适配器列表与可训练参数个数。
+    """
+    if isinstance(model, Model):
+        mlp = model.model
+    elif isinstance(model, MLP):
+        mlp = model
+    else:
+        raise TypeError("finetune_lora: model 必须是 Model 或 MLP 实例")
+    if not isinstance(mlp.layers, list) or not mlp.layers:
+        raise ValueError("finetune_lora: MLP 至少需要一层")
+    rank = _lora_ft_check_pos_int(rank, "rank")
+    if alpha is not None:
+        alpha = _lora_ft_check_pos_number(alpha, "alpha")
+    lr = _lora_ft_check_pos_number(lr, "学习率")
+    epochs = _lora_ft_check_pos_int(epochs, "epochs")
+    if loss not in ("mse", "cross_entropy"):
+        raise ValueError("finetune_lora: loss 只支持 'mse' 或 'cross_entropy'")
+    if loss == "cross_entropy" and getattr(mlp.layers[-1].act_fn, "__name__", "") == "_softmax":
+        raise ValueError(
+            "finetune_lora: cross_entropy 模式要求输出层为线性 logits；"
+            "softmax 输出层的导数恒为 1，不能用于独立损失反传")
+    if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+        raise ValueError("finetune_lora: xs 与 ys 必须是列表")
+    if not xs or len(xs) != len(ys):
+        raise ValueError("finetune_lora: xs 与 ys 必须非空且等长")
+    if not isinstance(shuffle, bool):
+        raise TypeError("finetune_lora: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("finetune_lora: seed 必须是 int 或 None")
+    for adapter in mlp.layers:
+        if isinstance(adapter, LoRA):
+            raise ValueError("finetune_lora: 模型中已存在 LoRA 适配器，请先 merge 或换新模型")
+
+    in_dim = mlp.layers[0].fan_in
+    out_dim = mlp.layers[-1].fan_out
+    clean_x = []
+    clean_y = []
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(f"finetune_lora: 每个输入必须是长度 {in_dim} 的列表")
+        values = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v)):
+                raise ValueError("finetune_lora: 输入必须只包含有限数字")
+            values.append(float(v))
+        clean_x.append(values)
+    for target in ys:
+        if loss == "mse":
+            if not isinstance(target, (list, tuple)) or len(target) != out_dim:
+                raise ValueError(f"finetune_lora: 每个目标必须是长度 {out_dim} 的列表")
+            values = []
+            for v in target:
+                if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                        or not math.isfinite(v)):
+                    raise ValueError("finetune_lora: 目标必须只包含有限数字")
+                values.append(float(v))
+            clean_y.append(values)
+        else:
+            if isinstance(target, bool) or not isinstance(target, int):
+                raise ValueError("finetune_lora: cross_entropy 目标必须是整数类别下标")
+            clean_y.append(target)
+
+    adapters = [LoRA(layer, rank, alpha) for layer in mlp.layers]
+    base_params = sum(layer.fan_in * layer.fan_out + layer.fan_out
+                      for layer in mlp.layers)
+    trainable_params = sum(adapter.trainable_param_count() for adapter in adapters)
+    rng = random.Random(seed)
+    indices = list(range(len(clean_x)))
+    history = []
+    for _ in range(epochs):
+        if shuffle:
+            rng.shuffle(indices)
+        for adapter in adapters:
+            adapter.zero_grad()
+        order_x = [clean_x[i] for i in indices] if shuffle else clean_x
+        order_y = [clean_y[i] for i in indices] if shuffle else clean_y
+        outputs = [_lora_ft_forward_chain(adapters, row) for row in order_x]
+        epoch_loss, d_rows = _lora_ft_loss_and_dlogits(outputs, order_y, loss)
+        for i in range(len(order_x) - 1, -1, -1):
+            _lora_ft_forward_chain(adapters, order_x[i])
+            d = d_rows[i]
+            for adapter in reversed(adapters):
+                d = adapter.backward(d)
+        for adapter in adapters:
+            A, grad_A = adapter.A, adapter.grad_A
+            for r in range(adapter.rank):
+                a_row, g_row = A[r], grad_A[r]
+                for i in range(adapter.fan_in):
+                    a_row[i] -= lr * g_row[i]
+            B, grad_B = adapter.B, adapter.grad_B
+            for j in range(adapter.fan_out):
+                b_row, g_row = B[j], grad_B[j]
+                for r in range(adapter.rank):
+                    b_row[r] -= lr * g_row[r]
+        history.append({"loss": epoch_loss})
+    return {
+        "loss_history": history,
+        "adapters": adapters,
+        "trainable_params": trainable_params,
+        "base_params": base_params,
+        "total_params": base_params + trainable_params,
+    }
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
