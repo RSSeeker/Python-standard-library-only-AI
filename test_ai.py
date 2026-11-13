@@ -38268,3 +38268,72 @@ class TestFlashMHA:
         assert hist[-1] < hist[0]
         out = flash.generate([0, 1], max_new_tokens=4, rng=random.Random(7))
         assert len(out) == 6
+
+
+"""B15：PagedKVCache 驱动的生成（generate_paged）。"""
+import random
+import AI
+
+
+def _raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % (exc,))
+
+
+class TestPagedGeneration:
+    def test_matches_cached_generation(self):
+        random.seed(201)
+        m = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        p = [0, 1, 2]
+        a = m.generate(p[:], max_new_tokens=6, rng=random.Random(3))
+        b = AI.generate_paged(m, p[:], max_new_tokens=6, rng=random.Random(3))
+        assert a == b
+        assert len(b) == 3 + 6
+
+    def test_window_sliding_matches(self):
+        random.seed(202)
+        m = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, num_layers=1, max_len=4)
+        a = m.generate([0, 1], max_new_tokens=5, rng=random.Random(5))
+        b = AI.generate_paged(m, [0, 1], max_new_tokens=5, rng=random.Random(5))
+        assert a == b
+
+    def test_gqa_rope_matches(self):
+        random.seed(203)
+        m = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, num_kv_heads=1,
+                        num_layers=2, max_len=8, rope=True)
+        a = m.generate([0], max_new_tokens=4, rng=random.Random(9))
+        b = AI.generate_paged(m, [0], max_new_tokens=4, rng=random.Random(9))
+        assert a == b
+
+    def test_block_table_reuse(self):
+        paged = AI.PagedKVCache(1, 1, 2, block_size=2, max_blocks=2)
+        rid = paged.new_request()
+        paged.append(rid, 0, [[0.0, 0.0]], [[0.0, 0.0]])
+        paged.append(rid, 0, [[1.0, 1.0]], [[1.0, 1.0]])
+        paged.append(rid, 0, [[2.0, 2.0]], [[2.0, 2.0]])
+        assert paged.length(rid) == 3
+        assert paged.stats()["blocks_used"] == 2
+        got = paged.get(rid, 0)
+        assert got["key"][2] == [[2.0, 2.0]]
+        paged.free(rid)
+        assert paged.stats()["blocks_used"] == 0
+        rid2 = paged.new_request()
+        paged.append(rid2, 0, [[3.0, 3.0]], [[4.0, 4.0]])
+        assert paged.get(rid2, 0)["value"] == [[[4.0, 4.0]]]
+
+    def test_invalid_inputs(self):
+        random.seed(204)
+        m = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, num_layers=1, max_len=16)
+        _raises(lambda: AI.generate_paged("x", [0]))
+        _raises(lambda: AI.generate_paged(m, []))
+        _raises(lambda: AI.generate_paged(m, [9]))
+        _raises(lambda: AI.generate_paged(m, [0], max_new_tokens=0))
+        _raises(lambda: AI.generate_paged(m, [0], block_size=0))
+        _raises(lambda: AI.generate_paged(m, [0], max_blocks=0))
+        _raises(lambda: AI.generate_paged(m, [0], top_p=0.0))
+        _raises(lambda: AI.generate_paged(m, [0], no_repeat_ngram_size=-1))
+        _raises(lambda: AI.generate_paged(m, [0, 1, 2], max_new_tokens=6,
+                                          rng=random.Random(1), block_size=2, max_blocks=1))

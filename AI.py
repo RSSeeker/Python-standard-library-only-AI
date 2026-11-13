@@ -9615,6 +9615,115 @@ def generate_kv_quantized(model, prompt_ids, max_new_tokens: int = 16,
     return ids
 
 
+def generate_paged(model, prompt_ids, max_new_tokens: int = 16,
+                   temperature: float = 1.0, top_k: int = 0, rng=None,
+                   top_p: float = 1.0, min_p: float = 0.0,
+                   repetition_penalty: float = 1.0,
+                   presence_penalty: float = 0.0,
+                   frequency_penalty: float = 0.0,
+                   no_repeat_ngram_size: int = 0,
+                   block_size: int = 4, max_blocks: int = None):
+    """用 :class:`PagedKVCache` 的块表驱动 ``CausalLM`` 生成（集成演示）
+
+    每步把新 token 的 K/V 写入分页缓存，再从块表**重建**每层的稠密 K/V 列表
+    交给 ``_forward_step``；由于重建是逐层从 ``get()`` 拷贝，这里不做真实显存
+    节省，价值在于验证「生成循环只依赖块表 + 块可跨请求复用」的接线。
+
+    简化点：每步整体重建缓存（O(T²) 拷贝），不实现连续批处理，也不做真实
+    显存池；窗口滑动时释放块表并从新窗口重新预填充。
+    """
+    if not isinstance(model, CausalLM):
+        raise TypeError("generate_paged: model 必须是 CausalLM 实例")
+    ids = _check_token_ids(prompt_ids, model.vocab_size, "generate_paged(prompt_ids)")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 1:
+        raise ValueError(f"generate_paged: max_new_tokens 必须是正整数，收到 {max_new_tokens!r}")
+    for name, val in (("temperature", temperature), ("top_p", top_p),
+                      ("min_p", min_p), ("repetition_penalty", repetition_penalty),
+                      ("presence_penalty", presence_penalty),
+                      ("frequency_penalty", frequency_penalty)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                or not math.isfinite(float(val)):
+            raise ValueError(f"generate_paged: {name} 必须是有限数字，收到 {val!r}")
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError(f"generate_paged: top_p 必须在 (0,1] 内，收到 {top_p!r}")
+    min_p = _check_min_p(min_p, "generate_paged")
+    top_k = _check_top_k(top_k, "generate_paged")
+    if isinstance(no_repeat_ngram_size, bool) or not isinstance(no_repeat_ngram_size, int) \
+            or no_repeat_ngram_size < 0:
+        raise ValueError("generate_paged: no_repeat_ngram_size 必须是非负整数，收到 %r"
+                         % (no_repeat_ngram_size,))
+    layers = len(model.encoder.layers)
+    num_heads = model.num_kv_heads if model.num_kv_heads else model.num_heads
+    head_dim = model.d_model // model.num_heads
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+        raise ValueError("generate_paged: block_size 必须是正整数，收到 %r" % (block_size,))
+    if max_blocks is None:
+        max_blocks = (model.max_len + block_size - 1) // block_size + 1
+    elif isinstance(max_blocks, bool) or not isinstance(max_blocks, int) or max_blocks < 1:
+        raise ValueError("generate_paged: max_blocks 必须是正整数，收到 %r" % (max_blocks,))
+    paged = PagedKVCache(layers, num_heads, head_dim,
+                         block_size=block_size, max_blocks=max_blocks)
+    rid = paged.new_request()
+    if rng is None:
+        rng = random.Random()
+
+    def _append(caches):
+        for li, cache in enumerate(caches):
+            key = [[cache["K"][h][-1][j] for j in range(head_dim)]
+                   for h in range(num_heads)]
+            val = [[cache["V"][h][-1][j] for j in range(head_dim)]
+                   for h in range(num_heads)]
+            paged.append(rid, li, key, val)
+
+    def _rebuild():
+        caches = [{} for _ in range(layers)]
+        for li in range(layers):
+            got = paged.get(rid, li)
+            keys, vals = got["key"], got["value"]
+            caches[li] = {
+                "pos": len(keys),
+                "K": [[[keys[t][h][j] for j in range(head_dim)]
+                       for t in range(len(keys))] for h in range(num_heads)],
+                "V": [[[vals[t][h][j] for j in range(head_dim)]
+                       for t in range(len(vals))] for h in range(num_heads)],
+            }
+        return caches
+
+    window = ids[-model.max_len:]
+    caches = [{} for _ in range(layers)]
+    pos = 0
+    logits = None
+    for tok in window:
+        logits = model._forward_step(tok, pos, caches)
+        _append(caches)
+        pos += 1
+    for _ in range(max_new_tokens):
+        cur = _apply_generation_penalties(logits, ids, repetition_penalty,
+                                          presence_penalty, frequency_penalty,
+                                          no_repeat_ngram_size)
+        pick = model._sample(cur, temperature, top_k, rng, top_p, min_p)
+        ids.append(pick)
+        new_window = ids[-model.max_len:]
+        if len(new_window) == len(window) + 1:
+            caches = _rebuild()
+            logits = model._forward_step(pick, pos, caches)
+            _append(caches)
+            pos += 1
+        else:
+            # 窗口滑动：块表整体作废并归还，重新预填充
+            paged.free(rid)
+            rid = paged.new_request()
+            caches = [{} for _ in range(layers)]
+            pos = 0
+            for tok in new_window:
+                logits = model._forward_step(tok, pos, caches)
+                _append(caches)
+                pos += 1
+        window = new_window
+    return ids
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

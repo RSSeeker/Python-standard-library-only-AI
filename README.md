@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2491 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2496 项）
 
 ## 特性
 
@@ -2040,6 +2040,7 @@ base = magnitude_prune(weights, sparsity=0.5)      # 幅度剪枝基线
 | `kv_quantize_row(row, bits=4, eps=1e-12)` | 单行 absmax 对称定点量化后立即反量化（`bits` 2–8），用于逐行数值模拟；零行保持 |
 | `kv_cache_quantize_rows(caches, bits=4)` | 就地量化 KV cache 列表（`[层]["K"/"V"][kv_head][t][d_k]` 的行），返回量化行数 |
 | `generate_kv_quantized(model, prompt_ids, ..., kv_cache_bits=4)` | 生成时每步把全部 KV cache 行量化/反量化（误差模拟）；采样参数与 `CausalLM.generate` 相同，支持窗口滑动 |
+| `generate_paged(model, prompt_ids, ..., block_size=4, max_blocks=None)` | 用 `PagedKVCache` 块表驱动生成：每步把新 token 的 K/V 写入分页缓存，再从块表重建每层稠密 K/V 交给 `_forward_step`；块表可跨请求复用，窗口滑动时释放并重新预填充 |
 | `wanda_importance(weights, activations)` | `\|W_ij\| × \|\|X_j\|\|`；`activations` 可为每列范数（1D）或 2D 校准数据 |
 | `wanda_prune(weights, activations, sparsity=0.5)` | 每行保留重要性 top-(1-sparsity)，返回 `{'weights','mask','sparsity','keep_per_row'}` |
 | `magnitude_prune(weights, sparsity=0.5)` | 幅度剪枝基线（每行按 `\|w\|` 保留） |
@@ -2063,6 +2064,21 @@ ids = generate_kv_quantized(lm, [1, 2, 3], max_new_tokens=8,
 - `CausalLM.generate(..., kv_cache_bits=4)` 是同一功能的常用入口：内部直接转调
   `generate_kv_quantized`，因此支持同样的温度/top-k/top-p/min-p/惩罚参数；
   要求 `use_cache=True` 且 `num_beams=1`，否则抛 ValueError。
+
+#### 分页 KV cache 生成（generate_paged）
+
+`generate_paged` 用 `PagedKVCache` 的块表（逻辑位置 → 物理块映射）作为生成时 K/V 的唯一
+存储：每个解码步把新 token 的 K/V 写入分页缓存，再从 `get()` 重建每层稠密 K/V 列表交给
+`CausalLM._forward_step`，从而把「块表 + 生成循环」串起来；窗口滑动时释放块表并重填。
+
+```python
+lm = CausalLM(vocab_size=8, d_model=32, num_heads=4, num_layers=1, max_len=16)
+ids = generate_paged(lm, [1, 2, 3], max_new_tokens=8,
+                     temperature=0.8, block_size=4, max_blocks=None)
+```
+
+- 边界：每步整体重建缓存是 O(T²) 拷贝，没有真实显存节省或连续批处理；块表只为演示
+  `PagedKVCache` 的分配/复用语义；`max_blocks` 不足时生成中途抛 ValueError；只支持采样式生成。
 
 ### 稀疏检索与混合重排（BM25 / RRF / ColBERT-lite）
 
@@ -5188,7 +5204,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2491 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2496 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5507,6 +5523,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPRMTrainer` | BCE 梯度中心差分、可分离标签拟合并排序、序列聚合复用、便捷函数、非法输入 |
 | `TestKVCacheQuantize` | 行量化误差界与网格、cache 结构就地量化、量化生成长度/词表/复现、窗口滑动、非法输入 |
 | `TestGenerateKVBits` | `CausalLM.generate(kv_cache_bits=...)` 与 generate_kv_quantized 逐位一致、束搜索/use_cache/非法 bits 报错 |
+| `TestPagedGeneration` | `generate_paged` 与稠密 KV cache 生成逐 token 一致（causal / 窗口滑动 / GQA+RoPE）、块表 token 计数与块复用、非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
@@ -5629,6 +5646,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2491 个单元测试
+├── test_ai.py       # 2496 个单元测试
 └── README.md
 ```
