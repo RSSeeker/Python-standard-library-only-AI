@@ -31735,7 +31735,7 @@ class MoE:
         return per * self.num_experts + len(self.W_gate) * self.d_model + len(self.b_gate)
 
     # ---- 前向
-    def forward(self, x_seq):
+    def forward(self, x_seq, capacity_factor=None):
         if not isinstance(x_seq, (list, tuple)) or not x_seq:
             raise ValueError("MoE.forward: 输入必须是非空序列")
         T = len(x_seq)
@@ -31765,6 +31765,36 @@ class MoE:
                 group_pos[e][t] = len(group_index[e])
                 group_index[e].append(t)
                 group_w[e].append(w)
+        # capacity factor：每个专家最多容纳 ceil(cf * T * top_k / E) 个 token，
+        # 超出容量的路由被丢弃（token dropping），被丢弃路由不参与输出。
+        self.dropped_count = 0
+        self.capacity = None
+        if capacity_factor is not None:
+            if (isinstance(capacity_factor, bool)
+                    or not isinstance(capacity_factor, (int, float))
+                    or not math.isfinite(float(capacity_factor))
+                    or float(capacity_factor) <= 0.0):
+                raise ValueError(
+                    "MoE.forward: capacity_factor 必须是有限正数，"
+                    f"收到 {capacity_factor!r}")
+            cf = float(capacity_factor)
+            capacity = max(1, int(math.ceil(cf * T * self.top_k / self.num_experts)))
+            self.capacity = capacity
+            kept_index = [[] for _ in range(self.num_experts)]
+            kept_w = [[] for _ in range(self.num_experts)]
+            kept_pos = [{} for _ in range(self.num_experts)]
+            for e in range(self.num_experts):
+                for k, t in enumerate(group_index[e]):
+                    if len(kept_index[e]) < capacity:
+                        kept_pos[e][t] = len(kept_index[e])
+                        kept_index[e].append(t)
+                        kept_w[e].append(group_w[e][k])
+                    else:
+                        self.dropped_count += 1
+            group_index = kept_index
+            group_w = kept_w
+            group_pos = kept_pos
+
         self.group_index = group_index
         self.group_w = group_w
         self.group_pos = group_pos
@@ -31813,18 +31843,20 @@ class MoE:
                 for j in range(self.d_model):
                     dx[t][j] += row[j]
 
-        # 2) 路由梯度：被选中专家的 softmax
+        # 2) 路由梯度：被选中专家上的 softmax（capacity 丢弃的路由不参与）
         for t in range(T):
-            route = self.routes[t]
+            kept = [(e, w) for (e, w) in self.routes[t] if t in self.group_pos[e]]
+            if not kept:
+                continue
             c = []
-            for e, _w in route:
+            for e, _w in kept:
                 gpos = self.group_pos[e][t]
                 c.append(sum(map(_mul, dout_seq[t], self._last_group_out[e][gpos])))
-            # p 已归一化在选中集合上：dz_j = p_j (c_j - Σ_k p_k c_k)
-            q = [w for _e, w in route]
-            base = sum(q[k] * c[k] for k in range(len(route)))
+            # q 已归一化在全部 top_k 上：dz_j = q_j (c_j - Σ_k q_k c_k)，只对保留路由求和
+            q = [w for _e, w in kept]
+            base = sum(q[k] * c[k] for k in range(len(kept)))
             xt = self.x[t]
-            for k, (e, _w) in enumerate(route):
+            for k, (e, _w) in enumerate(kept):
                 dz = q[k] * (c[k] - base)
                 self.grad_b_gate[e] += dz
                 gw = self.grad_W_gate[e]
@@ -31866,6 +31898,43 @@ class MoE:
     def aux_loss(self, coefficient: float = 0.01):
         """:meth:`load_balancing_loss` 的别名。"""
         return self.load_balancing_loss(coefficient)
+
+    def load_balancing_loss_and_backward(self, coefficient: float = 0.01):
+        """负载均衡损失的解析反向。
+
+        返回 ``(loss, dx)``，并把梯度累加到 ``grad_W_gate`` / ``grad_b_gate``。
+        记 ``p_{t,e}`` 为 token t 在全部专家上的门 softmax，``f_e`` 为 top-k
+        计数比例，则
+
+            dL/dlogit_{t,k} = coef * E / T * p_{t,k} * (f_k - Σ_i f_i p_{t,i})
+
+        （``f_i`` 来自硬 top-k 选择，对 logits 的导数几乎处处为 0）。
+        需要先调用 :meth:`forward`（含 capacity 时同样适用：``f`` 用丢弃前的
+        top-k 路由统计）。"""
+        loss = self.load_balancing_loss(coefficient)
+        T = len(self._gate_all_probs)
+        E = self.num_experts
+        counts = [0] * E
+        for route in self.routes:
+            for e, _w in route:
+                counts[e] += 1
+        f = [c / float(T * self.top_k) for c in counts]
+        coef = float(coefficient)
+        dx = [[0.0] * self.d_model for _ in range(T)]
+        for t in range(T):
+            probs = self._gate_all_probs[t]
+            weighted = sum(f[e] * probs[e] for e in range(E))
+            xt = self.x[t]
+            for e in range(E):
+                dlogit = coef * E / float(T) * probs[e] * (f[e] - weighted)
+                if dlogit == 0.0:
+                    continue
+                self.grad_b_gate[e] += dlogit
+                gw = self.grad_W_gate[e]
+                for j in range(self.d_model):
+                    gw[j] += dlogit * xt[j]
+                    dx[t][j] += dlogit * self.W_gate[e][j]
+        return loss, dx
 
     # ---- 优化
     def sgd_step(self, lr: float = 0.01):

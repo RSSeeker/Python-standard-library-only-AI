@@ -41004,3 +41004,112 @@ class TestHyenaBlock:
         assert _hyena_raises(lambda: blk.backward([["x"] * 4, [0.0] * 4]))
         assert _hyena_raises(lambda: blk.sgd_step(0.0))
         assert _hyena_raises(lambda: blk.adam_step(-0.1))
+
+
+def _moe_aux_raises(fn, exc=(ValueError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _moe_seq(t_len, d, seed):
+    rng = random.Random(seed)
+    return [[rng.uniform(-1.0, 1.0) for _ in range(d)] for _ in range(t_len)]
+
+
+class TestMoEAdvanced:
+    def test_aux_loss_backward_fd(self):
+        m = AI.MoE(4, 6, 3, 2)
+        xs = _moe_seq(5, 4, 1)
+        m.zero_grad()
+        m.forward(xs)
+        loss, dx = m.load_balancing_loss_and_backward(0.01)
+        assert abs(loss - m.load_balancing_loss(0.01)) < 1e-12
+
+        def aux():
+            return m.load_balancing_loss(0.01)
+
+        h = 1e-5
+        cases = [
+            ("W_gate[0][1]", lambda: m.W_gate[0][1],
+             lambda v: m.W_gate[0].__setitem__(1, v), m.grad_W_gate[0][1]),
+            ("b_gate[2]", lambda: m.b_gate[2],
+             lambda v: m.b_gate.__setitem__(2, v), m.grad_b_gate[2]),
+            ("dx[0][2]", lambda: xs[0][2],
+             lambda v: xs[0].__setitem__(2, v), dx[0][2]),
+        ]
+        for tag, getter, setter, ana in cases:
+            p0 = getter()
+            setter(p0 + h)
+            m.forward(xs)
+            lp = aux()
+            setter(p0 - h)
+            m.forward(xs)
+            lm = aux()
+            setter(p0)
+            m.forward(xs)
+            num = (lp - lm) / (2.0 * h)
+            rel = abs(ana - num) / max(1.0, abs(ana), abs(num))
+            assert rel < 1e-6, "%s rel=%.3e ana=%.6e num=%.6e" % (tag, rel, ana, num)
+
+    def test_capacity_token_dropping(self):
+        m = AI.MoE(2, 2, 2, 1)
+        # 让 x0>0 路由到专家 0、x0<0 路由到专家 1
+        m.W_gate = [[1.0, 0.0], [-1.0, 0.0]]
+        m.b_gate = [0.0, 0.0]
+        xs = [[1.0, 0.0], [-1.0, 0.0], [2.0, 0.0], [-2.0, 0.0]]
+        out = m.forward(xs, capacity_factor=0.5)
+        # capacity = ceil(0.5*4*1/2) = 1，每个专家接收 2 个 token，丢弃 1 个
+        assert m.capacity == 1
+        assert m.dropped_count == 2
+        assert out[0] != [0.0, 0.0]
+        assert out[1] != [0.0, 0.0]
+        assert out[2] == [0.0, 0.0]
+        assert out[3] == [0.0, 0.0]
+        # 丢弃 token 无输入梯度；保留 token 有梯度
+        dx = m.backward([[1.0, 1.0]] * 4)
+        assert dx[2] == [0.0, 0.0]
+        assert dx[3] == [0.0, 0.0]
+        assert dx[0] != [0.0, 0.0]
+        # 无容量限制时不丢弃
+        m.zero_grad()
+        out2 = m.forward(xs)
+        assert m.dropped_count == 0
+        assert m.capacity is None
+        assert out2[2] != [0.0, 0.0]
+
+    def test_capacity_factor_validation(self):
+        m = AI.MoE(2, 2, 2, 1)
+        xs = _moe_seq(3, 2, 3)
+        for bad in (0.0, -1.0, True, "x", float("nan"), float("inf")):
+            assert _moe_aux_raises(lambda: m.forward(xs, capacity_factor=bad)), bad
+        # 合法值
+        m.forward(xs, capacity_factor=2.0)
+        assert m.capacity >= 1
+
+    def test_aux_backward_accumulates(self):
+        m = AI.MoE(4, 6, 3, 2)
+        xs = _moe_seq(4, 4, 5)
+        m.zero_grad()
+        m.forward(xs)
+        _, _dx1 = m.load_balancing_loss_and_backward(0.01)
+        g1 = m.grad_W_gate[0][0]
+        _, _dx2 = m.load_balancing_loss_and_backward(0.01)
+        g2 = m.grad_W_gate[0][0]
+        assert abs(g2 - 2.0 * g1) < 1e-12
+        # coefficient=0 返回 0 损失且梯度为零
+        m.zero_grad()
+        m.forward(xs)
+        loss, dx = m.load_balancing_loss_and_backward(0.0)
+        assert loss == 0.0
+        assert all(v == 0.0 for row in dx for v in row)
+
+    def test_aux_backward_errors(self):
+        m = AI.MoE(4, 6, 3, 2)
+        xs = _moe_seq(3, 4, 7)
+        assert _moe_aux_raises(lambda: m.load_balancing_loss_and_backward())
+        m.forward(xs)
+        assert _moe_aux_raises(lambda: m.load_balancing_loss(-0.01))
+        assert _moe_aux_raises(lambda: m.load_balancing_loss_and_backward(-0.5))

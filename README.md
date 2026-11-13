@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2613 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2618 项）
 
 ## 特性
 
@@ -305,8 +305,10 @@ aux = moe.load_balancing_loss(coefficient=0.01)   # L_aux = coef·E·Σ f_i·P_i
 - `GradScaler` 是**状态机**：`update()` 在 `growth_interval` 次正常更新后翻倍，检测到 inf/nan 后退半；
   它不负责把缩放因子传给优化器，调用方应只在实际更新成功后调用 `update()`。
 - `MoE.load_balancing_loss` 返回标量损失，用 `moe._gate_all_probs`（forward 缓存的全专家概率）
-  与 top-k 路由计数计算 `f_i`/`P_i`；当前框架的路由梯度只回传选中专家，这个辅助损失用于监控
-  或与外部训练循环组合，尚未接入路由网络的梯度（Switch Transformer 的 aux loss 训练需要对应反向）。
+  与 top-k 路由计数计算 `f_i`/`P_i`；`load_balancing_loss_and_backward` 进一步给出辅助损失的解析
+  路由梯度（含 `grad_W_gate`/`grad_b_gate` 与输入梯度），可直接与任务损失相加做正则。
+- `MoE.forward(..., capacity_factor=...)` 是**容量限制**的简化实现：按 `ceil(cf·T·top_k/E)` 截断
+  每个专家接收的 token，超出的路由被丢弃且不产生输出/梯度；`cf=None` 时行为不变（不丢弃）。
 
 ### 半监督与一致性正则
 
@@ -396,7 +398,7 @@ model.train()     # 回到训练
 | `MultiHeadAttention` | 多头注意力机制（`causal=True` → 因果掩码，位置 t 只能看到 `0..t`；`window=N` → 滑动窗口局部因果；`rope=True` → Q/K 旋转位置编码；`dropout>0` → 注意力权重 dropout） |
 | `FeedForward(d_model, d_ff, activation='relu')` | 前馈网络（`activation` 可选 relu/gelu/sigmoid/silu/mish/elu/selu/linear） |
 | `SwiGLU(d_model, d_ff)` | 门控前馈网络（LLaMA/PaLM）：`(silu(x·W_g) ⊙ (x·W_1))·W_2`，表达力强于 ReLU-FFN；`gate="swish\|silu\|gelu\|relu\|bilinear"` 对应 GeGLU / ReGLU / Bilinear GLU |
-| `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0 |
+| `MoE(d_model, d_ff, num_experts=4, top_k=2)` | 专家混合前馈层：路由网络为每个 token 选 top-k 个专家，在被选中的专家上做 softmax 加权求和；未被选中的专家梯度恰为 0；`forward(..., capacity_factor=None)` 支持容量限制与 token dropping，`load_balancing_loss_and_backward` 提供负载均衡损失的解析路由梯度 |
 | `VAE(input_dim, hidden_dim=32, latent_dim=2, beta=1.0)` | 变分自编码器：重参数化采样 `z = mu + eps·std`，损失 = 重构 MSE + `beta·KL`；`fit` / `sample` |
 | `ActNorm(dim)` / `InvertibleLinear(dim, noise=0.05, seed=0)` | Glow 的两个可逆组件：`ActNorm` 做逐维仿射 `y=(x-b)·e^{log_s}`（`data_init(batch)` 按首批均值/方差初始化，`logdet = Σlog_s` 与输入无关）；`InvertibleLinear` 做 `y=Wx`，`log\|det J\|=log\|det W\|` **精确**（LU + 部分主元），`inverse` 用高斯消元求解而非矩阵求逆；两者都有 `backward`（`InvertibleLinear` 的 `g_W` 含 `g_logdet·W^{-T}` 项）与 `sgd_step`/`adam_step` |
 | `RealNVP(data_dim=2, hidden_dim=16, num_layers=4, scale_limit=1.0)` | 仿射耦合流：`s = scale_limit·tanh(W_s2 σ(W_s1 x_a+b_s1)+b_s2)`、`y_b = x_b·e^s + t`，`log\|det J\| = Σs` **精确**；`inverse` 与 `forward` 互逆（实测 4.4e-16）、`log_prob` 给真密度、`nll`/`fit`/`sample`；`tanh` 限幅避免 `exp` 溢出（教学简化，原论文用自由 scale） |
@@ -5505,6 +5507,7 @@ print(model.history['train_loss'][-1])
 ```python
 moe = AI.MoE(d_model=32, d_ff=64, num_experts=4, top_k=2)
 out = moe.forward(hidden)            # (T, d_model)，与 FeedForward 同形
+out = moe.forward(hidden, capacity_factor=1.25)  # 容量限制 + token dropping
 loss, dout = ..., ...               # 由上层给出对 out 的梯度
 dx = moe.backward(dout)             # (T, d_model)，可继续往前传
 moe.adam_step(lr=1e-3)
@@ -5519,10 +5522,17 @@ moe.adam_step(lr=1e-3)
 批量矩阵化。token 数不多时很快，超长序列会比稠密 FFN 慢；真实实现需要更复杂的
 分组矩阵乘法。
 
+`forward(x_seq, capacity_factor=...)` 会按 `capacity = ceil(cf · T · top_k / E)` 限制每个专家
+接收的 token 数，超出的路由被丢弃（`moe.dropped_count` 为丢弃数、`moe.capacity` 为容量），
+被丢弃 token 在该专家上的输出与梯度都为 0；`cf=None`（默认）时不做容量限制。
+
 训练时可调用 `moe.load_balancing_loss(coefficient=0.01)` 计算 Switch Transformer 的
 负载均衡辅助损失 `L_aux = coefficient · E · Σ_i f_i · P_i`（`f_i` 为路由计数比例、
 `P_i` 为全专家门概率均值）；均匀路由时它等于 `coefficient`，全部 token 挤到少数专家时会接近
-`coefficient · E`。该值用于监控与外部损失组合，路由梯度只回传被选中的专家。
+`coefficient · E`。`moe.load_balancing_loss_and_backward(coefficient)` 返回 `(loss, dx)`，
+同时把辅助损失对门控网络的解析梯度累积到 `grad_W_gate`/`grad_b_gate`（`dx` 是辅助损失对输入的
+梯度，可与其他损失相加）；其路由梯度公式为
+`dL/dlogit_{t,k} = coef · E / T · p_{t,k} · (f_k − Σ_i f_i · p_{t,i})`，`p` 为全专家 softmax。
 
 ## 生成模型：VAE / GAN / DDPM
 
@@ -5711,7 +5721,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2613 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2618 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5733,6 +5743,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTokenClassificationHead` | 形状与参数校验、W/b 中心差分、`mask` 只算有效 token 且被屏蔽行梯度为 0、`predict` 的 argmax 与 mask 语义、300 步训练后 loss 降 20 倍并全对 |
 | `TestMultiLabelHead` | 概率范围与校验、BCE 梯度中心差分、阈值预测（含非法阈值）、400 步训练后 loss 降 3 倍并全对 |
 | `TestMoE` | 形状与参数校验（含 `top_k > num_experts`、非法 `top_k`）、`top_k=1` 权重恒 1、路由权重与专家权重/输入的中心差分、未选中专家梯度恰为 0、200 步训练降 5 倍且至少两个专家被用到 |
+| `TestMoEAdvanced` | 负载均衡损失对门控权重/偏置/输入的中心差分、`capacity_factor` 的容量计算与 token dropping（输出与梯度为 0）、非法容量参数、辅助损失梯度累加与 `coefficient=0` 边界 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
 | `TestDDPM` | `q_sample` 与公式逐位一致、`t`/`x0`/`noise` 三类校验、噪声预测层梯度中心差分、150 轮训练降 2.5 倍、反向采样有限且均值在数据尺度内 |
@@ -6179,6 +6190,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2613 个单元测试
+├── test_ai.py       # 2618 个单元测试
 └── README.md
 ```
