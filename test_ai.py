@@ -40321,3 +40321,96 @@ class TestMoleculeGNN(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _b4_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+class TestBERT4Rec(unittest.TestCase):
+    def test_forward_mask_and_param_count(self):
+        random.seed(0)
+        m = AI.BERT4Rec(num_items=5, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                        max_len=8, mask_prob=0.4, seed=1)
+        self.assertEqual(m.param_count(), 702)
+        seq = [1, 2, 3, 4, 5]
+        logits = m.forward(seq)
+        self.assertEqual(len(logits), 5)
+        self.assertEqual(len(logits[0]), 6)
+        corrupted, positions, targets = m.mask_tokens(seq, random.Random(3))
+        self.assertEqual(len(positions), len(targets))
+        self.assertTrue(all(corrupted[p] == m.mask_id for p in positions))
+        self.assertTrue(all(seq[p] == t for p, t in zip(positions, targets)))
+        c2, p2, t2 = m.mask_tokens(seq, random.Random(3))
+        self.assertEqual((c2, p2, t2), (corrupted, positions, targets))
+        top = m.predict(seq, top_k=3)
+        self.assertEqual(len(top), 3)
+        self.assertTrue(all(1 <= v <= 5 for v in top))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.BERT4Rec(num_items=5, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                        max_len=8, mask_prob=0.4, seed=1)
+        seq = [1, 2, 3, 4, 5]
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(seq, random.Random(3))
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 2e-3, tag)
+
+        fd(lambda: m.grad_out[0][0][0], lambda: m.out_layer.weights[0][0],
+           lambda v: m.out_layer.weights[0].__setitem__(0, v), "out layer")
+        fd(lambda: m.embedding.grad_weight[5][0], lambda: m.embedding.weight[5][0],
+           lambda v: m.embedding.weight[5].__setitem__(0, v), "mask emb")
+
+    def test_fit(self):
+        random.seed(0)
+        seqs = [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]]
+        m = AI.BERT4Rec(num_items=5, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                        max_len=8, mask_prob=0.4, seed=2)
+        hist = m.fit(seqs, epochs=200, lr=0.05, seed=1)
+        self.assertGreater(len(hist), 0)
+        self.assertLess(hist[-1], hist[0] * 0.3)
+
+    def test_invalid_inputs(self):
+        _b4_raises(lambda: AI.BERT4Rec(num_items=0))
+        _b4_raises(lambda: AI.BERT4Rec(num_items=5, d_model=7, num_heads=2))
+        _b4_raises(lambda: AI.BERT4Rec(num_items=5, mask_prob=0.0))
+        _b4_raises(lambda: AI.BERT4Rec(num_items=5, dropout=1.0))
+        _b4_raises(lambda: AI.BERT4Rec(num_items=5, seed=1.5))
+        m = AI.BERT4Rec(num_items=5, d_model=8, num_heads=2, d_ff=16, num_layers=1,
+                        max_len=8, seed=1)
+        _b4_raises(lambda: m.forward([]))
+        _b4_raises(lambda: m.forward([1, 6]))
+        _b4_raises(lambda: m.forward([1] * 9))
+        _b4_raises(lambda: m.predict([1, 2], top_k=0))
+        _b4_raises(lambda: m.sgd_step(0.0))
+        _b4_raises(lambda: m.fit([]))
+        _b4_raises(lambda: m.fit([[1, 2, 3]], epochs=0))
+
+
+if __name__ == "__main__":
+    unittest.main()

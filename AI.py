@@ -13438,6 +13438,175 @@ class MoleculeGNN:
             total += layer.param_count()
         return total
 
+"""BERT4Rec 式序列推荐：双向 Transformer + 掩码物品预测（cloze）。
+
+简化点：没有训练时的 mask 替换比例（只按 mask_prob 全遮）、没有负采样与全量 softmax 近似，
+没有物品流行度 debias；训练目标是只在被遮位置做交叉熵。
+"""
+import math
+import random
+
+
+def _b4r_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("BERT4Rec: %s 必须是正整数" % name)
+    return value
+
+
+def _b4r_check_seq(seq, num_items, max_len):
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError("BERT4Rec: 序列必须是非空列表")
+    if len(seq) > max_len:
+        raise ValueError("BERT4Rec: 序列长度不能超过 max_len")
+    out = []
+    for v in seq:
+        if isinstance(v, bool) or not isinstance(v, int) or not (1 <= v <= num_items):
+            raise ValueError("BERT4Rec: token 必须是 [1, num_items] 内的整数")
+        out.append(int(v))
+    return out
+
+
+class BERT4Rec:
+    def __init__(self, num_items, d_model=32, num_heads=2, d_ff=64, num_layers=2,
+                 max_len=50, mask_prob=0.15, dropout=0.0, seed=None):
+        self.num_items = _b4r_check_pos_int(num_items, "num_items")
+        self.d_model = _b4r_check_pos_int(d_model, "d_model")
+        self.num_heads = _b4r_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _b4r_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _b4r_check_pos_int(num_layers, "num_layers")
+        self.max_len = _b4r_check_pos_int(max_len, "max_len")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("BERT4Rec: d_model 必须能被 num_heads 整除")
+        if isinstance(mask_prob, bool) or not isinstance(mask_prob, (int, float)) or not (0.0 < mask_prob < 1.0):
+            raise ValueError("BERT4Rec: mask_prob 必须在 (0, 1) 内")
+        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not (0.0 <= dropout < 1.0):
+            raise ValueError("BERT4Rec: dropout 必须在 [0, 1) 内")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("BERT4Rec: seed 必须是 int 或 None")
+        self.mask_prob = float(mask_prob)
+        self.dropout = float(dropout)
+        self.mask_id = self.num_items
+        saved = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.embedding = Embedding(self.num_items + 1, self.d_model)
+            self.pos = PositionalEncoding(self.d_model, self.max_len)
+            self.encoder = TransformerEncoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.num_layers,
+                                              dropout=self.dropout, causal=False)
+            self.out_layer = Layer(self.d_model, self.num_items + 1, "linear")
+        finally:
+            random.setstate(saved)
+        self._cache = None
+
+    # ---------- 掩码 ----------
+
+    def mask_tokens(self, seq, rng=None):
+        rng = rng if rng is not None else random
+        n = len(seq)
+        k = max(1, min(n, int(round(n * self.mask_prob))))
+        positions = sorted(rng.sample(range(n), k))
+        corrupted = list(seq)
+        for p in positions:
+            corrupted[p] = self.mask_id
+        targets = [seq[p] for p in positions]
+        return corrupted, positions, targets
+
+    # ---------- 前向 ----------
+
+    def forward(self, ids):
+        seq = _b4r_check_seq(ids, self.num_items, self.max_len)
+        h = self.embedding.forward(seq)
+        h = self.pos.forward(h)
+        enc = self.encoder.forward(h)
+        logits, out_cache = _dense_rows_forward(self.out_layer, enc)
+        self._cache = {"seq": seq, "enc": enc, "logits": logits, "out_cache": out_cache}
+        return logits
+
+    def predict(self, seq, top_k=5):
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("BERT4Rec: top_k 必须是正整数")
+        s = _b4r_check_seq(seq, self.num_items, self.max_len)
+        corrupted = list(s[:-1]) + [self.mask_id]
+        logits = self.forward(corrupted)
+        row = logits[-1][1:self.num_items + 1]
+        order = sorted(range(len(row)), key=lambda i: row[i], reverse=True)[:min(top_k, len(row))]
+        return [i + 1 for i in order]
+
+    # ---------- 损失与反向 ----------
+
+    def loss_and_backward(self, ids, rng=None):
+        seq = _b4r_check_seq(ids, self.num_items, self.max_len)
+        corrupted, positions, targets = self.mask_tokens(seq, rng)
+        logits = self.forward(corrupted)
+        loss = 0.0
+        d_logits = [[0.0] * (self.num_items + 1) for _ in range(len(corrupted))]
+        for pos, target in zip(positions, targets):
+            row = logits[pos]
+            m = max(row)
+            exps = [math.exp(v - m) for v in row]
+            total = sum(exps)
+            probs = [v / total for v in exps]
+            loss += -math.log(max(1e-12, probs[target]))
+            d = list(probs)
+            d[target] -= 1.0
+            d_logits[pos] = d
+        loss /= len(positions)
+        for pos in positions:
+            for k in range(len(d_logits[pos])):
+                d_logits[pos][k] /= len(positions)
+        gw, gb, d_enc = _dense_rows_backward(self.out_layer, self._cache["out_cache"], d_logits)
+        self.grad_out = (gw, gb)
+        d_h = self.encoder.backward(d_enc)
+        d_h = self.pos.backward(d_h)
+        self.embedding.backward(d_h)
+        return loss
+
+    def zero_grad(self):
+        self.grad_out = None
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("BERT4Rec: lr 必须为正数")
+        if self.grad_out is not None:
+            _dense_apply_sgd(self.out_layer, self.grad_out, lr)
+        self.embedding.sgd_step(lr)
+        self.encoder.sgd_step(lr)
+
+    def fit(self, sequences, epochs=20, lr=0.05, seed=None, shuffle=True):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("BERT4Rec: sequences 必须是非空列表")
+        _b4r_check_pos_int(epochs, "epochs")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("BERT4Rec: seed 必须是 int 或 None")
+        checked = [_b4r_check_seq(s, self.num_items, self.max_len) for s in sequences]
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(checked)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(checked[idx], rng)
+                self.sgd_step(lr)
+            history.append(total / len(checked))
+        return history
+
+    def param_count(self):
+        return (self.embedding.vocab_size * self.embedding.embed_dim +
+                self.out_layer.fan_in * self.out_layer.fan_out +
+                self.out_layer.fan_out + self._encoder_param_count())
+
+    def _encoder_param_count(self):
+        d = self.d_model
+        per_layer = 4 * (d * d + d) + (d * self.d_ff + self.d_ff) + (self.d_ff * d + d) + 4 * d
+        return self.num_layers * per_layer
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

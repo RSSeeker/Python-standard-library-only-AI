@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2584 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2588 项）
 
 ## 特性
 
@@ -4034,6 +4034,31 @@ print(model.predict([1], top_k=3))
 逐序列 SGD（无 mini-batch、无 Adam、无负采样、无采样评估指标）；只做下一物品预测，
 不含序列增广、物品侧信息与多任务输出；因果 mask 保证位置 `t` 的表示只依赖 `≤ t` 的输入。
 
+### BERT4Rec（双向序列推荐 + 掩码物品预测）
+
+```python
+from AI import BERT4Rec
+
+model = BERT4Rec(num_items=100, d_model=32, num_heads=2, d_ff=64,
+                 num_layers=2, max_len=50, mask_prob=0.15, seed=1)
+history = model.fit([[1, 2, 3, 4, 5], [2, 3, 4, 5, 6]], epochs=20, lr=0.05)
+top = model.predict([1, 2, 3, 4], top_k=5)
+```
+
+| API | 说明 |
+| --- | --- |
+| `BERT4Rec(...)` | 双向 Transformer 序列推荐；物品嵌入 `num_items+1` 行（`0` 为 padding、`num_items` 为 `[MASK]`），非因果编码器，输出头预测被遮物品 |
+| `mask_tokens(seq, rng)` | 随机遮 `round(len(seq)*mask_prob)` 个位置，返回 `(corrupted, positions, targets)` |
+| `forward(ids)` | 返回逐位置 logits `[L, num_items+1]` |
+| `loss_and_backward(ids, rng)` | 只在被遮位置做交叉熵并反传（其余位置梯度为 0），返回平均损失 |
+| `predict(seq, top_k)` | 遮住最后一位，返回 top-k 物品 id |
+| `fit(sequences, epochs, lr, seed, shuffle)` | 逐序列随机遮罩 + SGD，返回每 epoch 平均损失 |
+| `param_count()` | 物品嵌入 + 编码器 + 输出头参数量 |
+
+边界：这是简化版 BERT4Rec——训练时只做「全遮」不按 80/10/10 替换为随机物品；没有负采样、
+没有物品流行度去偏、不做全量 softmax 近似（输出维度就是 num_items+1）；`predict` 只遮最后
+一位（推理不做 beam / 多次采样）；每步更新是逐序列 SGD，没有 batch/Adam/学习率调度。
+
 ### 神经风格迁移
 
 | 接口 | 说明 |
@@ -5617,7 +5642,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2584 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2588 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5814,6 +5839,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestE3NN` | 旋转/平移等变与置换等变、`phi_e`/`phi_x`/`phi_h` 与坐标梯度有限差分、模型参数量 104、距离和拟合下降、非法输入 |
 | `TestCheckpointReleaseAndFp8` | `checkpoint_grads(release=True)` 与普通反传逐位一致、段后缓存确实被清空；`prune_channels_structured` 真删通道后 fan/参数量/前向形状正确；`fp8_round` 的 E4M3/E5M2 已知值、饱和与下溢；FP8 量化幂等与 `mixed_precision_grads` 的 FP8 舍入 |
 | `TestFitMixedPrecision` | fp16 批量训练收敛、bf16 逐样本 batch、两种 fp8 格式能跑、无 shuffle 的 batch 数、非法输入（模型/dtype/scale/lr/epochs/batch_size/维度/类型） |
+| `TestBERT4Rec` | 前向形状与 param_count（702）、mask 可复现、输出层/嵌入权重中心差分、固定序列 fit 损失下降、非法 token/长度/参数 |
 | `TestSASRec` | 前向形状与 param_count（226）、因果前缀不变性、输出层/嵌入权重中心差分、固定转移序列可学会、预测排除 padding、非法 token/长度/参数 |
 | `TestDCNv2` | logit/概率/损失、交叉层两处权重中心差分、深侧 MLP 与线性项梯度、XOR 型目标可学会、非法输入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
@@ -6079,6 +6105,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2584 个单元测试
+├── test_ai.py       # 2588 个单元测试
 └── README.md
 ```
