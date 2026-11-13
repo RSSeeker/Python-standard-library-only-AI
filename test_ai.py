@@ -39113,3 +39113,104 @@ class TestCheckpointedCausalLM:
         assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed(m, [[1, 2]], seed="a"))
         assert _ckpt_raises(lambda: AI.checkpoint_causal_lm_backward("x", [1, 2]))
         assert _ckpt_raises(lambda: AI.fit_causal_lm_checkpointed("x", [[1, 2]]))
+
+
+# ---------------------------------------------------------------------------
+# TrOCR（图像编码器 + 文本解码器 OCR）
+# ---------------------------------------------------------------------------
+
+
+def _trocr_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+class TestTrOCR:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.TrOCR(vocab_size=6, in_channels=1, image_size=8, patch_size=4,
+                     d_model=8, num_heads=1, d_ff=16, enc_layers=1, dec_layers=1,
+                     max_len=8, seed=3)
+        assert m.param_count() == 1742
+        img = [[[0.2] * 8 for _ in range(8)]]
+        logits = m.forward(img, [1, 2])
+        assert len(logits) == 2 and len(logits[0]) == 6
+        out = m.predict(img, start_id=1, max_new_tokens=2)
+        assert out[0] == 1 and len(out) <= 4
+        _trocr_raises(lambda: m._encode_image([[0.0] * 8 for _ in range(8)]))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.TrOCR(vocab_size=6, in_channels=1, image_size=8, patch_size=4,
+                     d_model=8, num_heads=1, d_ff=16, enc_layers=1, dec_layers=1,
+                     max_len=8, seed=5)
+        img = [[[0.3] * 8 for _ in range(8)]]
+        cap = [1, 2, 3]
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(img, cap)
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            return abs(analytic - (lp - lm) / (2 * h)) / max(
+                1e-8, abs(analytic) + abs((lp - lm) / (2 * h)) + 1e-12)
+
+        rel_conv = fd(lambda: m.patch_embed.grad_w[0][0][1][1],
+                      lambda: m.patch_embed.weights[0][0][1][1],
+                      lambda v: m.patch_embed.weights[0][0][1].__setitem__(1, v))
+        rel_out = fd(lambda: m.grads['W_out'][2][1],
+                     lambda: m.W_out[2][1],
+                     lambda v: m.W_out[2].__setitem__(1, v))
+        assert rel_conv < 1e-4 and rel_out < 1e-4
+
+    def test_fit_memorize(self):
+        random.seed(0)
+        m = AI.TrOCR(vocab_size=6, in_channels=1, image_size=8, patch_size=4,
+                     d_model=8, num_heads=1, d_ff=16, enc_layers=1, dec_layers=1,
+                     max_len=8, seed=7)
+        images = [[[[1.0 if (i + j) % 2 == 0 else 0.0 for j in range(8)]
+                    for i in range(8)]],
+                  [[[0.5] * 8 for _ in range(8)]]]
+        captions = [[1, 2, 3], [3, 4, 5]]
+        hist = m.fit(images, captions, epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+        out = m.predict(images[0], start_id=1, max_new_tokens=2)
+        assert out[:2] == [1, 2]
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        m = AI.TrOCR(vocab_size=6, in_channels=1, image_size=8, patch_size=4,
+                     d_model=8, num_heads=1, d_ff=16, enc_layers=1, dec_layers=1,
+                     max_len=8, seed=3)
+        img = [[[0.1] * 8 for _ in range(8)]]
+        cases = [
+            lambda: AI.TrOCR(0),
+            lambda: AI.TrOCR(6, image_size=8, patch_size=3),
+            lambda: AI.TrOCR(6, d_model=8, num_heads=3),
+            lambda: m.forward(img, []),
+            lambda: m.forward(img, [1] * 9),
+            lambda: m.forward(img, [1, 99]),
+            lambda: m.forward([[0.0] * 8 for _ in range(8)], [1, 2]),
+            lambda: m.forward(img, [1, True]),
+            lambda: m.loss_and_backward(img, [1]),
+            lambda: m.loss_and_backward(img, 'abc'),
+            lambda: m.sgd_step(0.0),
+            lambda: m.sgd_step(-0.1),
+            lambda: m.predict(img, start_id=99),
+            lambda: m.predict(img, start_id=1, max_new_tokens=0),
+            lambda: m.fit([], []),
+            lambda: m.fit(images=[img], captions=[[1, 2], [3, 4]]),
+        ]
+        for i, fn in enumerate(cases):
+            _trocr_raises(fn)

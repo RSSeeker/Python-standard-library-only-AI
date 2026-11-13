@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2536 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2540 项）
 
 ## 特性
 
@@ -3693,6 +3693,34 @@ print(model.predict([1.0, 0.0, 1.0, 0.0]))
 边界：输入是稠密数值向量，不含稀疏特征哈希/embedding 查表；交叉层为全秩矩阵（无低秩分解）；
 逐样本 SGD（无 mini-batch、无正则项）；只做二分类打分，不含多任务输出与校准。
 
+### TrOCR（图像编码器 + 文本解码器 OCR）
+
+卷积 patch 嵌入 + Transformer 编码器 + 因果解码器，把整张图识别成文字序列：
+
+```python
+import AI
+
+model = AI.TrOCR(vocab_size=20, in_channels=1, image_size=8, patch_size=4,
+                 d_model=16, num_heads=2, d_ff=32, max_len=8, seed=0)
+image = [[[1.0 if (i + j) % 2 == 0 else 0.0 for j in range(8)] for i in range(8)]]
+loss = model.loss_and_backward(image, [1, 2, 3])   # caption 至少 2 个 token
+model.sgd_step(0.05)
+print(model.predict(image, start_id=1, max_new_tokens=4))  # 贪心解码
+```
+
+| API | 说明 |
+| --- | --- |
+| `TrOCR(vocab_size, in_channels=1, image_size=8, patch_size=4, d_model=16, num_heads=2, d_ff=32, enc_layers=1, dec_layers=1, max_len=8, seed=None)` | patch 嵌入 + 编码器 + 解码器；要求 `image_size % patch_size == 0`、`d_model % num_heads == 0` |
+| `forward(image, input_ids)` | 返回逐位置词表 logits `[len(input_ids)][vocab_size]` |
+| `loss_and_backward(image, caption)` | teacher forcing 交叉熵（`caption[:-1]` 预测 `caption[1:]`），反向到卷积核与输出头，返回平均损失 |
+| `predict(image, start_id=0, max_new_tokens=6, end_id=None)` | 贪心自回归解码，返回 token 序列 |
+| `fit(images, captions, epochs=20, lr=0.01, seed=None, shuffle=True)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `param_count()` | 卷积 patch 核 + 编码/解码层 + token 嵌入 + 输出头 |
+
+边界：这是 OCR 结构的简化版——patch 嵌入用单层 `Conv2d`（`kernel_size=stride=patch_size`），不接检测器/自适应尺寸，也不含真实 OCR 数据集上的预训练；解码为贪心，不支持 beam search。
+
+测试：`TestTrOCR` 覆盖前向形状/参数量、卷积核与输出头梯度有限差分、两张图与标题的过拟合训练、非法输入。
+
 ### 序列推荐（SASRec）
 
 | 接口 | 说明 |
@@ -5302,7 +5330,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2536 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2540 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5504,6 +5532,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
 | `TestCheckpointTransformer` | `checkpoint_transformer` 与普通 `encoder.backward` 逐位一致（`segments=1/2/4`）、causal 编码器同样成立、返回后各层缓存已释放、非法输入报错 |
 | `TestCheckpointedCausalLM` | 检查点反传与 `CausalLM._loss_and_backward` 的 loss/输出头/嵌入梯度一致、`segments=1/3` 结果相同、`fit_causal_lm_checkpointed` loss 下降、非法输入 |
+| `TestTrOCR` | 前向/参数量、卷积核与输出头梯度有限差分、合成图过拟合训练、predict 长度/非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5752,6 +5781,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2536 个单元测试
+├── test_ai.py       # 2540 个单元测试
 └── README.md
 ```

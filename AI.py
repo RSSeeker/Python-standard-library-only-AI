@@ -10843,6 +10843,245 @@ def fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2,
         history.append(total / len(clean))
     return history
 
+# ---------------------------------------------------------------------------
+# TrOCR（图像编码器 + 文本解码器的 OCR 模型，简化版）
+# ---------------------------------------------------------------------------
+
+
+def _trocr_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"TrOCR: {name} 必须是正整数")
+    return value
+
+
+def _trocr_check_image(image, in_channels, image_size):
+    if (not isinstance(image, (list, tuple)) or len(image) != in_channels):
+        raise ValueError(f"TrOCR: image 必须是 {in_channels} 通道的 (C,H,W) 列表")
+    for ch in image:
+        if not isinstance(ch, (list, tuple)) or len(ch) != image_size:
+            raise ValueError(f"TrOCR: image 高度必须是 {image_size}")
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or len(row) != image_size:
+                raise ValueError(f"TrOCR: image 宽度必须是 {image_size}")
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise ValueError("TrOCR: image 必须只包含有限数字")
+    return image
+
+
+def _trocr_check_ids(ids, vocab_size, max_len, who="caption"):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"TrOCR: {who} 必须是非空 token 列表")
+    if len(ids) > max_len:
+        raise ValueError(f"TrOCR: {who} 长度不能超过 max_len={max_len}")
+    out = []
+    for idx in ids:
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise ValueError(f"TrOCR: {who} 必须只包含整数 token")
+        if not 0 <= idx < vocab_size:
+            raise ValueError(f"TrOCR: {who} token 必须在 [0, {vocab_size}) 内")
+        out.append(idx)
+    return out
+
+
+class TrOCR:
+    """TrOCR 式 OCR：卷积 patch 嵌入 → Transformer 编码器 → 因果解码器。"""
+
+    def __init__(self, vocab_size, in_channels=1, image_size=8, patch_size=4,
+                 d_model=16, num_heads=2, d_ff=32, enc_layers=1, dec_layers=1,
+                 max_len=8, seed=None):
+        self.vocab_size = _trocr_check_pos_int(vocab_size, "vocab_size")
+        self.in_channels = _trocr_check_pos_int(in_channels, "in_channels")
+        self.image_size = _trocr_check_pos_int(image_size, "image_size")
+        self.patch_size = _trocr_check_pos_int(patch_size, "patch_size")
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("TrOCR: image_size 必须能被 patch_size 整除")
+        self.d_model = _trocr_check_pos_int(d_model, "d_model")
+        self.num_heads = _trocr_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _trocr_check_pos_int(d_ff, "d_ff")
+        self.enc_layers = _trocr_check_pos_int(enc_layers, "enc_layers")
+        self.dec_layers = _trocr_check_pos_int(dec_layers, "dec_layers")
+        self.max_len = _trocr_check_pos_int(max_len, "max_len")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("TrOCR: d_model 必须能被 num_heads 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("TrOCR: seed 必须是整数或 None")
+        self.grid = self.image_size // self.patch_size
+        self.num_patches = self.grid * self.grid
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.patch_embed = Conv2d(self.in_channels, self.d_model,
+                                      self.patch_size, stride=self.patch_size)
+            self.enc_pos = PositionalEncoding(self.d_model, self.num_patches)
+            self.encoder = TransformerEncoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.enc_layers, dropout=0.0,
+                                              causal=False)
+            self.token_emb = Embedding(self.vocab_size, self.d_model)
+            self.dec_pos = PositionalEncoding(self.d_model, self.max_len)
+            self.decoder = TransformerDecoder(self.d_model, self.num_heads, self.d_ff,
+                                              num_layers=self.dec_layers, dropout=0.0,
+                                              causal=True)
+            self.W_out = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                          for _ in range(self.vocab_size)]
+            self.b_out = [0.0 for _ in range(self.vocab_size)]
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.patch_embed.zero_grad()
+        self.encoder.zero_grad()
+        self.decoder.zero_grad()
+        self.token_emb.zero_grad()
+        self.grads = {
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0 for _ in range(self.vocab_size)],
+        }
+
+    def param_count(self):
+        conv = self.patch_embed.out_channels * self.patch_embed.cg * \
+            self.patch_embed.kh * self.patch_embed.kw + self.patch_embed.out_channels
+        d, f = self.d_model, self.d_ff
+        enc_layer = 4 * (d * d + d) + (d * f + f) + (f * d + d) + 4 * d
+        dec_layer = 8 * (d * d + d) + (d * f + f) + (f * d + d) + 6 * d
+        tok = self.vocab_size * d
+        out = self.vocab_size * (d + 1)
+        return conv + self.enc_layers * enc_layer + self.dec_layers * dec_layer + tok + out
+
+    # ---- 前向 ----
+    def _encode_image(self, image):
+        _trocr_check_image(image, self.in_channels, self.image_size)
+        conv_out = self.patch_embed.forward(image)
+        tokens = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                tokens.append([conv_out[k][r][c] for k in range(self.d_model)])
+        tokens = self.enc_pos.forward(tokens)
+        memory = self.encoder.forward(tokens)
+        return tokens, memory
+
+    def forward(self, image, input_ids):
+        ids = _trocr_check_ids(input_ids, self.vocab_size, self.max_len, "input_ids")
+        tokens, memory = self._encode_image(image)
+        emb = self.token_emb.forward(ids)
+        x = self.dec_pos.forward(emb)
+        h = self.decoder.forward(x, memory)
+        logits = [[sum(self.W_out[v][j] * h[t][j] for j in range(self.d_model))
+                   + self.b_out[v] for v in range(self.vocab_size)]
+                  for t in range(len(ids))]
+        self._cache = {"image_tokens": tokens, "memory": memory, "ids": ids, "h": h}
+        return logits
+
+    # ---- 损失与反向 ----
+    def loss_and_backward(self, image, caption):
+        if (not isinstance(caption, (list, tuple)) or len(caption) < 2):
+            raise ValueError("TrOCR: caption 至少需要 2 个 token")
+        cap = _trocr_check_ids(caption, self.vocab_size, self.max_len, "caption")
+        logits = self.forward(image, cap[:-1])
+        n = len(cap) - 1
+        d_logits = []
+        loss = 0.0
+        for t in range(n):
+            row = logits[t]
+            m = max(row)
+            exps = [math.exp(v - m) for v in row]
+            total = sum(exps)
+            probs = [v / total for v in exps]
+            target = cap[t + 1]
+            loss += -math.log(max(probs[target], 1e-12))
+            d = list(probs)
+            d[target] -= 1.0
+            d_logits.append([v / n for v in d])
+        h = self._cache["h"]
+        seq_len = len(h)
+        for v in range(self.vocab_size):
+            grow = self.grads["W_out"][v]
+            gb = 0.0
+            for t in range(seq_len):
+                dv = d_logits[t][v]
+                gb += dv
+                ht = h[t]
+                for j in range(self.d_model):
+                    grow[j] += dv * ht[j]
+            self.grads["b_out"][v] += gb
+        dh = [[0.0] * self.d_model for _ in range(seq_len)]
+        for t in range(seq_len):
+            dl = d_logits[t]
+            for j in range(self.d_model):
+                s = 0.0
+                for v in range(self.vocab_size):
+                    s += dl[v] * self.W_out[v][j]
+                dh[t][j] = s
+        d_dec, d_mem = self.decoder.backward(dh)
+        self.token_emb.backward(d_dec)
+        d_tokens = self.encoder.backward(d_mem)
+        conv_grid = [[[0.0] * self.grid for _ in range(self.grid)] for _ in range(self.d_model)]
+        for t in range(self.num_patches):
+            r, c = divmod(t, self.grid)
+            for k in range(self.d_model):
+                conv_grid[k][r][c] = d_tokens[t][k]
+        self.patch_embed.backward(conv_grid)
+        return loss / n
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("TrOCR: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("TrOCR: lr 必须为正数")
+        _conv_sgd(self.patch_embed, lr)
+        self.encoder.sgd_step(lr)
+        self.decoder.sgd_step(lr)
+        self.token_emb.sgd_step(lr)
+        for v in range(self.vocab_size):
+            grow = self.W_out[v]
+            gg = self.grads["W_out"][v]
+            for j in range(self.d_model):
+                grow[j] -= lr * gg[j]
+            self.b_out[v] -= lr * self.grads["b_out"][v]
+
+    def predict(self, image, start_id=0, max_new_tokens=6, end_id=None):
+        start_id = int(start_id)
+        if not 0 <= start_id < self.vocab_size:
+            raise ValueError("TrOCR: start_id 越界")
+        max_new_tokens = _trocr_check_pos_int(max_new_tokens, "max_new_tokens")
+        out = [start_id]
+        for _ in range(max_new_tokens):
+            logits = self.forward(image, out)
+            nxt = max(range(self.vocab_size), key=lambda v: logits[-1][v])
+            out.append(nxt)
+            if end_id is not None and nxt == end_id:
+                break
+            if len(out) >= self.max_len:
+                break
+        return out
+
+    def fit(self, images, captions, epochs=20, lr=0.01, seed=None, shuffle=True):
+        if (not isinstance(images, (list, tuple)) or not isinstance(captions, (list, tuple))
+                or not images or len(images) != len(captions)):
+            raise ValueError("TrOCR: images 与 captions 必须是非空且等长的列表")
+        epochs = _trocr_check_pos_int(epochs, "epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr):
+            raise ValueError("TrOCR: lr 必须是有限数字")
+        if lr <= 0.0:
+            raise ValueError("TrOCR: lr 必须为正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("TrOCR: seed 必须是整数或 None")
+        rng = random.Random(seed)
+        order = list(range(len(images)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(images[idx], captions[idx])
+                self.sgd_step(lr)
+            history.append(total / len(images))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
