@@ -38654,3 +38654,72 @@ class TestTrainMedusaHeads:
 
         assert _mt_raises(lambda: AI.train_medusa_heads(BadHidden(), heads, [[1, 2, 3]]))
         assert _mt_raises(lambda: AI.train_medusa_heads(NoVocab(), heads, [[1, 2, 3]]))
+
+
+def _amp_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestFitMixedPrecision:
+    def test_fp16_convergence(self):
+        random.seed(21)
+        model = AI.Model(AI.MLP([2, 4, 1], ["relu", "linear"]), loss_fn="mse")
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [[0.0], [1.0], [1.0], [2.0]]
+        result = AI.fit_mixed_precision(model, xs, ys, dtype="fp16", scale=1024.0,
+                                        epochs=120, lr=0.05, batch_size=4, seed=1)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.2
+        assert len(losses) == 120
+        assert result["batches"] == 1
+        assert result["dtype"] == "fp16"
+        assert result["scale"] == 1024.0
+        assert result["epochs"] == 120
+
+    def test_bf16_single_batch(self):
+        random.seed(22)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [[0.0], [1.0], [1.0], [2.0]]
+        result = AI.fit_mixed_precision(mlp, xs, ys, dtype="bf16", epochs=80,
+                                        lr=0.05, batch_size=1, seed=2)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.5
+        assert result["batches"] == 4
+
+    def test_fp8_variants(self):
+        for dtype in ("fp8_e4m3", "fp8_e5m2"):
+            result = AI.fit_mixed_precision(
+                AI.MLP([1, 3, 1]), [[0.0], [1.0], [2.0]], [[1.0], [3.0], [5.0]],
+                dtype=dtype, epochs=20, lr=0.01, batch_size=3)
+            assert len(result["loss_history"]) == 20
+            assert result["dtype"] == dtype
+
+    def test_no_shuffle_batches(self):
+        result = AI.fit_mixed_precision(
+            AI.MLP([2, 4, 1], ["relu", "linear"]),
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+            [[0.0], [1.0], [1.0], [2.0]],
+            dtype="fp16", epochs=30, lr=0.05, batch_size=2, seed=3, shuffle=False)
+        assert result["batches"] == 2
+        assert len(result["loss_history"]) == 30
+
+    def test_invalid_inputs(self):
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        m = AI.MLP([2, 2])
+        assert _amp_raises(lambda: AI.fit_mixed_precision("x", xs, xs))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, dtype="fp32"))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, scale=0.0))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, scale=float("inf")))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, lr=0.0))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, epochs=0))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, batch_size=0))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, [], []))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs[:3]))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(AI.MLP([3, 2]), xs, xs))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, shuffle=1))
+        assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, seed="a"))

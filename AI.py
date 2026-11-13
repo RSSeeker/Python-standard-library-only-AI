@@ -10137,6 +10137,93 @@ def train_medusa_heads(target, heads, sequences, epochs=10, lr=0.01):
         "num_heads": num_heads,
     }
 
+def _amp_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"fit_mixed_precision: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _amp_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"fit_mixed_precision: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"fit_mixed_precision: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def _amp_apply_sgd(layers, grads, lr):
+    """把（可能含 None 的）梯度按 SGD 写回 MLP 各层。"""
+    for layer, (gw, gb) in zip(layers, grads):
+        if gw is not None:
+            for j, row in enumerate(gw):
+                w = layer.weights[j]
+                for k, v in enumerate(row):
+                    w[k] -= lr * v
+        if gb is not None:
+            for j, v in enumerate(gb):
+                layer.biases[j] -= lr * v
+
+
+def fit_mixed_precision(model, xs, ys, dtype="fp16", scale=1024.0, epochs=20,
+                        lr=0.01, batch_size=32, seed=None, shuffle=True):
+    """用「低精度梯度舍入」模拟的混合精度训练循环。
+
+    每个 batch 先用 ``mixed_precision_grads`` 正常 fp32 前向/反传，把梯度乘
+    ``scale`` 舍入到 ``fp16`` / ``bf16`` / ``fp8_e4m3`` / ``fp8_e5m2`` 再除回，
+    然后用 SGD 更新。只模拟梯度舍入，不做真正的低精度矩阵乘，因此没有速度收益。
+    ``model`` 可以是 ``Model``（用其 ``loss_fn``）或 ``MLP``（默认均方误差）。
+    """
+    if isinstance(model, MLP):
+        model = Model(model)
+    elif not isinstance(model, Model):
+        raise TypeError("fit_mixed_precision: model 必须是 Model 或 MLP 实例")
+    if dtype not in ("fp16", "bf16", "fp8_e4m3", "fp8_e5m2"):
+        raise ValueError(
+            "fit_mixed_precision: dtype 只能是 'fp16' / 'bf16' / 'fp8_e4m3' / "
+            f"'fp8_e5m2'，收到 {dtype!r}")
+    scale = _amp_check_pos_number(scale, "scale")
+    lr = _amp_check_pos_number(lr, "学习率")
+    epochs = _amp_check_pos_int(epochs, "epochs")
+    batch_size = _amp_check_pos_int(batch_size, "batch_size")
+    if not isinstance(shuffle, bool):
+        raise TypeError("fit_mixed_precision: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("fit_mixed_precision: seed 必须是 int 或 None")
+    if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+        raise ValueError("fit_mixed_precision: xs 与 ys 必须是列表")
+    if not xs or len(xs) != len(ys):
+        raise ValueError("fit_mixed_precision: xs 与 ys 必须非空且等长")
+    n = len(xs)
+    in_dim = model.model.layers[0].fan_in
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(f"fit_mixed_precision: 每个输入必须是长度 {in_dim} 的列表")
+    rng = random.Random(seed)
+    order = list(range(n))
+    history = []
+    for _ in range(epochs):
+        if shuffle:
+            rng.shuffle(order)
+        total = 0.0
+        batches = 0
+        for start in range(0, n, batch_size):
+            batch_idx = order[start:start + batch_size]
+            bx = [xs[i] for i in batch_idx]
+            by = [ys[i] for i in batch_idx]
+            loss, grads = mixed_precision_grads(model, bx, by, scale=scale, dtype=dtype)
+            total += loss
+            batches += 1
+            _amp_apply_sgd(model.model.layers, grads, lr)
+        history.append({"loss": total / batches})
+    return {
+        "loss_history": history,
+        "dtype": dtype,
+        "scale": scale,
+        "batches": batches,
+        "epochs": epochs,
+    }
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
