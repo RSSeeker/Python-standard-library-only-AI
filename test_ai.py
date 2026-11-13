@@ -37311,3 +37311,110 @@ class TestHyena:
         assert _lin_raises(lambda: AI.hyena_long_conv([], [1.0]))
         assert _lin_raises(lambda: AI.hyena_forward(u, u[:-1], [1.0]))
         assert _lin_raises(lambda: AI.hyena_forward(u, [[1.0]], [1.0]))
+
+
+
+
+def _rwkv567_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+def _rwkv567_case():
+    import random
+    rng = random.Random(5)
+    t_len, dk, dv = 4, 3, 2
+    r = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(t_len)]
+    k = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(t_len)]
+    v = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(t_len)]
+    return r, k, v
+
+
+class TestRWKV5:
+    def test_decay_one_closed_form(self):
+        r, k, v = _rwkv567_case()
+        out = AI.rwkv5_time_mixing(r, k, v, 1.0)
+        for t in range(len(r)):
+            ref = [0.0] * len(v[0])
+            for j in range(t + 1):
+                dot = sum(r[t][i] * k[j][i] for i in range(len(r[0])))
+                for c in range(len(v[0])):
+                    ref[c] += dot * v[j][c]
+            assert max(abs(out[t][c] - ref[c]) for c in range(len(v[0]))) < 1e-12
+
+    def test_vector_decay_matches_reference(self):
+        r, k, v = _rwkv567_case()
+        decay = [0.9, 0.5, 0.7]
+        dk, dv = len(r[0]), len(v[0])
+        state = [[0.0] * dv for _ in range(dk)]
+        ref = []
+        for t in range(len(r)):
+            for i in range(dk):
+                for c in range(dv):
+                    state[i][c] = decay[i] * state[i][c] + k[t][i] * v[t][c]
+            ref.append([sum(r[t][i] * state[i][c] for i in range(dk))
+                        for c in range(dv)])
+        got = AI.rwkv5_time_mixing(r, k, v, decay)
+        err = max(abs(got[t][c] - ref[t][c])
+                  for t in range(len(r)) for c in range(dv))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        r, k, v = _rwkv567_case()
+        assert _rwkv567_raises(lambda: AI.rwkv5_time_mixing([], k, v, 0.5))
+        assert _rwkv567_raises(lambda: AI.rwkv5_time_mixing(r, k, v[:-1], 0.5))
+        assert _rwkv567_raises(lambda: AI.rwkv5_time_mixing(r, k, v, 1.5))
+        assert _rwkv567_raises(lambda: AI.rwkv5_time_mixing(r, k, v, [0.5, 0.5]))
+
+
+class TestRWKV6:
+    def test_constant_w_equals_rwkv5(self):
+        import math
+        r, k, v = _rwkv567_case()
+        w = 0.4
+        alpha = math.exp(-math.exp(w))
+        wlog = [[w] * len(r[0]) for _ in range(len(r))]
+        g6 = AI.rwkv6_time_mixing(r, k, v, wlog)
+        g5 = AI.rwkv5_time_mixing(r, k, v, [alpha] * len(r[0]))
+        err = max(abs(g6[t][c] - g5[t][c])
+                  for t in range(len(r)) for c in range(len(v[0])))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        r, k, v = _rwkv567_case()
+        dk = len(r[0])
+        assert _rwkv567_raises(lambda: AI.rwkv6_time_mixing(r, k, v, [[0.0] * dk] * (len(r) - 1)))
+        assert _rwkv567_raises(lambda: AI.rwkv6_time_mixing(r, k, v, [[0.0] * (dk - 1)] * len(r)))
+        assert _rwkv567_raises(lambda: AI.rwkv6_time_mixing(r, k, v, None))
+
+
+class TestRWKV7:
+    def test_delta_zero_equals_rwkv6(self):
+        import random
+        r, k, v = _rwkv567_case()
+        rng = random.Random(7)
+        wlog = [[rng.uniform(-1, 1) for _ in range(len(r[0]))] for _ in range(len(r))]
+        g7 = AI.rwkv7_time_mixing(r, k, v, wlog, delta=0.0)
+        g6 = AI.rwkv6_time_mixing(r, k, v, wlog)
+        err = max(abs(g7[t][c] - g6[t][c])
+                  for t in range(len(r)) for c in range(len(v[0])))
+        assert err < 1e-12
+
+    def test_first_step(self):
+        r, k, v = _rwkv567_case()
+        dk = len(r[0])
+        wlog = [[0.0] * dk for _ in range(len(r))]
+        out = AI.rwkv7_time_mixing(r, k, v, wlog, delta=1.0)
+        ref = [sum(r[0][i] * k[0][i] * v[0][c] for i in range(dk))
+               for c in range(len(v[0]))]
+        assert max(abs(out[0][c] - ref[c]) for c in range(len(v[0]))) < 1e-12
+
+    def test_invalid_inputs(self):
+        r, k, v = _rwkv567_case()
+        dk = len(r[0])
+        assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * len(r), delta=-1.0))
+        assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * (len(r) - 1)))
+        assert _rwkv567_raises(lambda: AI.rwkv7_time_mixing(r, k, v, [[0.0] * dk] * len(r), delta=float("nan")))

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2433 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2441 项）
 
 ## 特性
 
@@ -3155,6 +3155,36 @@ print(model.generate([0, 1], max_new_tokens=3, temperature=0.8))
 channel-mixing 使用 `relu(k)²` 而不是 GELU 变体，也没有 dropout；注意力退化为逐通道
 状态递推，因此训练时按完整序列前向/反向，不做并行扫描优化。
 
+### RWKV-5 / 6 / 7 time-mixing（矩阵状态 / 数据相关衰减 / 增量修正）
+
+RWKV-4 的 time-mixing 用**向量**状态；后续版本逐步升级：
+
+- **RWKV-5（Eagle）**：状态升级为矩阵 `S ∈ R^{d_k×d_v}`，每个 key 通道有独立衰减。
+- **RWKV-6（Finch）**：衰减由数据生成（逐 token、逐 channel），`alpha=exp(-exp(w))`。
+- **RWKV-7（Goose）**：在数据相关衰减上再加增量修正（delta 规则）。
+
+```python
+from ai import AI
+
+r = [[0.1, -0.2, 0.3]]
+k = [[0.3, 0.1, -0.2]]
+v = [[1.0, 0.5]]
+
+print(AI.rwkv5_time_mixing(r, k, v, [0.9, 0.5, 0.7]))
+print(AI.rwkv6_time_mixing(r, k, v, [[0.0, 0.5, -0.5]]))
+print(AI.rwkv7_time_mixing(r, k, v, [[0.0, 0.5, -0.5]], delta=0.5))
+```
+
+| API | 说明 |
+| --- | --- |
+| `rwkv5_time_mixing(r_rows, k_rows, v_rows, decay)` | 固定逐 channel 衰减：`S_t=diag(decay)S_{t-1}+k_t⊗v_t`，`y_t=r_t@S_t` |
+| `rwkv6_time_mixing(r_rows, k_rows, v_rows, w_logits)` | 数据相关衰减：`alpha_t=exp(-exp(w_t))`（逐 token 逐 channel） |
+| `rwkv7_time_mixing(r_rows, k_rows, v_rows, w_logits, delta=1.0)` | 数据相关衰减 + 简化增量修正：`S_t=diag(alpha)S_{t-1}+k_t⊗(v_t-delta·S_{t-1}^T k_t)` |
+
+边界：三者均为**前向推理**实现（无反向/训练循环）；RWKV-7 的增量修正是简化
+形式（单一 `delta` 标量，非原文的逐 channel in-context rate），
+需要训练时请用带反向的 `RWKVBlock` / `RWKVModel`（RWKV-4）。
+
 ### 神经算子（DeepONet / FNO1d）
 
 `DeepONet` 与 `FNO1d` 都学习「函数到函数」的映射，与上面的 PINN（求解单个方程）互补。
@@ -4961,7 +4991,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2433 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2441 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5207,6 +5237,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGLA` | 常数门等价于 lightning、非法输入 |
 | `TestDeltaNet` | beta=0 恒零、首步公式、矩阵参考、非法输入 |
 | `TestHyena` | 长卷积手算、逐元素门控、非法输入 |
+| `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
+| `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
+| `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5387,6 +5420,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2433 个单元测试
+├── test_ai.py       # 2441 个单元测试
 └── README.md
 ```

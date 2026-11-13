@@ -8452,6 +8452,196 @@ def hyena_forward(u_rows, v_rows, kernel):
     return [[conv[t][c] * v[t][c] for c in range(len(u[0]))]
             for t in range(len(u))]
 
+
+"""RWKV-5 / RWKV-6 / RWKV-7 的 time-mixing 递推（简化前向实现）
+
+RWKV-4 的 time-mixing 用**向量**状态；RWKV-5（Eagle）把状态升级为**矩阵**
+`S ∈ R^{d_k x d_v}`，每个 key 通道有自己的衰减；RWKV-6（Finch）把衰减变为
+**数据相关**（每个 token、每个通道一组 `w`）；RWKV-7（Goose）在数据相关衰减之上
+再加**增量修正**（in-context learning rate 的简化形式）。
+
+三者共享同一个骨架：
+
+    S_t = diag(alpha_t) S_{t-1} + k_t (x) (v_t - delta * S_{t-1}^T k_t)
+    y_t = r_t @ S_t
+
+其中 alpha_t 是逐 channel 衰减（RWKV-5 固定、RWKV-6/7 由 `w` 数据相关生成；
+`alpha = exp(-exp(w))`），delta 为 0 时退化为 RWKV-5/6。这些函数只做**前向**，
+用于理解矩阵状态递推；训练请用 `RWKVBlock` / `RWKVModel`（RWKV-4，含反向）。
+"""
+
+import math
+
+
+def _rwkv_check_matrix(rows, name="rows"):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"rwkv567: {name} 必须是非空二维列表")
+    width = None
+    out = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"rwkv567: {name} 的每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"rwkv567: {name} 的行长度必须一致")
+        new_row = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"rwkv567: {name} 必须只包含数字")
+            v = float(v)
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"rwkv567: {name} 必须只包含有限数字")
+            new_row.append(v)
+        out.append(new_row)
+    return out
+
+
+def _rwkv_check_number(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"rwkv567: {name} 必须是数字")
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"rwkv567: {name} 必须是有限数字")
+    return value
+
+
+def _rwkv_check_decay(value, name):
+    value = _rwkv_check_number(value, name)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"rwkv567: {name} 必须在 [0, 1] 内")
+    return value
+
+
+def _rwkv_check_decay_vector(values, dim, name):
+    if not isinstance(values, (list, tuple)) or len(values) != dim:
+        raise ValueError(f"rwkv567: {name} 长度必须为 {dim}")
+    return [_rwkv_check_decay(v, name) for v in values]
+
+
+def rwkv5_time_mixing(r_rows, k_rows, v_rows, decay):
+    """RWKV-5：固定逐 channel 衰减的矩阵状态 time-mixing。
+
+    S_t = diag(decay) S_{t-1} + k_t (x) v_t,  y_t = r_t @ S_t
+    """
+    r = _rwkv_check_matrix(r_rows, "r_rows")
+    k = _rwkv_check_matrix(k_rows, "k_rows")
+    v = _rwkv_check_matrix(v_rows, "v_rows")
+    if len(r) != len(k) or len(r) != len(v):
+        raise ValueError("rwkv567: r/k/v 的序列长度必须一致")
+    dk = len(r[0])
+    if len(k[0]) != dk:
+        raise ValueError("rwkv567: r 与 k 的特征维度必须一致")
+    dv = len(v[0])
+    if isinstance(decay, (list, tuple)):
+        w = _rwkv_check_decay_vector(decay, dk, "decay")
+    else:
+        w = [_rwkv_check_decay(decay, "decay")] * dk
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    for t in range(len(r)):
+        for i in range(dk):
+            row = state[i]
+            kt = k[t][i]
+            wi = w[i]
+            for c in range(dv):
+                row[c] = wi * row[c] + kt * v[t][c]
+        y = [0.0] * dv
+        for i in range(dk):
+            ri = r[t][i]
+            if ri == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += ri * row[c]
+        out.append(y)
+    return out
+
+
+def rwkv6_time_mixing(r_rows, k_rows, v_rows, w_logits):
+    """RWKV-6：数据相关衰减（`alpha = exp(-exp(w))`，逐 token 逐 channel）。"""
+    r = _rwkv_check_matrix(r_rows, "r_rows")
+    k = _rwkv_check_matrix(k_rows, "k_rows")
+    v = _rwkv_check_matrix(v_rows, "v_rows")
+    if len(r) != len(k) or len(r) != len(v):
+        raise ValueError("rwkv567: r/k/v 的序列长度必须一致")
+    dk = len(r[0])
+    if len(k[0]) != dk:
+        raise ValueError("rwkv567: r 与 k 的特征维度必须一致")
+    dv = len(v[0])
+    w = _rwkv_check_matrix(w_logits, "w_logits")
+    if len(w) != len(r) or len(w[0]) != dk:
+        raise ValueError("rwkv567: w_logits 必须是 (T, d_k) 的二维列表")
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    for t in range(len(r)):
+        for i in range(dk):
+            alpha = math.exp(-math.exp(w[t][i]))
+            row = state[i]
+            kt = k[t][i]
+            for c in range(dv):
+                row[c] = alpha * row[c] + kt * v[t][c]
+        y = [0.0] * dv
+        for i in range(dk):
+            ri = r[t][i]
+            if ri == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += ri * row[c]
+        out.append(y)
+    return out
+
+
+def rwkv7_time_mixing(r_rows, k_rows, v_rows, w_logits, delta=1.0):
+    """RWKV-7 的简化增量修正：先读出旧状态，再按 delta 修正写入。
+
+    S_t = diag(alpha) S_{t-1} + k_t (x) (v_t - delta * S_{t-1}^T k_t)
+    y_t = r_t @ S_t
+    """
+    r = _rwkv_check_matrix(r_rows, "r_rows")
+    k = _rwkv_check_matrix(k_rows, "k_rows")
+    v = _rwkv_check_matrix(v_rows, "v_rows")
+    if len(r) != len(k) or len(r) != len(v):
+        raise ValueError("rwkv567: r/k/v 的序列长度必须一致")
+    dk = len(r[0])
+    if len(k[0]) != dk:
+        raise ValueError("rwkv567: r 与 k 的特征维度必须一致")
+    dv = len(v[0])
+    w = _rwkv_check_matrix(w_logits, "w_logits")
+    if len(w) != len(r) or len(w[0]) != dk:
+        raise ValueError("rwkv567: w_logits 必须是 (T, d_k) 的二维列表")
+    delta = _rwkv_check_number(delta, "delta")
+    if delta < 0.0:
+        raise ValueError("rwkv567: delta 必须 >= 0")
+    state = [[0.0] * dv for _ in range(dk)]
+    out = []
+    for t in range(len(r)):
+        old = [[state[i][c] for c in range(dv)] for i in range(dk)]
+        sk = [0.0] * dv
+        for i in range(dk):
+            ki = k[t][i]
+            if ki == 0.0:
+                continue
+            for c in range(dv):
+                sk[c] += ki * old[i][c]
+        for i in range(dk):
+            alpha = math.exp(-math.exp(w[t][i]))
+            row = state[i]
+            ki = k[t][i]
+            for c in range(dv):
+                row[c] = alpha * old[i][c] + ki * (v[t][c] - delta * sk[c])
+        y = [0.0] * dv
+        for i in range(dk):
+            ri = r[t][i]
+            if ri == 0.0:
+                continue
+            row = state[i]
+            for c in range(dv):
+                y[c] += ri * row[c]
+        out.append(y)
+    return out
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
