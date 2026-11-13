@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2449 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2461 项）
 
 ## 特性
 
@@ -2180,6 +2180,61 @@ print(rag.query("what does cat like?")["prompt"])
 边界：`ReActAgent` 不包含真实 LLM 调用与多轮记忆（history 仅本轮的 Action/Observation）；
 `RAGPipeline` 复用 BM25 的 ASCII 分词器（英文/数字），中文资料需先自行切词或改用其他
 检索器；两者都不做训练，prompt 模板是可覆盖的字符串。
+
+### test-time compute 组合器与 Constitutional AI
+
+- `test_time_scaling`：预算内多次采样，`best_of_n` 用 verifier 分数取最高，
+  `self_consistency` 用（可选规范化的）多数投票，分数和用于并列裁决。
+- `constitutional_ai`：先自我批评再修订，循环固定轮数，保留每轮历史。
+
+```python
+from ai import AI
+
+res = AI.test_time_scaling(lambda n: ["a", "bb", "ccc"][:n],
+                           lambda s: float(len(s)), budget=3)
+print(res["answer"])   # ccc
+
+res = AI.test_time_scaling(lambda n: ["cat", "dog", "cat"][:n],
+                           lambda s: 1.0, budget=3, strategy="self_consistency")
+print(res["answer"], res["votes"])   # cat 2
+
+res = AI.constitutional_ai("答案是 42",
+                           critique_fn=lambda a: "缺少引用",
+                           revise_fn=lambda a, c: a + "（据文献[1]）",
+                           rounds=2)
+print(res["answer"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `test_time_scaling(generate_fn, verifier_fn, budget=8, strategy="best_of_n", normalize=None)` | 返回 `{"strategy","answer","score","samples","scores"}`；`self_consistency` 另含 `votes/tally` |
+| `constitutional_ai(initial_answer, critique_fn, revise_fn, rounds=1)` | 返回 `{"answer","rounds","revisions":[{"round","critique","answer"}]}` |
+
+边界：`test_time_scaling` 只做采样内的选择与投票，不做过程奖励/搜索树扩展；
+`constitutional_ai` 的批评与修订质量完全由注入回调决定，不包含规则库或训练。
+
+### LLMSearch（MCTS + LLM 推理搜索）
+
+把通用 `mcts_search` 包成「逐 token 展开」的推理搜索：`propose_fn` 提供候选
+`(token, prior)`，`value_fn` 给整条序列打分，每一步做一次深度 1 的 MCTS 选下一个
+token，直到达到最大深度或 `is_terminal` 为真。
+
+```python
+from ai import AI
+
+res = AI.llm_search(lambda state: [("a", 1.0), ("b", 1.0)],
+                    lambda state: 1.0 if (state and state[-1] == "b") else 0.0,
+                    max_depth=3, num_simulations=32)
+print(res["tokens"], res["score"])   # ['b', 'b', 'b'] 1.0
+```
+
+| API | 说明 |
+| --- | --- |
+| `llm_search(propose_fn, value_fn, max_depth=8, num_simulations=32, c_puct=1.4, is_terminal=None, seed=None)` | 返回 `{"tokens","score","steps","visits_per_step"}`；每步一次深度 1 的 MCTS |
+
+边界：总模拟量约为 `num_simulations × 深度`；`propose_fn`/`value_fn` 完全由调用方
+注入（可接真实 LLM），本实现不包含 tokenizer、缓存或批量推理；价值函数必须返回
+有限数字，候选 token 必须可哈希。
 
 ### 部署与推理工具（文本水印 / StreamingLLM 掩码）
 
@@ -5028,7 +5083,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2449 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2461 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5279,6 +5334,9 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
 | `TestReActAgent` | 完整循环与 trace、工具错误回填、超步数、JSON Action Input、非法输入 |
 | `TestRAGPipeline` | 混合检索排序与 prompt、top_k 覆盖、非法输入 |
+| `TestTimeScaling` | best_of_n 选择、self_consistency 投票/规范化/并列、非法输入 |
+| `TestConstitutionalAI` | 多轮批评-修订链、非法输入 |
+| `TestLLMSearch` | 深度 1/多步路径、terminal 提前停止、状态相关候选、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5459,6 +5517,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2449 个单元测试
+├── test_ai.py       # 2461 个单元测试
 └── README.md
 ```

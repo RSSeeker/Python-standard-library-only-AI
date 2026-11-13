@@ -37532,3 +37532,139 @@ class TestRAGPipeline:
         assert _pipe_raises(lambda: rag.retrieve(""))
         assert _pipe_raises(lambda: rag.retrieve("cat", top_k=0))
         assert _pipe_raises(lambda: rag.query(None))
+
+
+
+
+def _ttc_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+class TestTimeScaling:
+    def test_best_of_n(self):
+        res = AI.test_time_scaling(lambda n: ["a", "bb", "ccc"][:n],
+                                   lambda s: float(len(s)), budget=3)
+        assert res["answer"] == "ccc"
+        assert res["score"] == 3.0
+        assert res["index"] == 2
+        assert res["samples"] == ["a", "bb", "ccc"]
+
+    def test_self_consistency(self):
+        samples = ["cat", "dog", "cat", "bird", "cat"]
+        res = AI.test_time_scaling(lambda n: samples[:n], lambda s: 1.0,
+                                   budget=5, strategy="self_consistency")
+        assert res["answer"] == "cat"
+        assert res["votes"] == 3
+        assert res["tally"]["cat"] == 3
+
+    def test_self_consistency_normalize(self):
+        samples = ["Cat", "cat", "dog"]
+        res = AI.test_time_scaling(lambda n: samples[:n], lambda s: 1.0,
+                                   budget=3, strategy="self_consistency",
+                                   normalize=str.lower)
+        assert res["answer"] == "Cat"
+        assert res["tally"]["cat"] == 2
+
+    def test_tie_uses_first_occurrence(self):
+        samples = ["x", "y"]
+        res = AI.test_time_scaling(lambda n: samples[:n], lambda s: 1.0,
+                                   budget=2, strategy="self_consistency")
+        assert res["answer"] == "x"
+
+    def test_invalid_inputs(self):
+        gen = lambda n: ["a"] * n
+        assert _ttc_raises(lambda: AI.test_time_scaling(None, lambda s: 1.0))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, "not callable"))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: 1.0, budget=0))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: 1.0, budget=2.5))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: 1.0, strategy="beam"))
+        assert _ttc_raises(lambda: AI.test_time_scaling(lambda n: [], lambda s: 1.0))
+        assert _ttc_raises(lambda: AI.test_time_scaling(lambda n: [1] * n, lambda s: 1.0))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: float("nan")))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: True))
+        assert _ttc_raises(lambda: AI.test_time_scaling(gen, lambda s: 1.0, normalize=3))
+
+
+class TestConstitutionalAI:
+    def test_rounds_and_history(self):
+        def critique(answer):
+            return "缺少引用" if "据文献" not in answer else "无问题"
+
+        def revise(answer, crit):
+            return answer + "（据文献[1]）"
+
+        res = AI.constitutional_ai("答案是 42", critique, revise, rounds=2)
+        assert res["answer"].count("据文献[1]") == 2
+        assert res["rounds"] == 2
+        assert len(res["revisions"]) == 2
+        assert res["revisions"][0]["critique"] == "缺少引用"
+        assert res["revisions"][1]["critique"] == "无问题"
+
+    def test_invalid_inputs(self):
+        assert _ttc_raises(lambda: AI.constitutional_ai("x", None, lambda a, c: a))
+        assert _ttc_raises(lambda: AI.constitutional_ai("x", lambda a: "c", None))
+        assert _ttc_raises(lambda: AI.constitutional_ai("x", lambda a: "c", lambda a, c: a, rounds=0))
+        assert _ttc_raises(lambda: AI.constitutional_ai(42, lambda a: "c", lambda a, c: a))
+        assert _ttc_raises(lambda: AI.constitutional_ai("x", lambda a: 1, lambda a, c: a))
+
+
+
+
+def _llm_search_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+        return False
+    except exc:
+        return True
+
+
+class TestLLMSearch:
+    def test_depth_one_choice(self):
+        res = AI.llm_search(lambda s: [("a", 1.0), ("b", 1.0)],
+                            lambda s: 1.0 if (s and s[-1] == "b") else 0.0,
+                            max_depth=1, num_simulations=32)
+        assert res["tokens"] == ["b"]
+        assert res["score"] == 1.0
+        assert res["steps"] == 1
+
+    def test_depth_three_path(self):
+        res = AI.llm_search(lambda s: [("a", 1.0), ("b", 1.0)],
+                            lambda s: 1.0 if (s and s[-1] == "b") else 0.0,
+                            max_depth=3, num_simulations=32)
+        assert res["tokens"] == ["b", "b", "b"]
+        assert res["steps"] == 3
+        assert len(res["visits_per_step"]) == 3
+
+    def test_terminal_early_stop(self):
+        res = AI.llm_search(lambda s: [("x", 0.5), ("y", 0.5)],
+                            lambda s: 0.0, max_depth=5,
+                            num_simulations=8, is_terminal=lambda s: len(s) >= 2)
+        assert res["steps"] == 2
+
+    def test_state_dependent_proposals(self):
+        def propose(state):
+            if not state:
+                return [("start", 1.0), ("end", 0.0)]
+            return [("right", 1.0), ("wrong", 0.0)]
+
+        res = AI.llm_search(propose,
+                            lambda s: 1.0 if (s and s[-1] == "right") else 0.0,
+                            max_depth=2, num_simulations=16)
+        assert res["tokens"] == ["start", "right"]
+
+    def test_invalid_inputs(self):
+        good_propose = lambda s: [("a", 1.0)]
+        good_value = lambda s: 0.0
+        assert _llm_search_raises(lambda: AI.llm_search(None, good_value))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, None))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, good_value, max_depth=0))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, good_value, num_simulations=0))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, good_value, c_puct=-1.0))
+        assert _llm_search_raises(lambda: AI.llm_search(lambda s: [], good_value))
+        assert _llm_search_raises(lambda: AI.llm_search(lambda s: [("a", -1.0)], good_value))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, lambda s: "bad"))
+        assert _llm_search_raises(lambda: AI.llm_search(good_propose, good_value, is_terminal=lambda s: "yes"))

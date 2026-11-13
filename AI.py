@@ -8850,6 +8850,205 @@ class RAGPipeline:
         return {"question": question, "chunks": [h["chunk"] for h in hits],
                 "hits": hits, "prompt": "\n".join(lines)}
 
+
+"""Test-time compute 组合器与 Constitutional AI 循环（简化管道）
+
+- `test_time_scaling`：在固定预算内多次采样，按策略挑答案：
+  `best_of_n` 用 verifier 分数取最高，`self_consistency` 用（可选规范化的）多数投票。
+- `constitutional_ai`：让模型先自我批评再修订，循环若干轮。
+
+两者都通过回调注入模型/打分器，纯 Python 可测，不含真实推理。
+"""
+
+
+def _ttc_check_str(value, name):
+    if not isinstance(value, str):
+        raise ValueError(f"ttc: {name} 必须是字符串")
+    return value
+
+
+def _ttc_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"ttc: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def test_time_scaling(generate_fn, verifier_fn, budget=8, strategy="best_of_n",
+                      normalize=None):
+    """预算内采样并挑选答案。
+
+    generate_fn(n) -> 长度为 n 的字符串列表；
+    verifier_fn(text) -> 有限数字分数（越大越好）；
+    strategy: 'best_of_n'（按分数）或 'self_consistency'（多数投票，分数用作并列裁决）。
+    """
+    if not callable(generate_fn):
+        raise ValueError("ttc: generate_fn 必须可调用")
+    if not callable(verifier_fn):
+        raise ValueError("ttc: verifier_fn 必须可调用")
+    budget = _ttc_check_pos_int(budget, "budget")
+    if strategy not in ("best_of_n", "self_consistency"):
+        raise ValueError("ttc: strategy 只能是 'best_of_n' 或 'self_consistency'")
+    if normalize is not None and not callable(normalize):
+        raise ValueError("ttc: normalize 必须是可调用对象或 None")
+    samples = generate_fn(budget)
+    if not isinstance(samples, (list, tuple)) or not samples:
+        raise ValueError("ttc: generate_fn 必须返回非空字符串列表")
+    cleaned = []
+    for i, s in enumerate(samples):
+        if not isinstance(s, str):
+            raise ValueError(f"ttc: generate_fn 返回的第 {i} 个样本不是字符串")
+        cleaned.append(s)
+    scores = []
+    for i, s in enumerate(cleaned):
+        score = verifier_fn(s)
+        if (not isinstance(score, (int, float)) or isinstance(score, bool)
+                or score != score or score in (float("inf"), float("-inf"))):
+            raise ValueError(f"ttc: verifier_fn 对第 {i} 个样本返回了非法分数")
+        scores.append(float(score))
+
+    if strategy == "best_of_n":
+        best = max(range(len(cleaned)), key=lambda i: (scores[i], -i))
+        return {"strategy": strategy, "answer": cleaned[best],
+                "score": scores[best], "index": best,
+                "samples": cleaned, "scores": scores}
+
+    # self_consistency：按规范化后的键投票，分数之和作并列裁决
+    tally = {}
+    first = {}
+    score_sum = {}
+    for i, s in enumerate(cleaned):
+        key = s if normalize is None else normalize(s)
+        if not isinstance(key, (str, int, float, bool, tuple)):
+            raise ValueError("ttc: normalize 的返回值必须是可哈希的基本类型")
+        try:
+            tally[key] = tally.get(key, 0) + 1
+        except TypeError as exc:
+            raise ValueError("ttc: normalize 的返回值必须可哈希") from exc
+        first.setdefault(key, i)
+        score_sum[key] = score_sum.get(key, 0.0) + scores[i]
+    best_key = max(tally, key=lambda k: (tally[k], score_sum[k], -first[k]))
+    return {"strategy": strategy, "answer": cleaned[first[best_key]],
+            "score": score_sum[best_key], "votes": tally[best_key],
+            "samples": cleaned, "scores": scores, "tally": tally}
+
+
+def constitutional_ai(initial_answer, critique_fn, revise_fn, rounds=1):
+    """自我批评 → 修订循环，返回每轮批评与答案历史。"""
+    _ttc_check_str(initial_answer, "initial_answer")
+    if not callable(critique_fn):
+        raise ValueError("ttc: critique_fn 必须可调用")
+    if not callable(revise_fn):
+        raise ValueError("ttc: revise_fn 必须可调用")
+    rounds = _ttc_check_pos_int(rounds, "rounds")
+    answer = initial_answer
+    revisions = []
+    for r in range(rounds):
+        critique = critique_fn(answer)
+        _ttc_check_str(critique, f"critique_fn 第 {r + 1} 轮返回值")
+        revised = revise_fn(answer, critique)
+        _ttc_check_str(revised, f"revise_fn 第 {r + 1} 轮返回值")
+        revisions.append({"round": r + 1, "critique": critique,
+                          "answer": revised})
+        answer = revised
+    return {"answer": answer, "rounds": rounds, "revisions": revisions}
+
+
+"""LLMSearch：把 MCTS 用在「token 序列」上（LLM 当策略/价值函数的简化封装）
+
+已有的 `mcts_search` 是通用的：状态、候选动作、价值函数都靠回调注入。
+`llm_search` 把它包成「逐 token 展开」的推理搜索：
+
+- `propose_fn(state_tuple)` 返回该状态下的候选 `(token, prior)` 列表（LLM 策略）；
+- `value_fn(state_tuple)` 返回该序列的分数（LLM verifier / 奖励模型）；
+- 达到 `max_depth` 或 `is_terminal(state)` 为真时停止，返回完整 token 序列。
+
+每步只做一次「深度 1 的 MCTS」来选下一个 token，因此总模拟次数为
+`num_simulations * depth` 量级；这是教学/演示用的组合，不是工业级 tree search。
+"""
+
+
+def _llm_search_check_int(value, name, minimum=1):
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(f"llm_search: {name} 必须是 >= {minimum} 的整数，收到 {value!r}")
+    return value
+
+
+def _llm_search_check_number(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"llm_search: {name} 必须是数字")
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"llm_search: {name} 必须是有限数字")
+    return value
+
+
+def llm_search(propose_fn, value_fn, max_depth=8, num_simulations=32,
+               c_puct=1.4, is_terminal=None, seed=None):
+    """逐 token MCTS，返回 {"tokens","score","steps","visits_per_step"}。"""
+    if not callable(propose_fn):
+        raise ValueError("llm_search: propose_fn 必须可调用")
+    if not callable(value_fn):
+        raise ValueError("llm_search: value_fn 必须可调用")
+    if is_terminal is not None and not callable(is_terminal):
+        raise ValueError("llm_search: is_terminal 必须是可调用对象或 None")
+    max_depth = _llm_search_check_int(max_depth, "max_depth")
+    num_simulations = _llm_search_check_int(num_simulations, "num_simulations")
+    c_puct = _llm_search_check_number(c_puct, "c_puct")
+    if c_puct < 0.0:
+        raise ValueError("llm_search: c_puct 必须 >= 0")
+    if seed is not None:
+        _llm_search_check_int(seed, "seed", minimum=0)
+
+    state = ()
+    visits_per_step = []
+
+    def _propose(s):
+        proposals = propose_fn(tuple(s))
+        if not isinstance(proposals, (list, tuple)) or not proposals:
+            raise ValueError("llm_search: propose_fn 必须返回非空 (token, prior) 列表")
+        out = []
+        for item in proposals:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("llm_search: propose_fn 的候选必须是 (token, prior)")
+            token, prior = item
+            try:
+                hash(token)
+            except TypeError as exc:
+                raise ValueError("llm_search: 候选 token 必须可哈希") from exc
+            p = _llm_search_check_number(prior, "prior")
+            if p < 0.0:
+                raise ValueError("llm_search: prior 必须 >= 0")
+            out.append((token, p))
+        return out
+
+    def _value(s):
+        v = value_fn(tuple(s))
+        return _llm_search_check_number(v, "value_fn 返回值")
+
+    for step in range(max_depth):
+        if is_terminal is not None:
+            terminal_flag = is_terminal(state)
+            if not isinstance(terminal_flag, bool):
+                raise ValueError("llm_search: is_terminal 必须返回布尔值")
+            if terminal_flag:
+                break
+        node = mcts_search(_propose, _value,
+                           lambda s: len(s) >= max_depth,
+                           state,
+                           num_simulations=num_simulations,
+                           c_puct=c_puct,
+                           max_depth=1,
+                           seed=None if seed is None else seed + step,
+                           next_state_fn=lambda s, a: tuple(s) + (a,))
+        action = node["action"]
+        if action is None:
+            break
+        visits_per_step.append(node.get("visits", 0))
+        state = state + (action,)
+
+    return {"tokens": list(state), "score": _value(state),
+            "steps": len(state), "visits_per_step": visits_per_step}
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
