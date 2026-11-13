@@ -13817,6 +13817,111 @@ class AutoInt:
         count += self.num_features * d + 1  # head
         return count
 
+"""工程便利件：模型解包、统一 Trainer 包装、前向基准计时。"""
+import time
+
+
+def unwrap_model(model, name="model"):
+    """把 Model 包装器解包成内部 MLP；普通 MLP 原样返回。"""
+    if model is None:
+        raise ValueError("unwrap_model: %s 不能是 None" % name)
+    inner = getattr(model, "model", None)
+    if inner is None:
+        if not hasattr(model, "layers"):
+            raise ValueError("unwrap_model: %s 既不是 Model 也不是 MLP" % name)
+        return model
+    if not hasattr(inner, "layers"):
+        raise ValueError("unwrap_model: %s.model 不是 MLP" % name)
+    return inner
+
+
+def _eng_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("%s 必须是正整数" % name)
+    return value
+
+
+def _eng_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("%s 必须是非负有限数" % name)
+    return float(value)
+
+
+def benchmark_forward(fn, warmup=1, repeats=5):
+    """对一个无参前向函数做粗粒度计时，返回毫秒统计。"""
+    if not callable(fn):
+        raise ValueError("benchmark_forward: fn 必须可调用")
+    _eng_check_pos_int(warmup + 1, "warmup+1")
+    _eng_check_pos_int(repeats, "repeats")
+    for _ in range(warmup):
+        fn()
+    samples = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - start) * 1000.0)
+    return {"mean_ms": sum(samples) / len(samples), "min_ms": min(samples),
+            "max_ms": max(samples), "repeats": repeats}
+
+
+class Trainer:
+    """把「Model/MLP + 训练循环」统一成一个薄封装，支持混合精度分支与回调。"""
+
+    def __init__(self, model, lr=0.01, callbacks=None):
+        if model is None:
+            raise ValueError("Trainer: model 不能是 None")
+        _eng_check_pos_number(lr, "Trainer: lr")
+        if callbacks is None:
+            callbacks = []
+        if not isinstance(callbacks, (list, tuple)):
+            raise ValueError("Trainer: callbacks 必须是列表")
+        for cb in callbacks:
+            if not (callable(cb) or hasattr(cb, "on_epoch_end")):
+                raise ValueError("Trainer: callbacks 元素必须是可调用或 Callback")
+        if isinstance(model, Model):
+            self.model = model
+        elif hasattr(model, "layers"):
+            self.model = Model(model, loss_fn="mse")
+        else:
+            raise ValueError("Trainer: model 必须是 Model 或 MLP")
+        self.lr = float(lr)
+        self.callbacks = list(callbacks)
+        self.history = []
+
+    def fit(self, x, y, epochs=100, batch_size=32, mixed_precision=False,
+            dtype="fp16", scale=1024.0, callbacks=None, verbose=True):
+        extra = list(callbacks or [])
+        for cb in extra:
+            if not (callable(cb) or hasattr(cb, "on_epoch_end")):
+                raise ValueError("Trainer: callbacks 元素必须是可调用或 Callback")
+        hooks = [cb for cb in self.callbacks + extra if hasattr(cb, "on_epoch_end")]
+        post = [cb for cb in self.callbacks + extra if callable(cb) and not hasattr(cb, "on_epoch_end")]
+        if mixed_precision:
+            kind = mixed_precision if isinstance(mixed_precision, str) else (dtype or "fp16")
+            result = fit_mixed_precision(unwrap_model(self.model), x, y,
+                                         dtype=kind, scale=scale,
+                                         epochs=epochs, lr=self.lr,
+                                         batch_size=batch_size)
+            raw = list(result["loss_history"])
+            self.history = [(v.get("loss") if isinstance(v, dict) else v) for v in raw]
+        else:
+            self.model.lr = self.lr
+            self.model.fit(x, y, epochs=epochs, batch_size=batch_size,
+                           callbacks=hooks, verbose=verbose)
+            hist = getattr(self.model, "history", None)
+            losses = hist.get("train_loss") if isinstance(hist, dict) else hist
+            if losses is None:
+                self.history = []
+            else:
+                self.history = [(v[1] if isinstance(v, (list, tuple)) and len(v) >= 2 else v)
+                                for v in losses]
+        for cb in post:
+            cb({"history": list(self.history)})
+        return list(self.history)
+
+    def predict(self, x):
+        return self.model.predict(x)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

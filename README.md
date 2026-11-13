@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2592 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2597 项）
 
 ## 特性
 
@@ -4031,6 +4031,29 @@ prob = model.predict(features[0])
 输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
 无 batch/Adam/正则；注意力权重不做可视化导出。
 
+### 工程便利件（unwrap_model / Trainer / benchmark_forward）
+
+```python
+from AI import Trainer, unwrap_model, benchmark_forward
+from AI import MLP
+
+mlp = MLP([8, 32, 1], ["relu", "linear"])
+trainer = Trainer(mlp, lr=0.01)
+history = trainer.fit(xs, ys, epochs=50, batch_size=32, verbose=False)
+mlp = unwrap_model(trainer.model)            # Model → 内部 MLP
+stats = benchmark_forward(lambda: mlp.forward(xs[0]), warmup=2, repeats=10)
+```
+
+| API | 说明 |
+| --- | --- |
+| `unwrap_model(model)` | 把 `Model` 包装器解包成内部 `MLP`；普通 `MLP` 原样返回，其他对象报错 |
+| `Trainer(model, lr=0.01, callbacks=None)` | `Model`/`MLP` 统一封装：`fit(x, y, epochs, batch_size, mixed_precision=False, callbacks=...)` 返回逐轮 loss 列表；`mixed_precision` 传 fp16/bf16/fp8 名称时走模拟混合精度循环 |
+| `benchmark_forward(fn, warmup=1, repeats=5)` | 对无参前向函数计时，返回 `mean_ms/min_ms/max_ms/repeats` |
+
+边界：`Trainer` 只统一「小数据 + Model/MLP」这一条训练路径，`CausalLM`/`ViT` 等大模型仍用各自的
+`fit`；`benchmark_forward` 只做墙钟计时（不做统计显著性、不测 GPU/多进程），结果依赖机器负载，
+适合横向对比同一台机器上的相对耗时。
+
 ### 序列推荐（SASRec）
 
 | 接口 | 说明 |
@@ -5665,7 +5688,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2592 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2597 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5864,6 +5887,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFitMixedPrecision` | fp16 批量训练收敛、bf16 逐样本 batch、两种 fp8 格式能跑、无 shuffle 的 batch 数、非法输入（模型/dtype/scale/lr/epochs/batch_size/维度/类型） |
 | `TestBERT4Rec` | 前向形状与 param_count（702）、mask 可复现、输出层/嵌入权重中心差分、固定序列 fit 损失下降、非法 token/长度/参数 |
 | `TestSASRec` | 前向形状与 param_count（226）、因果前缀不变性、输出层/嵌入权重中心差分、固定转移序列可学会、预测排除 padding、非法 token/长度/参数 |
+| `TestEngineering` | `unwrap_model` 解包/报错、`benchmark_forward` 统计字段、`Trainer` 普通训练与混合精度分支、回调、非法输入 |
 | `TestAutoInt` | 前向/param_count（177）、嵌入/注意力/FFN/头权重中心差分、XOR 型特征交叉可学会、非法输入 |
 | `TestDCNv2` | logit/概率/损失、交叉层两处权重中心差分、深侧 MLP 与线性项梯度、XOR 型目标可学会、非法输入 |
 | `TestCheckpointMixedPrecision` | `checkpoint_grads` 与手工逐样本反传逐位一致、`segments=1/2/3/99` 结果相同、非法段数/长度不一致报错、`fp16_round` 的 65504 界限与上下溢、`bf16_round` 尾数截断、`quantize_model` 幂等、`mixed_precision_grads` 与`fp16(g*scale)/scale` 一致且 loss scaling 保住极小梯度 |
@@ -6129,6 +6153,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2592 个单元测试
+├── test_ai.py       # 2597 个单元测试
 └── README.md
 ```

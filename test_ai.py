@@ -40498,3 +40498,84 @@ class TestAutoInt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _eng_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+class TestEngineering(unittest.TestCase):
+    def test_unwrap_model(self):
+        random.seed(0)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        self.assertIs(AI.unwrap_model(mlp), mlp)
+        wrapped = AI.Model(mlp, loss_fn="mse", lr=0.05)
+        self.assertIs(AI.unwrap_model(wrapped), mlp)
+        _eng_raises(lambda: AI.unwrap_model(None))
+        _eng_raises(lambda: AI.unwrap_model("not a model"))
+        _eng_raises(lambda: AI.unwrap_model(3))
+
+    def test_benchmark_forward(self):
+        random.seed(0)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        stats = AI.benchmark_forward(lambda: mlp.forward([0.5, -0.5]), warmup=1, repeats=3)
+        self.assertEqual(stats["repeats"], 3)
+        for key in ("mean_ms", "min_ms", "max_ms"):
+            self.assertIn(key, stats)
+            self.assertTrue(math.isfinite(stats[key]))
+            self.assertGreaterEqual(stats[key], 0.0)
+        self.assertLessEqual(stats["min_ms"], stats["mean_ms"] + 1e-9)
+        self.assertGreaterEqual(stats["max_ms"], stats["mean_ms"] - 1e-9)
+        _eng_raises(lambda: AI.benchmark_forward("nope"))
+        _eng_raises(lambda: AI.benchmark_forward(lambda: 1.0, repeats=0))
+
+    def test_trainer_plain(self):
+        random.seed(0)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        trainer = AI.Trainer(mlp, lr=0.05)
+        calls = []
+        hist = trainer.fit([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                           [[0.0], [1.0], [2.0]], epochs=40, batch_size=1,
+                           verbose=False, callbacks=[calls.append])
+        self.assertEqual(len(hist), 40)
+        self.assertTrue(all(math.isfinite(v) for v in hist))
+        self.assertLess(hist[-1], hist[0])
+        self.assertEqual(len(calls), 1)
+        pred = trainer.predict([[0.0, 0.0]])
+        self.assertEqual(len(pred), 1)
+        self.assertIs(AI.unwrap_model(trainer.model), mlp)
+
+    def test_trainer_mixed_precision(self):
+        random.seed(0)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        trainer = AI.Trainer(mlp, lr=0.01)
+        hist = trainer.fit([[0.0, 0.0], [1.0, 1.0]], [[0.0], [1.0]],
+                           epochs=4, mixed_precision="bf16", verbose=False)
+        self.assertEqual(len(hist), 4)
+        self.assertTrue(all(math.isfinite(v) for v in hist))
+
+    def test_trainer_invalid(self):
+        random.seed(0)
+        mlp = AI.MLP([2, 4, 1], ["relu", "linear"])
+        _eng_raises(lambda: AI.Trainer(None))
+        _eng_raises(lambda: AI.Trainer("nope"))
+        _eng_raises(lambda: AI.Trainer(mlp, lr=-0.1))
+        _eng_raises(lambda: AI.Trainer(mlp, callbacks="nope"))
+        _eng_raises(lambda: AI.Trainer(mlp, callbacks=[1]))
+        trainer = AI.Trainer(mlp, lr=0.05)
+        _eng_raises(lambda: trainer.fit([[0.0, 0.0]], [[0.0]], callbacks=[1], verbose=False))
+
+
+if __name__ == "__main__":
+    unittest.main()
