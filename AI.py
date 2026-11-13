@@ -34680,6 +34680,584 @@ class PerformerAttention:
                 param[i] -= lr * (mv[i] / c1) / (math.sqrt(vv[i] / c2) + eps)
 
 
+def _mla_check_pos_int(value, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("DeepSeekMLA: %s 必须是整数，收到 %r" % (name, value))
+    if value <= 0:
+        raise ValueError("DeepSeekMLA: %s 必须为正整数，收到 %r" % (name, value))
+    return value
+
+
+def _mla_check_positive(value, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("DeepSeekMLA: %s 必须是数字，收到 %r" % (name, value))
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("DeepSeekMLA: %s 必须是有限正数，收到 %r" % (name, value))
+    return value
+
+
+def _mla_rotate(vec, pos: int, base: float):
+    """对 vec 的偶数长度做 RoPE 旋转；返回旋转后的新向量。"""
+    out = [0.0] * len(vec)
+    half = len(vec) // 2
+    for i in range(half):
+        theta = pos / (base ** (2.0 * i / len(vec)))
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        a = vec[2 * i]
+        b = vec[2 * i + 1]
+        out[2 * i] = a * cos_t - b * sin_t
+        out[2 * i + 1] = a * sin_t + b * cos_t
+    return out
+
+
+def _mla_rotate_backward(d_rot, pos: int, base: float):
+    """RoPE 旋转是正交变换，反向即按 -theta 旋转。"""
+    out = [0.0] * len(d_rot)
+    half = len(d_rot) // 2
+    for i in range(half):
+        theta = pos / (base ** (2.0 * i / len(d_rot)))
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        a = d_rot[2 * i]
+        b = d_rot[2 * i + 1]
+        out[2 * i] = a * cos_t + b * sin_t
+        out[2 * i + 1] = -a * sin_t + b * cos_t
+    return out
+
+
+def _mla_matvec(weights, x):
+    return [sum(weights[i][j] * x[j] for j in range(len(x))) for i in range(len(weights))]
+
+
+def _mla_add_row(dst, src):
+    for i in range(len(dst)):
+        dst[i] += src[i]
+
+
+def _mla_outer_add(grad, a, b):
+    for i in range(len(a)):
+        ai = a[i]
+        if ai == 0.0:
+            continue
+        row = grad[i]
+        for j in range(len(b)):
+            row[j] += ai * b[j]
+
+
+class DeepSeekMLA:
+    """完整版 MLA（DeepSeek-V2 风格）：KV 低秩压缩 + Q 低秩压缩 + 解耦 RoPE。
+
+    与 ``MLAttention``（只压缩 KV）的区别：Q 先压到 ``q_latent_dim`` 再投影回
+    ``num_heads * d_k``，并且把一份**跨头共享**的 RoPE 分量（``rope_dim`` 维）
+    从内容维度中解耦出来：``score = q_nope·k_nope/sqrt(d_k) +
+    q_rope(t)·k_rope(j)/sqrt(rope_dim)``。手写反向覆盖全部投影与 RoPE 旋转。
+    """
+
+    def __init__(self, d_model: int, num_heads: int, kv_latent_dim: int = None,
+                 q_latent_dim: int = None, rope_dim: int = None,
+                 causal: bool = True, eps: float = 1e-8,
+                 rope_base: float = 10000.0, seed=None):
+        d_model = _mla_check_pos_int(d_model, "d_model")
+        num_heads = _mla_check_pos_int(num_heads, "num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "DeepSeekMLA: d_model=%d 不能被 num_heads=%d 整除" % (d_model, num_heads))
+        d_k = d_model // num_heads
+        if d_k < 2:
+            raise ValueError("DeepSeekMLA: 每个头的维度 d_k=%d 至少为 2" % d_k)
+        if not isinstance(causal, bool):
+            raise ValueError("DeepSeekMLA: causal 必须是 bool，收到 %r" % (causal,))
+        eps = _mla_check_positive(eps, "eps")
+        rope_base = _mla_check_positive(rope_base, "rope_base")
+        if rope_dim is None:
+            rope_dim = max(2, (d_k // 2) - ((d_k // 2) % 2))
+        rope_dim = _mla_check_pos_int(rope_dim, "rope_dim")
+        if rope_dim % 2 != 0 or rope_dim > d_k:
+            raise ValueError(
+                "DeepSeekMLA: rope_dim 必须是 <= d_k 的偶数，收到 %r" % (rope_dim,))
+        if kv_latent_dim is None:
+            kv_latent_dim = d_k
+        if q_latent_dim is None:
+            q_latent_dim = d_k
+        kv_latent_dim = _mla_check_pos_int(kv_latent_dim, "kv_latent_dim")
+        q_latent_dim = _mla_check_pos_int(q_latent_dim, "q_latent_dim")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_k
+        self.kv_latent_dim = kv_latent_dim
+        self.q_latent_dim = q_latent_dim
+        self.rope_dim = rope_dim
+        self.causal = causal
+        self.eps = eps
+        self.rope_base = rope_base
+
+        state = random.getstate()
+        try:
+            if seed is not None:
+                if not isinstance(seed, int) or isinstance(seed, bool):
+                    raise ValueError("DeepSeekMLA: seed 必须是整数或 None")
+                random.seed(seed)
+            std = math.sqrt(2.0 / d_model)
+
+            def gauss_rows(rows, cols):
+                return [[random.gauss(0.0, std) for _ in range(cols)] for _ in range(rows)]
+
+            self.W_dq = gauss_rows(q_latent_dim, d_model)
+            self.b_dq = [0.0] * q_latent_dim
+            self.W_uq = gauss_rows(num_heads * d_k, q_latent_dim)
+            self.b_uq = [0.0] * (num_heads * d_k)
+            self.W_qr = gauss_rows(rope_dim, d_model)
+            self.b_qr = [0.0] * rope_dim
+
+            self.W_dkv = gauss_rows(kv_latent_dim, d_model)
+            self.b_dkv = [0.0] * kv_latent_dim
+            self.W_uk = gauss_rows(num_heads * d_k, kv_latent_dim)
+            self.b_uk = [0.0] * (num_heads * d_k)
+            self.W_uv = gauss_rows(num_heads * d_k, kv_latent_dim)
+            self.b_uv = [0.0] * (num_heads * d_k)
+            self.W_kr = gauss_rows(rope_dim, d_model)
+            self.b_kr = [0.0] * rope_dim
+
+            self.W_o = gauss_rows(d_model, d_model)
+            self.b_o = [0.0] * d_model
+        finally:
+            random.setstate(state)
+
+        self._shape = {
+            "W_dq": (q_latent_dim, d_model),
+            "b_dq": (q_latent_dim,),
+            "W_uq": (num_heads * d_k, q_latent_dim),
+            "b_uq": (num_heads * d_k,),
+            "W_qr": (rope_dim, d_model),
+            "b_qr": (rope_dim,),
+            "W_dkv": (kv_latent_dim, d_model),
+            "b_dkv": (kv_latent_dim,),
+            "W_uk": (num_heads * d_k, kv_latent_dim),
+            "b_uk": (num_heads * d_k,),
+            "W_uv": (num_heads * d_k, kv_latent_dim),
+            "b_uv": (num_heads * d_k,),
+            "W_kr": (rope_dim, d_model),
+            "b_kr": (rope_dim,),
+            "W_o": (d_model, d_model),
+            "b_o": (d_model,),
+        }
+        self.grads = None
+        self._m = None
+        self._v = None
+        self._adam_t = 0
+        self._cache = None
+        self._in_dim = d_model
+        self.attn_weights = None
+        self.zero_grad()
+
+    def kv_cache_size(self, seq_len: int) -> int:
+        """MLA 只需缓存压缩后的潜在向量 + 解耦 RoPE 分量：T*(d_c + d_rope)。"""
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 0:
+            raise ValueError("DeepSeekMLA.kv_cache_size: seq_len 必须是非负整数")
+        return seq_len * (self.kv_latent_dim + self.rope_dim)
+
+    def full_kv_cache_size(self, seq_len: int) -> int:
+        """等价的明文 KV cache 大小：T*(2*H*d_k + 2*d_rope)。"""
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 0:
+            raise ValueError("DeepSeekMLA.full_kv_cache_size: seq_len 必须是非负整数")
+        return seq_len * (2 * self.num_heads * self.d_k + 2 * self.rope_dim)
+
+    # ---------- 梯度容器 ----------
+
+    def _zeros_for(self, name):
+        shape = self._shape[name]
+        if len(shape) == 1:
+            return [0.0] * shape[0]
+        return [[0.0] * shape[1] for _ in range(shape[0])]
+
+    def zero_grad(self):
+        self.grads = {name: self._zeros_for(name) for name in self._shape}
+
+    def _init_adam(self):
+        if self._m is not None:
+            return
+        self._m = {name: self._zeros_for(name) for name in self._shape}
+        self._v = {name: self._zeros_for(name) for name in self._shape}
+        self._adam_t = 0
+
+    def _param_names(self):
+        return list(self._shape.keys())
+
+    def param_count(self):
+        total = 0
+        for shape in self._shape.values():
+            n = 1
+            for dim in shape:
+                n *= dim
+            total += n
+        return total
+
+    # ---------- 前向 ----------
+
+    def _check_seq(self, seq, who: str):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError("DeepSeekMLA.%s: 输入序列不能为空" % who)
+        out = []
+        for t, row in enumerate(seq):
+            if not isinstance(row, (list, tuple)):
+                raise ValueError("DeepSeekMLA.%s: 第 %d 个 token 必须是列表" % (who, t))
+            if len(row) != self.d_model:
+                raise ValueError(
+                    "DeepSeekMLA.%s: 第 %d 个 token 的维度 %d 与 d_model=%d 不一致"
+                    % (who, t, len(row), self.d_model))
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError("DeepSeekMLA.%s: token 元素必须是数字" % who)
+                v = float(v)
+                if not math.isfinite(v):
+                    raise ValueError("DeepSeekMLA.%s: token 元素必须是有限数字" % who)
+                vals.append(v)
+            out.append(vals)
+        return out
+
+    def forward(self, x_seq):
+        x_seq = self._check_seq(x_seq, "forward")
+        t_len = len(x_seq)
+        h = self.num_heads
+        d_k = self.d_k
+        rope_dim = self.rope_dim
+        inv_k = 1.0 / math.sqrt(d_k)
+        inv_r = 1.0 / math.sqrt(rope_dim)
+
+        cache = []
+        for t, x in enumerate(x_seq):
+            c_q = _mla_matvec(self.W_dq, x)
+            for i in range(len(c_q)):
+                c_q[i] += self.b_dq[i]
+            q_all = _mla_matvec(self.W_uq, c_q)
+            for i in range(len(q_all)):
+                q_all[i] += self.b_uq[i]
+            q_rope_raw = _mla_matvec(self.W_qr, x)
+            for i in range(rope_dim):
+                q_rope_raw[i] += self.b_qr[i]
+            q_rope = _mla_rotate(q_rope_raw, t, self.rope_base)
+
+            c_kv = _mla_matvec(self.W_dkv, x)
+            for i in range(len(c_kv)):
+                c_kv[i] += self.b_dkv[i]
+            k_all = _mla_matvec(self.W_uk, c_kv)
+            for i in range(len(k_all)):
+                k_all[i] += self.b_uk[i]
+            v_all = _mla_matvec(self.W_uv, c_kv)
+            for i in range(len(v_all)):
+                v_all[i] += self.b_uv[i]
+            k_rope_raw = _mla_matvec(self.W_kr, x)
+            for i in range(rope_dim):
+                k_rope_raw[i] += self.b_kr[i]
+            k_rope = _mla_rotate(k_rope_raw, t, self.rope_base)
+
+            cache.append({
+                "x": x, "c_q": c_q, "q_all": q_all, "q_rope": q_rope,
+                "c_kv": c_kv, "k_all": k_all, "v_all": v_all,
+                "k_rope": k_rope,
+            })
+
+        # 逐头注意力（内容分数 + 解耦 RoPE 分数）
+        head_out = [[[0.0] * d_k for _ in range(t_len)] for _ in range(h)]
+        probs_all = [[[0.0] * t_len for _ in range(t_len)] for _ in range(h)]
+        self.attn_weights = None
+        for hd in range(h):
+            for t in range(t_len):
+                q_t = cache[t]["q_all"][hd * d_k:(hd + 1) * d_k]
+                q_r = cache[t]["q_rope"]
+                scores = []
+                for s in range(t_len):
+                    if self.causal and s > t:
+                        scores.append(None)
+                        continue
+                    k_s = cache[s]["k_all"][hd * d_k:(hd + 1) * d_k]
+                    k_r = cache[s]["k_rope"]
+                    val = sum(q_t[i] * k_s[i] for i in range(d_k)) * inv_k
+                    val += sum(q_r[i] * k_r[i] for i in range(rope_dim)) * inv_r
+                    scores.append(val)
+                m = max(v for v in scores if v is not None)
+                exps = []
+                for s in range(t_len):
+                    if scores[s] is None:
+                        exps.append(0.0)
+                    else:
+                        exps.append(math.exp(scores[s] - m))
+                denom = sum(exps) + self.eps
+                probs = [e / denom for e in exps]
+                probs_all[hd][t] = probs
+                out_row = [0.0] * d_k
+                for s in range(t_len):
+                    p = probs[s]
+                    if p == 0.0:
+                        continue
+                    v_s = cache[s]["v_all"][hd * d_k:(hd + 1) * d_k]
+                    for c in range(d_k):
+                        out_row[c] += p * v_s[c]
+                head_out[hd][t] = out_row
+
+        concat = []
+        for t in range(t_len):
+            row = []
+            for hd in range(h):
+                row.extend(head_out[hd][t])
+            concat.append(row)
+        y = []
+        for t in range(t_len):
+            y_t = _mla_matvec(self.W_o, concat[t])
+            for i in range(self.d_model):
+                y_t[i] += self.b_o[i]
+            y.append(y_t)
+
+        self._cache = {"x_seq": x_seq, "tokens": cache, "concat": concat,
+                       "head_out": head_out, "probs": probs_all}
+        self.attn_weights = probs_all
+        return y
+
+    # ---------- 反向 ----------
+
+    def backward(self, dout_seq):
+        if self._cache is None:
+            raise RuntimeError("DeepSeekMLA.backward: 必须先 forward")
+        cache = self._cache
+        t_len = len(cache["tokens"])
+        h = self.num_heads
+        d_k = self.d_k
+        rope_dim = self.rope_dim
+        dm = self.d_model
+        if not isinstance(dout_seq, (list, tuple)) or len(dout_seq) != t_len:
+            raise ValueError("DeepSeekMLA.backward: dout 长度必须与 forward 输入一致")
+        dout = []
+        for t, row in enumerate(dout_seq):
+            if not isinstance(row, (list, tuple)) or len(row) != dm:
+                raise ValueError(
+                    "DeepSeekMLA.backward: 第 %d 行 dout 维度必须是 %d" % (t, dm))
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError("DeepSeekMLA.backward: dout 元素必须是数字")
+                v = float(v)
+                if not math.isfinite(v):
+                    raise ValueError("DeepSeekMLA.backward: dout 元素必须是有限数字")
+                vals.append(v)
+            dout.append(vals)
+
+        g = self.grads
+        # 输出投影
+        for t in range(t_len):
+            d = dout[t]
+            if any(v != 0.0 for v in d):
+                _mla_outer_add(g["W_o"], d, cache["concat"][t])
+            _mla_add_row(g["b_o"], d)
+        d_concat = []
+        for t in range(t_len):
+            row = [0.0] * dm
+            for i in range(dm):
+                d = dout[t][i]
+                if d == 0.0:
+                    continue
+                W_row = self.W_o[i]
+                for j in range(dm):
+                    row[j] += d * W_row[j]
+            d_concat.append(row)
+
+        # 逐头注意力反向
+        d_q_all = [[0.0] * (h * d_k) for _ in range(t_len)]
+        d_k_all = [[0.0] * (h * d_k) for _ in range(t_len)]
+        d_v_all = [[0.0] * (h * d_k) for _ in range(t_len)]
+        d_q_rope = [[0.0] * rope_dim for _ in range(t_len)]
+        d_k_rope = [[0.0] * rope_dim for _ in range(t_len)]
+        inv_k = 1.0 / math.sqrt(d_k)
+        inv_r = 1.0 / math.sqrt(rope_dim)
+        for hd in range(h):
+            probs_h = cache["probs"][hd]
+            for t in range(t_len):
+                d_out = d_concat[t][hd * d_k:(hd + 1) * d_k]
+                if all(v == 0.0 for v in d_out):
+                    continue
+                q_t = cache["tokens"][t]["q_all"][hd * d_k:(hd + 1) * d_k]
+                q_r = cache["tokens"][t]["q_rope"]
+                scores = [None] * t_len
+                for s in range(t_len):
+                    if self.causal and s > t:
+                        continue
+                    k_s = cache["tokens"][s]["k_all"][hd * d_k:(hd + 1) * d_k]
+                    k_r = cache["tokens"][s]["k_rope"]
+                    val = sum(q_t[i] * k_s[i] for i in range(d_k)) * inv_k
+                    val += sum(q_r[i] * k_r[i] for i in range(rope_dim)) * inv_r
+                    scores[s] = val
+                m = max(v for v in scores if v is not None)
+                exps = [0.0 if scores[s] is None else math.exp(scores[s] - m)
+                        for s in range(t_len)]
+                denom = sum(exps) + self.eps
+                probs = [e / denom for e in exps]
+                dp = [0.0] * t_len
+                for s in range(t_len):
+                    if probs[s] == 0.0:
+                        continue
+                    v_s = cache["tokens"][s]["v_all"][hd * d_k:(hd + 1) * d_k]
+                    dp[s] = sum(d_out[c] * v_s[c] for c in range(d_k))
+                dot = sum(probs[s] * dp[s] for s in range(t_len))
+                ds = [probs[s] * (dp[s] - dot) for s in range(t_len)]
+                # 对 v / q / k 的梯度
+                for s in range(t_len):
+                    p = probs[s]
+                    if p != 0.0:
+                        v_slot = d_v_all[s]
+                        for c in range(d_k):
+                            v_slot[hd * d_k + c] += p * d_out[c]
+                    dsv = ds[s]
+                    if dsv == 0.0:
+                        continue
+                    q_slot = d_q_all[t]
+                    k_slot = d_k_all[s]
+                    k_s = cache["tokens"][s]["k_all"][hd * d_k:(hd + 1) * d_k]
+                    for i in range(d_k):
+                        q_slot[hd * d_k + i] += dsv * k_s[i] * inv_k
+                        k_slot[hd * d_k + i] += dsv * q_t[i] * inv_k
+                    k_r = cache["tokens"][s]["k_rope"]
+                    for i in range(rope_dim):
+                        d_q_rope[t][i] += dsv * k_r[i] * inv_r
+                        d_k_rope[s][i] += dsv * q_r[i] * inv_r
+
+        # Q 路径：W_uq -> c_q -> W_dq -> x；RoPE 分量 W_qr
+        dx_seq = [[0.0] * dm for _ in range(t_len)]
+        for t in range(t_len):
+            dq = d_q_all[t]
+            c_q = cache["tokens"][t]["c_q"]
+            _mla_outer_add(g["W_uq"], dq, c_q)
+            _mla_add_row(g["b_uq"], dq)
+            d_cq = [0.0] * len(c_q)
+            for i in range(h * d_k):
+                d = dq[i]
+                if d == 0.0:
+                    continue
+                W_row = self.W_uq[i]
+                for j in range(len(c_q)):
+                    d_cq[j] += d * W_row[j]
+            _mla_outer_add(g["W_dq"], d_cq, cache["tokens"][t]["x"])
+            _mla_add_row(g["b_dq"], d_cq)
+            # dx += W_dq^T d_cq
+            dx_t = dx_seq[t]
+            for j in range(len(c_q)):
+                d = d_cq[j]
+                if d == 0.0:
+                    continue
+                W_row = self.W_dq[j]
+                for c in range(dm):
+                    dx_t[c] += d * W_row[c]
+            # RoPE 分量
+            d_qr = _mla_rotate_backward(d_q_rope[t], t, self.rope_base)
+            _mla_outer_add(g["W_qr"], d_qr, cache["tokens"][t]["x"])
+            _mla_add_row(g["b_qr"], d_qr)
+            for j in range(rope_dim):
+                d = d_qr[j]
+                if d == 0.0:
+                    continue
+                W_row = self.W_qr[j]
+                for c in range(dm):
+                    dx_t[c] += d * W_row[c]
+
+        # KV 路径：W_uk/W_uv -> c_kv -> W_dkv；RoPE 分量 W_kr
+        for s in range(t_len):
+            dk = d_k_all[s]
+            dv = d_v_all[s]
+            c_kv = cache["tokens"][s]["c_kv"]
+            _mla_outer_add(g["W_uk"], dk, c_kv)
+            _mla_add_row(g["b_uk"], dk)
+            _mla_outer_add(g["W_uv"], dv, c_kv)
+            _mla_add_row(g["b_uv"], dv)
+            d_ckv = [0.0] * len(c_kv)
+            for i in range(h * d_k):
+                dk_i = dk[i]
+                if dk_i != 0.0:
+                    W_row = self.W_uk[i]
+                    for j in range(len(c_kv)):
+                        d_ckv[j] += dk_i * W_row[j]
+                dv_i = dv[i]
+                if dv_i != 0.0:
+                    W_row = self.W_uv[i]
+                    for j in range(len(c_kv)):
+                        d_ckv[j] += dv_i * W_row[j]
+            _mla_outer_add(g["W_dkv"], d_ckv, cache["tokens"][s]["x"])
+            _mla_add_row(g["b_dkv"], d_ckv)
+            dx_s = dx_seq[s]
+            for j in range(len(c_kv)):
+                d = d_ckv[j]
+                if d == 0.0:
+                    continue
+                W_row = self.W_dkv[j]
+                for c in range(dm):
+                    dx_s[c] += d * W_row[c]
+            d_kr = _mla_rotate_backward(d_k_rope[s], s, self.rope_base)
+            _mla_outer_add(g["W_kr"], d_kr, cache["tokens"][s]["x"])
+            _mla_add_row(g["b_kr"], d_kr)
+            for j in range(rope_dim):
+                d = d_kr[j]
+                if d == 0.0:
+                    continue
+                W_row = self.W_kr[j]
+                for c in range(dm):
+                    dx_s[c] += d * W_row[c]
+
+        return dx_seq
+
+    # ---------- 优化 ----------
+
+    def sgd_step(self, lr=0.01):
+        if self.grads is None:
+            raise RuntimeError("DeepSeekMLA.sgd_step: 没有可用的梯度，请先 backward")
+        lr = _mla_check_positive(lr, "lr")
+        params = {name: getattr(self, name) for name in self._shape}
+        for name, grad in self.grads.items():
+            param = params[name]
+            if isinstance(param[0], list):
+                for i in range(len(param)):
+                    for j in range(len(param[i])):
+                        param[i][j] -= lr * grad[i][j]
+            else:
+                for i in range(len(param)):
+                    param[i] -= lr * grad[i]
+
+    def adam_step(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        if self.grads is None:
+            raise RuntimeError("DeepSeekMLA.adam_step: 没有可用的梯度，请先 backward")
+        lr = _mla_check_positive(lr, "lr")
+        self._init_adam()
+        self._adam_t += 1
+        t = self._adam_t
+        bc1 = 1.0 - beta1 ** t
+        bc2 = 1.0 - beta2 ** t
+        params = {name: getattr(self, name) for name in self._shape}
+        for name, grad in self.grads.items():
+            param = params[name]
+            m = self._m[name]
+            v = self._v[name]
+            if isinstance(param[0], list):
+                for i in range(len(param)):
+                    for j in range(len(param[i])):
+                        gd = grad[i][j]
+                        m[i][j] = beta1 * m[i][j] + (1.0 - beta1) * gd
+                        v[i][j] = beta2 * v[i][j] + (1.0 - beta2) * gd * gd
+                        param[i][j] -= lr * (m[i][j] / bc1) / (
+                            math.sqrt(v[i][j] / bc2) + eps)
+            else:
+                for i in range(len(param)):
+                    gd = grad[i]
+                    m[i] = beta1 * m[i] + (1.0 - beta1) * gd
+                    v[i] = beta2 * v[i] + (1.0 - beta2) * gd * gd
+                    param[i] -= lr * (m[i] / bc1) / (math.sqrt(v[i] / bc2) + eps)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 class MLAttention:
     """MLA 简化版：把 K/V 压到低秩潜在向量，再上投影回每头
 

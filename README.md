@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2602 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2608 项）
 
 ## 特性
 
@@ -419,6 +419,7 @@ model.train()     # 回到训练
 | `LinformerAttention(d_model, num_heads, seq_len, num_proj=None)` | **Linformer**（Wang 2020）：用两个可学习投影 `E`/`F`（`k×T`）把 K/V 沿**序列维**压到 `k` 个 token，分数矩阵从 `T×T` 变成 `T×k`，代价 O(T·k·d)。`num_proj` 默认 `max(1, seq_len//4)`；**不支持 causal**（E/F 用了整条序列，做自回归会泄漏未来）、同一个实例只能处理固定长度；`k == T` 且 `E = F = I` 时与标准注意力逐位等价（测试里验证） |
 | `PerformerAttention(d_model, num_heads, num_features=16, causal=False, eps=1e-6, seed=0)` | **Performer**（Choromanski 2020，FAVOR+）：`phi(x)=exp(Wx-\|x\|²/2)/sqrt(m)` 近似 softmax 核，同样用前缀累加矩阵，O(T·d·m)。`W` 是固定随机特征（不训练）、每头一份；`causal=True` 可自回归。**近似质量**：实测 d=8 时 `m=4` 相对误差约 92%、`m=64` 约 35%（iid 高斯特征，论文的正交版更好），所以它是「省算力」而不是「逼近 softmax」的组件 |
 | `MLAttention(d_model, num_heads, latent_dim=None, causal=False, eps=1e-8)` | **MLA 简化版**（DeepSeek-V2）：`c_t = W_dkv x_t` 是低秩潜在向量，`k/v` 由 `W_uk c_t` / `W_uv c_t` 上投影得到——**KV cache 只需存 `T·d_c` 个标量**，而不是标准 MHA 的 `T·2·H·d_k`（`kv_cache_size` / `full_kv_cache_size` 可查）。保留全秩 Q 与标准缩放点积注意力（也支持 causal），所以它是「低秩 KV」而非完整 MLA（后者还会压缩 Q、并把 RoPE 解耦出去） |
+| `DeepSeekMLA(d_model, num_heads, kv_latent_dim=None, q_latent_dim=None, rope_dim=None, causal=True, eps=1e-8, rope_base=10000.0)` | **完整版 MLA**（DeepSeek-V2 风格）：KV 低秩压缩 + Q 低秩压缩 + 跨头共享的解耦 RoPE 分量，`score = q_nope·k_nope/√d_k + q_rope(t)·k_rope(j)/√d_rope`；手写反向覆盖全部投影与 RoPE 旋转，`kv_cache_size()` 为 `T·(d_c + d_rope)`。边界：单层、无 KV cache 增量解码接口、无张量并行/分布式 |
 | `BigBirdAttention(d_model, num_heads, window_size=2, num_global=1, num_random=1, causal=False, seed=0)` | **BigBird 稀疏注意力**：窗口 + 全局 + 随机三类连接，只在稀疏图上做 softmax。全连通时与稠密注意力**逐位等价**（验证 <1e-12），`seed` 决定随机连边且可复现 |
 | `LongformerAttention(d_model, num_heads, window_size=2, global_tokens=None, causal=False)` | **Longformer**：滑窗 + 全局 token。全局 token（默认 `[0]`）能看见整条序列，其余位置只看窗口 ∪ 全局，代价 O(T·w) |
 | `ReformerAttention(d_model, num_heads, num_buckets=2, causal=False, seed=0)` | **Reformer 的 LSH 注意力**：固定随机投影 argmax 分桶，只在桶内做注意力。简化点：单轮哈希、桶分配不可导（梯度只走注意力权重），`num_buckets=1` 时退化为稠密注意力 |
@@ -5701,7 +5702,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2602 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2608 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5846,6 +5847,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLinearAttention` | 形状与参数量 168、单头非 causal 闭式解、causal 的「改尾部不影响前部」、`W_q/W_k/W_v/W_o` 与输入梯度中心差分（两种模式 ≤1e-5）、梯度累加与 `zero_grad`、`sgd_step`/`adam_step` 真更新、120 步 Adam 收敛、9 类非法输入 |
 | `TestLinformerAttention` | 形状与参数量 312（低秩分数矩阵是 `T×k`）、`W_q/W_k/W_v/W_o`/`E`/`F`/偏置/输入梯度中心差分 ≤1e-5、`k==T` 且 `E=F=I` 时与 `MultiHeadAttention` 逐位等价（<1e-12）、梯度累加与 `zero_grad`、Adam 120 步收敛、非法构造与长度校验 |
 | `TestPerformerAttention` | 形状与参数量 288、`phi` 长度 = m、随机特征不训练，`W_*`/输入梯度中心差分 ≤1e-5（causal 与非 causal）、causal 只影响当前及之后的位置、特征数越多近似越准（m=4 → m=64）、梯度累加与两个优化器、非法输入 |
+| `TestDeepSeekMLA` | 前向/参数 258/KV cache 25 与 100、全部 16 个参数的梯度中心差分、causal 与非 causal 输入梯度、causal 掩码（改尾部不影响前部）、RoPE 位置 0 恒等与往返可逆、SGD/Adam 更新、非法输入 |
 | `TestMLAttention` | 形状、`latent` 是 `T×d_c`、参数量 210、KV cache `T·d_c` 与标准 MHA 的 8 倍压缩比，五个权重/五个偏置/输入梯度中心差分 ≤1e-5（causal 与非 causal），causal 上三角权重恰为 0 且每行和为 1、梯度累加与两个优化器、Adam 120 步收敛、非法输入 |
 | `TestBigBirdAttention` | 稀疏模式（窗口/全局/随机）、causal 上三角恰 0、每行和为 1、全连通时与稠密 softmax 等价、参数与输入梯度中心差分 ≤1e-5（含 causal）、累加/清零/两个优化器、8 类非法输入 |
 | `TestLongformerAttention` | 全局 token 看见全部位置、普通位置只看窗口 ∪ 全局、causal 下全局行仍看全序列、参数与输入梯度 ≤1e-5、非法输入 |
@@ -6167,6 +6169,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2602 个单元测试
+├── test_ai.py       # 2608 个单元测试
 └── README.md
 ```

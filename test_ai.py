@@ -40709,3 +40709,152 @@ class TestLinearAttentionBackward:
         _linb_raises(lambda: AI.deltanet_backward(q, k, v, [0.1, 0.2, 1.5], good_out))
         _linb_raises(lambda: AI.hyena_long_conv_backward(q, [], good_out))
         _linb_raises(lambda: AI.hyena_forward_backward(q, _linb_mat(2, 2, 55), [0.5], good_out))
+
+
+def _mla_t_mat(t_len, d, seed=0, lo=-1.0, hi=1.0):
+    rng = random.Random(seed)
+    return [[rng.uniform(lo, hi) for _ in range(d)] for _ in range(t_len)]
+
+
+def _mla_t_loss(model, xs, ws):
+    out = model.forward(xs)
+    return sum(out[t][c] * ws[t][c] for t in range(len(out)) for c in range(len(out[0])))
+
+
+def _mla_t_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as err:  # noqa: BLE001
+        raise AssertionError(f"expected {exc}, got {type(err).__name__}: {err}")
+    raise AssertionError(f"expected {exc}, nothing raised")
+
+
+def _mla_t_check_param(model, name, xi=0, xj=1, h=1e-5):
+    xs = _mla_t_mat(3, model.d_model, 7)
+    ws = _mla_t_mat(3, model.d_model, 8)
+    model.zero_grad()
+    model.forward(xs)
+    model.backward(ws)
+    param = getattr(model, name)
+    ana = model.grads[name][xi][xj]
+    old = param[xi][xj]
+    param[xi][xj] = old + h
+    lp = _mla_t_loss(model, xs, ws)
+    param[xi][xj] = old - h
+    lm = _mla_t_loss(model, xs, ws)
+    param[xi][xj] = old
+    num = (lp - lm) / (2 * h)
+    scale = max(1.0, abs(ana), abs(num))
+    return abs(ana - num) / scale
+
+
+class TestDeepSeekMLA:
+    def test_forward_param_and_cache_sizes(self):
+        model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3, rope_dim=2,
+                               causal=True, seed=1)
+        assert model.param_count() == 258
+        assert model.kv_cache_size(5) == 25
+        assert model.full_kv_cache_size(5) == 100
+        assert model.kv_cache_size(0) == 0
+        y = model.forward(_mla_t_mat(3, 8, 1))
+        assert len(y) == 3 and len(y[0]) == 8
+        _mla_t_raises(lambda: model.kv_cache_size(-1))
+
+    def test_all_param_gradients(self):
+        model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3, rope_dim=2,
+                               causal=True, seed=1)
+        for name in ("W_dq", "W_uq", "W_qr", "W_dkv", "W_uk", "W_uv", "W_kr", "W_o"):
+            rel = _mla_t_check_param(model, name)
+            assert rel < 1e-5, (name, rel)
+        for name in ("b_dq", "b_uq", "b_qr", "b_dkv", "b_uk", "b_uv", "b_kr", "b_o"):
+            model.zero_grad()
+            xs = _mla_t_mat(3, 8, 7)
+            ws = _mla_t_mat(3, 8, 8)
+            model.forward(xs)
+            model.backward(ws)
+            param = getattr(model, name)
+            ana = model.grads[name][0]
+            old = param[0]
+            param[0] = old + 1e-5
+            lp = _mla_t_loss(model, xs, ws)
+            param[0] = old - 1e-5
+            lm = _mla_t_loss(model, xs, ws)
+            param[0] = old
+            num = (lp - lm) / 2e-5
+            rel = abs(ana - num) / max(1.0, abs(ana), abs(num))
+            assert rel < 1e-5, (name, rel)
+
+    def test_input_gradient_causal_and_noncausal(self):
+        for causal in (True, False):
+            model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3,
+                                   rope_dim=2, causal=causal, seed=3)
+            xs = _mla_t_mat(3, 8, 7)
+            ws = _mla_t_mat(3, 8, 8)
+            model.zero_grad()
+            model.forward(xs)
+            dx = model.backward(ws)
+            ana = dx[1][2]
+            old = xs[1][2]
+            xs[1][2] = old + 1e-5
+            lp = _mla_t_loss(model, xs, ws)
+            xs[1][2] = old - 1e-5
+            lm = _mla_t_loss(model, xs, ws)
+            xs[1][2] = old
+            num = (lp - lm) / 2e-5
+            rel = abs(ana - num) / max(1.0, abs(ana), abs(num))
+            assert rel < 1e-5, (causal, rel)
+
+    def test_causal_mask_and_rope(self):
+        model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3, rope_dim=2,
+                               causal=True, seed=4)
+        xs = _mla_t_mat(4, 8, 9)
+        y0 = model.forward(xs)
+        changed = [row[:] for row in xs]
+        changed[3] = [v + 0.05 for v in changed[3]]
+        y1 = model.forward(changed)
+        for t in range(3):
+            for c in range(8):
+                assert abs(y0[t][c] - y1[t][c]) < 1e-12
+        # RoPE 位置 0 恒等、往返可逆
+        vec = [0.3, -0.7, 1.1, 0.2]
+        assert AI._mla_rotate(vec, 0, 10000.0) == vec
+        back = AI._mla_rotate_backward(AI._mla_rotate(vec, 3, 10000.0), 3, 10000.0)
+        for a, b in zip(back, vec):
+            assert abs(a - b) < 1e-12
+
+    def test_sgd_and_adam_step(self):
+        model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3, rope_dim=2,
+                               causal=False, seed=5)
+        xs = _mla_t_mat(3, 8, 10)
+        ws = _mla_t_mat(3, 8, 11)
+        model.zero_grad()
+        model.forward(xs)
+        model.backward(ws)
+        before = model.W_o[0][0]
+        model.sgd_step(0.01)
+        assert model.W_o[0][0] != before
+        model.zero_grad()
+        model.forward(xs)
+        model.backward(ws)
+        before = model.W_dq[0][0]
+        model.adam_step(0.01)
+        assert model.W_dq[0][0] != before
+
+    def test_invalid_inputs(self):
+        _mla_t_raises(lambda: AI.DeepSeekMLA(0, 2))
+        _mla_t_raises(lambda: AI.DeepSeekMLA(8, 3))
+        _mla_t_raises(lambda: AI.DeepSeekMLA(8, 2, rope_dim=3))
+        _mla_t_raises(lambda: AI.DeepSeekMLA(8, 2, rope_dim=6))
+        _mla_t_raises(lambda: AI.DeepSeekMLA(8, 2, causal="yes"))
+        _mla_t_raises(lambda: AI.DeepSeekMLA(8, 2, eps=0.0))
+        model = AI.DeepSeekMLA(8, 2, kv_latent_dim=3, q_latent_dim=3, rope_dim=2,
+                               causal=True, seed=1)
+        _mla_t_raises(lambda: model.forward([]))
+        _mla_t_raises(lambda: model.forward([[0.1] * 7]))
+        _mla_t_raises(lambda: model.backward([[0.1] * 8]), RuntimeError)
+        model.forward(_mla_t_mat(3, 8, 1))
+        _mla_t_raises(lambda: model.backward([[0.1] * 8]))
+        _mla_t_raises(lambda: model.backward([[0.1] * 7 for _ in range(3)]))
+        _mla_t_raises(lambda: model.sgd_step(0.0))
