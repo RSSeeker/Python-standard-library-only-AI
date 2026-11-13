@@ -38552,3 +38552,105 @@ class TestFinetuneLoRA:
         m2 = AI.Model(AI.MLP([2, 2]))
         m2.model.layers[0] = AI.LoRA(m2.model.layers[0], rank=1)
         assert _fl_raises(lambda: AI.finetune_lora(m2, xs, xs))
+
+
+class _MTFakeTarget:
+    """隐藏状态 = token 的 one-hot 行，d_model = vocab_size。"""
+
+    def __init__(self, vocab_size=8):
+        self.vocab_size = vocab_size
+        self.d_model = vocab_size
+        self.h = None
+
+    def forward(self, seq):
+        self.h = [[1.0 if k == tok else 0.0 for k in range(self.vocab_size)]
+                  for tok in seq]
+        return [row[:] for row in self.h]
+
+
+def _mt_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestTrainMedusaHeads:
+    def test_rows_targets_and_convergence(self):
+        target = _MTFakeTarget(8)
+        heads = AI.MedusaHeads(8, 8, num_heads=3, seed=1)
+        result = AI.train_medusa_heads(
+            target, heads, [[0, 1, 2, 3, 4], [1, 2, 3, 4, 5]], epochs=800, lr=0.2)
+        assert result["rows"] == 2 * (5 - 3)
+        assert result["num_heads"] == 3
+        assert result["num_sequences"] == 2
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert len(losses) == 800
+        assert losses[-1] < losses[0] * 0.05
+        correct = 0
+        for seq in ([0, 1, 2, 3, 4], [1, 2, 3, 4, 5]):
+            hidden = target.forward(seq)
+            for r in range(len(seq) - 3):
+                preds = heads.predict(hidden[r])
+                for k in range(3):
+                    tok = max(range(8), key=lambda t: preds[k][t])
+                    correct += int(tok == seq[r + k + 1])
+        assert correct == result["rows"] * 3
+
+    def test_causal_lm_target_frozen(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16, rope=False)
+        before = [[v for v in row] for row in lm.embedding.weight]
+        heads = AI.MedusaHeads(8, 8, num_heads=2, seed=2)
+        result = AI.train_medusa_heads(
+            lm, heads, [[1, 2, 3, 4, 5, 6], [2, 3, 4, 5, 6, 7]], epochs=40, lr=0.05)
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.9
+        assert result["rows"] == 2 * (6 - 2)
+        assert before == [[v for v in row] for row in lm.embedding.weight]
+
+    def test_single_head(self):
+        target = _MTFakeTarget(6)
+        heads = AI.MedusaHeads(6, 6, num_heads=1, seed=3)
+        result = AI.train_medusa_heads(target, heads, [[0, 1, 2, 3]], epochs=400, lr=0.2)
+        assert result["rows"] == 3
+        losses = [h["loss"] for h in result["loss_history"]]
+        assert losses[-1] < losses[0] * 0.1
+
+    def test_invalid_inputs(self):
+        target = _MTFakeTarget(8)
+        heads = AI.MedusaHeads(8, 8, num_heads=2, seed=1)
+        assert _mt_raises(lambda: AI.train_medusa_heads(object(), heads, [[1, 2, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, object(), [[1, 2, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(
+            target, AI.MedusaHeads(4, 8, 2), [[1, 2, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, []))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, 2]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, 2.0, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, -1, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, 8, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, 2, 3]], epochs=0))
+        assert _mt_raises(lambda: AI.train_medusa_heads(target, heads, [[1, 2, 3]], lr=0.0))
+
+    def test_bad_hidden_and_missing_vocab(self):
+        heads = AI.MedusaHeads(8, 8, num_heads=1, seed=1)
+
+        class BadHidden:
+            vocab_size = 8
+            d_model = 8
+            h = None
+
+            def forward(self, seq):
+                self.h = [[1.0] * 8]
+                return []
+
+        class NoVocab:
+            d_model = 8
+
+            def forward(self, seq):
+                self.h = [[0.0] * 8 for _ in seq]
+                return []
+
+        assert _mt_raises(lambda: AI.train_medusa_heads(BadHidden(), heads, [[1, 2, 3]]))
+        assert _mt_raises(lambda: AI.train_medusa_heads(NoVocab(), heads, [[1, 2, 3]]))

@@ -10055,6 +10055,88 @@ def finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50,
         "total_params": base_params + trainable_params,
     }
 
+def _mt_check_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"train_medusa_heads: {name} 必须是 >= {minimum} 的整数，收到 {value!r}")
+    return value
+
+
+def _mt_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"train_medusa_heads: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"train_medusa_heads: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def train_medusa_heads(target, heads, sequences, epochs=10, lr=0.01):
+    """用冻结目标模型收集隐藏状态，训练 Medusa 多分支草稿头。
+
+    ``target`` 需提供 ``forward(seq)`` 且前向后把隐藏状态存到 ``target.h``
+    （形状 `[T, d_model]`），例如 ``CausalLM``。``heads`` 是 ``MedusaHeads``。
+    对每条序列收集 ``T - num_heads`` 行隐藏状态，第 k 个头预测位置 r+k+1 的
+    token；训练只更新草稿头，目标模型保持不变。
+    """
+    if not callable(getattr(target, "forward", None)):
+        raise TypeError("train_medusa_heads: target 必须有 forward 方法")
+    if not isinstance(heads, MedusaHeads):
+        raise TypeError("train_medusa_heads: heads 必须是 MedusaHeads 实例")
+    vocab_size = getattr(target, "vocab_size", None)
+    d_model = getattr(target, "d_model", None)
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 1:
+        raise ValueError("train_medusa_heads: target 必须有正整数 vocab_size 属性")
+    if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+        raise ValueError("train_medusa_heads: target 必须有正整数 d_model 属性")
+    if d_model != heads.d_model:
+        raise ValueError(
+            f"train_medusa_heads: target.d_model={d_model} 与 heads.d_model={heads.d_model} 不一致")
+    epochs = _mt_check_int(epochs, "epochs")
+    lr = _mt_check_pos_number(lr, "学习率")
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError("train_medusa_heads: sequences 必须是非空列表")
+    num_heads = heads.num_heads
+    all_rows = []
+    all_targets = [[] for _ in range(num_heads)]
+    for i, seq in enumerate(sequences):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError(f"train_medusa_heads: 第 {i} 条序列必须是非空 token 列表")
+        if len(seq) <= num_heads:
+            raise ValueError(
+                f"train_medusa_heads: 第 {i} 条序列长度必须 > num_heads={num_heads}")
+        clean = []
+        for tok in seq:
+            if isinstance(tok, bool) or not isinstance(tok, int):
+                raise ValueError("train_medusa_heads: token 必须是整数")
+            if tok < 0 or tok >= vocab_size:
+                raise ValueError(
+                    f"train_medusa_heads: token {tok} 超出词表 [0, {vocab_size})")
+            clean.append(tok)
+        out = target.forward(clean)
+        hidden = getattr(target, "h", None)
+        if (not isinstance(hidden, (list, tuple)) or len(hidden) != len(clean)
+                or not all(isinstance(row, (list, tuple)) and len(row) == d_model
+                           for row in hidden)):
+            raise RuntimeError(
+                "train_medusa_heads: target.forward 后 target.h 必须是 [T, d_model] 的隐藏状态")
+        n_rows = len(clean) - num_heads
+        for r in range(n_rows):
+            all_rows.append([float(v) for v in hidden[r]])
+        for k in range(num_heads):
+            all_targets[k].extend(clean[r + k + 1] for r in range(n_rows))
+    history = []
+    for _ in range(epochs):
+        heads.zero_grad()
+        loss = heads.loss_and_backward(all_rows, all_targets)
+        heads.sgd_step(lr)
+        history.append({"loss": loss})
+    return {
+        "loss_history": history,
+        "rows": len(all_rows),
+        "num_sequences": len(sequences),
+        "num_heads": num_heads,
+    }
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

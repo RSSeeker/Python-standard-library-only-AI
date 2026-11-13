@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2508 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2513 项）
 
 ## 特性
 
@@ -4544,6 +4544,7 @@ print(out["ids"], out["stats"]["accept_rate"])
 |---|---|
 | `MedusaHeads(d_model, vocab_size, num_heads=4, seed=None)` | `num_heads` 个独立线性头，输入同一个隐藏状态 `h_t`，第 k 个头预测 `t+1+k`；`forward(hidden_rows)` 返回每头 logits、`loss_and_backward(hidden_rows, targets)` 按头算交叉熵并回填梯度、`sgd_step(lr)`、`param_count()` |
 | `medusa_decode(target, prompt_ids, heads, max_new_tokens=8, eos_id=None)` | 每一轮：目标模型前向拿 `target.h[-1]` → 多头草稿 → 目标模型一次验证 `prompt+草稿` → 接受连续匹配的贪心前缀，否则回退目标模型自己的下一个 token；返回 `{"ids", "tokens", "stats"}` |
+| `train_medusa_heads(target, heads, sequences, epochs=10, lr=0.01)` | 用冻结目标模型收集隐藏状态并训练 Medusa 多头：每条序列取 `T - num_heads` 行，第 k 个头拟合位置 `r+k+1` 的 token；只更新草稿头，返回 `loss_history`/`rows` |
 | `EagleDrafter(d_model, vocab_size, hidden=64, seed=None)` | 特征级草稿器：`tanh(W_f·feature + W_e·emb(prev) + b)` → 词表 logits；`draft(feature, prev_token, k, embed_weight, vocab_size)` 自回归出 k 个草稿 token |
 | `eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=None)` | 用目标模型最后隐藏状态当 `feature`，先取目标贪心 token 起头，再让草稿器连出 `gamma-1` 个，一次前向验证整条链；返回结构同 `medusa_decode` |
 
@@ -4559,8 +4560,7 @@ res2 = AI.eagle_decode(lm, [1, 2, 3], drafter, max_new_tokens=8, gamma=4)
 
 边界与口径：
 
-- 多头/草稿器都是**随机初始化、未训练**的教学实现：`MedusaHeads` 提供 `loss_and_backward` +
-  `sgd_step` 可以自己对齐，`EagleDrafter` 只给了前向和草稿，没有内置训练循环。
+- 多头/草稿器都是**随机初始化、未训练**的教学实现：`MedusaHeads` 可以用 `train_medusa_heads` 在冻结目标模型的隐藏状态上训练（逐头交叉熵 + 逐样本 SGD，无批量/Adam/学习率调度）；`EagleDrafter` 只给了前向和草稿，没有内置训练循环。
 - 验证按**目标模型的贪心 token** 做严格匹配；因而 `medusa_decode` / `eagle_decode` 的输出与
   「目标模型逐 token 贪心生成」逐位一致。采样温度、树形候选、top-k 分叉都没有实现。
 - `stats` 里 `drafted` / `accepted` / `target_calls` / `accept_rate` 只统计本函数内的调用；
@@ -5246,7 +5246,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2508 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2513 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5568,6 +5568,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGenerateKVBits` | `CausalLM.generate(kv_cache_bits=...)` 与 generate_kv_quantized 逐位一致、束搜索/use_cache/非法 bits 报错 |
 | `TestPagedGeneration` | `generate_paged` 与稠密 KV cache 生成逐 token 一致（causal / 窗口滑动 / GQA+RoPE）、块表 token 计数与块复用、非法输入 |
 | `TestMedusaEagle` | Medusa 多头形状/参数、单头权重有限差分、medusa_decode 与目标模型贪心逐 token 一致、EAGLE 草稿器参数/草稿/解码一致、非法输入 |
+| `TestTrainMedusaHeads` | 行/目标映射与 100% 拟合、CausalLM 目标权重冻结、单头训练、非法输入（目标/头/序列长度/token 范围/epochs/lr/隐藏状态形状/缺 vocab_size） |
 | `TestGanPenalties` | R2 闭式值与空列表/负 λ 报错、诊断函数字段/同点 R1=R2、渐变图像下 R1/R2 非负且可复现、错误判别器类型与坏形状/坏 alpha 报错 |
 | `TestCycleGAN` | 一步训练返回五项损失且数值有限、40 步固定域上循环损失降到 20% 以下且 A/B 域均值对调、一步更新后生成器权重确实改变、非法类型/负 λ/零学习率/空 pairs 报错 |
 | `TestProgressiveGenerator` | 生成器默认与 `grow()` 后形状/参数量 818/1083、淡入路径与 alpha=1 权重有限差分、grow 后新阶段权重有限差分、40 步 MSE 重建损失减半、非法输入与未 forward 先 backward |
@@ -5690,6 +5691,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2508 个单元测试
+├── test_ai.py       # 2513 个单元测试
 └── README.md
 ```
