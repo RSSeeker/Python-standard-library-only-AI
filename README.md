@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2401 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2409 项）
 
 ## 特性
 
@@ -2246,6 +2246,36 @@ abl = transcoder_ablate(res["params"], activations, [0, 5])  # 置零特征后�
 | `transcoder_ablate(params, activations, feature_indices)` | 指定特征置零后的重建 |
 
 - 边界：单层转码器（无层级/跨层转码），特征为 ReLU 稀疏编码，归因基于线性化输出方向（非严格电路追踪）；`params` 为 1D 偏置 + 2D 权重字典。
+
+### QK-Norm 与 DyT（Dynamic Tanh）
+
+QK-Norm 在注意力计算前对 Q、K 分别做逐行 RMSNorm（可学习 `gamma` 缩放），
+用于抑制 logit 爆炸、稳定大模型训练；DyT 用逐通道 `gamma * tanh(alpha * x) + beta`
+替代 LayerNorm（`alpha` 为可学习标量），结构更简单。
+
+```python
+from ai import AI
+
+rows = [[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]]
+gamma = [1.0, 1.0, 1.0]
+normed = AI.qk_norm(rows, gamma)
+print(normed["out"], normed["rms"])
+
+dyt = AI.DynamicTanh(3, alpha=0.5)
+y = dyt.forward(rows)
+grad = dyt.backward([[0.1, -0.2, 0.3]])
+dyt.sgd_step(0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `qk_norm(rows, gamma, eps=1e-6)` | 逐行 RMSNorm，返回 `{"out","rms","xhat","gamma"}`（缓存可直接反传） |
+| `qk_norm_backward(dout_rows, cache)` | 返回 `{"gamma_grad","input_grad"}`，输入梯度按 `(dxhat - xhat*mean(dxhat*xhat))/rms` |
+| `apply_qk_norm(q_rows, k_rows, q_gamma, k_gamma, eps=1e-6)` | 同时对 Q/K 归一化，返回 `{"q","k","q_cache","k_cache"}` |
+| `DynamicTanh(d_model, alpha=0.5)` | 逐通道 `y = gamma * tanh(alpha*x) + beta`；`forward/backward/zero_grad/sgd_step/param_count` |
+
+边界：QK-Norm 需要调用方在投影之后、缩放与 softmax 之前自行接入；DyT 只处理
+二维 batch 输入（逐样本逐通道），不包含卷积/RNN 变体，也不含自适应初始化。
 
 ### 稀疏注意力掩码（NSA / MoBA 简化）
 
@@ -4867,7 +4897,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2401 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2409 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5103,6 +5133,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
 | `TestFIM` | PSM/SPM 重排结构、target mask、批量、非法输入 |
 | `TestSpanCorruption` | span 非重叠与边界、输入/目标替换、显式哨兵、种子确定性、非法输入 |
+| `TestQKNorm` | 逐行 RMSNorm 手算、gamma/输入梯度数值校验、Q/K 同时归一化、非法输入 |
+| `TestDynamicTanh` | 前向/参数计数、alpha/gamma/输入梯度数值校验、SGD 更新、非法输入 |
 | `TestKVQuantization` | 量化/反量化误差、逐 token/逐通道语义、cache 量化误差与非法输入 |
 | `TestWandaPruning` | Wanda 重要性手算、剪枝手算与 mask、稀疏度边界、非法输入 |
 | `TestBM25` | 词频/长度排序、单文档打分公式、idf 稀有词偏好、top_k 与非法输入 |
@@ -5283,6 +5315,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2401 个单元测试
+├── test_ai.py       # 2409 个单元测试
 └── README.md
 ```

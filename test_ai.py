@@ -36893,3 +36893,141 @@ def _fim_raises(fn, exc=ValueError):
     except Exception as other:
         raise AssertionError("期望 %s，实际 %r" % (exc, other))
     raise AssertionError("期望 %s，但没有抛异常" % exc)
+
+
+import math
+
+import AI
+
+
+def _ns_raises(fn, exc=(ValueError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected exception")
+
+
+class TestQKNorm:
+    def test_forward_and_rms(self):
+        rows = [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]]
+        gamma = [1.0, 2.0, 0.5]
+        cache = AI.qk_norm(rows, gamma)
+        rms0 = math.sqrt(14.0 / 3.0 + 1e-6)
+        assert abs(cache["rms"][0] - rms0) < 1e-12
+        assert abs(cache["out"][0][0] - 1.0 / rms0) < 1e-12
+        assert abs(cache["out"][0][1] - 2.0 * 2.0 / rms0) < 1e-12
+        assert abs(cache["out"][0][2] - 0.5 * 3.0 / rms0) < 1e-12
+        assert cache["out"][1] == [0.0, 0.0, 0.0]
+
+    def test_numerical_gradients(self):
+        rows = [[0.2, -0.5, 1.0], [0.7, 0.3, -0.2]]
+        gamma = [1.0, 0.5, 2.0]
+        dout = [[0.3, -0.4, 0.5], [-0.6, 0.7, 0.1]]
+        cache = AI.qk_norm(rows, gamma)
+        grads = AI.qk_norm_backward(dout, cache)
+        h = 1e-6
+
+        def loss(rs, gm):
+            out = AI.qk_norm(rs, gm)["out"]
+            return sum(d * o for dr, orow in zip(dout, out) for d, o in zip(dr, orow))
+
+        for i in range(3):
+            gp = list(gamma)
+            gp[i] += h
+            gm = list(gamma)
+            gm[i] -= h
+            fd = (loss(rows, gp) - loss(rows, gm)) / (2 * h)
+            assert abs(fd - grads["gamma_grad"][i]) < 1e-5
+        for r, c in [(0, 1), (1, 2)]:
+            rp = [list(row) for row in rows]
+            rm = [list(row) for row in rows]
+            rp[r][c] += h
+            rm[r][c] -= h
+            fd = (loss(rp, gamma) - loss(rm, gamma)) / (2 * h)
+            assert abs(fd - grads["input_grad"][r][c]) < 1e-6
+
+    def test_apply_qk_norm_shapes(self):
+        rows = [[1.0, 2.0], [3.0, 4.0]]
+        res = AI.apply_qk_norm(rows, rows, [1.0, 1.0], [0.5, 0.5])
+        assert len(res["q"]) == 2 and len(res["q"][0]) == 2
+        assert len(res["k"]) == 2 and len(res["k"][0]) == 2
+        assert abs(res["q"][0][0] - AI.qk_norm(rows, [1.0, 1.0])["out"][0][0]) < 1e-12
+
+    def test_invalid_inputs(self):
+        _ns_raises(lambda: AI.qk_norm([], [1.0]))
+        _ns_raises(lambda: AI.qk_norm([[1.0, 2.0]], [1.0]))
+        _ns_raises(lambda: AI.qk_norm([[1.0, 2.0]], [1.0, 2.0], eps=0.0))
+        _ns_raises(lambda: AI.qk_norm([[], []], []))
+        _ns_raises(lambda: AI.qk_norm([[1.0, 2.0], [3.0]], [1.0, 2.0]))
+        _ns_raises(lambda: AI.qk_norm([[1.0, 2.0]], [1.0, float("nan")]))
+        cache = AI.qk_norm([[1.0, 2.0]], [1.0, 1.0])
+        _ns_raises(lambda: AI.qk_norm_backward([], cache))
+        _ns_raises(lambda: AI.qk_norm_backward([[1.0]], cache))
+        _ns_raises(lambda: AI.qk_norm_backward([[1.0, 2.0]], {}))
+
+
+class TestDynamicTanh:
+    def test_forward_and_param_count(self):
+        dyt = AI.DynamicTanh(3, alpha=0.7)
+        out = dyt.forward([[1.0, 0.0, -1.0]])
+        assert dyt.param_count() == 7
+        assert abs(out[0][0] - math.tanh(0.7)) < 1e-12
+        assert abs(out[0][1]) < 1e-12
+        assert abs(out[0][2] + math.tanh(0.7)) < 1e-12
+
+    def test_numerical_gradients(self):
+        dyt = AI.DynamicTanh(2, alpha=0.6)
+        rows = [[0.3, -0.8], [1.2, 0.4]]
+        dout = [[0.5, -0.2], [0.1, 0.7]]
+        dyt.forward(rows)
+        dx = dyt.backward(dout)
+        h = 1e-6
+
+        def loss(rs):
+            out = dyt.forward(rs)
+            return sum(d * o for dr, orow in zip(dout, out) for d, o in zip(dr, orow))
+
+        g0 = dyt.gamma[0]
+        dyt.gamma[0] = g0 + h
+        lp = loss(rows)
+        dyt.gamma[0] = g0 - h
+        lm = loss(rows)
+        dyt.gamma[0] = g0
+        assert abs((lp - lm) / (2 * h) - dyt.grad_gamma[0]) < 1e-6
+        a0 = dyt.alpha
+        dyt.alpha = a0 + h
+        lp = loss(rows)
+        dyt.alpha = a0 - h
+        lm = loss(rows)
+        dyt.alpha = a0
+        assert abs((lp - lm) / (2 * h) - dyt.grad_alpha) < 1e-6
+        rp = [list(row) for row in rows]
+        rm = [list(row) for row in rows]
+        rp[1][0] += h
+        rm[1][0] -= h
+        assert abs((loss(rp) - loss(rm)) / (2 * h) - dx[1][0]) < 1e-6
+
+    def test_sgd_step_and_zero_grad(self):
+        dyt = AI.DynamicTanh(2, alpha=0.5)
+        dyt.forward([[1.0, 2.0]])
+        dyt.backward([[0.5, -0.5]])
+        a0 = dyt.alpha
+        g0 = list(dyt.gamma)
+        dyt.sgd_step(0.1)
+        assert dyt.alpha != a0
+        assert dyt.gamma != g0
+        assert all(v == 0.0 for v in dyt.grad_gamma)
+        assert dyt.grad_alpha == 0.0
+
+    def test_invalid_inputs(self):
+        _ns_raises(lambda: AI.DynamicTanh(0))
+        _ns_raises(lambda: AI.DynamicTanh(True))
+        _ns_raises(lambda: AI.DynamicTanh(2, alpha=0.0))
+        _ns_raises(lambda: AI.DynamicTanh(2, seed=1.5))
+        d = AI.DynamicTanh(2)
+        _ns_raises(lambda: d.backward([[1.0, 2.0]]))
+        d.forward([[1.0, 2.0]])
+        _ns_raises(lambda: d.forward([[1.0]]))
+        _ns_raises(lambda: d.backward([[1.0]]))
+        _ns_raises(lambda: d.sgd_step(0.0))

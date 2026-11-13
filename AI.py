@@ -7790,6 +7790,197 @@ def span_corruption_ids(ids, vocab_size, mask_ratio=0.15, mean_span=3.0,
     }
 
 
+
+
+import math
+
+
+def _ns_check_matrix(rows, name="rows"):
+    """校验非空二维数值矩阵（行非空且等长、元素有限）。"""
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"QK-Norm: {name} 必须是非空矩阵")
+    width = None
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"QK-Norm: {name}[{i}] 必须是非空数字列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"QK-Norm: {name} 各行长度必须一致")
+        out = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+                raise ValueError(f"QK-Norm: {name} 必须只包含有限数字")
+            out.append(float(v))
+    return width
+
+
+def _ns_check_vector(vec, dim, name="gamma"):
+    """校验长度为 dim 的数值向量。"""
+    if not isinstance(vec, (list, tuple)) or len(vec) != dim:
+        raise ValueError(f"QK-Norm: {name} 长度必须是 {dim}")
+    out = []
+    for v in vec:
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+            raise ValueError(f"QK-Norm: {name} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def _ns_check_eps(eps):
+    """校验 eps 为正有限数。"""
+    if not isinstance(eps, (int, float)) or isinstance(eps, bool) \
+            or not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("QK-Norm: eps 必须是正有限数")
+    return float(eps)
+
+
+def qk_norm(rows, gamma, eps=1e-6):
+    """逐行 RMSNorm（QK-Norm 的核心），返回 out/rms/xhat。"""
+    width = _ns_check_matrix(rows)
+    gamma = _ns_check_vector(gamma, width)
+    eps = _ns_check_eps(eps)
+    out_rows = []
+    rms_list = []
+    xhat_rows = []
+    for row in rows:
+        mean_sq = sum(v * v for v in row) / width
+        rms = math.sqrt(mean_sq + eps)
+        xhat = [v / rms for v in row]
+        out_rows.append([gamma[i] * xhat[i] for i in range(width)])
+        rms_list.append(rms)
+        xhat_rows.append(xhat)
+    return {"out": out_rows, "rms": rms_list, "xhat": xhat_rows, "gamma": list(gamma)}
+
+
+def qk_norm_backward(dout_rows, cache):
+    """QK-Norm 反向：返回 gamma 梯度与输入梯度。"""
+    if (not isinstance(cache, dict) or "xhat" not in cache
+            or "rms" not in cache or "gamma" not in cache):
+        raise ValueError("QK-Norm: cache 无效，请使用 qk_norm 的返回缓存")
+    xhat_rows = cache["xhat"]
+    rms_list = cache["rms"]
+    if not isinstance(dout_rows, (list, tuple)) or len(dout_rows) != len(xhat_rows):
+        raise ValueError("QK-Norm: dout_rows 行数必须与前向一致")
+    width = len(xhat_rows[0])
+    for i, row in enumerate(dout_rows):
+        if not isinstance(row, (list, tuple)) or len(row) != width:
+            raise ValueError("QK-Norm: dout_rows 每行长度必须与前向一致")
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+                raise ValueError("QK-Norm: dout_rows 必须只包含有限数字")
+    # gamma 梯度需要前向时的 gamma，这里从 cache 中补齐
+    gamma = cache.get("gamma")
+    if gamma is None:
+        raise ValueError("QK-Norm: cache 缺少 gamma，请使用 qk_norm 的返回缓存")
+    grad_gamma = [0.0] * width
+    grad_rows = []
+    for t, drow in enumerate(dout_rows):
+        xhat = xhat_rows[t]
+        rms = rms_list[t]
+        dxhat = [float(drow[i]) * gamma[i] for i in range(width)]
+        for i in range(width):
+            grad_gamma[i] += float(drow[i]) * xhat[i]
+        dot = sum(dxhat[i] * xhat[i] for i in range(width)) / width
+        grad_rows.append([(dxhat[i] - xhat[i] * dot) / rms for i in range(width)])
+    return {"gamma_grad": grad_gamma, "input_grad": grad_rows}
+
+
+def apply_qk_norm(q_rows, k_rows, q_gamma, k_gamma, eps=1e-6):
+    """对注意力 Q/K 分别做 QK-Norm，返回归一化结果与缓存。"""
+    q_cache = qk_norm(q_rows, q_gamma, eps)
+    k_cache = qk_norm(k_rows, k_gamma, eps)
+    q_cache["gamma"] = list(q_gamma)
+    k_cache["gamma"] = list(k_gamma)
+    return {"q": q_cache["out"], "k": k_cache["out"],
+            "q_cache": q_cache, "k_cache": k_cache}
+
+
+class DynamicTanh:
+    """DyT：用可学习 alpha 的逐元素 tanh + gamma/beta 替代 LayerNorm。"""
+
+    def __init__(self, d_model, alpha=0.5, seed=None):
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
+            raise ValueError("DyT: d_model 必须是正整数")
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) \
+                or not math.isfinite(alpha) or alpha == 0.0:
+            raise ValueError("DyT: alpha 必须是非零有限数")
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise ValueError("DyT: seed 必须是整数或 None")
+        self.d_model = d_model
+        self.alpha = float(alpha)
+        self.gamma = [1.0] * d_model
+        self.beta = [0.0] * d_model
+        self.grad_alpha = 0.0
+        self.grad_gamma = [0.0] * d_model
+        self.grad_beta = [0.0] * d_model
+        self._cache = None
+
+    def _check_rows(self, rows):
+        """校验输入矩阵，返回宽度。"""
+        return _ns_check_matrix(rows)
+
+    def forward(self, rows):
+        """前向：y = gamma * tanh(alpha * x) + beta。"""
+        width = self._check_rows(rows)
+        if width != self.d_model:
+            raise ValueError(f"DyT: 输入维度必须是 {self.d_model}")
+        out_rows = []
+        tanh_rows = []
+        for row in rows:
+            tanh_row = [math.tanh(self.alpha * v) for v in row]
+            tanh_rows.append(tanh_row)
+            out_rows.append([self.gamma[i] * tanh_row[i] + self.beta[i]
+                             for i in range(width)])
+        self._cache = {"x": [[float(v) for v in row] for row in rows],
+                       "tanh": tanh_rows, "n": len(rows)}
+        return out_rows
+
+    def backward(self, dout_rows):
+        """反向：累积 alpha/gamma/beta 梯度并返回输入梯度。"""
+        if self._cache is None:
+            raise RuntimeError("DyT: 先 forward 再 backward")
+        x_rows = self._cache["x"]
+        tanh_rows = self._cache["tanh"]
+        if not isinstance(dout_rows, (list, tuple)) or len(dout_rows) != len(x_rows):
+            raise ValueError("DyT: dout_rows 行数必须与前向一致")
+        width = self.d_model
+        grad_rows = []
+        for t, drow in enumerate(dout_rows):
+            if not isinstance(drow, (list, tuple)) or len(drow) != width:
+                raise ValueError("DyT: dout_rows 每行长度必须与前向一致")
+            x = x_rows[t]
+            t_row = tanh_rows[t]
+            g_row = []
+            for i in range(width):
+                d = float(drow[i])
+                self.grad_gamma[i] += d * t_row[i]
+                self.grad_beta[i] += d
+                self.grad_alpha += d * self.gamma[i] * (1.0 - t_row[i] * t_row[i]) * x[i]
+                g_row.append(d * self.gamma[i] * (1.0 - t_row[i] * t_row[i]) * self.alpha)
+            grad_rows.append(g_row)
+        return grad_rows
+
+    def zero_grad(self):
+        """清零梯度。"""
+        self.grad_alpha = 0.0
+        self.grad_gamma = [0.0] * self.d_model
+        self.grad_beta = [0.0] * self.d_model
+
+    def sgd_step(self, lr=0.01):
+        """SGD 更新 alpha/gamma/beta 后清零梯度。"""
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("DyT: lr 必须是正有限数")
+        self.alpha -= lr * self.grad_alpha
+        for i in range(self.d_model):
+            self.gamma[i] -= lr * self.grad_gamma[i]
+            self.beta[i] -= lr * self.grad_beta[i]
+        self.zero_grad()
+
+    def param_count(self):
+        """可训练参数数：alpha + gamma + beta。"""
+        return 1 + 2 * self.d_model
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
