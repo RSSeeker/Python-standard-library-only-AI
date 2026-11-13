@@ -38145,3 +38145,126 @@ class TestGenerateKVBits:
         _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=0))
         _raises(lambda: lm.generate([0], max_new_tokens=2, kv_cache_bits=9))
         _raises(lambda: lm.generate([], max_new_tokens=2, kv_cache_bits=4))
+
+
+"""B14：FlashAttention 接入 MHA / CausalLM（attn_impl='flash'）。"""
+import random
+import AI
+
+
+def _raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % (exc,))
+
+
+def _copy_mha(dst, src):
+    for name in ("W_q", "W_k", "W_v", "W_o"):
+        setattr(dst, name, [row[:] for row in getattr(src, name)])
+    for name in ("b_q", "b_k", "b_v", "b_o"):
+        setattr(dst, name, list(getattr(src, name)))
+
+
+def _copy_lm(dst, src):
+    dst.embedding.weight = [row[:] for row in src.embedding.weight]
+    dst.pos.pe = [row[:] for row in src.pos.pe]
+    dst.W_out = [row[:] for row in src.W_out]
+    dst.b_out = list(src.b_out)
+    for ld, lf in zip(src.encoder.layers, dst.encoder.layers):
+        _copy_mha(lf.self_attn, ld.self_attn)
+        lf.ffn.W1 = [row[:] for row in ld.ffn.W1]
+        lf.ffn.b1 = list(ld.ffn.b1)
+        lf.ffn.W2 = [row[:] for row in ld.ffn.W2]
+        lf.ffn.b2 = list(ld.ffn.b2)
+        for ln in ("ln1", "ln2"):
+            getattr(lf, ln).gamma = list(getattr(ld, ln).gamma)
+            getattr(lf, ln).beta = list(getattr(ld, ln).beta)
+
+
+def _max_err(a, b):
+    return max(abs(a[t][j] - b[t][j]) for t in range(len(a)) for j in range(len(a[0])))
+
+
+class TestFlashMHA:
+    def test_causal_matches_dense(self):
+        rng = random.Random(0)
+        dense = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0)
+        flash = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0,
+                                      attn_impl="flash", flash_block_size=2)
+        _copy_mha(flash, dense)
+        x = [[rng.gauss(0, 0.3) for _ in range(8)] for _ in range(6)]
+        y1 = dense.forward(x)
+        y2 = flash.forward(x)
+        assert _max_err(y1, y2) < 1e-12
+        g = [[rng.gauss(0, 0.2) for _ in range(8)] for _ in range(6)]
+        d1 = dense.backward(g)
+        d2 = flash.backward(g)
+        assert _max_err(d1, d2) < 1e-10
+        for k in ("W_q", "W_k", "W_v", "W_o"):
+            assert _max_err(dense.grads[k], flash.grads[k]) < 1e-10
+        for k in ("b_q", "b_k", "b_v", "b_o"):
+            e = max(abs(dense.grads[k][i] - flash.grads[k][i])
+                    for i in range(len(dense.grads[k])))
+            assert e < 1e-10
+
+    def test_noncausal_matches_dense(self):
+        rng = random.Random(1)
+        dense = AI.MultiHeadAttention(8, 2, causal=False, dropout=0.0)
+        flash = AI.MultiHeadAttention(8, 2, causal=False, dropout=0.0, attn_impl="flash")
+        _copy_mha(flash, dense)
+        x = [[rng.gauss(0, 0.3) for _ in range(8)] for _ in range(5)]
+        assert _max_err(dense.forward(x), flash.forward(x)) < 1e-12
+        g = [[rng.gauss(0, 0.2) for _ in range(8)] for _ in range(5)]
+        assert _max_err(dense.backward(g), flash.backward(g)) < 1e-10
+
+    def test_block_size_invariance(self):
+        rng = random.Random(2)
+        x = [[rng.gauss(0, 0.3) for _ in range(8)] for _ in range(7)]
+        base_model = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0,
+                                           attn_impl="flash", flash_block_size=1)
+        base = base_model.forward(x)
+        for bs in (2, 4):
+            m = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0,
+                                      attn_impl="flash", flash_block_size=bs)
+            _copy_mha(m, base_model)
+            y = m.forward(x)
+            assert _max_err(base, y) < 1e-12
+
+    def test_gqa_matches_dense(self):
+        rng = random.Random(3)
+        dense = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0, num_kv_heads=1)
+        flash = AI.MultiHeadAttention(8, 2, causal=True, dropout=0.0, num_kv_heads=1,
+                                      attn_impl="flash")
+        _copy_mha(flash, dense)
+        x = [[rng.gauss(0, 0.3) for _ in range(8)] for _ in range(5)]
+        assert _max_err(dense.forward(x), flash.forward(x)) < 1e-12
+        g = [[rng.gauss(0, 0.2) for _ in range(8)] for _ in range(5)]
+        assert _max_err(dense.backward(g), flash.backward(g)) < 1e-10
+
+    def test_errors(self):
+        _raises(lambda: AI.MultiHeadAttention(8, 2, attn_impl="sparse"))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, dropout=0.1, attn_impl="flash"))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, rope=True, attn_impl="flash"))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, window=2, attn_impl="flash"))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, alibi=True, attn_impl="flash"))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, attn_impl="flash",
+                                              flash_block_size=0))
+        _raises(lambda: AI.MultiHeadAttention(8, 2, dropout=0.0, attn_impl="flash")
+                .forward([[0.0] * 8], key_mask=[0]))
+        _raises(lambda: AI.CausalLM(vocab_size=5, d_model=8, num_heads=2,
+                                    attn_impl="bad"))
+        _raises(lambda: AI.CausalLM(vocab_size=5, d_model=8, num_heads=2,
+                                    dropout=0.1, attn_impl="flash"))
+
+    def test_causallm_flash_equivalence_and_fit(self):
+        dense = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8)
+        flash = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8,
+                            attn_impl="flash")
+        _copy_lm(flash, dense)
+        assert _max_err(dense.forward([0, 1, 2]), flash.forward([0, 1, 2])) < 1e-12
+        hist = flash.fit([[0, 1, 2, 3], [3, 2, 1, 0]], epochs=20, lr=0.05)
+        assert hist[-1] < hist[0]
+        out = flash.generate([0, 1], max_new_tokens=4, rng=random.Random(7))
+        assert len(out) == 6

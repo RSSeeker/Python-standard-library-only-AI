@@ -25622,7 +25622,8 @@ class MultiHeadAttention:
                  rope_scaling: str = None, rope_factor: float = 8.0,
                  rope_original_max: int = 512, rope_beta_fast: float = 32.0,
                  rope_beta_slow: float = 1.0, relative_bias=None,
-                 yarn_mscale: float = None):
+                 yarn_mscale: float = None, attn_impl: str = "dense",
+                 flash_block_size: int = 2):
         """dropout: 注意力权重上的 dropout（训练模式下生效，eval() 关闭）。
 
         实现方式是「对 softmax 后的权重逐元素做 inverted dropout」：训练时每个
@@ -25679,6 +25680,25 @@ class MultiHeadAttention:
             self.window = window
         self.alibi = bool(alibi)
         self.relative_bias = relative_bias   # 可选：T5RelativeBias 实例
+        if attn_impl not in ("dense", "flash"):
+            raise ValueError(
+                f"MultiHeadAttention: attn_impl 必须是 'dense' 或 'flash'，收到 {attn_impl!r}")
+        if attn_impl == "flash":
+            if dropout != 0.0:
+                raise ValueError(
+                    "MultiHeadAttention: attn_impl='flash' 要求 dropout=0（注意力权重 dropout 不兼容）")
+            if rope or window is not None or relative_bias is not None or alibi:
+                raise ValueError(
+                    "MultiHeadAttention: attn_impl='flash' 不支持 rope/window/relative_bias/alibi，"
+                    "这些特性请用 dense 实现")
+        if (isinstance(flash_block_size, bool)
+                or not isinstance(flash_block_size, int) or flash_block_size < 1):
+            raise ValueError(
+                f"MultiHeadAttention: flash_block_size 必须是正整数，收到 {flash_block_size!r}")
+        self.attn_impl = attn_impl
+        self.flash_block_size = flash_block_size
+        self.flash_m = []   # flash 前向缓存：逐头逐行的在线 softmax 最大值
+        self.flash_l = []   # flash 前向缓存：逐头逐行的指数和
         self.training = True
         self.rng = random            # 可注入（测试里换成 random.Random(seed) 复现 mask）
         # 每次 forward 重建；反向只读这几个列表
@@ -25814,6 +25834,82 @@ class MultiHeadAttention:
             out[i + half] = x0 * s + x1 * c
         return out
 
+    def _flash_forward_heads(self):
+        """分块 + 在线 softmax 的逐头前向（不物化 T×T 分数矩阵）。
+
+        返回 List[(T, d_k)]；缓存每头逐行的 (m, l) 供反向重算概率。
+        """
+        T = self.seq_len
+        d_k = self.d_k
+        bs = self.flash_block_size
+        scale = (1.0 / math.sqrt(d_k)) * self.yarn_mscale
+        head_outs = []
+        self.flash_m = []
+        self.flash_l = []
+        for head in range(self.num_heads):
+            q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
+            out_h = [[0.0] * d_k for _ in range(T)]
+            m_list = [0.0] * T
+            l_list = [0.0] * T
+            for t in range(T):
+                limit = t if self.causal else T - 1
+                m = float("-inf")
+                l = 0.0
+                acc = [0.0] * d_k
+                j = 0
+                while j <= limit:
+                    j_end = min(limit, j + bs - 1)
+                    scores = [sum(map(_mul, q_h[t], k_h[jj])) * scale
+                              for jj in range(j, j_end + 1)]
+                    m_new = max(m, max(scores))
+                    corr = math.exp(m - m_new) if m != float("-inf") else 0.0
+                    l *= corr
+                    if corr != 1.0:
+                        acc = [a * corr for a in acc]
+                    for idx, jj in enumerate(range(j, j_end + 1)):
+                        p = math.exp(scores[idx] - m_new)
+                        l += p
+                        v_row = v_h[jj]
+                        for dd in range(d_k):
+                            acc[dd] += p * v_row[dd]
+                    m = m_new
+                    j = j_end + 1
+                m_list[t] = m
+                l_list[t] = l
+                out_h[t] = [a / l for a in acc]
+            head_outs.append(out_h)
+            self.flash_m.append(m_list)
+            self.flash_l.append(l_list)
+        return head_outs
+
+    def _flash_backward_head(self, head, d_out):
+        """按缓存的 (m, l) 重算概率，返回该头的 (dQ, dK, dV)。"""
+        T = self.seq_len
+        d_k = self.d_k
+        scale = (1.0 / math.sqrt(d_k)) * self.yarn_mscale
+        q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
+        m_list, l_list = self.flash_m[head], self.flash_l[head]
+        dq = [[0.0] * d_k for _ in range(T)]
+        dk = [[0.0] * d_k for _ in range(T)]
+        dv = [[0.0] * d_k for _ in range(T)]
+        for t in range(T):
+            limit = t if self.causal else T - 1
+            q_t = q_h[t]
+            d_out_t = d_out[t]
+            srow = [sum(map(_mul, q_t, k_h[j])) * scale for j in range(limit + 1)]
+            probs = [math.exp(s - m_list[t]) / l_list[t] for s in srow]
+            dp = [sum(map(_mul, d_out_t, v_h[j])) for j in range(limit + 1)]
+            tot = sum(probs[j] * dp[j] for j in range(limit + 1))
+            for j in range(limit + 1):
+                ds = probs[j] * (dp[j] - tot)
+                ds_scale = ds * scale
+                k_row = k_h[j]
+                for dd in range(d_k):
+                    dq[t][dd] += ds_scale * k_row[dd]
+                    dk[j][dd] += ds_scale * q_t[dd]
+                    dv[j][dd] += probs[j] * d_out_t[dd]
+        return dq, dk, dv
+
     def forward_step(self, x_t, cache):
         """单 token 增量前向（推理专用，不写反向缓存）
 
@@ -25888,6 +25984,9 @@ class MultiHeadAttention:
                     f"与 seq_len={len(x_seq)} 不一致")
             if not any(key_mask):
                 raise ValueError("MultiHeadAttention.forward: key_mask 至少要有 1 个有效位置")
+        if self.attn_impl == "flash" and key_mask is not None:
+            raise ValueError(
+                "MultiHeadAttention.forward: attn_impl='flash' 不支持 key_mask")
         self.key_mask = key_mask
         # 复制一份，避免调用者之后原地修改 x_seq 污染反向传播缓存
         self.x = [list(row) for row in x_seq]
@@ -25938,6 +26037,24 @@ class MultiHeadAttention:
         # T5 式相对位置偏置：整段前向一次算好 (num_heads, T, T)，各头共用。
         self._rel_bias = (self.relative_bias.forward(self.seq_len)
                           if self.relative_bias is not None else None)
+
+        if self.attn_impl == "flash":
+            self.head_out = self._flash_forward_heads()
+            self.concat = [[0.0] * self.d_model for _ in range(self.seq_len)]
+            for head in range(h):
+                off = head * d_k
+                out_h = self.head_out[head]
+                for t in range(self.seq_len):
+                    row_out = self.concat[t]
+                    src = out_h[t]
+                    for j in range(d_k):
+                        row_out[off + j] = src[j]
+            output = _matmul(self.concat, _transpose(self.W_o))
+            for t in range(self.seq_len):
+                out_row = output[t]
+                for j in range(self.d_model):
+                    out_row[j] += self.b_o[j]
+            return output
 
         for head in range(h):
             q_h, k_h, v_h = self.Q[head], self.K[head], self.V[head]
@@ -26052,6 +26169,12 @@ class MultiHeadAttention:
         dQ_list, dK_list, dV_list = [], [], []
         dbias = [] if self.relative_bias is not None else None
         for head in range(h):
+            if self.attn_impl == "flash":
+                dQ, dK, dV = self._flash_backward_head(head, d_head_out[head])
+                dQ_list.append(dQ)
+                dK_list.append(dK)
+                dV_list.append(dV)
+                continue
             attn = self.attn_weights[head]          # 干净权重（softmax 输出）
             attn_used = self.attn_dropped[head]     # 实际参与 attn@V 的权重
             mask = self.attn_masks[head]
@@ -26737,12 +26860,15 @@ class TransformerEncoderLayer:
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
                  causal: bool = False, rope: bool = False, window: int = None,
-                 num_kv_heads: int = None, alibi: bool = False):
+                 num_kv_heads: int = None, alibi: bool = False,
+                 attn_impl: str = "dense", flash_block_size: int = 2):
         # causal=True 时自注意力加因果掩码（自回归语言模型用）；
         # dropout 同时作用在注意力权重（MHA 内部）和两个残差子层（dropout1/2）
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout,
                                             causal=causal, rope=rope, window=window,
-                                            num_kv_heads=num_kv_heads, alibi=alibi)
+                                            num_kv_heads=num_kv_heads, alibi=alibi,
+                                            attn_impl=attn_impl,
+                                            flash_block_size=flash_block_size)
         self.causal = self.self_attn.causal
         self.ffn = FeedForward(d_model, d_ff)
         self.ln1 = LayerNorm(d_model)
@@ -26906,13 +27032,16 @@ class TransformerEncoder:
     def __init__(self, d_model: int, num_heads: int, d_ff: int,
                  num_layers: int = 6, dropout: float = 0.1, causal: bool = False,
                  rope: bool = False, window: int = None, num_kv_heads: int = None,
-                 alibi: bool = False):
+                 alibi: bool = False, attn_impl: str = "dense",
+                 flash_block_size: int = 2):
         """causal=True: 每层自注意力都加因果掩码（供 CausalLM 使用）"""
         self.causal = bool(causal)
         self.layers = [
             TransformerEncoderLayer(d_model, num_heads, d_ff, dropout,
                                     causal=causal, rope=rope, window=window,
-                                    num_kv_heads=num_kv_heads, alibi=alibi)
+                                    num_kv_heads=num_kv_heads, alibi=alibi,
+                                    attn_impl=attn_impl,
+                                    flash_block_size=flash_block_size)
             for _ in range(num_layers)
         ]
 
@@ -30911,7 +31040,8 @@ class CausalLM:
                  d_ff: int = 64, num_layers: int = 2, max_len: int = 256,
                  dropout: float = 0.0, rope: bool = False, use_abs_pos=None,
                  window: int = None, num_kv_heads: int = None,
-                 alibi: bool = False):
+                 alibi: bool = False, attn_impl: str = "dense",
+                 flash_block_size: int = 2):
         if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size < 1:
             raise ValueError(f"CausalLM: vocab_size 必须是正整数，收到 {vocab_size!r}")
         if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
@@ -30936,10 +31066,17 @@ class CausalLM:
         self.embedding = Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len)
         self.alibi = bool(alibi)
+        if attn_impl not in ("dense", "flash"):
+            raise ValueError(
+                f"CausalLM: attn_impl 必须是 'dense' 或 'flash'，收到 {attn_impl!r}")
+        if attn_impl == "flash" and dropout != 0.0:
+            raise ValueError("CausalLM: attn_impl='flash' 要求 dropout=0")
+        self.attn_impl = attn_impl
         self.encoder = TransformerEncoder(d_model, num_heads, d_ff, num_layers,
                                           dropout, causal=True, rope=self.rope,
                                           window=window, num_kv_heads=num_kv_heads,
-                                          alibi=self.alibi)
+                                          alibi=self.alibi, attn_impl=attn_impl,
+                                          flash_block_size=flash_block_size)
 
         std = math.sqrt(2.0 / d_model)
         self.W_out = [[random.gauss(0, std) for _ in range(d_model)] for _ in range(vocab_size)]
