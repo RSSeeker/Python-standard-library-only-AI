@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2576 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2580 项）
 
 ## 特性
 
@@ -3753,6 +3753,34 @@ print(model.param_count(), hist[-1])
 
 测试：`TestGaussianSplat` 覆盖前向/参数量、颜色/不透明度/尺度/位置梯度有限差分、单目标图渲染收敛、非法输入。
 
+### 3D 检测头（PointNetDetector）
+
+用 PointNet 全局特征接两个线性头：一个分类头、一个 3D 框回归头（中心/对数尺寸/朝向 sincos）：
+
+```python
+import AI
+
+model = AI.PointNetDetector(num_classes=2, hidden=(16, 32), seed=0)
+points = [[0.0, 0.0, 0.0], [1.0, 0.5, 0.5], [-1.0, 0.5, 0.5], [0.0, 1.0, 0.5]]
+target = (0, [0.0, 0.5, 0.5], [2.0, 1.0, 1.0], 0.0)
+loss = model.loss_and_backward(points, target)
+model.sgd_step(0.01)
+print(model.predict(points)["center"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `PointNetDetector(num_classes=2, in_channels=3, hidden=(16, 32), seed=None)` | `PointNetEncoder`（逐点 MLP + 最大池化）+ 分类头 + 框头；框头 8 维 = 中心 3 + 对数尺寸 3 + 朝向 sin/cos |
+| `forward(points)` / `predict(points)` | 返回 `{class_id, class_logits, center, size, yaw_sin, yaw_cos}` |
+| `loss_and_backward(points, target, box_weight=1.0)` | 分类交叉熵 + 中心/对数尺寸 L1 + 朝向 sin/cos MSE；`target=(class_id, center[3], size[3], yaw)`；反向到两个头与 PointNet 编码器 |
+| `fit(clouds, targets, epochs=20, lr=0.01, box_weight=1.0, seed=None, shuffle=True)` | 逐点云 SGD，返回每 epoch 平均损失 |
+| `sgd_step(lr)` / `zero_grad()` / `param_count()` | 手写 SGD（编码器逐层 + 两个头）、梯度清零、参数量 |
+
+边界：教学简化版——单物体、无锚框/区域提议、无 NMS、无点云体素化或旋转增强；3D 框只回归中心/尺寸/朝向，
+不预测速度/类别不确定度，也没有真实的 3D 检测数据集训练。
+
+测试：`TestPointNetDetector` 覆盖前向/参数量、分类头/框头/编码器权重梯度有限差分、两个合成点云的类别与框回归训练、非法输入。
+
 ### YOLOLite（单尺度网格检测训练循环）
 
 两层 stride-2 卷积 backbone + 逐网格单元检测头；训练时只让目标中心所在单元负责：
@@ -5561,7 +5589,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2576 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2580 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5769,6 +5797,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestYOLOLite` | 前向/参数量、检测头与卷积核梯度有限差分、合成图目标分配训练、非法输入 |
 | `TestNeRF` | 前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入 |
 | `TestGaussianSplat` | 前向/参数量、颜色/不透明度/尺度/位置梯度有限差分、渲染收敛、非法输入 |
+| `TestPointNetDetector` | 前向/参数量、分类头/框头/编码器梯度有限差分、点云类别与框回归训练、非法输入 |
 | `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
 | `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
 | `TestVideoMAE` | 前向/遮罩可复现/参数量、卷积核/解码器/mask token 梯度有限差分、重建过拟合、非法输入 |
@@ -6021,6 +6050,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2576 个单元测试
+├── test_ai.py       # 2580 个单元测试
 └── README.md
 ```

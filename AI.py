@@ -13069,6 +13069,212 @@ class GaussianSplatLite:
     def param_count(self):
         return self.num_points * (3 + 1 + 1 + 3)
 
+"""简化 3D 检测头：PointNet 全局特征 -> 类别 + 3D 框回归。
+
+不是完整 3D 检测器：没有区域提议/锚框、没有 NMS、没有点云体素化或旋转数据增强，
+也不做多物体实例；每次输入一个点云、回归一个 3D 框（中心/尺寸/朝向 sincos）。
+"""
+import math
+import random
+
+
+def _pnd_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("PointNetDetector: %s 必须是正整数" % name)
+    return value
+
+
+def _pnd_check_cloud(points, in_channels):
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError("PointNetDetector: 点云必须是非空列表")
+    out = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != in_channels:
+            raise ValueError("PointNetDetector: 每个点必须是 %d 维" % in_channels)
+        vals = []
+        for v in point:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError("PointNetDetector: 点坐标必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _pnd_check_target(target, num_classes):
+    if not isinstance(target, (list, tuple)) or len(target) != 4:
+        raise ValueError("PointNetDetector: target 必须是 (class_id, center[3], size[3], yaw)")
+    cls = target[0]
+    if isinstance(cls, bool) or not isinstance(cls, int) or not (0 <= cls < num_classes):
+        raise ValueError("PointNetDetector: class_id 必须是 [0, num_classes) 内的整数")
+    center = target[1]
+    size = target[2]
+    yaw = target[3]
+    if not isinstance(center, (list, tuple)) or len(center) != 3:
+        raise ValueError("PointNetDetector: center 必须是长度 3 的列表")
+    if not isinstance(size, (list, tuple)) or len(size) != 3:
+        raise ValueError("PointNetDetector: size 必须是长度 3 的列表")
+    out_center = []
+    out_size = []
+    for v in center:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError("PointNetDetector: center 必须是有限数字")
+        out_center.append(float(v))
+    for v in size:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise ValueError("PointNetDetector: size 必须是正数")
+        out_size.append(float(v))
+    if isinstance(yaw, bool) or not isinstance(yaw, (int, float)) or not math.isfinite(yaw):
+        raise ValueError("PointNetDetector: yaw 必须是有限数字")
+    return int(cls), out_center, out_size, float(yaw)
+
+
+def _pnd_softmax(logits):
+    m = max(logits)
+    exps = [math.exp(v - m) for v in logits]
+    total = sum(exps)
+    return [v / total for v in exps]
+
+
+class PointNetDetector:
+    def __init__(self, num_classes=2, in_channels=3, hidden=(16, 32), seed=None):
+        self.num_classes = _pnd_check_pos_int(num_classes, "num_classes")
+        self.in_channels = _pnd_check_pos_int(in_channels, "in_channels")
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("PointNetDetector: hidden 必须是非空列表")
+        for v in hidden:
+            _pnd_check_pos_int(v, "hidden 元素")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("PointNetDetector: seed 必须是 int 或 None")
+        self.encoder = PointNetEncoder(in_channels, tuple(int(v) for v in hidden), seed)
+        width = int(hidden[-1])
+        if seed is not None:
+            saved = random.getstate()
+            random.seed(seed + 1)
+            try:
+                self.cls_head = Layer(width, self.num_classes, "linear")
+                self.box_head = Layer(width, 8, "linear")
+            finally:
+                random.setstate(saved)
+        else:
+            self.cls_head = Layer(width, self.num_classes, "linear")
+            self.box_head = Layer(width, 8, "linear")
+        self.zero_grad()
+
+    # ---------- 前向 ----------
+
+    def forward(self, points):
+        pts = _pnd_check_cloud(points, self.in_channels)
+        feat, _ = self.encoder.forward(pts)
+        cls_out, cls_cache = _dense_rows_forward(self.cls_head, [feat])
+        box_out, box_cache = _dense_rows_forward(self.box_head, [feat])
+        raw = box_out[0]
+        center = [raw[0], raw[1], raw[2]]
+        size = [math.exp(max(-6.0, min(6.0, v))) for v in raw[3:6]]
+        yaw_s, yaw_c = raw[6], raw[7]
+        self._cache = {
+            "feat": feat,
+            "cls_cache": cls_cache,
+            "box_cache": box_cache,
+            "logits": cls_out[0],
+            "raw": raw,
+        }
+        return {
+            "class_id": max(range(self.num_classes), key=lambda i: cls_out[0][i]),
+            "class_logits": list(cls_out[0]),
+            "center": center,
+            "size": size,
+            "yaw_sin": yaw_s,
+            "yaw_cos": yaw_c,
+        }
+
+    def predict(self, points):
+        return self.forward(points)
+
+    # ---------- 损失与反向 ----------
+
+    def loss_and_backward(self, points, target, box_weight=1.0):
+        if not isinstance(box_weight, (int, float)) or isinstance(box_weight, bool) or not math.isfinite(box_weight) or box_weight < 0:
+            raise ValueError("PointNetDetector: box_weight 必须是非负有限数字")
+        cls, center_t, size_t, yaw_t = _pnd_check_target(target, self.num_classes)
+        out = self.forward(points)
+        logits = self._cache["logits"]
+        raw = self._cache["raw"]
+        probs = _pnd_softmax(logits)
+        loss = -math.log(max(1e-12, probs[cls]))
+        d_logits = list(probs)
+        d_logits[cls] -= 1.0
+        d_box = [0.0] * 8
+        for k in range(3):
+            diff = raw[k] - center_t[k]
+            loss += box_weight * abs(diff)
+            d_box[k] = box_weight * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+        for k in range(3):
+            log_t = math.log(size_t[k])
+            diff = raw[3 + k] - log_t
+            loss += box_weight * abs(diff)
+            d_box[3 + k] = box_weight * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+        sy, cy = math.sin(yaw_t), math.cos(yaw_t)
+        diff_s = raw[6] - sy
+        diff_c = raw[7] - cy
+        loss += box_weight * 0.5 * (diff_s * diff_s + diff_c * diff_c)
+        d_box[6] = box_weight * diff_s
+        d_box[7] = box_weight * diff_c
+        # 分类头反传
+        gw_c, gb_c, dh_c = _dense_rows_backward(self.cls_head, self._cache["cls_cache"], [d_logits])
+        # 框回归头反传
+        gw_b, gb_b, dh_b = _dense_rows_backward(self.box_head, self._cache["box_cache"], [d_box])
+        self.grad_cls = (gw_c, gb_c)
+        self.grad_box = (gw_b, gb_b)
+        d_feat = [dh_c[0][k] + dh_b[0][k] for k in range(len(dh_c[0]))]
+        self.encoder.backward(d_feat)
+        return loss
+
+    def zero_grad(self):
+        self.grad_cls = None
+        self.grad_box = None
+        self.encoder.zero_grad()
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("PointNetDetector: lr 必须为正数")
+        if self.grad_cls is not None:
+            _dense_apply_sgd(self.cls_head, self.grad_cls, lr)
+        if self.grad_box is not None:
+            _dense_apply_sgd(self.box_head, self.grad_box, lr)
+        grads = self.encoder.grads()
+        if grads is not None:
+            for layer, pair in zip(self.encoder.layers, grads):
+                _dense_apply_sgd(layer, pair, lr)
+
+    def fit(self, clouds, targets, epochs=20, lr=0.01, box_weight=1.0, seed=None, shuffle=True):
+        if not isinstance(clouds, (list, tuple)) or not isinstance(targets, (list, tuple)):
+            raise ValueError("PointNetDetector: clouds/targets 必须是列表")
+        if not clouds or len(clouds) != len(targets):
+            raise ValueError("PointNetDetector: clouds 与 targets 必须非空且等长")
+        _pnd_check_pos_int(epochs, "epochs")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("PointNetDetector: seed 必须是 int 或 None")
+        checked = [_pnd_check_cloud(c, self.in_channels) for c in clouds]
+        tgt = [_pnd_check_target(t, self.num_classes) for t in targets]
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(checked)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(checked[idx], tgt[idx], box_weight)
+                self.sgd_step(lr)
+            history.append(total / len(checked))
+        return history
+
+    def param_count(self):
+        return (self.encoder.param_count() +
+                self.cls_head.fan_in * self.cls_head.fan_out + self.cls_head.fan_out +
+                self.box_head.fan_in * self.box_head.fan_out + self.box_head.fan_out)
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

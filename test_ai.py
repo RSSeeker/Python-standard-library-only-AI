@@ -40135,3 +40135,104 @@ class TestGaussianSplat(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _pnd_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+def _pnd_box_cloud(center, size, num=6, noise=0.0, seed=0):
+    rng = random.Random(seed)
+    pts = []
+    for sx in (-0.5, 0.5):
+        for sy in (-0.5, 0.5):
+            for sz in (-0.5, 0.5):
+                pts.append([center[0] + sx * size[0] + rng.uniform(-noise, noise),
+                            center[1] + sy * size[1] + rng.uniform(-noise, noise),
+                            center[2] + sz * size[2] + rng.uniform(-noise, noise)])
+    return pts[:num]
+
+
+class TestPointNetDetector(unittest.TestCase):
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.PointNetDetector(num_classes=2, hidden=(8, 16), seed=1)
+        self.assertEqual(m.param_count(), 346)
+        cloud = _pnd_box_cloud([0.3, -0.2, 0.4], [1.0, 0.8, 0.6])
+        out = m.forward(cloud)
+        self.assertIn(out["class_id"], (0, 1))
+        self.assertEqual(len(out["class_logits"]), 2)
+        self.assertEqual(len(out["center"]), 3)
+        self.assertEqual(len(out["size"]), 3)
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.PointNetDetector(num_classes=2, hidden=(8, 16), seed=1)
+        cloud = _pnd_box_cloud([0.3, -0.2, 0.4], [1.0, 0.8, 0.6])
+        target = (0, [0.3, -0.2, 0.4], [1.0, 0.8, 0.6], 0.3)
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(cloud, target)
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 2e-3, tag)
+
+        fd(lambda: m.grad_cls[0][0][1], lambda: m.cls_head.weights[0][1],
+           lambda v: m.cls_head.weights[0].__setitem__(1, v), "cls head")
+        fd(lambda: m.grad_box[0][2][0], lambda: m.box_head.weights[2][0],
+           lambda v: m.box_head.weights[2].__setitem__(0, v), "box head")
+        fd(lambda: m.encoder.grads()[0][0][0][1], lambda: m.encoder.layers[0].weights[0][1],
+           lambda v: m.encoder.layers[0].weights[0].__setitem__(1, v), "encoder w")
+
+    def test_fit(self):
+        random.seed(0)
+        clouds = [_pnd_box_cloud([0.3, -0.2, 0.4], [1.0, 0.8, 0.6], seed=1),
+                  _pnd_box_cloud([-0.4, 0.5, 0.2], [2.0, 1.6, 1.2], seed=2)]
+        targets = [(0, [0.3, -0.2, 0.4], [1.0, 0.8, 0.6], 0.0),
+                   (1, [-0.4, 0.5, 0.2], [2.0, 1.6, 1.2], 1.2)]
+        m = AI.PointNetDetector(num_classes=2, hidden=(8, 16), seed=2)
+        hist = m.fit(clouds, targets, epochs=200, lr=0.03, seed=1)
+        self.assertGreater(len(hist), 0)
+        self.assertLess(hist[-1], hist[0] * 0.4)
+
+    def test_invalid_inputs(self):
+        _pnd_raises(lambda: AI.PointNetDetector(num_classes=0))
+        _pnd_raises(lambda: AI.PointNetDetector(hidden=[]))
+        _pnd_raises(lambda: AI.PointNetDetector(seed=1.5))
+        m = AI.PointNetDetector(num_classes=2, hidden=(8, 16), seed=1)
+        cloud = _pnd_box_cloud([0.3, -0.2, 0.4], [1.0, 0.8, 0.6])
+        _pnd_raises(lambda: m.forward([]))
+        _pnd_raises(lambda: m.forward([[0.0, 0.0]]))
+        _pnd_raises(lambda: m.loss_and_backward(cloud, (0, [0, 0, 0], [1, 1], 0.0)))
+        _pnd_raises(lambda: m.loss_and_backward(cloud, (5, [0, 0, 0], [1, 1, 1], 0.0)))
+        _pnd_raises(lambda: m.loss_and_backward(cloud, (0, [0, 0, 0], [1, 0, 1], 0.0)))
+        _pnd_raises(lambda: m.sgd_step(0.0))
+        _pnd_raises(lambda: m.fit([], []))
+        _pnd_raises(lambda: m.fit([cloud], [(0, [0, 0, 0], [1, 1, 1], 0.0)], epochs=0))
+        _pnd_raises(lambda: m.fit([cloud], [(0, [0, 0, 0], [1, 1, 1], 0.0)], box_weight=-1.0))
+
+
+if __name__ == "__main__":
+    unittest.main()
