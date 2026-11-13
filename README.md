@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2496 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2502 项）
 
 ## 特性
 
@@ -1004,6 +1004,8 @@ print(best["path"], best["score"])
 | `r_drop_loss(logits_a, logits_b, alpha=0.5)` | R-Drop 的对称 KL 正则项：`alpha/2·(KL(p‖q)+KL(q‖p))`，吃两次 dropout 前向的 logits（内部自己 log-softmax）；完整损失是 `CE + r_drop_loss(...)` |
 | `hint_loss(student_feat, teacher_feat, weight=1.0)` | 隐藏层对齐（FitNet 式）：学生/教师特征的均方误差，`weight` 调与主损失的配比 |
 | `preference_loss(chosen_logp, rejected_logp, ref_*, method='dpo', beta=0.1)` | 偏好对齐，五种：`dpo` / `ipo` / `simpo` / `cpo` / `orpo`；吃**一对**序列的 log 概率，返回对两者的梯度 |
+| `RLHFTrainer(policy, reference=None, method='dpo', beta=0.1, ...)` | 把偏好损失串成训练循环：序列 log 概率 → `preference_loss` → 以 `d_chosen`/`d_rejected` 重放反传 → Adam；`pair_step` 单对、`fit` 逐对更新 |
+| `rlhf_align(policy, pairs, reference, method='dpo', ..., epochs=1)` | 便捷入口：`RLHFTrainer(...).fit(...)`，返回每轮平均损失 |
 | `kto_loss(logp, ref_logp, desirable=True, beta=0.1, baseline=0.0)` | KTO：单条样本「好/坏」二元反馈即可，不需要成对偏好数据 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
@@ -1034,6 +1036,29 @@ print(best["path"], best["score"])
 focal 联合梯度」成立，放到隐藏层或搭配 `mse` 等逐元素损失会静默算错梯度）。
 `'ldam'` 是唯一需要 `loss_kwargs={'class_counts': [...]}` 的索引损失；`'distill'` 的
 target 必须是**教师 logits 向量**，传类别索引会在第一批就报错并提示改用 `cross_entropy`。
+
+### 偏好对齐训练循环（RLHFTrainer）
+
+`preference_loss` 只给损失和标量梯度；`RLHFTrainer` 把「策略模型 / 参考模型 / 配对数据」
+串成能直接跑的循环：对每对 `(prompt, chosen, rejected)` 分别算策略与参考模型对回答的
+**平均 token log 概率**（长度归一化），交给 `preference_loss`，再以返回的 `d_chosen` /
+`d_rejected` 为系数重放两次反传累积梯度，最后 `adam_step`。
+
+```python
+policy = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+ref = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+pairs = [([1, 2, 3], [4, 5, 6], [7, 8, 9])]
+losses = rlhf_align(policy, pairs, reference=ref, method="dpo", beta=0.1,
+                    lr=0.01, epochs=3, seed=0)
+```
+
+- `sequence_logprob` / `_rlhf_seq_logprob(model, prompt_ids, response_ids, grad_scale=...)`：
+  平均 token log 概率；`grad_scale` 非空时把对应梯度累积进模型
+- `RLHFTrainer(policy, reference=None, method='dpo', beta=0.1, margin=0.0,
+  sft_weight=0.1, lr=0.01)`：`pair_step` 单对、`fit(pairs, epochs, lr, shuffle, seed)`
+- 边界：用完整回答序列的平均 logp（不做 token 级 mask/加权）、每对立即更新（不积累 batch）、
+  参考模型固定不更新、不打包/不分片；`simpo`/`orpo` 不需要 `reference`；
+  只有 DPO/IPO/CPO 需要参考模型（构造时缺 `reference` 会抛 ValueError）
 
 `ohem_loss` 是**批级**接口（一次吃一批概率向量、返回整批梯度），不能塞进 `Model(loss_fn=...)`
 （那是逐样本调用约定）；类别不平衡的两个可选项已经接进映射表，用法：
@@ -5204,7 +5229,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2496 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2502 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5613,6 +5638,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestImbalanceLosses` | Class-Balanced 权重公式与归一化、CB 索引/软标签梯度、LDAM 闭式对齐与梯度、OHEM 选样、Model 接线与两个激活守卫、8 类非法输入 |
 | `TestDistillAndHint` | 蒸馏损失：T² 缩放与 KL 对齐、梯度差分、T 校验、hint 均方误差与 weight、Model 接线与激活守卫 |
 | `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
+| `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
@@ -5646,6 +5672,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2496 个单元测试
+├── test_ai.py       # 2502 个单元测试
 └── README.md
 ```

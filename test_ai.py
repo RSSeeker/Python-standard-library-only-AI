@@ -38337,3 +38337,126 @@ class TestPagedGeneration:
         _raises(lambda: AI.generate_paged(m, [0], no_repeat_ngram_size=-1))
         _raises(lambda: AI.generate_paged(m, [0, 1, 2], max_new_tokens=6,
                                           rng=random.Random(1), block_size=2, max_blocks=1))
+
+
+"""B16：RLHFTrainer 偏好对齐训练。"""
+import math
+import random
+import AI
+
+
+def _raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected %s" % (exc,))
+
+
+def _manual_logp(model, prompt, response):
+    ids = prompt + response
+    logits = model.forward(ids[:-1])
+    s = 0.0
+    for i in range(len(prompt), len(ids)):
+        probs = AI._softmax_row(logits[i - 1])
+        s += math.log(probs[ids[i]])
+    return s / len(response)
+
+
+COUNTER = [0]
+
+
+def _make_models(seed=11, vocab=10):
+    import random as _r
+    _r.seed(seed)
+    policy = AI.CausalLM(vocab_size=vocab, d_model=8, num_heads=2, num_layers=1, max_len=12)
+    _r.seed(seed)
+    ref = AI.CausalLM(vocab_size=vocab, d_model=8, num_heads=2, num_layers=1, max_len=12)
+    return policy, ref
+
+
+def _pairs():
+    return [([0, 1], [2, 3, 4], [5, 6, 7]),
+            ([1, 2], [3, 4, 5], [6, 7, 8]),
+            ([2, 3], [4, 5, 6], [7, 8, 9])]
+
+
+class TestRLHFTrainer:
+    def test_sequence_logprob(self):
+        policy, _ = _make_models(11)
+        prompt, chosen = [0, 1], [2, 3, 4]
+        lp = AI._rlhf_seq_logprob(policy, prompt, chosen)
+        assert abs(lp - _manual_logp(policy, prompt, chosen)) < 1e-12
+        assert lp < 0.0
+
+    def test_dpo_initial_loss(self):
+        policy, ref = _make_models(11)
+        trainer = AI.RLHFTrainer(policy, ref, method="dpo", beta=0.1, lr=0.01)
+        loss = trainer.pair_step([0, 1], [2, 3, 4], [5, 6, 7])
+        assert abs(loss - math.log(2.0)) < 1e-9
+
+    def test_gradient_matches_finite_difference(self):
+        import random as _r
+        policy, ref = _make_models(11)
+        _r.seed(11)
+        clone = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, num_layers=1, max_len=12)
+        prompt, chosen, rejected = [0, 1], [2, 3, 4], [5, 6, 7]
+        rc = AI._rlhf_seq_logprob(ref, prompt, chosen)
+        rr = AI._rlhf_seq_logprob(ref, prompt, rejected)
+
+        def loss_of(m):
+            pc = AI._rlhf_seq_logprob(m, prompt, chosen)
+            pr = AI._rlhf_seq_logprob(m, prompt, rejected)
+            return AI.preference_loss(pc, pr, rc, rr, method="dpo", beta=0.1)[0]
+
+        policy.zero_grad()
+        pc = AI._rlhf_seq_logprob(policy, prompt, chosen)
+        pr = AI._rlhf_seq_logprob(policy, prompt, rejected)
+        _, dc, dr = AI.preference_loss(pc, pr, rc, rr, method="dpo", beta=0.1)
+        policy.zero_grad()
+        AI._rlhf_seq_logprob(policy, prompt, chosen, grad_scale=dc)
+        AI._rlhf_seq_logprob(policy, prompt, rejected, grad_scale=dr)
+        g = policy.grads["W_out"][0][0]
+        v0 = clone.W_out[0][0]
+        h = 1e-5
+        clone.W_out[0][0] = v0 + h
+        lp = loss_of(clone)
+        clone.W_out[0][0] = v0 - h
+        lm = loss_of(clone)
+        clone.W_out[0][0] = v0
+        fd = (lp - lm) / (2 * h)
+        assert abs(g - fd) / max(1e-12, abs(g)) < 1e-5
+
+    def test_fit_decreases_loss(self):
+        policy, ref = _make_models(11)
+        hist = AI.rlhf_align(policy, _pairs(), reference=ref, method="dpo", beta=0.1,
+                             lr=0.01, epochs=30, seed=3)
+        assert len(hist) == 30
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_other_methods(self):
+        for method in ("simpo", "orpo"):
+            policy, _ = _make_models(12)
+            hist = AI.rlhf_align(policy, _pairs(), reference=None, method=method,
+                                 beta=0.2, lr=0.01, epochs=10, seed=1)
+            assert hist[-1] < hist[0]
+        for method in ("ipo", "cpo"):
+            policy, ref = _make_models(13)
+            hist = AI.rlhf_align(policy, _pairs(), reference=ref, method=method,
+                                 beta=0.1, lr=0.01, epochs=10, seed=1)
+            assert hist[-1] < hist[0]
+
+    def test_invalid_inputs(self):
+        policy, ref = _make_models(11)
+        _raises(lambda: AI.RLHFTrainer("x", ref))
+        _raises(lambda: AI.RLHFTrainer(policy, "x"))
+        _raises(lambda: AI.RLHFTrainer(policy, ref, method="bad"))
+        _raises(lambda: AI.RLHFTrainer(policy, None, method="dpo")
+                .pair_step([0, 1], [2, 3, 4], [5, 6, 7]))
+        _raises(lambda: AI.RLHFTrainer(policy, ref).fit([]))
+        _raises(lambda: AI.RLHFTrainer(policy, ref).fit(_pairs(), epochs=0))
+        _raises(lambda: AI.RLHFTrainer(policy, ref).fit(_pairs(), lr=-0.1))
+        _raises(lambda: AI.RLHFTrainer(policy, ref)
+                .pair_step([0, 1], [], [5, 6, 7]))
+        _raises(lambda: AI._rlhf_seq_logprob(policy, [11], [2, 3, 4]))
+        _raises(lambda: AI._rlhf_seq_logprob(policy, [0], []))

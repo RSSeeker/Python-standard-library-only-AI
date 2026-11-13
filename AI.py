@@ -9724,6 +9724,163 @@ def generate_paged(model, prompt_ids, max_new_tokens: int = 16,
     return ids
 
 
+def _rlhf_check_lm(model, name):
+    if not isinstance(model, CausalLM):
+        raise TypeError("%s: 必须是 CausalLM 实例，收到 %r" % (name, type(model).__name__))
+
+
+def _rlhf_seq_logprob(model, prompt_ids, response_ids, grad_scale=None):
+    """返回 (平均 logp, 无)；grad_scale 非 None 时同时把梯度累积到 model。"""
+    _rlhf_check_lm(model, "sequence_logprob")
+    prompt = _check_token_ids(prompt_ids, model.vocab_size, "sequence_logprob(prompt_ids)")
+    response = _check_token_ids(response_ids, model.vocab_size, "sequence_logprob(response_ids)")
+    if not response:
+        raise ValueError("sequence_logprob: response_ids 不能为空")
+    ids = prompt + response
+    if len(ids) < 2:
+        raise ValueError("sequence_logprob: prompt+response 至少要有 2 个 token")
+    logits = model.forward(ids[:-1])
+    total = 0.0
+    n = len(response)
+    d_logits = [[0.0] * model.vocab_size for _ in range(len(ids) - 1)]
+    scale = 0.0 if grad_scale is None else float(grad_scale)
+    for i in range(len(prompt), len(ids)):
+        t = i - 1
+        target = ids[i]
+        probs = _softmax_row(logits[t])
+        p = probs[target]
+        total += math.log(p) if p > 1e-12 else math.log(1e-12)
+        if scale != 0.0:
+            row = d_logits[t]
+            for v in range(model.vocab_size):
+                row[v] = -scale * probs[v] / n
+            row[target] += scale / n
+    avg = total / n
+    if scale == 0.0:
+        return avg
+    h = model.h
+    seq_len = len(h)
+    for v in range(model.vocab_size):
+        g_row = model.grads["W_out"][v]
+        gb = 0.0
+        for t in range(seq_len):
+            d = d_logits[t][v]
+            gb += d
+            ht = h[t]
+            for j in range(model.d_model):
+                g_row[j] += d * ht[j]
+        model.grads["b_out"][v] += gb
+    dh = [[0.0] * model.d_model for _ in range(seq_len)]
+    for t in range(seq_len):
+        dl = d_logits[t]
+        for j in range(model.d_model):
+            s = 0.0
+            for v in range(model.vocab_size):
+                s += dl[v] * model.W_out[v][j]
+            dh[t][j] = s
+    d_seq = model.encoder.backward(dh)
+    model.embedding.backward(d_seq)
+    return avg
+
+
+class RLHFTrainer:
+    """把 ``preference_loss`` 串成可用的偏好对齐训练循环（DPO/IPO/SimPO/CPO/ORPO）
+
+    - ``policy``：待训练 ``CausalLM``；``reference``：参考模型（dpo/ipo/cpo 必需）
+    - 每个偏好对 ``(prompt, chosen, rejected)``：分别算策略与参考模型对回答的
+      **平均 token logp**（长度归一化），交给 ``preference_loss`` 得到损失与
+      ``d_chosen`` / ``d_rejected``，再以这两个标量为系数重放两次反传累积梯度
+    - ``pair_step`` 返回该对的损失；``fit`` 逐对 ``adam_step`` 并记录平均损失
+
+    简化点：只做完整回答的序列 logp（不做 token 级 mask/加权）、每对立刻更新一次
+    （不积累 batch）、参考模型固定不更新、不做打包与分布式。
+    """
+
+    def __init__(self, policy, reference=None, method: str = "dpo",
+                 beta: float = 0.1, margin: float = 0.0,
+                 sft_weight: float = 0.1, lr: float = 0.01):
+        _rlhf_check_lm(policy, "RLHFTrainer(policy)")
+        if reference is not None:
+            _rlhf_check_lm(reference, "RLHFTrainer(reference)")
+        if not isinstance(method, str):
+            raise TypeError("RLHFTrainer: method 必须是字符串，收到 %r" % (method,))
+        m = method.strip().lower()
+        # 复用 preference_loss 的校验（构造一个最小调用即可）
+        try:
+            preference_loss(-1.0, -1.0, -1.0, -1.0, method=m, beta=beta,
+                            margin=margin, sft_weight=sft_weight)
+        except ValueError:
+            raise
+        self.policy = policy
+        self.reference = reference
+        self.method = m
+        self.beta = float(beta)
+        self.margin = float(margin)
+        self.sft_weight = float(sft_weight)
+        self.lr = float(lr)
+        self.loss_history = []
+
+    def _averaged_logp(self, model, prompt, response, grad_scale=None):
+        return _rlhf_seq_logprob(model, prompt, response, grad_scale=grad_scale)
+
+    def pair_step(self, prompt_ids, chosen_ids, rejected_ids):
+        needs_ref = self.method in ("dpo", "ipo", "cpo")
+        if needs_ref and self.reference is None:
+            raise ValueError("RLHFTrainer: method=%r 需要 reference 模型" % (self.method,))
+        pc = _rlhf_seq_logprob(self.policy, prompt_ids, chosen_ids)
+        pr = _rlhf_seq_logprob(self.policy, prompt_ids, rejected_ids)
+        if needs_ref:
+            rc = _rlhf_seq_logprob(self.reference, prompt_ids, chosen_ids)
+            rr = _rlhf_seq_logprob(self.reference, prompt_ids, rejected_ids)
+        else:
+            rc = rr = None
+        loss, dc, dr = preference_loss(pc, pr, rc, rr, method=self.method,
+                                       beta=self.beta, margin=self.margin,
+                                       sft_weight=self.sft_weight)
+        self.policy.zero_grad()
+        _rlhf_seq_logprob(self.policy, prompt_ids, chosen_ids, grad_scale=dc)
+        _rlhf_seq_logprob(self.policy, prompt_ids, rejected_ids, grad_scale=dr)
+        self.policy.adam_step(self.lr)
+        self.loss_history.append(loss)
+        return loss
+
+    def fit(self, pairs, epochs: int = 1, lr: float = None, shuffle: bool = True,
+            seed=None):
+        if not isinstance(pairs, (list, tuple)) or not pairs:
+            raise ValueError("RLHFTrainer.fit: pairs 必须是非空列表")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("RLHFTrainer.fit: epochs 必须是正整数，收到 %r" % (epochs,))
+        if lr is not None:
+            if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                    or not math.isfinite(float(lr)) or lr <= 0:
+                raise ValueError("RLHFTrainer.fit: lr 必须是正有限数字，收到 %r" % (lr,))
+            self.lr = float(lr)
+        rng = random.Random(seed)
+        order = list(range(len(pairs)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            losses = []
+            for idx in order:
+                item = pairs[idx]
+                if not isinstance(item, (list, tuple)) or len(item) != 3:
+                    raise ValueError("RLHFTrainer.fit: 每个样本必须是 (prompt, chosen, rejected)")
+                prompt, chosen, rejected = item
+                losses.append(self.pair_step(prompt, chosen, rejected))
+            history.append(sum(losses) / len(losses))
+        return history
+
+
+def rlhf_align(policy, pairs, reference=None, method: str = "dpo",
+               beta: float = 0.1, margin: float = 0.0, sft_weight: float = 0.1,
+               lr: float = 0.01, epochs: int = 1, shuffle: bool = True, seed=None):
+    """偏好对齐便捷入口：构 ``RLHFTrainer`` 并返回每轮平均损失。"""
+    trainer = RLHFTrainer(policy, reference=reference, method=method, beta=beta,
+                          margin=margin, sft_weight=sft_weight, lr=lr)
+    return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
