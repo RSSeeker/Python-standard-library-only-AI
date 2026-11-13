@@ -10224,6 +10224,169 @@ def fit_mixed_precision(model, xs, ys, dtype="fp16", scale=1024.0, epochs=20,
         "epochs": epochs,
     }
 
+# ---------------------------------------------------------------------------
+# SASRec（自注意力序列推荐）
+# ---------------------------------------------------------------------------
+
+
+def _sasrec_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"SASRec: {name} 必须是正整数")
+    return value
+
+
+def _sasrec_check_feat(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"SASRec: {name} 必须是有限数字")
+    return float(value)
+
+
+def _sasrec_check_seq(seq, num_items, max_len, who="序列"):
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError(f"SASRec: {who} 必须是非空 token 列表")
+    if len(seq) > max_len:
+        raise ValueError(f"SASRec: {who} 长度不能超过 max_len={max_len}")
+    out = []
+    for idx in seq:
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise ValueError(f"SASRec: {who} 必须只包含整数 token")
+        if idx < 1 or idx > num_items:
+            raise ValueError(f"SASRec: {who} token 必须在 [1, {num_items}] 内（0 保留给 padding）")
+        out.append(idx)
+    return out
+
+
+class SASRec:
+    """自注意力序列推荐：物品嵌入 + 位置编码 + 因果 Transformer + 下一物品预测。"""
+
+    def __init__(self, num_items, d_model=32, num_heads=2, d_ff=64, num_layers=2,
+                 max_len=50, dropout=0.0, seed=None):
+        self.num_items = _sasrec_check_pos_int(num_items, "num_items")
+        self.d_model = _sasrec_check_pos_int(d_model, "d_model")
+        self.num_heads = _sasrec_check_pos_int(num_heads, "num_heads")
+        self.d_ff = _sasrec_check_pos_int(d_ff, "d_ff")
+        self.num_layers = _sasrec_check_pos_int(num_layers, "num_layers")
+        self.max_len = _sasrec_check_pos_int(max_len, "max_len")
+        _sasrec_check_feat(dropout, "dropout")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("SASRec: dropout 必须在 [0, 1) 内")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("SASRec: d_model 必须能被 num_heads 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("SASRec: seed 必须是整数或 None")
+        self.dropout = float(dropout)
+
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.embedding = Embedding(self.num_items + 1, self.d_model)
+            self.pos = PositionalEncoding(self.d_model, self.max_len)
+            self.encoder = TransformerEncoder(
+                self.d_model, self.num_heads, self.d_ff, num_layers=self.num_layers,
+                dropout=self.dropout, causal=True)
+            self.out_layer = Layer(self.d_model, self.num_items + 1, "linear")
+        finally:
+            random.setstate(state)
+        self._cache = None
+        self.grad_out_w = None
+        self.grad_out_b = None
+
+    # ---- 工具 ----
+    def _check_target(self, target):
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise ValueError("SASRec: target 必须是整数 token")
+        if target < 1 or target > self.num_items:
+            raise ValueError(f"SASRec: target 必须在 [1, {self.num_items}] 内")
+        return target
+
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.grad_out_w = [[0.0] * self.d_model for _ in range(self.num_items + 1)]
+        self.grad_out_b = [0.0 for _ in range(self.num_items + 1)]
+
+    def param_count(self):
+        emb = (self.num_items + 1) * self.d_model
+        out = (self.num_items + 1) * (self.d_model + 1)
+        d, f = self.d_model, self.d_ff
+        per_layer = 4 * (d * d + d) + (d * f + f) + (f * d + d) + 4 * d
+        return emb + out + self.num_layers * per_layer
+
+    # ---- 前向 / 损失 ----
+    def forward(self, seq):
+        tokens = _sasrec_check_seq(seq, self.num_items, self.max_len)
+        x = self.embedding.forward(tokens)
+        x = self.pos.forward(x)
+        h = self.encoder.forward(x)
+        logits, cache = _dense_rows_forward(self.out_layer, h)
+        self._cache = {"tokens": tokens, "h": h, "logits": logits, "out_cache": cache}
+        return logits
+
+    def predict(self, seq, top_k=5):
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("SASRec: top_k 必须是正整数")
+        logits = self.forward(seq)
+        last = logits[-1]
+        order = sorted(range(1, self.num_items + 1), key=lambda i: (-last[i], i))
+        return order[:min(top_k, self.num_items)]
+
+    def loss_and_backward(self, seq, target):
+        logits = self.forward(seq)
+        target = self._check_target(target)
+        last = logits[-1]
+        m = max(last)
+        exps = [math.exp(v - m) for v in last]
+        total = sum(exps)
+        probs = [v / total for v in exps]
+        loss = -math.log(max(probs[target], 1e-300))
+        # dL/dlogits = probs - onehot
+        d_last = [probs[i] - (1.0 if i == target else 0.0)
+                  for i in range(self.num_items + 1)]
+        d_rows = [[0.0] * (self.num_items + 1) for _ in range(len(seq))]
+        d_rows[-1] = d_last
+        gw, gb, d_h = _dense_rows_backward(self.out_layer, self._cache["out_cache"], d_rows)
+        for i in range(self.num_items + 1):
+            for j in range(self.d_model):
+                self.grad_out_w[i][j] += gw[i][j]
+            self.grad_out_b[i] += gb[i]
+        d_x = self.encoder.backward(d_h)
+        self.embedding.backward(d_x)
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        _dense_apply_sgd(self.out_layer, (self.grad_out_w, self.grad_out_b), lr)
+        self.embedding.sgd_step(lr)
+        self.encoder.sgd_step(lr)
+
+    def fit(self, sequences, epochs=20, lr=0.05, seed=None, shuffle=True):
+        if (not isinstance(sequences, (list, tuple)) or not sequences):
+            raise ValueError("SASRec: sequences 必须是非空列表")
+        epochs = _sasrec_check_pos_int(epochs, "epochs")
+        _sasrec_check_feat(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("SASRec: lr 必须为正数")
+        samples = []
+        for seq in sequences:
+            tokens = _sasrec_check_seq(seq, self.num_items, self.max_len)
+            if len(tokens) < 2:
+                raise ValueError("SASRec: 每个序列至少需要 2 个 token 才能预测下一个")
+            samples.append((tokens[:-1], tokens[-1]))
+        rng = random.Random(seed)
+        history = []
+        for epoch in range(epochs):
+            order = list(range(len(samples)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                xs, ys = samples[idx]
+                self.zero_grad()
+                total += self.loss_and_backward(xs, ys)
+                self.sgd_step(lr)
+            history.append(total / len(samples))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

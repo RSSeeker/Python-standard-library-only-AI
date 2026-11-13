@@ -38723,3 +38723,99 @@ class TestFitMixedPrecision:
         assert _amp_raises(lambda: AI.fit_mixed_precision(AI.MLP([3, 2]), xs, xs))
         assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, shuffle=1))
         assert _amp_raises(lambda: AI.fit_mixed_precision(m, xs, xs, seed="a"))
+
+
+def _sasrec_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _sasrec_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+class TestSASRec:
+    def test_forward_param_count_and_predict(self):
+        random.seed(7)
+        m = AI.SASRec(5, d_model=4, num_heads=1, d_ff=8, num_layers=1, max_len=6, seed=3)
+        assert m.param_count() == 226
+        logits = m.forward([1, 2, 3])
+        assert len(logits) == 3 and len(logits[0]) == 6
+        assert all(isinstance(v, float) and math.isfinite(v) for row in logits for v in row)
+        pred = m.predict([1, 2, 3], top_k=3)
+        assert len(pred) == 3 and 0 not in pred and all(1 <= i <= 5 for i in pred)
+        assert sorted(m.predict([1, 2, 3], top_k=100)) == [1, 2, 3, 4, 5]
+
+    def test_causal_prefix(self):
+        random.seed(8)
+        m = AI.SASRec(5, d_model=4, num_heads=1, d_ff=8, num_layers=1, max_len=6, seed=4)
+        l1 = m.forward([1, 2, 3])
+        l2 = m.forward([1, 2, 4])
+        for row1, row2 in zip(l1[:2], l2[:2]):
+            assert all(_sasrec_close(a, b) for a, b in zip(row1, row2))
+        assert any(not _sasrec_close(a, b) for a, b in zip(l1[2], l2[2]))
+
+    def test_gradients(self):
+        random.seed(11)
+        m = AI.SASRec(5, d_model=4, num_heads=1, d_ff=8, num_layers=1, max_len=6, seed=5)
+        m.zero_grad()
+        loss = m.loss_and_backward([1, 2, 3], 4)
+        assert loss >= 0.0
+        h = 1e-5
+        w0 = m.out_layer.weights[4][0]
+        m.out_layer.weights[4][0] = w0 + h
+        lp = m.loss_and_backward([1, 2, 3], 4)
+        m.out_layer.weights[4][0] = w0 - h
+        lm = m.loss_and_backward([1, 2, 3], 4)
+        m.out_layer.weights[4][0] = w0
+        num = (lp - lm) / (2 * h)
+        m.zero_grad()
+        m.loss_and_backward([1, 2, 3], 4)
+        assert _sasrec_close(num, m.grad_out_w[4][0], 1e-4)
+        e0 = m.embedding.weight[2][1]
+        m.zero_grad()
+        m.loss_and_backward([1, 2, 3], 4)
+        grad_e = m.embedding.grad_weight[2][1]
+        m.embedding.weight[2][1] = e0 + h
+        lp = m.loss_and_backward([1, 2, 3], 4)
+        m.embedding.weight[2][1] = e0 - h
+        lm = m.loss_and_backward([1, 2, 3], 4)
+        m.embedding.weight[2][1] = e0
+        num = (lp - lm) / (2 * h)
+        assert _sasrec_close(num, grad_e, 1e-3)
+
+    def test_fit_learns_transition(self):
+        random.seed(21)
+        m = AI.SASRec(4, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=6, seed=2)
+        seqs = [[1, 2], [2, 1], [3, 4], [4, 3], [1, 2], [2, 1]]
+        history = m.fit(seqs, epochs=120, lr=0.1, seed=1)
+        assert history[-1] < history[0] * 0.7
+        assert m.predict([1], 1)[0] == 2
+        assert m.predict([3], 1)[0] == 4
+
+    def test_invalid_inputs(self):
+        m = AI.SASRec(5, d_model=4, num_heads=1, d_ff=8, num_layers=1, max_len=6, seed=1)
+        assert _sasrec_raises(lambda: AI.SASRec(0))
+        assert _sasrec_raises(lambda: AI.SASRec(5, d_model=5, num_heads=2))
+        assert _sasrec_raises(lambda: AI.SASRec(5, d_model=4, num_heads=1, d_ff=0))
+        assert _sasrec_raises(lambda: AI.SASRec(5, d_model=4, num_heads=1, num_layers=0))
+        assert _sasrec_raises(lambda: AI.SASRec(5, d_model=4, num_heads=1, max_len=0))
+        assert _sasrec_raises(lambda: AI.SASRec(5, d_model=4, num_heads=1, dropout=1.0))
+        assert _sasrec_raises(lambda: AI.SASRec(5, seed="a"))
+        assert _sasrec_raises(lambda: m.forward([]))
+        assert _sasrec_raises(lambda: m.forward([0, 1]))
+        assert _sasrec_raises(lambda: m.forward([1, 6]))
+        assert _sasrec_raises(lambda: m.forward([1] * 7))
+        assert _sasrec_raises(lambda: m.forward([1.0, 2]))
+        assert _sasrec_raises(lambda: m.loss_and_backward([1, 2], 0))
+        assert _sasrec_raises(lambda: m.loss_and_backward([1, 2], 6))
+        assert _sasrec_raises(lambda: m.fit([]))
+        assert _sasrec_raises(lambda: m.fit([[1]]))
+        assert _sasrec_raises(lambda: m.fit([[1, 2]], epochs=0))
+        assert _sasrec_raises(lambda: m.fit([[1, 2]], lr=0.0))
+        assert _sasrec_raises(lambda: m.fit([[1, 2]], lr=float("nan")))
+        assert _sasrec_raises(lambda: m.predict([], 3))
+        assert _sasrec_raises(lambda: m.predict([1, 2], 0))
