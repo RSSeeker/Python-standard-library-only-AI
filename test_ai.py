@@ -39624,3 +39624,213 @@ class TestNeRF:
         ]
         for i, fn in enumerate(cases):
             _nerf_raises(fn)
+
+
+# ---------------------------------------------------------------------------
+# AlphaFold-lite（三角乘法更新 + 简化 IPA）
+# ---------------------------------------------------------------------------
+
+
+def _af_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError('expected exception not raised')
+
+
+class TestTriangleMultiplication:
+    @staticmethod
+    def _pair(n=3, d=3):
+        return [[[0.1 * i + 0.02 * j + 0.003 * t for t in range(d)]
+                 for j in range(n)] for i in range(n)]
+
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        tm = AI.TriangleMultiplication(3, outgoing=True, seed=2)
+        assert tm.param_count() == 48
+        pair = self._pair()
+        out = tm.forward(pair)
+        assert len(out) == 3 and len(out[0]) == 3 and len(out[0][0]) == 3
+        _af_raises(lambda: tm.forward([]))
+        _af_raises(lambda: AI.TriangleMultiplication(0))
+
+    def test_gradients(self):
+        random.seed(0)
+        tm = AI.TriangleMultiplication(3, outgoing=True, seed=2)
+        pair = self._pair()
+
+        def loss_of():
+            tm.reset_grads()
+            out = tm.forward(pair)
+            loss = 0.0
+            dout = []
+            for i in range(3):
+                row = []
+                for j in range(3):
+                    vals = []
+                    for t in range(3):
+                        loss += out[i][j][t] ** 2
+                        vals.append(2.0 * out[i][j][t])
+                    row.append(vals)
+                dout.append(row)
+            tm.backward(dout)
+            return loss
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+
+        rels = [
+            fd(lambda: tm.grads['W_a'][0][0][0],
+               lambda: tm.W_a.weights[0][0],
+               lambda v: tm.W_a.weights[0].__setitem__(0, v)),
+            fd(lambda: tm.grads['W_o'][0][1][2],
+               lambda: tm.W_o.weights[1][2],
+               lambda v: tm.W_o.weights[1].__setitem__(2, v)),
+            fd(lambda: tm.grads['W_g'][0][0][1],
+               lambda: tm.W_g.weights[0][1],
+               lambda v: tm.W_g.weights[0].__setitem__(1, v)),
+        ]
+        assert all(r < 1e-4 for r in rels)
+
+    def test_fit(self):
+        random.seed(0)
+        tm = AI.TriangleMultiplication(3, outgoing=True, seed=3)
+        pair = self._pair()
+        target = [[[0.0] * 3 for _ in range(3)] for _ in range(3)]
+        hist = []
+        for _ in range(120):
+            tm.reset_grads()
+            out = tm.forward(pair)
+            loss = 0.0
+            dout = []
+            for i in range(3):
+                row = []
+                for j in range(3):
+                    vals = []
+                    for t in range(3):
+                        diff = out[i][j][t] - target[i][j][t]
+                        loss += diff * diff
+                        vals.append(2.0 * diff)
+                    row.append(vals)
+                dout.append(row)
+            tm.backward(dout)
+            tm.sgd_step(0.05)
+            hist.append(loss)
+        assert hist[-1] < hist[0] * 0.05
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        tm = AI.TriangleMultiplication(3, outgoing=True, seed=2)
+        _af_raises(lambda: AI.TriangleMultiplication(3, outgoing='yes'))
+        _af_raises(lambda: AI.TriangleMultiplication(3, seed=1.5))
+        _af_raises(lambda: tm.forward([[[0.0] * 4] * 3] * 3))
+        _af_raises(lambda: tm.backward([[[0.0] * 3] * 3] * 3))
+        _af_raises(lambda: tm.sgd_step(0.0))
+
+
+class TestIPALite:
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        ipa = AI.IPALite(4, pair_dim=4, num_heads=2, seed=5)
+        assert ipa.param_count() == 90
+        single = [[0.1 * i + 0.01 * t for t in range(4)] for i in range(3)]
+        pair = [[[0.05 * i + 0.01 * j + 0.002 * t for t in range(4)]
+                 for j in range(3)] for i in range(3)]
+        out = ipa.forward(single, pair)
+        assert len(out) == 3 and len(out[0]) == 4
+        _af_raises(lambda: ipa.forward(single[:2], pair))
+        _af_raises(lambda: ipa.forward(single, pair[:-1]))
+
+    @staticmethod
+    def _fixture():
+        single = [[0.1 * i + 0.01 * t for t in range(4)] for i in range(3)]
+        pair = [[[0.05 * i + 0.01 * j + 0.002 * t for t in range(4)]
+                 for j in range(3)] for i in range(3)]
+        return single, pair
+
+    def test_gradients(self):
+        random.seed(0)
+        ipa = AI.IPALite(4, pair_dim=4, num_heads=2, seed=5)
+        single, pair = self._fixture()
+
+        def loss_of():
+            ipa.reset_grads()
+            out = ipa.forward(single, pair)
+            loss = 0.0
+            dout = []
+            for i in range(3):
+                row = []
+                for t in range(4):
+                    loss += out[i][t] ** 2
+                    row.append(2.0 * out[i][t])
+                dout.append(row)
+            ipa.backward(dout)
+            return loss
+
+        def fd(grad_getter, param_getter, param_setter, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            return abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+
+        rels = [
+            fd(lambda: ipa.grads['W_q'][0][0][1],
+               lambda: ipa.W_q.weights[0][1],
+               lambda v: ipa.W_q.weights[0].__setitem__(1, v)),
+            fd(lambda: ipa.grads['W_b'][0][1][0],
+               lambda: ipa.W_b.weights[1][0],
+               lambda v: ipa.W_b.weights[1].__setitem__(0, v)),
+            fd(lambda: ipa.grads['W_o'][0][2][3],
+               lambda: ipa.W_o.weights[2][3],
+               lambda v: ipa.W_o.weights[2].__setitem__(3, v)),
+        ]
+        assert all(r < 1e-4 for r in rels)
+
+    def test_fit(self):
+        random.seed(0)
+        ipa = AI.IPALite(4, pair_dim=4, num_heads=2, seed=5)
+        single, pair = self._fixture()
+        target = [[0.0] * 4 for _ in range(3)]
+        hist = []
+        for _ in range(150):
+            ipa.reset_grads()
+            out = ipa.forward(single, pair)
+            loss = 0.0
+            dout = []
+            for i in range(3):
+                row = []
+                for t in range(4):
+                    diff = out[i][t] - target[i][t]
+                    loss += diff * diff
+                    row.append(2.0 * diff)
+                dout.append(row)
+            ipa.backward(dout)
+            ipa.sgd_step(0.1)
+            hist.append(loss)
+        assert hist[-1] < hist[0] * 0.2
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        ipa = AI.IPALite(4, pair_dim=4, num_heads=2, seed=5)
+        single, pair = self._fixture()
+        _af_raises(lambda: AI.IPALite(4, 4, 3))
+        _af_raises(lambda: AI.IPALite(0))
+        _af_raises(lambda: ipa.forward([[0.0] * 3] * 3, pair))
+        _af_raises(lambda: ipa.backward([[0.0] * 4]))
+        _af_raises(lambda: ipa.sgd_step(0.0))

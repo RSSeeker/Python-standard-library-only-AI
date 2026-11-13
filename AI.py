@@ -11989,6 +11989,352 @@ class NeRF:
             history.append(loss)
         return history
 
+# ---------------------------------------------------------------------------
+# AlphaFold 简化组件：Triangle multiplicative update + Invariant Point Attention（简化）
+# ---------------------------------------------------------------------------
+
+
+def _af_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"AlphaFold: {name} 必须是正整数")
+    return value
+
+
+def _af_check_matrix(rows, who, dim=None):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(f"AlphaFold: {who} 必须是非空行列表")
+    out = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            raise ValueError(f"AlphaFold: {who} 每行必须是数字列表")
+        if dim is not None and len(row) != dim:
+            raise ValueError(f"AlphaFold: {who} 每行长度必须是 {dim}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError(f"AlphaFold: {who} 必须只包含有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _af_check_pair(pair, dim):
+    if not isinstance(pair, (list, tuple)) or not pair:
+        raise ValueError("AlphaFold: pair 必须是非空方阵")
+    n = len(pair)
+    out = []
+    for row in pair:
+        if not isinstance(row, (list, tuple)) or len(row) != n:
+            raise ValueError("AlphaFold: pair 必须是 N×N 方阵")
+        cells = []
+        for cell in row:
+            cells.append(_af_check_matrix([cell], "pair 单元", dim)[0])
+        out.append(cells)
+    return out
+
+
+class TriangleMultiplication:
+    """三角乘法更新（outgoing/incoming），无 LayerNorm。"""
+
+    def __init__(self, dim, outgoing=True, seed=None):
+        self.dim = _af_check_pos_int(dim, "dim")
+        if not isinstance(outgoing, bool):
+            raise ValueError("AlphaFold: outgoing 必须是 bool")
+        self.outgoing = outgoing
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("AlphaFold: seed 必须是整数或 None")
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.W_a = Layer(dim, dim, "linear")
+            self.W_b = Layer(dim, dim, "linear")
+            self.W_g = Layer(dim, dim, "linear")
+            self.W_o = Layer(dim, dim, "linear")
+        finally:
+            random.setstate(state)
+        self._cache = None
+        self.reset_grads()
+
+    def reset_grads(self):
+        self.grads = {}
+
+    def param_count(self):
+        return 4 * (self.dim * self.dim + self.dim)
+
+    def forward(self, pair):
+        pair = _af_check_pair(pair, self.dim)
+        n = len(pair)
+        rows = [pair[i][j] for i in range(n) for j in range(n)]
+        a_vals, ca = _dense_rows_forward(self.W_a, rows)
+        b_vals, cb = _dense_rows_forward(self.W_b, rows)
+        g_logits, cg = _dense_rows_forward(self.W_g, rows)
+        gate = [[0.0] * self.dim for _ in range(n * n)]
+        for r in range(n * n):
+            for t in range(self.dim):
+                z = g_logits[r][t]
+                gate[r][t] = 1.0 / (1.0 + math.exp(-z)) if z >= 0 else \
+                    math.exp(z) / (1.0 + math.exp(z))
+        a3 = [[a_vals[i * n + k] for k in range(n)] for i in range(n)]
+        b3 = [[b_vals[k * n + j] for k in range(n)] for j in range(n)]
+        c3 = [[[0.0] * self.dim for _ in range(n)] for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                acc = c3[i][j]
+                if self.outgoing:
+                    for k in range(n):
+                        ak = a3[i][k]
+                        bk = b_vals[k * n + j]
+                        for t in range(self.dim):
+                            acc[t] += ak[t] * bk[t]
+                else:
+                    for k in range(n):
+                        ak = a_vals[k * n + i]
+                        bk = b_vals[k * n + j]
+                        for t in range(self.dim):
+                            acc[t] += ak[t] * bk[t]
+        gated_rows = []
+        for i in range(n):
+            for j in range(n):
+                g = gate[i * n + j]
+                c = c3[i][j]
+                gated_rows.append([g[t] * c[t] for t in range(self.dim)])
+        out, co = _dense_rows_forward(self.W_o, gated_rows)
+        self._cache = {
+            "pair": pair, "n": n, "rows": rows, "a_vals": a_vals, "ca": ca,
+            "b_vals": b_vals, "cb": cb, "g_logits": g_logits, "cg": cg,
+            "gate": gate, "a3": a3, "c3": c3, "gated_rows": gated_rows, "co": co,
+        }
+        return [[out[i * n + j] for j in range(n)] for i in range(n)]
+
+    def backward(self, dout_pair):
+        if self._cache is None:
+            raise RuntimeError("AlphaFold: TriangleMultiplication 反向之前必须前向")
+        cache = self._cache
+        n = cache["n"]
+        dout_pair = _af_check_pair(dout_pair, self.dim)
+        if len(dout_pair) != n or any(len(row) != n for row in dout_pair):
+            raise ValueError("AlphaFold: dout_pair 形状必须与前向 pair 一致")
+        dout_rows = [dout_pair[i][j] for i in range(n) for j in range(n)]
+        gw_o, gb_o, d_gated = _dense_rows_backward(self.W_o, cache["co"], dout_rows)
+        self.grads["W_o"] = (gw_o, gb_o)
+        gate = cache["gate"]
+        d_c3 = [[[0.0] * self.dim for _ in range(n)] for _ in range(n)]
+        d_gate_rows = []
+        for i in range(n):
+            for j in range(n):
+                r = i * n + j
+                g = gate[r]
+                dc = d_c3[i][j]
+                dg = []
+                for t in range(self.dim):
+                    dc[t] = d_gated[r][t] * g[t]
+                    dg.append(d_gated[r][t] * cache["c3"][i][j][t])
+                d_gate_rows.append(dg)
+        # sigmoid 反传
+        d_g_logits = []
+        for r in range(n * n):
+            g = gate[r]
+            d_g_logits.append([d_gate_rows[r][t] * g[t] * (1.0 - g[t])
+                               for t in range(self.dim)])
+        d_a_rows = [[0.0] * self.dim for _ in range(n * n)]
+        d_b_rows = [[0.0] * self.dim for _ in range(n * n)]
+        for i in range(n):
+            for j in range(n):
+                dc = d_c3[i][j]
+                for k in range(n):
+                    if self.outgoing:
+                        ak = cache["a_vals"][i * n + k]
+                        bk = cache["b_vals"][k * n + j]
+                        da = d_a_rows[i * n + k]
+                        db = d_b_rows[k * n + j]
+                    else:
+                        ak = cache["a_vals"][k * n + i]
+                        bk = cache["b_vals"][k * n + j]
+                        da = d_a_rows[k * n + i]
+                        db = d_b_rows[k * n + j]
+                    for t in range(self.dim):
+                        da[t] += dc[t] * bk[t]
+                        db[t] += dc[t] * ak[t]
+        gw_a, gb_a, dx_a = _dense_rows_backward(self.W_a, cache["ca"], d_a_rows)
+        gw_b, gb_b, dx_b = _dense_rows_backward(self.W_b, cache["cb"], d_b_rows)
+        gw_g, gb_g, dx_g = _dense_rows_backward(self.W_g, cache["cg"], d_g_logits)
+        self.grads["W_a"] = (gw_a, gb_a)
+        self.grads["W_b"] = (gw_b, gb_b)
+        self.grads["W_g"] = (gw_g, gb_g)
+        d_rows = [[dx_a[r][t] + dx_b[r][t] + dx_g[r][t] for t in range(self.dim)]
+                  for r in range(n * n)]
+        return [[d_rows[i * n + j] for j in range(n)] for i in range(n)]
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("AlphaFold: lr 必须是正有限数字")
+        if not self.grads:
+            raise RuntimeError("AlphaFold: 没有梯度，先反向")
+        for name, layer in (("W_a", self.W_a), ("W_b", self.W_b),
+                            ("W_g", self.W_g), ("W_o", self.W_o)):
+            gw, gb = self.grads[name]
+            _dense_apply_sgd(layer, (gw, gb), lr)
+        self.reset_grads()
+
+
+class IPALite:
+    """简化 IPA：内容注意力 + pair 偏置（不含点注意力/旋转平移）。"""
+
+    def __init__(self, dim, pair_dim=None, num_heads=2, seed=None):
+        self.dim = _af_check_pos_int(dim, "dim")
+        self.pair_dim = self.dim if pair_dim is None else _af_check_pos_int(pair_dim, "pair_dim")
+        self.num_heads = _af_check_pos_int(num_heads, "num_heads")
+        if self.dim % self.num_heads != 0:
+            raise ValueError("AlphaFold: dim 必须能被 num_heads 整除")
+        self.head_dim = self.dim // self.num_heads
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("AlphaFold: seed 必须是整数或 None")
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.W_q = Layer(self.dim, self.dim, "linear")
+            self.W_k = Layer(self.dim, self.dim, "linear")
+            self.W_v = Layer(self.dim, self.dim, "linear")
+            self.W_o = Layer(self.dim, self.dim, "linear")
+            self.W_b = Layer(self.pair_dim, self.num_heads, "linear")
+        finally:
+            random.setstate(state)
+        self._cache = None
+        self.reset_grads()
+
+    def reset_grads(self):
+        self.grads = {}
+
+    def param_count(self):
+        d, p = self.dim, self.pair_dim
+        return (4 * (d * d + d) + (p * self.num_heads + self.num_heads))
+
+    def forward(self, single, pair):
+        single = _af_check_matrix(single, "single", self.dim)
+        pair = _af_check_pair(pair, self.pair_dim)
+        n = len(single)
+        if len(pair) != n:
+            raise ValueError("AlphaFold: pair 的行数必须与 single 一致")
+        q_vals, cq = _dense_rows_forward(self.W_q, single)
+        k_vals, ck = _dense_rows_forward(self.W_k, single)
+        v_vals, cv = _dense_rows_forward(self.W_v, single)
+        pair_rows = [pair[i][j] for i in range(n) for j in range(n)]
+        bias_vals, cb = _dense_rows_forward(self.W_b, pair_rows)
+        h = self.num_heads
+        dh = self.head_dim
+        scale = 1.0 / math.sqrt(dh)
+        logits = [[[0.0] * n for _ in range(h)] for _ in range(n)]
+        probs = [[[0.0] * n for _ in range(h)] for _ in range(n)]
+        for i in range(n):
+            for head in range(h):
+                off = head * dh
+                row = []
+                for j in range(n):
+                    s = sum(q_vals[i][off + t] * k_vals[j][off + t]
+                            for t in range(dh)) * scale
+                    s += bias_vals[i * n + j][head]
+                    row.append(s)
+                    logits[i][head][j] = s
+                m = max(row)
+                ex = [math.exp(z - m) for z in row]
+                tot = sum(ex)
+                probs[i][head] = [z / tot for z in ex]
+        agg = [[0.0] * self.dim for _ in range(n)]
+        for i in range(n):
+            for head in range(h):
+                off = head * dh
+                for j in range(n):
+                    p = probs[i][head][j]
+                    if p == 0.0:
+                        continue
+                    vj = v_vals[j]
+                    for t in range(dh):
+                        agg[i][off + t] += p * vj[off + t]
+        out, co = _dense_rows_forward(self.W_o, agg)
+        result = [[single[i][t] + out[i][t] for t in range(self.dim)]
+                  for i in range(n)]
+        self._cache = {
+            "single": single, "pair": pair, "n": n, "q_vals": q_vals,
+            "cq": cq, "k_vals": k_vals, "ck": ck, "v_vals": v_vals, "cv": cv,
+            "bias_vals": bias_vals, "cb": cb, "logits": logits,
+            "probs": probs, "agg": agg, "co": co, "out": out,
+        }
+        return result
+
+    def backward(self, dout_single):
+        if self._cache is None:
+            raise RuntimeError("AlphaFold: IPALite 反向之前必须前向")
+        cache = self._cache
+        n = cache["n"]
+        h = self.num_heads
+        dh = self.head_dim
+        dout_single = _af_check_matrix(dout_single, "dout_single", self.dim)
+        if len(dout_single) != n:
+            raise ValueError("AlphaFold: dout_single 行数必须与 single 一致")
+        gw_o, gb_o, d_agg = _dense_rows_backward(self.W_o, cache["co"], dout_single)
+        self.grads["W_o"] = (gw_o, gb_o)
+        probs = cache["probs"]
+        v_vals = cache["v_vals"]
+        d_v = [[0.0] * self.dim for _ in range(n)]
+        d_logits = [[[0.0] * n for _ in range(h)] for _ in range(n)]
+        for i in range(n):
+            for head in range(h):
+                off = head * dh
+                d_agg_row = d_agg[i]
+                d_p = []
+                for j in range(n):
+                    val = sum(d_agg_row[off + t] * v_vals[j][off + t]
+                              for t in range(dh))
+                    d_p.append(val)
+                    for t in range(dh):
+                        d_v[j][off + t] += probs[i][head][j] * d_agg_row[off + t]
+                dot = sum(probs[i][head][j] * d_p[j] for j in range(n))
+                for j in range(n):
+                    d_logits[i][head][j] = probs[i][head][j] * (d_p[j] - dot)
+        d_bias_rows = [[d_logits[i][h2][j] if h2 < h else 0.0 for h2 in range(h)]
+                       for i in range(n) for j in range(n)]
+        gw_b, gb_b, d_pair_rows = _dense_rows_backward(self.W_b, cache["cb"], d_bias_rows)
+        self.grads["W_b"] = (gw_b, gb_b)
+        scale = 1.0 / math.sqrt(dh)
+        d_q = [[0.0] * self.dim for _ in range(n)]
+        d_k = [[0.0] * self.dim for _ in range(n)]
+        for i in range(n):
+            for head in range(h):
+                off = head * dh
+                for t in range(dh):
+                    acc = 0.0
+                    for j in range(n):
+                        acc += d_logits[i][head][j] * cache["k_vals"][j][off + t]
+                    d_q[i][off + t] = acc * scale
+                for j in range(n):
+                    for t in range(dh):
+                        d_k[j][off + t] += d_logits[i][head][j] * cache["q_vals"][i][off + t] * scale
+        gw_q, gb_q, dx_q = _dense_rows_backward(self.W_q, cache["cq"], d_q)
+        gw_k, gb_k, dx_k = _dense_rows_backward(self.W_k, cache["ck"], d_k)
+        gw_v, gb_v, dx_v = _dense_rows_backward(self.W_v, cache["cv"], d_v)
+        self.grads["W_q"] = (gw_q, gb_q)
+        self.grads["W_k"] = (gw_k, gb_k)
+        self.grads["W_v"] = (gw_v, gb_v)
+        d_single = [[dout_single[i][t] + dx_q[i][t] + dx_k[i][t] + dx_v[i][t]
+                     for t in range(self.dim)] for i in range(n)]
+        d_pair = [[d_pair_rows[i * n + j] for j in range(n)] for i in range(n)]
+        return d_single, d_pair
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("AlphaFold: lr 必须是正有限数字")
+        if not self.grads:
+            raise RuntimeError("AlphaFold: 没有梯度，先反向")
+        for name in ("W_q", "W_k", "W_v", "W_o", "W_b"):
+            gw, gb = self.grads[name]
+            _dense_apply_sgd(getattr(self, name), (gw, gb), lr)
+        self.reset_grads()
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

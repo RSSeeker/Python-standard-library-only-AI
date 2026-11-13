@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2556 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2564 项）
 
 ## 特性
 
@@ -3667,6 +3667,36 @@ grads["dcandidate"], grads["dhistory"]    # 输入梯度也在返回值里
   只保留点积打分 + softmax 池化 + ReLU MLP；`mask` 为 0 的位置权重恰为 0。
 - 两者都只做二分类打分；不含负采样、召回评估与多任务输出。
 
+### AlphaFold-lite（三角乘法更新 + 简化 IPA）
+
+蛋白质结构模块的两个核心部件的极简实现：pair 表示的三角乘法更新与单表示的简化不变点注意力（IPA）：
+
+```python
+import AI
+
+tm = AI.TriangleMultiplication(4, outgoing=True, seed=0)
+pair = [[[0.1 * i + 0.02 * j for _ in range(4)] for j in range(3)] for i in range(3)]
+out = tm.forward(pair)
+d_pair = tm.backward([[[0.0] * 4 for _ in range(3)] for _ in range(3)])
+tm.sgd_step(0.01)
+
+ipa = AI.IPALite(4, pair_dim=4, num_heads=2, seed=0)
+single = [[0.1 * i for _ in range(4)] for i in range(3)]
+s_out = ipa.forward(single, pair)
+d_single, d_pair = ipa.backward([[0.0] * 4 for _ in range(3)])
+```
+
+| API | 说明 |
+| --- | --- |
+| `TriangleMultiplication(dim, outgoing=True, seed=None)` | pair 单元 → 两条线性投影 → `Σ_k a_ik ⊙ b_kj`（outgoing）或 `Σ_k a_ki ⊙ b_kj`（incoming）→ sigmoid 门控 → 输出投影；`forward(pair)`、`backward(dout_pair)` 返回 pair 梯度、`sgd_step(lr)`、`param_count()` |
+| `IPALite(dim, pair_dim=None, num_heads=2, seed=None)` | 简化 IPA：内容注意力（Q/K/V）+ pair 偏置，`out_i = s_i + W_o(Σ_j softmax(...)·v_j)`；`forward(single, pair)`、`backward(dout_single)` 返回 `(d_single, d_pair)`、`sgd_step(lr)`、`param_count()` |
+
+边界：这是两个部件的教学实现——三角乘法**不含 LayerNorm**、不做三角自注意力与 pair 转置一致性约束；
+`IPALite` **省略点注意力与旋转/平移不变性**（没有 frames、没有 3D 点变换），因此不是完整 IPA，也不是 Evoformer/结构模块；
+两者都只处理小 N 的 Python 列表输入，无批量化与掩码。
+
+测试：`TestTriangleMultiplication` 覆盖前向/参数量、W_a/W_o/W_g 权重梯度有限差分、拟合收敛、非法输入；`TestIPALite` 覆盖前向/参数量、W_q/W_b/W_o 权重梯度有限差分、拟合收敛、非法输入。
+
 ### NeRF-lite（体渲染神经辐射场）
 
 位置编码 + 密度/颜色双 MLP + 固定步长体渲染（解析反向到两个 MLP）：
@@ -5441,7 +5471,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2556 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2564 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5648,6 +5678,8 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestWhisperLite` | 前向/参数量、投影层与输出头梯度有限差分、合成 mel 过拟合训练、predict 长度/非法输入 |
 | `TestYOLOLite` | 前向/参数量、检测头与卷积核梯度有限差分、合成图目标分配训练、非法输入 |
 | `TestNeRF` | 前向/参数量、sigma 与颜色 MLP 权重梯度有限差分、单 ray 颜色拟合、非法输入 |
+| `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
+| `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
@@ -5896,6 +5928,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2556 个单元测试
+├── test_ai.py       # 2564 个单元测试
 └── README.md
 ```
