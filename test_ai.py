@@ -40236,3 +40236,88 @@ class TestPointNetDetector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+import unittest
+
+import AI
+
+
+def _mg_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError("expected an error")
+
+
+class TestMoleculeGNN(unittest.TestCase):
+    def test_forward_and_param_count(self):
+        random.seed(0)
+        m = AI.MoleculeGNN(node_features=1, hidden=(8,), num_layers=2, seed=1)
+        self.assertEqual(m.param_count(), 241)
+        nodes = [[1.0], [0.0]]
+        adj = [[0.0, 1.0], [1.0, 0.0]]
+        pred = m.forward(nodes, adj)
+        self.assertIsInstance(pred, float)
+        self.assertTrue(math.isfinite(pred))
+
+    def test_gradients(self):
+        random.seed(0)
+        m = AI.MoleculeGNN(node_features=1, hidden=(8,), num_layers=2, seed=1)
+        nodes = [[1.0], [0.0]]
+        adj = [[0.0, 1.0], [1.0, 0.0]]
+
+        def loss_of():
+            m.zero_grad()
+            return m.loss_and_backward(nodes, adj, 0.5)
+
+        def fd(grad_getter, param_getter, param_setter, tag, h=1e-5):
+            loss_of()
+            analytic = grad_getter()
+            p0 = param_getter()
+            param_setter(p0 + h)
+            lp = loss_of()
+            param_setter(p0 - h)
+            lm = loss_of()
+            param_setter(p0)
+            fd_val = (lp - lm) / (2 * h)
+            rel = abs(analytic - fd_val) / max(1e-9, abs(analytic) + abs(fd_val))
+            self.assertLess(rel, 2e-3, tag)
+
+        fd(lambda: m.grad_head[0][0][0], lambda: m.head.weights[0][0],
+           lambda v: m.head.weights[0].__setitem__(0, v), "head")
+        fd(lambda: m.layers[0].l1.gW[0][0], lambda: m.layers[0].l1.W[0][0],
+           lambda v: m.layers[0].l1.W[0].__setitem__(0, v), "gin l1")
+        fd(lambda: m.layers[1].l2.gW[3][2], lambda: m.layers[1].l2.W[3][2],
+           lambda v: m.layers[1].l2.W[3].__setitem__(2, v), "gin l2")
+
+    def test_fit(self):
+        random.seed(0)
+        graphs = [([[1.0], [0.0]], [[0.0, 1.0], [1.0, 0.0]]),
+                  ([[2.0], [0.0], [1.0]], [[0, 1, 0], [1, 0, 1], [0, 1, 0]])]
+        targets = [0.5, 1.0]
+        m = AI.MoleculeGNN(node_features=1, hidden=(8,), num_layers=2, seed=2)
+        hist = m.fit(graphs, targets, epochs=150, lr=0.01, seed=1)
+        self.assertGreater(len(hist), 0)
+        self.assertLess(hist[-1], hist[0] * 0.3)
+
+    def test_invalid_inputs(self):
+        _mg_raises(lambda: AI.MoleculeGNN(node_features=0))
+        _mg_raises(lambda: AI.MoleculeGNN(hidden=[]))
+        _mg_raises(lambda: AI.MoleculeGNN(seed=1.5))
+        m = AI.MoleculeGNN(node_features=1, hidden=(8,), num_layers=2, seed=1)
+        adj = [[0.0, 1.0], [1.0, 0.0]]
+        _mg_raises(lambda: m.forward([], []))
+        _mg_raises(lambda: m.forward([[1.0], [0.0]], [[0.0]]))
+        _mg_raises(lambda: m.loss_and_backward([[1.0], [0.0]], adj, float("nan")))
+        _mg_raises(lambda: m.loss_and_backward([], [], 1.0))
+        _mg_raises(lambda: m.sgd_step(0.0))
+        _mg_raises(lambda: m.fit([], []))
+        _mg_raises(lambda: m.fit([([[1.0]], [[0.0]])], [1.0], epochs=0))
+
+
+if __name__ == "__main__":
+    unittest.main()

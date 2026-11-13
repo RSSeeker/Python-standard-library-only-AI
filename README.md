@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2580 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2584 项）
 
 ## 特性
 
@@ -3697,6 +3697,34 @@ d_single, d_pair = ipa.backward([[0.0] * 4 for _ in range(3)])
 
 测试：`TestTriangleMultiplication` 覆盖前向/参数量、W_a/W_o/W_g 权重梯度有限差分、拟合收敛、非法输入；`TestIPALite` 覆盖前向/参数量、W_q/W_b/W_o 权重梯度有限差分、拟合收敛、非法输入。
 
+### 分子性质预测 GNN（MoleculeGNN）
+
+节点特征在图上做 GIN 消息传递，图级 mean 池化后用线性头回归分子性质：
+
+```python
+import AI
+
+model = AI.MoleculeGNN(node_features=4, hidden=(16,), num_layers=2, seed=0)
+nodes = [[1.0, 0.0, 0.5, 2.0], [0.0, 1.0, 0.5, 2.0]]
+adj = [[0.0, 1.0], [1.0, 0.0]]
+loss = model.loss_and_backward(nodes, adj, 1.0)
+model.sgd_step(0.01)
+print(model.predict(nodes, adj))
+```
+
+| API | 说明 |
+| --- | --- |
+| `MoleculeGNN(node_features, hidden=(16,), num_layers=2, seed=None)` | 由 `num_layers` 个 `GINLayer` 堆叠 + 图级 mean 池化 + 线性回归头组成 |
+| `forward(nodes, adj)` / `predict(nodes, adj)` | `nodes` 为节点特征列表、`adj` 为 `n×n` 加权邻接矩阵，返回标量性质预测 |
+| `loss_and_backward(nodes, adj, target)` | 平方误差损失，反向到回归头与各 GIN 层，返回损失 |
+| `fit(graphs, targets, epochs=20, lr=0.01, seed=None, shuffle=True)` | `graphs` 为 `(nodes, adj)` 二元组列表；逐图 SGD，返回每 epoch 平均损失 |
+| `sgd_step(lr)` / `zero_grad()` / `param_count()` | 手写 SGD（各 GIN 层 + 回归头）、梯度清零、参数量 |
+
+边界：这不是完整分子模型——没有原子/键类型的可学习嵌入、没有 3D 构象或键级消息传递，
+也没有注意力池化/子结构解释；节点特征和邻接矩阵由调用方提供，只训练消息传递与图级回归。
+
+测试：`TestMoleculeGNN` 覆盖前向/参数量、回归头与两层 GIN 权重梯度有限差分、两个小图的图级性质回归训练、非法输入。
+
 ### NeRF-lite（体渲染神经辐射场）
 
 位置编码 + 密度/颜色双 MLP + 固定步长体渲染（解析反向到两个 MLP）：
@@ -5589,7 +5617,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2580 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2584 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5800,6 +5828,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPointNetDetector` | 前向/参数量、分类头/框头/编码器梯度有限差分、点云类别与框回归训练、非法输入 |
 | `TestTriangleMultiplication` | 前向/参数量、W_a/W_o/W_g 梯度有限差分、拟合收敛、非法输入 |
 | `TestIPALite` | 前向/参数量、W_q/W_b/W_o 梯度有限差分、拟合收敛、非法输入 |
+| `TestMoleculeGNN` | 前向/参数量、回归头与 GIN 权重梯度有限差分、两个小图性质回归、非法输入 |
 | `TestVideoMAE` | 前向/遮罩可复现/参数量、卷积核/解码器/mask token 梯度有限差分、重建过拟合、非法输入 |
 | `TestWav2Vec2` | 前向/遮罩可复现/参数量、投影层/码本/mask token 梯度有限差分、对比训练收敛、非法输入 |
 | `TestDeepONet` | 前向形状与参数计数、branch 权重中心差分、拟合算子 `a·sin(2c)` 收敛、非法输入 |
@@ -6050,6 +6079,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2580 个单元测试
+├── test_ai.py       # 2584 个单元测试
 └── README.md
 ```

@@ -13275,6 +13275,169 @@ class PointNetDetector:
                 self.cls_head.fan_in * self.cls_head.fan_out + self.cls_head.fan_out +
                 self.box_head.fan_in * self.box_head.fan_out + self.box_head.fan_out)
 
+"""分子性质预测 GNN：GIN 堆叠 + 图级 mean 池化 + 线性回归头。
+
+不是完整分子模型：没有原子类型/键型的真实嵌入、没有 3D 构象、没有可解释子结构注意力，
+只演示「消息传递 -> 图池化 -> 性质回归」的训练管线；节点特征与邻接矩阵由调用方给出。
+"""
+import math
+import random
+
+
+def _mg_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("MoleculeGNN: %s 必须是正整数" % name)
+    return value
+
+
+def _mg_check_adj(adj, n):
+    if not isinstance(adj, (list, tuple)) or len(adj) != n:
+        raise ValueError("MoleculeGNN: adj 必须是 n x n 邻接矩阵")
+    out = []
+    for row in adj:
+        if not isinstance(row, (list, tuple)) or len(row) != n:
+            raise ValueError("MoleculeGNN: adj 必须是 n x n 邻接矩阵")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError("MoleculeGNN: adj 元素必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _mg_check_graph(nodes, adj):
+    if not isinstance(nodes, (list, tuple)) or not nodes:
+        raise ValueError("MoleculeGNN: nodes 必须是非空列表")
+    n = len(nodes)
+    feats = []
+    width = None
+    for row in nodes:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("MoleculeGNN: 每个节点特征必须是非空列表")
+        if width is None:
+            width = len(row)
+        if len(row) != width:
+            raise ValueError("MoleculeGNN: 所有节点特征维度必须一致")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError("MoleculeGNN: 节点特征必须是有限数字")
+            vals.append(float(v))
+        feats.append(vals)
+    return feats, _mg_check_adj(adj, n)
+
+
+class MoleculeGNN:
+    def __init__(self, node_features, hidden=(16,), num_layers=2, seed=None):
+        self.node_features = _mg_check_pos_int(node_features, "node_features")
+        self.num_layers = _mg_check_pos_int(num_layers, "num_layers")
+        if not isinstance(hidden, (list, tuple)) or not hidden:
+            raise ValueError("MoleculeGNN: hidden 必须是非空列表")
+        for v in hidden:
+            _mg_check_pos_int(v, "hidden 元素")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("MoleculeGNN: seed 必须是 int 或 None")
+        self.hidden = tuple(int(v) for v in hidden)
+        self.layers = []
+        for li in range(self.num_layers):
+            in_f = self.node_features if li == 0 else self.hidden[-1]
+            self.layers.append(GINLayer(in_f, self.hidden[0], self.hidden[-1],
+                                        seed=(0 if seed is None else seed + li)))
+        width = self.hidden[-1]
+        if seed is not None:
+            saved = random.getstate()
+            random.seed(seed + 100)
+            try:
+                self.head = Layer(width, 1, "linear")
+            finally:
+                random.setstate(saved)
+        else:
+            self.head = Layer(width, 1, "linear")
+        self._cache = None
+
+    def forward(self, nodes, adj):
+        feats, adj = _mg_check_graph(nodes, adj)
+        h = feats
+        acts = []
+        for layer in self.layers:
+            h = layer.forward(h, adj)
+            acts.append(h)
+        n = len(h)
+        width = self.hidden[-1]
+        pooled = [sum(h[i][k] for i in range(n)) / n for k in range(width)]
+        out, head_cache = _dense_rows_forward(self.head, [pooled])
+        self._cache = {"n": n, "width": width, "pooled": pooled,
+                       "head_cache": head_cache, "acts": acts}
+        return out[0][0]
+
+    def predict(self, nodes, adj):
+        return self.forward(nodes, adj)
+
+    def loss_and_backward(self, nodes, adj, target):
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target):
+            raise ValueError("MoleculeGNN: target 必须是有限数字")
+        pred = self.forward(nodes, adj)
+        diff = pred - float(target)
+        loss = diff * diff
+        d_pred = 2.0 * diff
+        d_head = [[d_pred]]
+        gw, gb, d_pooled = _dense_rows_backward(self.head, self._cache["head_cache"], d_head)
+        self.grad_head = (gw, gb)
+        n = self._cache["n"]
+        width = self._cache["width"]
+        d_h = [[d_pooled[0][k] / n for k in range(width)] for _ in range(n)]
+        for layer in reversed(self.layers):
+            d_h = layer.backward(d_h)
+        return loss
+
+    def zero_grad(self):
+        self.grad_head = None
+        for layer in self.layers:
+            layer.zero_grad()
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("MoleculeGNN: lr 必须为正数")
+        if self.grad_head is not None:
+            _dense_apply_sgd(self.head, self.grad_head, lr)
+        for layer in self.layers:
+            layer.sgd_step(lr)
+
+    def fit(self, graphs, targets, epochs=20, lr=0.01, seed=None, shuffle=True):
+        if not isinstance(graphs, (list, tuple)) or not isinstance(targets, (list, tuple)):
+            raise ValueError("MoleculeGNN: graphs/targets 必须是列表")
+        if not graphs or len(graphs) != len(targets):
+            raise ValueError("MoleculeGNN: graphs 与 targets 必须非空且等长")
+        _mg_check_pos_int(epochs, "epochs")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("MoleculeGNN: seed 必须是 int 或 None")
+        checked = [_mg_check_graph(g[0], g[1]) for g in graphs]
+        tgt = []
+        for t in targets:
+            if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+                raise ValueError("MoleculeGNN: target 必须是有限数字")
+            tgt.append(float(t))
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(checked)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(checked[idx][0], checked[idx][1], tgt[idx])
+                self.sgd_step(lr)
+            history.append(total / len(checked))
+        return history
+
+    def param_count(self):
+        total = self.head.fan_in * self.head.fan_out + self.head.fan_out
+        for layer in self.layers:
+            total += layer.param_count()
+        return total
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
