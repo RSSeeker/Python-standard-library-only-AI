@@ -38819,3 +38819,116 @@ class TestSASRec:
         assert _sasrec_raises(lambda: m.fit([[1, 2]], lr=float("nan")))
         assert _sasrec_raises(lambda: m.predict([], 3))
         assert _sasrec_raises(lambda: m.predict([1, 2], 0))
+
+
+def _dcn_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dcn_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def _dcn_fd(model, feats, tgt, grad_getter, param_getter, param_setter, h=1e-5):
+    model.zero_grad()
+    model.loss_and_backward(feats, tgt)
+    ana = grad_getter()
+    old = param_getter()
+    param_setter(old + h)
+    model.zero_grad()
+    lp = model.loss_and_backward(feats, tgt)
+    param_setter(old - h)
+    model.zero_grad()
+    lm = model.loss_and_backward(feats, tgt)
+    param_setter(old)
+    return (lp - lm) / (2 * h), ana
+
+
+class TestDCNv2:
+    def test_forward_param_and_predict(self):
+        random.seed(7)
+        m = AI.DCNv2(4, num_cross_layers=2, hidden=(6,), seed=1)
+        assert m.param_count() == 82
+        logit = m.forward([0.5, 1.0, 0.0, 0.5])
+        assert isinstance(logit, float) and math.isfinite(logit)
+        p = m.predict([0.5, 1.0, 0.0, 0.5])
+        assert 0.0 < p < 1.0
+        loss = m.loss_and_backward([0.5, 1.0, 0.0, 0.5], 1.0)
+        assert loss >= 0.0
+
+    def test_cross_layer_gradients(self):
+        random.seed(11)
+        m = AI.DCNv2(4, num_cross_layers=2, hidden=(5,), seed=3)
+        feats = [0.3, -0.2, 0.7, 0.1]
+        num, ana = _dcn_fd(m, feats, 1.0,
+                           lambda: m.grad_cross_w[0][0][1],
+                           lambda: m.cross_w[0][0][1],
+                           lambda v: m.cross_w[0][0].__setitem__(1, v))
+        assert _dcn_close(num, ana, 1e-4)
+        num, ana = _dcn_fd(m, feats, 1.0,
+                           lambda: m.grad_cross_w[1][2][3],
+                           lambda: m.cross_w[1][2][3],
+                           lambda v: m.cross_w[1][2].__setitem__(3, v))
+        assert _dcn_close(num, ana, 1e-4)
+
+    def test_deep_and_linear_gradients(self):
+        random.seed(12)
+        m = AI.DCNv2(4, num_cross_layers=2, hidden=(5,), seed=4)
+        feats = [0.3, -0.2, 0.7, 0.1]
+        num, ana = _dcn_fd(m, feats, 1.0,
+                           lambda: m.grad_lin_w[0][2],
+                           lambda: m.lin_cross.weights[0][2],
+                           lambda v: m.lin_cross.weights[0].__setitem__(2, v))
+        assert _dcn_close(num, ana, 1e-4)
+        found = False
+        for i in range(len(m.deep.layers[0].weights)):
+            for j in range(m.deep.layers[0].fan_in):
+                num, ana = _dcn_fd(m, feats, 1.0,
+                                   lambda i=i, j=j: m.grad_deep_w[0][i][j],
+                                   lambda i=i, j=j: m.deep.layers[0].weights[i][j],
+                                   lambda v, i=i, j=j: m.deep.layers[0].weights[i].__setitem__(j, v))
+                if abs(ana) > 1e-8:
+                    assert _dcn_close(num, ana, 1e-4)
+                    found = True
+                    break
+            if found:
+                break
+        assert found
+
+    def test_fit_xor_pattern(self):
+        random.seed(21)
+        m = AI.DCNv2(4, num_cross_layers=2, hidden=(8,), seed=2)
+        data = [([0.0, 0.0, 1.0, 0.0], 0.0), ([0.0, 1.0, 1.0, 0.0], 1.0),
+                ([1.0, 0.0, 1.0, 0.0], 1.0), ([1.0, 1.0, 1.0, 0.0], 0.0)]
+        history = m.fit([d[0] for d in data], [d[1] for d in data],
+                        epochs=400, lr=0.1, seed=1)
+        assert history[-1] < history[0] * 0.25
+        assert m.predict([1.0, 0.0, 1.0, 0.0]) > 0.5
+        assert m.predict([1.0, 1.0, 1.0, 0.0]) < 0.5
+
+    def test_invalid_inputs(self):
+        m = AI.DCNv2(4, num_cross_layers=2, hidden=(5,), seed=1)
+        assert _dcn_raises(lambda: AI.DCNv2(0))
+        assert _dcn_raises(lambda: AI.DCNv2(3, num_cross_layers=0))
+        assert _dcn_raises(lambda: AI.DCNv2(3, hidden=()))
+        assert _dcn_raises(lambda: AI.DCNv2(3, hidden=(0,)))
+        assert _dcn_raises(lambda: AI.DCNv2(3, hidden=("a",)))
+        assert _dcn_raises(lambda: AI.DCNv2(3, seed="x"))
+        assert _dcn_raises(lambda: m.forward([]))
+        assert _dcn_raises(lambda: m.forward([1.0, 2.0]))
+        assert _dcn_raises(lambda: m.forward([1.0, 2.0, 3.0, 4.0, 5.0]))
+        assert _dcn_raises(lambda: m.forward([1.0, 2.0, 3.0, float("nan")]))
+        assert _dcn_raises(lambda: m.forward([1.0, 2.0, 3.0, True]))
+        assert _dcn_raises(lambda: m.loss_and_backward([1.0, 2.0, 3.0, 4.0], 2.0))
+        assert _dcn_raises(lambda: m.loss_and_backward([1.0, 2.0, 3.0, 4.0], -0.1))
+        assert _dcn_raises(lambda: m.loss_and_backward([1.0, 2.0, 3.0, 4.0], float("inf")))
+        assert _dcn_raises(lambda: m.sgd_step(0.0))
+        assert _dcn_raises(lambda: m.sgd_step(float("nan")))
+        assert _dcn_raises(lambda: m.fit([], []))
+        assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], []))
+        assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], [1.0], epochs=0))
+        assert _dcn_raises(lambda: m.fit([[1.0, 2.0, 3.0, 4.0]], [1.0], lr=0.0))

@@ -10387,6 +10387,195 @@ class SASRec:
             history.append(total / len(samples))
         return history
 
+# ---------------------------------------------------------------------------
+# DCN-v2（Deep & Cross Network v2，推荐排序）
+# ---------------------------------------------------------------------------
+
+
+def _dcn_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"DCNv2: {name} 必须是正整数")
+    return value
+
+
+def _dcn_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"DCNv2: {name} 必须是有限数字")
+    return float(value)
+
+
+def _dcn_check_features(features, num_features, who="features"):
+    if not isinstance(features, (list, tuple)) or len(features) != num_features:
+        raise ValueError(f"DCNv2: {who} 必须是长度为 {num_features} 的列表")
+    out = []
+    for v in features:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"DCNv2: {who} 必须只包含有限数字")
+        out.append(float(v))
+    return out
+
+
+def _dcn_sigmoid(v):
+    if v >= 0:
+        return 1.0 / (1.0 + math.exp(-v))
+    e = math.exp(v)
+    return e / (1.0 + e)
+
+
+class DCNv2:
+    """Deep & Cross Network v2：显式特征交叉 + 深侧 MLP 塔。"""
+
+    def __init__(self, num_features, num_cross_layers=2, hidden=(8,), seed=None):
+        self.num_features = _dcn_check_pos_int(num_features, "num_features")
+        self.num_cross_layers = _dcn_check_pos_int(num_cross_layers, "num_cross_layers")
+        if (not isinstance(hidden, (list, tuple)) or not hidden
+                or any(isinstance(h, bool) or not isinstance(h, int) or h <= 0 for h in hidden)):
+            raise ValueError("DCNv2: hidden 必须是非空正整数列表")
+        self.hidden = list(hidden)
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("DCNv2: seed 必须是整数或 None")
+        d = self.num_features
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.cross_w = []
+            self.cross_b = []
+            for _ in range(self.num_cross_layers):
+                self.cross_w.append([[random.gauss(0.0, 1.0 / math.sqrt(d))
+                                      for _ in range(d)] for _ in range(d)])
+                self.cross_b.append([0.0 for _ in range(d)])
+            self.deep = MLP([d] + self.hidden + [1],
+                            ["relu"] * len(self.hidden) + ["linear"])
+            self.lin_cross = Layer(d, 1, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    # ---- 梯度容器 ----
+    def zero_grad(self):
+        d = self.num_features
+        self.grad_cross_w = [[[0.0] * d for _ in range(d)]
+                             for _ in range(self.num_cross_layers)]
+        self.grad_cross_b = [[0.0] * d for _ in range(self.num_cross_layers)]
+        self.grad_lin_w = [[0.0] * d]
+        self.grad_lin_b = [0.0]
+        self.grad_deep_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                            for layer in self.deep.layers]
+        self.grad_deep_b = [[0.0] * layer.fan_out for layer in self.deep.layers]
+
+    def param_count(self):
+        d = self.num_features
+        cross = self.num_cross_layers * (d * d + d)
+        deep = 0
+        for layer in self.deep.layers:
+            deep += layer.fan_in * layer.fan_out + layer.fan_out
+        return cross + deep + d + 1
+
+    # ---- 前向 ----
+    def forward(self, features):
+        x0 = _dcn_check_features(features, self.num_features)
+        x = list(x0)
+        layers = []
+        for li in range(self.num_cross_layers):
+            w = self.cross_w[li]
+            b = self.cross_b[li]
+            t = [sum(w[i][j] * x[j] for j in range(self.num_features)) + b[i]
+                 for i in range(self.num_features)]
+            y = [x0[i] * t[i] + x[i] for i in range(self.num_features)]
+            layers.append({"x_in": list(x)})
+            x = y
+        x_final = x
+        deep_logit = self.deep.forward(x_final)
+        lin, lin_cache = _dense_rows_forward(self.lin_cross, [x_final])
+        logit = deep_logit[0] + lin[0][0]
+        self._cache = {"x0": x0, "layers": layers, "x_final": x_final,
+                       "lin_cache": lin_cache, "logit": logit}
+        return logit
+
+    def predict(self, features):
+        return _dcn_sigmoid(self.forward(features))
+
+    # ---- 损失与反向 ----
+    def loss_and_backward(self, features, target):
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target):
+            raise ValueError("DCNv2: target 必须是有限数字")
+        target = float(target)
+        if not 0.0 <= target <= 1.0:
+            raise ValueError("DCNv2: target 必须在 [0, 1] 内")
+        logit = self.forward(features)
+        p = _dcn_sigmoid(logit)
+        eps = 1e-12
+        loss = -(target * math.log(max(p, eps)) + (1.0 - target) * math.log(max(1.0 - p, eps)))
+        d_logit = p - target
+
+        deep_grads, d_deep = _mlp_backward_with_input(self.deep, [d_logit])
+        for li, (gw, gb) in enumerate(deep_grads):
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_deep_w[li][i][j] += gw[i][j]
+                self.grad_deep_b[li][i] += gb[i]
+
+        gw, gb, dx = _dense_rows_backward(self.lin_cross, self._cache["lin_cache"], [[d_logit]])
+        for j in range(self.num_features):
+            self.grad_lin_w[0][j] += gw[0][j]
+        self.grad_lin_b[0] += gb[0]
+        d_x = [d_deep[j] + dx[0][j] for j in range(self.num_features)]
+
+        x0 = self._cache["x0"]
+        for li in range(self.num_cross_layers - 1, -1, -1):
+            x_in = self._cache["layers"][li]["x_in"]
+            w = self.cross_w[li]
+            g = [d_x[i] * x0[i] for i in range(self.num_features)]
+            for i in range(self.num_features):
+                self.grad_cross_b[li][i] += g[i]
+                for j in range(self.num_features):
+                    self.grad_cross_w[li][i][j] += g[i] * x_in[j]
+            d_x = [sum(g[i] * w[i][j] for i in range(self.num_features)) + d_x[j]
+                   for j in range(self.num_features)]
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        lr = _dcn_check_pos_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("DCNv2: lr 必须为正数")
+        d = self.num_features
+        for li in range(self.num_cross_layers):
+            for i in range(d):
+                for j in range(d):
+                    self.cross_w[li][i][j] -= lr * self.grad_cross_w[li][i][j]
+                self.cross_b[li][i] -= lr * self.grad_cross_b[li][i]
+        for j in range(d):
+            self.lin_cross.weights[0][j] -= lr * self.grad_lin_w[0][j]
+        self.lin_cross.biases[0] -= lr * self.grad_lin_b[0]
+        for li, layer in enumerate(self.deep.layers):
+            for i in range(layer.fan_out):
+                for j in range(layer.fan_in):
+                    layer.weights[i][j] -= lr * self.grad_deep_w[li][i][j]
+                layer.biases[i] -= lr * self.grad_deep_b[li][i]
+
+    def fit(self, xs, ys, epochs=20, lr=0.05, seed=None, shuffle=True):
+        if (not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple))
+                or not xs or len(xs) != len(ys)):
+            raise ValueError("DCNv2: xs 与 ys 必须是非空且等长的列表")
+        epochs = _dcn_check_pos_int(epochs, "epochs")
+        lr = _dcn_check_pos_number(lr, "lr")
+        if lr <= 0.0:
+            raise ValueError("DCNv2: lr 必须为正数")
+        rng = random.Random(seed)
+        history = []
+        order = list(range(len(xs)))
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(xs[idx], ys[idx])
+                self.sgd_step(lr)
+            history.append(total / len(xs))
+        return history
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
