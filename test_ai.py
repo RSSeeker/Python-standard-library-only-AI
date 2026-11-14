@@ -44151,3 +44151,94 @@ class TestKVCacheEviction:
         ]
         results = [_kve_raises(f) for f in bad]
         assert all(results), results
+
+
+def _pcm_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _pcm_cache(tokens, num_layers=1, d_model=4):
+    cache = AI.PrefixCache(num_layers, d_model)
+    rows = [[0.0] * d_model for _ in range(len(tokens))]
+    cache.set(0, rows, rows)
+    return cache
+
+
+class TestPromptCacheManager:
+    def test_prefix_match_and_stats(self):
+        m = AI.PromptCacheManager(1, 4)
+        assert m.put([1, 2, 3], _pcm_cache([1, 2, 3])) is False
+        matched, cache = m.match([1, 2, 3])
+        assert matched == 3 and cache is not None
+        stats = m.stats()
+        assert stats["hits"] == 1 and stats["tokens_reused"] == 3
+        assert stats["hit_rate"] == 1.0
+        # 最长部分前缀
+        matched, cache = m.match([1, 2, 3, 4, 5])
+        assert matched == 3 and cache is not None
+        assert m.match([9, 9]) == (0, None)
+        stats = m.stats()
+        assert stats["requests"] == 3 and stats["misses"] == 1
+
+    def test_lru_and_token_budget(self):
+        m = AI.PromptCacheManager(1, 4, max_entries=2)
+        m.put([1], _pcm_cache([1]))
+        m.put([2], _pcm_cache([2]))
+        assert m.put([3], _pcm_cache([3])) is True
+        assert m.match([1])[0] == 0
+        assert m.match([3])[0] == 1
+        m2 = AI.PromptCacheManager(1, 4, max_entries=8, max_cached_tokens=5)
+        m2.put([1, 1, 1], _pcm_cache([1, 1, 1]))
+        assert m2.put([2, 2, 2], _pcm_cache([2, 2, 2])) is True
+        assert m2.stats()["cached_tokens"] == 3
+
+    def test_persistence_roundtrip(self):
+        import os
+        import tempfile
+
+        m = AI.PromptCacheManager(1, 4)
+        m.put([5, 6], _pcm_cache([5, 6]))
+        m.match([5, 6, 7])
+        path = os.path.join(tempfile.mkdtemp(), "prompt_cache.json")
+        m.save(path)
+        m2 = AI.PromptCacheManager(1, 4)
+        m2.load(path)
+        assert m2.stats()["entries"] == 1
+        matched, cache = m2.match([5, 6])
+        assert matched == 2 and cache is not None
+        os.remove(path)
+
+    def test_simulation_savings(self):
+        out = AI.prompt_cache_simulation(
+            [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7], [1, 2, 3, 4, 5, 6, 7, 8]])
+        assert out["processed_tokens"] == 8
+        assert out["baseline_tokens"] == 20
+        assert out["saved_tokens"] == 12
+        assert abs(out["stats"]["hit_rate"] - 2 / 3) < 1e-12
+
+    def test_invalid_inputs(self):
+        m = AI.PromptCacheManager(1, 4)
+        bad = [
+            lambda: AI.PromptCacheManager(0, 4),
+            lambda: AI.PromptCacheManager(1, 0),
+            lambda: AI.PromptCacheManager(1, 4, max_entries=0),
+            lambda: AI.PromptCacheManager(1, 4, max_cached_tokens=0),
+            lambda: AI.PromptCacheManager(1, 4, min_prefix=0),
+            lambda: AI.PromptCacheManager(1, 4, min_prefix=9, max_entries=2),
+            lambda: m.match([]),
+            lambda: m.match([1, -1]),
+            lambda: m.match([True]),
+            lambda: m.put([1, 2], "not-a-cache"),
+            lambda: AI.PromptCacheManager(2, 4).put([1], _pcm_cache([1])),
+            lambda: AI.PromptCacheManager(1, 4, min_prefix=3).put(
+                [1, 2], _pcm_cache([1, 2])),
+            lambda: AI.PromptCacheManager(1, 4, max_cached_tokens=3).put(
+                [1, 2, 3, 4], _pcm_cache([1, 2, 3, 4])),
+            lambda: AI.prompt_cache_simulation([]),
+        ]
+        results = [_pcm_raises(f) for f in bad]
+        assert all(results), results

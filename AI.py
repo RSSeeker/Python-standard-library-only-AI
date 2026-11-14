@@ -30751,6 +30751,248 @@ class PrefixCacheStore:
 
 
 
+
+
+def _pcm_check_tokens(tokens, who="PromptCacheManager"):
+    """校验 token 列表：非空、逐项非负整数。"""
+    if not isinstance(tokens, (list, tuple)) or not tokens:
+        raise ValueError(f"{who}: tokens 必须是非空列表")
+    out = []
+    for t in tokens:
+        if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+            raise ValueError(f"{who}: token 必须是非负整数，收到 {t!r}")
+        out.append(t)
+    return list(out)
+
+
+def _pcm_check_pos_int(value, name, who="PromptCacheManager"):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{who}: {name} 必须是正整数，收到 {value!r}")
+    return int(value)
+
+
+class PromptCacheManager:
+    """完整的 prompt 前缀缓存管理：前缀匹配 + LRU + token 预算 + 命中统计。
+
+    与 ``PrefixCacheStore`` 相比补上：
+
+    - 前缀索引（按前缀元组直接查表，而不是逐条线性扫描）；
+    - token 预算 ``max_cached_tokens``：即使条目数没超，token 总量超了也会淘汰；
+    - 命中统计：``tokens_reused`` / ``tokens_saved`` / ``hit_rate``；
+    - JSON 持久化（``save`` / ``load``）。
+
+    ``put(tokens, cache)`` 写入前缀；``match(tokens)`` 返回最长前缀的
+    ``(matched_len, cache)``；``reuse_tokens(tokens)`` 只返回可复用长度。
+    """
+
+    def __init__(self, num_layers: int, d_model: int, max_entries: int = 8,
+                 max_cached_tokens: int = 4096, min_prefix: int = 1):
+        _pcm_check_pos_int(num_layers, "num_layers")
+        _pcm_check_pos_int(d_model, "d_model")
+        _pcm_check_pos_int(max_entries, "max_entries")
+        _pcm_check_pos_int(max_cached_tokens, "max_cached_tokens")
+        _pcm_check_pos_int(min_prefix, "min_prefix")
+        if min_prefix > max_entries:
+            raise ValueError("PromptCacheManager: min_prefix 不能大于 max_entries")
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.max_entries = max_entries
+        self.max_cached_tokens = max_cached_tokens
+        self.min_prefix = min_prefix
+        self._entries = {}
+        self._prefix_index = {}
+        self._order = []
+        self._next_id = 0
+        self._tick = 0
+        self._requests = 0
+        self._hits = 0
+        self._tokens_reused = 0
+
+    def _check_cache(self, cache, who):
+        if not isinstance(cache, PrefixCache):
+            raise ValueError(f"{who}: cache 必须是 PrefixCache 实例")
+        if cache.num_layers != self.num_layers or cache.d_model != self.d_model:
+            raise ValueError(f"{who}: cache 的层数/维度与缓存表不一致")
+
+    def _token_total(self):
+        return sum(len(e["tokens"]) for e in self._entries.values())
+
+    def _drop(self, entry_id):
+        entry = self._entries.pop(entry_id, None)
+        if entry is None:
+            return
+        self._prefix_index.pop(tuple(entry["tokens"]), None)
+        if entry_id in self._order:
+            self._order.remove(entry_id)
+
+    def _evict_for(self, incoming_tokens):
+        """按 LRU 淘汰，直到条目数与 token 预算都能容纳新前缀。"""
+        while self._entries and (
+                len(self._entries) >= self.max_entries
+                or self._token_total() + incoming_tokens > self.max_cached_tokens):
+            if not self._order:
+                break
+            victim = self._order[0]
+            self._drop(victim)
+
+    def put(self, tokens, cache):
+        """写入一条前缀缓存，返回是否触发了淘汰。"""
+        who = "PromptCacheManager.put"
+        toks = _pcm_check_tokens(tokens, who)
+        self._check_cache(cache, who)
+        if len(toks) < self.min_prefix:
+            raise ValueError(
+                f"{who}: 前缀长度 {len(toks)} 小于 min_prefix={self.min_prefix}")
+        if len(toks) > self.max_cached_tokens:
+            raise ValueError(
+                f"{who}: 前缀长度 {len(toks)} 超过 max_cached_tokens={self.max_cached_tokens}")
+        key = tuple(toks)
+        evicted = False
+        if key in self._prefix_index:
+            entry_id = self._prefix_index[key]
+            self._entries[entry_id]["cache"] = cache
+            self._order.remove(entry_id)
+            self._order.append(entry_id)
+            return False
+        before = len(self._entries)
+        self._evict_for(len(toks))
+        evicted = len(self._entries) < before
+        entry_id = self._next_id
+        self._next_id += 1
+        self._entries[entry_id] = {"tokens": toks, "cache": cache, "hits": 0}
+        self._prefix_index[key] = entry_id
+        self._order.append(entry_id)
+        return evicted
+
+    def match(self, tokens):
+        """返回最长已缓存前缀的 ``(matched_len, cache)``；未命中为 ``(0, None)``。"""
+        who = "PromptCacheManager.match"
+        toks = _pcm_check_tokens(tokens, who)
+        self._requests += 1
+        best_len = 0
+        best_cache = None
+        for length in range(len(toks), 0, -1):
+            entry_id = self._prefix_index.get(tuple(toks[:length]))
+            if entry_id is None:
+                continue
+            entry = self._entries[entry_id]
+            best_len = length
+            best_cache = entry["cache"]
+            entry["hits"] += 1
+            self._order.remove(entry_id)
+            self._order.append(entry_id)
+            break
+        if best_cache is None:
+            return 0, None
+        self._hits += 1
+        self._tokens_reused += best_len
+        return best_len, best_cache
+
+    def reuse_tokens(self, tokens):
+        """只返回可复用的 token 数（未命中为 0）。"""
+        return self.match(tokens)[0]
+
+    def stats(self):
+        return {
+            "entries": len(self._entries),
+            "cached_tokens": self._token_total(),
+            "requests": self._requests,
+            "hits": self._hits,
+            "misses": self._requests - self._hits,
+            "hit_rate": (self._hits / self._requests) if self._requests else 0.0,
+            "tokens_reused": self._tokens_reused,
+            "tokens_saved": self._tokens_reused,
+            "max_entries": self.max_entries,
+            "max_cached_tokens": self.max_cached_tokens,
+        }
+
+    def clear(self):
+        self._entries.clear()
+        self._prefix_index.clear()
+        self._order.clear()
+        self._requests = 0
+        self._hits = 0
+        self._tokens_reused = 0
+
+    def to_dict(self):
+        return {
+            "num_layers": self.num_layers,
+            "d_model": self.d_model,
+            "max_entries": self.max_entries,
+            "max_cached_tokens": self.max_cached_tokens,
+            "min_prefix": self.min_prefix,
+            "entries": [
+                {"tokens": e["tokens"], "hits": e["hits"],
+                 "cache": e["cache"].to_dict()}
+                for e in self._entries.values()
+            ],
+            "stats": self.stats(),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("PromptCacheManager.from_dict: 需要字典")
+        for key in ("num_layers", "d_model", "max_entries",
+                    "max_cached_tokens", "min_prefix", "entries"):
+            if key not in data:
+                raise ValueError(f"PromptCacheManager.from_dict: 缺少字段 {key!r}")
+        obj = cls(data["num_layers"], data["d_model"],
+                  max_entries=data["max_entries"],
+                  max_cached_tokens=data["max_cached_tokens"],
+                  min_prefix=data["min_prefix"])
+        for item in data["entries"]:
+            if not isinstance(item, dict) or "tokens" not in item or "cache" not in item:
+                raise ValueError("PromptCacheManager.from_dict: entries 条目格式错误")
+            cache = PrefixCache.from_dict(item["cache"])
+            obj.put(item["tokens"], cache)
+        return obj
+
+    def save(self, path):
+        payload = json.dumps(self.to_dict(), ensure_ascii=False, allow_nan=False)
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        return path
+
+    def load(self, path):
+        with io.open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        other = PromptCacheManager.from_dict(data)
+        self.__dict__.update(other.__dict__)
+        return self
+
+
+def prompt_cache_simulation(prompts, num_layers=1, d_model=4, min_prefix=1,
+                            max_entries=8, max_cached_tokens=4096):
+    """教学用「前缀复用省了多少 prefill」模拟：按顺序处理 prompts，返回统计。
+
+    每个 prompt 命中缓存前缀后只需处理剩余 token；随后把完整 prompt 写入缓存
+    （用全零 PrefixCache 占位，真实 KV 由调用方填入）。
+    """
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError("prompt_cache_simulation: prompts 不能为空")
+    manager = PromptCacheManager(num_layers, d_model, max_entries=max_entries,
+                                 max_cached_tokens=max_cached_tokens,
+                                 min_prefix=min_prefix)
+    processed = 0
+    baseline = 0
+    for prompt in prompts:
+        toks = _pcm_check_tokens(prompt, "prompt_cache_simulation")
+        matched, _ = manager.match(toks)
+        processed += len(toks) - matched
+        baseline += len(toks)
+        cache = PrefixCache(num_layers, d_model)
+        rows = [[0.0] * d_model for _ in range(len(toks))]
+        cache.set(0, rows, rows)
+        manager.put(toks, cache)
+    return {
+        "processed_tokens": processed,
+        "baseline_tokens": baseline,
+        "saved_tokens": baseline - processed,
+        "stats": manager.stats(),
+    }
+
+
 """RULER 风格的长上下文合成评测：检索 / 多跳追踪 / 聚合 / 简单 QA。
 
 评测重点是**长上下文里能否正确定位并使用信息**，生成的任务都是可自动判分的

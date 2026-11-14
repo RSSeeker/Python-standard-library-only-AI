@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2756 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2761 项）
 
 ## 特性
 
@@ -611,6 +611,31 @@ print(out["kept_indices"], out["evicted"])
 边界：这是**策略层**实现，不做真实显存管理，也不改模型前向——调用方在增量解码时用
 `kept_indices` 裁剪各层 cache 即可；H2O/SnapKV 依赖传入的注意力分数（可由
 `attention_maps` 或生成时的注意力统计得到），分数缺失时会显式报错。
+
+### Prompt 前缀缓存管理（PromptCacheManager）
+
+`PrefixCacheStore` 只做 LRU 索引；`PromptCacheManager` 把「前缀索引 + 容量预算 + 命中统计 +
+持久化」补齐，适合多轮对话/共享系统提示等重复前缀场景：
+
+| API | 说明 |
+| --- | --- |
+| `PromptCacheManager(num_layers, d_model, max_entries=8, max_cached_tokens=4096, min_prefix=1)` | 前缀按 token 元组直接索引（`match` 是 O(前缀长度) 查表，不再线性扫描所有条目）；同时按条目数与缓存 token 总量淘汰 LRU |
+| `put(tokens, cache)` | 写入一段前缀的 `PrefixCache`；返回是否触发淘汰 |
+| `match(tokens)` / `reuse_tokens(tokens)` | 返回最长已缓存前缀的 `(matched_len, cache)` / 仅返回可复用长度，并累计命中与省下的 token 数 |
+| `stats()` | `entries` / `cached_tokens` / `requests` / `hits` / `misses` / `hit_rate` / `tokens_reused` / `tokens_saved` |
+| `save(path)` / `load(path)` | JSON 持久化前缀表（含每层 K/V 与命中统计） |
+| `prompt_cache_simulation(prompts, ...)` | 教学模拟：按顺序处理 prompts，统计命中前缀后实际 prefill 的 token 数，对比不复用时的 baseline |
+
+```python
+m = AI.PromptCacheManager(num_layers=1, d_model=4)
+m.put([1, 2, 3], cache)
+matched, cache = m.match([1, 2, 3, 4, 5])   # matched == 3
+print(m.stats()["tokens_saved"])
+```
+
+边界：管理的是**缓存表**，不负责从模型里抓 K/V——调用方命中原前缀后，把新 token 的
+prefill 结果写回 `PrefixCache` 再 `put`；淘汰只按 LRU，不做 LFU/前缀树分层。
+
 
 
 **优化器与 LoRA**：`Lion`（符号动量，`lr` 取 1e-4~1e-3）和 `Adafactor`（行列因子化，显存 O(m+n)）
@@ -6223,7 +6248,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2756 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2761 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6250,6 +6275,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestShampooNewtonGrafting` | Newton–Schulz 逆根与 Jacobi 特征分解结果一致（max_abs < 1e-6）、Newton 路径训练收敛、grafting 一步更新范数与 Adam 一致、`state_dict` 往返（含 `L/R/m/v` 字段）、非法超参 |
 | `TestGaLore` | 全秩投影重建（`rank=min` 时 err < 1e-8）、`rank=1` 更新增量行列式 ≈ 0、200 步线性回归收敛、偏置更新与手写 Adam 一致、7 类非法输入 |
 | `TestKVCacheEviction` | StreamingLLM 的 sink+最近窗口、H2O 保留高注意力与 `recent` token、SnapKV 只看观测窗口、下标有序且长度等于 budget、cache 子集一致、非法输入 |
+| `TestPromptCacheManager` | 前缀/最长部分前缀命中与统计、LRU 与 token 预算淘汰、JSON 持久化往返、前缀复用模拟的 token 节省、非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6721,6 +6747,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2756 个单元测试
+├── test_ai.py       # 2761 个单元测试
 └── README.md
 ```
