@@ -41576,3 +41576,119 @@ class TestKTOTrainer:
                 samples, epochs=1, shuffle=1),
         ]
         assert all(_kto_raises(fn) for fn in bad)
+
+
+import math
+
+
+def _grpo_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _grpo_policy(seed=5):
+    random.seed(seed)
+    return AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                       num_layers=1, max_len=12)
+
+
+def _grpo_reward(prompt, response):
+    return 1.0 if response[-1] == 1 else 0.0
+
+
+def _grpo_mean_reward(policy, n=60, seed=0):
+    rng = random.Random(seed)
+    vals = []
+    for _ in range(n):
+        seq = policy.generate([0], max_new_tokens=2, temperature=1.5, rng=rng)
+        vals.append(_grpo_reward([0], seq[1:]))
+    return sum(vals) / len(vals)
+
+
+class TestGRPOTrainer:
+    def test_training_improves_reward(self):
+        policy = _grpo_policy()
+        before = _grpo_mean_reward(policy)
+        trainer = AI.GRPOTrainer(
+            policy, _grpo_reward, num_samples=4, lr=0.05,
+            max_new_tokens=2, temperature=1.5, entropy_coef=0.01)
+        history = trainer.fit([[0], [0], [1]], epochs=20, seed=2)
+        after = _grpo_mean_reward(policy)
+        assert len(history) == 20
+        assert all(math.isfinite(v) for v in history)
+        assert after > before + 0.3
+        assert len(trainer.reward_history) == len(history) * 3
+
+    def test_group_step_outputs_and_determinism(self):
+        policy = _grpo_policy()
+        trainer = AI.GRPOTrainer(policy, _grpo_reward, num_samples=3,
+                                 lr=0.01, max_new_tokens=2, temperature=1.0)
+        out = trainer.group_step([0], rng=random.Random(11))
+        assert sorted(out.keys()) == ["advantages", "loss", "responses", "rewards"]
+        assert len(out["rewards"]) == 3
+        assert len(out["advantages"]) == 3
+        assert len(out["responses"]) == 3
+        assert math.isfinite(out["loss"])
+        # 同 seed 的 rng 采样结果一致（不更新策略的前置下）
+        policy2 = _grpo_policy()
+        trainer2 = AI.GRPOTrainer(policy2, _grpo_reward, num_samples=3,
+                                  lr=0.01, max_new_tokens=2, temperature=1.0)
+        a = trainer2._sample_responses([0], random.Random(7))
+        b = trainer2._sample_responses([0], random.Random(7))
+        assert a == b
+
+    def test_equal_rewards_mean_zero_advantage_no_update(self):
+        policy = _grpo_policy()
+        trainer = AI.GRPOTrainer(policy, lambda p, r: 1.0, num_samples=4,
+                                 lr=0.05, max_new_tokens=2, temperature=1.5,
+                                 entropy_coef=0.0)
+        before = [row[:] for row in policy.embedding.weight]
+        out = trainer.group_step([0], rng=random.Random(3))
+        assert out["advantages"] == [0.0, 0.0, 0.0, 0.0]
+        assert policy.embedding.weight == before
+
+    def test_ppo_entropy_gradient_matches_finite_difference(self):
+        logits = [0.2, -0.1, 0.5]
+        loss, grad, info = AI.ppo_loss(
+            logits, -1.0, 1, 0.7, clip_ratio=0.2, entropy_coef=0.3)
+        eps = 1e-6
+        for j in range(3):
+            plus = [v for v in logits]
+            minus = [v for v in logits]
+            plus[j] += eps
+            minus[j] -= eps
+            fd = (AI.ppo_loss(plus, -1.0, 1, 0.7, 0.2, 0.3)[0]
+                  - AI.ppo_loss(minus, -1.0, 1, 0.7, 0.2, 0.3)[0]) / (2 * eps)
+            assert abs(grad[j] - fd) < 1e-5
+        assert math.isfinite(loss) and math.isfinite(info["entropy"])
+
+    def test_grpo_align_convenience(self):
+        policy = _grpo_policy()
+        history = AI.grpo_align(
+            policy, _grpo_reward, [[0], [0]], num_samples=2, lr=0.05,
+            max_new_tokens=2, temperature=1.5, epochs=2, seed=4)
+        assert len(history) == 2
+        assert all(math.isfinite(v) for v in history)
+
+    def test_invalid_inputs(self):
+        policy = _grpo_policy()
+        trainer = AI.GRPOTrainer(policy, _grpo_reward, num_samples=2,
+                                 lr=0.01, max_new_tokens=2)
+        bad = [
+            lambda: AI.GRPOTrainer("policy", _grpo_reward),
+            lambda: AI.GRPOTrainer(policy, "reward"),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, num_samples=0),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, lr=0.0),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, clip_ratio=-0.1),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, entropy_coef=-1.0),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, max_new_tokens=0),
+            lambda: AI.GRPOTrainer(policy, _grpo_reward, temperature=0.0),
+            lambda: trainer.fit([], epochs=1),
+            lambda: trainer.fit([[0]], epochs=0),
+            lambda: trainer.group_step([]),
+            lambda: AI.GRPOTrainer(policy, lambda p, r: float("nan")).group_step([0]),
+        ]
+        assert all(_grpo_raises(fn) for fn in bad)

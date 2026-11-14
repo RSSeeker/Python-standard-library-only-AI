@@ -10483,6 +10483,193 @@ def _kto_check_samples(pairs):
     return out
 
 
+# ---- GRPO rollout 训练循环（GRPOTrainer / grpo_align） ----
+
+
+def _grpo_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"GRPOTrainer: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _grpo_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"GRPOTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"GRPOTrainer: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def _grpo_seq_targets(model, ids, start):
+    """前向一次并返回从 ``start`` 起的逐步 logp / 动作 / 缓存 logits。"""
+    logits = model.forward(ids[:-1])
+    old_logps = []
+    actions = []
+    for i in range(start, len(ids)):
+        t = i - 1
+        probs = _softmax_row(logits[t])
+        p = probs[ids[i]]
+        old_logps.append(math.log(p) if p > 1e-12 else math.log(1e-12))
+        actions.append(ids[i])
+    return logits, old_logps, actions
+
+
+def _grpo_accumulate_grads(model, d_logits, scale):
+    """把逐位置 logits 梯度按 ``scale`` 累加进模型（与 seq_logprob 同一条路径）。"""
+    seq_len = len(d_logits)
+    vocab = model.vocab_size
+    for v in range(vocab):
+        g_row = model.grads["W_out"][v]
+        gb = 0.0
+        for t in range(seq_len):
+            d = d_logits[t][v] * scale
+            gb += d
+            ht = model.h[t]
+            for j in range(model.d_model):
+                g_row[j] += d * ht[j]
+        model.grads["b_out"][v] += gb
+    dh = [[0.0] * model.d_model for _ in range(seq_len)]
+    for t in range(seq_len):
+        dl = d_logits[t]
+        for j in range(model.d_model):
+            s = 0.0
+            for v in range(vocab):
+                s += dl[v] * model.W_out[v][j]
+            dh[t][j] = s * scale
+    d_seq = model.encoder.backward(dh)
+    model.embedding.backward(d_seq)
+
+
+class GRPOTrainer:
+    """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
+
+    对每个 prompt：
+    1. 用策略采样 ``num_samples`` 条回答（同一 prompt 为一组）
+    2. ``reward_fn(prompt_ids, response_ids)`` 给每条回答打分，再用
+       ``group_relative_advantages`` 做组内归一化得到优势
+    3. 以采样时的 logp 为 ``old_logps``、优势广播到每个决策步，交给
+       ``grpo_losses`` 得到逐步裁剪损失与 logits 梯度，累加反传到策略
+    4. ``adam_step`` 更新策略；``group_step`` 处理一个 prompt、``fit`` 依次跑
+       prompts 并记录每步平均损失/奖励
+
+    ``reward_fn`` 是普通可调用对象（返回有限数字），本库不内置奖励模型。
+    简化点：一组内每个回答的全部 token 共享同一个组优势（不按 token 细化）、
+    逐 prompt 更新（不积累 batch）、不做参考模型 KL 惩罚、不打包/不分片。
+    """
+
+    def __init__(self, policy, reward_fn, num_samples: int = 4,
+                 clip_ratio: float = 0.2, entropy_coef: float = 0.0,
+                 lr: float = 0.01, max_new_tokens: int = 4,
+                 temperature: float = 1.0):
+        _rlhf_check_lm(policy, "GRPOTrainer(policy)")
+        if not callable(reward_fn):
+            raise TypeError("GRPOTrainer: reward_fn 必须可调用")
+        self.policy = policy
+        self.reward_fn = reward_fn
+        self.num_samples = _grpo_check_pos_int(num_samples, "num_samples")
+        self.clip_ratio = float(clip_ratio)
+        if not math.isfinite(self.clip_ratio) or self.clip_ratio < 0.0:
+            raise ValueError(
+                f"GRPOTrainer: clip_ratio 必须是有限非负数，收到 {clip_ratio!r}")
+        if isinstance(entropy_coef, bool) or not isinstance(entropy_coef, (int, float)):
+            raise TypeError("GRPOTrainer: entropy_coef 必须是数字")
+        self.entropy_coef = float(entropy_coef)
+        if not math.isfinite(self.entropy_coef) or self.entropy_coef < 0.0:
+            raise ValueError(
+                f"GRPOTrainer: entropy_coef 必须是有限非负数，收到 {entropy_coef!r}")
+        self.lr = _grpo_check_pos_number(lr, "lr")
+        self.max_new_tokens = _grpo_check_pos_int(max_new_tokens, "max_new_tokens")
+        self.temperature = _grpo_check_pos_number(temperature, "temperature")
+        self.loss_history = []
+        self.reward_history = []
+
+    def _sample_responses(self, prompt, rng):
+        responses = []
+        for _ in range(self.num_samples):
+            seq = self.policy.generate(
+                list(prompt), max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature, rng=rng)
+            responses.append(list(seq[len(prompt):]))
+        return responses
+
+    def group_step(self, prompt_ids, rng=None):
+        prompt = _check_token_ids(prompt_ids, self.policy.vocab_size,
+                                  "GRPOTrainer(prompt_ids)")
+        if not prompt:
+            raise ValueError("GRPOTrainer: prompt_ids 不能为空")
+        if rng is None:
+            rng = random
+        responses = self._sample_responses(prompt, rng)
+        rewards = []
+        for response in responses:
+            if not response:
+                raise ValueError("GRPOTrainer: 生成的回答不能为空")
+            value = self.reward_fn(prompt, response)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(float(value)):
+                raise ValueError(
+                    "GRPOTrainer: reward_fn 必须返回有限数字，"
+                    f"收到 {value!r}")
+            rewards.append(float(value))
+        advantages = group_relative_advantages(
+            rewards, group_size=self.num_samples)
+        self.policy.zero_grad()
+        total_loss = 0.0
+        for response, advantage in zip(responses, advantages):
+            ids = prompt + response
+            logits, old_logps, actions = _grpo_seq_targets(
+                self.policy, ids, len(prompt))
+            step_advs = [advantage] * len(actions)
+            loss, dlogits, _infos = grpo_losses(
+                logits, old_logps, actions, step_advs,
+                clip_ratio=self.clip_ratio,
+                entropy_coef=self.entropy_coef)
+            total_loss += loss
+            _grpo_accumulate_grads(self.policy, dlogits,
+                                   scale=1.0 / self.num_samples)
+        self.policy.adam_step(self.lr)
+        mean_loss = total_loss / self.num_samples
+        mean_reward = sum(rewards) / len(rewards)
+        self.loss_history.append(mean_loss)
+        self.reward_history.append(mean_reward)
+        return {
+            "loss": mean_loss,
+            "rewards": rewards,
+            "advantages": advantages,
+            "responses": responses,
+        }
+
+    def fit(self, prompts, epochs: int = 1, lr: float = None, seed=None):
+        if not isinstance(prompts, (list, tuple)) or not prompts:
+            raise ValueError("GRPOTrainer.fit: prompts 必须是非空列表")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(
+                f"GRPOTrainer.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if lr is not None:
+            self.lr = _grpo_check_pos_number(lr, "lr")
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            losses = []
+            for prompt in prompts:
+                losses.append(self.group_step(prompt, rng=rng)["loss"])
+            history.append(sum(losses) / len(losses))
+        return history
+
+
+def grpo_align(policy, reward_fn, prompts, num_samples: int = 4,
+               clip_ratio: float = 0.2, entropy_coef: float = 0.0,
+               lr: float = 0.01, max_new_tokens: int = 4,
+               temperature: float = 1.0, epochs: int = 1, seed=None):
+    """GRPO 便捷入口：构 ``GRPOTrainer`` 并返回每轮平均损失。"""
+    trainer = GRPOTrainer(
+        policy, reward_fn, num_samples=num_samples, clip_ratio=clip_ratio,
+        entropy_coef=entropy_coef, lr=lr, max_new_tokens=max_new_tokens,
+        temperature=temperature)
+    return trainer.fit(prompts, epochs=epochs, seed=seed)
+
+
 class KTOTrainer:
     """把 ``kto_loss`` 串成可用的 KTO（Kahneman-Tversky 优化）训练循环
 
@@ -51050,7 +51237,7 @@ def ppo_loss(logits, old_logp, action, advantage, clip_ratio=0.2, entropy_coef=0
         h, dh = entropy_term(logits)
         loss -= entropy_coef * h
         for j in range(n):
-            grad[j] += entropy_coef * dh[j]
+            grad[j] -= entropy_coef * dh[j]
     info = {"ratio": ratio, "clipped": not use_unclipped, "entropy": entropy_term(logits)[0]}
     return loss, grad, info
 

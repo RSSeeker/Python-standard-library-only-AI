@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2637 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2643 项）
 
 ## 特性
 
@@ -3211,6 +3211,8 @@ losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
 | `dr_grpo_advantages(rewards, group_size=None)` | Dr. GRPO 优势：只减组内均值，不做标准差归一化（避免难题被放大） |
 | `dapo_token_losses(logit_seqs, old_logp_seqs, action_seqs, advantage_seqs, clip_ratio=0.2, clip_ratio_high=0.28, entropy_coef=0.0)` | DAPO 的 token 级裁剪损失（clip-higher：上界更松），按整批 token 总数归一化 |
 | `gspo_losses(logit_seqs, old_logp_seqs, action_seqs, sequence_advantages, clip_ratio=0.2, clip_ratio_high=None, entropy_coef=0.0)` | GSPO 的序列级重要性比裁剪：`s_i=exp(mean_t(logp_new-logp_old))`，梯度按 `s_i/T` 分摊到各 token |
+| `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0)` | GRPO rollout 训练循环：同一 prompt 采 `num_samples` 条回答 → `reward_fn` 打分 → 组内相对优势 → `grpo_losses` 逐步裁剪损失 → 反传 `adam_step`；`group_step` 单 prompt、`fit` 遍历 prompts |
+| `grpo_align(policy, reward_fn, prompts, num_samples=4, ..., epochs=1)` | 便捷入口：`GRPOTrainer(...).fit(...)`，返回每轮平均损失 |
 
 示例：
 
@@ -3233,6 +3235,37 @@ DAPO 的 `clip_ratio_high` 通常略大于 `clip_ratio` 以抑制熵塌缩；GSP
 序列的 log-ratio 取平均再加权，适合长度差异大的推理轨迹。
 
 边界：GRPO 只做「组内优势 + 裁剪损失」，不含参考模型的 KL 项、不做序列级长度归一化的额外处理；`grpo_losses` 的 `dlogits` 需要调用方按策略网络/语言模型手工回传；Best-of-N、Self-Consistency、拒绝采样只作用于已采样结果（奖励函数由调用方提供）。
+
+### GRPO rollout 训练循环（GRPOTrainer）
+
+`group_relative_advantages` 与 `grpo_losses` 只给「一步」的数学；`GRPOTrainer`
+把采样、打分、组内优势、裁剪损失和反传串成能直接跑的 rollout 循环：对每个 prompt
+用策略采 `num_samples` 条回答，`reward_fn(prompt, response)` 打分后做组内归一化，
+再把同一组优势广播到该回答的每个决策步，交给 `grpo_losses` 得到逐步裁剪损失与
+logits 梯度，累加反传后 `adam_step`。
+
+```python
+policy = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+
+def reward_fn(prompt, response):
+    return 1.0 if response and response[-1] == 1 else 0.0
+
+trainer = GRPOTrainer(policy, reward_fn, num_samples=4, lr=0.05,
+                      max_new_tokens=8, temperature=1.5, entropy_coef=0.01)
+losses = trainer.fit([[1, 2, 3], [1, 2, 4]], epochs=3, seed=0)
+```
+
+- `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2,
+  entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0)`：
+  `group_step(prompt_ids, rng=None)` 单 prompt、`fit(prompts, epochs, lr, seed)`
+  逐 prompt 更新；`loss_history` 与 `reward_history` 记录每一步均值
+- `reward_fn` 是普通可调用对象（返回有限数字），本库不内置奖励模型
+- 边界：一组内每个回答的全部 token 共享同一个组优势（不按 token 细化）、
+  逐 prompt 立即更新（不积累 batch）、不做参考模型 KL 惩罚、不打包/不分片；
+  采样用 `CausalLM.generate`，因此 `max_new_tokens`/`temperature` 直接控制 rollout
+- 顺带修正：`ppo_loss` 的熵正则解析梯度此前符号相反（会**压低**熵），已改为
+  `grad -= entropy_coef·dH/dz` 并补中心差分回归测试；`entropy_coef>0` 现在确实
+  起熵奖励作用
 
 ### 离线强化学习（IQL / CQL）
 
@@ -5749,7 +5782,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2637 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2643 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6189,6 +6222,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
 | `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
 | `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
+| `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
@@ -6222,6 +6256,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2637 个单元测试
+├── test_ai.py       # 2643 个单元测试
 └── README.md
 ```
