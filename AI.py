@@ -5489,6 +5489,316 @@ def _eval_check_int(value, name: str, allow_zero: bool = True):
     return value
 
 
+
+def _me_tokenize(expr):
+    if not isinstance(expr, str) or not expr.strip():
+        raise ValueError("math_equivalent: 表达式必须是非空字符串")
+    tokens = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        c = expr[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c.isdigit() or (c == "." and i + 1 < n and expr[i + 1].isdigit()):
+            j = i
+            seen_dot = False
+            while j < n and (expr[j].isdigit() or expr[j] == "."):
+                if expr[j] == ".":
+                    if seen_dot:
+                        raise ValueError(
+                            f"math_equivalent: 非法数字（多个小数点）：{expr!r}")
+                    seen_dot = True
+                j += 1
+            tokens.append(("num", float(expr[i:j])))
+            i = j
+            continue
+        if c.isalpha() or c == "_":
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            tokens.append(("var", expr[i:j]))
+            i = j
+            continue
+        if c in "+-*/^()":
+            tokens.append(("op", c))
+            i += 1
+            continue
+        raise ValueError(f"math_equivalent: 无法识别的字符 {c!r}")
+    return tokens
+
+
+class _MathParser:
+    def __init__(self, tokens, expr):
+        self.tokens = tokens
+        self.expr = expr
+        self.pos = 0
+
+    def peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def take(self, want=None):
+        tok = self.peek()
+        if tok is None:
+            raise ValueError(f"math_equivalent: 表达式意外结束：{self.expr!r}")
+        if want is not None and not (tok == want or (tok[0] == "op"
+                                                    and tok[1] == want)):
+            raise ValueError(
+                f"math_equivalent: 期望 {want!r}，得到 {tok!r}：{self.expr!r}")
+        self.pos += 1
+        return tok
+
+    def parse(self):
+        node = self.parse_expr()
+        if self.pos != len(self.tokens):
+            raise ValueError(
+                f"math_equivalent: 多余记号 {self.peek()!r}：{self.expr!r}")
+        return node
+
+    def parse_expr(self):
+        terms = [self.parse_term()]
+        while True:
+            tok = self.peek()
+            if tok and tok[0] == "op" and tok[1] in "+-":
+                self.pos += 1
+                rhs = self.parse_term()
+                if tok[1] == "-":
+                    terms.append(("neg", rhs))
+                else:
+                    terms.append(rhs)
+            else:
+                break
+        return terms[0] if len(terms) == 1 else ("add", terms)
+
+    def parse_term(self):
+        factors = [self.parse_power()]
+        while True:
+            tok = self.peek()
+            if tok and tok[0] == "op" and tok[1] in "*/":
+                self.pos += 1
+                rhs = self.parse_power()
+                if tok[1] == "/":
+                    factors.append(("inv", rhs))
+                else:
+                    factors.append(rhs)
+            else:
+                break
+        return factors[0] if len(factors) == 1 else ("mul", factors)
+
+    def parse_power(self):
+        base = self.parse_unary()
+        tok = self.peek()
+        if tok and tok[0] == "op" and tok[1] == "^":
+            self.pos += 1
+            exp = self.parse_power()
+            return ("pow", base, exp)
+        return base
+
+    def parse_unary(self):
+        tok = self.peek()
+        if tok and tok[0] == "op" and tok[1] in "+-":
+            self.pos += 1
+            inner = self.parse_unary()
+            return inner if tok[1] == "+" else ("neg", inner)
+        return self.parse_primary()
+
+    def parse_primary(self):
+        tok = self.take()
+        if tok[0] == "num":
+            return tok
+        if tok[0] == "var":
+            return tok
+        if tok == ("op", "("):
+            node = self.parse_expr()
+            self.take(")")
+            return node
+        raise ValueError(f"math_equivalent: 非法开头 {tok!r}：{self.expr!r}")
+
+
+def _me_key(node):
+    return repr(node)
+
+
+def _me_num_exp(base, exp):
+    """常数底数的数值幂折叠；不可折叠返回 None。"""
+    if base[0] != "num" or exp[0] != "num":
+        return None
+    if abs(exp[1] - round(exp[1])) < 1e-12:
+        try:
+            return ("num", base[1] ** int(round(exp[1])))
+        except ZeroDivisionError:
+            return None
+    try:
+        return ("num", base[1] ** exp[1])
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _me_coeff_prod(node):
+    """把已化简的项拆成 (数值系数, 乘积因子列表)；非乘积项系数为 1。"""
+    if node[0] == "mul":
+        coeff = 1.0
+        prods = []
+        for f in node[1]:
+            if f[0] == "num":
+                coeff *= f[1]
+            else:
+                prods.append(f)
+        return coeff, prods
+    return 1.0, [node]
+
+
+def _me_product(prods, coeff=1.0):
+    """把系数与乘积因子拼回规范节点。"""
+    if coeff == 0.0:
+        return ("num", 0.0)
+    factors = list(prods)
+    if coeff != 1.0:
+        factors.append(("num", coeff))
+    if not factors:
+        return ("num", 1.0)
+    if len(factors) == 1:
+        return factors[0]
+    return ("mul", sorted(factors, key=_me_key))
+
+
+def _me_simplify(node):
+    kind = node[0]
+    if kind in ("num", "var"):
+        return node
+    if kind == "inv":
+        return _me_simplify(("pow", node[1], ("num", -1.0)))
+    if kind == "neg":
+        inner = _me_simplify(node[1])
+        if inner[0] == "num":
+            return ("num", -inner[1])
+        return _me_simplify(("mul", [("num", -1.0), inner]))
+
+    if kind == "add":
+        terms = []
+        const = 0.0
+        for t in node[1]:
+            s = _me_simplify(t)
+            if s[0] == "num":
+                const += s[1]
+            elif s[0] == "add":
+                for sub in s[1]:
+                    if sub[0] == "num":
+                        const += sub[1]
+                    else:
+                        terms.append(sub)
+            else:
+                terms.append(s)
+        groups = {}
+        for term in terms:
+            coeff, prods = _me_coeff_prod(term)
+            key = repr(prods)
+            if key in groups:
+                groups[key][0] += coeff
+            else:
+                groups[key] = [coeff, prods]
+        combined = []
+        for coeff, prods in groups.values():
+            if coeff == 0.0:
+                continue
+            if not prods:
+                const += coeff
+            else:
+                combined.append(_me_product(prods, coeff))
+        if const != 0.0:
+            combined.append(("num", const))
+        if not combined:
+            return ("num", 0.0)
+        if len(combined) == 1:
+            return combined[0]
+        return ("add", sorted(combined, key=_me_key))
+
+    if kind == "mul":
+        coeff = 1.0
+        powers = {}
+        flat = []
+        for f in node[1]:
+            s = _me_simplify(f)
+            if s[0] == "mul":
+                flat.extend(s[1])
+            else:
+                flat.append(s)
+        for s in flat:
+            if s[0] == "num":
+                coeff *= s[1]
+                continue
+            if s[0] == "pow":
+                base = _me_simplify(s[1])
+                exp = _me_simplify(s[2])
+            else:
+                base, exp = s, ("num", 1.0)
+            if base[0] == "num":
+                folded = _me_num_exp(base, exp)
+                if folded is not None:
+                    coeff *= folded[1]
+                    continue
+            key = _me_key(base)
+            if key in powers and powers[key][1][0] == "num" \
+                    and exp[0] == "num":
+                powers[key][1] = ("num", powers[key][1][1] + exp[1])
+            elif key in powers:
+                k2 = _me_key(("pow", base, exp))
+                powers[k2] = [base, exp]
+            else:
+                powers[key] = [base, exp]
+        factors = []
+        for base, exp in powers.values():
+            exp = _me_simplify(exp)
+            if exp[0] == "num":
+                if exp[1] == 0.0:
+                    continue
+                if exp[1] == 1.0:
+                    factors.append(base)
+                    continue
+            factors.append(("pow", base, exp))
+        if coeff == 0.0:
+            return ("num", 0.0)
+        if coeff != 1.0:
+            factors.append(("num", coeff))
+        if not factors:
+            return ("num", 1.0)
+        if len(factors) == 1:
+            return factors[0]
+        return ("mul", sorted(factors, key=_me_key))
+
+    if kind == "pow":
+        base = _me_simplify(node[1])
+        exp = _me_simplify(node[2])
+        if exp[0] == "num":
+            if exp[1] == 0.0:
+                return ("num", 1.0)
+            if exp[1] == 1.0:
+                return base
+        folded = _me_num_exp(base, exp)
+        if folded is not None:
+            return folded
+        return ("pow", base, exp)
+
+    raise ValueError(f"math_equivalent: 内部节点类型错误：{kind!r}")
+
+
+def math_canonical(expr):
+    """把算术表达式解析并化简成规范形式（用于判断数学等价）。
+
+    支持 `+ - * / ^`、括号、数字、变量名（字母/下划线开头）、一元负号。
+    化简规则：常数折叠、加减/乘除结合律展平、项排序、同底数幂合并、
+    `x/2` 与 `x*0.5` 归一、`x-x` 归零。返回规范形式的字符串。
+    """
+    tokens = _me_tokenize(expr)
+    tree = _MathParser(tokens, expr).parse()
+    return repr(_me_simplify(tree))
+
+
+def math_equivalent(expr_a, expr_b):
+    """判断两个算术表达式在化简后是否同构（不是完整符号代数证明）。"""
+    return math_canonical(expr_a) == math_canonical(expr_b)
+
 def pass_at_k(n: int, c: int, k: int):
     """pass@k 无偏估计：1 - C(n-c,k)/C(n,k)（n 总样本，c 正确数）。"""
     _eval_check_int(n, "n", allow_zero=False)

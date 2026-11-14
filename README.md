@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2680 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2684 项）
 
 ## 特性
 
@@ -2323,6 +2323,28 @@ tox = toxicity_score(tokens, banned_words)    # {"score","flagged"}
 | `toxicity_score(tokens, lexicon)` | 命中毒性词表比例与命中下标 |
 
 - 边界：pass@k 为无偏组合估计而非置信区间；PRM 聚合只看逐步分数、不训练 PRM；verifier 排序假设分数已由外部模型给出；毒性只做词表匹配（不做语义/上下文判断）。
+
+### 数学等价检查（AST 规范化）
+
+比较两个算术表达式是否在代数化简后同构：解析成语法树后做常数折叠、
+加减/乘除结合律展平、项排序、同底数幂合并，再把规范形式字符串化比较。
+
+```python
+AI.math_equivalent("(x + 1) + (2 + y)", "y + x + 3")   # True
+AI.math_equivalent("x*x", "x^2")                        # True
+AI.math_equivalent("2*(x + 3)", "2*x + 6")              # False（不做分配律）
+AI.math_canonical("x - x")                              # "('num', 0.0)"
+```
+
+| API | 说明 |
+| --- | --- |
+| `math_canonical(expr)` | 解析并化简表达式，返回规范形式字符串（规范化语法树） |
+| `math_equivalent(expr_a, expr_b)` | 两个表达式的规范形式是否相同 |
+
+支持 `+ - * / ^`、括号、数字（含小数）、字母/下划线开头的变量、一元负号。
+边界：这是**结构规范化**而不是完整符号代数证明——`2*(x+3)` 与 `2*x+6` 不等价（未实现
+分配律）、不支持函数调用/方程/矩阵；常数除法会折叠成浮点（如 `x/2 == x*0.5`），
+浮点精度按 Python float 处理。
 
 ### PRM 训练（逐步奖励模型 / PRMTrainer）
 
@@ -5929,7 +5951,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2680 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2684 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6229,6 +6251,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
 | `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
+| `TestMathEquivalence` | 交换/结合律与常数折叠、同底数幂、负号归一，非等价用例（含分配律边界），非法表达式 |
 | `TestToxicity` | 比例与命中下标、非法输入 |
 | `TestEloBradleyTerry` | BT 恢复强度排序与比值（真值 2×/8×）、Elo 排序与期望得分、平局中性、rounds 累积、非法输入 |
 | `TestRankingMetricsCompat` | 已有 Recall@k / reciprocal_rank 语义回归 |
@@ -6410,6 +6433,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2680 个单元测试
+├── test_ai.py       # 2684 个单元测试
 └── README.md
 ```

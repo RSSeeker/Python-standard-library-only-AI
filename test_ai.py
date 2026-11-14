@@ -42580,3 +42580,66 @@ class TestInductionHeadAndProbe:
             [[1.0], [float("inf")]], [0, 1]))
         assert _interp_raises(lambda: AI.train_linear_probe(
             [[1.0], [1.0, 2.0]], [0, 1]))
+
+
+def _math_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestMathEquivalence:
+    def test_commutative_and_associative(self):
+        pairs = [
+            ("(x + 1) + (2 + y)", "y + x + 3"),
+            ("(a*b)*c", "c*a*b"),
+            ("x + y", "y + x"),
+            ("x*x", "x^2"),
+            ("x + x", "2*x"),
+            ("x - x", "0"),
+            ("-(-x)", "x"),
+            ("x/2", "x*0.5"),
+            ("x^2*x^3", "x^5"),
+            ("2 + 3*4", "14"),
+            ("x - y", "x + (-1)*y"),
+            ("2*(x + 3)", "2*(3 + x)"),
+        ]
+        for a, b in pairs:
+            assert AI.math_equivalent(a, b), (a, b,
+                                              AI.math_canonical(a),
+                                              AI.math_canonical(b))
+
+    def test_not_equivalent(self):
+        pairs = [
+            ("x + 1", "x + 2"),
+            ("x^2", "x"),
+            ("x*y", "x + y"),
+            ("x/2", "2/x"),
+            # 未实现分配律：结构不同即判不等
+            ("2*(x + 3)", "2*x + 6"),
+        ]
+        for a, b in pairs:
+            assert not AI.math_equivalent(a, b), (a, b)
+
+    def test_canonical_is_stable(self):
+        expr = "(x + 1) + (2 + y)"
+        c1 = AI.math_canonical(expr)
+        c2 = AI.math_canonical("y + 3 + x")
+        assert c1 == c2
+        assert isinstance(c1, str) and c1.startswith("('add'") or \
+            c1.startswith("('num'")
+
+    def test_invalid_inputs(self):
+        assert _math_raises(lambda: AI.math_canonical(""))
+        assert _math_raises(lambda: AI.math_canonical("   "))
+        assert _math_raises(lambda: AI.math_canonical("x +"))
+        assert _math_raises(lambda: AI.math_canonical("(x + 1"))
+        assert _math_raises(lambda: AI.math_canonical("x $ y"))
+        assert _math_raises(lambda: AI.math_canonical("1.2.3"))
+        assert _math_raises(lambda: AI.math_canonical("x + (y"))
+        assert _math_raises(lambda: AI.math_equivalent("x", ""))
+        assert _math_raises(lambda: AI.math_equivalent(1, "x"))
