@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2857 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2862 项）
 
 ## 特性
 
@@ -4359,6 +4359,7 @@ shared_avg, privates = fedbn_average(updates)
 | `auto_correlation(values, max_lag=None)` | 自相关，0 阶为 1 |
 | `autoformer_aggregate(seasonal, period, top_k=2, weights=None)` | 按自相关挑 top-k 周期做加权平移平均 |
 | `PatchTSTEmbedding(patch_len=16, stride=8, d_model=32, seed=None)` | patch 切分 + 线性嵌入 + RevIN |
+| `DLinear(lookback, horizon, kernel_size=3, seed=None)` | 趋势/季节分解 + 共享线性映射：`trend=移动平均(x)`、`seasonal=x-trend`，分别接一层线性后求和；带反向（含移动平均的梯度分摊） |
 
 ```python
 tcn = TCN(in_channels=4, hidden=16, levels=3)
@@ -4370,6 +4371,10 @@ lag_agg, meta = autoformer_aggregate(seasonal, period=24, top_k=2)
 
 emb = PatchTSTEmbedding(patch_len=16, stride=8, d_model=32)
 patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
+
+dl = DLinear(lookback=24, horizon=6, kernel_size=3)
+y = dl.forward(values[:24])      # 未来 6 步，所有通道共享线性层
+dx = dl.backward(dy)             # 反向到输入（趋势路径按窗口均摊）
 ```
 
 三条边界：
@@ -6515,7 +6520,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2857 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2862 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6999,6 +7004,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLLRD` | 逐层衰减值/`min_lr` 截断、逐层步长比 2.0、训练收敛、非法输入 |
 | `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
+| `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7033,6 +7039,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2857 个单元测试
+├── test_ai.py       # 2862 个单元测试
 └── README.md
 ```

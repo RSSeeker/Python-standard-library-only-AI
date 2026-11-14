@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1768 个 def / 423 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1770 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -7970,6 +7970,189 @@ def _pool_check_seq(seq, d_model):
             vals.append(float(v))
         rows.append(vals)
     return rows
+
+
+def _dl_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"DLinear: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _dl_check_seq(seq, lookback, channels):
+    if not isinstance(seq, (list, tuple)) or len(seq) != lookback:
+        raise ValueError(f"DLinear: 输入必须是长度 {lookback} 的 (L, C) 列表")
+    rows = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != channels:
+            raise ValueError(f"DLinear: 每行长度必须为 {channels}")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError("DLinear: 输入必须是有限数字")
+            vals.append(float(v))
+        rows.append(vals)
+    return rows
+
+
+class DLinear:
+    """DLinear（2023）：把时序分解成趋势 + 季节项后各接一层线性映射
+
+    ```text
+    trend    = MovingAvg(x, kernel)          # 滑动平均平滑趋势
+    seasonal = x - trend
+    y = W_trend · trend + b_trend + W_seasonal · seasonal + b_seasonal
+    ```
+
+    线性层对所有通道共享（channel-independent），因此参数量与通道数无关，
+    是「线性模型也能做强时序预测」的代表作。`y[t][c]` 是第 c 通道未来第 t 步。
+
+    边界：滑动平均用边缘复制填充；kernels 必须为奇数；反向覆盖两个线性层与
+    滑动平均。
+    """
+
+    def __init__(self, lookback: int, horizon: int, kernel_size: int = 3,
+                 seed: int = None):
+        self.lookback = _dl_check_pos_int(lookback, "lookback")
+        self.horizon = _dl_check_pos_int(horizon, "horizon")
+        self.kernel_size = _dl_check_pos_int(kernel_size, "kernel_size")
+        if self.kernel_size % 2 == 0:
+            raise ValueError("DLinear: kernel_size 必须是奇数")
+        self.k = self.kernel_size // 2
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / self.lookback)
+        def mat(r, c):
+            return [[rng.gauss(0.0, std) for _ in range(c)] for _ in range(r)]
+        def vec(n):
+            return [0.0] * n
+        self.W_trend = mat(self.horizon, self.lookback)
+        self.b_trend = vec(self.horizon)
+        self.W_seasonal = mat(self.horizon, self.lookback)
+        self.b_seasonal = vec(self.horizon)
+        self.zero_grad()
+
+    # ---- 滑动平均 ----
+    def _moving_average(self, xs):
+        L = self.lookback
+        C = len(xs[0])
+        out = [[0.0] * C for _ in range(L)]
+        k = self.k
+        for t in range(L):
+            for c in range(C):
+                s = 0.0
+                for d in range(-k, k + 1):
+                    u = t + d
+                    if u < 0:
+                        u = 0
+                    elif u >= L:
+                        u = L - 1
+                    s += xs[u][c]
+                out[t][c] = s / self.kernel_size
+        return out
+
+    # ---- 前向 / 反向 ----
+    def forward(self, xs):
+        rows = _dl_check_seq(xs, self.lookback, len(xs[0]) if xs else 0)
+        trend = self._moving_average(rows)
+        seasonal = [[rows[t][c] - trend[t][c] for c in range(len(rows[0]))]
+                    for t in range(self.lookback)]
+        C = len(rows[0])
+        out = [[self.b_trend[h] + self.b_seasonal[h] for _ in range(C)]
+               for h in range(self.horizon)]
+        for h in range(self.horizon):
+            for l in range(self.lookback):
+                wt = self.W_trend[h][l]
+                ws = self.W_seasonal[h][l]
+                if wt == 0.0 and ws == 0.0:
+                    continue
+                for c in range(C):
+                    out[h][c] += wt * trend[l][c] + ws * seasonal[l][c]
+        self._x = rows
+        self._trend = trend
+        self._seasonal = seasonal
+        return out
+
+    def backward(self, d_out):
+        if not hasattr(self, "_x"):
+            raise RuntimeError("DLinear: 反向前必须先调用 forward")
+        L, H = self.lookback, self.horizon
+        C = len(self._x[0])
+        if not isinstance(d_out, (list, tuple)) or len(d_out) != H:
+            raise ValueError(f"DLinear: d_out 必须是长度 {H} 的列表")
+        dy = []
+        for row in d_out:
+            if not isinstance(row, (list, tuple)) or len(row) != C:
+                raise ValueError(f"DLinear: d_out 每行长度必须为 {C}")
+            dy.append([float(v) for v in row])
+        self.grad_W_trend = [[0.0] * L for _ in range(H)]
+        self.grad_b_trend = [0.0] * H
+        self.grad_W_seasonal = [[0.0] * L for _ in range(H)]
+        self.grad_b_seasonal = [0.0] * H
+        d_trend = [[0.0] * C for _ in range(L)]
+        d_seasonal = [[0.0] * C for _ in range(L)]
+        for h in range(H):
+            for c in range(C):
+                g = dy[h][c]
+                self.grad_b_trend[h] += g
+                self.grad_b_seasonal[h] += g
+            for l in range(L):
+                gw_t = 0.0
+                gw_s = 0.0
+                for c in range(C):
+                    gw_t += dy[h][c] * self._trend[l][c]
+                    gw_s += dy[h][c] * self._seasonal[l][c]
+                self.grad_W_trend[h][l] = gw_t
+                self.grad_W_seasonal[h][l] = gw_s
+                for c in range(C):
+                    d_trend[l][c] += dy[h][c] * self.W_trend[h][l]
+                    d_seasonal[l][c] += dy[h][c] * self.W_seasonal[h][l]
+        # seasonal = x - trend；trend 又是 x 的窗口均值 → 合并两条路径
+        d_trend_total = [[d_trend[l][c] - d_seasonal[l][c]
+                          for c in range(C)] for l in range(L)]
+        d_x = [[d_seasonal[l][c] for c in range(C)] for l in range(L)]
+        k = self.k
+        for l in range(L):
+            for c in range(C):
+                g = d_trend_total[l][c] / self.kernel_size
+                if g == 0.0:
+                    continue
+                for d in range(-k, k + 1):
+                    u = l + d
+                    if u < 0:
+                        u = 0
+                    elif u >= L:
+                        u = L - 1
+                    d_x[u][c] += g
+        return d_x
+
+    def zero_grad(self):
+        self.grad_W_trend = None
+        self.grad_b_trend = None
+        self.grad_W_seasonal = None
+        self.grad_b_seasonal = None
+
+    def param_count(self):
+        return (self.horizon * self.lookback + self.horizon) * 2
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool):
+            raise TypeError("DLinear: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("DLinear: lr 必须是非负有限数字")
+        if self.grad_W_trend is None:
+            raise RuntimeError("DLinear: 更新前必须先 backward")
+        for h in range(self.horizon):
+            for l in range(self.lookback):
+                self.W_trend[h][l] -= lr * self.grad_W_trend[h][l]
+                self.W_seasonal[h][l] -= lr * self.grad_W_seasonal[h][l]
+            self.b_trend[h] -= lr * self.grad_b_trend[h]
+            self.b_seasonal[h] -= lr * self.grad_b_seasonal[h]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
 
 
 def _grn_check_seq(seq, num_features, who="GRN"):

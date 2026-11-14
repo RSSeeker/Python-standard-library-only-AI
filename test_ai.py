@@ -46340,3 +46340,112 @@ class TestGRN:
         assert _grn_raises(lambda: m.backward([[1.0] * 3]), RuntimeError)
         assert _grn_raises(lambda: m.sgd_step(0.01), RuntimeError)
         assert _grn_raises(lambda: m.sgd_step(-1))
+
+
+# ---- DLinear 时序分解线性模型 ----
+
+
+def _dl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dl_loss(model, xs, w):
+    out = model.forward(xs)
+    return sum(out[h][c] * w[h][c]
+               for h in range(len(out)) for c in range(len(out[0])))
+
+
+class TestDLinear:
+    def test_forward_and_param_count(self):
+        xs = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]
+        model = AI.DLinear(4, 2, kernel_size=3, seed=1)
+        out = model.forward(xs)
+        assert len(out) == 2 and len(out[0]) == 2
+        assert model.param_count() == (2 * 4 + 2) * 2
+
+    def test_constant_sequence_trend(self):
+        # 常数序列：趋势 = 自身、季节项为 0，则输出只剩偏置
+        xs = [[1.5, -2.0] for _ in range(5)]
+        model = AI.DLinear(5, 2, kernel_size=3, seed=2)
+        out = model.forward(xs)
+        # 季节项为 0，输出 = W_trend·trend + b_trend + b_seasonal（trend 即原序列）
+        for h in range(2):
+            for c in range(2):
+                expected = model.b_trend[h] + model.b_seasonal[h]
+                for l in range(5):
+                    expected += model.W_trend[h][l] * xs[l][c]
+                assert abs(out[h][c] - expected) < 1e-12
+
+    def test_numerical_gradients(self):
+        rng = random.Random(3)
+        xs = [[rng.uniform(-1.0, 1.0) for _ in range(2)] for _ in range(6)]
+        w = [[rng.uniform(-1.0, 1.0) for _ in range(2)] for _ in range(3)]
+        model = AI.DLinear(6, 3, kernel_size=3, seed=4)
+        model.forward(xs)
+        dx = model.backward(w)
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = _dl_loss(model, xs, w)
+            param_set(p0 - h)
+            lm = _dl_loss(model, xs, w)
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        for gg, pg, ps in [
+            (lambda: model.grad_W_trend[0][1], lambda: model.W_trend[0][1],
+             lambda v: model.W_trend[0].__setitem__(1, v)),
+            (lambda: model.grad_W_seasonal[1][2], lambda: model.W_seasonal[1][2],
+             lambda v: model.W_seasonal[1].__setitem__(2, v)),
+            (lambda: model.grad_b_trend[1], lambda: model.b_trend[1],
+             lambda v: model.b_trend.__setitem__(1, v)),
+        ]:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-7, (a, f)
+        for (t, c) in [(0, 0), (3, 1), (5, 0)]:
+            a = dx[t][c]
+            x0 = xs[t][c]
+            xs[t][c] = x0 + 1e-5
+            lp = _dl_loss(model, xs, w)
+            xs[t][c] = x0 - 1e-5
+            lm = _dl_loss(model, xs, w)
+            xs[t][c] = x0
+            assert abs(a - (lp - lm) / (2e-5)) < 1e-7
+
+    def test_training_converges(self):
+        xs = [[math.sin(0.5 * t + 0.3 * c) for c in range(2)] for t in range(8)]
+        target = [[0.5 * math.sin(0.5 * (8 + h) + 0.3 * c) + 0.1 * c
+                   for c in range(2)] for h in range(3)]
+        model = AI.DLinear(8, 3, kernel_size=3, seed=5)
+
+        def mse():
+            out = model.forward(xs)
+            return sum((out[h][c] - target[h][c]) ** 2
+                       for h in range(3) for c in range(2)) / 6.0
+
+        first = mse()
+        for _ in range(300):
+            model.zero_grad()
+            out = model.forward(xs)
+            d = [[2.0 * (out[h][c] - target[h][c]) / 6.0 for c in range(2)]
+                 for h in range(3)]
+            model.backward(d)
+            model.sgd_step(0.05)
+        assert mse() < first * 0.3
+
+    def test_invalid_inputs(self):
+        assert _dl_raises(lambda: AI.DLinear(0, 3))
+        assert _dl_raises(lambda: AI.DLinear(4, 0))
+        assert _dl_raises(lambda: AI.DLinear(4, 3, kernel_size=2))
+        m = AI.DLinear(4, 2, seed=1)
+        assert _dl_raises(lambda: m.forward([]))
+        assert _dl_raises(lambda: m.forward([[1.0, 2.0]] * 3))
+        assert _dl_raises(lambda: m.backward([[1.0] * 2]), RuntimeError)
+        m.forward([[0.0, 0.0]] * 4)
+        assert _dl_raises(lambda: m.backward([[1.0] * 2]))  # 长度不对
+        assert _dl_raises(lambda: m.sgd_step(-1))
