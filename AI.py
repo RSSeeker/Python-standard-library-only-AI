@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1794 个 def / 426 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1797 个 def / 427 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8306,6 +8306,124 @@ def augmix_loss(logits_clean, logits_aug, target, lam=12.0, temperature=1.0):
     views = [list(logits_clean)] + [list(z) for z in logits_aug]
     jsd = augmix_jsd_loss(views, temperature=temperature)
     return ce + float(lam) * jsd, ce, jsd
+
+
+def _tent_check_norm(norm):
+    if not hasattr(norm, "gamma") or not hasattr(norm, "beta") \
+            or not hasattr(norm, "forward_batch") or not hasattr(norm, "backward"):
+        raise TypeError("tent_adapt: norm 必须带 gamma/beta/forward_batch/backward（如 BatchNorm1d）")
+
+
+def _tent_softmax(row):
+    m = max(row)
+    ex = [math.exp(v - m) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def tent_adapt(norm, head, xs, lr=1e-3, steps=1, update_beta=True):
+    """TENT / BN-Adapt 风格的测试时熵最小化（只更新归一化层的仿射参数）
+
+    ```text
+    out   = norm.forward_batch(xs)          # 用测试 batch 的统计量
+    logits = head · out
+    loss  = mean_t H(softmax(logits_t))     # 熵最小化
+    ```
+
+    梯度从熵目标反传到归一化层后，只更新 `gamma`（默认也更新 `beta`），
+    分类头与其它参数完全冻结。返回 `(mean_entropy, info)`，`info` 含
+    `steps`、`gamma_delta`、`beta_delta`。
+
+    边界：单 batch、CPU 版——不维护 running 统计量的冻结副本，不做
+    「只保留 BN 参数的梯度」之外的选择性反传；分类头须是 `Layer` 且
+    `_dense_rows_forward/_dense_rows_backward` 可用。
+    """
+    _tent_check_norm(norm)
+    if not isinstance(head, Layer):
+        raise TypeError("tent_adapt: head 必须是 Layer")
+    if not isinstance(xs, (list, tuple)) or len(xs) == 0:
+        raise ValueError("tent_adapt: xs 必须是非空 batch")
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or len(row) != norm.d:
+            raise ValueError(f"tent_adapt: 每个样本特征维度都必须是 {norm.d}")
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError("tent_adapt: 特征必须是有限数字")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise TypeError("tent_adapt: lr 必须是数字")
+    if not math.isfinite(float(lr)) or float(lr) <= 0.0:
+        raise ValueError("tent_adapt: lr 必须是正有限数字")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("tent_adapt: steps 必须是正整数")
+    if not isinstance(update_beta, bool):
+        raise TypeError("tent_adapt: update_beta 必须是 bool")
+
+    gamma0 = list(norm.gamma)
+    beta0 = list(norm.beta)
+    n = len(xs)
+    entropy = 0.0
+    for _ in range(steps):
+        out = norm.forward_batch(xs)
+        logits, cache = _dense_rows_forward(head, out)
+        probs = [_tent_softmax(row) for row in logits]
+        d_logits = []
+        entropy = 0.0
+        for p in probs:
+            h = -sum(v * math.log(max(v, 1e-300)) for v in p)
+            entropy += h
+            d_logits.append([-(v * (math.log(max(v, 1e-300)) + h)) / n for v in p])
+        entropy /= n
+        _gw, _gb, d_out = _dense_rows_backward(head, cache, d_logits)
+        _dx, g_gamma, g_beta = norm.backward(d_out)
+        for j in range(norm.d):
+            norm.gamma[j] -= lr * g_gamma[j]
+            if update_beta:
+                norm.beta[j] -= lr * g_beta[j]
+    info = {
+        "steps": steps,
+        "gamma_delta": [norm.gamma[j] - gamma0[j] for j in range(norm.d)],
+        "beta_delta": [norm.beta[j] - beta0[j] for j in range(norm.d)],
+    }
+    return entropy, info
+
+
+class TENTClassifier:
+    """TENT 的小型测试时自适应封装：共享归一化层 + 线性分类头
+
+    `adapt(xs, lr, steps)` 只更新 `norm` 的仿射参数；`predict(x)` 用当前参数
+    前向。用于演示「部署后无标签、用熵最小化把 BN 统计/仿射校准回目标域」。
+    """
+
+    def __init__(self, num_features, num_classes, seed=None):
+        for v, name in ((num_features, "num_features"), (num_classes, "num_classes")):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"TENTClassifier: {name} 必须是正整数")
+        self.norm = BatchNorm1d(num_features)
+        self.head = Layer(num_features, num_classes, "linear")
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / num_features)
+        self.head.weights = [[rng.gauss(0.0, std) for _ in range(num_features)]
+                             for _ in range(num_classes)]
+        self.head.biases = [0.0] * num_classes
+        self.num_features = num_features
+        self.num_classes = num_classes
+
+    def predict_batch(self, xs):
+        if not isinstance(xs, (list, tuple)) or len(xs) == 0:
+            raise ValueError("TENTClassifier: xs 必须是非空 batch")
+        out = self.norm.forward_batch(xs)
+        logits, _cache = _dense_rows_forward(self.head, out)
+        return [_tent_softmax(row) for row in logits]
+
+    def adapt(self, xs, lr=1e-3, steps=1, update_beta=True):
+        return tent_adapt(self.norm, self.head, xs, lr=lr, steps=steps,
+                          update_beta=update_beta)
+
+    def entropy(self, xs):
+        probs = self.predict_batch(xs)
+        return sum(-sum(v * math.log(max(v, 1e-300)) for v in row)
+                   for row in probs) / len(probs)
 
 
 class ITransformer:

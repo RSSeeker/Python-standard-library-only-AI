@@ -46840,3 +46840,66 @@ class TestAugMix:
         assert _aug_raises(lambda: AI.augmix_jsd_loss([[1.0, 2.0], [1.0]], ))
         assert _aug_raises(lambda: AI.augmix_loss([1.0], [1.0], 5))
         assert _aug_raises(lambda: AI.augmix_loss([1.0], [1.0], 0, lam=-1))
+
+
+# ---- TENT / BN-Adapt：测试时熵最小化 ----
+
+
+def _tent_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestTENT:
+    def test_tent_classifier_entropy_drop(self):
+        clf = AI.TENTClassifier(2, 2, seed=1)
+        clf.head.weights = [[-1.0, 0.0], [1.0, 0.0]]
+        clf.head.biases = [0.0, 0.0]
+        xs = [[2.0, 0.5], [-2.0, 0.5], [1.8, 0.2], [-1.9, 0.3]]
+        e0 = clf.entropy(xs)
+        e1, info = clf.adapt(xs, lr=0.05, steps=3, update_beta=False)
+        assert e1 < e0
+        assert any(abs(v) > 1e-9 for v in info["gamma_delta"])
+        assert all(abs(v) < 1e-12 for v in info["beta_delta"])
+
+    def test_beta_gradient_zero_sum(self):
+        # 熵对每个样本的 logits 梯度逐类和为 0；线性头下 beta 的梯度因此恒为 0
+        clf = AI.TENTClassifier(2, 2, seed=2)
+        xs = [[0.5, -0.3], [-1.0, 0.4]]
+        _e, info = clf.adapt(xs, lr=0.02, steps=1, update_beta=True)
+        assert all(abs(v) < 1e-12 for v in info["beta_delta"])
+        assert any(abs(v) > 1e-12 for v in info["gamma_delta"])
+
+    def test_predict_probs(self):
+        clf = AI.TENTClassifier(3, 2, seed=3)
+        probs = clf.predict_batch([[0.1, 0.2, 0.3], [-0.5, 0.0, 1.0]])
+        assert len(probs) == 2
+        for row in probs:
+            assert abs(sum(row) - 1.0) < 1e-12
+            assert all(0.0 <= v <= 1.0 for v in row)
+
+    def test_tent_adapt_returns_info(self):
+        clf = AI.TENTClassifier(2, 2, seed=4)
+        head = clf.head
+        xs = [[0.2, 0.1], [-0.3, 0.4]]
+        entropy, info = AI.tent_adapt(clf.norm, head, xs, lr=0.01, steps=2)
+        assert entropy >= 0.0
+        assert info["steps"] == 2
+        assert len(info["gamma_delta"]) == 2
+        assert len(info["beta_delta"]) == 2
+
+    def test_invalid_inputs(self):
+        clf = AI.TENTClassifier(2, 2, seed=5)
+        assert _tent_raises(lambda: AI.tent_adapt(object(), clf.head,
+                                                  [[0.1, 0.2]]))
+        assert _tent_raises(lambda: AI.tent_adapt(clf.norm, object(),
+                                                  [[0.1, 0.2]]))
+        assert _tent_raises(lambda: clf.adapt([]))
+        assert _tent_raises(lambda: clf.adapt([[1.0]]))
+        assert _tent_raises(lambda: clf.adapt([[0.1, 0.2]], lr=0))
+        assert _tent_raises(lambda: clf.adapt([[0.1, 0.2]], steps=0))
+        assert _tent_raises(lambda: clf.adapt([[0.1, 0.2]], update_beta=1))
+        assert _tent_raises(lambda: AI.TENTClassifier(0, 2))

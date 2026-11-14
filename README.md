@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2887 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2892 项）
 
 ## 特性
 
@@ -6225,6 +6225,26 @@ total, ce, jsd = augmix_loss(logits_clean, logits_aug, target, lam=12.0)
 `ops`/`width`/`depth` 由调用方控制；没有 batch 变体与 DataLoader 集成；`augmix_loss` 只做
 「干净视图 CE + 多视图一致性」，不涉及对抗训练或权重平均。
 
+### 测试时自适应：TENT / BN-Adapt
+
+```python
+from AI import TENTClassifier
+
+clf = TENTClassifier(num_features=8, num_classes=3, seed=1)
+entropy_before = clf.entropy(test_batch)
+entropy_after, info = clf.adapt(test_batch, lr=1e-3, steps=5)
+probs = clf.predict_batch(test_batch)
+```
+
+| API | 说明 |
+| --- | --- |
+| `tent_adapt(norm, head, xs, lr=1e-3, steps=1, update_beta=True)` | 熵最小化反传到归一化层，只更新 `gamma`（`update_beta=False` 时连 `beta` 也冻结）；返回 `(mean_entropy, info)`，`info` 含 `gamma_delta`/`beta_delta` |
+| `TENTClassifier(num_features, num_classes, seed=None)` | 共享 `BatchNorm1d` + 线性分类头的小封装；`predict_batch(xs)` 前向、`adapt(xs, lr, steps)` 自适应、`entropy(xs)` 当前平均熵 |
+
+边界：TENT / BN-Adapt 的教学化实现——单 batch、CPU；只更新归一化层仿射参数，分类头与
+其它参数冻结；不冻结 running 统计量、不做多域/多步重估；线性头下熵梯度对 `beta` 的
+和恒为 0（逐样本 logits 梯度逐类和为零），因此 `beta_delta` 通常为 0。
+
 ### 多任务权重
 
 多任务训练里各任务 loss 量级不同，直接相加会被大 loss 主导。三个工具分别处理
@@ -6602,7 +6622,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2887 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2892 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7089,6 +7109,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
+| `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
@@ -7126,6 +7147,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2887 个单元测试
+├── test_ai.py       # 2892 个单元测试
 └── README.md
 ```
