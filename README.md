@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3003 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3008 项）
 
 ## 特性
 
@@ -1185,6 +1185,28 @@ AI.export_history_json(history, "history.json")
 
 边界：`grid_search` 是对 `param_grid` 的笛卡尔积暴力枚举（组合数大时会很慢）；
 `objective` 必须返回有限数字；JSON 只支持标准库 `json` 能序列化的类型。
+
+### 蒸馏变体与低秩适配变体（rsLoRA / LoHa / LoKr）
+
+- `multiclass_distill_loss(student_logits, teacher_probs, temperature=1.0)`：
+  给定教师软标签的 KL 蒸馏，返回 `(loss, d_logits)`；
+- `self_distillation_loss(student_logits, ema_logits, temperature=1.0)`：
+  教师是同一模型的 EMA 副本（传入其 logits 即可）；
+- `multi_teacher_distill_loss(student_logits, teacher_logits_list, weights=None,
+  temperature=1.0)`：按权重平均多教师软标签后再做 KL；
+- `rslora_scale(alpha, rank)` / `rslora_delta(A, B, alpha=1.0)`：
+  rsLoRA 用 `alpha/sqrt(r)` 缩放，`B A` 增量按此缩放；
+- `loha_delta(A1, B1, A2, B2, alpha=1.0)`：两个低秩增量的 Hadamard 积；
+- `lokr_delta(A, B, alpha=1.0)`：Kronecker 积 `B ⊗ A` 作为增量。
+
+```python
+loss, dlogits = AI.multiclass_distill_loss(student_logits, teacher_probs)
+delta = AI.rslora_delta(A, B, alpha=8.0)
+```
+
+边界：蒸馏损失只接受「单标签/软标签分类」的 logits 向量；rsLoRA/LoHa/LoKr
+都是对权重增量做数值构造，不修改现有 `LoRA`/`QLoRA` 层；LoHa/LoKr 未提供
+反向（教学展示用）。
 
 ### 训练技巧：梯度噪声 / Noisy Student / 语义去重 / 数据质量过滤
 
@@ -5196,7 +5218,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3003 项）。
+`tests/`（合计 3008 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5204,7 +5226,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3003 项
+pytest -q                        # test_ai.py + tests/ 合计 3008 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6963,7 +6985,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3003 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3008 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7457,6 +7479,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestDistillAndLowRankVariants` | 自/多教师蒸馏、rsLoRA/LoHa/LoKr |
 | `TestTrainingTricks` | 梯度噪声/Noisy Student/语义去重/质量过滤 |
 | `TestAdvancedHPO` | TPE-lite/Hyperband/PBT 收敛与非法输入 |
 | `TestClassicCNNComponents` | DenseNet transition/ASPP/ROI Align/U-Net++ |

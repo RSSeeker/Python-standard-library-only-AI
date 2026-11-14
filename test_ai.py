@@ -47961,3 +47961,102 @@ class TestTrainingTricks:
         other = AI.MLP([3, 2], ["linear"])
         assert _tt_raises(lambda: AI.noisy_student_loss_and_backward(
             student, other, xs, ys))
+
+
+# ---- 蒸馏变体（自蒸馏 / 多教师）与低秩适配变体（rsLoRA / LoHa / LoKr） ----
+
+
+def _dd_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dd_softmax(logits, temperature=1.0):
+    scaled = [v / temperature for v in logits]
+    mx = max(scaled)
+    ex = [math.exp(v - mx) for v in scaled]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _dd_matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(len(b)))
+             for j in range(len(b[0]))] for i in range(len(a))]
+
+
+class TestDistillAndLowRankVariants:
+    def test_distill_zero_and_grad(self):
+        probs = _dd_softmax([1.0, 2.0])
+        loss, grad = AI.multiclass_distill_loss([1.0, 2.0], probs, 1.0)
+        assert abs(loss) < 1e-12
+        assert all(abs(g) < 1e-12 for g in grad)
+        base = [0.3, -0.4]
+        l0, g0 = AI.multiclass_distill_loss(base, [0.2, 0.8], 2.0)
+        h = 1e-6
+
+        def cur(logits):
+            return AI.multiclass_distill_loss(logits, [0.2, 0.8], 2.0)[0]
+
+        fd = []
+        for k in range(2):
+            up = list(base)
+            up[k] += h
+            dn = list(base)
+            dn[k] -= h
+            fd.append((cur(up) - cur(dn)) / (2 * h))
+        assert abs(l0 - AI.multiclass_distill_loss(base, [0.2, 0.8], 2.0)[0]) < 1e-15
+        assert max(abs(g0[k] - fd[k]) for k in range(2)) < 1e-6
+
+    def test_self_and_multi_teacher(self):
+        l1, _ = AI.self_distillation_loss([0.5, 1.0], [0.5, 1.0], 1.0)
+        assert abs(l1) < 1e-12
+        probs = _dd_softmax([1.0, 0.2])
+        base = [0.3, -0.4]
+        single, _ = AI.multiclass_distill_loss(base, probs, 1.0)
+        multi, _ = AI.multi_teacher_distill_loss(base, [[1.0, 0.2], [1.0, 0.2]])
+        assert abs(single - multi) < 1e-12
+        assert _dd_raises(
+            lambda: AI.multi_teacher_distill_loss(base, [[1.0, 0.2]], [0.5]))
+        assert _dd_raises(
+            lambda: AI.multi_teacher_distill_loss(base, [[1.0, 0.2, 0.3]]))
+
+    def test_rslora(self):
+        assert abs(AI.rslora_scale(8.0, 4) - 4.0) < 1e-12
+        A = [[1.0, 2.0], [0.0, 1.0]]
+        B = [[2.0, 1.0], [0.0, 1.0]]
+        d = AI.rslora_delta(A, B, alpha=8.0)
+        ba = _dd_matmul(B, A)
+        scale = 8.0 / math.sqrt(2.0)
+        assert all(abs(d[i][j] - scale * ba[i][j]) < 1e-12
+                   for i in range(2) for j in range(2))
+        assert _dd_raises(lambda: AI.rslora_scale(0.0, 4))
+
+    def test_loha_and_lokr(self):
+        A = [[1.0, 2.0], [0.0, 1.0]]
+        B = [[2.0, 1.0], [0.0, 1.0]]
+        d = AI.loha_delta(A, B, A, B, alpha=2.0)
+        ba = _dd_matmul(B, A)
+        expect = [[ba[i][j] * ba[i][j] * (2.0 / math.sqrt(2.0))
+                   for j in range(2)] for i in range(2)]
+        assert all(abs(d[i][j] - expect[i][j]) < 1e-12
+                   for i in range(2) for j in range(2))
+        A3 = [[1.0, 2.0], [3.0, 4.0]]
+        B3 = [[0.0, 1.0], [1.0, 0.0]]
+        k = AI.lokr_delta(A3, B3, alpha=1.0)
+        assert len(k) == 4 and len(k[0]) == 4
+        assert k[0][0] == 0.0 and k[0][2] == 0.5 and k[0][3] == 1.0
+        assert _dd_raises(lambda: AI.lokr_delta([], B3))
+
+    def test_invalid_inputs(self):
+        assert _dd_raises(lambda: AI.multiclass_distill_loss([1.0], [1.0]))
+        assert _dd_raises(
+            lambda: AI.multiclass_distill_loss([1.0, 2.0], [0.5, 0.6]))
+        assert _dd_raises(
+            lambda: AI.multiclass_distill_loss([1.0, 2.0], [0.5, 0.5], 0.0))
+        assert _dd_raises(
+            lambda: AI.self_distillation_loss([1.0, 2.0], [1.0]))
+        assert _dd_raises(
+            lambda: AI.multi_teacher_distill_loss([1.0, 2.0], []))

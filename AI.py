@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1861 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1872 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -25755,6 +25755,148 @@ def noisy_student_loss_and_backward(student, teacher, xs, ys,
         grads = _mlp_backward(student, d)
         _mlp_accumulate(zero_w, zero_b, grads)
     return total / n, list(zip(zero_w, zero_b))
+
+
+# ---- 蒸馏变体（自蒸馏 / 多教师）与低秩适配变体（rsLoRA / LoHa / LoKr） ----
+
+
+def _p113_check_logits(logits, who):
+    if not isinstance(logits, (list, tuple)) or len(logits) < 2:
+        raise ValueError(f"{who}: logits 必须是至少 2 类的 list")
+    for v in logits:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            raise ValueError(f"{who}: logits 必须是有限数字")
+
+
+def _p113_softmax(logits, temperature=1.0):
+    scaled = [float(v) / float(temperature) for v in logits]
+    mx = max(scaled)
+    ex = [math.exp(v - mx) for v in scaled]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _p113_kl_distill(student_logits, teacher_probs, temperature):
+    _p113_check_logits(student_logits, "distill")
+    if not isinstance(teacher_probs, (list, tuple)) \
+            or len(teacher_probs) != len(student_logits):
+        raise ValueError("distill: teacher_probs 必须与 student_logits 等长")
+    for v in teacher_probs:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)) or float(v) < 0.0:
+            raise ValueError("distill: teacher_probs 必须是非负有限数字")
+    total = sum(float(v) for v in teacher_probs)
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError("distill: teacher_probs 之和必须为 1")
+    T = float(temperature)
+    p = _p113_softmax(student_logits, T)
+    loss = 0.0
+    for q, pk in zip(teacher_probs, p):
+        q = float(q)
+        if q > 0.0:
+            loss += q * (math.log(q) - math.log(max(pk, 1e-300)))
+    loss *= T * T
+    grad = [T * (pk - float(q)) for pk, q in zip(p, teacher_probs)]
+    return loss, grad
+
+
+def multiclass_distill_loss(student_logits, teacher_probs, temperature=1.0):
+    """单教师、已给软标签的 KL 蒸馏损失；返回 (loss, d_logits)。"""
+    _p113_check_logits(student_logits, "multiclass_distill_loss")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("multiclass_distill_loss: temperature 必须为正")
+    return _p113_kl_distill(student_logits, teacher_probs, temperature)
+
+
+def self_distillation_loss(student_logits, ema_logits, temperature=1.0):
+    """自蒸馏：教师是同一模型的 EMA 副本（给其 logits 即可）。"""
+    _p113_check_logits(ema_logits, "self_distillation_loss")
+    return multiclass_distill_loss(student_logits,
+                                   _p113_softmax(ema_logits, temperature),
+                                   temperature)
+
+
+def multi_teacher_distill_loss(student_logits, teacher_logits_list,
+                               weights=None, temperature=1.0):
+    """多教师蒸馏：按权重平均各教师软标签再做 KL；返回 (loss, d_logits)。"""
+    if not isinstance(teacher_logits_list, (list, tuple)) \
+            or not teacher_logits_list:
+        raise ValueError("multi_teacher_distill_loss: teacher_logits_list 不能为空")
+    n = len(student_logits) if isinstance(student_logits, (list, tuple)) else 0
+    for t in teacher_logits_list:
+        if not isinstance(t, (list, tuple)) or len(t) != n:
+            raise ValueError("multi_teacher_distill_loss: 教师 logits 必须与学生对等长")
+    if weights is None:
+        weights = [1.0 / len(teacher_logits_list)] * len(teacher_logits_list)
+    if not isinstance(weights, (list, tuple)) or len(weights) != len(teacher_logits_list):
+        raise ValueError("multi_teacher_distill_loss: weights 长度必须与教师数一致")
+    total = sum(float(w) for w in weights)
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError("multi_teacher_distill_loss: weights 之和必须为 1")
+    mixed = [0.0] * n
+    for w, logits in zip(weights, teacher_logits_list):
+        probs = _p113_softmax(logits, temperature)
+        for k in range(n):
+            mixed[k] += float(w) * probs[k]
+    return multiclass_distill_loss(student_logits, mixed, temperature)
+
+
+def _p113_matmul(a, b):
+    if not a or not b or not a[0] or not b[0]:
+        raise ValueError("低秩: 矩阵不能为空")
+    if len(a[0]) != len(b):
+        raise ValueError("低秩: 矩阵形状不匹配")
+    return [[sum(a[i][k] * b[k][j] for k in range(len(b)))
+             for j in range(len(b[0]))] for i in range(len(a))]
+
+
+def rslora_scale(alpha, rank):
+    """rsLoRA：缩放系数从 alpha/r 改为 alpha/sqrt(r)，大 rank 时更稳定。"""
+    for name, v in (("alpha", alpha), ("rank", rank)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)) or float(v) <= 0.0:
+            raise ValueError(f"rslora_scale: {name} 必须为正数")
+    return float(alpha) / math.sqrt(float(rank))
+
+
+def rslora_delta(A, B, alpha=1.0):
+    """rsLoRA 增量：alpha/sqrt(rank) * B A，A 形状 r×in，B 形状 out×r。"""
+    rank = len(A)
+    scale = rslora_scale(alpha, rank)
+    ba = _p113_matmul(B, A)
+    return [[scale * v for v in row] for row in ba]
+
+
+def loha_delta(A1, B1, A2, B2, alpha=1.0):
+    """LoHa：两个低秩增量的 Hadamard 积，表达力高于单 LoRA。"""
+    d1 = _p113_matmul(B1, A1)
+    d2 = _p113_matmul(B2, A2)
+    if len(d1) != len(d2) or len(d1[0]) != len(d2[0]):
+        raise ValueError("loha_delta: 两个低秩增量的形状必须一致")
+    rank = max(len(A1), len(A2))
+    scale = float(alpha) / math.sqrt(float(rank))
+    return [[scale * d1[i][j] * d2[i][j] for j in range(len(d1[0]))]
+            for i in range(len(d1))]
+
+
+def lokr_delta(A, B, alpha=1.0):
+    """LoKr：Kronecker 积 B ⊗ A 作为增量（小矩阵表示大更新）。"""
+    if not A or not B:
+        raise ValueError("lokr_delta: A/B 不能为空")
+    rank = max(len(A) * len(B), 1)
+    scale = float(alpha) / math.sqrt(float(rank))
+    rows = len(B) * len(A)
+    cols = len(B[0]) * len(A[0])
+    out = [[0.0] * cols for _ in range(rows)]
+    for bi in range(len(B)):
+        for bj in range(len(B[0])):
+            base = B[bi][bj] * scale
+            for ai in range(len(A)):
+                for aj in range(len(A[0])):
+                    out[bi * len(A) + ai][bj * len(A[0]) + aj] = base * A[ai][aj]
+    return out
 
 class TransformerXL:
     """Transformer-XL 的段级循环（教学简化：无相对位置编码）
