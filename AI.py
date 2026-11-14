@@ -6303,6 +6303,202 @@ def toxicity_score(tokens, lexicon):
     return {"score": len(idx) / len(tokens), "flagged": idx}
 
 
+
+"""工具调用评测：从文本解析 tool call，并与标准答案比较名称/参数/完全匹配。
+
+支持三种常见输出格式（可混在自由文本里）：
+
+- JSON：``{"name": "add", "arguments": {"a": 1, "b": 2}}``，或数组形式；
+- 函数调用式：``add(a=1, b=2)`` / ``add({"a": 1})``；
+- 纯参数 JSON 前后带工具名。
+
+解析失败不会抛错，而是记入 ``parse_rate`` 的失败计数；参数比较把整数与浮点
+统一成 float，字符串按原样比较，嵌套 dict 递归成扁平 key。
+"""
+
+
+def _te_canonical(value):
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int) or isinstance(value, float):
+        return ("num", float(value))
+    if value is None:
+        return ("null", None)
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, (list, tuple)):
+        return ("list", tuple(_te_canonical(v) for v in value))
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted(
+            (str(k), _te_canonical(v)) for k, v in value.items())))
+    return ("other", repr(value))
+
+
+def _te_flatten(prefix, value, out):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _te_flatten(f"{prefix}.{k}" if prefix else str(k), v, out)
+    else:
+        out[prefix] = _te_canonical(value)
+
+
+def _te_check_calls(calls, who="calls"):
+    if not isinstance(calls, (list, tuple)) or not calls:
+        raise ValueError(f"{who} 必须是非空列表")
+    out = []
+    for i, c in enumerate(calls):
+        if not isinstance(c, dict):
+            raise ValueError(f"{who}[{i}] 必须是 dict")
+        name = c.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{who}[{i}].name 必须是非空字符串")
+        args = c.get("arguments", {})
+        if not isinstance(args, dict):
+            raise ValueError(f"{who}[{i}].arguments 必须是 dict")
+        out.append({"name": name, "arguments": args})
+    return out
+
+
+def _te_parse_json(text):
+    candidates = []
+    starts = [i for i, ch in enumerate(text) if ch in "{["]
+    for s in starts:
+        for e in range(len(text), s, -1):
+            chunk = text[s:e].strip()
+            if not chunk or chunk[0] not in "{[":
+                continue
+            try:
+                data = json.loads(chunk)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and "name" in data:
+                candidates.append(data)
+            elif isinstance(data, list) and data and all(
+                    isinstance(d, dict) and "name" in d for d in data):
+                candidates.extend(data)
+            if candidates:
+                return candidates
+    return []
+
+
+def _te_parse_call_syntax(text):
+    calls = []
+    pattern = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\{.*?\}|[^()]*)\s*\)", re.S)
+    for m in pattern.finditer(text):
+        name = m.group(1)
+        if name in ("if", "for", "while", "def", "print"):
+            continue
+        body = m.group(2).strip()
+        args = {}
+        try:
+            if body.startswith("{"):
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    continue
+                args = data
+            elif body:
+                for part in body.split(","):
+                    if "=" not in part:
+                        args = None
+                        break
+                    key, val = part.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    try:
+                        args[key] = json.loads(val)
+                    except ValueError:
+                        args[key] = val.strip("'\"")
+                if args is None:
+                    continue
+        except (ValueError, TypeError):
+            continue
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
+def parse_tool_calls(text):
+    """从一段自由文本中解析出 tool call 列表（解析不到返回空列表）。"""
+    if not isinstance(text, str):
+        raise ValueError("parse_tool_calls: text 必须是字符串")
+    calls = _te_parse_json(text)
+    if not calls:
+        calls = _te_parse_call_syntax(text)
+    normalized = []
+    for c in calls:
+        name = c.get("name")
+        args = c.get("arguments", c.get("args", {}))
+        if isinstance(name, str) and name and isinstance(args, dict):
+            normalized.append({"name": name, "arguments": args})
+    return normalized
+
+
+def tool_call_metrics(predictions, gold):
+    """逐条比较预测的 tool call 与标准答案，返回总体与逐条指标。"""
+    if not isinstance(predictions, (list, tuple)) or not predictions:
+        raise ValueError("tool_call_metrics: predictions 必须是非空列表")
+    if not isinstance(gold, (list, tuple)) or len(gold) != len(predictions):
+        raise ValueError("tool_call_metrics: gold 必须与 predictions 等长")
+    gold_calls = _te_check_calls(gold, "gold")
+    details = []
+    n = len(predictions)
+    parsed = 0
+    exact = 0
+    name_hits = 0
+    tp = fp = fn = 0
+    for i, (raw, g) in enumerate(zip(predictions, gold_calls)):
+        if not isinstance(raw, str):
+            raise ValueError(f"tool_call_metrics: predictions[{i}] 必须是字符串")
+        calls = parse_tool_calls(raw)
+        if not calls:
+            details.append({"index": i, "parsed": False, "exact": False,
+                            "name_match": False, "arg_f1": 0.0,
+                            "predicted": None, "gold": g})
+            fn += len(_te_flatten_keys(g["arguments"]))
+            continue
+        parsed += 1
+        pred = calls[0]
+        name_match = pred["name"] == g["name"]
+        name_hits += 1 if name_match else 0
+        pred_flat = {}
+        gold_flat = {}
+        _te_flatten("", pred["arguments"], pred_flat)
+        _te_flatten("", g["arguments"], gold_flat)
+        common = set(pred_flat) & set(gold_flat)
+        matched = sum(1 for k in common if pred_flat[k] == gold_flat[k])
+        tp += matched
+        fp += len(pred_flat) - matched
+        fn += len(gold_flat) - matched
+        is_exact = name_match and matched == len(gold_flat) == len(pred_flat)
+        exact += 1 if is_exact else 0
+        denom = len(pred_flat) + len(gold_flat)
+        arg_f1 = (2 * matched / denom) if denom else 1.0
+        details.append({
+            "index": i, "parsed": True, "exact": is_exact,
+            "name_match": name_match, "arg_f1": arg_f1,
+            "predicted": pred, "gold": g,
+        })
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if precision + recall else 0.0)
+    return {
+        "n": n,
+        "parse_rate": parsed / n,
+        "exact_match": exact / n,
+        "name_accuracy": name_hits / n,
+        "arg_precision": precision,
+        "arg_recall": recall,
+        "arg_f1": f1,
+        "details": details,
+    }
+
+
+def _te_flatten_keys(args):
+    flat = {}
+    _te_flatten("", args, flat)
+    return flat
+
 class ToolRegistry:
     """记录可调用工具并统一分发（ReAct/Agent 流程用）。"""
 

@@ -43366,3 +43366,78 @@ class TestRedTeamSafety:
         assert _sfty_raises(lambda: AI.red_team_report(["x"], canaries=None,
                                                       threshold=1.5))
         assert _sfty_raises(lambda: AI.red_team_report([""]))
+
+
+def _tce_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestToolCallEval:
+    def test_parse_formats(self):
+        assert AI.parse_tool_calls(
+            '{"name": "add", "arguments": {"a": 1, "b": 2}}') == [
+                {"name": "add", "arguments": {"a": 1, "b": 2}}]
+        assert AI.parse_tool_calls(
+            'blah [{"name": "x", "arguments": {"k": 1}}] tail') == [
+                {"name": "x", "arguments": {"k": 1}}]
+        assert AI.parse_tool_calls("调用 add(a=1, b=2) 即可") == [
+            {"name": "add", "arguments": {"a": 1, "b": 2}}]
+        assert AI.parse_tool_calls('f({"p": {"q": 1}})') == [
+            {"name": "f", "arguments": {"p": {"q": 1}}}]
+        assert AI.parse_tool_calls("no tool call") == []
+
+    def test_metrics_basic(self):
+        preds = ['{"name": "add", "arguments": {"a": 1, "b": 2}}',
+                 '{"name": "sub", "arguments": {"a": 3}}',
+                 '{"name": "add", "arguments": {"a": "x"}}',
+                 'garbage']
+        gold = [{"name": "add", "arguments": {"a": 1, "b": 2}},
+                {"name": "add", "arguments": {"a": 3}},
+                {"name": "add", "arguments": {"a": "x", "b": 9}},
+                {"name": "add", "arguments": {"a": 1}}]
+        m = AI.tool_call_metrics(preds, gold)
+        assert m["n"] == 4
+        assert m["parse_rate"] == 0.75
+        assert m["exact_match"] == 0.25
+        assert m["name_accuracy"] == 0.5
+        assert abs(m["arg_f1"] - 0.8) < 1e-12
+        assert len(m["details"]) == 4
+        assert m["details"][0]["exact"] is True
+
+    def test_metrics_numeric_and_nested(self):
+        m = AI.tool_call_metrics(
+            ['{"name": "f", "arguments": {"x": 1, "y": {"z": 2.0}}}'],
+            [{"name": "f", "arguments": {"x": 1.0, "y": {"z": 2}}}])
+        assert m["exact_match"] == 1.0
+        m2 = AI.tool_call_metrics(
+            ['{"name": "f", "arguments": {"x": True}}'],
+            [{"name": "f", "arguments": {"x": 1}}])
+        assert m2["exact_match"] == 0.0
+        assert m2["arg_f1"] == 0.0
+
+    def test_parse_failure_counted(self):
+        m = AI.tool_call_metrics(
+            ["nothing", "garbage"],
+            [{"name": "f", "arguments": {"a": 1}},
+             {"name": "g", "arguments": {"b": 2}}])
+        assert m["parse_rate"] == 0.0
+        assert m["exact_match"] == 0.0
+        assert m["name_accuracy"] == 0.0
+        assert all(d["parsed"] is False for d in m["details"])
+
+    def test_invalid_inputs(self):
+        assert _tce_raises(lambda: AI.parse_tool_calls(1))
+        assert _tce_raises(lambda: AI.tool_call_metrics([], []))
+        assert _tce_raises(lambda: AI.tool_call_metrics(["x"], []))
+        assert _tce_raises(lambda: AI.tool_call_metrics(
+            [1], [{"name": "f", "arguments": {}}]))
+        assert _tce_raises(lambda: AI.tool_call_metrics(
+            ["x"], [{"name": "", "arguments": {}}]))
+        assert _tce_raises(lambda: AI.tool_call_metrics(
+            ["x"], [{"name": "f", "arguments": []}]))

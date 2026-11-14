@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2717 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2722 项）
 
 ## 特性
 
@@ -2439,6 +2439,25 @@ print(probe["accuracy"], probe["loss_history"][-1])
 `offset` 需要满足因果可及（`p+offset <= t-1`）。`train_linear_probe` 返回的是**训练集**
 上的精度，没有 train/val 划分（需要泛化评估时请自行留出验证集）；探针只有 L2 正则、
 全批量更新，不做特征标准化。
+
+### 工具调用评测（tool call 解析 / 名称与参数匹配）
+
+| 函数 | 说明 |
+|---|---|
+| `parse_tool_calls(text)` | 从自由文本解析 tool call：支持 JSON 对象/数组、`name(a=1, b=2)` 函数调用式、`name({"a": 1})`；解析不到返回 `[]`，不抛错 |
+| `tool_call_metrics(predictions, gold)` | 逐条比较预测与标准 `{"name","arguments"}`：`parse_rate`、`exact_match`、`name_accuracy`、参数 precision/recall/F1（数值统一为 float、嵌套 dict 扁平比较） |
+
+```python
+preds = ['{"name": "add", "arguments": {"a": 1, "b": 2}}', 'garbage']
+gold = [{"name": "add", "arguments": {"a": 1, "b": 2}},
+        {"name": "add", "arguments": {"a": 1}}]
+m = tool_call_metrics(preds, gold)
+print(m["parse_rate"], m["exact_match"], m["arg_f1"])
+```
+
+边界：只评测「第一条 tool call」的名称与参数，多调用/并行调用不拆开对比；
+参数比较不做字符串归一化（`"1"` 与 `1` 视为不同），解析失败计入分母但
+不抛异常，便于在评测报告里同时看到格式与内容两层的质量。
 
 ### 验证器与评测工具（pass@k / PRM 聚合 / verifier 排序 / 毒性）
 
@@ -6115,7 +6134,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2717 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2722 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6419,6 +6438,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKnowledgeEditing` | ROME 单条编辑输出精确性/偏置不变/最小范数、MEMIT 多条编辑精确性、键线性相关与维度不匹配等非法输入 |
 | `TestJudgeCalibration` | 合成 1.8 温度数据恢复 `a≈1.8` 且 NLL/Brier/ECE 下降、ECE 在完全正确预测下为 0、全正标签仍有限、九类非法输入（空/不等长/越界标签/NaN/lr/epochs/l2/bins） |
 | `TestRedTeamSafety` | 七类 PII 全部命中且按起点排序、Luhn 拒绝假卡、类别过滤、canary 命中/去重、越狱高/中/低风险与规则名、批量报告汇总与阈值、十一类非法输入 |
+| `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6605,6 +6625,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2717 个单元测试
+├── test_ai.py       # 2722 个单元测试
 └── README.md
 ```
