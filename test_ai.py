@@ -43959,3 +43959,108 @@ class TestDeepSeekV3Model:
         assert _dsv3_raises(lambda: m.generate([], max_new_tokens=2))
         assert _dsv3_raises(lambda: m.generate([0], max_new_tokens=-1))
         assert _dsv3_raises(lambda: m.generate([0], temperature=0.0))
+
+
+import math
+import random
+
+import AI
+
+
+def _galore_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _galore_grads(model, xs, ys):
+    n = len(xs)
+    out_dim = len(ys[0])
+    acc_w = AI._mlp_zero_grads(model)
+    acc_b = AI._mlp_acc_bias(model)
+    for k in range(n):
+        pred = model.forward(xs[k])
+        d = [2.0 * (pred[i] - ys[k][i]) / (n * out_dim) for i in range(out_dim)]
+        grads, _ = AI._mlp_backward_with_input(model, d)
+        AI._mlp_accumulate(acc_w, acc_b, grads)
+    return list(zip(acc_w, acc_b))
+
+
+def _galore_loss(model, xs, ys):
+    total = 0.0
+    for x, y in zip(xs, ys):
+        pred = model.forward(x)
+        total += sum((pred[i] - y[i]) ** 2 for i in range(len(y)))
+    return total / (len(xs) * len(ys[0]))
+
+
+class TestGaLore:
+    def test_full_rank_reconstruction(self):
+        random.seed(0)
+        m = AI.MLP([3, 4], ["linear"])
+        opt = AI.GaLore(m, lr=0.01, rank=3, proj_gap=100)
+        g = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(4)]
+        u, v = AI._galore_svd_low_rank(g, 3)
+        low = AI._galore_project(g, u, v)
+        rec = AI._galore_unproject(low, u, v)
+        err = max(abs(rec[i][j] - g[i][j]) for i in range(4) for j in range(3))
+        assert err < 1e-8
+
+    def test_rank_one_delta_is_rank_one(self):
+        m = AI.MLP([2, 2], ["linear"])
+        xs = [[1.0, 2.0], [0.5, -1.0], [-1.0, 0.5]]
+        ys = [[1.5, 0.2], [-0.5, 0.1], [0.2, -0.3]]
+        opt = AI.GaLore(m, lr=0.1, rank=1, proj_gap=1)
+        w0 = [row[:] for row in m.layers[0].weights]
+        opt.step(_galore_grads(m, xs, ys))
+        dw = [[m.layers[0].weights[i][j] - w0[i][j] for j in range(2)]
+              for i in range(2)]
+        det = dw[0][0] * dw[1][1] - dw[0][1] * dw[1][0]
+        assert abs(det) < 1e-10
+
+    def test_training_converges(self):
+        random.seed(1)
+        xs = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(16)]
+        true_w = [2.0, -1.0, 0.5]
+        ys = [[sum(w * x for w, x in zip(true_w, row)) + 0.3] for row in xs]
+        m = AI.MLP([3, 1], ["linear"])
+        opt = AI.GaLore(m, lr=0.1, rank=2, proj_gap=5)
+        first = _galore_loss(m, xs, ys)
+        for _ in range(200):
+            opt.step(_galore_grads(m, xs, ys))
+        last = _galore_loss(m, xs, ys)
+        assert last < first * 0.01
+
+    def test_bias_update_matches_adam(self):
+        m = AI.MLP([2, 2], ["linear"])
+        m.layers[0].weights = [[1.0, 2.0], [0.5, -1.0]]
+        g1 = [([[-0.2, 0.1], [0.3, -0.4]], [0.5, -0.2])]
+        opt = AI.GaLore(m, lr=0.05, rank=2, proj_gap=10,
+                        beta1=0.9, beta2=0.999)
+        opt.step(g1)
+        b0 = [v for v in m.layers[0].biases]
+        g2 = [([[-0.1, 0.2], [0.1, 0.2]], [0.3, 0.6])]
+        opt.step(g2)
+        beta1, beta2, lr, t = 0.9, 0.999, 0.05, 2
+        c1, c2 = 1 - beta1 ** t, 1 - beta2 ** t
+        mb0 = 0.1 * g1[0][1][0]
+        vb0 = 0.001 * g1[0][1][0] ** 2
+        mb = beta1 * mb0 + 0.1 * g2[0][1][0]
+        vb = beta2 * vb0 + 0.001 * g2[0][1][0] ** 2
+        step = lr * (mb / c1) / (math.sqrt(vb / c2) + 1e-8)
+        expected = b0[0] - step
+        assert abs(expected - m.layers[0].biases[0]) < 1e-12
+
+    def test_invalid_inputs(self):
+        m = AI.MLP([2, 2], ["linear"])
+        assert _galore_raises(lambda: AI.GaLore("x"))
+        assert _galore_raises(lambda: AI.GaLore(m, lr=0.0))
+        assert _galore_raises(lambda: AI.GaLore(m, rank=0))
+        assert _galore_raises(lambda: AI.GaLore(m, proj_gap=0))
+        assert _galore_raises(lambda: AI.GaLore(m, beta1=1.0))
+        assert _galore_raises(lambda: AI.GaLore(m, beta2=-0.1))
+        assert _galore_raises(lambda: AI.GaLore(m, eps=0.0))
+        opt = AI.GaLore(m, lr=0.01, rank=2)
+        assert _galore_raises(lambda: opt.step([]))

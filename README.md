@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2746 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2751 项）
 
 ## 特性
 
@@ -1098,6 +1098,7 @@ print(history[-1]["loss"])
 | `LARS` / `LAMB` / `Ranger` | 层粒度优化器三件套：先看整层范数再定步长，所以 `state_dict()` 里同层共享 `trust`/`vel` 这类结构；同样与 `Adam` 一样只支持二维 `Layer` 权重 |
 | `Adan` / `Prodigy` / `CAME` | 进阶三件套：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
 | `Shampoo` / `Sophia` / `LBFGS` | 二阶近似三件套：Shampoo 用 `L=GGᵀ`/`R=GᵀG` 的 `L^{-1/4} G R^{-1/4}` 预条件（`max(fan_out,fan_in) > max_dim` 的层退化为逐元素 Adam）；其中 `inverse_root='newton'` 改用 Newton–Schulz 迭代求逆根（`newton_iters` 控制步数），`grafting=True` 时把更新方向按 Adam 更新范数缩放后再落地（论文的 Adam grafting）；Sophia 用 `clip(m / max(ρh, ε), ±1)`（`h` 来自 `hessian_diags` / `hessian_fn` / `g²` 三者之一，**不是真 Hessian**）；L-BFGS 是逐层分块的两循环递归、无 line search，`lr` 要比 SGD 小一个量级 |
+| `GaLore(model, lr=1e-3, rank=4, proj_gap=100)` | 梯度低秩投影优化器：每 `proj_gap` 步对权重的梯度做一次低秩分解（取 `GᵀG` 的前 `rank` 个特征向量，`U Σ Vᵀ`），只在该子空间里跑 Adam，更新按 `U · Ĝ_low · Vᵀ` 投影回完整矩阵；`max(fan_out, fan_in) <= rank` 的层退化为普通 Adam；状态只存 `r×r` 矩与投影基，`state_bytes_estimate()` 给出元素数 |
 | `sophia_hutchinson_diag(model, xs, ys, num_samples=8, eps=1e-3, seed=None)` | 用 Hutchinson 方法估计 MLP + MSE 损失对参数的 Hessian 对角：Rademacher 向量 `v` 乘 `(g(w+εv) − g(w−εv)) / (2ε)` 作为 `H v`，再对 `v ⊙ H v` 取平均；逐层返回 `(diag_w, diag_b)`，可直接传给 `Sophia.step(grads, hessian_diags=...)`。中心差分在 ReLU 拐点附近不精确，估计有方差（`num_samples` 越大越稳） |
 | `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
 | `SGD` | 随机梯度下降 |
@@ -6198,7 +6199,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2746 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2751 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6223,6 +6224,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMoEAdvanced` | 负载均衡损失对门控权重/偏置/输入的中心差分、`capacity_factor` 的容量计算与 token dropping（输出与梯度为 0）、非法容量参数、辅助损失梯度累加与 `coefficient=0` 边界 |
 | `TestSophiaHutchinson` | 正交零和输入下线性模型 Hessian 对角精确为 2、两层 MLP 返回形状、与逐参数中心差分精确对角的近似（max abs diff < 0.4）、Sophia + Hutchinson 训练 loss 下降、非法输入 |
 | `TestShampooNewtonGrafting` | Newton–Schulz 逆根与 Jacobi 特征分解结果一致（max_abs < 1e-6）、Newton 路径训练收敛、grafting 一步更新范数与 Adam 一致、`state_dict` 往返（含 `L/R/m/v` 字段）、非法超参 |
+| `TestGaLore` | 全秩投影重建（`rank=min` 时 err < 1e-8）、`rank=1` 更新增量行列式 ≈ 0、200 步线性回归收敛、偏置更新与手写 Adam 一致、7 类非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6694,6 +6696,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2746 个单元测试
+├── test_ai.py       # 2751 个单元测试
 └── README.md
 ```

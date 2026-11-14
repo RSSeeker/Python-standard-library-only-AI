@@ -45995,6 +45995,207 @@ def _mat_mul(a, b):
     return out
 
 
+# ============================================================================
+#  GaLore：梯度低秩投影优化器（梯度投影 → 低秩 Adam → 投影回原位）
+# ----------------------------------------------------------------------------
+# 对每个二维权重矩阵 W（fan_out×fan_in），只在每隔 proj_gap 步重算一次低秩
+# 子空间：
+#   G ≈ U Σ Vᵀ，  U (fan_out×r)，V (r×fan_in)
+# 把梯度投影到秩 r 坐标：G_low = Uᵀ G Vᵀ (r×r)，在低秩坐标上跑 Adam，再
+# 投影回去：W ← W − lr · U · Ĝ_low · Vᵀ。
+# 一维偏置与「小于 rank」的小矩阵回退到普通 Adam。这样优化器状态只存
+# r×r 的矩（两个），而不是 fan_out×fan_in。
+# ============================================================================
+
+
+def _galore_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("GaLore: %s 必须是正整数，收到 %r" % (name, value))
+    if value < 1:
+        raise ValueError("GaLore: %s 必须 >= 1，收到 %r" % (name, value))
+    return int(value)
+
+
+def _galore_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("GaLore: %s 必须是正数，收到 %r" % (name, value))
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("GaLore: %s 必须是有限正数，收到 %r" % (name, value))
+    return value
+
+
+def _galore_transpose(a):
+    return [list(col) for col in zip(*a)]
+
+
+def _galore_mul(a, b):
+    rows, inner, cols = len(a), len(b), len(b[0])
+    out = [[0.0] * cols for _ in range(rows)]
+    for i in range(rows):
+        ai = a[i]
+        oi = out[i]
+        for k in range(inner):
+            aik = ai[k]
+            if aik == 0.0:
+                continue
+            bk = b[k]
+            for j in range(cols):
+                oi[j] += aik * bk[j]
+    return out
+
+
+def _galore_svd_low_rank(matrix, rank):
+    """返回 (U, V)：U 为 fan_out×r 列向量，V 为 r×fan_in 行向量。"""
+    rows, cols = len(matrix), len(matrix[0])
+    if len(matrix) == 0:
+        return [], []
+    # 用 AᵀA 的特征分解取前 rank 个右奇异向量（GaLore 论文用 SVD；这里教学实现）
+    at = _galore_transpose(matrix)
+    ata = _galore_mul(at, matrix)
+    eigvals, eigvecs = _jacobi_eigh(ata)
+    order = sorted(range(len(eigvals)), key=lambda i: eigvals[i], reverse=True)
+    order = order[:max(1, min(rank, len(order)))]
+    v_rows = []
+    sigmas = []
+    for idx in order:
+        vec = [eigvecs[i][idx] for i in range(len(eigvecs))]
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm <= 1e-14:
+            vec = [1.0 if i == 0 else 0.0 for i in range(len(vec))]
+            norm = 1.0
+        vec = [x / norm for x in vec]
+        v_rows.append(vec)
+        sigmas.append(math.sqrt(max(eigvals[idx], 0.0)))
+    # U = A Vᵀ / sigma，逐列
+    u_cols = []
+    for r in range(len(v_rows)):
+        vrow = v_rows[r]
+        col = [sum(matrix[i][j] * vrow[j] for j in range(cols))
+               for i in range(rows)]
+        sigma = sigmas[r]
+        if sigma > 1e-12:
+            col = [v / sigma for v in col]
+        u_cols.append(col)
+    # U 存成行主序 (fan_out × r)：U_rows[i][r]
+    u_rows = [[u_cols[r][i] for r in range(len(u_cols))] for i in range(rows)]
+    return u_rows, v_rows
+
+
+def _galore_project(grad, u_rows, v_rows):
+    """P = Uᵀ G Vᵀ，返回 rank×rank。"""
+    rank = len(v_rows)
+    ug = _galore_mul(_galore_transpose(u_rows), grad)   # rank×fan_in
+    return _galore_mul(ug, _galore_transpose(v_rows))    # rank×rank
+
+
+def _galore_unproject(low, u_rows, v_rows):
+    """G_approx = U · low · V。"""
+    return _galore_mul(_galore_mul(u_rows, low), v_rows)
+
+
+class GaLore:
+    """低秩梯度投影 + Adam 更新（支持 MLP 的所有层）"""
+
+    def __init__(self, model, lr=1e-3, rank=4, proj_gap=100,
+                 beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(model, MLP):
+            raise ValueError("GaLore: model 必须是 MLP，收到 %s"
+                             % type(model).__name__)
+        self.model = model
+        self.lr = _galore_check_pos_number(lr, "lr")
+        self.rank = _galore_check_pos_int(rank, "rank")
+        self.proj_gap = _galore_check_pos_int(proj_gap, "proj_gap")
+        if not isinstance(beta1, (int, float)) or isinstance(beta1, bool) \
+                or not (0.0 <= beta1 < 1.0):
+            raise ValueError("GaLore: beta1 必须在 [0,1)，收到 %r" % (beta1,))
+        if not isinstance(beta2, (int, float)) or isinstance(beta2, bool) \
+                or not (0.0 <= beta2 < 1.0):
+            raise ValueError("GaLore: beta2 必须在 [0,1)，收到 %r" % (beta2,))
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = _galore_check_pos_number(eps, "eps")
+        self.step_count = 0
+        self.state = []
+        for layer in model.layers:
+            rows, cols = len(layer.weights), len(layer.weights[0])
+            if max(rows, cols) > self.rank:
+                self.state.append({"mode": "low", "U": None, "V": None,
+                                   "m": None, "v": None,
+                                   "mb": [0.0] * rows, "vb": [0.0] * rows})
+            else:
+                self.state.append({"mode": "full",
+                                   "mw": [[0.0] * cols for _ in range(rows)],
+                                   "vw": [[0.0] * cols for _ in range(rows)],
+                                   "mb": [0.0] * rows, "vb": [0.0] * rows})
+
+    def _refresh_subspace(self, state, grad):
+        u_rows, v_rows = _galore_svd_low_rank(grad, self.rank)
+        state["U"] = u_rows
+        state["V"] = v_rows
+        rank = len(v_rows)
+        if state["m"] is None or len(state["m"]) != rank:
+            state["m"] = [[0.0] * rank for _ in range(rank)]
+            state["v"] = [[0.0] * rank for _ in range(rank)]
+
+    def step(self, all_grads):
+        if not isinstance(all_grads, list) or len(all_grads) != len(self.model.layers):
+            raise ValueError("GaLore.step: 梯度层数与模型层数不一致")
+        self.step_count += 1
+        t = self.step_count
+        c1 = 1.0 - self.beta1 ** t
+        c2 = 1.0 - self.beta2 ** t
+        for idx, (layer, (grad_w, grad_b)) in enumerate(
+                zip(self.model.layers, all_grads)):
+            st = self.state[idx]
+            rows, cols = len(layer.weights), len(layer.weights[0])
+            if st["mode"] == "low":
+                if st["U"] is None or (t - 1) % self.proj_gap == 0:
+                    self._refresh_subspace(st, grad_w)
+                low = _galore_project(grad_w, st["U"], st["V"])
+                rank = len(low)
+                for i in range(rank):
+                    for j in range(rank):
+                        g = low[i][j]
+                        st["m"][i][j] = self.beta1 * st["m"][i][j] + (1.0 - self.beta1) * g
+                        st["v"][i][j] = self.beta2 * st["v"][i][j] + (1.0 - self.beta2) * g * g
+                        low[i][j] = (st["m"][i][j] / c1) / (math.sqrt(st["v"][i][j] / c2) + self.eps)
+                update = _galore_unproject(low, st["U"], st["V"])
+                for i in range(rows):
+                    for j in range(cols):
+                        layer.weights[i][j] -= self.lr * update[i][j]
+            else:
+                for i in range(rows):
+                    for j in range(cols):
+                        g = grad_w[i][j]
+                        st["mw"][i][j] = self.beta1 * st["mw"][i][j] + (1.0 - self.beta1) * g
+                        st["vw"][i][j] = self.beta2 * st["vw"][i][j] + (1.0 - self.beta2) * g * g
+                        layer.weights[i][j] -= self.lr * (st["mw"][i][j] / c1) / (
+                            math.sqrt(st["vw"][i][j] / c2) + self.eps)
+            for i in range(rows):
+                g = grad_b[i]
+                st["mb"][i] = self.beta1 * st["mb"][i] + (1.0 - self.beta1) * g
+                st["vb"][i] = self.beta2 * st["vb"][i] + (1.0 - self.beta2) * g * g
+                layer.biases[i] -= self.lr * (st["mb"][i] / c1) / (
+                    math.sqrt(st["vb"][i] / c2) + self.eps)
+        return self
+
+    def state_bytes_estimate(self):
+        total = 0
+        for st in self.state:
+            if st["mode"] == "low":
+                if st["m"] is not None:
+                    total += 2 * len(st["m"]) * len(st["m"][0])
+                    total += len(st["U"]) * len(st["U"][0])
+                    total += len(st["V"]) * len(st["V"][0])
+                else:
+                    total += 2 * self.rank * self.rank
+                total += 2 * len(st["mb"])
+            else:
+                total += 2 * len(st["mw"]) * len(st["mw"][0]) + 2 * len(st["mb"])
+        return total
+
+
 def _jacobi_eigh(a, tol=1e-12, max_sweeps=60):
     """对称矩阵的 Jacobi 特征分解，返回 ``(eigvals, V)``，列为特征向量
 
