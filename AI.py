@@ -5583,6 +5583,184 @@ def steer(rows, direction, alpha: float = 1.0):
     return [[row[j] + a * d[j] for j in range(len(d))] for row in hidden]
 
 
+
+"""Tuned lens：为每一层隐藏状态训练一个仿射探针，拟合最终 logits。
+
+与 logit lens 直接用输出层反投影不同，tuned lens 每层单独训练一个
+``logits_l = W_l·h_l + b_l``，用最终模型的软分布作为监督（KL / 交叉熵），
+得到的「每层可读性」曲线通常更平滑、也能处理没有绑定权重的模型。
+"""
+
+
+def _tl_check_matrix(rows, name):
+    if not isinstance(rows, (list, tuple)) or len(rows) == 0:
+        raise ValueError(f"tuned_lens: {name} 必须是非空二维列表")
+    out = []
+    width = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise ValueError(f"tuned_lens: {name} 必须是非空二维列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"tuned_lens: {name} 各行长度必须一致")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError(f"tuned_lens: {name} 必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _tl_softmax(row):
+    m = max(row)
+    ex = [math.exp(v - m) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _tl_log_softmax(row):
+    m = max(row)
+    lse = m + math.log(sum(math.exp(v - m) for v in row))
+    return [v - lse for v in row]
+
+
+def tuned_lens(hidden_states, final_logits, lr=0.1, epochs=100, l2=1e-4,
+               seed=None):
+    """在每层隐藏状态上训练仿射探针，拟合最终 logits 的软分布。
+
+    hidden_states: 长度 L 的列表，每项是 ``(T, d)`` 的隐藏状态；
+    final_logits: ``(T, V)`` 的最终模型输出。
+
+    返回 ``{"num_layers", "layers": [{layer, loss, kl, accuracy, weights,
+    biases, loss_history}], "best_layer", "best_accuracy"}``。
+    """
+    if not isinstance(hidden_states, (list, tuple)) or len(hidden_states) == 0:
+        raise ValueError("tuned_lens: hidden_states 必须是非空列表")
+    if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+            or not math.isfinite(lr) or lr <= 0.0:
+        raise ValueError("tuned_lens: lr 必须是正数")
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+        raise ValueError("tuned_lens: epochs 必须是正整数")
+    if not isinstance(l2, (int, float)) or isinstance(l2, bool) \
+            or not math.isfinite(l2) or l2 < 0.0:
+        raise ValueError("tuned_lens: l2 必须是非负有限数")
+    if seed is not None:
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError("tuned_lens: seed 必须是整数或 None")
+
+    logits = _tl_check_matrix(final_logits, "final_logits")
+    T = len(logits)
+    V = len(logits[0])
+    if V < 2:
+        raise ValueError("tuned_lens: final_logits 的 vocab 维度至少为 2")
+    layers = []
+    for idx, hs in enumerate(hidden_states):
+        rows = _tl_check_matrix(hs, f"hidden_states[{idx}]")
+        if len(rows) != T:
+            raise ValueError(
+                f"tuned_lens: hidden_states[{idx}] 的序列长度必须与 final_logits 一致")
+        layers.append(rows)
+    d = len(layers[0][0])
+    for idx, rows in enumerate(layers):
+        if len(rows[0]) != d:
+            raise ValueError(
+                f"tuned_lens: hidden_states[{idx}] 的隐藏维度与第 0 层不一致")
+
+    targets = [_tl_softmax(row) for row in logits]
+    target_argmax = [max(range(V), key=lambda j: logits[t][j]) for t in range(T)]
+
+    if seed is not None:
+        state = random.getstate()
+        random.seed(seed)
+        try:
+            results = _tl_fit_all(layers, targets, target_argmax, lr, epochs,
+                                  l2, V, d)
+        finally:
+            random.setstate(state)
+    else:
+        results = _tl_fit_all(layers, targets, target_argmax, lr, epochs,
+                              l2, V, d)
+
+    best = max(results, key=lambda r: r["accuracy"])
+    return {"num_layers": len(results), "layers": results,
+            "best_layer": best["layer"], "best_accuracy": best["accuracy"]}
+
+
+def _tl_fit_all(layers, targets, target_argmax, lr, epochs, l2, V, d):
+    T = len(targets)
+    results = []
+    for layer_idx, hidden in enumerate(layers):
+        W = [[random.gauss(0.0, math.sqrt(2.0 / max(1, d)))
+              for _ in range(d)] for _ in range(V)]
+        b = [0.0] * V
+        history = []
+        for _ in range(epochs):
+            loss = 0.0
+            grad_logits = [[0.0] * V for _ in range(T)]
+            for t in range(T):
+                h = hidden[t]
+                row = [0.0] * V
+                for j in range(V):
+                    acc = b[j]
+                    w = W[j]
+                    for k in range(d):
+                        acc += w[k] * h[k]
+                    row[j] = acc
+                q = _tl_softmax(row)
+                p = targets[t]
+                for j in range(V):
+                    loss -= p[j] * math.log(max(q[j], 1e-12))
+                    grad_logits[t][j] = (q[j] - p[j]) / T
+            loss /= T
+            history.append(loss)
+            gW = [[0.0] * d for _ in range(V)]
+            gb = [0.0] * V
+            for t in range(T):
+                h = hidden[t]
+                for j in range(V):
+                    g = grad_logits[t][j]
+                    gb[j] += g
+                    for k in range(d):
+                        gW[j][k] += g * h[k]
+            for j in range(V):
+                b[j] -= lr * (gb[j] + l2 * b[j])
+                for k in range(d):
+                    W[j][k] -= lr * (gW[j][k] + l2 * W[j][k])
+        # 评估
+        loss = 0.0
+        kl = 0.0
+        correct = 0
+        for t in range(T):
+            h = hidden[t]
+            row = [0.0] * V
+            for j in range(V):
+                acc = b[j]
+                w = W[j]
+                for k in range(d):
+                    acc += w[k] * h[k]
+                row[j] = acc
+            q = _tl_softmax(row)
+            p = targets[t]
+            for j in range(V):
+                loss -= p[j] * math.log(max(q[j], 1e-12))
+                if p[j] > 0.0:
+                    kl += p[j] * math.log(p[j] / max(q[j], 1e-12))
+            if max(range(V), key=lambda j: row[j]) == target_argmax[t]:
+                correct += 1
+        results.append({
+            "layer": layer_idx,
+            "loss": loss / T,
+            "kl": kl / T,
+            "accuracy": correct / T,
+            "weights": W,
+            "biases": b,
+            "loss_history": history,
+        })
+    return results
+
 def patching_delta(clean_rows, patched_rows, direction):
     """激活替换效应：patched 与 clean 在 direction 上平均投影之差。"""
     clean = _interp_check_matrix(clean_rows, "clean_rows")

@@ -43080,3 +43080,75 @@ class TestS5Block:
         assert _s5_raises(lambda: m.backward([[0.1, 0.2]]))
         assert _s5_raises(lambda: m.sgd_step(0.0))
         assert _s5_raises(lambda: m.sgd_step(-1.0))
+
+
+import random
+
+
+def _tl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _tl_data(seed=4):
+    rng = random.Random(seed)
+    T, d, V = 40, 6, 5
+    w_true = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(V)]
+    h1 = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(T)]
+    h2 = [[h1[t][k] + 0.3 * rng.gauss(0, 1) for k in range(d)]
+          for t in range(T)]
+    final = [[sum(w_true[j][k] * h2[t][k] for k in range(d))
+              for j in range(V)] for t in range(T)]
+    h0 = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(T)]
+    return [h0, h1, h2], final, T, d, V
+
+
+class TestTunedLens:
+    def test_shapes_and_history(self):
+        hiddens, final, T, d, V = _tl_data()
+        res = AI.tuned_lens(hiddens, final, lr=0.2, epochs=80, seed=3)
+        assert res["num_layers"] == 3
+        for r in res["layers"]:
+            assert len(r["weights"]) == V and len(r["weights"][0]) == d
+            assert len(r["biases"]) == V
+            assert len(r["loss_history"]) == 80
+            assert r["loss_history"][-1] < r["loss_history"][0]
+            assert 0.0 <= r["accuracy"] <= 1.0
+            assert r["kl"] >= 0.0
+
+    def test_deeper_layers_more_readable(self):
+        hiddens, final, T, d, V = _tl_data()
+        res = AI.tuned_lens(hiddens, final, lr=0.2, epochs=150, seed=3)
+        layers = res["layers"]
+        assert layers[2]["accuracy"] > layers[0]["accuracy"]
+        assert layers[2]["kl"] < layers[0]["kl"]
+        assert layers[2]["accuracy"] > 0.9
+        assert res["best_layer"] == 2
+
+    def test_deterministic_with_seed(self):
+        hiddens, final, T, d, V = _tl_data()
+        a = AI.tuned_lens(hiddens, final, lr=0.1, epochs=20, seed=7)
+        b = AI.tuned_lens(hiddens, final, lr=0.1, epochs=20, seed=7)
+        assert a["layers"][0]["weights"] == b["layers"][0]["weights"]
+        assert a["layers"][0]["loss_history"] == b["layers"][0]["loss_history"]
+
+    def test_invalid_inputs(self):
+        assert _tl_raises(lambda: AI.tuned_lens([], [[0.1, 0.2]]))
+        hiddens, final, T, d, V = _tl_data()
+        assert _tl_raises(lambda: AI.tuned_lens([hiddens[0]], final[:-1]))
+        assert _tl_raises(lambda: AI.tuned_lens([[[0.1, 0.2], [0.3, 0.4]]],
+                                                [[0.1, 0.2]]))
+        assert _tl_raises(
+            lambda: AI.tuned_lens([[[0.1, 0.2]]], [[0.1, 0.2]] * 1, lr=0))
+        assert _tl_raises(lambda: AI.tuned_lens(hiddens, final, epochs=0))
+        assert _tl_raises(lambda: AI.tuned_lens(hiddens, final, l2=-1.0))
+        assert _tl_raises(lambda: AI.tuned_lens(hiddens, final, seed=1.5))
+        assert _tl_raises(
+            lambda: AI.tuned_lens([[[float("nan"), 0.2]]], [[0.1, 0.2]]))
+        # vocab < 2
+        assert _tl_raises(lambda: AI.tuned_lens([[[0.1, 0.2]]], [[0.5]]))

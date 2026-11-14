@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2700 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2704 项）
 
 ## 特性
 
@@ -2321,6 +2321,24 @@ hits = hybrid_search(idx, "apple", [1.0, 0.0],
 | `hybrid_search(index, query, query_vec, doc_vecs, top_k=5, rrf_k=60, ...)` | BM25 + dense 两路排名用 RRF 融合，返回 `rrf_score`/`bm25_rank`/`dense_rank` |
 
 - 边界：切词固定为小写 `[a-z0-9]+`（中文需先分词）；BM25 只做纯 Python 打分，不含倒排索引/增量更新；RRF 不下沉原始分数；ColBERT-lite 用向量最大相似度近似 MaxSim，不做 query 扩展。
+
+### tuned lens（每层仿射探针）
+
+logit lens 把中间层表示直接乘输出头，前提是模型有绑定/可用的输出权重；tuned lens
+改为**每层单独训练一个仿射探针**，用最终模型的软分布做监督：
+
+```python
+res = AI.tuned_lens([h_layer0, h_layer1, h_layer2], final_logits,
+                    lr=0.2, epochs=100, seed=0)
+for r in res["layers"]:
+    print(r["layer"], r["loss"], r["kl"], r["accuracy"])
+```
+
+`hidden_states` 是长度 L 的列表（每项 `(T, d)`），`final_logits` 是 `(T, V)`；
+函数对每层训练 `logits_l = W_l·h_l + b_l`（对最终 softmax 分布做交叉熵），返回
+`{"num_layers", "layers": [{"layer", "loss", "kl", "accuracy", "weights",
+"biases", "loss_history"}], "best_layer", "best_accuracy"}`。`accuracy` 是
+「探针 argmax 与最终 logits argmax 一致」的比例，`kl` 是每 token 的平均 KL。
 
 ### 可解释性工具（logit lens / 残差方向 / activation patching）
 
@@ -6044,7 +6062,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2700 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2704 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6344,6 +6362,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestColBERT` | late interaction 手算、normalize 开关、维度错误 |
 | `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
 | `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
+| `TestTunedLens` | 每层探针形状与 loss 下降、深层可读性（accuracy 升 / KL 降）、seed 可复现、非法输入（空列表 / 长度不一致 / 维度不一致 / V<2） |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6530,6 +6549,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2700 个单元测试
+├── test_ai.py       # 2704 个单元测试
 └── README.md
 ```
