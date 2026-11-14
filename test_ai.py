@@ -47879,3 +47879,85 @@ class TestAdvancedHPO:
         assert _hpo_raises(lambda: AI.pbt(obj, space, population=0))
         assert _hpo_raises(lambda: AI.pbt(obj, space, top_ratio=1.5))
         assert _hpo_raises(lambda: AI.pbt(obj, space, perturb=3.0))
+
+
+# ---- 训练技巧：梯度噪声 / Noisy Student / 语义去重 / 数据质量过滤 ----
+
+
+def _tt_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestTrainingTricks:
+    def test_gradient_noise(self):
+        grads = [([[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])]
+        assert AI.gradient_noise(grads, 0.0) == grads
+        n1 = AI.gradient_noise(grads, 0.5, seed=3)
+        n2 = AI.gradient_noise(grads, 0.5, seed=3)
+        assert n1 == n2 and n1 != grads
+        assert len(n1[0][0]) == 2 and len(n1[0][1]) == 2
+        assert _tt_raises(lambda: AI.gradient_noise(grads, -1.0))
+        assert _tt_raises(lambda: AI.gradient_noise([]))
+        assert _tt_raises(lambda: AI.gradient_noise(grads, seed=1.5))
+
+    def test_semdedup(self):
+        emb = [[1.0, 0.0], [0.99999, 0.01], [0.0, 1.0]]
+        r = AI.semdedup(emb, 0.99)
+        assert r["kept"] == [0, 2] and r["removed"] == [1]
+        r2 = AI.semdedup(emb, 1.0)
+        assert r2["kept"] == [0, 1, 2]
+        assert _tt_raises(lambda: AI.semdedup([[1.0], [1.0, 2.0]]))
+        assert _tt_raises(lambda: AI.semdedup(emb, 1.5))
+        assert _tt_raises(lambda: AI.semdedup([]))
+
+    def test_quality_filter(self):
+        r = AI.quality_filter([0.9, 0.1, 0.6], 0.5)
+        assert r["kept"] == [0, 2] and r["removed"] == [1]
+        r2 = AI.quality_filter([0.4, 0.5], 0.5)
+        assert r2["kept"] == [1]
+        assert _tt_raises(lambda: AI.quality_filter([float("nan")]))
+        assert _tt_raises(lambda: AI.quality_filter([]))
+
+    def test_noisy_student_distillation(self):
+        teacher = AI.MLP([2, 4, 2], ["sigmoid", "linear"])
+        student = AI.MLP([2, 4, 2], ["sigmoid", "linear"])
+        xs = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, -1.0]]
+        ys = [0, 1, 0, 1]
+
+        def train(model, steps, lr, alpha):
+            opt = AI.Adam(model, lr)
+            for _ in range(steps):
+                loss, grads = AI.noisy_student_loss_and_backward(
+                    model, teacher, xs, ys, alpha=alpha)
+                opt.step(grads)
+            return loss
+
+        loss_t = train(teacher, 120, 0.05, 0.0)
+        assert loss_t < 0.3
+        first = AI.noisy_student_loss_and_backward(student, teacher, xs, ys,
+                                                   alpha=0.5)[0]
+        opt = AI.Adam(student, 0.05)
+        for _ in range(60):
+            loss, grads = AI.noisy_student_loss_and_backward(
+                student, teacher, xs, ys, alpha=0.5)
+            opt.step(grads)
+        assert loss < first * 0.6
+
+    def test_invalid_inputs(self):
+        teacher = AI.MLP([2, 2], ["linear"])
+        student = AI.MLP([2, 2], ["linear"])
+        xs = [[1.0, 0.0]]
+        ys = [0]
+        assert _tt_raises(lambda: AI.noisy_student_loss_and_backward(
+            student, teacher, xs, ys, alpha=1.5))
+        assert _tt_raises(lambda: AI.noisy_student_loss_and_backward(
+            student, teacher, xs, [5]))
+        assert _tt_raises(lambda: AI.noisy_student_loss_and_backward(
+            student, teacher, [], []))
+        other = AI.MLP([3, 2], ["linear"])
+        assert _tt_raises(lambda: AI.noisy_student_loss_and_backward(
+            student, other, xs, ys))

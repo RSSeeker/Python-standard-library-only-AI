@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2998 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3003 项）
 
 ## 特性
 
@@ -1185,6 +1185,30 @@ AI.export_history_json(history, "history.json")
 
 边界：`grid_search` 是对 `param_grid` 的笛卡尔积暴力枚举（组合数大时会很慢）；
 `objective` 必须返回有限数字；JSON 只支持标准库 `json` 能序列化的类型。
+
+### 训练技巧：梯度噪声 / Noisy Student / 语义去重 / 数据质量过滤
+
+- `gradient_noise(grads, noise_std=0.01, seed=None)`：给每层
+  `(grad_w, grad_b)` 加独立高斯噪声，返回新的梯度列表。
+- `noisy_student_loss_and_backward(student, teacher, xs, ys,
+  alpha=0.5, temperature=2.0)`：学生同时学硬标签与教师软标签
+  （`(1-alpha)·CE + alpha·T²·KL`），返回 `(loss, grads)`，可直接交给
+  `Adam(student).step(grads)`。
+- `semdedup(embeddings, threshold=0.9)`：按顺序贪心保留与已保留样本
+  余弦相似度都 `<= threshold` 的样本，返回 `{kept, removed}`。
+- `quality_filter(scores, threshold=0.5)`：按质量分类器分数过滤，
+  返回 `{kept, removed}` 下标。
+
+```python
+loss, grads = AI.noisy_student_loss_and_backward(student, teacher, xs, ys)
+AI.Adam(student, 1e-3).step(grads)
+kept = AI.semdedup(embeddings, 0.9)["kept"]
+```
+
+边界：`gradient_noise` 不修改入参；`noisy_student` 只支持单标签分类
+（标签为类别下标）与同结构 MLP；`semdedup` 是 O(n²) 贪心去重（不做
+聚类）且只在已保留集合上比较；`quality_filter` 不训练分类器，只做阈值
+筛选。
 
 ### 断点续训
 
@@ -5172,7 +5196,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2998 项）。
+`tests/`（合计 3003 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5180,7 +5204,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2998 项
+pytest -q                        # test_ai.py + tests/ 合计 3003 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6939,7 +6963,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2998 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3003 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7433,6 +7457,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestTrainingTricks` | 梯度噪声/Noisy Student/语义去重/质量过滤 |
 | `TestAdvancedHPO` | TPE-lite/Hyperband/PBT 收敛与非法输入 |
 | `TestClassicCNNComponents` | DenseNet transition/ASPP/ROI Align/U-Net++ |
 | `TestTransformerXL` | Transformer-XL 段级循环/记忆/梯度 |

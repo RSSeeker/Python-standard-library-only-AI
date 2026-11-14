@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1853 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1861 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -25594,6 +25594,167 @@ def unet_plus_plus_forward(images, channels=8, seed=None):
                              seed=None if seed is None else seed + 3))
     out = _cnn_conv(d2, c, 1, seed=None if seed is None else seed + 4)
     return out
+
+
+# ---- 训练技巧：梯度噪声 / Noisy Student / 语义去重 / 数据质量过滤 ----
+
+
+def _p112_check_mlp(model, who):
+    if not isinstance(model, MLP):
+        raise ValueError(f"{who}: model 必须是 MLP")
+
+
+def _p112_softmax(v):
+    mx = max(v)
+    ex = [math.exp(x - mx) for x in v]
+    s = sum(ex)
+    return [x / s for x in ex]
+
+
+def _p112_check_grads(grads, who):
+    if not isinstance(grads, (list, tuple)) or not grads:
+        raise ValueError(f"{who}: grads 必须是非空列表")
+    for item in grads:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"{who}: grads 每项必须是 (grad_w, grad_b)")
+        gw, gb = item
+        if not isinstance(gw, list) or not isinstance(gb, list):
+            raise ValueError(f"{who}: 梯度必须是嵌套 list")
+        for row in gw:
+            if not isinstance(row, list) or len(row) != len(gb):
+                raise ValueError(f"{who}: 权重梯度形状不一致")
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: 梯度必须是有限数字")
+
+
+def gradient_noise(grads, noise_std=0.01, seed=None):
+    """给每层梯度加独立高斯噪声（Neelakantan et al. 2015）。"""
+    _p112_check_grads(grads, "gradient_noise")
+    if isinstance(noise_std, bool) or not isinstance(noise_std, (int, float)) \
+            or not math.isfinite(float(noise_std)) or float(noise_std) < 0.0:
+        raise ValueError("gradient_noise: noise_std 必须是非负有限数字")
+    if seed is not None and (isinstance(seed, bool)
+                             or not isinstance(seed, int)):
+        raise ValueError("gradient_noise: seed 必须是 int 或 None")
+    rng = random.Random(seed)
+    out = []
+    for gw, gb in grads:
+        ngw = [[float(v) + rng.gauss(0.0, float(noise_std)) for v in row]
+               for row in gw]
+        ngb = [float(v) + rng.gauss(0.0, float(noise_std)) for v in gb]
+        out.append((ngw, ngb))
+    return out
+
+
+def _p112_cos(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def semdedup(embeddings, threshold=0.9):
+    """语义去重：按顺序保留与已保留样本余弦相似度都 <= threshold 的样本。"""
+    if not isinstance(embeddings, (list, tuple)) or not embeddings:
+        raise ValueError("semdedup: embeddings 必须是非空列表")
+    dim = None
+    for emb in embeddings:
+        if not isinstance(emb, (list, tuple)) or not emb:
+            raise ValueError("semdedup: 每个 embedding 必须是非空 list")
+        if dim is None:
+            dim = len(emb)
+        elif len(emb) != dim:
+            raise ValueError("semdedup: 所有 embedding 维度必须一致")
+        for v in emb:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(float(v)):
+                raise ValueError("semdedup: embedding 必须是有限数字")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) \
+            or not -1.0 <= float(threshold) <= 1.0:
+        raise ValueError("semdedup: threshold 必须在 [-1,1]")
+    kept, removed = [], []
+    for i, emb in enumerate(embeddings):
+        dup = False
+        for j in kept:
+            if _p112_cos(emb, embeddings[j]) > float(threshold):
+                dup = True
+                break
+        if dup:
+            removed.append(i)
+        else:
+            kept.append(i)
+    return {"kept": kept, "removed": removed}
+
+
+def quality_filter(scores, threshold=0.5):
+    """按质量分类器分数过滤样本（分数越高越可信）。"""
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError("quality_filter: scores 必须是非空列表")
+    for v in scores:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            raise ValueError("quality_filter: score 必须是有限数字")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) \
+            or not math.isfinite(float(threshold)):
+        raise ValueError("quality_filter: threshold 必须是有限数字")
+    kept = [i for i, v in enumerate(scores) if float(v) >= float(threshold)]
+    removed = [i for i, v in enumerate(scores) if float(v) < float(threshold)]
+    return {"kept": kept, "removed": removed}
+
+
+def noisy_student_loss_and_backward(student, teacher, xs, ys,
+                                    alpha=0.5, temperature=2.0):
+    """Noisy Student：学生同时学硬标签与教师的软标签（知识蒸馏 + 噪声）。
+
+    返回 `(loss, grads)`；`grads` 是 `[(grad_w, grad_b), ...]`，可交给
+    `Adam(student).step(grads)`。教师参数不更新。
+    """
+    _p112_check_mlp(student, "noisy_student_loss_and_backward.student")
+    _p112_check_mlp(teacher, "noisy_student_loss_and_backward.teacher")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("noisy_student: xs 不能为空")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("noisy_student: ys 必须与 xs 等长")
+    if student.layer_sizes[0] != teacher.layer_sizes[0] \
+            or student.layer_sizes[-1] != teacher.layer_sizes[-1]:
+        raise ValueError("noisy_student: student 与 teacher 的输入/输出维度必须一致")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
+            or not 0.0 <= float(alpha) <= 1.0:
+        raise ValueError("noisy_student: alpha 必须在 [0,1]")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("noisy_student: temperature 必须为正有限数字")
+    n = len(xs)
+    T = float(temperature)
+    out_dim = student.layer_sizes[-1]
+    zero_w = _mlp_zero_grads(student)
+    zero_b = [[0.0] * layer.fan_out for layer in student.layers]
+    total = 0.0
+    for x, y in zip(xs, ys):
+        if isinstance(y, bool) or not isinstance(y, int) or not 0 <= y < out_dim:
+            raise ValueError("noisy_student: 标签必须是合法类别下标")
+        logits_s = student.forward(x)
+        logits_t = teacher.forward(x)
+        p_hard = _p112_softmax(logits_s)
+        p = _p112_softmax([v / T for v in logits_s])
+        q = _p112_softmax([v / T for v in logits_t])
+        ce = -math.log(max(p_hard[y], 1e-300))
+        kl = sum(q[k] * (math.log(max(q[k], 1e-300))
+                         - math.log(max(p[k], 1e-300)))
+                 for k in range(out_dim))
+        total += (1.0 - float(alpha)) * ce + float(alpha) * T * T * kl
+        d = []
+        for k in range(out_dim):
+            hard = 1.0 if k == y else 0.0
+            d.append((1.0 - float(alpha)) * (p_hard[k] - hard)
+                     + float(alpha) * T * (p[k] - q[k]))
+        grads = _mlp_backward(student, d)
+        _mlp_accumulate(zero_w, zero_b, grads)
+    return total / n, list(zip(zero_w, zero_b))
 
 class TransformerXL:
     """Transformer-XL 的段级循环（教学简化：无相对位置编码）
