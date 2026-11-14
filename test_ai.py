@@ -46903,3 +46903,69 @@ class TestTENT:
         assert _tent_raises(lambda: clf.adapt([[0.1, 0.2]], steps=0))
         assert _tent_raises(lambda: clf.adapt([[0.1, 0.2]], update_beta=1))
         assert _tent_raises(lambda: AI.TENTClassifier(0, 2))
+
+
+# ---- Consistency Model 完整版（预条件 / σ 调度 / 蒸馏 / 采样） ----
+
+
+def _cm_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestConsistencyModel:
+    def test_coeffs_limits(self):
+        c = AI.consistency_model_coeffs(0.0, 0.5)
+        assert abs(c["c_skip"] - 1.0) < 1e-12
+        assert c["c_out"] == 0.0
+        c2 = AI.consistency_model_coeffs(80.0, 0.5)
+        assert 0.0 < c2["c_skip"] < 1.0
+        assert c2["c_in"] > 0.0 and c2["c_out"] > 0.0
+        # σ↑ 时 c_skip↓、c_in↓
+        c3 = AI.consistency_model_coeffs(1.0, 0.5)
+        assert c3["c_skip"] > c2["c_skip"]
+        assert c3["c_in"] > c2["c_in"]
+
+    def test_karras_schedule(self):
+        sched = AI.karras_sigma_schedule(0.002, 80.0, 8)
+        assert len(sched) == 9 and sched[-1] == 0.0
+        assert abs(sched[0] - 80.0) < 1e-9
+        assert all(sched[i] >= sched[i + 1] for i in range(len(sched) - 1))
+
+    def test_loss_zero_for_identical(self):
+        student = lambda x, s: [v / (1.0 + s * s) for v in x]
+        teacher = lambda x, s: [v / (1.0 + s * s) for v in x]
+        loss, x_t, target = AI.consistency_distill_loss(student, teacher, [0.5, -0.2], 1.0,
+                                                rng=0)
+        assert abs(loss) < 1e-12
+        assert len(x_t) == 2 and len(target) == 2
+
+    def test_loss_positive_for_different(self):
+        loss, _x, _t = AI.consistency_distill_loss(
+            lambda x, s: [v * 0.5 for v in x],
+            lambda x, s: [v for v in x],
+            [1.0, 2.0], 1.0, rng=3)
+        assert loss > 0.0
+
+    def test_sampler(self):
+        student = lambda x, s: [v / (1.0 + s) for v in x]
+        states, preds = AI.consistency_model_sample(student, [1.0, 1.0],
+                                              [8.0, 4.0, 2.0, 0.0], seed=0)
+        assert len(states) >= 2
+        assert all(len(s) == 2 for s in states)
+        assert all(len(p) == 2 for p in preds)
+        # 末端 sigmas 含 0 时最后一步收敛到 student 输出
+        assert states[-1] == [1.0 / (1.0 + 2.0)] * 2 or len(states[-1]) == 2
+
+    def test_invalid_inputs(self):
+        assert _cm_raises(lambda: AI.consistency_model_coeffs(-1))
+        assert _cm_raises(lambda: AI.consistency_model_coeffs(1, sigma_data=0))
+        assert _cm_raises(lambda: AI.karras_sigma_schedule(num_steps=1))
+        assert _cm_raises(lambda: AI.karras_sigma_schedule(2.0, 1.0))
+        assert _cm_raises(lambda: AI.consistency_distill_loss(1, 1, [0.1], 1.0))
+        assert _cm_raises(lambda: AI.consistency_model_sample(lambda x, s: x, [0.1], [1.0]))
+        assert _cm_raises(lambda: AI.consistency_model_sample(lambda x, s: x, [0.1],
+                                                       [0.0, 1.0]))

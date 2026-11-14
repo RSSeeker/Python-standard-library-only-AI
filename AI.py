@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1797 个 def / 427 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1802 个 def / 427 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8424,6 +8424,148 @@ class TENTClassifier:
         probs = self.predict_batch(xs)
         return sum(-sum(v * math.log(max(v, 1e-300)) for v in row)
                    for row in probs) / len(probs)
+
+
+def _cm_check_sigma(sigma, name="sigma"):
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)):
+        raise TypeError(f"ConsistencyModel: {name} 必须是数字")
+    if not math.isfinite(float(sigma)) or float(sigma) < 0.0:
+        raise ValueError(f"ConsistencyModel: {name} 必须是非负有限数字")
+    return float(sigma)
+
+
+def consistency_model_coeffs(sigma, sigma_data=0.5):
+    """EDM / Consistency Model 的预条件系数
+
+    ```text
+    c_skip = σd² / (σ² + σd²)
+    c_out  = σ·σd / sqrt(σ² + σd²)
+    c_in   = 1 / sqrt(σ² + σd²)
+    c_noise = 0.25 · ln(σ)        # 网络输入用的对数噪声尺度
+    ```
+    """
+    sigma = _cm_check_sigma(sigma)
+    sigma_data = _cm_check_sigma(sigma_data, "sigma_data")
+    if sigma_data <= 0.0:
+        raise ValueError("ConsistencyModel: sigma_data 必须为正")
+    denom = sigma * sigma + sigma_data * sigma_data
+    c_skip = sigma_data * sigma_data / denom
+    c_out = sigma * sigma_data / math.sqrt(denom)
+    c_in = 1.0 / math.sqrt(denom)
+    c_noise = 0.25 * math.log(max(sigma, 1e-300))
+    return {"c_skip": c_skip, "c_out": c_out, "c_in": c_in, "c_noise": c_noise}
+
+
+def karras_sigma_schedule(sigma_min=0.002, sigma_max=80.0, num_steps=10, rho=7.0):
+    """Karras 等人的 σ 调度（EDM 用）：`σ_i = (σmax^(1/ρ) + i/(n-1)·(σmin^(1/ρ)-σmax^(1/ρ)))^ρ`"""
+    for v, name in ((sigma_min, "sigma_min"), (sigma_max, "sigma_max")):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError(f"ConsistencyModel: {name} 必须是数字")
+        if not math.isfinite(float(v)) or float(v) <= 0.0:
+            raise ValueError(f"ConsistencyModel: {name} 必须为正有限数字")
+    if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 2:
+        raise ValueError("ConsistencyModel: num_steps 必须是 ≥2 的整数")
+    rho = _cm_check_sigma(rho, "rho")
+    if rho <= 0.0:
+        raise ValueError("ConsistencyModel: rho 必须为正")
+    sigma_min = float(sigma_min)
+    sigma_max = float(sigma_max)
+    if sigma_min >= sigma_max:
+        raise ValueError("ConsistencyModel: 必须满足 sigma_min < sigma_max")
+    n = num_steps
+    a = sigma_max ** (1.0 / rho)
+    b = sigma_min ** (1.0 / rho)
+    out = []
+    for i in range(n):
+        t = i / (n - 1)
+        out.append((a + t * (b - a)) ** rho)
+    out.append(0.0)
+    return out
+
+
+def consistency_distill_loss(student, teacher, x0, sigma, sigma_data=0.5, rng=None,
+                     sigma_min=0.002):
+    """一致性蒸馏损失（单样本的确定性形式）
+
+    ```text
+    x_t = x0 + σ·ε                       # ε ~ N(0, I)
+    target = teacher(x_t, σ)             # EMA teacher，stop-grad
+    loss = mean((student(x_t, σ) - target)²)
+    ```
+
+    `student`/`teacher` 都是 `(x_t, σ) -> x0_hat` 的可调用对象。单样本版本，
+    不做 σ 的加权（可选在调用方乘 λ(σ)）；返回 `(loss, x_t, target)` 便于调试。
+    """
+    if not isinstance(x0, (list, tuple)) or len(x0) == 0:
+        raise ValueError("ConsistencyModel: x0 必须是非空向量")
+    x0v = []
+    for v in x0:
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(float(v)):
+            raise ValueError("ConsistencyModel: x0 必须是有限数字")
+        x0v.append(float(v))
+    sigma = _cm_check_sigma(sigma)
+    if sigma < float(sigma_min):
+        raise ValueError("ConsistencyModel: sigma 不能小于 sigma_min")
+    if not callable(student) or not callable(teacher):
+        raise TypeError("ConsistencyModel: student/teacher 必须是可调用对象")
+    rng = random.Random(rng) if rng is not None else random
+    eps = [rng.gauss(0.0, 1.0) for _ in range(len(x0v))]
+    x_t = [x0v[i] + sigma * eps[i] for i in range(len(x0v))]
+    target = teacher(x_t, sigma)
+    pred = student(x_t, sigma)
+    if len(target) != len(x0v) or len(pred) != len(x0v):
+        raise ValueError("ConsistencyModel: student/teacher 输出维度必须与 x0 一致")
+    loss = sum((pred[i] - target[i]) ** 2 for i in range(len(x0v))) / len(x0v)
+    return loss, x_t, list(target)
+
+
+def consistency_model_sample(student, x_start, sigmas, sigma_data=0.5, seed=None,
+                       sigma_min=0.0):
+    """一致性模型多步采样（Algorithm 2 的简化）：每步先预测 x0，再加噪到下一 σ
+
+    `sigmas` 从大到小排列（如 `karras_sigma_schedule` 的返回值），末项可为 0；
+    返回 `(samples, x0_preds)`，`samples` 是各步状态。
+    """
+    if not callable(student):
+        raise TypeError("ConsistencyModel: student 必须是可调用对象")
+    if not isinstance(sigmas, (list, tuple)) or len(sigmas) < 2:
+        raise ValueError("ConsistencyModel: sigmas 至少需要两个值")
+    sig = [_cm_check_sigma(s, "sigmas") for s in sigmas]
+    for i in range(len(sig) - 1):
+        if sig[i] < sig[i + 1]:
+            raise ValueError("ConsistencyModel: sigmas 必须从大到小")
+    if not isinstance(x_start, (list, tuple)) or len(x_start) == 0:
+        raise ValueError("ConsistencyModel: x_start 必须是非空向量")
+    x = []
+    for v in x_start:
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(float(v)):
+            raise ValueError("ConsistencyModel: x_start 必须是有限数字")
+        x.append(float(v))
+    rng = random.Random(seed) if seed is not None else random
+    states = [list(x)]
+    preds = []
+    for i in range(len(sig)):
+        s = sig[i]
+        if s == 0.0:
+            break
+        x0_hat = student(x, s)
+        if len(x0_hat) != len(x):
+            raise ValueError("ConsistencyModel: student 输出维度必须与输入一致")
+        preds.append(list(x0_hat))
+        if i == len(sig) - 1:
+            x = list(x0_hat)
+            break
+        s_next = sig[i + 1]
+        if s_next > 0.0:
+            noise = [rng.gauss(0.0, 1.0) for _ in x]
+            amp = math.sqrt(max(s_next * s_next - sigma_min * sigma_min, 0.0))
+            x = [x0_hat[j] + amp * noise[j] for j in range(len(x))]
+        else:
+            x = list(x0_hat)
+        states.append(list(x))
+    return states, preds
 
 
 class ITransformer:

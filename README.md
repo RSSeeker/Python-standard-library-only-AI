@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2892 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2898 项）
 
 ## 特性
 
@@ -416,6 +416,10 @@ model.train()     # 回到训练
 | `edm_heun_sampler(denoise_fn, x, ...)` | EDM 的二阶 Heun 采样：Euler 预测 + 端点平均校正，同等步数下误差更小 |
 | `dpm_solver_sampler(denoise_fn, x, steps=20, ...)` | DPM-Solver 的一阶指数积分器：区间内假设 x0 恒定，`x(sigma_next) = x0 + (sigma_next/sigma)*(x - x0)`，取得比 Euler 更大的有效步长 |
 | `consistency_training_loss(student_fn, teacher_fn, x, sigma, sigma_next)` / `consistency_sampler(student_fn, x, steps=8, ...)` | 一致性蒸馏（CD）的逐样本损失与采样器：student 直接预测 x0，teacher 用两步 Euler 目标；采样时逐级预测 x0 并重新加噪 |
+| `consistency_model_coeffs(sigma, sigma_data=0.5)` | Consistency Model 的预条件系数：`c_skip=σd²/(σ²+σd²)`、`c_out=σ·σd/sqrt(σ²+σd²)`、`c_in=1/sqrt(σ²+σd²)`、`c_noise=0.25·ln σ` |
+| `karras_sigma_schedule(sigma_min=0.002, sigma_max=80.0, num_steps=10, rho=7.0)` | Karras σ 调度（EDM 用）：`σ_i=(σmax^(1/ρ)+i/(n-1)(σmin^(1/ρ)-σmax^(1/ρ)))^ρ`，末尾追加 0 |
+| `consistency_distill_loss(student, teacher, x0, sigma, sigma_data=0.5, rng=None)` | 一致性蒸馏损失（单样本）：`x_t=x0+σ·ε`、`target=teacher(x_t,σ)`、`loss=mean((student(x_t,σ)-target)²)`，返回 `(loss, x_t, target)` |
+| `consistency_model_sample(student, x_start, sigmas, ...)` | 多步一致性采样（Algorithm 2 简化）：每步 student 预测 x0，再按下一 σ 加噪；返回各步状态与 x0 预测 |
 | `TransformerEncoderLayer` | 单层 Encoder（`causal=True` 时自注意力带因果掩码，`rope=True` / `window=N` / `alibi=True` 透传给注意力） |
 | `TransformerEncoder` | 多层 Encoder 堆叠（`causal` / `rope` / `window` 会传给每一层） |
 | `CrossAttention` | 交叉注意力：Q 来自解码器、K/V 来自编码器输出 `memory`（长度可不同，无因果掩码），`backward` 返回 `(dx, dmemory)` |
@@ -6622,7 +6626,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2892 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2898 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7110,6 +7114,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |
+| `TestConsistencyModel` | 预条件系数极限与单调性、Karras 调度单调、同函数损失为 0/不同为正、多步采样、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
@@ -7147,6 +7152,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2892 个单元测试
+├── test_ai.py       # 2898 个单元测试
 └── README.md
 ```
