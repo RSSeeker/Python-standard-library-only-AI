@@ -43830,3 +43830,132 @@ class TestMixtralModel:
         raises(lambda: m.loss_and_backward([0]))
         raises(lambda: m.generate([0, 1], max_new_tokens=-1))
         raises(lambda: AI.MixtralBlock(8, 2, num_experts=2, top_k=3))
+
+
+def _dsv3_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dsv3_model(seed=1, num_future=2, aux_coef=0.0):
+    return AI.DeepSeekV3Model(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                              num_layers=1, num_experts=3, top_k=2,
+                              max_len=16, aux_coef=aux_coef,
+                              num_future=num_future, mtp_weight=0.5, seed=seed)
+
+
+def _dsv3_fd(model, seq, get_value, set_value, get_grad, h=1e-5):
+    model.zero_grad()
+    model.loss_and_backward(seq)
+    ana = get_grad()
+    v0 = get_value()
+    set_value(v0 + h)
+    model.zero_grad()
+    lp = model.loss_and_backward(seq)
+    set_value(v0 - h)
+    model.zero_grad()
+    lm = model.loss_and_backward(seq)
+    set_value(v0)
+    num = (lp - lm) / (2.0 * h)
+    scale = max(abs(num), abs(ana), 1e-12)
+    return num, ana, abs(num - ana) / scale
+
+
+class TestDeepSeekV3Model:
+    def test_forward_and_param_count(self):
+        m = _dsv3_model()
+        assert m.param_count() == 1401
+        assert m.blocks[0].param_count() == 1183
+        logits = m.forward([0, 1, 2, 3, 4])
+        assert len(logits) == 5 and len(logits[0]) == 6
+        assert all(isinstance(v, float) for row in logits for v in row)
+        gen = m.generate([0, 1], max_new_tokens=3, seed=0)
+        assert len(gen) == 5
+        assert all(0 <= t < 6 for t in gen)
+        m2 = _dsv3_model(num_future=0)
+        assert m2.num_future == 0
+
+    def test_numerical_gradients(self):
+        m = _dsv3_model()
+        seq = [0, 1, 2, 3, 4]
+        blk = m.blocks[0]
+        cases = [
+            (lambda: blk.mla.W_dq[0][0],
+             lambda v: blk.mla.W_dq[0].__setitem__(0, v),
+             lambda: blk.mla.grads["W_dq"][0][0]),
+            (lambda: blk.mla.W_o[1][2],
+             lambda v: blk.mla.W_o[1].__setitem__(2, v),
+             lambda: blk.mla.grads["W_o"][1][2]),
+            (lambda: blk.moe.W_gate[1][2],
+             lambda v: blk.moe.W_gate[1].__setitem__(2, v),
+             lambda: blk.moe.grad_W_gate[1][2]),
+            (lambda: blk.moe.experts[0].W1[2][1],
+             lambda v: blk.moe.experts[0].W1[2].__setitem__(1, v),
+             lambda: blk.moe.experts[0].grads["W1"][2][1]),
+            (lambda: blk.ln2.gamma[3],
+             lambda v: blk.ln2.gamma.__setitem__(3, v),
+             lambda: blk.grad_ln2[3]),
+            (lambda: m.W_out[2][5],
+             lambda v: m.W_out[2].__setitem__(5, v),
+             lambda: m.grad_W_out[2][5]),
+            (lambda: m.emb.weight[3][4],
+             lambda v: m.emb.weight[3].__setitem__(4, v),
+             lambda: m.emb.grad_weight[3][4]),
+            (lambda: m.mtp_W[0][1][2],
+             lambda v: m.mtp_W[0][1].__setitem__(2, v),
+             lambda: m.grad_mtp_W[0][1][2]),
+        ]
+        for getv, setv, getg in cases:
+            num, ana, rel = _dsv3_fd(m, seq, getv, setv, getg)
+            assert rel < 2e-4, (rel, num, ana)
+
+    def test_causal_and_fit(self):
+        m = _dsv3_model(num_future=0)
+        l1 = m.forward([0, 1, 2, 3, 4])
+        l2 = m.forward([0, 1, 5, 3, 4])
+        for t in range(2):
+            for j in range(6):
+                assert abs(l1[t][j] - l2[t][j]) < 1e-10
+        data = [[0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 0], [2, 3, 4, 5, 0, 1]]
+        hist = m.fit(data, epochs=60, lr=0.02, seed=3)
+        assert hist[-1] < hist[0] * 0.6
+
+    def test_aux_loss_and_mtp(self):
+        m = _dsv3_model(num_future=1)
+        m.zero_grad()
+        total = m.loss_and_backward([0, 1, 2, 3, 4])
+        assert total == m.last_main_loss + 0.5 * m.last_mtp_loss
+        assert m.last_mtp_loss > 0.0
+        m3 = _dsv3_model(num_future=1, aux_coef=0.1)
+        m3.zero_grad()
+        m3.loss_and_backward([0, 1, 2, 3, 4])
+        assert m3.last_aux_loss > 0.0
+        gate = m3.blocks[0].moe.grad_W_gate
+        assert any(abs(v) > 0.0 for row in gate for v in row)
+
+    def test_invalid_inputs(self):
+        assert _dsv3_raises(lambda: AI.DeepSeekV3Model(vocab_size=0))
+        assert _dsv3_raises(
+            lambda: AI.DeepSeekV3Model(vocab_size=6, d_model=7, num_heads=2))
+        assert _dsv3_raises(
+            lambda: AI.DeepSeekV3Model(vocab_size=6, top_k=5))
+        assert _dsv3_raises(
+            lambda: AI.DeepSeekV3Model(vocab_size=6, num_future=9))
+        assert _dsv3_raises(
+            lambda: AI.DeepSeekV3Model(vocab_size=6, num_future=-1))
+        assert _dsv3_raises(
+            lambda: AI.DeepSeekV3Model(vocab_size=6, mtp_weight=0.0))
+        m = _dsv3_model()
+        assert _dsv3_raises(lambda: m.forward([]))
+        assert _dsv3_raises(lambda: m.forward([0, 9]))
+        assert _dsv3_raises(lambda: m.forward([0, 1.5]))
+        assert _dsv3_raises(lambda: m.forward([0] * 100))
+        assert _dsv3_raises(lambda: m.loss_and_backward([1]))
+        assert _dsv3_raises(lambda: m.loss_and_backward("ab"))
+        assert _dsv3_raises(lambda: m.blocks[0].backward([[0.0] * 8]))
+        assert _dsv3_raises(lambda: m.generate([], max_new_tokens=2))
+        assert _dsv3_raises(lambda: m.generate([0], max_new_tokens=-1))
+        assert _dsv3_raises(lambda: m.generate([0], temperature=0.0))

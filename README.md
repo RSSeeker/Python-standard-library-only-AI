@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2741 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2746 项）
 
 ## 特性
 
@@ -847,6 +847,11 @@ mix = MixtralModel(vocab_size=64, d_model=64, num_heads=8, num_layers=2,
                    num_experts=8, top_k=2, max_len=128)   # 每 token 只走 2 个专家
 mix.fit(seqs, epochs=50, lr=3e-3)
 out = mix.generate([1, 2, 3], max_new_tokens=16)
+
+v3 = DeepSeekV3Model(vocab_size=64, d_model=64, num_heads=8, num_layers=2,
+                     num_experts=8, top_k=2, num_future=1, max_len=128)
+v3.fit(seqs, epochs=50, lr=3e-3)      # 主 CE + MTP 加权损失
+out = v3.generate([1, 2, 3], max_new_tokens=16)
 ```
 
 | 类 | 结构 / 说明 |
@@ -855,6 +860,8 @@ out = mix.generate([1, 2, 3], max_new_tokens=16)
 | `LlamaModel(vocab_size, d_model=32, num_heads=4, d_ff=64, num_layers=2, num_kv_heads=None, max_len=256, dropout=0.0, rope=True)` | Embedding → N×LlamaBlock → RMSNorm → LM 头；`fit` 做 teacher-forcing CE（位置 t 预测 `ids[t+1]`）；`generate` 支持温度 / top_k；另有 `param_count` / `zero_grad` / `adam_step` |
 | `MixtralBlock(d_model, num_heads, d_ff=None, num_experts=4, top_k=2, num_kv_heads=None, dropout=0.0, rope=True)` | Mixtral 解码器块：pre-norm 自注意力（GQA / RoPE）残差 + pre-norm 稀疏 `MoE` 残差（`top_k` 个专家，每个专家是 GELU FFN）；反向按残差链式法则手写 |
 | `MixtralModel(vocab_size, d_model=32, num_heads=4, d_ff=None, num_layers=2, num_experts=4, top_k=2, num_kv_heads=None, max_len=256, dropout=0.0, rope=True, aux_coef=0.0, seed=None)` | Embedding → N×MixtralBlock → RMSNorm → LM 头；`fit` 做 teacher-forcing CE；`aux_coef > 0` 时附加负载均衡辅助损失（只对门控参数产生梯度）；`generate` 支持温度 / top_k；另有 `param_count` / `zero_grad` / `adam_step` |
+| `DeepSeekV3Block(d_model, num_heads, d_ff=None, kv_latent_dim=None, q_latent_dim=None, rope_dim=None, num_experts=4, top_k=2, aux_coef=0.0)` | DeepSeek-V3 解码器块：pre-norm 残差 + `DeepSeekMLA`（Q/KV 低秩 + 解耦 RoPE），pre-norm 残差 + 稀疏 `MoE`；反向逐层手写（MLA 的 RoPE 逆旋转、RMSNorm 重放、MoE 路由梯度均在内部完成） |
+| `DeepSeekV3Model(vocab_size, d_model=32, num_heads=4, d_ff=None, num_layers=2, num_experts=4, top_k=2, kv_latent_dim=None, q_latent_dim=None, rope_dim=None, max_len=64, aux_coef=0.0, num_future=0, mtp_weight=0.5, seed=None)` | Embedding → N×DeepSeekV3Block → RMSNorm → 词表头（+ 可选 `num_future` 个 MTP 线性头）；`fit` 用主 CE + `mtp_weight`×MTP 平均 CE；`aux_coef > 0` 时附加负载均衡损失（Stop-Gradient）；`generate` 支持温度 / top_k；另有 `param_count` / `zero_grad` / `adam_step` |
 | `ResNet(in_channels=3, num_classes=10, stem_channels=16, channel_plan=(16,32,64), blocks_per_stage=(2,2,2))` | stem `Conv2d → BatchNorm2d → ReLU`；每个 stage 用 `Bottleneck2d`（首块 stride=2 下采样，1×1 投影捷径），末尾 `AdaptiveAvgPool2d((1,1)) → Flatten → 分类头`；`logits` / `loss_and_backward` / `adam_step`（Conv 与 BN 分开更新）/ `fit` |
 
 `LlamaModel.generate` 不走 KV cache（每次整段重算，和 `CausalLM.generate` 的默认路径一致）；
@@ -863,6 +870,9 @@ out = mix.generate([1, 2, 3], max_new_tokens=16)
 `MixtralModel` 的稀疏激活只发生在 FFN 子层：每个 token 走 `top_k` 个专家，其余专家不参与该 token 的前向/反向；
 `aux_coef > 0` 时用 Switch Transformer 的负载均衡损失惩罚路由塌缩，梯度只回传到门控参数，
 不改变各专家的输入梯度（标准 Stop-Gradient 做法）。与 `LlamaModel` 一样，`generate` 不走 KV cache。
+`DeepSeekV3Model` 复用同一套 MLA 与 MoE 组件：MTP 头为每个未来偏移建一个线性头，训练时把
+`num_future` 个未来位置的交叉熵按 `mtp_weight` 加权进总损失；MLA 的 `kv_cache_size` 只按
+`kv_latent_dim + rope_dim` 计，体现「压缩 KV 后再上投影」的缓存收益（本实现仍逐段重算，不做增量解码）。
 
 ### 组合模型（T5 / BERT）
 
@@ -6188,7 +6198,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2741 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2746 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6266,6 +6276,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAdaLoRALinear` | B=0 等价原层 / A、B 数值梯度 / `prune` 保留 top-k 且死秩全零 / 剪枝后前向等于存活秩之和 / 非法 `keep` |
 | `TestCompositeModels` | LLaMA 前向形状/参数量/fit 降 loss/generate/GQA/非法输入；ResNet 前向/参数量、`Bottleneck2d` stride=2 反向回归、100 轮拟合收敛（合成图案 6/6） |
 | `TestMixtralModel` | Mixtral 前向/参数量、6 类参数中心差分（注意力/门控/专家/归一化/词表头/嵌入）、因果性、40 轮拟合降 loss、aux 负载均衡梯度、非法输入 |
+| `TestDeepSeekV3Model` | DeepSeek-V3 前向/参数量（1401，块 1183）、8 类参数中心差分（MLA/门控/专家/RMSNorm/词表头/嵌入/MTP）、因果性、60 轮拟合降 loss、aux 负载均衡梯度、MTP 损失分解、非法输入 |
 | `TestMultiLabelAndStatistics` | 多标签 Exact Match / Ranking Loss / LRAP 手算值；MSP / Energy / OOD AUROC；McNemar 精确与近似；Wilcoxon 对称与单侧 |
 | `TestT5AndBertModels` | T5 forward/param_count=6040/编码器与解码器相对偏置梯度非零/fit 降 loss/非法输入；BERT MLM+NSP forward、loss 下降、mask 标签与 NSP 非法输入 |
 | `TestBootstrapCohensTemperature` | bootstrap CI 包含均值/自定义统计量/非法参数；Cohen's d 已知值、相同与零方差；温度缩放的欠自信锐化、过自信平滑、对称样本平坦与非法输入 |
@@ -6683,6 +6694,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2741 个单元测试
+├── test_ai.py       # 2746 个单元测试
 └── README.md
 ```

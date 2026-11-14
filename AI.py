@@ -83474,6 +83474,536 @@ class MixtralModel:
                 return tok
         return cand[-1]
 
+# ============================================================================
+#  DeepSeek-V3 风格复合模型（MLA + MoE + MTP）
+# ----------------------------------------------------------------------------
+# 把已有的三个组件拼起来：
+#   * DeepSeekMLA —— 完整版 MLA（Q/KV 低秩压缩 + 解耦 RoPE）
+#   * MoE         —— 稀疏前馈（top-k 专家 + 可选负载均衡辅助损失）
+#   * MTP 头      —— 多 token 预测（每个未来偏移一个线性头）
+# 每个 block = pre-norm MLA 残差 + pre-norm MoE 残差；模型 = Embedding →
+# N×block → RMSNorm → 词表头（+ 可选 MTP 头）。反向逐层手写。
+# ============================================================================
+
+
+def _dsv3_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("DeepSeekV3: %s 必须是正整数，收到 %r" % (name, value))
+    if value < 1:
+        raise ValueError("DeepSeekV3: %s 必须 >= 1，收到 %r" % (name, value))
+    return int(value)
+
+
+def _dsv3_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("DeepSeekV3: %s 必须是正数，收到 %r" % (name, value))
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("DeepSeekV3: %s 必须是有限正数，收到 %r" % (name, value))
+    return value
+
+
+def _dsv3_check_nonneg_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("DeepSeekV3: %s 必须是非负数，收到 %r" % (name, value))
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("DeepSeekV3: %s 必须是有限非负数，收到 %r" % (name, value))
+    return value
+
+
+def _dsv3_check_seq(seq, d_model, who):
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError("DeepSeekV3.%s: 输入序列不能为空" % who)
+    out = []
+    for t, row in enumerate(seq):
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("DeepSeekV3.%s: 第 %d 个 token 必须是列表" % (who, t))
+        if len(row) != d_model:
+            raise ValueError(
+                "DeepSeekV3.%s: 第 %d 个 token 维度 %d 与 d_model=%d 不一致"
+                % (who, t, len(row), d_model))
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError("DeepSeekV3.%s: token 元素必须是数字" % who)
+            v = float(v)
+            if not math.isfinite(v):
+                raise ValueError("DeepSeekV3.%s: token 元素必须是有限数字" % who)
+            vals.append(v)
+        out.append(vals)
+    return out
+
+
+def _dsv3_zero_like(tree):
+    if tree is None:
+        return None
+    if isinstance(tree[0], list):
+        return [_dsv3_zero_like(row) for row in tree]
+    return [0.0] * len(tree)
+
+
+def _dsv3_adam_step_list(params, grads, m, v, t, lr, beta1, beta2, eps):
+    """对任意嵌套 list 做逐标量 Adam（原地更新 params/m/v）。"""
+    c1 = 1.0 - beta1 ** t
+    c2 = 1.0 - beta2 ** t
+    for i in range(len(params)):
+        if isinstance(params[i], list):
+            _dsv3_adam_step_list(params[i], grads[i], m[i], v[i], t, lr,
+                                 beta1, beta2, eps)
+        else:
+            g = grads[i]
+            m[i] = beta1 * m[i] + (1.0 - beta1) * g
+            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
+            params[i] -= lr * (m[i] / c1) / (math.sqrt(v[i] / c2) + eps)
+
+
+def _dsv3_sgd_step_list(params, grads, lr):
+    for i in range(len(params)):
+        if isinstance(params[i], list):
+            _dsv3_sgd_step_list(params[i], grads[i], lr)
+        else:
+            params[i] -= lr * grads[i]
+
+
+class DeepSeekV3Block:
+    """DeepSeek-V3 解码器块：pre-norm MLA 残差 + pre-norm MoE 残差"""
+
+    def __init__(self, d_model, num_heads, d_ff=None, kv_latent_dim=None,
+                 q_latent_dim=None, rope_dim=None, num_experts=4, top_k=2,
+                 aux_coef=0.0, eps=1e-6, seed=None):
+        d_model = _dsv3_check_pos_int(d_model, "d_model")
+        num_heads = _dsv3_check_pos_int(num_heads, "num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "DeepSeekV3Block: d_model=%d 不能被 num_heads=%d 整除"
+                % (d_model, num_heads))
+        if d_ff is None:
+            d_ff = 4 * d_model
+        d_ff = _dsv3_check_pos_int(d_ff, "d_ff")
+        num_experts = _dsv3_check_pos_int(num_experts, "num_experts")
+        top_k = _dsv3_check_pos_int(top_k, "top_k")
+        if top_k > num_experts:
+            raise ValueError("DeepSeekV3Block: top_k=%d 不能大于 num_experts=%d"
+                             % (top_k, num_experts))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.aux_coef = _dsv3_check_nonneg_number(aux_coef, "aux_coef")
+        self.eps = _dsv3_check_pos_number(eps, "eps")
+        self.ln1 = RMSNorm(d_model, eps=self.eps)
+        self.mla = DeepSeekMLA(d_model, num_heads, kv_latent_dim=kv_latent_dim,
+                               q_latent_dim=q_latent_dim, rope_dim=rope_dim,
+                               causal=True, seed=seed)
+        self.ln2 = RMSNorm(d_model, eps=self.eps)
+        self.moe = MoE(d_model, d_ff, num_experts=num_experts,
+                       top_k=top_k, activation="gelu")
+        self.aux_loss = 0.0
+        self.grad_ln1 = [0.0] * d_model
+        self.grad_ln2 = [0.0] * d_model
+        self._cache = None
+
+    # ---------- 前向 ----------
+    def forward(self, seq):
+        seq = _dsv3_check_seq(seq, self.d_model, "block.forward")
+        t_len = len(seq)
+        h1 = [self.ln1.forward(seq[t]) for t in range(t_len)]
+        attn = self.mla.forward(h1)
+        res1 = [[seq[t][j] + attn[t][j] for j in range(self.d_model)]
+                for t in range(t_len)]
+        h2 = [self.ln2.forward(res1[t]) for t in range(t_len)]
+        moe_out = self.moe.forward(h2)
+        out = [[res1[t][j] + moe_out[t][j] for j in range(self.d_model)]
+               for t in range(t_len)]
+        self._cache = (seq, h1, res1, h2)
+        return out
+
+    # ---------- 反向 ----------
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("DeepSeekV3Block.backward: 必须先调用 forward()")
+        seq, h1, res1, h2 = self._cache
+        t_len = len(dout)
+        if len(dout) != t_len:
+            raise ValueError("DeepSeekV3Block.backward: dout 长度与缓存不一致")
+        d_moe = [list(row) for row in dout]
+        d_h2 = self.moe.backward(d_moe)
+        d_res1 = [list(row) for row in dout]
+        d_ln2 = [0.0] * self.d_model
+        for t in range(t_len):
+            self.ln2.forward(res1[t])
+            gg, dx = self.ln2.backward(d_h2[t])
+            for j in range(self.d_model):
+                d_ln2[j] += gg[j]
+                d_res1[t][j] += dx[j]
+        d_attn = [list(row) for row in d_res1]
+        d_h1 = self.mla.backward(d_attn)
+        d_ln1 = [0.0] * self.d_model
+        for t in range(t_len):
+            self.ln1.forward(seq[t])
+            gg, dx = self.ln1.backward(d_h1[t])
+            for j in range(self.d_model):
+                d_ln1[j] += gg[j]
+                d_res1[t][j] += dx[j]
+        self.grad_ln1 = d_ln1
+        self.grad_ln2 = d_ln2
+        self.aux_loss = 0.0
+        if self.aux_coef > 0.0:
+            aux, _ = self.moe.load_balancing_loss_and_backward(self.aux_coef)
+            self.aux_loss = float(aux)
+        return d_res1
+
+    # ---------- 参数 ----------
+    def param_count(self):
+        return (2 * self.d_model
+                + self.mla.param_count()
+                + self.moe.param_count())
+
+    def sgd_step(self, lr=0.01):
+        self.mla.sgd_step(lr)
+        self.moe.sgd_step(lr)
+        for norm, grads in ((self.ln1, self.grad_ln1), (self.ln2, self.grad_ln2)):
+            for j in range(self.d_model):
+                norm.gamma[j] -= lr * grads[j]
+
+    def adam_step(self, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.mla.adam_step(lr, beta1=beta1, beta2=beta2, eps=eps)
+        self.moe.adam_step(lr, b1=beta1, b2=beta2, eps=eps)
+        self._dsv3_adam_t = getattr(self, "_dsv3_adam_t", 0) + 1
+        t = self._dsv3_adam_t
+        if not hasattr(self, "_ln1_m"):
+            self._ln1_m = [0.0] * self.d_model
+            self._ln1_v = [0.0] * self.d_model
+            self._ln2_m = [0.0] * self.d_model
+            self._ln2_v = [0.0] * self.d_model
+        _dsv3_adam_step_list(self.ln1.gamma, self.grad_ln1, self._ln1_m,
+                             self._ln1_v, t, lr, beta1, beta2, eps)
+        _dsv3_adam_step_list(self.ln2.gamma, self.grad_ln2, self._ln2_m,
+                             self._ln2_v, t, lr, beta1, beta2, eps)
+
+    def zero_grad(self):
+        self.mla.zero_grad()
+        self.moe.zero_grad()
+        self.grad_ln1 = [0.0] * self.d_model
+        self.grad_ln2 = [0.0] * self.d_model
+
+
+class DeepSeekV3Model:
+    """DeepSeek-V3 风格语言模型：Embedding + N×(MLA+MoE) + RMSNorm + 词表头（+MTP）"""
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=None,
+                 num_layers=2, num_experts=4, top_k=2, kv_latent_dim=None,
+                 q_latent_dim=None, rope_dim=None, max_len=64, aux_coef=0.0,
+                 num_future=0, mtp_weight=0.5, seed=None):
+        vocab_size = _dsv3_check_pos_int(vocab_size, "vocab_size")
+        d_model = _dsv3_check_pos_int(d_model, "d_model")
+        num_heads = _dsv3_check_pos_int(num_heads, "num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError("DeepSeekV3Model: d_model 必须能被 num_heads 整除")
+        num_layers = _dsv3_check_pos_int(num_layers, "num_layers")
+        max_len = _dsv3_check_pos_int(max_len, "max_len")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        d_ff = _dsv3_check_pos_int(d_ff, "d_ff")
+        num_experts = _dsv3_check_pos_int(num_experts, "num_experts")
+        top_k = _dsv3_check_pos_int(top_k, "top_k")
+        if top_k > num_experts:
+            raise ValueError("DeepSeekV3Model: top_k 不能大于 num_experts")
+        self.aux_coef = _dsv3_check_nonneg_number(aux_coef, "aux_coef")
+        if isinstance(num_future, bool) or not isinstance(num_future, int):
+            raise ValueError("DeepSeekV3: num_future 必须是整数")
+        if num_future < 0 or num_future > 8:
+            raise ValueError("DeepSeekV3: num_future 必须在 0..8")
+        self.num_future = int(num_future)
+        self.mtp_weight = _dsv3_check_pos_number(mtp_weight, "mtp_weight")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_len = max_len
+        saved_state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.emb = Embedding(vocab_size, d_model)
+            self.blocks = [
+                DeepSeekV3Block(d_model, num_heads, d_ff=d_ff,
+                                kv_latent_dim=kv_latent_dim,
+                                q_latent_dim=q_latent_dim, rope_dim=rope_dim,
+                                num_experts=num_experts, top_k=top_k,
+                                aux_coef=self.aux_coef, eps=1e-6)
+                for _ in range(num_layers)]
+            self.ln_out = RMSNorm(d_model, eps=1e-6)
+            self.W_out = [[random.gauss(0.0, math.sqrt(2.0 / d_model))
+                           for _ in range(d_model)] for _ in range(vocab_size)]
+            self.b_out = [0.0] * vocab_size
+            self.mtp_W = [[[random.gauss(0.0, math.sqrt(2.0 / d_model))
+                            for _ in range(d_model)]
+                           for _ in range(vocab_size)]
+                          for _ in range(self.num_future)]
+            self.mtp_b = [[0.0] * vocab_size for _ in range(self.num_future)]
+        finally:
+            random.setstate(saved_state)
+        self._cache = None
+        self.last_main_loss = 0.0
+        self.last_mtp_loss = 0.0
+        self.last_aux_loss = 0.0
+
+    # ---------- 参数 / 梯度 ----------
+    def zero_grad(self):
+        self.emb.zero_grad()
+        for blk in self.blocks:
+            blk.zero_grad()
+        self.grad_ln_out = [0.0] * self.d_model
+        self.grad_W_out = [[0.0] * self.d_model for _ in range(self.vocab_size)]
+        self.grad_b_out = [0.0] * self.vocab_size
+        self.grad_mtp_W = [[[0.0] * self.d_model for _ in range(self.vocab_size)]
+                           for _ in range(self.num_future)]
+        self.grad_mtp_b = [[0.0] * self.vocab_size for _ in range(self.num_future)]
+
+    def param_count(self):
+        total = self.emb.vocab_size * self.emb.embed_dim
+        for blk in self.blocks:
+            total += blk.param_count()
+        total += self.d_model
+        total += self.vocab_size * self.d_model + self.vocab_size
+        total += self.num_future * (self.vocab_size * self.d_model
+                                    + self.vocab_size)
+        return total
+
+    # ---------- 前向 ----------
+    def forward(self, ids):
+        if not isinstance(ids, (list, tuple)) or not ids:
+            raise ValueError("DeepSeekV3.forward: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError("DeepSeekV3.forward: 序列长度超过 max_len")
+        for t, idx in enumerate(ids):
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                raise ValueError("DeepSeekV3: token id 必须是整数")
+            if idx < 0 or idx >= self.vocab_size:
+                raise ValueError("DeepSeekV3: token id 越界")
+        x = self.emb.forward(list(ids))
+        for blk in self.blocks:
+            x = blk.forward(x)
+        h = [self.ln_out.forward(x[t]) for t in range(len(x))]
+        logits = []
+        for t in range(len(h)):
+            row = []
+            for v in range(self.vocab_size):
+                Wv = self.W_out[v]
+                row.append(sum(Wv[j] * h[t][j] for j in range(self.d_model))
+                           + self.b_out[v])
+            logits.append(row)
+        self._cache = {"ids": list(ids), "x": x, "h": h, "logits": logits}
+        return logits
+
+    # ---------- 损失与反向 ----------
+    def _softmax_row(self, row):
+        m = max(row)
+        exps = [math.exp(v - m) for v in row]
+        s = sum(exps)
+        return [e / s for e in exps]
+
+    def loss_and_backward(self, ids):
+        if not isinstance(ids, (list, tuple)):
+            raise ValueError("DeepSeekV3.loss_and_backward: ids 必须是列表")
+        if len(ids) < 2:
+            raise ValueError("DeepSeekV3.loss_and_backward: 至少需要 2 个 token")
+        self.zero_grad()
+        self.forward(ids)
+        t_len = len(ids)
+        h = self._cache["h"]
+        dh = [[0.0] * self.d_model for _ in range(t_len)]
+        main_loss = 0.0
+        n_main = t_len - 1
+        for t in range(n_main):
+            probs = self._softmax_row(self._cache["logits"][t])
+            target = ids[t + 1]
+            main_loss -= math.log(max(probs[target], 1e-300))
+            d = [probs[v] / n_main for v in range(self.vocab_size)]
+            d[target] -= 1.0 / n_main
+            row = h[t]
+            for v in range(self.vocab_size):
+                dv = d[v]
+                if dv == 0.0:
+                    continue
+                self.grad_b_out[v] += dv
+                Wv = self.W_out[v]
+                for j in range(self.d_model):
+                    self.grad_W_out[v][j] += dv * row[j]
+                    dh[t][j] += dv * Wv[j]
+        main_loss /= n_main
+        valid_ks = [k for k in range(1, self.num_future + 1)
+                    if t_len - 1 - k > 0]
+        mtp_loss = 0.0
+        if valid_ks:
+            K = len(valid_ks)
+            for k in valid_ks:
+                valid = t_len - 1 - k
+                for t in range(valid):
+                    target = ids[t + k + 1]
+                    row = h[t]
+                    logits_k = [sum(self.mtp_W[k - 1][v][j] * row[j]
+                                    for j in range(self.d_model))
+                                + self.mtp_b[k - 1][v]
+                                for v in range(self.vocab_size)]
+                    probs = self._softmax_row(logits_k)
+                    mtp_loss -= math.log(max(probs[target], 1e-300)) / (valid * K)
+                    scale = self.mtp_weight / (valid * K)
+                    d = [probs[v] * scale for v in range(self.vocab_size)]
+                    d[target] -= scale
+                    for v in range(self.vocab_size):
+                        dv = d[v]
+                        if dv == 0.0:
+                            continue
+                        self.grad_mtp_b[k - 1][v] += dv
+                        Wv = self.mtp_W[k - 1][v]
+                        for j in range(self.d_model):
+                            self.grad_mtp_W[k - 1][v][j] += dv * row[j]
+                            dh[t][j] += dv * Wv[j]
+        d_x = [[0.0] * self.d_model for _ in range(t_len)]
+        for t in range(t_len):
+            self.ln_out.forward(self._cache["x"][t])
+            gg, dx = self.ln_out.backward(dh[t])
+            for j in range(self.d_model):
+                self.grad_ln_out[j] += gg[j]
+                d_x[t][j] += dx[j]
+        aux_total = 0.0
+        for blk in reversed(self.blocks):
+            d_x = blk.backward(d_x)
+            aux_total += blk.aux_loss
+        self.emb.backward(d_x)
+        self.last_main_loss = main_loss
+        self.last_mtp_loss = mtp_loss
+        self.last_aux_loss = aux_total
+        return main_loss + self.mtp_weight * mtp_loss
+
+    # ---------- 优化 ----------
+    def _init_outer_adam(self):
+        if getattr(self, "_outer_m", None) is not None:
+            return
+        self._outer_m = {
+            "emb": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "ln": [0.0] * self.d_model,
+            "W": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b": [0.0] * self.vocab_size,
+            "mtpW": [[[0.0] * self.d_model for _ in range(self.vocab_size)]
+                     for _ in range(self.num_future)],
+            "mtpb": [[0.0] * self.vocab_size for _ in range(self.num_future)],
+        }
+        self._outer_v = {
+            "emb": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "ln": [0.0] * self.d_model,
+            "W": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b": [0.0] * self.vocab_size,
+            "mtpW": [[[0.0] * self.d_model for _ in range(self.vocab_size)]
+                     for _ in range(self.num_future)],
+            "mtpb": [[0.0] * self.vocab_size for _ in range(self.num_future)],
+        }
+        self._outer_t = 0
+
+    def adam_step(self, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self._init_outer_adam()
+        self._outer_t += 1
+        t = self._outer_t
+        for blk in self.blocks:
+            blk.adam_step(lr, beta1=beta1, beta2=beta2, eps=eps)
+        _dsv3_adam_step_list(self.emb.weight, self.emb.grad_weight,
+                             self._outer_m["emb"], self._outer_v["emb"], t,
+                             lr, beta1, beta2, eps)
+        _dsv3_adam_step_list(self.ln_out.gamma, self.grad_ln_out,
+                             self._outer_m["ln"], self._outer_v["ln"], t,
+                             lr, beta1, beta2, eps)
+        _dsv3_adam_step_list(self.W_out, self.grad_W_out,
+                             self._outer_m["W"], self._outer_v["W"], t,
+                             lr, beta1, beta2, eps)
+        _dsv3_adam_step_list(self.b_out, self.grad_b_out,
+                             self._outer_m["b"], self._outer_v["b"], t,
+                             lr, beta1, beta2, eps)
+        for k in range(self.num_future):
+            _dsv3_adam_step_list(self.mtp_W[k], self.grad_mtp_W[k],
+                                 self._outer_m["mtpW"][k],
+                                 self._outer_v["mtpW"][k], t, lr, beta1, beta2, eps)
+            _dsv3_adam_step_list(self.mtp_b[k], self.grad_mtp_b[k],
+                                 self._outer_m["mtpb"][k],
+                                 self._outer_v["mtpb"][k], t, lr, beta1, beta2, eps)
+
+    def sgd_step(self, lr=0.01):
+        for blk in self.blocks:
+            blk.sgd_step(lr)
+        _dsv3_sgd_step_list(self.emb.weight, self.emb.grad_weight, lr)
+        _dsv3_sgd_step_list(self.ln_out.gamma, self.grad_ln_out, lr)
+        _dsv3_sgd_step_list(self.W_out, self.grad_W_out, lr)
+        _dsv3_sgd_step_list(self.b_out, self.grad_b_out, lr)
+        for k in range(self.num_future):
+            _dsv3_sgd_step_list(self.mtp_W[k], self.grad_mtp_W[k], lr)
+            _dsv3_sgd_step_list(self.mtp_b[k], self.grad_mtp_b[k], lr)
+
+    # ---------- 生成 ----------
+    def generate(self, prompt_ids, max_new_tokens=8, temperature=1.0, top_k=None,
+                 seed=None):
+        if not isinstance(prompt_ids, (list, tuple)) or not prompt_ids:
+            raise ValueError("DeepSeekV3.generate: prompt_ids 不能为空")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) \
+                or max_new_tokens < 0:
+            raise ValueError("DeepSeekV3.generate: max_new_tokens 必须是非负整数")
+        temperature = _dsv3_check_pos_number(temperature, "temperature")
+        if top_k is not None:
+            top_k = _dsv3_check_pos_int(top_k, "top_k")
+        rng = random.Random(seed) if seed is not None else random
+        ids = list(prompt_ids)
+        for _ in range(max_new_tokens):
+            logits = self.forward(ids)
+            row = [v / temperature for v in logits[-1]]
+            if top_k is not None and top_k < len(row):
+                ranked = sorted(range(len(row)), key=lambda i: row[i],
+                                reverse=True)[:top_k]
+                keep = set(ranked)
+                row = [v if i in keep else -1e30 for i, v in enumerate(row)]
+            probs = self._softmax_row(row)
+            r = rng.random()
+            acc = 0.0
+            picked = len(probs) - 1
+            for i, p in enumerate(probs):
+                acc += p
+                if r <= acc:
+                    picked = i
+                    break
+            ids.append(picked)
+        return ids
+
+    # ---------- 训练 ----------
+    def fit(self, sequences, epochs=1, lr=0.01, shuffle=True, seed=None,
+            batch_size=1):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("DeepSeekV3.fit: sequences 不能为空")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("DeepSeekV3.fit: epochs 必须是正整数")
+        lr = _dsv3_check_pos_number(lr, "lr")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+                or batch_size < 1:
+            raise ValueError("DeepSeekV3.fit: batch_size 必须是正整数")
+        rng = random.Random(seed) if seed is not None else random
+        history = []
+        order = list(range(len(sequences)))
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            losses = []
+            for start in range(0, len(order), batch_size):
+                idxs = order[start:start + batch_size]
+                total = 0.0
+                self.zero_grad()
+                for i in idxs:
+                    total += self.loss_and_backward(sequences[i])
+                avg = total / len(idxs)
+                self.adam_step(lr)
+                losses.append(avg)
+            history.append(sum(losses) / len(losses))
+        return history
+
+
+
 class LlamaBlock:
     """LLaMA 解码器块（pre-norm）：
 
