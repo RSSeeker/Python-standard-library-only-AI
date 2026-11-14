@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2925 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2930 项）
 
 ## 特性
 
@@ -4907,22 +4907,50 @@ Swin V2 相对 V1 的两处核心改动在这个 block 里：
 
 反向按 post-norm 链式顺序处理：`LN_ffn` → `W2/W1` → 残差相加 → `LN_attn` → attention → 残差相加，返回输入梯度。边界：单窗口（无窗口划分/移位）、无相对位置偏置与 drop path，属于组件级实现。
 
+### 命令行入口（python -m ai）
+
+`ai/` 包把已有能力串成可执行命令行（零新依赖）：
+
+```bash
+python -m ai train  --config config.json     # 读配置、训练、保存检查点 + 实验记录
+python -m ai eval   --checkpoint run/model.json --config config.json
+python -m ai export --checkpoint run/model.json --output m.onnx --format onnx
+python -m ai serve  --checkpoint run/model.json --port 8000
+```
+
+配置示例（`config.json`，路径相对配置文件所在目录）：
+
+```json
+{
+  "model": {"hidden": [16], "activation": "relu"},
+  "data": {"train": "train.csv", "target": "y"},
+  "train": {"epochs": 50, "lr": 0.05, "batch_size": 16},
+  "output": "run"
+}
+```
+
+- `train`：CSV 表头除目标列外都是特征；目标列非数字时自动按分类处理（标签编码进检查点元数据），数字时按回归；训练结束保存 `model.json` 并用 `ExperimentTracker` 写 `run/train-000.json`（指标、loss 曲线、耗时）。
+- `eval`：加载检查点，打印 `{"mse"/"accuracy", "samples"}` JSON。
+- `export`：`json` 走 `Model.save`，`onnx` 走 `export_onnx_mlp`。
+- `serve`：标准库 `http.server`，`GET /health`、`POST /predict`（`{"x": [...]}` → `{"prediction": [...]}`）。
+- 出错统一输出 `{"error": "..."}` 到 stderr 并返回码 2。
+
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（12 项，`pytest tests/ -q` 约 0.1 秒），只检查公开 API 能否
+一组**快速冒烟测试**（17 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2925 项）。
+`tests/`（合计 2930 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 12 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2925 项
+pytest tests/ -q                 # 17 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2930 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6681,7 +6709,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2925 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2930 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
