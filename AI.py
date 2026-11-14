@@ -16290,6 +16290,211 @@ class S4DBlock:
     def eval(self):
         return self
 
+
+def _rglru_check_pos_int(v, name):
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"RG-LRU: {name} 必须是正整数，收到 {v!r}")
+    return int(v)
+
+
+def _rglru_check_seq(x_seq, d_model):
+    if not isinstance(x_seq, (list, tuple)) or not x_seq:
+        raise ValueError("RG-LRU: 输入序列必须是非空 (T,d) 列表")
+    rows = []
+    for t, row in enumerate(x_seq):
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(
+                f"RG-LRU: 第 {t} 个位置必须是长度 {d_model} 的向量")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"RG-LRU: x[{t}][{j}] 不是数字")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"RG-LRU: x[{t}][{j}] 不是有限数字")
+            vals.append(float(v))
+        rows.append(vals)
+    return rows
+
+
+class RGLRUBlock:
+    """RG-LRU（gated linear recurrent unit）简化 block。
+
+    逐通道递推：`h_t = a_t ⊙ h_{t-1} + sqrt(1 - a_t²) ⊙ i_t`，
+    其中 `i_t = W_i·LN(x) + b_i`、`a_t = sigmoid(W_a·LN(x) + b_a)`，
+    输出 `y_t = W_o·h_t`；外层是 pre-LN 残差 + FFN 残差。反向按 BPTT 手写，
+    包含 sqrt(1-a²) 对 a 的梯度与 sigmoid 导数。
+    """
+
+    def __init__(self, d_model, d_ff=None, eps=1e-5, seed=None):
+        d_model = _rglru_check_pos_int(d_model, "d_model")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        d_ff = _rglru_check_pos_int(d_ff, "d_ff")
+        if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+                or not math.isfinite(float(eps)) or float(eps) <= 0):
+            raise ValueError(f"RG-LRU: eps 必须是正有限数，收到 {eps!r}")
+        if seed is not None and (not isinstance(seed, int)
+                                 or isinstance(seed, bool)):
+            raise ValueError(f"RG-LRU: seed 必须是 int 或 None，收到 {seed!r}")
+
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.eps = float(eps)
+        was = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.W_i = Layer(d_model, d_model, "linear")
+            self.W_a = Layer(d_model, d_model, "linear")
+            self.W_o = Layer(d_model, d_model, "linear")
+            self.W1 = Layer(d_model, d_ff, "relu")
+            self.W2 = Layer(d_ff, d_model, "linear")
+        finally:
+            random.setstate(was)
+        self.ln1 = LayerNorm(d_model, self.eps)
+        self.ln2 = LayerNorm(d_model, self.eps)
+        self.zero_grad()
+        self._cache = None
+        self.training = True
+
+    def zero_grad(self):
+        for name in ("grad_W_i", "grad_b_i", "grad_W_a", "grad_b_a",
+                     "grad_W_o", "grad_b_o", "grad_W1", "grad_b1",
+                     "grad_W2", "grad_b2", "grad_ln1", "grad_ln2"):
+            setattr(self, name, None)
+
+    def param_count(self):
+        return (_dense_param_count(self.W_i) + _dense_param_count(self.W_a)
+                + _dense_param_count(self.W_o) + _dense_param_count(self.W1)
+                + _dense_param_count(self.W2) + _norm_param_count(self.ln1)
+                + _norm_param_count(self.ln2))
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def forward(self, x_seq):
+        rows = _rglru_check_seq(x_seq, self.d_model)
+        T = len(rows)
+        h1, c1 = _norm_rows_forward(self.ln1, rows)
+        i_t, ci = _dense_rows_forward(self.W_i, h1)
+        a_raw, ca = _dense_rows_forward(self.W_a, h1)
+        state = []
+        a_list = []
+        sq_list = []
+        for t in range(T):
+            prev = state[t - 1] if t > 0 else [0.0] * self.d_model
+            h = [0.0] * self.d_model
+            a_row = [0.0] * self.d_model
+            sq_row = [0.0] * self.d_model
+            for j in range(self.d_model):
+                raw = a_raw[t][j]
+                if raw >= 0.0:
+                    a = 1.0 / (1.0 + math.exp(-raw))
+                else:
+                    e = math.exp(raw)
+                    a = e / (1.0 + e)
+                sq = math.sqrt(max(1.0 - a * a, 0.0))
+                h[j] = a * prev[j] + sq * i_t[t][j]
+                a_row[j] = a
+                sq_row[j] = sq
+            state.append(h)
+            a_list.append(a_row)
+            sq_list.append(sq_row)
+        y_proj, cy = _dense_rows_forward(self.W_o, state)
+        mid = [[rows[t][j] + y_proj[t][j] for j in range(self.d_model)]
+               for t in range(T)]
+        h2, c2 = _norm_rows_forward(self.ln2, mid)
+        f1, cf1 = _dense_rows_forward(self.W1, h2)
+        f2, cf2 = _dense_rows_forward(self.W2, f1)
+        out = [[mid[t][j] + f2[t][j] for j in range(self.d_model)]
+               for t in range(T)]
+        self._cache = {
+            "rows": rows, "h1": h1, "c1": c1, "i": i_t, "ci": ci,
+            "a_raw": a_raw, "ca": ca, "state": state, "a": a_list,
+            "sq": sq_list, "y_proj": y_proj, "cy": cy,
+            "mid": mid, "h2": h2, "c2": c2, "f1": f1, "cf1": cf1,
+            "cf2": cf2, "T": T,
+        }
+        return out
+
+    def backward(self, d_out):
+        if self._cache is None:
+            raise RuntimeError("RG-LRU: 必须先 forward 再 backward")
+        c = self._cache
+        T = c["T"]
+        dm = self.d_model
+        if not isinstance(d_out, (list, tuple)) or len(d_out) != T:
+            raise ValueError("RG-LRU: d_out 长度必须与输入序列一致")
+        d_out = [[float(v) for v in row] for row in d_out]
+
+        dW2, db2, d_f1 = _dense_rows_backward(self.W2, c["cf2"], d_out)
+        dW1, db1, d_h2 = _dense_rows_backward(self.W1, c["cf1"], d_f1)
+        g_ln2, b_ln2, d_mid_ln = _norm_rows_backward(
+            self.ln2, c["c2"], d_h2)
+        d_mid = [[d_mid_ln[t][j] + d_out[t][j] for j in range(dm)]
+                 for t in range(T)]
+
+        dW_o, db_o, dh = _dense_rows_backward(self.W_o, c["cy"], d_mid)
+
+        d_i = [[0.0] * dm for _ in range(T)]
+        d_a_raw = [[0.0] * dm for _ in range(T)]
+        for t in range(T - 1, -1, -1):
+            for j in range(dm):
+                a = c["a"][t][j]
+                sq = c["sq"][t][j]
+                i = c["i"][t][j]
+                d_s = dh[t][j]
+                d_i[t][j] = d_s * sq
+                d_a = -d_s * a / max(sq, 1e-300) * i
+                if t > 0:
+                    d_a += d_s * c["state"][t - 1][j]
+                d_a_raw[t][j] = d_a * a * (1.0 - a)
+                if t > 0:
+                    dh[t - 1][j] += d_s * a
+
+        dW_i, db_i, d_h1_i = _dense_rows_backward(self.W_i, c["ci"], d_i)
+        dW_a, db_a, d_h1_a = _dense_rows_backward(
+            self.W_a, c["ca"], d_a_raw)
+        d_h1 = [[d_h1_i[t][j] + d_h1_a[t][j] for j in range(dm)]
+                for t in range(T)]
+        g_ln1, b_ln1, d_rows_ln = _norm_rows_backward(
+            self.ln1, c["c1"], d_h1)
+        d_rows = [[d_rows_ln[t][j] + d_mid[t][j] for j in range(dm)]
+                  for t in range(T)]
+
+        self.grad_W_i = dW_i
+        self.grad_b_i = db_i
+        self.grad_W_a = dW_a
+        self.grad_b_a = db_a
+        self.grad_W_o = dW_o
+        self.grad_b_o = db_o
+        self.grad_W1 = dW1
+        self.grad_b1 = db1
+        self.grad_W2 = dW2
+        self.grad_b2 = db2
+        self.grad_ln1 = (g_ln1, b_ln1)
+        self.grad_ln2 = (g_ln2, b_ln2)
+        return d_rows
+
+    def sgd_step(self, lr=0.01):
+        if (not isinstance(lr, (int, float)) or isinstance(lr, bool)
+                or not math.isfinite(float(lr)) or float(lr) < 0):
+            raise ValueError(f"RG-LRU: lr 必须是非负有限数，收到 {lr!r}")
+        lr = float(lr)
+        _dense_apply_sgd(self.W_i, (self.grad_W_i, self.grad_b_i), lr)
+        _dense_apply_sgd(self.W_a, (self.grad_W_a, self.grad_b_a), lr)
+        _dense_apply_sgd(self.W_o, (self.grad_W_o, self.grad_b_o), lr)
+        _dense_apply_sgd(self.W1, (self.grad_W1, self.grad_b1), lr)
+        _dense_apply_sgd(self.W2, (self.grad_W2, self.grad_b2), lr)
+        _norm_apply_sgd(self.ln1, self.grad_ln1, lr)
+        _norm_apply_sgd(self.ln2, self.grad_ln2, lr)
+        return self
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

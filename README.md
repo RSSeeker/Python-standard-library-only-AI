@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2688 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2692 项）
 
 ## 特性
 
@@ -758,6 +758,28 @@ block.sgd_step(0.01)
 
 边界：逐通道标量递推是 S4D 的教学简化，没有 HiPPO 初始化、没有 FFT 卷积核，`dt` 不训练；
 序列很长时仍是 O(T) Python 循环；不支持 batch/变长 padding。
+
+### RG-LRU（门控线性循环单元）
+
+RG-LRU 用一个**输入相关的门**控制状态的保留比例：每个通道维护标量状态，门直接由
+当前输入算出。`h_t = a_t·h_{t-1} + sqrt(1−a_t²)·i_t`，其中 `i_t = W_i·LN1(x)_t + b_i`、
+`a_t = sigmoid(W_a·LN1(x)_t + b_a)`；`sqrt(1−a_t²)` 让新旧信息按能量守恒的方式混合，
+避免简单 `(1−a)` 插值在长序列上衰减过快。外层沿用 pre-norm 残差 block。
+
+```python
+block = AI.RGLRUBlock(d_model=16, d_ff=64, seed=0)
+y = block.forward(x)          # 长度 T × 16
+block.zero_grad()
+dx = block.backward(dy)       # 手写 BPTT，反传到输入
+block.sgd_step(0.01)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `RGLRUBlock(d_model, d_ff=None, eps=1e-5, seed=None)` | `x += W_o·RG-LRU(LN1(x))` → `x += FFN(LN2(x))`；门与候选都只由当前输入投影得到（无 recurrent 权重）；`forward` / `backward`（对 `W_i/W_a/W_o`、两层 FFN、两个 LayerNorm 与输入做 BPTT）/ `zero_grad` / `sgd_step` / `param_count` |
+
+边界：门控只依赖当前输入（Griffin/Hawk 的简化版，不含循环门）；状态是逐通道标量，
+没有分块并行扫描；序列很长时仍是 O(T) Python 循环；不支持 batch/变长 padding。
 
 ### 组合模型（LLaMA / ResNet）
 
@@ -5976,7 +5998,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2688 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2692 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6256,6 +6278,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHyenaBlock` | 完整 block 的前向/参数计数、三个投影/两个卷积核/LayerNorm 的梯度中心差分、输入梯度与因果性、SGD/Adam 更新、非法输入 |
 | `TestFNetBlock` | 傅里叶混合公式与对称性（反向 = 同一变换）、前向形状与参数量 184、W1/W2/两个 LayerNorm/输入梯度中心差分、全局非因果性质、均值池化+线性头 80 步收敛、非法输入 |
 | `TestS4DBlock` | 前向形状与参数量 128、`A_log/B/C/D`/W_o/W1/两个 LayerNorm/输入梯度中心差分、衰减系数范围与 300 步长序列数值稳定、均值池化+线性头 100 步收敛、非法输入 |
+| `TestRGLRUBlock` | 前向形状与参数量 152、因果性（改末 token 不影响前缀）、`W_i/W_a/W_o/W1/W2` 与输入梯度中心差分、150 步池化+线性头训练收敛、非法输入（含未 forward 先 backward） |
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
@@ -6459,6 +6482,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2688 个单元测试
+├── test_ai.py       # 2692 个单元测试
 └── README.md
 ```

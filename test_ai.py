@@ -42707,3 +42707,130 @@ class TestContaminationReport:
             ["a b"], ["a b"], ngram=0))
         assert _contam_raises(lambda: AI.contamination_ngram_overlap(
             "a b", "a b", n=0))
+
+
+import random
+
+
+def _rglru_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _rglru_seq(T=4, d=4, seed=0):
+    rng = random.Random(seed)
+    return [[rng.gauss(0, 1) for _ in range(d)] for _ in range(T)]
+
+
+def _rglru_loss(block, xs, w):
+    out = block.forward(xs)
+    return sum(out[t][j] * w[t][j] for t in range(len(xs))
+               for j in range(len(out[t])))
+
+
+class TestRGLRUBlock:
+    def test_forward_param_and_causal(self):
+        blk = AI.RGLRUBlock(4, d_ff=8, seed=5)
+        assert blk.param_count() == 152
+        xs = _rglru_seq()
+        out = blk.forward(xs)
+        assert len(out) == 4 and len(out[0]) == 4
+        # 因果性：只改最后一个 token，前 3 个位置输出不变
+        xs2 = [row[:] for row in xs]
+        xs2[3][0] += 1.0
+        out2 = blk.forward(xs2)
+        assert all(abs(out[t][j] - out2[t][j]) < 1e-12
+                   for t in range(3) for j in range(4))
+        # 改第一个 token 会影响后面所有位置
+        xs3 = [row[:] for row in xs]
+        xs3[0][0] += 1.0
+        out3 = blk.forward(xs3)
+        assert any(abs(out[t][j] - out3[t][j]) > 1e-9
+                   for t in range(4) for j in range(4))
+
+    def test_numerical_gradients(self):
+        blk = AI.RGLRUBlock(4, d_ff=8, seed=5)
+        xs = _rglru_seq()
+        w = [[0.1 * (t + 1) - 0.05 * j for j in range(4)] for t in range(4)]
+
+        def fd(name, layer, idx, grad_getter):
+            orig = layer.weights[idx[0]][idx[1]]
+            blk.zero_grad()
+            out = blk.forward(xs)
+            d_out = [[w[t][j] for j in range(4)] for t in range(4)]
+            blk.backward(d_out)
+            ana = grad_getter()
+            layer.weights[idx[0]][idx[1]] = orig + 1e-5
+            lp = _rglru_loss(blk, xs, w)
+            layer.weights[idx[0]][idx[1]] = orig - 1e-5
+            lm = _rglru_loss(blk, xs, w)
+            layer.weights[idx[0]][idx[1]] = orig
+            assert abs(ana - (lp - lm) / 2e-5) < 1e-4, (name, ana)
+
+        fd("W_i", blk.W_i, (0, 1), lambda: blk.grad_W_i[0][1])
+        fd("W_a", blk.W_a, (1, 2), lambda: blk.grad_W_a[1][2])
+        fd("W_o", blk.W_o, (2, 3), lambda: blk.grad_W_o[2][3])
+        fd("W1", blk.W1, (2, 1), lambda: blk.grad_W1[2][1])
+        fd("W2", blk.W2, (1, 0), lambda: blk.grad_W2[1][0])
+
+        # 输入梯度
+        blk.zero_grad()
+        blk.forward(xs)
+        d_out = [[w[t][j] for j in range(4)] for t in range(4)]
+        d_x = blk.backward(d_out)
+        err = 0.0
+        for t in range(4):
+            for j in range(4):
+                old = xs[t][j]
+                xs[t][j] = old + 1e-5
+                lp = _rglru_loss(blk, xs, w)
+                xs[t][j] = old - 1e-5
+                lm = _rglru_loss(blk, xs, w)
+                xs[t][j] = old
+                err = max(err, abs((lp - lm) / 2e-5 - d_x[t][j]))
+        assert err < 1e-4, err
+
+    def test_training_reduces_loss(self):
+        blk = AI.RGLRUBlock(4, d_ff=8, seed=5)
+        head = AI.Layer(4, 1, "linear")
+        xs = _rglru_seq(5, 4, seed=11)
+        target = 0.5
+        losses = []
+        for _ in range(150):
+            out = blk.forward(xs)
+            pooled = [sum(out[t][j] for t in range(5)) / 5.0
+                      for j in range(4)]
+            pred = head.forward(pooled)[0]
+            losses.append((pred - target) ** 2)
+            err = pred - target
+            gW, gb, d_pooled = head.backward([2.0 * err])
+            for k in range(4):
+                head.weights[0][k] -= 0.01 * 2.0 * err * pooled[k]
+            head.biases[0] -= 0.01 * 2.0 * err
+            d_out = [[d_pooled[k] / 5.0 for k in range(4)] for _ in range(5)]
+            blk.zero_grad()
+            blk.backward(d_out)
+            blk.sgd_step(0.01)
+        assert losses[-1] < losses[0] * 0.2, (losses[0], losses[-1])
+        assert losses[-1] < 0.05
+
+    def test_invalid_inputs(self):
+        assert _rglru_raises(lambda: AI.RGLRUBlock(0))
+        assert _rglru_raises(lambda: AI.RGLRUBlock(4, d_ff=0))
+        assert _rglru_raises(lambda: AI.RGLRUBlock(4, eps=0))
+        assert _rglru_raises(lambda: AI.RGLRUBlock(4, eps=-1e-3))
+        assert _rglru_raises(lambda: AI.RGLRUBlock(4, seed=1.5))
+        blk = AI.RGLRUBlock(4, d_ff=8, seed=1)
+        assert _rglru_raises(lambda: blk.forward([]))
+        assert _rglru_raises(lambda: blk.forward([[0.1] * 3]))
+        assert _rglru_raises(lambda: blk.forward([[0.1, 0.2, 0.3, "x"]]))
+        assert _rglru_raises(lambda: blk.forward([[0.1, 0.2, 0.3, float("inf")]]))
+        assert _rglru_raises(lambda: blk.backward([[0.1] * 4]), RuntimeError)
+        blk.forward([[0.1] * 4] * 3)
+        assert _rglru_raises(lambda: blk.backward([[0.1] * 4] * 2))
+        assert _rglru_raises(lambda: blk.sgd_step(-0.1))
