@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1764 个 def / 420 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1765 个 def / 421 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -7844,6 +7844,108 @@ class SAMOptimizer:
 
     def zero_grad(self):
         """占位：SAM 的梯度由调用方（MLP 反向）给出，无需自行清零。"""
+
+
+def layerwise_lr_decay(base_lr: float, num_layers: int, decay: float = 0.8,
+                       min_lr: float = 0.0):
+    """逐层学习率衰减（LLRD）：返回从底层到顶层的 lr 列表
+
+    顶层用 `base_lr`，每往下一层乘一次 `decay`：
+
+    `lr_i = max(min_lr, base_lr * decay ** (num_layers - 1 - i))`。
+
+    这是 BERT/LLM 微调的标准做法：底层学通用表示、学习率小；顶层任务相关、
+    学习率大。返回长度 `num_layers` 的列表（索引 0 是底层）。
+    """
+    if not isinstance(base_lr, (int, float)) or isinstance(base_lr, bool):
+        raise TypeError(f"llrd: base_lr 必须是数字，收到 {base_lr!r}")
+    if not math.isfinite(float(base_lr)) or float(base_lr) <= 0.0:
+        raise ValueError("llrd: base_lr 必须是 > 0 的有限数字")
+    if isinstance(num_layers, bool) or not isinstance(num_layers, int) \
+            or num_layers < 1:
+        raise ValueError(f"llrd: num_layers 必须是正整数，收到 {num_layers!r}")
+    if not isinstance(decay, (int, float)) or isinstance(decay, bool):
+        raise TypeError(f"llrd: decay 必须是数字，收到 {decay!r}")
+    if not (0.0 < float(decay) <= 1.0) or not math.isfinite(float(decay)):
+        raise ValueError("llrd: decay 必须在 (0,1] 内")
+    if not isinstance(min_lr, (int, float)) or isinstance(min_lr, bool):
+        raise TypeError(f"llrd: min_lr 必须是数字，收到 {min_lr!r}")
+    if not math.isfinite(float(min_lr)) or float(min_lr) < 0.0:
+        raise ValueError("llrd: min_lr 必须是非负有限数字")
+    out = []
+    for i in range(num_layers):
+        v = float(base_lr) * float(decay) ** (num_layers - 1 - i)
+        out.append(max(float(min_lr), v))
+    return out
+
+
+class LLRDAdam:
+    """带逐层学习率衰减的 Adam（Layer-wise LR Decay）
+
+    每层用 `lr_i = base_lr * decay^(L-1-i)`（并受 `min_lr` 下限约束），
+    其余与 `Adam` 一致：一阶/二阶矩 + 偏差修正 + 逐参数更新。
+
+    适用场景：微调预训练模型的 MLP 堆叠时，底层通常需要更小的 lr。
+    `step(all_grads)` 的格式与 `Adam.step` 相同。
+    """
+
+    def __init__(self, model, lr: float = 1e-3, decay: float = 0.8,
+                 min_lr: float = 0.0, beta1: float = 0.9,
+                 beta2: float = 0.999, eps: float = 1e-8):
+        if not isinstance(model, MLP):
+            raise ValueError(f"LLRDAdam: model 必须是 MLP，收到 {type(model).__name__}")
+        self.lrs = layerwise_lr_decay(lr, len(model.layers), decay, min_lr)
+        for name, v in (("beta1", beta1), ("beta2", beta2)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"LLRDAdam: {name} 必须是数字")
+            if not (0.0 <= float(v) < 1.0):
+                raise ValueError(f"LLRDAdam: {name} 必须在 [0,1)")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+            raise TypeError("LLRDAdam: eps 必须是数字")
+        if not math.isfinite(float(eps)) or float(eps) <= 0.0:
+            raise ValueError("LLRDAdam: eps 必须是 > 0 的有限数字")
+        self.model = model
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.step_count = 0
+        self._m = None
+        self._v = None
+
+    def zero_grad(self):
+        """占位：梯度由调用方（MLP 反向）提供。"""
+
+    def step(self, all_grads):
+        if not isinstance(all_grads, (list, tuple)):
+            raise ValueError("LLRDAdam: all_grads 必须是 [(grad_w, grad_b), ...]")
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError("LLRDAdam: 梯度层数与模型层数不一致")
+        if self._m is None:
+            self._m = [([ [0.0] * len(row) for row in gw], [0.0] * len(gb))
+                       for gw, gb in all_grads]
+            self._v = [([ [0.0] * len(row) for row in gw], [0.0] * len(gb))
+                       for gw, gb in all_grads]
+        self.step_count += 1
+        b1, b2 = self.beta1, self.beta2
+        c1 = 1.0 - b1 ** self.step_count
+        c2 = 1.0 - b2 ** self.step_count
+        for li, (layer, (gw, gb)) in enumerate(zip(self.model.layers, all_grads)):
+            mw, mb = self._m[li]
+            vw, vb = self._v[li]
+            lr = self.lrs[li]
+            for r in range(len(layer.weights)):
+                for c in range(len(layer.weights[r])):
+                    g = float(gw[r][c])
+                    mw[r][c] = b1 * mw[r][c] + (1.0 - b1) * g
+                    vw[r][c] = b2 * vw[r][c] + (1.0 - b2) * g * g
+                    layer.weights[r][c] -= lr * (mw[r][c] / c1) / (
+                        math.sqrt(vw[r][c] / c2) + self.eps)
+            for k in range(len(layer.biases)):
+                g = float(gb[k])
+                mb[k] = b1 * mb[k] + (1.0 - b1) * g
+                vb[k] = b2 * vb[k] + (1.0 - b2) * g * g
+                layer.biases[k] -= lr * (mb[k] / c1) / (
+                    math.sqrt(vb[k] / c2) + self.eps)
 
 
 def gradient_centralize(grads, mode: str = "rows"):

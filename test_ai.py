@@ -46043,3 +46043,92 @@ class TestPEFTVariants:
         assert bad(lambda: AI.BAdam(m, lr=0.0))
         assert bad(lambda: AI.BAdam(m, num_blocks=3))
         assert bad(lambda: AI.BAdam(m, beta1=1.0))
+
+
+# ---- 逐层学习率衰减（LLRD） ----
+
+
+def _llrd_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _llrd_grads(model, xs, ys):
+    acc_w = [[[0.0] * len(r) for r in L.weights] for L in model.layers]
+    acc_b = [[0.0] * len(L.biases) for L in model.layers]
+    n = len(xs)
+    out_dim = len(model.layers[-1].weights)
+    for x, y in zip(xs, ys):
+        caches = []
+        cur = list(x)
+        for layer in model.layers:
+            out, cache = AI._dense_rows_forward(layer, [cur])
+            caches.append(cache)
+            cur = out[0]
+        drows = [[2.0 * (cur[i] - y[i]) / (n * out_dim) for i in range(out_dim)]]
+        for li in range(len(model.layers) - 1, -1, -1):
+            gw, gb, dx = AI._dense_rows_backward(
+                model.layers[li], caches[li], drows)
+            for r in range(len(acc_w[li])):
+                for c in range(len(acc_w[li][r])):
+                    acc_w[li][r][c] += gw[r][c]
+            for k in range(len(acc_b[li])):
+                acc_b[li][k] += gb[k]
+            drows = dx
+    return list(zip(acc_w, acc_b))
+
+
+def _llrd_loss(model, xs, ys):
+    total = 0.0
+    for x, y in zip(xs, ys):
+        cur = list(x)
+        for layer in model.layers:
+            cur = AI._dense_rows_forward(layer, [cur])[0][0]
+        for a, b in zip(cur, y):
+            total += (a - b) ** 2
+    return total / (len(xs) * len(ys[0]))
+
+
+class TestLLRD:
+    def test_decay_values(self):
+        assert AI.layerwise_lr_decay(0.01, 3, 0.5) == [0.0025, 0.005, 0.01]
+        assert AI.layerwise_lr_decay(0.02, 4, 1.0) == [0.02] * 4
+        clipped = AI.layerwise_lr_decay(0.01, 3, 0.5, min_lr=0.004)
+        assert clipped == [0.004, 0.005, 0.01]
+        assert _llrd_raises(lambda: AI.layerwise_lr_decay(0.0, 3))
+        assert _llrd_raises(lambda: AI.layerwise_lr_decay(0.01, 0))
+        assert _llrd_raises(lambda: AI.layerwise_lr_decay(0.01, 3, 0.0))
+
+    def test_per_layer_step_ratio(self):
+        model = AI.MLP([2, 2, 1], ["sigmoid", "linear"])
+        opt = AI.LLRDAdam(model, lr=0.01, decay=0.5)
+        before = [[row[:] for row in L.weights] for L in model.layers]
+        grads = [([[1.0, 1.0], [1.0, 1.0]], [1.0, 1.0]),
+                 ([[1.0, 1.0]], [1.0])]
+        opt.step(grads)
+        d0 = before[0][0][0] - model.layers[0].weights[0][0]
+        d1 = before[1][0][0] - model.layers[1].weights[0][0]
+        assert abs(d1 / d0 - 2.0) < 1e-6
+        assert abs(d1 - 0.01) < 1e-6  # 顶层的第一个 Adam 步约等于 lr
+
+    def test_training_converges(self):
+        xs = [[0.3, -0.2], [0.6, 0.4], [-0.5, 0.1], [0.2, -0.7]]
+        ys = [[1.0], [-1.0], [0.5], [0.2]]
+        model = AI.MLP([2, 4, 1], ["sigmoid", "linear"])
+        opt = AI.LLRDAdam(model, lr=0.02, decay=0.7)
+        first = _llrd_loss(model, xs, ys)
+        for _ in range(300):
+            opt.step(_llrd_grads(model, xs, ys))
+        last = _llrd_loss(model, xs, ys)
+        assert last < first * 0.2
+
+    def test_invalid_inputs(self):
+        model = AI.MLP([2, 1], ["linear"])
+        assert _llrd_raises(lambda: AI.LLRDAdam("x"))
+        assert _llrd_raises(lambda: AI.LLRDAdam(model, beta1=1.0))
+        assert _llrd_raises(lambda: AI.LLRDAdam(model, eps=0.0))
+        assert _llrd_raises(lambda: AI.LLRDAdam(model, decay=2.0))
+        assert _llrd_raises(lambda: AI.layerwise_lr_decay(0.01, 3, min_lr=-1.0))
