@@ -43152,3 +43152,76 @@ class TestTunedLens:
             lambda: AI.tuned_lens([[[float("nan"), 0.2]]], [[0.1, 0.2]]))
         # vocab < 2
         assert _tl_raises(lambda: AI.tuned_lens([[[0.1, 0.2]]], [[0.5]]))
+
+
+import random
+import math
+
+
+def _re_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestKnowledgeEditing:
+    def test_rome_exact_single_edit(self):
+        rng = random.Random(0)
+        layer = AI.Layer(5, 3, "linear")
+        k = [rng.gauss(0, 1) for _ in range(5)]
+        v = [0.5, -0.2, 0.1]
+        before = AI.edit_output(layer, k)
+        info = AI.rome_edit(layer, k, v)
+        after = AI.edit_output(layer, k)
+        assert max(abs(after[i] - before[i] - v[i]) for i in range(3)) < 1e-9
+        assert info["keys"] == 1
+        expect = math.sqrt(sum(x * x for x in v)) / math.sqrt(
+            sum(x * x for x in k))
+        assert abs(info["delta_norm"] - expect) < 1e-9
+
+    def test_rome_bias_and_min_norm(self):
+        rng = random.Random(3)
+        layer = AI.Layer(4, 2, "linear")
+        bias0 = layer.biases[:]
+        k = [rng.gauss(0, 1) for _ in range(4)]
+        v = [1.0, -1.0]
+        info = AI.rome_edit(layer, k, v)
+        assert layer.biases == bias0
+        # 秩一更新的最小范数应为 v·k^T/(k·k)，Frobenius 范数 = ||v||/||k||
+        norm = math.sqrt(sum(x * x for x in v)) / math.sqrt(
+            sum(x * x for x in k))
+        assert abs(info["delta_norm"] - norm) < 1e-12
+
+    def test_memit_multi_edit(self):
+        rng = random.Random(1)
+        layer = AI.Layer(6, 3, "linear")
+        ks = [[rng.gauss(0, 1) for _ in range(6)] for _ in range(3)]
+        vals = [[rng.gauss(0, 1) for _ in range(3)] for _ in range(3)]
+        before = [AI.edit_output(layer, k) for k in ks]
+        info = AI.memit_edit(layer, ks, vals)
+        after = [AI.edit_output(layer, k) for k in ks]
+        err = max(abs(after[s][i] - before[s][i] - vals[s][i])
+                  for s in range(3) for i in range(3))
+        assert err < 1e-9
+        assert info["keys"] == 3
+        assert info["delta_norm"] > 0.0
+
+    def test_invalid_inputs(self):
+        layer = AI.Layer(4, 2, "linear")
+        assert _re_raises(lambda: AI.rome_edit(object(), [1, 0, 0, 0], [1.0, 2.0]))
+        assert _re_raises(lambda: AI.rome_edit(layer, [0, 0, 0, 0], [1.0, 2.0]))
+        assert _re_raises(lambda: AI.rome_edit(layer, [1, 0, 0], [1.0, 2.0]))
+        assert _re_raises(lambda: AI.rome_edit(layer, [1, 0, 0, 0], [1.0]))
+        assert _re_raises(lambda: AI.rome_edit(layer, [1, 0, 0, float("nan")],
+                                               [1.0, 2.0]))
+        assert _re_raises(lambda: AI.memit_edit(layer, [], []))
+        # 线性相关的键 -> Gram 矩阵奇异
+        assert _re_raises(lambda: AI.memit_edit(
+            layer, [[1, 0, 0, 0], [2, 0, 0, 0]], [[1.0, 2.0], [0.5, 1.0]]))
+        # 数量不一致
+        assert _re_raises(lambda: AI.memit_edit(
+            layer, [[1, 0, 0, 0], [0, 1, 0, 0]], [[1.0, 2.0]]))

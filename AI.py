@@ -5504,6 +5504,143 @@ def _interp_check_vector(vec, name: str = "direction"):
     return out
 
 
+
+"""ROME / MEMIT 风格的知识编辑（作用于 MLP 的线性层）。
+
+给定线性层 ``y = W·x + b``、一个键向量 ``k`` 和目标输出增量 ``v``，
+ROME 求秩一更新 ``ΔW`` 使 ``(W+ΔW)·k = W·k + v``，最小范数解为
+``ΔW = v·k^T / (k·k)``。MEMIT 把多个 (k_i, v_i) 一次写进去：
+``ΔW = V·K^T·(K·K^T)^{-1}``（K 的列为键，V 的列为目标增量）。
+"""
+
+
+def _re_check_vec(vec, name):
+    if not isinstance(vec, (list, tuple)) or len(vec) == 0:
+        raise ValueError(f"知识编辑: {name} 必须是非空向量")
+    out = []
+    for v in vec:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            raise ValueError(f"知识编辑: {name} 必须是有限数字")
+        out.append(float(v))
+    return out
+
+
+def _re_check_keys(keys, dim):
+    if not isinstance(keys, (list, tuple)) or len(keys) == 0:
+        raise ValueError("知识编辑: keys 必须是非空列表")
+    out = []
+    for i, k in enumerate(keys):
+        vec = _re_check_vec(k, f"keys[{i}]")
+        if len(vec) != dim:
+            raise ValueError(
+                f"知识编辑: keys[{i}] 长度必须等于层输入维度 {dim}")
+        out.append(vec)
+    return out
+
+
+def _re_check_values(values, out_dim, n):
+    if not isinstance(values, (list, tuple)) or len(values) != n:
+        raise ValueError("知识编辑: values 数量必须与 keys 一致")
+    out = []
+    for i, v in enumerate(values):
+        vec = _re_check_vec(v, f"values[{i}]")
+        if len(vec) != out_dim:
+            raise ValueError(
+                f"知识编辑: values[{i}] 长度必须等于层输出维度 {out_dim}")
+        out.append(vec)
+    return out
+
+
+def _re_inverse(matrix):
+    """Gauss-Jordan 求逆（小矩阵）。"""
+    n = len(matrix)
+    aug = [[float(matrix[i][j]) for j in range(n)]
+           + [1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-12:
+            raise ValueError("知识编辑: 键向量线性相关，无法求逆")
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        pv = aug[col][col]
+        for j in range(2 * n):
+            aug[col][j] /= pv
+        for r in range(n):
+            if r == col:
+                continue
+            factor = aug[r][col]
+            if factor != 0.0:
+                for j in range(2 * n):
+                    aug[r][j] -= factor * aug[col][j]
+    return [[aug[i][n + j] for j in range(n)] for i in range(n)]
+
+
+def rome_edit(layer, key, value):
+    """把单个键值对写入线性层：``y(k)`` 增加 ``value``。
+
+    返回 ``{"delta_norm": ..., "keys": 1}``。
+    """
+    if not hasattr(layer, "weights") or not hasattr(layer, "biases"):
+        raise ValueError("知识编辑: layer 必须是带 weights/biases 的线性层")
+    out_dim = len(layer.weights)
+    in_dim = len(layer.weights[0])
+    k = _re_check_vec(key, "key")
+    if len(k) != in_dim:
+        raise ValueError(f"知识编辑: key 长度 {len(k)} 与层输入维度 {in_dim} 不符")
+    v = _re_check_vec(value, "value")
+    if len(v) != out_dim:
+        raise ValueError(f"知识编辑: value 长度 {len(v)} 与层输出维度 {out_dim} 不符")
+    denom = sum(x * x for x in k)
+    if denom <= 1e-12:
+        raise ValueError("知识编辑: key 不能是零向量")
+    delta_norm = 0.0
+    for i in range(out_dim):
+        for j in range(in_dim):
+            d = v[i] * k[j] / denom
+            layer.weights[i][j] += d
+            delta_norm += d * d
+    return {"delta_norm": math.sqrt(delta_norm), "keys": 1}
+
+
+def memit_edit(layer, keys, values):
+    """一次写入多个键值对（最小范数秩 n 更新）。
+
+    对每个输出维度 i，求 δ_i 使 δ_i·k_s = v_s[i]（所有 s）；最小范数解
+    δ_i = Σ_s α_s k_s，其中 α = G^{-1} u，G 为键的 Gram 矩阵、u_s = v_s[i]。
+    """
+    if not hasattr(layer, "weights") or not hasattr(layer, "biases"):
+        raise ValueError("知识编辑: layer 必须是带 weights/biases 的线性层")
+    out_dim = len(layer.weights)
+    in_dim = len(layer.weights[0])
+    ks = _re_check_keys(keys, in_dim)
+    vs = _re_check_values(values, out_dim, len(ks))
+    n = len(ks)
+    gram = [[sum(ks[s][j] * ks[u][j] for j in range(in_dim))
+             for u in range(n)] for s in range(n)]
+    inv = _re_inverse(gram)
+    delta = [[0.0] * in_dim for _ in range(out_dim)]
+    for i in range(out_dim):
+        u = [vs[s][i] for s in range(n)]
+        alpha = [sum(inv[s][t] * u[t] for t in range(n)) for s in range(n)]
+        for j in range(in_dim):
+            delta[i][j] = sum(alpha[s] * ks[s][j] for s in range(n))
+    norm = 0.0
+    for i in range(out_dim):
+        for j in range(in_dim):
+            layer.weights[i][j] += delta[i][j]
+            norm += delta[i][j] * delta[i][j]
+    return {"delta_norm": math.sqrt(norm), "keys": n}
+
+
+def edit_output(layer, key):
+    """返回线性层对 ``key`` 的当前输出（供编辑前后对比）。"""
+    k = _re_check_vec(key, "key")
+    in_dim = len(layer.weights[0])
+    if len(k) != in_dim:
+        raise ValueError(f"知识编辑: key 长度 {len(k)} 与层输入维度 {in_dim} 不符")
+    return [sum(layer.weights[i][j] * k[j] for j in range(in_dim))
+            + layer.biases[i] for i in range(len(layer.weights))]
+
 def logit_lens(hidden_rows, W_out, b_out=None):
     """把中间层表示经输出头投影并 softmax，返回每行的词表概率。"""
     hidden = _interp_check_matrix(hidden_rows, "hidden_rows")

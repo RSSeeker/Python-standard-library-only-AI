@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2704 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2708 项）
 
 ## 特性
 
@@ -2339,6 +2339,30 @@ for r in res["layers"]:
 `{"num_layers", "layers": [{"layer", "loss", "kl", "accuracy", "weights",
 "biases", "loss_history"}], "best_layer", "best_accuracy"}`。`accuracy` 是
 「探针 argmax 与最终 logits argmax 一致」的比例，`kl` 是每 token 的平均 KL。
+
+### 知识编辑（ROME / MEMIT）
+
+给定线性层 `y = W·x + b` 和一对「键 → 输出增量」，ROME 求**秩一更新**把
+`(W+ΔW)·k = W·k + v` 精确写进去，最小范数解是 `ΔW = v·kᵀ/(k·k)`；
+MEMIT 把多个键值对一次写入：对每条键按 Gram 矩阵解出最小范数组合，
+`ΔW` 的秩不超过键的个数。
+
+```python
+layer = AI.Layer(64, 128, "linear")
+AI.rome_edit(layer, key_vec, delta_vec)          # 单条
+AI.memit_edit(layer, [k1, k2, k3], [v1, v2, v3])  # 多条
+out = AI.edit_output(layer, key_vec)              # 编辑前后对比
+```
+
+| 函数 | 说明 |
+|------|------|
+| `rome_edit(layer, key, value)` | 秩一最小范数更新；返回 `{"delta_norm","keys"}` |
+| `memit_edit(layer, keys, values)` | 多个键值对的最小范数更新（Gram 矩阵求逆）；键线性相关时报错 |
+| `edit_output(layer, key)` | 返回 `W·key + b`，用于编辑前后对比与验证 |
+
+边界：这是**单层线性记忆**的教学版编辑（真实 ROME/MEMIT 作用在 Transformer 的
+MLP down-projection 上并带协方差约束）；不做因果追踪、不验证编辑的泛化/副作用；
+只支持 `Layer`，不支持卷积或批量键值对。
 
 ### 可解释性工具（logit lens / 残差方向 / activation patching）
 
@@ -6062,7 +6086,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2704 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2708 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6363,6 +6387,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
 | `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
 | `TestTunedLens` | 每层探针形状与 loss 下降、深层可读性（accuracy 升 / KL 降）、seed 可复现、非法输入（空列表 / 长度不一致 / 维度不一致 / V<2） |
+| `TestKnowledgeEditing` | ROME 单条编辑输出精确性/偏置不变/最小范数、MEMIT 多条编辑精确性、键线性相关与维度不匹配等非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6549,6 +6574,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2704 个单元测试
+├── test_ai.py       # 2708 个单元测试
 └── README.md
 ```
