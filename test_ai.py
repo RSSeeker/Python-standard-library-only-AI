@@ -42127,3 +42127,139 @@ class TestFNetBlock:
         assert _fnet_raises(lambda: block.backward([[0.1] * 3] * 6))
         assert _fnet_raises(lambda: block.sgd_step(0.0))
         assert _fnet_raises(lambda: block.sgd_step(-0.1))
+
+
+import copy
+
+def _b8t_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _b8t_grads(model, xs, ys):
+    gw = [[0.0] * model.layers[0].fan_in
+          for _ in range(model.layers[0].fan_out)]
+    gb = [0.0] * model.layers[0].fan_out
+    n = len(xs)
+    for x, y in zip(xs, ys):
+        pred = model.forward(x)
+        d = 2.0 * (pred[0] - y[0]) / n
+        for i in range(model.layers[0].fan_out):
+            gb[i] += d
+            for j in range(model.layers[0].fan_in):
+                gw[i][j] += d * x[j]
+    return [(gw, gb)]
+
+
+def _b8t_mse(model, xs, ys):
+    return sum((model.forward(x)[0] - y[0]) ** 2
+               for x, y in zip(xs, ys)) / len(xs)
+
+
+class TestAdam8bit:
+    def test_block_quantization(self):
+        a = [[1.0, -2.0, 0.5, 0.25]] * 2
+        flat = [v for row in a for v in row]
+        for bs in (4, 256):
+            qs, scales = AI._b8_quantize_block(flat, bs)
+            back = AI._b8_dequantize_block(qs, scales, bs)
+            assert all(isinstance(q, int) and -127 <= q <= 127 for q in qs)
+            worst = 0.0
+            for start in range(0, len(flat), bs):
+                scale = scales[start // bs]
+                for k in range(start, min(start + bs, len(flat))):
+                    worst = max(worst, abs(flat[k] - back[k]) - 0.5 * scale)
+            assert worst <= 1e-12
+
+    def test_training_converges(self):
+        random.seed(1)
+        model = AI.MLP([3, 1], ["linear"])
+        xs = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(20)]
+        ys = [[2.0 * x[0] - x[1] + 0.5 * x[2] + 0.3] for x in xs]
+        opt = AI.Adam8bit(model, lr=0.05, block_size=8)
+        first = _b8t_mse(model, xs, ys)
+        for _ in range(400):
+            opt.step(_b8t_grads(model, xs, ys))
+        assert _b8t_mse(model, xs, ys) < 1e-3
+        assert first > 0.5
+
+    def test_state_is_int8(self):
+        random.seed(2)
+        model = AI.MLP([4, 3], ["linear"])
+        opt = AI.Adam8bit(model, lr=0.01, block_size=4)
+        xs = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(6)]
+        ys = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(6)]
+        for _ in range(3):
+            gw = [[0.0] * 4 for _ in range(3)]
+            gb = [0.0] * 3
+            for x, y in zip(xs, ys):
+                p = model.forward(x)
+                d = [2.0 * (p[c] - y[c]) / 6 for c in range(3)]
+                for i in range(3):
+                    gb[i] += d[i]
+                    for j in range(4):
+                        gw[i][j] += d[i] * x[j]
+            opt.step([(gw, gb)])
+        for st in opt.state.values():
+            for name in ("m_w", "v_w", "m_b", "v_b"):
+                assert all(isinstance(q, int) and -127 <= q <= 127
+                           for q in st[name]["q"])
+        # 状态字节 ≈ int8 + 每块一个 fp32 scale，应小于 fp32 Adam 的一半
+        assert 0 < opt.state_bytes_estimate() < 4 * (2 * 3 * 4 + 2 * 3) * 2
+
+    def test_compare_with_adam(self):
+        random.seed(1)
+        m_a = AI.MLP([3, 1], ["linear"])
+        m_b = AI.MLP([3, 1], ["linear"])
+        for la, lb in zip(m_a.layers, m_b.layers):
+            lb.weights = [row[:] for row in la.weights]
+            lb.biases = la.biases[:]
+        xs = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(20)]
+        ys = [[2.0 * x[0] - x[1] + 0.5 * x[2] + 0.3] for x in xs]
+        opt_a = AI.Adam(m_a, lr=0.05)
+        opt_b = AI.Adam8bit(m_b, lr=0.05, block_size=8)
+        for _ in range(200):
+            opt_a.step(_b8t_grads(m_a, xs, ys))
+            opt_b.step(_b8t_grads(m_b, xs, ys))
+        la, lb = _b8t_mse(m_a, xs, ys), _b8t_mse(m_b, xs, ys)
+        assert lb < 0.05 and lb < 5 * la
+
+    def test_state_roundtrip(self):
+        random.seed(3)
+        model = AI.MLP([2, 1], ["linear"])
+        xs = [[1.0, 0.5], [0.5, 1.0]]
+        ys = [[1.0], [0.0]]
+        opt = AI.Adam8bit(model, lr=0.01, block_size=4)
+        for _ in range(5):
+            opt.step(_b8t_grads(model, xs, ys))
+        model2 = AI.MLP([2, 1], ["linear"])
+        for la, lb in zip(model.layers, model2.layers):
+            lb.weights = [row[:] for row in la.weights]
+            lb.biases = la.biases[:]
+        opt2 = AI.Adam8bit(model2, lr=0.01, block_size=4)
+        opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
+        g = _b8t_grads(model, xs, ys)
+        opt2.step([([row[:] for row in gw], gb[:]) for gw, gb in g])
+        opt.step([([row[:] for row in gw], gb[:]) for gw, gb in g])
+        diff = max(abs(a - b) for row1, row2 in zip(model.layers[0].weights,
+                                                   model2.layers[0].weights)
+                   for a, b in zip(row1, row2))
+        assert diff < 1e-12
+        assert opt2.step_count == opt.step_count
+
+    def test_invalid_inputs(self):
+        model = AI.MLP([3, 1], ["linear"])
+        assert _b8t_raises(lambda: AI.Adam8bit(model, lr=0))
+        assert _b8t_raises(lambda: AI.Adam8bit(model, beta1=1.0))
+        assert _b8t_raises(lambda: AI.Adam8bit(model, beta2=-0.1))
+        assert _b8t_raises(lambda: AI.Adam8bit(model, eps=0))
+        assert _b8t_raises(lambda: AI.Adam8bit(model, block_size=0))
+        opt = AI.Adam8bit(model, block_size=8)
+        assert _b8t_raises(lambda: opt.step([]))
+        assert _b8t_raises(lambda: opt.step([([[float("inf")] * 3], [0.0])]))
+        assert _b8t_raises(lambda: opt.load_state_dict([]))

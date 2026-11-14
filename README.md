@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2661 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2667 项）
 
 ## 特性
 
@@ -546,6 +546,11 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False)` | 一键 LoRA 微调：接受 `Model`（其 `.model` 为 `MLP`）或直接传 `MLP`，给每层套 `LoRA`、冻结基座、只更新 A/B；`loss` 支持 `"mse"` 与 `"cross_entropy"`（后者要求输出层为线性 logits）；返回 `loss_history`、`adapters`、`trainable_params`/`base_params`/`total_params` |
 | `finetune_adapter(model, xs, ys, adapter="lora", rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False, prune_keep=None, **options)` | 通用 PEFT 微调入口：`adapter` 支持 `lora` / `qlora` / `dora` / `adalora` / `vera` / `reft`，逐层套对应适配器并冻结基座（`qlora` 构造时会量化基座、之后不再更新）；`adalora` 可用 `prune_keep` 每轮按重要性收缩秩；`bits`/`eps`/`ema` 等透传；返回同 `finetune_lora` 的统计 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
+| `Adam8bit(model, lr=1e-3, ..., block_size=256)` | 8-bit Adam 模拟：每步把一阶/二阶矩按 `block_size` 分块、用块内 `absmax/127` 量化成 int8，反量化后更新参数；与 `Adam.step` 同接口，另提供 `state_bytes_estimate()` 与 `state_dict`/`load_state_dict` |
+
+`Adam8bit` 是分块量化的教学实现：状态在每步更新后重新量化（int8 值 + 每块一个
+fp32 scale），误差被限制在半个 scale 内；这里用 Python 列表模拟、不省真实内存，
+但可以直观看到「量化后仍能正常训练」与「状态字节数约为 fp32 的 1/4」。
 | `Lion(model, lr=1e-4, beta1=0.9, beta2=0.99)` | 符号动量优化器：更新量恒为 `±lr`（+ 解耦 wd），只存一份动量；**lr 通常比 Adam 小一个量级** |
 | `Adafactor(model, lr=1e-3, eps2=1e-3, weight_decay=0.0)` | 行列因子化二阶矩，显存 O(m+n)；乘相对步长 `max(eps2, rms(g))`，所以 lr 语义比 Adam 小一个量级 |
 | `AdaGrad(model, lr=0.01, eps=1e-8)` | 累积梯度平方 `s += g²`，步长 `lr·g/(√s+eps)` **单调不增**；稀疏梯度友好，但训练中期容易过早停滞 |
@@ -5856,7 +5861,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2661 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2667 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5903,6 +5908,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAttentionDropout` | 注意力 dropout 的 mask 取值/缩放、`eval()` 关闭、train 随机性、**固定 mask 下 `W_v` 解析梯度 vs 数值梯度** |
 | `TestModernComponents` | GELU 公式与导数、sigmoid 不溢出、`Linear`、`RMSNorm` 的 `dx / dgamma` vs 数值梯度 |
 | `TestAdamWAndWarmup` | AdamW 零梯度只做衰减、`weight_decay=0` 与 Adam 逐位相同、`WarmupLR` 的爬坡/接力曲线 |
+| `TestAdam8bit` | 分块量化误差界与 int8 取值范围、线性回归 400 步收敛、状态确实是 int8 且字节估算小于 fp32、与 fp32 Adam 的收敛对比、state_dict 往返后下一步权重逐位一致、非法输入 |
 | `TestExtraLosses` | `gamma=0` 的 focal 退化为 CE、focal/CE-ls 梯度 vs 数值梯度、BCE 的 logits 稳定分支、Huber 两段、KL 公式 |
 | `TestRoPE` | 增量前向 == 整段前向（逐位）、RoPE 改变输出、**Q/K 逆旋转后的梯度 vs 数值梯度** |
 | `TestKVCache` | KV cache 生成 == 整段重算（含窗口滑动与 RoPE 两种情形）、训练后仍一致、生成不改参数 |
@@ -6333,6 +6339,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2661 个单元测试
+├── test_ai.py       # 2667 个单元测试
 └── README.md
 ```

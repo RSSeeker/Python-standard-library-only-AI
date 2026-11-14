@@ -41220,6 +41220,227 @@ class MuPAdam:
                     Wj[i] -= lr * (m / c1) / (sqrt(v / c2) + eps)
 
 
+# ============================================================================
+#  8-bit Adam：把一阶/二阶矩按块量化成 int8（bitsandbytes 风格的分块 absmax）
+# ============================================================================
+
+
+def _b8_check_positive(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"Adam8bit: {name} 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"Adam8bit: {name} 必须是有限正数，收到 {value!r}")
+
+
+def _b8_check_beta(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"Adam8bit: {name} 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)) or not 0.0 <= value < 1.0:
+        raise ValueError(f"Adam8bit: {name} 必须满足 0 <= {name} < 1，收到 {value!r}")
+
+
+def _b8_check_block(block_size):
+    if not isinstance(block_size, int) or isinstance(block_size, bool) \
+            or block_size <= 0:
+        raise ValueError(
+            f"Adam8bit: block_size 必须是正整数，收到 {block_size!r}")
+
+
+def _b8_flatten(nested):
+    """二维嵌套数字列表 → (flat list, rows, cols)。"""
+    rows = len(nested)
+    cols = len(nested[0])
+    flat = []
+    for row in nested:
+        if len(row) != cols:
+            raise ValueError("Adam8bit: 状态数组必须是矩形")
+        flat.extend(float(v) for v in row)
+    return flat, rows, cols
+
+
+def _b8_unflatten(flat, rows, cols):
+    return [flat[r * cols:(r + 1) * cols] for r in range(rows)]
+
+
+def _b8_quantize_block(values, block_size):
+    """把一段浮点值量化到 int8（[-127,127]），返回 (qs, scales)。
+
+    每个 block 用 `absmax/127` 做 scale；全零 block 的 scale 记 1.0、量化值全 0
+    （这样反量化仍是 0，且不会除零）。
+    """
+    qs, scales = [], []
+    for start in range(0, len(values), block_size):
+        block = values[start:start + block_size]
+        amax = max(abs(v) for v in block)
+        if amax == 0.0:
+            scales.append(1.0)
+            qs.extend([0] * len(block))
+            continue
+        scale = amax / 127.0
+        scales.append(scale)
+        for v in block:
+            q = int(round(v / scale))
+            q = -127 if q < -127 else (127 if q > 127 else q)
+            qs.append(q)
+    return qs, scales
+
+
+def _b8_dequantize_block(qs, scales, block_size):
+    out = []
+    for start in range(0, len(qs), block_size):
+        scale = scales[start // block_size]
+        for q in qs[start:start + block_size]:
+            out.append(q * scale)
+    return out
+
+
+class Adam8bit:
+    """把 Adam 的 m/v 量化到 int8 的模拟优化器。
+
+    与 `Adam` 的接口一致（`step(all_grads)`，按层 zip），但状态在每步更新后
+    重新分块量化为 int8，因此显存约是 fp32 Adam 的 1/4（这里用 Python 列表
+    模拟，不省真实内存，只用于练习量化误差与训练稳定性）。
+    """
+
+    def __init__(self, model: MLP, lr: float = 1e-3, beta1: float = 0.9,
+                 beta2: float = 0.999, eps: float = 1e-8,
+                 block_size: int = 256):
+        _b8_check_positive(lr, "lr")
+        _b8_check_beta(beta1, "beta1")
+        _b8_check_beta(beta2, "beta2")
+        _b8_check_positive(eps, "eps")
+        _b8_check_block(block_size)
+        self.model = model
+        self.lr = float(lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.block_size = block_size
+        self.step_count = 0
+        self.state = {}
+
+    def _state_for(self, idx):
+        st = self.state.get(idx)
+        if st is None:
+            layer = self.model.layers[idx]
+            zeros_w = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+            zeros_b = [0.0] * layer.fan_out
+            st = {}
+            for name, arr, is_w in (("m_w", zeros_w, True),
+                                    ("v_w", zeros_w, True),
+                                    ("m_b", zeros_b, False),
+                                    ("v_b", zeros_b, False)):
+                if is_w:
+                    flat, rows, cols = _b8_flatten(arr)
+                else:
+                    flat, rows, cols = [float(v) for v in arr], 1, len(arr)
+                qs, scales = _b8_quantize_block(flat, self.block_size)
+                st[name] = {"q": qs, "scales": scales,
+                            "rows": rows, "cols": cols,
+                            "kind": "w" if is_w else "b"}
+            self.state[idx] = st
+        return st
+
+    def _dequant(self, st, name):
+        entry = st[name]
+        flat = _b8_dequantize_block(entry["q"], entry["scales"],
+                                    self.block_size)
+        if entry.get("kind") == "b":
+            return flat
+        return _b8_unflatten(flat, entry["rows"], entry["cols"])
+
+    def _requant(self, st, name, nested):
+        kind = st[name].get("kind", "w")
+        if kind == "b":
+            flat, rows, cols = [float(v) for v in nested], 1, len(nested)
+        else:
+            flat, rows, cols = _b8_flatten(nested)
+        qs, scales = _b8_quantize_block(flat, self.block_size)
+        st[name] = {"q": qs, "scales": scales, "rows": rows, "cols": cols,
+                    "kind": kind}
+
+    def step(self, all_grads):
+        if not isinstance(all_grads, list):
+            raise ValueError("Adam8bit.step: all_grads 必须是列表")
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError(
+                f"Adam8bit.step: 梯度层数 {len(all_grads)} 与模型层数 "
+                f"{len(self.model.layers)} 不一致")
+        self.step_count += 1
+        b1, b2, lr, eps = self.beta1, self.beta2, self.lr, self.eps
+        c1 = 1.0 - b1 ** self.step_count
+        c2 = 1.0 - b2 ** self.step_count
+        for idx, (layer, (grad_w, grad_b)) in enumerate(
+                zip(self.model.layers, all_grads)):
+            st = self._state_for(idx)
+            m_w = self._dequant(st, "m_w")
+            v_w = self._dequant(st, "v_w")
+            m_b = self._dequant(st, "m_b")
+            v_b = self._dequant(st, "v_b")
+            new_m_w = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+            new_v_w = [[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+            for i in range(layer.fan_out):
+                gi = grad_w[i]
+                for j in range(layer.fan_in):
+                    g = gi[j]
+                    if not isinstance(g, (int, float)) or isinstance(g, bool):
+                        raise ValueError("Adam8bit.step: 梯度必须是数字")
+                    if not math.isfinite(float(g)):
+                        raise ValueError("Adam8bit.step: 梯度出现 NaN/Inf")
+                    m = b1 * m_w[i][j] + (1.0 - b1) * g
+                    v = b2 * v_w[i][j] + (1.0 - b2) * g * g
+                    new_m_w[i][j] = m
+                    new_v_w[i][j] = v
+                    m_hat = m / c1
+                    v_hat = v / c2
+                    layer.weights[i][j] -= lr * m_hat / (math.sqrt(v_hat) + eps)
+            new_m_b = [0.0] * layer.fan_out
+            new_v_b = [0.0] * layer.fan_out
+            for i in range(layer.fan_out):
+                g = grad_b[i]
+                if not isinstance(g, (int, float)) or isinstance(g, bool):
+                    raise ValueError("Adam8bit.step: 梯度必须是数字")
+                if not math.isfinite(float(g)):
+                    raise ValueError("Adam8bit.step: 梯度出现 NaN/Inf")
+                m = b1 * m_b[i] + (1.0 - b1) * g
+                v = b2 * v_b[i] + (1.0 - b2) * g * g
+                new_m_b[i] = m
+                new_v_b[i] = v
+                m_hat = m / c1
+                v_hat = v / c2
+                layer.biases[i] -= lr * m_hat / (math.sqrt(v_hat) + eps)
+            self._requant(st, "m_w", new_m_w)
+            self._requant(st, "v_w", new_v_w)
+            self._requant(st, "m_b", new_m_b)
+            self._requant(st, "v_b", new_v_b)
+        return self
+
+    def state_bytes_estimate(self):
+        """int8 状态 + 每个 block 一个 fp32 scale 的粗略字节数。"""
+        total = 0
+        for st in self.state.values():
+            for entry in st.values():
+                total += len(entry["q"])          # int8
+                total += 4 * len(entry["scales"])  # fp32 scale
+        return total
+
+    def state_dict(self):
+        return {"optimizer": "adam8bit", "lr": self.lr,
+                "beta1": self.beta1, "beta2": self.beta2, "eps": self.eps,
+                "block_size": self.block_size,
+                "step_count": self.step_count, "state": self.state}
+
+    def load_state_dict(self, blob):
+        if not isinstance(blob, dict):
+            raise ValueError("Adam8bit: state_dict 必须是 dict")
+        if blob.get("optimizer") not in (None, "adam8bit"):
+            raise ValueError("Adam8bit: state_dict 属于其它优化器")
+        if blob.get("block_size") != self.block_size:
+            raise ValueError("Adam8bit: block_size 与当前实例不一致")
+        self.step_count = int(blob.get("step_count", 0))
+        self.state = blob.get("state", {})
+        return self
+
 class Adam:
     """Adam 优化器（一阶矩 + 二阶矩 + 偏差修正）
 
