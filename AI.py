@@ -51661,6 +51661,224 @@ def linear_probe_accuracy(scores, labels):
             hit += 1
     return hit / len(scores)
 
+
+def _ihs_check_ids(ids):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError("induction_head_score: ids 必须是非空 token 列表")
+    out = []
+    for i, v in enumerate(ids):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(
+                f"induction_head_score: ids[{i}]={v!r} 必须是非负整数")
+        out.append(int(v))
+    return out
+
+
+def _ihs_check_offset(offset):
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+        raise ValueError(
+            f"induction_head_score: offset 必须是 >=1 的整数，收到 {offset!r}")
+    return int(offset)
+
+
+def _ihs_maps(attn):
+    if isinstance(attn, dict):
+        maps = attn.get("maps")
+        if maps is None:
+            layers = attn.get("layers")
+            if not isinstance(layers, list) or not layers:
+                raise ValueError(
+                    "induction_head_score: attn 字典需要 maps 或非空 layers")
+            maps = layers[-1].get("maps") if isinstance(layers[-1], dict) else None
+            if maps is None:
+                raise ValueError(
+                    "induction_head_score: layers[-1] 缺少 maps 字段")
+    else:
+        maps = attn
+    if not isinstance(maps, (list, tuple)) or not maps:
+        raise ValueError("induction_head_score: attention 图必须是非空列表")
+    cleaned = []
+    for h, m in enumerate(maps):
+        if not isinstance(m, (list, tuple)) or not m:
+            raise ValueError(
+                f"induction_head_score: 第 {h} 个头的注意力矩阵必须是非空方阵")
+        rows = []
+        for t, row in enumerate(m):
+            if not isinstance(row, (list, tuple)) or len(row) != len(m):
+                raise ValueError(
+                    f"induction_head_score: 第 {h} 头第 {t} 行长度必须等于序列长度")
+            vals = []
+            for j, v in enumerate(row):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(
+                        f"induction_head_score: attn[{h}][{t}][{j}] 不是数字")
+                vals.append(float(v))
+            rows.append(vals)
+        cleaned.append(rows)
+    return cleaned
+
+
+def induction_head_score(attn, ids, offset=1):
+    """评估每个注意力头的「归纳头」强度。
+
+    归纳头（induction head）的行为：看到 `... A B ... A` 之后，把注意力放到
+    上一次 A 之后的 B 上。这里对每个位置 t 找 `ids[t]` 的上一次出现位置 p，
+    若 `p + offset <= t - 1`（因果可及），就取该头在 (t, p+offset) 上的注意力
+    权重；对所有可评估位置取平均作为该头得分。
+
+    `attn` 可以是 `attention_maps` 的返回值（`{"maps": ...}` / `{"layers": [...]}`
+    取最后一层），也可以直接是 `maps[h][t][j]` 列表。
+
+    返回 `{"num_heads", "scores", "best_head", "best_score"}`。
+    """
+    ids = _ihs_check_ids(ids)
+    offset = _ihs_check_offset(offset)
+    maps = _ihs_maps(attn)
+    seq = len(ids)
+    if any(len(m) != seq for m in maps):
+        raise ValueError(
+            f"induction_head_score: 注意力序列长度必须等于 ids 长度 {seq}")
+
+    scores = []
+    for h, m in enumerate(maps):
+        total = 0.0
+        count = 0
+        for t in range(seq):
+            p = -1
+            for j in range(t - 1, -1, -1):
+                if ids[j] == ids[t]:
+                    p = j
+                    break
+            if p < 0:
+                continue
+            target = p + offset
+            if target > t - 1:
+                continue
+            total += m[t][target]
+            count += 1
+        scores.append(total / count if count else 0.0)
+
+    best_head = max(range(len(scores)), key=lambda h: scores[h]) if scores else -1
+    return {
+        "num_heads": len(maps),
+        "scores": scores,
+        "best_head": best_head,
+        "best_score": scores[best_head] if scores else 0.0,
+    }
+
+
+def _tlp_check_data(features, labels):
+    if not isinstance(features, (list, tuple)) or not features:
+        raise ValueError("train_linear_probe: features 必须是非空样本列表")
+    if not isinstance(labels, (list, tuple)) or len(labels) != len(features):
+        raise ValueError("train_linear_probe: labels 长度必须等于 features 样本数")
+    dim = None
+    xs = []
+    for i, row in enumerate(features):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"train_linear_probe: features[{i}] 必须是非空向量")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"train_linear_probe: features[{i}][{j}] 不是数字")
+            if not math.isfinite(float(v)):
+                raise ValueError(
+                    f"train_linear_probe: features[{i}][{j}] 不是有限数字")
+            vals.append(float(v))
+        if dim is None:
+            dim = len(vals)
+        elif len(vals) != dim:
+            raise ValueError(
+                f"train_linear_probe: features 行宽不一致（第 {i} 行）")
+        xs.append(vals)
+    ys = []
+    for i, t in enumerate(labels):
+        if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+            raise ValueError(f"train_linear_probe: labels[{i}]={t!r} 必须是非负整数")
+        ys.append(int(t))
+    return xs, ys, dim
+
+
+def train_linear_probe(features, labels, num_classes=None, lr=0.1,
+                       epochs=100, l2=1e-4, seed=None):
+    """训练一个线性分类探针（softmax 回归），返回权重与训练记录。
+
+    常用于「冻结特征 + 线性探针」评估：`features` 是每层的隐藏表示，
+    `labels` 是类别下标。本函数只用 `Layer` 的线性输出与手写 softmax 交叉熵
+    反传，不依赖优化器类，方便把探针误差当作表示质量指标。
+
+    返回 `{"weights", "biases", "loss_history", "accuracy", "num_classes"}`。
+    """
+    xs, ys, dim = _tlp_check_data(features, labels)
+    if num_classes is None:
+        num_classes = max(ys) + 1
+    if isinstance(num_classes, bool) or not isinstance(num_classes, int) \
+            or num_classes < 1:
+        raise ValueError(
+            f"train_linear_probe: num_classes 必须是正整数，收到 {num_classes!r}")
+    if any(t >= num_classes for t in ys):
+        raise ValueError(
+            f"train_linear_probe: labels 越界（num_classes={num_classes}）")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+        raise ValueError(f"train_linear_probe: lr 必须是正数，收到 {lr!r}")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError(
+            f"train_linear_probe: epochs 必须是 >=1 的整数，收到 {epochs!r}")
+    if isinstance(l2, bool) or not isinstance(l2, (int, float)) or l2 < 0:
+        raise ValueError(f"train_linear_probe: l2 必须是非负数，收到 {l2!r}")
+    if seed is not None and (isinstance(seed, bool)
+                             or not isinstance(seed, int)):
+        raise ValueError("train_linear_probe: seed 必须是 int 或 None")
+
+    was = random.getstate()
+    if seed is not None:
+        random.seed(seed)
+    try:
+        probe = Layer(dim, num_classes, "linear")
+    finally:
+        random.setstate(was)
+
+    history = []
+    for _ in range(epochs):
+        acc_w = [[0.0] * dim for _ in range(num_classes)]
+        acc_b = [0.0] * num_classes
+        total = 0.0
+        for x, y in zip(xs, ys):
+            logits = probe.forward(x)
+            mx = max(logits)
+            exps = [math.exp(v - mx) for v in logits]
+            denom = sum(exps)
+            probs = [v / denom for v in exps]
+            total -= math.log(max(probs[y], 1e-300))
+            dlogits = probs[:]
+            dlogits[y] -= 1.0
+            grad_w, grad_b, _ = probe.backward(dlogits)
+            for r in range(num_classes):
+                for c in range(dim):
+                    acc_w[r][c] += grad_w[r][c]
+                acc_b[r] += grad_b[r]
+        n = len(xs)
+        for r in range(num_classes):
+            for c in range(dim):
+                g = acc_w[r][c] / n + l2 * probe.weights[r][c]
+                probe.weights[r][c] -= lr * g
+            probe.biases[r] -= lr * (acc_b[r] / n)
+        history.append(total / n)
+
+    hit = 0
+    for x, y in zip(xs, ys):
+        logits = probe.forward(x)
+        if max(range(num_classes), key=lambda r: logits[r]) == y:
+            hit += 1
+    return {
+        "weights": [row[:] for row in probe.weights],
+        "biases": list(probe.biases),
+        "loss_history": history,
+        "accuracy": hit / len(xs),
+        "num_classes": num_classes,
+    }
+
 # ============================================================================
 #  RL 算法（DQN 族）
 # ============================================================================

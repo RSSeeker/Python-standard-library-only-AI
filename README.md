@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2676 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2680 项）
 
 ## 特性
 
@@ -2279,6 +2279,27 @@ delta = patching_delta(clean_hidden, patched_hidden, direction)
 | `patching_delta(clean_rows, patched_rows, direction)` | patched 与 clean 在方向上的平均投影差 |
 
 - 边界：纯表示层工具，不包含解码头之外的模型逻辑；残差方向只是均值差（不做 PCA/白化）；activation patching 只给投影差，不做逐 head/path 定位；只支持二维浮点列表。
+
+### 归纳头与线性探针（induction head / probing）
+
+在注意力图上定位「归纳头」，并用线性探针检验隐藏表示是否线性可分。
+
+```python
+maps = AI.attention_maps(encoder, tokens)      # {"num_heads","seq_len","maps"}
+scores = AI.induction_head_score(maps, tokens)  # {"scores","best_head",...}
+probe = AI.train_linear_probe(features, labels, lr=0.2, epochs=300)
+print(probe["accuracy"], probe["loss_history"][-1])
+```
+
+| API | 说明 |
+| --- | --- |
+| `induction_head_score(attn, ids, offset=1)` | 对每个位置找 `ids[t]` 的上一次出现 `p`，取该头在 `(t, p+offset)` 的注意力并求均值；返回 `{num_heads, scores, best_head, best_score}`；`attn` 可用 `attention_maps` 的返回值或原始 `maps[h][t][j]` |
+| `train_linear_probe(features, labels, num_classes=None, lr=0.1, epochs=100, l2=1e-4, seed=None)` | 手写 softmax 交叉熵训练线性探针，返回 `{weights, biases, loss_history, accuracy, num_classes}` |
+
+边界：`induction_head_score` 只看单层单序列的注意力，重复 token 越少可评估位置越少；
+`offset` 需要满足因果可及（`p+offset <= t-1`）。`train_linear_probe` 返回的是**训练集**
+上的精度，没有 train/val 划分（需要泛化评估时请自行留出验证集）；探针只有 L2 正则、
+全批量更新，不做特征标准化。
 
 ### 验证器与评测工具（pass@k / PRM 聚合 / verifier 排序 / 毒性）
 
@@ -5908,7 +5929,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2676 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2680 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6204,6 +6225,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestColBERT` | late interaction 手算、normalize 开关、维度错误 |
 | `TestHybridSearch` | 融合顺序与字段、权重与非法输入 |
 | `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
+| `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
 | `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
@@ -6388,6 +6410,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2676 个单元测试
+├── test_ai.py       # 2680 个单元测试
 └── README.md
 ```

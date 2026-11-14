@@ -42463,3 +42463,120 @@ class TestEloBradleyTerry:
         assert _ebt_raises(lambda: AI.bradley_terry_fit([("A", "B", 1)],
                                                         l2=-1))
         assert _ebt_raises(lambda: AI.bradley_terry_expected(0.0, 0.0))
+
+
+import random
+
+
+def _interp_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _interp_maps():
+    seq = [5, 7, 5, 7, 5, 7]
+    n = len(seq)
+    good = [[1.0 / n] * n for _ in range(n)]
+    bad = [[1.0 / n] * n for _ in range(n)]
+    for t in range(n):
+        p = -1
+        for j in range(t - 1, -1, -1):
+            if seq[j] == seq[t]:
+                p = j
+                break
+        target = p + 1
+        if p >= 0 and target <= t - 1:
+            row = [0.0] * n
+            row[target] = 1.0
+            good[t] = row
+    return seq, [good, bad]
+
+
+def _interp_gaussians(seed=0, n_per=30):
+    rng = random.Random(seed)
+    centers = [(2.0, 0.0), (-2.0, 1.0), (0.0, -2.0)]
+    pairs = []
+    for c, (cx, cy) in enumerate(centers):
+        for _ in range(n_per):
+            pairs.append(([cx + rng.gauss(0, 0.35),
+                           cy + rng.gauss(0, 0.35)], c))
+    rng.shuffle(pairs)
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+class TestInductionHeadAndProbe:
+    def test_induction_head_score_synthetic(self):
+        seq, maps = _interp_maps()
+        res = AI.induction_head_score(
+            {"num_heads": 2, "seq_len": len(seq), "maps": maps}, seq)
+        assert res["num_heads"] == 2
+        assert res["best_head"] == 0
+        assert abs(res["scores"][0] - 1.0) < 1e-12
+        assert res["scores"][1] < 0.2
+        # offset=2：上一次出现位置 +2 处通常因果不可及 → 0 分
+        res2 = AI.induction_head_score(maps, seq, offset=2)
+        assert res2["scores"] == [0.0, 0.0]
+        # 无重复 token 时全 0
+        res0 = AI.induction_head_score(maps, [1, 2, 3, 4, 5, 6])
+        assert res0["scores"] == [0.0, 0.0]
+        # 支持 attention_maps 的 layers 形式（取最后一层）
+        res_l = AI.induction_head_score(
+            {"layers": [{"layer": 0, "maps": maps}]}, seq)
+        assert res_l["best_head"] == 0
+
+    def test_induction_head_invalid_inputs(self):
+        seq, maps = _interp_maps()
+        assert _interp_raises(lambda: AI.induction_head_score(maps, []))
+        assert _interp_raises(lambda: AI.induction_head_score(
+            maps, [1, -1] + seq[2:]))
+        assert _interp_raises(lambda: AI.induction_head_score(
+            maps, seq, offset=0))
+        assert _interp_raises(lambda: AI.induction_head_score(
+            {"maps": [[[1.0, 0.0]]]}, [1, 2]))
+        assert _interp_raises(lambda: AI.induction_head_score(
+            {"num_heads": 1}, seq))
+        assert _interp_raises(lambda: AI.induction_head_score(
+            [[[1.0, 0.0], [0.0, 1.0]]], ["a", "b"]))
+
+    def test_train_linear_probe_learns(self):
+        features, labels = _interp_gaussians()
+        probe = AI.train_linear_probe(features, labels, lr=0.2, epochs=300,
+                                      seed=7)
+        assert probe["num_classes"] == 3
+        assert len(probe["weights"]) == 3
+        assert len(probe["weights"][0]) == 2
+        assert probe["accuracy"] > 0.95
+        assert probe["loss_history"][-1] < probe["loss_history"][0] * 0.2
+        # 同 seed 可复现
+        probe2 = AI.train_linear_probe(features, labels, lr=0.2, epochs=300,
+                                       seed=7)
+        assert probe2["weights"] == probe["weights"]
+        # 闭式最优附近：至少比随机初始化好
+        probe3 = AI.train_linear_probe(features, labels, lr=0.2, epochs=1,
+                                       seed=7)
+        assert probe["accuracy"] >= probe3["accuracy"]
+
+    def test_train_linear_probe_invalid_inputs(self):
+        features, labels = _interp_gaussians(n_per=2)
+        assert _interp_raises(lambda: AI.train_linear_probe([], []))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels[:1]))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels, num_classes=0))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels, num_classes=2))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels, lr=0))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels, epochs=0))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            features, labels, l2=-1))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            [[1.0], [float("inf")]], [0, 1]))
+        assert _interp_raises(lambda: AI.train_linear_probe(
+            [[1.0], [1.0, 2.0]], [0, 1]))
