@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2766 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2771 项）
 
 ## 特性
 
@@ -4006,6 +4006,9 @@ pinn.predict(0.5)   # ≈ 0.125
 | `fsdp_reduce_scatter(rank_grads, world_size)` | 模拟 FSDP reduce-scatter：各 rank 的完整梯度先求平均、再按住分片 |
 | `zero_adam_step(flat_params, rank_grads, states=None, zero_stage=2, lr=1e-3, ...)` | 模拟 ZeRO-2/3 的 Adam 单步：各 rank 的完整梯度取平均后，只更新/保存自己那段参数分片与 `m`/`v`；stage=3 的参数也按分片持有，数值与单机 Adam 逐位一致 |
 | `zero_memory_bytes(num_params, world_size, zero_stage=2, dtype_bytes=4, state_multiples=2)` | 估算每 rank 的参数/梯度/优化器状态字节数：ZeRO-1/2/3 分别分片状态、梯度、参数 |
+| `pipeline_1f1b_schedule(num_stages, num_microbatches)` | 生成 1F1B 风格的 microbatch 调度事件（`F`/`B`、tick、stage），返回 `ticks` / `busy_slots` / `bubble_fraction`；greedy 规则「能反向就反向，否则前向」 |
+| `pipeline_1f1b_grads(model, xs, ys, splits)` | 纯数值模拟流水线训练一步：按段前向、按调度反向，返回与单机逐样本反传一致的平均梯度（含 `loss` 与调度信息） |
+
 
 | `tensor_parallel_linear_forward(weight, bias, x, world_size, mode='column')` | Megatron 式列/行并行线性层前向，数值与稠密前向一致 |
 | `sequence_parallel_layer_norm(x_seq, eps=1e-5)` | 序列并行 LayerNorm：每个 token 独立归一化，按序列切分不改变结果 |
@@ -4015,7 +4018,7 @@ updated, ranges = AI.zero_optimizer_step(params, grads, lr=0.1, world_size=4)
 y, shards = AI.tensor_parallel_linear_forward(W, b, x, world_size=2, mode="column")
 ```
 
-边界：这些是**教学用纯数值模拟**——不做真实通信/多进程/显存节省，只验证「分片-聚合后的数值与单机等价」；ZeRO 提供 1/2/3 三档分片（3 档参数也分片）但仍是同一进程内的数值模拟；张量并行只实现线性层前向对照，不含反向与通信 overlap。
+边界：这些是**教学用纯数值模拟**——不做真实通信/多进程/显存节省，只验证「分片-聚合后的数值与单机等价」；ZeRO 提供 1/2/3 三档分片（3 档参数也分片）但仍是同一进程内的数值模拟；1F1B 只生成调度并做逐段数值反传，事件按「ticks + 依赖」模拟、不建模真实通信延迟；张量并行只实现线性层前向对照，不含反向与通信 overlap。
 
 ### RL 基础设施与 RLHF 奖励
 
@@ -6251,7 +6254,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2766 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2771 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6280,6 +6283,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKVCacheEviction` | StreamingLLM 的 sink+最近窗口、H2O 保留高注意力与 `recent` token、SnapKV 只看观测窗口、下标有序且长度等于 budget、cache 子集一致、非法输入 |
 | `TestPromptCacheManager` | 前缀/最长部分前缀命中与统计、LRU 与 token 预算淘汰、JSON 持久化往返、前缀复用模拟的 token 节省、非法输入 |
 | `TestZero23` | ZeRO-2 单步与手写 Adam 逐位一致、三步状态递推一致、ZeRO-3 分片数值等价且覆盖完整、显存估算随 stage 递减、非法输入 |
+| `TestPipeline1F1B` | 1F1B 平均梯度与单机逐样本反传一致（err < 1e-12）、调度顺序与每段 F/B 计数、单段退化、bubble 比例公式、非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6751,6 +6755,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2766 个单元测试
+├── test_ai.py       # 2771 个单元测试
 └── README.md
 ```

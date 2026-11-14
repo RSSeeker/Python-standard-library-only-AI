@@ -58584,6 +58584,184 @@ def fsdp_reduce_scatter(rank_grads, world_size):
     return [(start, end, [avg[i] for i in range(start, end)]) for start, end, _ in shards]
 
 
+
+def _pipe_check_stages(num_stages):
+    if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
+        raise ValueError("pipeline: num_stages 必须是正整数")
+    return num_stages
+
+
+def _pipe_ssplit(layers, splits):
+    """按每段层数把层列表切成若干段，校验总和与段数。"""
+    if not isinstance(splits, (list, tuple)) or not splits:
+        raise ValueError("pipeline: splits 必须是非空列表")
+    total = 0
+    for s in splits:
+        if isinstance(s, bool) or not isinstance(s, int) or s < 1:
+            raise ValueError("pipeline: splits 每段必须是正整数")
+        total += s
+    if total != len(layers):
+        raise ValueError("pipeline: splits 之和必须等于层数")
+    stages = []
+    pos = 0
+    for s in splits:
+        stages.append(list(layers[pos:pos + s]))
+        pos += s
+    return stages
+
+
+def _pipe_stage_forward(layers, x_seq):
+    """单段前向：返回 (out_rows, caches)。"""
+    rows = [list(r) for r in x_seq]
+    caches = []
+    for layer in layers:
+        out, cache = _dense_rows_forward(layer, rows)
+        caches.append(cache)
+        rows = out
+    return rows, caches
+
+
+def _pipe_stage_backward(layers, caches, d_out):
+    """单段反向：返回 (dx_rows, grads=[(gw, gb), ...])。"""
+    drows = [list(r) for r in d_out]
+    grads = [None] * len(layers)
+    for idx in range(len(layers) - 1, -1, -1):
+        gw, gb, drows = _dense_rows_backward(layers[idx], caches[idx], drows)
+        grads[idx] = (gw, gb)
+    return drows, grads
+
+
+def pipeline_1f1b_schedule(num_stages, num_microbatches, greedy=True):
+    """生成 1F1B 风格的 microbatch 调度（纯事件列表，用于数值模拟）。
+
+    ``greedy=True`` 时每个 rank 在「能反向就反向、否则前向」的规则下每个 tick
+    最多做一个动作；返回 ``{'events': [(tick, stage, kind, mb), ...],
+    'ticks', 'busy_slots', 'bubble_fraction'}``，kind 为 ``'F'`` / ``'B'``。
+    """
+    p = _pipe_check_stages(num_stages)
+    m = _pipe_check_stages(num_microbatches)
+    f_done = [[False] * m for _ in range(p)]
+    b_done = [[False] * m for _ in range(p)]
+    f_next = [0] * p
+    events = []
+    ticks = 0
+    max_ticks = 8 * (p + m) + 8
+    while ticks < max_ticks:
+        if all(b_done[r][i] for r in range(p) for i in range(m)):
+            break
+        progressed = False
+        for r in range(p):
+            cand = None
+            for i in range(m):
+                if f_done[r][i] and not b_done[r][i]:
+                    if r == p - 1 or b_done[r + 1][i]:
+                        cand = i
+                        break
+            if cand is not None:
+                b_done[r][cand] = True
+                events.append((ticks, r, "B", cand))
+                progressed = True
+                continue
+            if f_next[r] < m:
+                i = f_next[r]
+                if r == 0 or f_done[r - 1][i]:
+                    f_done[r][i] = True
+                    f_next[r] += 1
+                    events.append((ticks, r, "F", i))
+                    progressed = True
+        if not progressed:
+            raise ValueError("pipeline_1f1b_schedule: 调度死锁（splits 或依赖不满足）")
+        ticks += 1
+    busy = len(events)
+    slots = p * ticks
+    return {
+        "events": events,
+        "ticks": ticks,
+        "busy_slots": busy,
+        "bubble_fraction": (slots - busy) / slots if slots else 0.0,
+    }
+
+
+def pipeline_1f1b_grads(model, xs, ys, splits):
+    """模拟 1F1B 流水线训练一步，返回与单机训练一致的层梯度。
+
+    每段内的层用 ``_dense_rows_forward/backward`` 逐样本计算；microbatch 数为
+    样本数（每条样本一个 microbatch）。返回 ``{'grads','loss','schedule',
+    'ticks','bubble_fraction'}``，其中 ``grads`` 为每层 ``(gw, gb)`` 的平均。
+    """
+    if not isinstance(model, MLP):
+        raise ValueError("pipeline_1f1b_grads: model 必须是 MLP")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("pipeline_1f1b_grads: xs 不能为空")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("pipeline_1f1b_grads: ys 必须与 xs 等长")
+    stages = _pipe_ssplit(model.layers, splits)
+    p = len(stages)
+    m = len(xs)
+    in_dim = model.layers[0].fan_in
+    out_dim = model.layers[-1].fan_out
+    xrows = []
+    yrows = []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if (not isinstance(x, (list, tuple)) or len(x) != in_dim):
+            raise ValueError(f"pipeline_1f1b_grads: xs[{i}] 维度必须是 {in_dim}")
+        if (not isinstance(y, (list, tuple)) or len(y) != out_dim):
+            raise ValueError(f"pipeline_1f1b_grads: ys[{i}] 维度必须是 {out_dim}")
+        xrows.append([float(v) for v in x])
+        yrows.append([float(v) for v in y])
+
+    schedule = pipeline_1f1b_schedule(p, m)
+    fwd_out = {}
+    caches = {}
+    grads_acc = [[None, None] for _ in model.layers]
+    total_loss = 0.0
+    layer_base = []
+    pos = 0
+    for stage in stages:
+        layer_base.append(pos)
+        pos += len(stage)
+
+    for tick, r, kind, i in schedule["events"]:
+        if kind == "F":
+            inp = [xrows[i]] if r == 0 else fwd_out[(r - 1, i)]
+            out, caches[(r, i)] = _pipe_stage_forward(stages[r], inp)
+            fwd_out[(r, i)] = out
+            if r == p - 1:
+                pred = out[0]
+                y = yrows[i]
+                diff = [pred[j] - y[j] for j in range(out_dim)]
+                total_loss += sum(v * v for v in diff) / out_dim
+                d_out = [[2.0 * v / out_dim for v in diff]]
+                fwd_out[("grad", i)] = d_out
+        else:
+            d_out = fwd_out[("grad", i)] if r == p - 1 else fwd_out[("bgrad", r + 1, i)]
+            dx, grads = _pipe_stage_backward(stages[r], caches[(r, i)], d_out)
+            fwd_out[("bgrad", r, i)] = dx
+            for k, (gw, gb) in enumerate(grads):
+                idx = layer_base[r] + k
+                if grads_acc[idx][0] is None:
+                    grads_acc[idx] = [gw, gb]
+                else:
+                    for a in range(len(gw)):
+                        for b in range(len(gw[0])):
+                            grads_acc[idx][0][a][b] += gw[a][b]
+                    for a in range(len(gb)):
+                        grads_acc[idx][1][a] += gb[a]
+
+    avg = []
+    for gw, gb in grads_acc:
+        avg.append((
+            [[v / m for v in row] for row in gw],
+            [v / m for v in gb],
+        ))
+    return {
+        "grads": avg,
+        "loss": total_loss / m,
+        "schedule": schedule,
+        "ticks": schedule["ticks"],
+        "bubble_fraction": schedule["bubble_fraction"],
+    }
+
 def tensor_parallel_linear_forward(weight, bias, x, world_size, mode="column"):
     """模拟 Megatron 式张量并行线性层（不做反向，只对照前向数值）。
 

@@ -44338,3 +44338,109 @@ class TestZero23:
         ]
         results = [_zero_raises(f) for f in bad]
         assert all(results), results
+
+
+import random
+
+
+def _pipe_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestPipeline1F1B:
+    def _model(self):
+        random.seed(5)
+        return AI.MLP([2, 3, 3, 1], ["relu", "relu", "linear"])
+
+    def test_grads_match_sequential(self):
+        model = self._model()
+        xs = [[0.1, 0.2], [0.4, -0.3], [-0.2, 0.5], [0.3, 0.1]]
+        ys = [[0.5], [-0.2], [0.1], [0.0]]
+        out = AI.pipeline_1f1b_grads(model, xs, ys, [1, 1, 1])
+        acc = [[None, None] for _ in model.layers]
+        for x, y in zip(xs, ys):
+            pred = model.forward(x)
+            diff = [pred[0] - y[0]]
+            grads, _ = AI._mlp_backward_with_input(
+                model, [2.0 * v for v in diff])
+            for idx, (gw, gb) in enumerate(grads):
+                if acc[idx][0] is None:
+                    acc[idx] = [[v for v in row] for row in gw], list(gb)
+                else:
+                    for a in range(len(gw)):
+                        for b in range(len(gw[0])):
+                            acc[idx][0][a][b] += gw[a][b]
+                    for a in range(len(gb)):
+                        acc[idx][1][a] += gb[a]
+        m = len(xs)
+        err = 0.0
+        for (gw, gb), (agw, agb) in zip(out["grads"], acc):
+            for a in range(len(gw)):
+                for b in range(len(gw[0])):
+                    err = max(err, abs(gw[a][b] - agw[a][b] / m))
+            for a in range(len(gb)):
+                err = max(err, abs(gb[a] - agb[a] / m))
+        assert err < 1e-12, err
+
+    def test_schedule_order_and_counts(self):
+        sched = AI.pipeline_1f1b_schedule(3, 4)
+        events = sched["events"]
+        pos = {}
+        f_count = {}
+        b_count = {}
+        for tick, r, kind, i in events:
+            pos[(r, kind, i)] = tick
+            if kind == "F":
+                f_count[r] = f_count.get(r, 0) + 1
+            else:
+                b_count[r] = b_count.get(r, 0) + 1
+        assert all(f_count.get(r) == 4 for r in range(3))
+        assert all(b_count.get(r) == 4 for r in range(3))
+        for i in range(4):
+            for r in range(3):
+                assert pos[(r, "F", i)] < pos[(r, "B", i)]
+                if r < 2:
+                    assert pos[(r, "F", i)] <= pos[(r + 1, "F", i)]
+                    assert pos[(r + 1, "B", i)] < pos[(r, "B", i)]
+        assert sched["ticks"] > 0
+        assert 0.0 < sched["bubble_fraction"] < 1.0
+
+    def test_single_stage_and_loss(self):
+        model = self._model()
+        xs = [[0.1, 0.2], [0.4, -0.3]]
+        ys = [[0.5], [-0.2]]
+        out = AI.pipeline_1f1b_grads(model, xs, ys, [3])
+        assert len(out["grads"]) == 3
+        losses = []
+        for x, y in zip(xs, ys):
+            pred = model.forward(x)
+            losses.append((pred[0] - y[0]) ** 2)
+        assert abs(out["loss"] - sum(losses) / len(losses)) < 1e-12
+
+    def test_bubble_fraction_formula(self):
+        sched = AI.pipeline_1f1b_schedule(2, 8)
+        slots = 2 * sched["ticks"]
+        assert sched["busy_slots"] == len(sched["events"])
+        assert abs(sched["bubble_fraction"] - (slots - sched["busy_slots"]) / slots) < 1e-12
+
+    def test_invalid_inputs(self):
+        model = self._model()
+        xs = [[0.1, 0.2], [0.4, -0.3]]
+        ys = [[0.5], [-0.2]]
+        bad = [
+            lambda: AI.pipeline_1f1b_grads("no", xs, ys, [1, 1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, [], [], [1, 1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, xs, ys[:1], [1, 1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, xs, ys, [1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, [[0.1]] * 2, ys, [1, 1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, xs, [[1.0, 2.0]] * 2, [1, 1, 1]),
+            lambda: AI.pipeline_1f1b_grads(model, xs, ys, [1, 0, 2]),
+            lambda: AI.pipeline_1f1b_schedule(0, 4),
+            lambda: AI.pipeline_1f1b_schedule(3, 0),
+        ]
+        results = [_pipe_raises(f) for f in bad]
+        assert all(results), results
