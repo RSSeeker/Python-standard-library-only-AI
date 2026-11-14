@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2984 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2989 项）
 
 ## 特性
 
@@ -4892,6 +4892,20 @@ Layer Scale 初值 1e-6 使初始近似恒等；与论文的 FCMAE 预训练实�
 流水线、act-order、packing 或与论文逐位一致。测试用固定随机种子，断言
 GPTQ 的**平均**加权误差低于 round-to-nearest（单例可能更差）。
 
+### Transformer-XL（段级循环，简化版）
+
+- `TransformerXL(vocab_size, d_model=32, num_heads=4, d_ff=64,
+  num_layers=1, max_len=64, mem_len=16, seed=None)`：把上一段末尾
+  `mem_len` 个隐藏状态拼到当前段前，一起做因果自注意力；
+  `forward(ids, memory=None)` 返回当前段 logits 与新的 memory；
+  `loss_and_backward(ids, targets, memory)` 反向时对 memory 行
+  stop-gradient；`fit(segments, epochs, lr, seed)` 按段携带 memory；
+  `param_count()`。
+
+边界：简化实现——没有相对位置编码（用绝对位置编码代替）、段长仍是
+`max_len`、memory 只保留最近 `mem_len` 行；不含论文里的段级缓存流水
+与自适应计算时间。
+
 ### 轻量 CNN 架构（MobileNetV2 / MobileNetV3 / EfficientNet）
 
 - `inverted_residual_block(x, out_ch, stride=1, expand_ratio=6, use_se=False,
@@ -5119,7 +5133,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2984 项）。
+`tests/`（合计 2989 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5127,7 +5141,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2984 项
+pytest -q                        # test_ai.py + tests/ 合计 2989 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6886,7 +6900,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2984 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2989 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7380,6 +7394,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestTransformerXL` | Transformer-XL 段级循环/记忆/梯度 |
 | `TestFCMAEReconstructor` | FCMAE 掩码重建/梯度/训练 |
 | `TestConvNeXtV2Block` | ConvNeXt V2 block 前向/梯度/训练 |
 | `TestCNNArchitectures` | 轻量 CNN 前向（复合缩放/倒残差/MBConv） |

@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1833 个 def / 432 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1834 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -25181,6 +25181,171 @@ class FCMAEReconstructor:
                 total += self.loss_and_backward(images[idx])
                 self.sgd_step(lr)
             history.append(total / len(images))
+        return history
+
+
+# ---- Transformer-XL（段级循环，简化版） ----
+
+
+def _xl_check_memory(memory, d_model, who="TransformerXL"):
+    if memory is None:
+        return
+    if not isinstance(memory, (list, tuple)):
+        raise ValueError(f"{who}: memory 必须是 list 或 None")
+    for row in memory:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: memory 每行长度必须是 {d_model}")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: memory 必须是有限数字")
+
+
+class TransformerXL:
+    """Transformer-XL 的段级循环（教学简化：无相对位置编码）
+
+    每段前向时把上一段的末 `mem_len` 个隐藏状态拼到当前段前面一起做因果
+    自注意力；反向时**不**把梯度传回历史段（memory 当作常量输入，等价于
+    stop-gradient），因此可以无界长文训练而不爆显存。相对位置编码未实现，
+    用绝对位置编码代替。
+    """
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=64,
+                 num_layers=1, max_len=64, mem_len=16, seed=None):
+        for name, v in (("vocab_size", vocab_size), ("d_model", d_model),
+                        ("num_heads", num_heads), ("num_layers", num_layers),
+                        ("max_len", max_len), ("mem_len", mem_len)):
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"TransformerXL: {name} 必须是正整数，收到 {v!r}")
+        if d_model % num_heads != 0:
+            raise ValueError("TransformerXL: d_model 必须能被 num_heads 整除")
+        if mem_len >= max_len:
+            raise ValueError("TransformerXL: mem_len 必须小于 max_len")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("TransformerXL: seed 必须是 int 或 None")
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.d_ff = d_ff
+        self.max_len = max_len
+        self.mem_len = mem_len
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        try:
+            self.embedding = Embedding(vocab_size, d_model)
+            self.pos = PositionalEncoding(d_model, max_len)
+            self.encoder = TransformerEncoder(d_model, num_heads, d_ff,
+                                              num_layers, dropout=0.0,
+                                              causal=True)
+            self.head = Layer(d_model, vocab_size, "linear")
+        finally:
+            if seed is not None:
+                random.setstate(state)
+        self._cache = None
+
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.head.grad_w = [[0.0] * self.head.fan_in
+                            for _ in range(self.head.fan_out)]
+        self.head.grad_b = [0.0] * self.head.fan_out
+
+    def param_count(self):
+        d = self.d_model
+        ff = self.d_ff
+        enc = self.num_layers * (4 * d * d + 9 * d + 2 * d * ff + ff)
+        return 2 * self.vocab_size * d + enc
+
+    def forward(self, ids, memory=None):
+        _check_token_ids(ids, self.vocab_size, "TransformerXL")
+        if not ids:
+            raise ValueError("TransformerXL: ids 不能为空")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"TransformerXL: 段长 {len(ids)} 超过 max_len={self.max_len}")
+        _xl_check_memory(memory, self.d_model)
+        emb = self.embedding.forward(ids)
+        xs = [[row[k] for k in range(self.d_model)] for row in emb]
+        mem = [] if memory is None else [row[:] for row in memory]
+        combined = mem + xs
+        combined = self.pos.forward(combined)
+        h = self.encoder.forward(combined)
+        T = len(ids)
+        seg_h = h[len(mem):]
+        logits, head_cache = _dense_rows_forward(self.head, seg_h)
+        new_memory = [] if self.mem_len == 0 else \
+            [row[:] for row in h[len(h) - self.mem_len:]]
+        self._cache = (ids, memory, mem, combined, h, head_cache, T)
+        return logits, new_memory
+
+    def loss_and_backward(self, ids, targets, memory=None):
+        logits, new_memory = self.forward(ids, memory)
+        T = len(ids)
+        if not isinstance(targets, (list, tuple)) or len(targets) != T:
+            raise ValueError("TransformerXL: targets 必须与 ids 等长")
+        V = self.vocab_size
+        loss = 0.0
+        d_logits = []
+        for t in range(T):
+            y = targets[t]
+            if isinstance(y, bool) or not isinstance(y, int) or not 0 <= y < V:
+                raise ValueError("TransformerXL: target token 越界")
+            row = logits[t]
+            mx = max(row)
+            ex = [math.exp(v - mx) for v in row]
+            s = sum(ex)
+            loss += -(row[y] - mx - math.log(s))
+            d = [e / s for e in ex]
+            d[y] -= 1.0
+            d_logits.append([v / T for v in d])
+        loss /= T
+        ids_c, memory_c, mem, combined, h, head_cache, T2 = self._cache
+        gw, gb, d_seg = _dense_rows_backward(self.head, head_cache, d_logits)
+        for r in range(self.head.fan_out):
+            self.head.grad_w[r] = [self.head.grad_w[r][c] + gw[r][c]
+                                   for c in range(self.head.fan_in)]
+            self.head.grad_b[r] += gb[r]
+        d_h = [[0.0] * self.d_model for _ in range(len(combined))]
+        off = len(mem)
+        for t in range(T):
+            for k in range(self.d_model):
+                d_h[off + t][k] = d_seg[t][k]
+        d_combined = self.encoder.backward(d_h)
+        # 位置编码直通，只回传到当前段
+        d_xs = d_combined[off:]
+        self.embedding.backward(d_xs)
+        return loss, new_memory
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("TransformerXL: lr 必须是非负有限数字")
+        self.embedding.sgd_step(lr)
+        self.encoder.sgd_step(lr)
+        _dense_apply_sgd(self.head, (self.head.grad_w, self.head.grad_b), lr)
+
+    def fit(self, segments, epochs=20, lr=0.01, seed=None):
+        if not isinstance(segments, (list, tuple)) or not segments:
+            raise ValueError("TransformerXL: segments 必须是非空 list")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("TransformerXL: epochs 必须是正整数")
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            memory = None
+            total = 0.0
+            order = list(range(len(segments)))
+            rng.shuffle(order)
+            for idx in order:
+                ids, targets = segments[idx]
+                self.zero_grad()
+                loss, memory = self.loss_and_backward(ids, targets, memory)
+                self.sgd_step(lr)
+                total += loss
+            history.append(total / len(segments))
         return history
 
 class ConvNeXtBlock:

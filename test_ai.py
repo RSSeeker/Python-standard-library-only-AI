@@ -47630,3 +47630,120 @@ class TestFCMAEReconstructor:
         assert _fcmae_raises(lambda: net.fit([], epochs=2))
         assert _fcmae_raises(lambda: net.fit([_fcmae_images()], epochs=0))
         assert _fcmae_raises(lambda: net.sgd_step(-0.1))
+
+
+# ---- Transformer-XL（段级循环） ----
+
+
+def _xl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _xl_loss_value(model, ids, tg):
+    logits, _ = model.forward(ids)
+    tot = 0.0
+    for t in range(len(ids)):
+        row = logits[t]
+        mx = max(row)
+        ex = [math.exp(v - mx) for v in row]
+        s = sum(ex)
+        tot += -(row[tg[t]] - mx - math.log(s))
+    return tot / len(ids)
+
+
+class TestTransformerXL:
+    def test_forward_and_memory(self):
+        model = AI.TransformerXL(8, 8, 2, 16, 1, max_len=8, mem_len=3, seed=1)
+        assert model.param_count() == 728
+        logits, memory = model.forward([0, 1, 2, 3])
+        assert len(logits) == 4 and len(logits[0]) == 8
+        assert len(memory) == 3 and len(memory[0]) == 8
+        # 记忆应影响输出
+        fake = [[0.1 * (i + 1) for _ in range(8)] for i in range(3)]
+        logits2, _ = model.forward([0, 1, 2, 3], fake)
+        diff = max(abs(logits2[t][k] - logits[t][k])
+                   for t in range(4) for k in range(8))
+        assert diff > 1e-9
+        # 相同输入确定性
+        logits3, _ = model.forward([0, 1, 2, 3])
+        assert logits3 == logits
+
+    def test_numerical_gradients(self):
+        model = AI.TransformerXL(8, 8, 2, 16, 1, max_len=8, mem_len=3, seed=2)
+        ids, tg = [0, 1, 2], [1, 2, 3]
+        model.zero_grad()
+        loss0, _ = model.loss_and_backward(ids, tg)
+        assert loss0 > 0.0
+        h = 1e-5
+        # head 权重
+        p0 = model.head.weights[0][1]
+        model.head.weights[0][1] = p0 + h
+        lp = _xl_loss_value(model, ids, tg)
+        model.head.weights[0][1] = p0 - h
+        lm = _xl_loss_value(model, ids, tg)
+        model.head.weights[0][1] = p0
+        fd = (lp - lm) / (2 * h)
+        assert abs(model.head.grad_w[0][1] - fd) < 1e-6
+        # embedding 权重
+        model.zero_grad()
+        model.loss_and_backward(ids, tg)
+        g = model.embedding.grad_weight[0][1]
+        p0 = model.embedding.weight[0][1]
+        model.embedding.weight[0][1] = p0 + h
+        lp = _xl_loss_value(model, ids, tg)
+        model.embedding.weight[0][1] = p0 - h
+        lm = _xl_loss_value(model, ids, tg)
+        model.embedding.weight[0][1] = p0
+        assert abs(g - (lp - lm) / (2 * h)) < 1e-6
+        # encoder self-attn 权重
+        model.zero_grad()
+        model.loss_and_backward(ids, tg)
+        attn = model.encoder.layers[0].self_attn
+        g = attn.grads["W_q"][1][2]
+        p0 = attn.W_q[1][2]
+        attn.W_q[1][2] = p0 + h
+        lp = _xl_loss_value(model, ids, tg)
+        attn.W_q[1][2] = p0 - h
+        lm = _xl_loss_value(model, ids, tg)
+        attn.W_q[1][2] = p0
+        assert abs(g - (lp - lm) / (2 * h)) < 1e-6
+
+    def test_memory_stop_gradient(self):
+        """memory 行不应得到梯度：反向时把 history 部分置零。"""
+        model = AI.TransformerXL(8, 8, 2, 16, 1, max_len=8, mem_len=3, seed=4)
+        ids, tg = [0, 1, 2], [1, 2, 3]
+        mem = [[0.2 * (i + 1) for _ in range(8)] for i in range(3)]
+        model.zero_grad()
+        loss, new_mem = model.loss_and_backward(ids, tg, mem)
+        assert loss > 0.0
+        assert len(new_mem) == 3
+        # 无 memory 时同一段损失应不同（说明 memory 参与计算）
+        loss2, _ = model.loss_and_backward(ids, tg, None)
+        assert abs(loss - loss2) > 1e-9
+
+    def test_training_converges(self):
+        model = AI.TransformerXL(8, 8, 2, 16, 1, max_len=8, mem_len=3, seed=3)
+        segments = [([0, 1, 2, 3], [1, 2, 3, 4]),
+                    ([4, 5, 6, 7], [5, 6, 7, 0])]
+        hist = model.fit(segments, epochs=40, lr=0.05, seed=1)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_invalid_inputs(self):
+        model = AI.TransformerXL(8, 8, 2, 16, 1, max_len=8, mem_len=3, seed=1)
+        assert _xl_raises(lambda: AI.TransformerXL(0))
+        assert _xl_raises(lambda: AI.TransformerXL(8, 8, 3))
+        assert _xl_raises(lambda: AI.TransformerXL(8, max_len=8, mem_len=8))
+        assert _xl_raises(lambda: model.forward([0] * 9))
+        assert _xl_raises(lambda: model.forward([8]))
+        assert _xl_raises(lambda: model.forward([1, 2], [[0.0] * 7]))
+        assert _xl_raises(lambda: model.forward([1.5]))
+        assert _xl_raises(lambda: model.loss_and_backward([1, 2], [1]))
+        assert _xl_raises(lambda: model.loss_and_backward([1, 2], [9]))
+        assert _xl_raises(lambda: model.sgd_step(-1))
+        assert _xl_raises(lambda: model.fit([], epochs=2))
+        assert _xl_raises(lambda: model.fit([([1], [1])], epochs=0))
