@@ -109,18 +109,40 @@ def cmd_train(args):
     model = AI.Model(mlp, loss_fn="cross_entropy" if classification else "mse",
                      optimizer=train_cfg.get("optimizer", "adam"),
                      lr=train_cfg.get("lr", 0.05), task="classification" if classification else "regression")
+    ckpt_cfg = config.get("checkpoint", {})
+    manager = AI.CheckpointManager(
+        os.path.join(out_dir, "checkpoints"),
+        metric=ckpt_cfg.get("metric", "val_loss"),
+        mode=ckpt_cfg.get("mode", "min"),
+        keep_last=ckpt_cfg.get("keep_last", 3),
+        keep_best=ckpt_cfg.get("keep_best", 1),
+        name=ckpt_cfg.get("name", "ckpt"),
+    )
+    resume_from = None
+    start_epoch = 0
+    total_epochs = train_cfg.get("epochs", 50)
+    if args.resume:
+        latest = manager.resume()
+        if latest is not None:
+            resume_from = latest["path"]
+            start_epoch = int(latest["epoch"])
+            total_epochs = max(total_epochs, start_epoch)
+    callback = AI.CheckpointCallback(manager, start_epoch=start_epoch)
     tracker = AI.ExperimentTracker(out_dir, name="train", extra={"config": config})
     tracker.start()
     started = time.time()
     try:
-        history = model.fit(xs, ys, epochs=train_cfg.get("epochs", 50),
-                            batch_size=train_cfg.get("batch_size", 16))
+        history = model.fit(xs, ys, epochs=max(1, total_epochs - start_epoch),
+                            batch_size=train_cfg.get("batch_size", 16),
+                            callbacks=[callback], resume_from=resume_from)
         ckpt = os.path.join(out_dir, "model.json")
         model.save(ckpt)
+        latest = manager.resume()
+        done_epochs = int(latest["epoch"]) if latest else start_epoch
         curve = []
         if isinstance(history, dict):
             curve = [float(v) for (_ep, v) in history.get("train_loss", [])]
-        n_epochs = len(curve)
+        n_epochs = done_epochs
         preds = model.predict_classes(xs) if classification else model.predict(xs)
         m = _metrics(ys, preds, labels)
         tracker.log_metrics(m)
@@ -231,6 +253,8 @@ def build_parser():
 
     t = sub.add_parser("train", help="按配置训练模型")
     t.add_argument("--config", required=True)
+    t.add_argument("--resume", action="store_true",
+                   help="从输出目录的最近检查点继续训练")
     t.set_defaults(func=cmd_train)
 
     e = sub.add_parser("eval", help="评估检查点")

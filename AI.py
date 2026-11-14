@@ -68531,6 +68531,145 @@ def memory_usage():
     return {"tracing": True, "current": current, "peak": peak}
 
 
+
+"""检查点管理器：滚动保留最近 K 个 + 指标最优 K 个，并支持 resume。
+"""
+
+
+def _ckpt_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("%s 必须是正整数，收到 %r" % (name, value))
+    return value
+
+
+class CheckpointManager:
+    """管理一个目录下的训练检查点。
+
+    - 每次 save 写成 ``<name>-epoch-%05d.json``；
+    - ``keep_last``：只保留最近 N 个 epoch 的检查点；
+    - ``keep_best``：按 ``metric``（``mode="min"`` 或 ``"max"``）保留最优 N 个；
+    - 两类保留取并集，其余文件删除；
+    - ``manifest.json`` 记录 latest/best/history，``resume()`` 返回最近检查点与 epoch。
+    """
+
+    def __init__(self, directory, metric="val_loss", mode="min",
+                 keep_last=3, keep_best=2, name="ckpt"):
+        if not isinstance(directory, str) or not directory.strip():
+            raise ValueError("CheckpointManager: directory 必须是非空字符串")
+        if not isinstance(metric, str) or not metric.strip():
+            raise ValueError("CheckpointManager: metric 必须是非空字符串")
+        if mode not in ("min", "max"):
+            raise ValueError("CheckpointManager: mode 只能是 'min' 或 'max'")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("CheckpointManager: name 必须是非空字符串")
+        self.directory = directory
+        self.metric = metric
+        self.mode = mode
+        self.keep_last = _ckpt_check_pos_int(keep_last, "keep_last")
+        self.keep_best = _ckpt_check_pos_int(keep_best, "keep_best")
+        self.name = name
+
+    # ---------- 内部 ----------
+
+    def _manifest_path(self):
+        return os.path.join(self.directory, "manifest.json")
+
+    def _load_manifest(self):
+        path = self._manifest_path()
+        if not os.path.exists(path):
+            return {"latest": None, "best": [], "history": []}
+        with io.open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("CheckpointManager: manifest.json 损坏")
+        data.setdefault("latest", None)
+        data.setdefault("best", [])
+        data.setdefault("history", [])
+        return data
+
+    def _write_manifest(self, manifest):
+        os.makedirs(self.directory, exist_ok=True)
+        with io.open(self._manifest_path(), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f, ensure_ascii=False, sort_keys=True, indent=2)
+            f.write("\n")
+
+    def _value(self, metrics):
+        if metrics is None:
+            return None
+        if not isinstance(metrics, dict):
+            raise ValueError("CheckpointManager: metrics 必须是 dict")
+        if self.metric not in metrics:
+            return None
+        v = metrics[self.metric]
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError("CheckpointManager: 指标 %r 必须是数字" % self.metric)
+        return float(v)
+
+    @staticmethod
+    def _epoch_of(record):
+        return record["epoch"]
+
+    # ---------- 对外 ----------
+
+    def save(self, model, epoch, metrics=None):
+        _ckpt_check_pos_int(epoch + 1, "epoch+1")
+        os.makedirs(self.directory, exist_ok=True)
+        fname = "%s-epoch-%05d.json" % (self.name, epoch)
+        path = os.path.join(self.directory, fname)
+        if hasattr(model, "save"):
+            model.save(path)
+        else:
+            save_model(model, path)
+        manifest = self._load_manifest()
+        value = self._value(metrics)
+        manifest["latest"] = {"epoch": epoch, "path": path}
+        manifest["history"].append({"epoch": epoch, "path": path,
+                                    "metric": self.metric, "value": value})
+        if value is not None:
+            best = [r for r in manifest["best"] if r["value"] is not None]
+            best.append({"epoch": epoch, "path": path, "value": value})
+            reverse = self.mode == "max"
+            best.sort(key=lambda r: r["value"], reverse=reverse)
+            manifest["best"] = best[: self.keep_best]
+        self._write_manifest(manifest)
+        self.prune()
+        return path
+
+    def prune(self):
+        manifest = self._load_manifest()
+        history = manifest["history"]
+        keep = set()
+        for rec in history[-self.keep_last:]:
+            keep.add(rec["path"])
+        for rec in manifest["best"]:
+            keep.add(rec["path"])
+        for rec in history:
+            if rec["path"] not in keep and os.path.exists(rec["path"]):
+                os.remove(rec["path"])
+        manifest["history"] = [r for r in history if r["path"] in keep]
+        self._write_manifest(manifest)
+        return sorted(keep)
+
+    def best(self, k=1):
+        _ckpt_check_pos_int(k, "k")
+        manifest = self._load_manifest()
+        return [dict(r) for r in manifest["best"][:k]]
+
+    def resume(self):
+        manifest = self._load_manifest()
+        latest = manifest.get("latest")
+        if not latest or not latest.get("path") or not os.path.exists(latest["path"]):
+            return None
+        return dict(latest)
+
+    def load_best(self, k=1):
+        records = self.best(k)
+        if not records:
+            return None, None
+        rec = records[0]
+        return load_model(rec["path"]), rec
+
+
 class ModelRegistry:
     """按名字 + 版本号存模型的目录注册表。
 
@@ -81921,6 +82060,35 @@ class Callback:
     def on_train_end(self, history):
         pass
 
+
+class CheckpointCallback(Callback):
+    """把 ``CheckpointManager`` 接进 ``Model.fit(callbacks=...)``。
+
+    ``start_epoch`` 用于恢复训练后保持 epoch 连续（首次训练传 0）。
+    """
+
+    def __init__(self, manager, start_epoch=0):
+        if not isinstance(manager, CheckpointManager):
+            raise TypeError("CheckpointCallback: manager 必须是 CheckpointManager")
+        if not isinstance(start_epoch, int) or isinstance(start_epoch, bool) or start_epoch < 0:
+            raise ValueError("CheckpointCallback: start_epoch 必须是非负整数")
+        self.manager = manager
+        self.start_epoch = start_epoch
+        self.model = None
+
+    def on_train_begin(self, model, info):
+        self.model = model
+
+    def on_epoch_end(self, epoch, logs):
+        if self.model is None:
+            return
+        metrics = {}
+        if isinstance(logs, dict):
+            if self.manager.metric in logs:
+                metrics[self.manager.metric] = logs[self.manager.metric]
+            elif logs.get("train_loss") is not None:
+                metrics[self.manager.metric] = logs["train_loss"]
+        self.manager.save(self.model, self.start_epoch + int(epoch), metrics or None)
 
 class EarlyStopping(Callback):
     """监控指标，连续 `patience` 轮没有改善就请求 `fit` 停止。

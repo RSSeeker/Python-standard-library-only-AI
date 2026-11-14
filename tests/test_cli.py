@@ -126,3 +126,16 @@ def test_bad_config_returns_error_code(tmp_path):
     proc = _run(tmp_path, "train", "--config", "config.json")
     assert proc.returncode != 0
     assert "error" in proc.stderr
+
+
+def test_train_resume_continues_epochs(tmp_path):
+    _write_dataset(tmp_path)
+    _config(tmp_path, epochs=3)
+    assert _run(tmp_path, "train", "--config", "config.json").returncode == 0
+    _config(tmp_path, epochs=6)
+    proc = _run(tmp_path, "train", "--config", "config.json", "--resume")
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout[proc.stdout.index("{"):])
+    assert payload["epochs"] == 6
+    manifest = json.loads((tmp_path / "run" / "checkpoints" / "manifest.json").read_text())
+    assert manifest["latest"]["epoch"] == 6
