@@ -4908,7 +4908,13 @@ model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
 ```bash
 pytest tests/ -q                 # 12 项冒烟测试
 pytest -q                        # test_ai.py + tests/ 合计 2920 项
+python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
+
+`tools/numeric_regression.py` 把 12 组确定性计算（固定权重 MLP、交叉熵、Gumbel-Softmax、
+Sparsemax/Entmax、SupCon/CosFace、AugMix JSD、Consistency 系数、MHA、NF4、缩放余弦
+注意力）的四舍五入结果存到 `tools/numeric_snapshot.json`；CI 在 pytest 之后跑
+`--check`，任何数值漂移超过 1e-6 即失败。修改实现后用 `--update` 重新生成快照。
 
 ### 工程便利件（unwrap_model / Trainer / benchmark_forward）
 
@@ -7190,6 +7196,8 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
 ├── test_ai.py       # 2908 个单元测试
 ├── tests/           # 12 个快速冒烟测试（pytest 自动发现）
+├── tools/
+│   └── numeric_regression.py  # 数值回归快照脚本
 ├── mypy.ini         # 渐进类型化配置模板
 ├── py.typed         # 类型标记（仓库非可安装包，仅作标记）
 └── README.md
