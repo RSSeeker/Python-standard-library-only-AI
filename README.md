@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2684 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2688 项）
 
 ## 特性
 
@@ -4988,6 +4988,31 @@ kept2 = simhash_dedup(docs, threshold=0.9)["indices"]
 
 - 边界：token 只支持 int/str（`blake2b` 稳定哈希，不受 `PYTHONHASHSEED` 影响）；Jaccard/相似度都是近似值；贪心去重是 O(n²) 次签名比较，适合教学/小规模语料；`bits` 上限 256，取值超过 64 时高位置零。
 
+### 数据污染检测（benchmark vs 训练集）
+
+评测前排查 benchmark 是否泄漏进训练语料：对每条 benchmark 文本估计它与训练集各条的
+MinHash Jaccard，并计算双向 n-gram 包含度（任一方 n-gram 被另一方覆盖的比例），
+取较大值作为污染得分。
+
+```python
+report = AI.contamination_report(benchmark_texts, training_texts,
+                                 threshold=0.8, ngram=5)
+report["contaminated_count"]        # 命中的 benchmark 条数
+report["contamination_rate"]        # 命中比例
+report["matches"][0]                # {index, matched, best_training_index,
+                                    #  jaccard, ngram_overlap, score}
+AI.contamination_ngram_overlap("a b c d e", "a b c d e", n=3)   # 1.0
+```
+
+| API | 说明 |
+| --- | --- |
+| `contamination_report(benchmark, training, threshold=0.8, ngram=5, num_hashes=64, seed=0)` | 返回 `{benchmark_size, training_size, threshold, ngram, matches, contaminated_count, contamination_rate}` |
+| `contamination_ngram_overlap(text_a, text_b, n=5)` | text_a 的 n-gram 有多大比例出现在 text_b（单向，0~1） |
+
+边界：这是**近似重复**检测（MinHash 估计 + n-gram 包含），能抓整题复制、改几个词、
+在前/后缀上扩写的情况；不做语义级改写或翻译检测。token 化只做小写 + 非字母数字切分，
+中文按字符序列处理；训练集很大时是 O(n_bench × n_train) 次签名比较，适合小到中等规模排查。
+
 ### 命名数据版本库（VersionedStore）
 
 ```python
@@ -5951,7 +5976,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2684 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2688 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6214,6 +6239,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMTPLanguageModel` | 参数计数、未来头/主干梯度数值校验、`num_future=0` 与 `CausalLM` 逐位等价、fit 降损失、非法输入 |
 | `TestModelMerging` | soup 均值、SLERP 端点/保范数/退化、TIES 手算与裁剪、DARE 复现与丢弃、非法输入 |
 | `TestDedup` | 稳定哈希、MinHash 签名/估计 Jaccard、SimHash 指纹/Hamming、两种贪心去重、非法输入 |
+| `TestContaminationReport` | 完全复制/近重复/无关文本/前缀扩写命中，threshold 灵敏度，n-gram 包含度性质，非法输入 |
 | `TestFIM` | PSM/SPM 重排结构、target mask、批量、非法输入 |
 | `TestSpanCorruption` | span 非重叠与边界、输入/目标替换、显式哨兵、种子确定性、非法输入 |
 | `TestQKNorm` | 逐行 RMSNorm 手算、gamma/输入梯度数值校验、Q/K 同时归一化、非法输入 |
@@ -6433,6 +6459,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2684 个单元测试
+├── test_ai.py       # 2688 个单元测试
 └── README.md
 ```

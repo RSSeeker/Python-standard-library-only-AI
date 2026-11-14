@@ -4900,6 +4900,119 @@ def minhash_dedup(items, threshold: float = 0.8, num_hashes: int = 64, seed: int
     return {"indices": kept, "signatures": sigs}
 
 
+
+def _ct_check_texts(texts, who):
+    if not isinstance(texts, (list, tuple)) or not texts:
+        raise ValueError(f"contamination: {who} 必须是非空文本列表")
+    out = []
+    for i, t in enumerate(texts):
+        if not isinstance(t, str) or not t.strip():
+            raise ValueError(
+                f"contamination: {who}[{i}] 必须是非空字符串")
+        out.append(t)
+    return out
+
+
+def _ct_tokens(text):
+    cleaned = []
+    for ch in text.lower():
+        cleaned.append(ch if (ch.isalnum() or ch == "_") else " ")
+    return "".join(cleaned).split()
+
+
+def _ct_ngrams(tokens, n):
+    if len(tokens) < n:
+        return []
+    return [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+
+
+def contamination_ngram_overlap(text_a, text_b, n=5):
+    """返回 text_a 的 n-gram 有多大比例出现在 text_b 中（0~1）。"""
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"contamination: n 必须是 >=1 的整数，收到 {n!r}")
+    ta = _ct_tokens(text_a)
+    tb = set(_ct_ngrams(_ct_tokens(text_b), n))
+    grams = _ct_ngrams(ta, n)
+    if not grams:
+        return 0.0
+    hits = sum(1 for g in grams if g in tb)
+    return hits / len(grams)
+
+
+def _ct_containment(text_a, text_b, n):
+    """双向 n-gram 包含度：任一方的 n-gram 被另一方覆盖的比例取最大。"""
+    ga = set(_ct_ngrams(_ct_tokens(text_a), n))
+    gb = set(_ct_ngrams(_ct_tokens(text_b), n))
+    if not ga or not gb:
+        return 0.0
+    a_in_b = len(ga & gb) / len(ga)
+    b_in_a = len(gb & ga) / len(gb)
+    return max(a_in_b, b_in_a)
+
+
+def contamination_report(benchmark, training, threshold=0.8, ngram=5,
+                         num_hashes=64, seed=0):
+    """检测 benchmark 文本是否出现在训练集中（数据污染）。
+
+    对每条 benchmark 文本，用 MinHash 估计它与每条训练文本的 Jaccard 相似度，
+    同时计算 n-gram 覆盖率，取二者较大值作为污染得分；得分 >= threshold 视为命中。
+    返回 `{"benchmark_size","training_size","threshold","ngram","matches",
+    "contaminated_count","contamination_rate"}`，其中 matches 按 benchmark 顺序
+    给出 `{index, matched, best_training_index, jaccard, ngram_overlap, score}`。
+
+    这是「近似重复」检测：适合找抄进训练集的题目，但不做语义级改写检测。
+    """
+    bench = _ct_check_texts(benchmark, "benchmark")
+    train = _ct_check_texts(training, "training")
+    if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+            or not math.isfinite(float(threshold))
+            or not (0.0 <= float(threshold) <= 1.0)):
+        raise ValueError(
+            f"contamination: threshold 必须在 [0,1]，收到 {threshold!r}")
+    if not isinstance(ngram, int) or isinstance(ngram, bool) or ngram < 1:
+        raise ValueError(
+            f"contamination: ngram 必须是 >=1 的整数，收到 {ngram!r}")
+
+    train_tokens = [_ct_tokens(t) for t in train]
+    train_sigs = [minhash_signature(tk, num_hashes, seed)
+                  for tk in train_tokens]
+    matches = []
+    hits = 0
+    for i, text in enumerate(bench):
+        tokens = _ct_tokens(text)
+        sig = minhash_signature(tokens, num_hashes, seed)
+        best = None
+        for j, other in enumerate(train_sigs):
+            jac = minhash_jaccard(sig, other)
+            if best is not None and jac <= best[1]:
+                continue
+            best = (j, jac)
+        jac = best[1] if best is not None else 0.0
+        idx = best[0] if best is not None else -1
+        overlap = _ct_containment(text, train[idx], ngram) \
+            if idx >= 0 else 0.0
+        score = max(jac, overlap)
+        matched = score >= float(threshold)
+        if matched:
+            hits += 1
+        matches.append({
+            "index": i,
+            "matched": matched,
+            "best_training_index": idx,
+            "jaccard": jac,
+            "ngram_overlap": overlap,
+            "score": score,
+        })
+    return {
+        "benchmark_size": len(bench),
+        "training_size": len(train),
+        "threshold": float(threshold),
+        "ngram": int(ngram),
+        "matches": matches,
+        "contaminated_count": hits,
+        "contamination_rate": hits / len(bench),
+    }
+
 def _dedup_popcount(value: int) -> int:
     return bin(value).count("1")
 

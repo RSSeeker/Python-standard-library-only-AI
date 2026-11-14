@@ -42643,3 +42643,67 @@ class TestMathEquivalence:
         assert _math_raises(lambda: AI.math_canonical("x + (y"))
         assert _math_raises(lambda: AI.math_equivalent("x", ""))
         assert _math_raises(lambda: AI.math_equivalent(1, "x"))
+
+
+def _contam_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestContaminationReport:
+    def test_detects_copies_and_near_duplicates(self):
+        train = [
+            "the capital of france is paris and the river is the seine",
+            "photosynthesis converts light energy into chemical energy in plants",
+            "a transformer uses self attention to model token dependencies",
+            "the great wall of china stretches thousands of kilometres",
+        ]
+        bench = [
+            "the capital of france is paris and the river is the seine",
+            "the capital of france is paris and the river is the rhine",
+            "what is the boiling point of water at sea level",
+            "a transformer uses self attention to model token dependencies in deep learning",
+        ]
+        r = AI.contamination_report(bench, train, threshold=0.8, ngram=3)
+        assert r["benchmark_size"] == 4 and r["training_size"] == 4
+        assert r["matches"][0]["matched"] is True
+        assert r["matches"][0]["best_training_index"] == 0
+        assert r["matches"][0]["jaccard"] == 1.0
+        assert r["matches"][1]["matched"] is True
+        assert r["matches"][2]["matched"] is False
+        assert r["matches"][3]["matched"] is True
+        assert abs(r["contamination_rate"] - 0.75) < 1e-12
+        assert r["contaminated_count"] == 3
+
+    def test_threshold_controls_sensitivity(self):
+        train = ["a b c d e f g h", "x y z w q r s t"]
+        bench = ["a b c d e f g h i j", "a b c d e f g h"]
+        loose = AI.contamination_report(bench, train, threshold=0.6, ngram=3)
+        assert loose["contaminated_count"] == 2
+        # threshold 越界应报错而不是静默
+        assert _contam_raises(lambda: AI.contamination_report(
+            bench, train, threshold=1.01))
+
+    def test_ngram_overlap_properties(self):
+        assert abs(AI.contamination_ngram_overlap(
+            "a b c d e", "a b c d e", n=3) - 1.0) < 1e-12
+        assert AI.contamination_ngram_overlap("a b c d e", "x y z", n=3) == 0.0
+        assert AI.contamination_ngram_overlap("a b", "a b", n=3) == 0.0
+        assert AI.contamination_ngram_overlap(
+            "a b c d e f", "a b c d e x", n=3) > 0.5
+
+    def test_invalid_inputs(self):
+        assert _contam_raises(lambda: AI.contamination_report([], ["a b"]))
+        assert _contam_raises(lambda: AI.contamination_report([1], ["a b"]))
+        assert _contam_raises(lambda: AI.contamination_report(["a b"], []))
+        assert _contam_raises(lambda: AI.contamination_report(
+            ["a b"], ["a b"], threshold=-0.1))
+        assert _contam_raises(lambda: AI.contamination_report(
+            ["a b"], ["a b"], ngram=0))
+        assert _contam_raises(lambda: AI.contamination_ngram_overlap(
+            "a b", "a b", n=0))
