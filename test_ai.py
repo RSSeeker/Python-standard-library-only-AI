@@ -46781,3 +46781,62 @@ class TestITransformer:
             [[0.0] * 4, [1.0] * 4], [[0.0, 0.0]]))
         assert _itr_raises(lambda: m.fit([], []))
         assert _itr_raises(lambda: m.sgd_step(-1))
+
+
+# ---- AugMix（多视图增强 + Jensen-Shannon 一致性） ----
+
+
+def _aug_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestAugMix:
+    def test_augment_deterministic_and_ranges(self):
+        img = [[[0.1, 0.5], [0.8, 0.2]]]
+        m1, w1 = AI.augmix_augment(img, width=3, depth=2, seed=7)
+        m2, w2 = AI.augmix_augment(img, width=3, depth=2, seed=7)
+        assert m1 == m2 and w1 == w2
+        assert abs(sum(w1) - 1.0) < 1e-12
+        assert all(len(ch) == 2 and len(ch[0]) == 2 for ch in m1)
+        assert all(0.0 <= v <= 1.0 for ch in m1 for row in ch for v in row)
+
+    def test_ops_behaviour(self):
+        img = [[[0.0, 1.0], [2.0, 3.0]]]
+        flipped = AI._augmix_op(img, "flip_h", None)
+        assert flipped == [[[2.0, 3.0], [0.0, 1.0]]]
+        transposed = AI._augmix_op(img, "flip_v", None)
+        assert transposed == [[[1.0, 0.0], [3.0, 2.0]]]
+        ident = AI._augmix_op(img, "identity", None)
+        assert ident == img
+
+    def test_jsd_properties(self):
+        same = AI.augmix_jsd_loss([[1.0, 2.0], [1.0, 2.0]])
+        assert abs(same) < 1e-12
+        a = AI.augmix_jsd_loss([[1.0, 2.0], [2.0, 1.0]])
+        b = AI.augmix_jsd_loss([[2.0, 1.0], [1.0, 2.0]])
+        assert abs(a - b) < 1e-12
+        assert a > 0.0
+
+    def test_augmix_loss_formula(self):
+        loss, ce, jsd = AI.augmix_loss([1.0, 2.0], [[2.0, 1.0]], 1)
+        assert abs(loss - (ce + 12.0 * jsd)) < 1e-12
+        assert ce > 0.0 and jsd >= 0.0
+        zero, ce0, jsd0 = AI.augmix_loss([1.0, 2.0], [[1.0, 2.0]], 1, lam=0.0)
+        assert abs(zero - ce0) < 1e-12 and abs(jsd0) < 1e-12
+
+    def test_invalid_inputs(self):
+        img = [[[0.1, 0.2], [0.3, 0.4]]]
+        assert _aug_raises(lambda: AI.augmix_augment([]))
+        assert _aug_raises(lambda: AI.augmix_augment(img, width=0))
+        assert _aug_raises(lambda: AI.augmix_augment(img, depth=0))
+        assert _aug_raises(lambda: AI.augmix_augment(img, ops=("bad",)))
+        assert _aug_raises(lambda: AI.augmix_augment([[[0.1, float("nan")]]]))
+        assert _aug_raises(lambda: AI.augmix_jsd_loss([[1.0]]))
+        assert _aug_raises(lambda: AI.augmix_jsd_loss([[1.0], [1.0]], temperature=0))
+        assert _aug_raises(lambda: AI.augmix_jsd_loss([[1.0, 2.0], [1.0]], ))
+        assert _aug_raises(lambda: AI.augmix_loss([1.0], [1.0], 5))
+        assert _aug_raises(lambda: AI.augmix_loss([1.0], [1.0], 0, lam=-1))

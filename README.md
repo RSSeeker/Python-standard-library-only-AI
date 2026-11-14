@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2882 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2887 项）
 
 ## 特性
 
@@ -6204,6 +6204,27 @@ print(restored.forward([0.1, 0.2, 0.3]))       # 与原模型逐位一致
   `ValueError`，不是 bytes 时抛 `TypeError`。
 - 不是通用 ONNX 导入器：不支持外部框架生成的多分支图、常量折叠、初始值以外的属性。
 
+### 数据增强：AugMix（多视图 + JSD 一致性）
+
+```python
+from AI import augmix_augment, augmix_jsd_loss, augmix_loss
+
+mixed, weights = augmix_augment(image, width=3, depth=2, seed=1)
+views = [model.forward(mixed) for _ in range(3)]
+loss = augmix_jsd_loss([model.forward(image)] + views)
+total, ce, jsd = augmix_loss(logits_clean, logits_aug, target, lam=12.0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `augmix_augment(image, width=3, depth=2, ops=None, seed=None)` | 单图 AugMix：`width` 条随机算子链（identity/flip_h/flip_v/brightness/contrast）各串 `depth` 个算子，按 Dirichlet 权重混合，返回 `(mixed, weights)` |
+| `augmix_jsd_loss(logits_list, temperature=1.0)` | 多视图 Jensen-Shannon 一致性损失：`M=mean(softmax(z_k/T))`，`JSD=mean_k KL(p_k||M)` |
+| `augmix_loss(logits_clean, logits_aug, target, lam=12.0, temperature=1.0)` | `CE(clean)+lam*JSD`，返回 `(total, ce, jsd)` |
+
+边界：单图、CPU 版——算子只含 identity/翻转/亮度/对比度（无 translate/rotate/色相），
+`ops`/`width`/`depth` 由调用方控制；没有 batch 变体与 DataLoader 集成；`augmix_loss` 只做
+「干净视图 CE + 多视图一致性」，不涉及对抗训练或权重平均。
+
 ### 多任务权重
 
 多任务训练里各任务 loss 量级不同，直接相加会被大 loss 主导。三个工具分别处理
@@ -6581,7 +6602,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2882 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2887 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7067,6 +7088,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
+| `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
@@ -7104,6 +7126,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2882 个单元测试
+├── test_ai.py       # 2887 个单元测试
 └── README.md
 ```

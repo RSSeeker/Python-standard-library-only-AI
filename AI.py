@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1787 个 def / 426 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1794 个 def / 426 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8151,6 +8151,161 @@ def _itr_check_matrix(rows, n_rows, n_cols, who, name):
             vals.append(float(v))
         out.append(vals)
     return out
+
+
+def _aug_check_image(image, who="AugMix"):
+    if not isinstance(image, (list, tuple)) or len(image) == 0:
+        raise ValueError(f"{who}: 图像必须是非空的 (C,H,W) 列表")
+    height = None
+    width = None
+    out = []
+    for ch in image:
+        if not isinstance(ch, (list, tuple)) or len(ch) == 0:
+            raise ValueError(f"{who}: 每个通道必须是非空的行列表")
+        rows = []
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or len(row) == 0:
+                raise ValueError(f"{who}: 行必须是非空列表")
+            if height is None:
+                height = len(row)
+            elif len(row) != height:
+                raise ValueError(f"{who}: 每行长度必须一致")
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: 像素必须是有限数字")
+                vals.append(float(v))
+            rows.append(vals)
+        if width is None:
+            width = len(rows)
+        elif len(rows) != width:
+            raise ValueError(f"{who}: 每个通道的高度必须一致")
+        out.append(rows)
+    return out
+
+
+def _augmix_copy(image):
+    return [[row[:] for row in ch] for ch in image]
+
+
+def _augmix_op(image, op, rng):
+    img = _aug_check_image(image)
+    if op == "identity":
+        return _augmix_copy(img)
+    if op == "flip_h":
+        return [ch[::-1] for ch in img]
+    if op == "flip_v":
+        return [[row[::-1] for row in ch] for ch in img]
+    if op == "brightness":
+        shift = rng.uniform(-0.2, 0.2)
+        return [[[max(0.0, min(1.0, v + shift)) for v in row] for row in ch]
+                for ch in img]
+    if op == "contrast":
+        mean = sum(v for ch in img for row in ch for v in row) / \
+               sum(len(row) for ch in img for row in ch)
+        scale = rng.uniform(0.7, 1.3)
+        return [[[max(0.0, min(1.0, (v - mean) * scale + mean)) for v in row]
+                 for row in ch] for ch in img]
+    raise ValueError(f"AugMix: 未知增强操作 {op!r}")
+
+
+AUGMIX_OPS = ("identity", "flip_h", "flip_v", "brightness", "contrast")
+
+
+def augmix_augment(image, width=3, depth=2, ops=None, seed=None):
+    """AugMix（2020）的单图增强：K 条随机算子链按 Dirichlet 权重混合
+
+    每条链对原图连续施加 `depth` 个随机算子（池可选 identity/flip_h/flip_v/
+    brightness/contrast），再用 `w ~ Dirichlet(1,...,1)` 混合；返回
+    `(mixed, weights)`。单图版本，不做 batch/多进程。
+    """
+    for v, name in ((width, "width"), (depth, "depth")):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f"AugMix: {name} 必须是正整数")
+    ops = AUGMIX_OPS if ops is None else tuple(ops)
+    if not ops:
+        raise ValueError("AugMix: ops 不能为空")
+    for op in ops:
+        if op not in AUGMIX_OPS:
+            raise ValueError(f"AugMix: 未知增强操作 {op!r}")
+    img = _aug_check_image(image)
+    rng = random.Random(seed)
+    weights = [rng.gammavariate(1.0, 1.0) for _ in range(width)]
+    total = sum(weights)
+    weights = [w / total for w in weights]
+    mixed = [[[0.0 for _ in row] for row in ch] for ch in img]
+    for k in range(width):
+        cur = _augmix_copy(img)
+        for _ in range(depth):
+            cur = _augmix_op(cur, ops[rng.randrange(len(ops))], rng)
+        wk = weights[k]
+        for c in range(len(img)):
+            for r in range(len(img[c])):
+                for j in range(len(img[c][r])):
+                    mixed[c][r][j] += wk * cur[c][r][j]
+    return mixed, weights
+
+
+def _aug_softmax(row):
+    m = max(row)
+    ex = [math.exp(v - m) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def augmix_jsd_loss(logits_list, temperature=1.0):
+    """AugMix 的 Jensen-Shannon 一致性损失（对多个增强视图的平均预测）
+
+    `M = mean(softmax(z_k/T))`，`JSD = mean_k KL(softmax(z_k/T) || M)`。
+    """
+    if not isinstance(logits_list, (list, tuple)) or len(logits_list) < 2:
+        raise ValueError("augmix_jsd_loss: 至少需要两个视图")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError("augmix_jsd_loss: temperature 必须是数字")
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("augmix_jsd_loss: temperature 必须是正有限数字")
+    probs = []
+    for row in logits_list:
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise ValueError("augmix_jsd_loss: 每个视图必须是非空 logits 列表")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError("augmix_jsd_loss: logits 必须是有限数字")
+            vals.append(float(v) / float(temperature))
+        probs.append(_aug_softmax(vals))
+    n = len(probs)
+    dim = len(probs[0])
+    for row in probs:
+        if len(row) != dim:
+            raise ValueError("augmix_jsd_loss: 各视图 logits 维度必须一致")
+    mean = [sum(probs[k][i] for k in range(n)) / n for i in range(dim)]
+    jsd = 0.0
+    for k in range(n):
+        for i in range(dim):
+            if probs[k][i] > 0.0:
+                jsd += probs[k][i] * math.log(probs[k][i] / mean[i])
+    return jsd / n
+
+
+def augmix_loss(logits_clean, logits_aug, target, lam=12.0, temperature=1.0):
+    """`CE(clean) + lam * JSD(clean, aug views)`，返回 (loss, ce, jsd)"""
+    if not isinstance(logits_aug, (list, tuple)) or len(logits_aug) < 1:
+        raise ValueError("augmix_loss: logits_aug 必须是非空列表")
+    if isinstance(lam, bool) or not isinstance(lam, (int, float)):
+        raise TypeError("augmix_loss: lam 必须是数字")
+    if not math.isfinite(float(lam)) or float(lam) < 0.0:
+        raise ValueError("augmix_loss: lam 必须是非负有限数字")
+    probs = _aug_softmax([float(v) for v in logits_clean])
+    if isinstance(target, bool) or not isinstance(target, int) \
+            or not (0 <= target < len(probs)):
+        raise ValueError("augmix_loss: target 必须是合法类别索引")
+    ce = -math.log(max(probs[target], 1e-300))
+    views = [list(logits_clean)] + [list(z) for z in logits_aug]
+    jsd = augmix_jsd_loss(views, temperature=temperature)
+    return ce + float(lam) * jsd, ce, jsd
 
 
 class ITransformer:
