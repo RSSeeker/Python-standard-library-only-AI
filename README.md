@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2727 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2731 项）
 
 ## 特性
 
@@ -2392,6 +2392,24 @@ out = AI.edit_output(layer, key_vec)              # 编辑前后对比
 边界：这是**单层线性记忆**的教学版编辑（真实 ROME/MEMIT 作用在 Transformer 的
 MLP down-projection 上并带协方差约束）；不做因果追踪、不验证编辑的泛化/副作用；
 只支持 `Layer`，不支持卷积或批量键值对。
+
+### causal tracing（逐层隐状态替换）
+
+| 函数 | 说明 |
+|---|---|
+| `causal_trace(lm, clean_ids, corrupt_ids, target_pos=None, token_id=None)` | 对 CausalLM 做逐层单点替换：把 corrupt 运行在 `target_pos` 的残差流换成 clean 同层同行，继续跑完剩余层，返回每层对目标 token logit 的恢复率、最佳层与端点 logit |
+
+```python
+lm = CausalLM(vocab_size=5, d_model=8, num_heads=2, num_layers=2)
+r = causal_trace(lm, [0, 1, 2], [0, 4, 2])   # 只改中间 token
+print(r["layers"][-1]["restoration"])         # 1.0（最后一层直接决定 logits）
+print(r["best_layer"])
+```
+
+恢复率定义：`(patched_logit − corrupt_logit) / (clean_logit − corrupt_logit)`，
+`0` 表示仍是 corrupt 的预测、`1` 表示完全恢复 clean；`layer=0` 是词嵌入之后、
+`layer=p` 是第 p 层之后。边界：只支持单点、单个 target token；clean 与 corrupt
+必须等长才能按位置对齐；数值可能超过 1（后续层是非线性的）。
 
 ### 可解释性工具（logit lens / 残差方向 / activation patching）
 
@@ -6151,7 +6169,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2727 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2731 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6457,6 +6475,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRedTeamSafety` | 七类 PII 全部命中且按起点排序、Luhn 拒绝假卡、类别过滤、canary 命中/去重、越狱高/中/低风险与规则名、批量报告汇总与阈值、十一类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
+| `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6643,6 +6662,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2727 个单元测试
+├── test_ai.py       # 2731 个单元测试
 └── README.md
 ```

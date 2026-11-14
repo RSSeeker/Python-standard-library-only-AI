@@ -43533,3 +43533,68 @@ class TestRulerEval:
             [{"task": "retrieval"}], _ruler_oracle))
         assert _ruler_raises(lambda: AI.ruler_evaluate(
             exs, lambda c, q: 1))
+
+
+def _ct_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _ct_lm(seed=None):
+    if seed is not None:
+        random.seed(seed)
+    lm = AI.CausalLM(vocab_size=5, d_model=8, num_heads=2, d_ff=16,
+                     num_layers=2, max_len=8)
+    lm.encoder.eval()
+    return lm
+
+
+class TestCausalTracing:
+    def test_trace_structure(self):
+        lm = _ct_lm(seed=1)
+        r = AI.causal_trace(lm, [0, 1, 2], [0, 4, 2])
+        assert r["num_layers"] == 2
+        assert r["seq_len"] == 3
+        assert r["target_pos"] == 2
+        assert len(r["layers"]) == 3
+        assert [x["layer"] for x in r["layers"]] == [0, 1, 2]
+        assert all(isinstance(x["restoration"], float) for x in r["layers"])
+
+    def test_final_layer_restores_clean_logit(self):
+        lm = _ct_lm(seed=2)
+        r = AI.causal_trace(lm, [0, 1, 2], [0, 4, 2])
+        assert abs(r["layers"][-1]["restoration"] - 1.0) < 1e-9
+        assert abs(r["layers"][-1]["patched_logit"] - r["clean_logit"]) < 1e-9
+        r2 = AI.causal_trace(lm, [0, 1, 2], [0, 4, 2], target_pos=1)
+        assert r2["target_pos"] == 1
+        assert abs(r2["layers"][-1]["restoration"] - 1.0) < 1e-9
+
+    def test_identical_and_best_layer(self):
+        lm = _ct_lm(seed=3)
+        r = AI.causal_trace(lm, [0, 1, 2], [0, 1, 2])
+        assert all(abs(x["restoration"]) < 1e-12 for x in r["layers"])
+        r2 = AI.causal_trace(lm, [0, 1, 2], [0, 4, 2])
+        assert 0 <= r2["best_layer"] <= 2
+        assert r2["best_restoration"] == max(
+            x["restoration"] for x in r2["layers"])
+
+    def test_invalid_inputs(self):
+        lm = _ct_lm(seed=4)
+        assert _ct_raises(lambda: AI.causal_trace(
+            AI.MLP([2, 1], ["linear"]), [0], [1]))
+        assert _ct_raises(lambda: AI.causal_trace(lm, [], []))
+        assert _ct_raises(lambda: AI.causal_trace(lm, [0, 1], [0]))
+        assert _ct_raises(lambda: AI.causal_trace(lm, [0, 9], [0, 1]))
+        assert _ct_raises(lambda: AI.causal_trace(lm, [0.1], [0]))
+        assert _ct_raises(lambda: AI.causal_trace(
+            lm, [0, 1], [0, 1], target_pos=2))
+        assert _ct_raises(lambda: AI.causal_trace(
+            lm, [0, 1], [0, 1], target_pos=-1))
+        assert _ct_raises(lambda: AI.causal_trace(
+            lm, [0, 1], [0, 1], token_id=9))
+        assert _ct_raises(lambda: AI.causal_trace(lm, [0] * 9, [0] * 9))

@@ -5898,6 +5898,120 @@ def _tl_fit_all(layers, targets, target_argmax, lr, epochs, l2, V, d):
         })
     return results
 
+
+"""Causal tracing：把 clean 运行里某一层/位置的隐状态替换进 corrupt 运行，
+看目标 token 的 logit 被恢复多少，用来定位「哪一层把关键信息带到了输出」。
+
+做法是逐层重放：``0`` 表示词嵌入 + 位置编码之后，``p`` 表示第 ``p`` 层
+Transformer 之后；把 corrupt 残差流在 target 位置的一行换成 clean 的同层同行，
+再继续跑完剩余层，比较目标 token 的 logit 与 clean/corrupt 两个端点。
+"""
+
+
+def _ct_check_lm(lm):
+    for name in ("embedding", "encoder", "W_out", "b_out"):
+        if not hasattr(lm, name):
+            raise ValueError("causal_trace: lm 需要是 CausalLM（缺 %s）" % name)
+    if not isinstance(getattr(lm, "max_len", 0), int) or lm.max_len < 1:
+        raise ValueError("causal_trace: lm.max_len 非法")
+    return lm
+
+
+def _ct_check_ids(lm, ids, who):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"causal_trace: {who} 必须是非空列表")
+    if len(ids) > lm.max_len:
+        raise ValueError(
+            f"causal_trace: {who} 长度 {len(ids)} 超过 max_len={lm.max_len}")
+    out = []
+    for i, t in enumerate(ids):
+        if not isinstance(t, int) or isinstance(t, bool):
+            raise ValueError(f"causal_trace: {who}[{i}] 必须是整数")
+        if not 0 <= t < lm.vocab_size:
+            raise ValueError(f"causal_trace: {who}[{i}] 越界（词表 {lm.vocab_size}）")
+        out.append(t)
+    return out
+
+
+def _ct_forward_to(lm, ids, upto):
+    """返回残差流：0=embedding(+pos)，p=第 p 层之后（无 dropout 时确定）。"""
+    emb = lm.embedding.forward(ids)
+    x = lm.pos.forward(emb) if getattr(lm, "use_abs_pos", False) else emb
+    for layer in lm.encoder.layers[:upto]:
+        x = layer.forward(x, None)
+    return [row[:] for row in x]
+
+
+def _ct_run_layers(lm, hidden, start):
+    x = [row[:] for row in hidden]
+    for layer in lm.encoder.layers[start:]:
+        x = layer.forward(x, None)
+    return x
+
+
+def _ct_logit_at(lm, hidden, pos, token_id):
+    row = hidden[pos]
+    w = lm.W_out[token_id]
+    return sum(row[j] * w[j] for j in range(len(row))) + lm.b_out[token_id]
+
+
+def causal_trace(lm, clean_ids, corrupt_ids, target_pos=None, token_id=None):
+    """逐层（含 embedding）做单点替换，返回目标 token 的 logit 恢复率。"""
+    _ct_check_lm(lm)
+    clean = _ct_check_ids(lm, clean_ids, "clean_ids")
+    corrupt = _ct_check_ids(lm, corrupt_ids, "corrupt_ids")
+    if len(clean) != len(corrupt):
+        raise ValueError(
+            "causal_trace: clean_ids 与 corrupt_ids 必须等长（位置对齐）")
+    seq_len = len(clean)
+    if target_pos is None:
+        target_pos = seq_len - 1
+    if not isinstance(target_pos, int) or isinstance(target_pos, bool) \
+            or not 0 <= target_pos < seq_len:
+        raise ValueError("causal_trace: target_pos 必须在 [0, seq_len)")
+
+    clean_logits = lm.forward(clean)
+    corrupt_logits = lm.forward(corrupt)
+    if token_id is None:
+        token_id = max(range(lm.vocab_size),
+                       key=lambda v: clean_logits[target_pos][v])
+    if not isinstance(token_id, int) or isinstance(token_id, bool) \
+            or not 0 <= token_id < lm.vocab_size:
+        raise ValueError("causal_trace: token_id 越界")
+
+    clean_states = [_ct_forward_to(lm, clean, p)
+                    for p in range(lm.num_layers + 1)]
+    corrupt_states = [_ct_forward_to(lm, corrupt, p)
+                      for p in range(lm.num_layers + 1)]
+
+    clean_logit = clean_logits[target_pos][token_id]
+    corrupt_logit = corrupt_logits[target_pos][token_id]
+    denom = clean_logit - corrupt_logit
+    layers = []
+    for p in range(lm.num_layers + 1):
+        patched = [row[:] for row in corrupt_states[p]]
+        patched[target_pos] = clean_states[p][target_pos][:]
+        hidden = _ct_run_layers(lm, patched, p)
+        patched_logit = _ct_logit_at(lm, hidden, target_pos, token_id)
+        if abs(denom) > 1e-12:
+            restore = (patched_logit - corrupt_logit) / denom
+        else:
+            restore = 0.0
+        layers.append({"layer": p, "restoration": restore,
+                       "patched_logit": patched_logit})
+    best = max(layers, key=lambda d: d["restoration"])
+    return {
+        "num_layers": lm.num_layers,
+        "seq_len": seq_len,
+        "target_pos": target_pos,
+        "token_id": token_id,
+        "clean_logit": clean_logit,
+        "corrupt_logit": corrupt_logit,
+        "layers": layers,
+        "best_layer": best["layer"],
+        "best_restoration": best["restoration"],
+    }
+
 def patching_delta(clean_rows, patched_rows, direction):
     """激活替换效应：patched 与 clean 在 direction 上平均投影之差。"""
     clean = _interp_check_matrix(clean_rows, "clean_rows")
