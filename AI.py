@@ -7145,6 +7145,151 @@ def watermark_z_score(token_ids, vocab_size: int, seed: int = 0,
     return {"z": (hits - n * p) / sigma, "hits": hits, "n": n, "green_fraction": p}
 
 
+
+def _kve_check_cache(keys, values, who="kv_cache_evict"):
+    """校验 KV cache：两个非空且等长的列表，每个元素是数字列表。"""
+    for name, seq in (("keys", keys), ("values", values)):
+        if not isinstance(seq, (list, tuple)) or not seq:
+            raise ValueError(f"{who}: {name} 必须是非空列表")
+        for i, item in enumerate(seq):
+            if not isinstance(item, (list, tuple)) or not item:
+                raise ValueError(f"{who}: {name}[{i}] 必须是非空列表")
+            for v in item:
+                if not _is_num(v) or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: {name}[{i}] 必须只包含有限数字")
+    if len(keys) != len(values):
+        raise ValueError(f"{who}: keys 与 values 长度必须一致")
+    return [list(item) for item in keys], [list(item) for item in values]
+
+
+def _kve_check_budget(budget, sink, seq_len, who="kv_cache_evict"):
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        raise ValueError(f"{who}: budget 必须是正整数")
+    if isinstance(sink, bool) or not isinstance(sink, int) or sink < 0:
+        raise ValueError(f"{who}: sink 必须是非负整数")
+    if sink > budget:
+        raise ValueError(f"{who}: sink 不能大于 budget")
+    if budget > seq_len:
+        raise ValueError(f"{who}: budget 不能超过序列长度")
+    return budget, sink
+
+
+def _kve_aggregate(scores, seq_len, who="kv_cache_evict"):
+    """把 scores（每行一个 query 的注意力分布）按列求和，得到每个 KV 位置的重要度。"""
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError(f"{who}: 该策略需要非空 scores")
+    agg = [0.0] * seq_len
+    for r, row in enumerate(scores):
+        if not isinstance(row, (list, tuple)) or len(row) != seq_len:
+            raise ValueError(f"{who}: scores[{r}] 长度必须等于序列长度 {seq_len}")
+        for j, v in enumerate(row):
+            if not _is_num(v) or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: scores[{r}][{j}] 必须是有限数字")
+            agg[j] += float(v)
+    return agg
+
+
+def _kve_top_indices(scores_agg, count, forbidden):
+    """按重要度降序取 count 个不在 forbidden 中的下标，返回升序结果。"""
+    order = sorted(range(len(scores_agg)), key=lambda j: (-scores_agg[j], j))
+    picked = []
+    for j in order:
+        if j in forbidden:
+            continue
+        picked.append(j)
+        if len(picked) >= count:
+            break
+    return sorted(picked)
+
+
+def streaming_kv_keep(seq_len, budget, sink=1, who="streaming_kv_keep"):
+    """StreamingLLM 策略：保留前 `sink` 个 attention sink 与最近 `budget-sink` 个 token。"""
+    if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len < 1:
+        raise ValueError(f"{who}: seq_len 必须是正整数")
+    budget, sink = _kve_check_budget(budget, sink, seq_len, who)
+    recent = budget - sink
+    keep = set(range(sink)) | set(range(seq_len - recent, seq_len))
+    return sorted(keep)
+
+
+def h2o_kv_keep(scores, budget, sink=1, recent=0, who="h2o_kv_keep"):
+    """H2O 策略：保留累计注意力最高的 token（外加 sink 与最近 `recent` 个 token）。"""
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError(f"{who}: scores 不能为空")
+    seq_len = len(scores[0])
+    budget, sink = _kve_check_budget(budget, sink, seq_len, who)
+    if isinstance(recent, bool) or not isinstance(recent, int) or recent < 0:
+        raise ValueError(f"{who}: recent 必须是非负整数")
+    if sink + recent > budget:
+        raise ValueError(f"{who}: sink + recent 不能大于 budget")
+    agg = _kve_aggregate(scores, seq_len, who)
+    forced = set(range(sink))
+    if recent > 0:
+        forced |= set(range(seq_len - recent, seq_len))
+    rest = budget - len(forced)
+    return sorted(forced | set(_kve_top_indices(agg, rest, forced)))
+
+
+def snapkv_kv_keep(scores, budget, sink=1, obs=None, who="snapkv_kv_keep"):
+    """SnapKV 策略：只用最后 `obs` 行 query 的注意力分数聚合后选 top token。"""
+    if not isinstance(scores, (list, tuple)) or not scores:
+        raise ValueError(f"{who}: scores 不能为空")
+    seq_len = len(scores[0])
+    budget, sink = _kve_check_budget(budget, sink, seq_len, who)
+    if obs is None:
+        obs = max(1, len(scores) // 4)
+    if isinstance(obs, bool) or not isinstance(obs, int) or obs < 1:
+        raise ValueError(f"{who}: obs 必须是正整数")
+    if obs > len(scores):
+        raise ValueError(f"{who}: obs 不能超过 query 数")
+    agg = _kve_aggregate(scores[-obs:], seq_len, who)
+    forced = set(range(sink))
+    rest = budget - len(forced)
+    return sorted(forced | set(_kve_top_indices(agg, rest, forced)))
+
+
+def kv_cache_evict(keys, values, budget, scores=None, policy="h2o",
+                   sink=1, recent=0, obs=None):
+    """按策略淘汰 KV cache，返回保留后的 cache 与保留下标。
+
+    policy 支持：
+    - ``"streaming"``：StreamingLLM，保留前 ``sink`` 个 + 最近 ``budget-sink`` 个；
+    - ``"h2o"``：按 ``scores`` 的累计注意力保留 top token（额外保留 sink 与最近 ``recent``）；
+    - ``"snapkv"``：只用最后 ``obs`` 行 query 的分数聚合后选 top。
+    """
+    keys, values = _kve_check_cache(keys, values)
+    seq_len = len(keys)
+    budget, sink = _kve_check_budget(budget, sink, seq_len)
+    policies = ("streaming", "h2o", "snapkv")
+    if policy not in policies:
+        raise ValueError(f"kv_cache_evict: policy 必须是 {policies} 之一，收到 {policy!r}")
+    if policy in ("h2o", "snapkv"):
+        if not isinstance(scores, (list, tuple)) or not scores:
+            raise ValueError(f"kv_cache_evict: {policy} 策略需要非空 scores")
+        for r, row in enumerate(scores):
+            if (not isinstance(row, (list, tuple))
+                    or len(row) != seq_len):
+                raise ValueError(
+                    f"kv_cache_evict: scores[{r}] 的长度必须等于 cache 序列长度 {seq_len}")
+    if budget == seq_len:
+        keep = list(range(seq_len))
+    elif policy == "streaming":
+        keep = streaming_kv_keep(seq_len, budget, sink)
+    elif policy == "h2o":
+        keep = h2o_kv_keep(scores, budget, sink, recent=recent)
+    else:
+        keep = snapkv_kv_keep(scores, budget, sink, obs=obs)
+    new_keys = [keys[i] for i in keep]
+    new_values = [values[i] for i in keep]
+    return {
+        "policy": policy,
+        "budget": budget,
+        "kept_indices": keep,
+        "evicted": seq_len - len(keep),
+        "keys": new_keys,
+        "values": new_values,
+    }
+
 def streaming_attention_mask(seq_len: int, sink_size: int = 4,
                              window_size: int = 8):
     """StreamingLLM 式掩码：每个位置可见 sink 前缀 + 最近 window 个 token（因果）。"""

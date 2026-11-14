@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2751 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2756 项）
 
 ## 特性
 
@@ -588,6 +588,30 @@ fp32 scale），误差被限制在半个 scale 内；这里用 Python 列表模�
 
 **RoPE + KV cache**：`CausalLM(..., rope=True)` 会默认关掉绝对位置编码（Llama 的做法），
 想两者同时用可传 `use_abs_pos=True`。
+
+### KV cache 淘汰（StreamingLLM / H2O / SnapKV）
+
+长上下文推理时 KV cache 会线性增长，`kv_cache_evict` 在给定预算下按策略丢掉低价值 token：
+
+| API | 说明 |
+| --- | --- |
+| `kv_cache_evict(keys, values, budget, scores=None, policy="h2o", sink=1, recent=0, obs=None)` | 返回 `{policy, budget, kept_indices, evicted, keys, values}`；`streaming` 保留前 `sink` 个 attention sink 与最近 `budget-sink` 个 token；`h2o` 按 `scores` 的累计注意力保留 top token（`recent` 可强制保留最近几个）；`snapkv` 只用最后 `obs` 行 query 的分数聚合后再选 top；保留结果保持原顺序 |
+| `streaming_kv_keep(seq_len, budget, sink=1)` / `h2o_kv_keep(scores, budget, sink=1, recent=0)` / `snapkv_kv_keep(scores, budget, sink=1, obs=None)` | 只返回保留下标，便于接入自己的 cache 结构 |
+
+```python
+keys = [[0.1, 0.2]] * 8
+values = [[0.3]] * 8
+scores = [[0.1] * 8]
+scores[0][2] = 5.0                  # 第 2 个 token 被强烈关注
+out = AI.kv_cache_evict(keys, values, budget=4, scores=scores,
+                        policy="h2o", sink=1, recent=1)
+print(out["kept_indices"], out["evicted"])
+```
+
+边界：这是**策略层**实现，不做真实显存管理，也不改模型前向——调用方在增量解码时用
+`kept_indices` 裁剪各层 cache 即可；H2O/SnapKV 依赖传入的注意力分数（可由
+`attention_maps` 或生成时的注意力统计得到），分数缺失时会显式报错。
+
 
 **优化器与 LoRA**：`Lion`（符号动量，`lr` 取 1e-4~1e-3）和 `Adafactor`（行列因子化，显存 O(m+n)）
 都能直接 `opt.step(AI._mlp_backward(model, grad))`；`LoRA` 用来冻结原层只训低秩分支：
@@ -6199,7 +6223,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2751 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2756 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6225,6 +6249,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSophiaHutchinson` | 正交零和输入下线性模型 Hessian 对角精确为 2、两层 MLP 返回形状、与逐参数中心差分精确对角的近似（max abs diff < 0.4）、Sophia + Hutchinson 训练 loss 下降、非法输入 |
 | `TestShampooNewtonGrafting` | Newton–Schulz 逆根与 Jacobi 特征分解结果一致（max_abs < 1e-6）、Newton 路径训练收敛、grafting 一步更新范数与 Adam 一致、`state_dict` 往返（含 `L/R/m/v` 字段）、非法超参 |
 | `TestGaLore` | 全秩投影重建（`rank=min` 时 err < 1e-8）、`rank=1` 更新增量行列式 ≈ 0、200 步线性回归收敛、偏置更新与手写 Adam 一致、7 类非法输入 |
+| `TestKVCacheEviction` | StreamingLLM 的 sink+最近窗口、H2O 保留高注意力与 `recent` token、SnapKV 只看观测窗口、下标有序且长度等于 budget、cache 子集一致、非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6696,6 +6721,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2751 个单元测试
+├── test_ai.py       # 2756 个单元测试
 └── README.md
 ```

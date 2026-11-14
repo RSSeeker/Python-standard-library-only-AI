@@ -44064,3 +44064,90 @@ class TestGaLore:
         assert _galore_raises(lambda: AI.GaLore(m, eps=0.0))
         opt = AI.GaLore(m, lr=0.01, rank=2)
         assert _galore_raises(lambda: opt.step([]))
+
+
+def _kve_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _kve_cache(n):
+    keys = [[float(i), float(i) + 0.5] for i in range(n)]
+    values = [[float(2 * i)] for i in range(n)]
+    return keys, values
+
+
+class TestKVCacheEviction:
+    def test_streaming_keep(self):
+        keep = AI.streaming_kv_keep(10, 4, sink=2)
+        assert keep == [0, 1, 8, 9]
+        keys, values = _kve_cache(10)
+        out = AI.kv_cache_evict(keys, values, 10, policy="streaming", sink=2)
+        assert out["kept_indices"] == list(range(10))
+        assert out["evicted"] == 0
+        assert out["keys"] == keys and out["values"] == values
+
+    def test_h2o_keeps_heavy_and_recent(self):
+        keys, values = _kve_cache(10)
+        scores = [[0.1] * 10]
+        scores[0][2] = 5.0
+        out = AI.kv_cache_evict(keys, values, 3, scores=scores, policy="h2o", sink=1)
+        assert 0 in out["kept_indices"] and 2 in out["kept_indices"]
+        assert len(out["kept_indices"]) == 3
+        assert out["keys"] == [keys[i] for i in out["kept_indices"]]
+        assert out["values"] == [values[i] for i in out["kept_indices"]]
+        assert out["evicted"] == 7
+        out = AI.kv_cache_evict(keys, values, 4, scores=scores, policy="h2o",
+                                sink=1, recent=2)
+        assert set(out["kept_indices"]) == {0, 2, 8, 9}
+
+    def test_snapkv_observation_window(self):
+        keys, values = _kve_cache(10)
+        scores = []
+        for q in range(8):
+            row = [0.05] * 10
+            if q < 6:
+                row[1] = 9.0
+            else:
+                row[6] = 9.0
+            scores.append(row)
+        full = AI.h2o_kv_keep(scores, 2, sink=0)
+        snap = AI.snapkv_kv_keep(scores, 2, sink=0, obs=2)
+        assert 1 in full and 6 in snap and 1 not in snap
+        out = AI.kv_cache_evict(keys, values, 2, scores=scores,
+                                policy="snapkv", obs=2)
+        assert out["kept_indices"] == snap
+
+    def test_sorted_and_budget(self):
+        keys, values = _kve_cache(12)
+        scores = [[float((j * 7) % 5) for j in range(12)]]
+        for policy in ("streaming", "h2o", "snapkv"):
+            out = AI.kv_cache_evict(keys, values, 5, scores=scores, policy=policy)
+            assert out["kept_indices"] == sorted(out["kept_indices"])
+            assert len(out["kept_indices"]) == 5
+            assert out["evicted"] == 7
+
+    def test_invalid_inputs(self):
+        keys, values = _kve_cache(6)
+        bad = [
+            lambda: AI.kv_cache_evict([], [], 3),
+            lambda: AI.kv_cache_evict(keys, values[:3], 3, policy="streaming"),
+            lambda: AI.kv_cache_evict(keys, values, 0, policy="streaming"),
+            lambda: AI.kv_cache_evict(keys, values, 7, policy="streaming"),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="fifo"),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="h2o"),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="h2o",
+                                      scores=[[0.1] * 5]),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="streaming", sink=9),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="snapkv",
+                                      scores=[[0.1] * 6], obs=0),
+            lambda: AI.kv_cache_evict([[1, 2]], [[3]], 1),
+            lambda: AI.kv_cache_evict([["a"]], [[1]], 1),
+            lambda: AI.kv_cache_evict(keys, values, 3, policy="h2o",
+                                      scores=[[0.1] * 6, [0.2] * 5]),
+        ]
+        results = [_kve_raises(f) for f in bad]
+        assert all(results), results
