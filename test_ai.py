@@ -44444,3 +44444,158 @@ class TestPipeline1F1B:
         ]
         results = [_pipe_raises(f) for f in bad]
         assert all(results), results
+
+
+def _cp_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _cp_avg_manual(model, xs, ys):
+    """逐样本 _mlp_backward_with_input 后平均，作为 checkpoint 梯度的参照。"""
+    acc = [None] * len(model.layers)
+    total = 0.0
+    for x, y in zip(xs, ys):
+        pred = model.forward(x)
+        diff = [pred[j] - y[j] for j in range(len(y))]
+        total += sum(v * v for v in diff) / len(y)
+        d = [2.0 * v / len(y) for v in diff]
+        g, _ = AI._mlp_backward_with_input(model, d)
+        for k, (gw, gb) in enumerate(g):
+            if acc[k] is None:
+                acc[k] = [[v for v in row] for row in gw], list(gb)
+            else:
+                for a in range(len(gw)):
+                    for b in range(len(gw[0])):
+                        acc[k][0][a][b] += gw[a][b]
+                for a in range(len(gb)):
+                    acc[k][1][a] += gb[a]
+    n = len(xs)
+    return [([[v / n for v in row] for row in gw], [v / n for v in gb])
+            for gw, gb in acc], total / n
+
+
+class TestCheckpointed:
+    def _model(self):
+        return AI.MLP([2, 3, 3, 1], ["relu", "relu", "linear"])
+
+    def test_grads_match_manual(self):
+        random.seed(11)
+        model = self._model()
+        xs = [[0.1, 0.2], [0.4, -0.3], [-0.2, 0.5], [0.3, 0.1]]
+        ys = [[0.5], [-0.2], [0.1], [0.0]]
+        grads, loss = AI.checkpointed_grads(model, xs, ys, segments=2)
+        ref_grads, ref_loss = _cp_avg_manual(model, xs, ys)
+        err = 0.0
+        for (gw, gb), (rgw, rgb) in zip(grads, ref_grads):
+            for a in range(len(gw)):
+                for b in range(len(gw[0])):
+                    err = max(err, abs(gw[a][b] - rgw[a][b]))
+            for a in range(len(gb)):
+                err = max(err, abs(gb[a] - rgb[a]))
+        assert err < 1e-12
+        assert abs(loss - ref_loss) < 1e-12
+
+    def test_segments_equivalence(self):
+        random.seed(5)
+        model = self._model()
+        xs = [[0.2, -0.1], [-0.4, 0.3], [0.5, 0.5]]
+        ys = [[0.1], [0.2], [-0.3]]
+        g1, _ = AI.checkpointed_grads(model, xs, ys, segments=1)
+        g3, _ = AI.checkpointed_grads(model, xs, ys, segments=3)
+        err = 0.0
+        for (gw, gb), (gw2, gb2) in zip(g1, g3):
+            for a in range(len(gw)):
+                for b in range(len(gw[0])):
+                    err = max(err, abs(gw[a][b] - gw2[a][b]))
+            for a in range(len(gb)):
+                err = max(err, abs(gb[a] - gb2[a]))
+        assert err < 1e-12
+
+    def test_cross_entropy_and_fit(self):
+        random.seed(3)
+        m2 = AI.MLP([2, 3, 3], ["relu", "linear"])
+        xs = [[0.1, 0.2], [0.4, -0.3], [-0.2, 0.5], [0.3, 0.1]]
+        grads, loss = AI.checkpointed_grads(m2, xs, [0, 2, 1, 0],
+                                            loss="cross_entropy", segments=2)
+        assert isinstance(loss, float) and loss > 0.0
+        assert len(grads) == len(m2.layers)
+
+        random.seed(7)
+        m3 = AI.MLP([2, 4, 1], ["relu", "linear"])
+        ys = [0.5, -0.2, 0.1, 0.0]
+        res = AI.fit_checkpointed(m3, xs, [[v] for v in ys], epochs=400,
+                                  lr=0.3, batch_size=2, segments=2,
+                                  shuffle=False)
+        assert res["loss_history"][-1] < res["loss_history"][0] * 0.2
+        assert res["recomputations"] == 400 * len(xs) * 2
+        assert res["batches"] == 400 * 2
+
+    def test_fit_matches_manual_sgd(self):
+        random.seed(21)
+        m_a = AI.MLP([2, 4, 1], ["relu", "linear"])
+        random.seed(21)
+        m_b = AI.MLP([2, 4, 1], ["relu", "linear"])
+        xs = [[0.1, 0.2], [0.4, -0.3], [-0.2, 0.5], [0.3, 0.1]]
+        ys = [[0.5], [-0.2], [0.1], [0.0]]
+        AI.fit_checkpointed(m_a, xs, ys, epochs=3, lr=0.05,
+                            batch_size=2, segments=2, shuffle=False)
+
+        # 手写同顺序 SGD 参照
+        for _ in range(3):
+            for start in range(0, len(xs), 2):
+                idxs = list(range(start, min(start + 2, len(xs))))
+                acc = [None] * len(m_b.layers)
+                for idx in idxs:
+                    pred = m_b.forward(xs[idx])
+                    d = [2.0 * (pred[0] - ys[idx][0])]
+                    g, _ = AI._mlp_backward_with_input(m_b, d)
+                    for k, (gw, gb) in enumerate(g):
+                        if acc[k] is None:
+                            acc[k] = [[v for v in row] for row in gw], list(gb)
+                        else:
+                            for a in range(len(gw)):
+                                for b in range(len(gw[0])):
+                                    acc[k][0][a][b] += gw[a][b]
+                            for a in range(len(gb)):
+                                acc[k][1][a] += gb[a]
+                nb = len(idxs)
+                for k, (gw, gb) in enumerate(acc):
+                    for a in range(len(gw)):
+                        for b in range(len(gw[0])):
+                            m_b.layers[k].weights[a][b] -= 0.05 * gw[a][b] / nb
+                    for a in range(len(gb)):
+                        m_b.layers[k].biases[a] -= 0.05 * gb[a] / nb
+
+        err = 0.0
+        for l1, l2 in zip(m_a.layers, m_b.layers):
+            for a in range(len(l1.weights)):
+                for b in range(len(l1.weights[0])):
+                    err = max(err, abs(l1.weights[a][b] - l2.weights[a][b]))
+            for a in range(len(l1.biases)):
+                err = max(err, abs(l1.biases[a] - l2.biases[a]))
+        assert err < 1e-12
+
+    def test_invalid_inputs(self):
+        model = self._model()
+        xs = [[0.1, 0.2], [0.4, -0.3]]
+        ys = [[0.5], [-0.2]]
+        bad = [
+            lambda: AI.checkpointed_grads("no", xs, ys),
+            lambda: AI.checkpointed_grads(model, [], []),
+            lambda: AI.checkpointed_grads(model, xs, ys[:1]),
+            lambda: AI.checkpointed_grads(model, xs, [[1.0, 2.0]] * 2),
+            lambda: AI.checkpointed_grads(model, xs, ys, segments=0),
+            lambda: AI.checkpointed_grads(model, xs, ys, segments=9),
+            lambda: AI.fit_checkpointed(model, xs, ys, epochs=0),
+            lambda: AI.fit_checkpointed(model, xs, ys, lr=-0.1),
+            lambda: AI.fit_checkpointed(model, xs, ys, batch_size=0),
+            lambda: AI.fit_checkpointed(model, xs, ys, segments=9),
+            lambda: AI.fit_checkpointed(model, xs, ys, shuffle="yes"),
+            lambda: AI.fit_checkpointed(model, xs, ys, seed=1.5),
+            lambda: AI.checkpointed_sample_grads(model, [0.1], [0.1]),
+        ]
+        assert all(_cp_raises(f) for f in bad)

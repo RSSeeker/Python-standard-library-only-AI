@@ -13854,6 +13854,209 @@ def checkpoint_causal_lm_backward(model, ids, segments=2):
     model.embedding.backward(d_seq)
     return loss
 
+def _cp_check_pos_int(value, name, who="checkpointed"):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{who}: {name} 必须是正整数")
+    return int(value)
+
+
+def _cp_split_stages(layers, segments):
+    """把层列表均分成 segments 段（前段可多一层），返回 [(base, layers), ...]。"""
+    if not isinstance(layers, (list, tuple)) or not layers:
+        raise ValueError("checkpointed: layers 不能为空")
+    if isinstance(segments, bool) or not isinstance(segments, int):
+        raise ValueError("checkpointed: segments 必须是正整数")
+    if not 1 <= segments <= len(layers):
+        raise ValueError("checkpointed: segments 必须在 [1, 层数] 内")
+    stages = []
+    pos = 0
+    n = len(layers)
+    for s in range(segments):
+        # 前 n % segments 段各多一层
+        size = n // segments + (1 if s < n % segments else 0)
+        stages.append((pos, list(layers[pos:pos + size])))
+        pos += size
+    return stages
+
+
+def _cp_stage_forward(stage_layers, rows):
+    """段前向：返回 (out_rows, caches)。"""
+    cur = [list(r) for r in rows]
+    caches = []
+    for layer in stage_layers:
+        out, cache = _dense_rows_forward(layer, cur)
+        caches.append(cache)
+        cur = out
+    return cur, caches
+
+
+def _cp_stage_backward(stage_layers, caches, d_out):
+    """段反向：返回 (dx_rows, grads=[(gw, gb), ...])。"""
+    drows = [list(r) for r in d_out]
+    grads = [None] * len(stage_layers)
+    for idx in range(len(stage_layers) - 1, -1, -1):
+        gw, gb, drows = _dense_rows_backward(stage_layers[idx], caches[idx], drows)
+        grads[idx] = (gw, gb)
+    return drows, grads
+
+
+def _cp_check_sample(model, x, d_out):
+    in_dim = model.layers[0].fan_in
+    out_dim = model.layers[-1].fan_out
+    if not isinstance(x, (list, tuple)) or len(x) != in_dim:
+        raise ValueError(f"checkpointed: x 维度必须是 {in_dim}")
+    if not isinstance(d_out, (list, tuple)) or len(d_out) != out_dim:
+        raise ValueError(f"checkpointed: d_out 维度必须是 {out_dim}")
+    return [float(v) for v in x], [float(v) for v in d_out]
+
+
+def checkpointed_sample_grads(model, x, d_out, segments=2):
+    """单样本梯度检查点：前向只保存每段输入，反向时按段重算激活再反传。"""
+    if not isinstance(model, MLP):
+        raise ValueError("checkpointed: model 必须是 MLP")
+    x, d_out = _cp_check_sample(model, x, d_out)
+    stages = _cp_split_stages(model.layers, segments)
+    stage_inputs = [[list(x)]]
+    cur = [list(x)]
+    for _, stage_layers in stages:
+        out, _ = _cp_stage_forward(stage_layers, cur)
+        stage_inputs.append(out)
+        cur = out
+    grads = [None] * len(model.layers)
+    d = [d_out]
+    for si in range(len(stages) - 1, -1, -1):
+        base, stage_layers = stages[si]
+        _, caches = _cp_stage_forward(stage_layers, stage_inputs[si])
+        d, stage_grads = _cp_stage_backward(stage_layers, caches, d)
+        for k, g in enumerate(stage_grads):
+            grads[base + k] = g
+    return grads
+
+
+def checkpointed_grads(model, xs, ys, loss="mse", segments=2):
+    """逐样本梯度检查点后累加平均，返回每层 ``(gw, gb)`` 平均梯度与损失。"""
+    if not isinstance(model, MLP):
+        raise ValueError("checkpointed_grads: model 必须是 MLP")
+    _cp_check_pos_int(segments, "segments", "checkpointed_grads")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("checkpointed_grads: xs 不能为空")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("checkpointed_grads: ys 必须与 xs 等长")
+    out_dim = model.layers[-1].fan_out
+    total_loss = 0.0
+    acc = [None] * len(model.layers)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if loss == "mse":
+            if not isinstance(y, (list, tuple)) or len(y) != out_dim:
+                raise ValueError(f"checkpointed_grads: ys[{i}] 维度必须是 {out_dim}")
+        else:
+            if isinstance(y, bool):
+                raise ValueError("checkpointed_grads: cross_entropy 标签不能是 bool")
+            if isinstance(y, (int, float)):
+                y = [int(y)]
+            elif not isinstance(y, (list, tuple)) or len(y) != 1:
+                raise ValueError("checkpointed_grads: cross_entropy 标签必须是整数或单元素列表")
+        xv = [float(v) for v in x]
+        pred = model.forward(xv)
+        if loss not in ("mse", "cross_entropy"):
+            raise ValueError("checkpointed_grads: loss 只支持 mse / cross_entropy")
+        if loss == "mse":
+            diff = [pred[j] - float(y[j]) for j in range(out_dim)]
+            total_loss += sum(v * v for v in diff) / out_dim
+            d_out = [2.0 * v / out_dim for v in diff]
+        else:
+            idx = int(y[0])
+            if not 0 <= idx < out_dim:
+                raise ValueError("checkpointed_grads: cross_entropy 的标签越界")
+            ex = [math.exp(min(v, 50.0)) for v in pred]
+            s = sum(ex)
+            probs = [v / s for v in ex]
+            total_loss += -math.log(max(probs[idx], 1e-300))
+            d_out = list(probs)
+            d_out[idx] -= 1.0
+        g = checkpointed_sample_grads(model, xv, d_out, segments=segments)
+        if acc[0] is None:
+            acc = [[gw, gb] for gw, gb in g]
+        else:
+            for idx2, (gw, gb) in enumerate(g):
+                agw, agb = acc[idx2]
+                for a in range(len(gw)):
+                    for b in range(len(gw[0])):
+                        agw[a][b] += gw[a][b]
+                for a in range(len(gb)):
+                    agb[a] += gb[a]
+    n = len(xs)
+    avg = [([[v / n for v in row] for row in gw], [v / n for v in gb])
+           for gw, gb in acc]
+    return avg, total_loss / n
+
+
+def fit_checkpointed(model, xs, ys, loss="mse", epochs=20, lr=0.01,
+                     batch_size=32, segments=2, shuffle=True, seed=None):
+    """用梯度检查点训练 MLP：逐样本重算激活，按 batch 平均后 SGD 更新。
+
+    返回 ``{'loss_history','epochs','batches','segments','recomputations'}``。
+    """
+    if not isinstance(model, MLP):
+        raise ValueError("fit_checkpointed: model 必须是 MLP")
+    _cp_check_pos_int(epochs, "epochs", "fit_checkpointed")
+    if isinstance(lr, bool) or not _is_num(lr) or lr < 0:
+        raise ValueError("fit_checkpointed: lr 必须是非负数")
+    _cp_check_pos_int(batch_size, "batch_size", "fit_checkpointed")
+    _cp_check_pos_int(segments, "segments", "fit_checkpointed")
+    if not isinstance(shuffle, bool):
+        raise ValueError("fit_checkpointed: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("fit_checkpointed: seed 必须是 int 或 None")
+    xs = [list(map(float, x)) for x in xs]
+    ys = [list(map(float, y)) for y in ys]
+    if not xs:
+        raise ValueError("fit_checkpointed: xs 不能为空")
+    if len(xs) != len(ys):
+        raise ValueError("fit_checkpointed: ys 必须与 xs 等长")
+    rng = random.Random(seed)
+    order = list(range(len(xs)))
+    history = []
+    recomputations = 0
+    batches = 0
+    for epoch in range(epochs):
+        if shuffle:
+            rng.shuffle(order)
+        epoch_loss = 0.0
+        for start in range(0, len(order), batch_size):
+            batch = order[start:start + batch_size]
+            acc = [None] * len(model.layers)
+            batch_loss = 0.0
+            for idx in batch:
+                grads, sample_loss = checkpointed_grads(
+                    model, [xs[idx]], [ys[idx]], loss=loss, segments=segments)
+                batch_loss += sample_loss
+                recomputations += segments
+                if acc[0] is None:
+                    acc = [[gw, gb] for gw, gb in grads]
+                else:
+                    for k, (gw, gb) in enumerate(grads):
+                        agw, agb = acc[k]
+                        for a in range(len(gw)):
+                            for b in range(len(gw[0])):
+                                agw[a][b] += gw[a][b]
+                        for a in range(len(gb)):
+                            agb[a] += gb[a]
+            n = len(batch)
+            for k, (gw, gb) in enumerate(acc):
+                _dense_apply_sgd(model.layers[k],
+                                 ([[v / n for v in row] for row in gw],
+                                  [v / n for v in gb]), lr)
+            batches += 1
+            epoch_loss += batch_loss / n
+        history.append(epoch_loss / max(1, (len(order) + batch_size - 1) // batch_size))
+    return {
+        "loss_history": history,
+        "epochs": epochs,
+        "batches": batches,
+        "segments": segments,
+        "recomputations": recomputations,
+    }
 
 def fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2,
                                seed=None, shuffle=True):

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2771 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2776 项）
 
 ## 特性
 
@@ -258,7 +258,10 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `checkpoint_grads(model, xs, ys, segments=2, loss_fn=None, release=False)` | 前向只保留段边界、反向逐段重放并重建层缓存；梯度与普通反传**逐位相同**；`release=True` 时每段结束丢弃 `input/z/a`，真正把激活峰值压到 O(段数) |
 | `checkpoint_transformer(encoder, x_seq, dout_seq, segments=2)` | TransformerEncoder 版梯度检查点：前向只保留段边界，段内每层 Q/K/V、注意力权重与 FFN 中间激活全部释放；反向逐段重放并逐层回传，参数梯度累积回各层；与 `encoder.forward`+`backward` 逐位相同 |
 | `checkpoint_causal_lm_backward(model, ids, segments=2)` | 用检查点反传单条序列：输出头/嵌入层与 `CausalLM._loss_and_backward` 相同，中间 Transformer 层走 `checkpoint_transformer`；返回平均交叉熵并累积梯度 |
-| `fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2, seed=None, shuffle=True)` | 把梯度检查点接进 CausalLM 训练循环：逐序列 `zero_grad → checkpoint_causal_lm_backward → adam_step`，返回每个 epoch 的平均损失 |
+| `fit_causal_lm_checkpointed(model, sequences, epochs=1, lr=3e-3, segments=2, seed=None, shuffle=True)` |
+| `checkpointed_sample_grads(model, x, d_out, segments=2)` | 单样本检查点梯度：接受裸 `MLP` 与显式上游梯度 `d_out`，前向只保留每段输入，反向按段重算激活，返回逐层 `(gw, gb)`，与普通反传逐位一致 |
+| `checkpointed_grads(model, xs, ys, loss='mse', segments=2)` | 逐样本检查点后累加平均，返回 `(平均梯度, 平均损失)`；`loss='cross_entropy'` 时接受整数标签；与 `checkpoint_grads` 的区别是可直接用于裸 `MLP` 并显式选择损失 |
+| `fit_checkpointed(model, xs, ys, loss='mse', epochs=20, lr=0.01, batch_size=32, segments=2, shuffle=True, seed=None)` | 把检查点梯度接进 `MLP` 训练循环：按 batch 平均梯度后 SGD 更新，返回 `loss_history`/`recomputations` 等；与同顺序的普通 SGD 逐位一致 | 把梯度检查点接进 CausalLM 训练循环：逐序列 `zero_grad → checkpoint_causal_lm_backward → adam_step`，返回每个 epoch 的平均损失 |
 | `fp16_round(value)` | 舍入到 IEEE 半精度（`struct` 的 `'e'` 格式）；`\|v\| > 65504` 返回 `inf`，低于次正规返回 0 |
 | `bf16_round(value)` | 舍入到 bfloat16（8 位指数 + 7 位尾数，round-half-to-even） |
 | `fp8_round(value, fmt='e4m3')` | 舍入到 FP8：`e4m3`（4 位指数 / 3 位尾数，最大有限值 448）或 `e5m2`（5 位指数 / 2 位尾数，最大 57344）；超出按饱和处理 |
@@ -6254,7 +6257,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2771 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2776 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6284,6 +6287,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPromptCacheManager` | 前缀/最长部分前缀命中与统计、LRU 与 token 预算淘汰、JSON 持久化往返、前缀复用模拟的 token 节省、非法输入 |
 | `TestZero23` | ZeRO-2 单步与手写 Adam 逐位一致、三步状态递推一致、ZeRO-3 分片数值等价且覆盖完整、显存估算随 stage 递减、非法输入 |
 | `TestPipeline1F1B` | 1F1B 平均梯度与单机逐样本反传一致（err < 1e-12）、调度顺序与每段 F/B 计数、单段退化、bubble 比例公式、非法输入 |
+| `TestCheckpointed` | 单样本检查点梯度与普通反传一致、不同 `segments` 等价、`cross_entropy` 整数标签路径、`fit_checkpointed` 与手写 SGD 逐位一致且 loss 下降、13 类非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6755,6 +6759,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2771 个单元测试
+├── test_ai.py       # 2776 个单元测试
 └── README.md
 ```
