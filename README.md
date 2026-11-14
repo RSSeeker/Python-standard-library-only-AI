@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2818 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2823 项）
 
 ## 特性
 
@@ -1160,6 +1160,42 @@ print(history[-1]["loss"])
 
 边界：B 样条使用**均匀固定节点**，没有 KAN 原文的自适应 grid 扩展；优化器固定为 SGD；
 单向量前向与批量前向是两套独立入口。
+
+### 稀疏 / 离散重参数化（Gumbel-Softmax / Sparsemax / Entmax）
+
+离散采样本身不可导。Gumbel-Softmax 用「加 Gumbel 噪声 + softmax」给出可导的连续松弛；
+`hard=True` 时前向取 one-hot、反向沿用 soft 版本的雅可比（straight-through），
+因此可以直接接进分类、离散 RL、离散扩散的训练循环。Sparsemax 与 α-entmax 是 softmax
+的稀疏替代：把 logits 投影到概率单纯形（或 α 单纯形），输出里会出现精确的 0，
+适合「只关注少数类」的场景。
+
+```python
+from AI import (gumbel_softmax, gumbel_softmax_backward,
+                sparsemax, sparsemax_backward, entmax)
+
+p = gumbel_softmax([2.0, 0.5, -1.0], temperature=1.0, seed=0)
+print(p)                                     # 概率，和为 1
+onehot = gumbel_softmax([2.0, 0.5, -1.0], temperature=1.0, hard=True, seed=0)
+print(onehot)                                # straight-through 前向：one-hot
+print(gumbel_softmax_backward([0.3, -0.5, 0.8], p, temperature=1.0))  # dL/dlogits
+
+print(sparsemax([1.0, 0.0, 0.0]))            # [1.0, 0.0, 0.0]（稀疏）
+print(sparsemax_backward([0.3, -0.5, 0.8], [0.6, 0.4, 0.0]))
+print(entmax([1.0, 0.5, -1.0], alpha=1.5))   # α=2 时退化为 sparsemax
+```
+
+| API | 说明 |
+|------|------|
+| `gumbel_softmax(logits, temperature=1.0, hard=False, seed=None)` | 采样连续松弛；`hard=True` 返回 one-hot（straight-through 前向） |
+| `gumbel_softmax_backward(d_out, probs, temperature=1.0)` | `dL/dlogits = (1/T)·p⊙(d − Σ p·d)`，soft 与 straight-through 共用 |
+| `sparsemax(logits)` | 欧氏投影到概率单纯形，输出稀疏、和为 1 |
+| `sparsemax_backward(d_out, probs)` | 支撑集内 `d_i − mean(d_S)`，支撑集外为 0 |
+| `entmax(logits, alpha=1.5)` | α-entmax（α>1），二分求 τ；α=2 与 sparsemax 一致 |
+
+边界：`gumbel_softmax` 的 `seed` 只控制本次噪声、不污染全局随机；`entmax` 只提供前向
+（α-entmax 的雅可比是稀疏分段形式，这里没有实现反向）；Sparsemax/Entmax 只支持一维
+logits，没有批量版。
+
 
 ### 优化器
 
@@ -6333,7 +6369,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2818 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2823 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6809,6 +6845,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGRPOMethods` | `method` 默认 grpo/clip_ratio_high 默认值、dapo 与 gspo 训练后奖励同样提升、多 token prompt 的 logits/old_logps 对齐、非法 method 与 clip_ratio_high 报错 |
 | `TestLookaheadDecoding` | 贪心等价（多种 lookahead/jacobi_steps 组合）、ids 拼接与 stats、forward 调用上界、n-gram 池最长后缀草稿、EOS 提前停止且为贪心前缀、合法性校验、max_len 截断 |
 | `TestGriffinBlock` | 局部注意力 + RG-LRU 前向与参数计数、四个参数的中心差分、因果性、30 步训练 loss 下降到 50% 以下、非法输入 |
+| `TestGumbelSparsemax` | Gumbel-Softmax 采样（同 seed 复现/硬采样/温度）、反向中心差分、Sparsemax 已知值/平移不变/稀疏性、Entmax α=2 与 sparsemax 一致、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6843,6 +6880,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2818 个单元测试
+├── test_ai.py       # 2823 个单元测试
 └── README.md
 ```

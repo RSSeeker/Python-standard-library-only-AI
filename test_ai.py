@@ -45435,3 +45435,115 @@ class TestGriffinBlock:
         assert _griff_raises(lambda: blk.forward([]))
         assert _griff_raises(lambda: blk.forward([[0.0] * 3]))
         assert _griff_raises(lambda: blk.backward([[0.0] * 4] * 5), RuntimeError)
+
+
+import math
+
+
+def _gsm_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestGumbelSparsemax:
+    """Gumbel-Softmax（含 straight-through）、Sparsemax、Entmax。"""
+
+    def test_gumbel_softmax_sample(self):
+        logits = [2.0, 0.5, -1.0]
+        p = AI.gumbel_softmax(logits, temperature=1.0, seed=0)
+        assert abs(sum(p) - 1.0) < 1e-12
+        assert all(v >= 0.0 for v in p)
+        assert AI.gumbel_softmax(logits, seed=0) == p
+        assert AI.gumbel_softmax(logits, seed=1) != p
+        hard = AI.gumbel_softmax(logits, hard=True, seed=0)
+        assert hard.count(1.0) == 1 and hard.count(0.0) == 2
+        # straight-through 前向与 soft 版本的 argmax 一致
+        assert hard.index(1.0) == p.index(max(p))
+        # 温度越低越尖锐（同 seed 比较最大值概率）
+        cold = AI.gumbel_softmax(logits, temperature=0.1, seed=0)
+        assert max(cold) > max(p)
+        # 平坦 logits + 高温 → 接近均匀
+        flat = AI.gumbel_softmax([0.0, 0.0, 0.0], temperature=5.0, seed=3)
+        assert max(abs(v - 1 / 3) for v in flat) < 0.3
+
+    def test_gumbel_softmax_backward_fd(self):
+        logits0 = [0.4, -0.2, 0.1]
+        d_out = [0.3, -0.5, 0.8]
+
+        def probs(z):
+            return AI.gumbel_softmax(z, temperature=1.0, seed=7)
+
+        def loss(z):
+            q = probs(z)
+            return sum(w * v for w, v in zip(d_out, q))
+
+        q0 = probs(logits0)
+        ana = AI.gumbel_softmax_backward(d_out, q0, temperature=1.0)
+        h = 1e-6
+        for i in range(3):
+            zp, zm = list(logits0), list(logits0)
+            zp[i] += h
+            zm[i] -= h
+            fd = (loss(zp) - loss(zm)) / (2 * h)
+            assert abs(ana[i] - fd) < 1e-6
+
+    def test_sparsemax(self):
+        assert AI.sparsemax([1.0, 0.0, 0.0]) == [1.0, 0.0, 0.0]
+        uni = AI.sparsemax([0.0, 0.0, 0.0])
+        assert all(abs(v - 1 / 3) < 1e-12 for v in uni)
+        p = AI.sparsemax([0.6, 0.3, 0.3])
+        assert abs(sum(p) - 1.0) < 1e-12
+        assert all(v >= 0.0 for v in p)
+        # 稀疏性：远离最大值的坐标被压成 0
+        sp = AI.sparsemax([5.0, 0.0, 0.0, 0.0])
+        assert sp == [1.0, 0.0, 0.0, 0.0]
+        # 平移不变性
+        a = AI.sparsemax([0.6, 0.3, 0.3])
+        b = AI.sparsemax([10.6, 10.3, 10.3])
+        assert max(abs(x - y) for x, y in zip(a, b)) < 1e-9
+        # backward FD（支撑集不变的内部点）
+        d_out = [0.3, -0.5, 0.8]
+        ana = AI.sparsemax_backward(d_out, p)
+        h = 1e-6
+        for i in range(3):
+            def loss(z):
+                q = AI.sparsemax(z)
+                return sum(w * v for w, v in zip(d_out, q))
+            zp, zm = [0.6, 0.3, 0.3], [0.6, 0.3, 0.3]
+            zp[i] += h
+            zm[i] -= h
+            fd = (loss(zp) - loss(zm)) / (2 * h)
+            assert abs(ana[i] - fd) < 1e-6
+
+    def test_entmax(self):
+        sp = AI.sparsemax([0.6, 0.3, 0.3])
+        e2 = AI.entmax([0.6, 0.3, 0.3], alpha=2.0)
+        assert max(abs(a - b) for a, b in zip(sp, e2)) < 1e-8
+        e15 = AI.entmax([1.0, 0.5, -1.0], alpha=1.5)
+        assert abs(sum(e15) - 1.0) < 1e-9
+        assert all(v >= 0.0 for v in e15)
+        # 比 softmax 更稀疏：负 logit 被压成 0
+        assert e15[2] == 0.0
+        # alpha 越大越稀疏（同一组 logits）
+        e12 = AI.entmax([1.0, 0.8, 0.6], alpha=1.2)
+        e30 = AI.entmax([1.0, 0.8, 0.6], alpha=3.0)
+        assert e12[2] >= e30[2]
+
+    def test_invalid_inputs(self):
+        assert _gsm_raises(lambda: AI.gumbel_softmax([]))
+        assert _gsm_raises(lambda: AI.gumbel_softmax([float("nan")]))
+        assert _gsm_raises(lambda: AI.gumbel_softmax([1.0], temperature=0.0))
+        assert _gsm_raises(lambda: AI.gumbel_softmax([1.0], temperature=float("inf")))
+        assert _gsm_raises(lambda: AI.gumbel_softmax([1.0], hard=1))
+        assert _gsm_raises(lambda: AI.gumbel_softmax([1.0], seed=1.5))
+        assert _gsm_raises(lambda: AI.sparsemax([]))
+        assert _gsm_raises(lambda: AI.sparsemax(["a"]))
+        assert _gsm_raises(lambda: AI.sparsemax_backward([1.0], [0.5, 0.5]))
+        assert _gsm_raises(lambda: AI.sparsemax_backward([1.0, 2.0], [0.0, 0.0]))
+        assert _gsm_raises(lambda: AI.entmax([1.0, 2.0], alpha=1.0))
+        assert _gsm_raises(lambda: AI.entmax([1.0, 2.0], alpha=0.5))
+        assert _gsm_raises(lambda: AI.entmax([1.0, 2.0], alpha="x"))
+        assert _gsm_raises(lambda: AI.gumbel_softmax_backward([1.0], [0.5, 0.5]))

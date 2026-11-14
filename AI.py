@@ -84459,6 +84459,184 @@ def _flow_time_features(t, dim=8):
     return out
 
 
+# ---------- 稀疏 / 离散重参数化：Gumbel-Softmax、Sparsemax、Entmax ----------
+def _gsm_check_logits(logits, who):
+    if not isinstance(logits, (list, tuple)) or len(logits) == 0:
+        raise ValueError(f"{who}: logits 必须是非空列表")
+    out = []
+    for i, v in enumerate(logits):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{who}: logits[{i}] 必须是有限数字")
+        out.append(float(v))
+    return out
+
+
+def _gsm_check_temperature(temperature, who):
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError(f"{who}: temperature 必须是数字")
+    t = float(temperature)
+    if not (t > 0.0 and math.isfinite(t)):
+        raise ValueError(f"{who}: temperature 必须是有限正数，收到 {temperature!r}")
+    return t
+
+
+def _gsm_check_prob_grad(p, d, who):
+    if not isinstance(p, (list, tuple)) or len(p) == 0:
+        raise ValueError(f"{who}: probs 必须是非空列表")
+    if not isinstance(d, (list, tuple)) or len(d) != len(p):
+        raise ValueError(f"{who}: d_out 长度必须与 probs 一致")
+    pp, dd = [], []
+    for i in range(len(p)):
+        pi, di = p[i], d[i]
+        if isinstance(pi, bool) or not isinstance(pi, (int, float)) or not math.isfinite(pi):
+            raise ValueError(f"{who}: probs[{i}] 必须是有限数字")
+        if isinstance(di, bool) or not isinstance(di, (int, float)) or not math.isfinite(di):
+            raise ValueError(f"{who}: d_out[{i}] 必须是有限数字")
+        pp.append(float(pi))
+        dd.append(float(di))
+    return pp, dd
+
+
+def gumbel_softmax(logits, temperature=1.0, hard=False, seed=None):
+    """Gumbel-Softmax（含 straight-through）采样。
+
+    ``y = softmax((logits + g) / temperature)``，``g`` 为独立 Gumbel(0,1) 噪声。
+    ``hard=True`` 时前向返回 ``one_hot(argmax(y))``，反向按「soft 版本」计算
+    （straight-through 近似），对应 ``gumbel_softmax_backward``。
+
+    ``seed`` 只影响本次采样的噪声，用独立 ``random.Random`` 生成，不会污染
+    调用方的全局随机状态。
+    """
+    z = _gsm_check_logits(logits, "gumbel_softmax")
+    t = _gsm_check_temperature(temperature, "gumbel_softmax")
+    if not isinstance(hard, bool):
+        raise TypeError("gumbel_softmax: hard 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("gumbel_softmax: seed 必须是整数或 None")
+    rng = random.Random(seed)
+    noisy = []
+    for i in range(len(z)):
+        u = rng.random()
+        if u <= 0.0:
+            u = 1e-300
+        g = -math.log(-math.log(u))
+        noisy.append((z[i] + g) / t)
+    m = max(noisy)
+    exps = [math.exp(v - m) for v in noisy]
+    denom = sum(exps)
+    probs = [v / denom for v in exps]
+    if not hard:
+        return probs
+    best = 0
+    for i in range(1, len(probs)):
+        if probs[i] > probs[best]:
+            best = i
+    out = [0.0] * len(probs)
+    out[best] = 1.0
+    return out
+
+
+def gumbel_softmax_backward(d_out, probs, temperature=1.0):
+    """Gumbel-Softmax（soft / straight-through）对 logits 的梯度。
+
+    对 ``y = softmax(u)``，``u = (z+g)/T``：``dL/dz_j = (1/T) y_j (d_j - Σ_k y_k d_k)``。
+    straight-through 时前向虽输出 one-hot，但反向用同一 soft 雅可比。
+    """
+    if not isinstance(d_out, (list, tuple)) or len(d_out) == 0:
+        raise ValueError("gumbel_softmax_backward: d_out 必须是非空列表")
+    p, d = _gsm_check_prob_grad(probs, d_out, "gumbel_softmax_backward")
+    t = _gsm_check_temperature(temperature, "gumbel_softmax_backward")
+    if len(p) != len(d):
+        raise ValueError("gumbel_softmax_backward: 长度不一致")
+    total = 0.0
+    for i in range(len(p)):
+        total += p[i] * d[i]
+    return [p[j] * (d[j] - total) / t for j in range(len(p))]
+
+
+def sparsemax(logits):
+    """Sparsemax：把 logits 欧氏投影到概率单纯形，输出天然稀疏（可为 0）。
+
+    算法（PyTorch 文档同款）：降序排序 ``z_(1) >= ... >= z_(n)``，找最大 ``k``
+    使 ``z_(k) - (Σ_{j<=k} z_(j) - 1) / k > 0``，则
+    ``τ = (Σ_{j<=k} z_(j) - 1) / k``、``p_i = max(0, z_i - τ)``。
+    """
+    z = _gsm_check_logits(logits, "sparsemax")
+    n = len(z)
+    order = sorted(range(n), key=lambda i: -z[i])
+    cum = 0.0
+    k = 0
+    for j in range(n):
+        cum += z[order[j]]
+        if z[order[j]] - (cum - 1.0) / (j + 1) <= 0.0:
+            break
+        k = j + 1
+    if k == 0:
+        # 理论上不会发生（τ 收敛时至少有一个支撑），兜底给均匀
+        return [1.0 / n] * n
+    tau = (cum - 1.0) / k
+    out = []
+    for v in z:
+        p = v - tau
+        out.append(p if p > 0.0 else 0.0)
+    return out
+
+
+def sparsemax_backward(d_out, probs):
+    """Sparsemax 的雅可比：支撑集内减去支撑集上的均值，支撑集外为 0。
+
+    ``dL/dz_i = d_i - mean_{j∈S}(d_j)``（``i∈S``），``S = {i : p_i > 0}``。
+    """
+    if not isinstance(d_out, (list, tuple)) or len(d_out) == 0:
+        raise ValueError("sparsemax_backward: d_out 必须是非空列表")
+    p, d = _gsm_check_prob_grad(probs, d_out, "sparsemax_backward")
+    support = [i for i in range(len(p)) if p[i] > 0.0]
+    if not support:
+        raise ValueError("sparsemax_backward: probs 全为 0，无法确定支撑集")
+    mean = sum(d[i] for i in support) / len(support)
+    out = [0.0] * len(p)
+    for i in support:
+        out[i] = d[i] - mean
+    return out
+
+
+def entmax(logits, alpha=1.5):
+    """α-entmax（α > 1）前向：``p_i = ((α-1) z_i - τ)_+^{1/(α-1)}``。
+
+    ``τ`` 由「Σp = 1」用二分求解；``alpha=2`` 退化为 sparsemax，
+    ``alpha→1`` 趋近 softmax（此处要求 α > 1）。返回稀疏概率向量。
+    """
+    z = _gsm_check_logits(logits, "entmax")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("entmax: alpha 必须是数字")
+    a = float(alpha)
+    if not (a > 1.0 and math.isfinite(a)):
+        raise ValueError(f"entmax: alpha 必须 > 1，收到 {alpha!r}")
+    base = [(a - 1.0) * v for v in z]
+    top = max(base)
+    lo, hi = top - 1.0, top - 1e-12
+    # 固定次数二分：在 [lo, hi] 上 sum(p(τ)) 单调递减
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        total = 0.0
+        for b in base:
+            d = b - mid
+            if d > 0.0:
+                total += d ** (1.0 / (a - 1.0))
+        if total > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    tau = 0.5 * (lo + hi)
+    out = []
+    for b in base:
+        d = b - tau
+        out.append(d ** (1.0 / (a - 1.0)) if d > 0.0 else 0.0)
+    total = sum(out)
+    return [v / total for v in out]
+
+
+
 class FlowMatching:
     """Flow Matching / Rectified Flow（学习速度场 v(x,t)，从噪声沿直线路径走到数据）
 
