@@ -30104,6 +30104,194 @@ class PrefixCacheStore:
         self._misses = 0
 
 
+
+"""RULER 风格的长上下文合成评测：检索 / 多跳追踪 / 聚合 / 简单 QA。
+
+评测重点是**长上下文里能否正确定位并使用信息**，生成的任务都是可自动判分的
+合成样例；``ruler_evaluate`` 只负责调用 ``model_fn`` 并统计准确率，不依赖具体
+模型实现。
+"""
+
+_RULER_TASKS = ("retrieval", "tracing", "aggregation", "qa")
+
+_RULER_FILLER = (
+    "apple", "brave", "coral", "delta", "eagle", "flame", "grape", "hazel",
+    "ivory", "jolly", "karma", "lemon", "mango", "noble", "ocean", "pearl",
+    "quiet", "river", "stone", "tiger", "unity", "vivid", "wheat", "youth",
+    "zebra", "amber", "bison", "cedar", "daisy", "ember", "frost", "globe",
+)
+
+
+def _ruler_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"ruler: {name} 必须是正整数")
+    return value
+
+
+def _ruler_filler(n, rng):
+    return [rng.choice(_RULER_FILLER) for _ in range(max(0, n))]
+
+
+def _ruler_retrieval(length, rng):
+    needle = "NEEDLE-" + "".join(
+        rng.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(6))
+    words = _ruler_filler(length, rng)
+    if not words:
+        words = ["placeholder"]
+    pos = rng.randrange(len(words))
+    words[pos] = needle
+    context = " ".join(words)
+    return {
+        "task": "retrieval",
+        "context": context,
+        "question": "文本中出现的特殊标记 NEEDLE-xxxxxx 是什么？",
+        "answer": needle,
+        "meta": {"needle": needle, "length": length},
+    }
+
+
+def _ruler_tracing(length, rng):
+    chain_len = max(2, min(8, length // 8 + 2))
+    value = str(rng.randrange(100000, 999999))
+    names = [f"T{i}" for i in range(chain_len)]
+    parts = []
+    for i in range(chain_len - 1):
+        parts.append(f"{names[i]} = {names[i + 1]}")
+    parts.append(f"{names[-1]} = {value}")
+    body = "; ".join(parts)
+    filler = _ruler_filler(max(0, length - len(parts)), rng)
+    context = " ".join(filler + [body])
+    return {
+        "task": "tracing",
+        "context": context,
+        "question": f"{names[0]} 的值是多少？",
+        "answer": value,
+        "meta": {"start": names[0], "value": value, "length": length},
+    }
+
+
+def _ruler_aggregation(length, rng):
+    target = min(max(1, length // 24), length)
+    words = _ruler_filler(max(1, length), rng)
+    for i in rng.sample(range(len(words)), target):
+        words[i] = "apple"
+    count = words.count("apple")
+    context = " ".join(words)
+    return {
+        "task": "aggregation",
+        "context": context,
+        "question": "单词 apple 在文本中出现了几次？",
+        "answer": str(count),
+        "meta": {"word": "apple", "count": count, "length": length},
+    }
+
+
+def _ruler_qa(length, rng):
+    facts = [
+        ("Ruritania", "Zenda"), ("Freedonia", "Sylvania"),
+        ("Genovia", "Pyrus"), ("Latveria", "Doomstadt"),
+        ("Wakanda", "Birnin Zana"),
+    ]
+    country, capital = facts[rng.randrange(len(facts))]
+    filler = _ruler_filler(max(0, length - 6), rng)
+    context = " ".join(filler + [
+        f"{country} 的首都是 {capital}。"])
+    return {
+        "task": "qa",
+        "context": context,
+        "question": f"{country} 的首都是哪里？",
+        "answer": capital,
+        "meta": {"country": country, "capital": capital, "length": length},
+    }
+
+
+_RULER_MAKERS = {
+    "retrieval": _ruler_retrieval,
+    "tracing": _ruler_tracing,
+    "aggregation": _ruler_aggregation,
+    "qa": _ruler_qa,
+}
+
+
+def ruler_make_task(task="retrieval", length=64, seed=None):
+    """生成一条 RULER 风格样例（context/question/answer + 可解释 meta）。"""
+    if task not in _RULER_TASKS:
+        raise ValueError(f"ruler: 未知任务 {task!r}，可选 {_RULER_TASKS}")
+    _ruler_check_pos_int(length, "length")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)
+                             or seed < 0):
+        raise ValueError("ruler: seed 必须是非负整数或 None")
+    rng = random.Random(seed)
+    return _RULER_MAKERS[task](length, rng)
+
+
+def ruler_benchmark(tasks=None, lengths=(64, 128, 256), seed=0):
+    """按任务×长度批量生成样例，便于跑长上下文缩放曲线。"""
+    if tasks is None:
+        tasks = list(_RULER_TASKS)
+    if not isinstance(tasks, (list, tuple)) or not tasks:
+        raise ValueError("ruler_benchmark: tasks 必须是非空列表")
+    for t in tasks:
+        if t not in _RULER_TASKS:
+            raise ValueError(f"ruler_benchmark: 未知任务 {t!r}")
+    if not isinstance(lengths, (list, tuple)) or not lengths:
+        raise ValueError("ruler_benchmark: lengths 必须是非空列表")
+    for ln in lengths:
+        _ruler_check_pos_int(ln, "length")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("ruler_benchmark: seed 必须是非负整数")
+    examples = []
+    for i, task in enumerate(tasks):
+        for j, length in enumerate(lengths):
+            examples.append(ruler_make_task(task, length, seed=seed + i * 17 + j))
+    return examples
+
+
+def _ruler_normalize(text):
+    return " ".join(str(text).strip().split()).lower()
+
+
+def ruler_evaluate(examples, model_fn):
+    """用 ``model_fn(context, question) -> answer`` 评测一批 RULER 样例。"""
+    if not isinstance(examples, (list, tuple)) or not examples:
+        raise ValueError("ruler_evaluate: examples 必须是非空列表")
+    if not callable(model_fn):
+        raise ValueError("ruler_evaluate: model_fn 必须可调用")
+    details = []
+    correct = 0
+    by_task = {}
+    by_length = {}
+    for i, ex in enumerate(examples):
+        if not isinstance(ex, dict):
+            raise ValueError(f"ruler_evaluate: examples[{i}] 必须是 dict")
+        for key in ("task", "context", "question", "answer"):
+            if key not in ex:
+                raise ValueError(f"ruler_evaluate: examples[{i}] 缺少 {key}")
+        if ex["task"] not in _RULER_TASKS:
+            raise ValueError(f"ruler_evaluate: examples[{i}] 未知任务")
+        pred = model_fn(ex["context"], ex["question"])
+        if not isinstance(pred, str):
+            raise TypeError("ruler_evaluate: model_fn 必须返回字符串")
+        gold = _ruler_normalize(ex["answer"])
+        got = _ruler_normalize(pred)
+        ok = gold in got
+        correct += 1 if ok else 0
+        task = ex["task"]
+        length = ex.get("meta", {}).get("length", 0)
+        by_task.setdefault(task, []).append(1 if ok else 0)
+        by_length.setdefault(length, []).append(1 if ok else 0)
+        details.append({"index": i, "task": task, "length": length,
+                        "prediction": pred, "gold": ex["answer"],
+                        "correct": ok})
+    n = len(details)
+    return {
+        "n": n,
+        "overall_accuracy": correct / n,
+        "by_task": {k: sum(v) / len(v) for k, v in by_task.items()},
+        "by_length": {k: sum(v) / len(v) for k, v in by_length.items()},
+        "details": details,
+    }
+
 def make_needle_haystack(total_tokens: int = 256, depth: float = 0.5,
                          needle: str = "NEEDLE", seed: int = None,
                          filler_words=None):

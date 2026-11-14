@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2722 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2727 项）
 
 ## 特性
 
@@ -2458,6 +2458,23 @@ print(m["parse_rate"], m["exact_match"], m["arg_f1"])
 边界：只评测「第一条 tool call」的名称与参数，多调用/并行调用不拆开对比；
 参数比较不做字符串归一化（`"1"` 与 `1` 视为不同），解析失败计入分母但
 不抛异常，便于在评测报告里同时看到格式与内容两层的质量。
+
+### RULER 长上下文评测（检索 / 多跳追踪 / 聚合 / QA）
+
+| 函数 | 说明 |
+|---|---|
+| `ruler_make_task(task="retrieval", length=64, seed=None)` | 生成一条可自动判分的合成长上下文样例：`retrieval`（找 NEEDLE）、`tracing`（沿赋值链追踪）、`aggregation`（数单词出现次数）、`qa`（单事实问答）；返回 `context/question/answer/meta` |
+| `ruler_benchmark(tasks=None, lengths=(64, 128, 256), seed=0)` | 按任务×长度批量生成样例，用于画准确率随上下文长度变化的曲线 |
+| `ruler_evaluate(examples, model_fn)` | 调 `model_fn(context, question) -> answer` 评测，返回 `overall_accuracy`、按任务/长度的准确率与逐条明细 |
+
+```python
+ex = ruler_make_task("retrieval", 128, seed=1)
+res = ruler_evaluate([ex], lambda ctx, q: "NEEDLE-ABCDEF")
+print(res["overall_accuracy"])    # 0.0 / 1.0
+```
+
+边界：合成任务只测「长上下文定位与使用」，不覆盖真实语料的推理；答案匹配是
+去空白、大小写不敏感的包含判断，适合做快速消融，不替代人工评测。
 
 ### 验证器与评测工具（pass@k / PRM 聚合 / verifier 排序 / 毒性）
 
@@ -6134,7 +6151,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2722 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2727 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6439,6 +6456,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestJudgeCalibration` | 合成 1.8 温度数据恢复 `a≈1.8` 且 NLL/Brier/ECE 下降、ECE 在完全正确预测下为 0、全正标签仍有限、九类非法输入（空/不等长/越界标签/NaN/lr/epochs/l2/bins） |
 | `TestRedTeamSafety` | 七类 PII 全部命中且按起点排序、Luhn 拒绝假卡、类别过滤、canary 命中/去重、越狱高/中/低风险与规则名、批量报告汇总与阈值、十一类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
+| `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6625,6 +6643,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2722 个单元测试
+├── test_ai.py       # 2727 个单元测试
 └── README.md
 ```

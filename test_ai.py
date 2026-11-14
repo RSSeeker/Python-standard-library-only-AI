@@ -43441,3 +43441,95 @@ class TestToolCallEval:
             ["x"], [{"name": "", "arguments": {}}]))
         assert _tce_raises(lambda: AI.tool_call_metrics(
             ["x"], [{"name": "f", "arguments": []}]))
+
+
+import re
+
+
+def _ruler_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _ruler_oracle(ctx, question):
+    if "NEEDLE-" in ctx:
+        return re.search(r"NEEDLE-[A-Z]+", ctx).group(0)
+    if "值是多少" in question:
+        name = "T0"
+        while True:
+            m = re.search(name + r" = (T\d+|\d+)", ctx)
+            assert m is not None
+            v = m.group(1)
+            if v.startswith("T"):
+                name = v
+            else:
+                return v
+    if "出现了几次" in question:
+        return str(ctx.split().count("apple"))
+    return re.search(r"的首都是 ([\w ]+)。", ctx).group(1)
+
+
+class TestRulerEval:
+    def test_generation_and_determinism(self):
+        for task in ("retrieval", "tracing", "aggregation", "qa"):
+            ex = AI.ruler_make_task(task, 64, seed=7)
+            assert ex["task"] == task
+            assert "context" in ex and "question" in ex and "answer" in ex
+            assert len(ex["context"].split()) >= 60
+        assert AI.ruler_make_task("qa", 32, seed=3) == \
+            AI.ruler_make_task("qa", 32, seed=3)
+        assert AI.ruler_make_task("qa", 32, seed=3) != \
+            AI.ruler_make_task("qa", 32, seed=4)
+
+    def test_retrieval_and_tracing(self):
+        ex = AI.ruler_make_task("retrieval", 64, seed=1)
+        assert ex["answer"] in ex["context"]
+        tr = AI.ruler_make_task("tracing", 64, seed=1)
+        assert tr["answer"] in tr["context"]
+        # 沿赋值链确实能到达 answer
+        name = "T0"
+        while True:
+            m = re.search(name + r" = (T\d+|\d+)", tr["context"])
+            v = m.group(1)
+            if v.startswith("T"):
+                name = v
+            else:
+                assert v == tr["answer"]
+                break
+
+    def test_aggregation_count(self):
+        ex = AI.ruler_make_task("aggregation", 128, seed=2)
+        assert int(ex["answer"]) == ex["context"].split().count("apple")
+        assert int(ex["answer"]) >= 1
+
+    def test_evaluate_oracle_and_bad_model(self):
+        exs = AI.ruler_benchmark(seed=0)
+        assert len(exs) == 12
+        res = AI.ruler_evaluate(exs, _ruler_oracle)
+        assert res["overall_accuracy"] == 1.0
+        assert set(res["by_task"]) == {
+            "retrieval", "tracing", "aggregation", "qa"}
+        assert res["by_length"] == {64: 1.0, 128: 1.0, 256: 1.0}
+        bad = AI.ruler_evaluate(exs, lambda c, q: "no idea")
+        assert bad["overall_accuracy"] == 0.0
+
+    def test_invalid_inputs(self):
+        exs = AI.ruler_benchmark(["qa"], (32,), 0)
+        assert _ruler_raises(lambda: AI.ruler_make_task("nope"))
+        assert _ruler_raises(lambda: AI.ruler_make_task("retrieval", 0))
+        assert _ruler_raises(lambda: AI.ruler_make_task("retrieval", 64, -1))
+        assert _ruler_raises(lambda: AI.ruler_benchmark([]))
+        assert _ruler_raises(lambda: AI.ruler_benchmark(lengths=[]))
+        assert _ruler_raises(lambda: AI.ruler_benchmark(["bad"]))
+        assert _ruler_raises(lambda: AI.ruler_benchmark(seed=-1))
+        assert _ruler_raises(lambda: AI.ruler_evaluate([], _ruler_oracle))
+        assert _ruler_raises(lambda: AI.ruler_evaluate(exs, 1))
+        assert _ruler_raises(lambda: AI.ruler_evaluate(
+            [{"task": "retrieval"}], _ruler_oracle))
+        assert _ruler_raises(lambda: AI.ruler_evaluate(
+            exs, lambda c, q: 1))
