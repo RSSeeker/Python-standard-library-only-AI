@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2650 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2656 项）
 
 ## 特性
 
@@ -544,6 +544,7 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `DoRALinear(layer, rank=4, alpha=None)` | DoRA：权重拆成「幅度 `m` × 方向 `V`」，LoRA 只改方向（`W' = m·Weff/‖Weff‖`），`V`/`m` 也可训；`B=0` 时与原层逐位一致，`merge()` 折回原层 |
 | `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `\|A_r\|·\|B_:,r\|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
 | `finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False)` | 一键 LoRA 微调：接受 `Model`（其 `.model` 为 `MLP`）或直接传 `MLP`，给每层套 `LoRA`、冻结基座、只更新 A/B；`loss` 支持 `"mse"` 与 `"cross_entropy"`（后者要求输出层为线性 logits）；返回 `loss_history`、`adapters`、`trainable_params`/`base_params`/`total_params` |
+| `finetune_adapter(model, xs, ys, adapter="lora", rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False, prune_keep=None, **options)` | 通用 PEFT 微调入口：`adapter` 支持 `lora` / `qlora` / `dora` / `adalora` / `vera` / `reft`，逐层套对应适配器并冻结基座（`qlora` 构造时会量化基座、之后不再更新）；`adalora` 可用 `prune_keep` 每轮按重要性收缩秩；`bits`/`eps`/`ema` 等透传；返回同 `finetune_lora` 的统计 |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
 | `Lion(model, lr=1e-4, beta1=0.9, beta2=0.99)` | 符号动量优化器：更新量恒为 `±lr`（+ 解耦 wd），只存一份动量；**lr 通常比 Adam 小一个量级** |
 | `Adafactor(model, lr=1e-3, eps2=1e-3, weight_decay=0.0)` | 行列因子化二阶矩，显存 O(m+n)；乘相对步长 `max(eps2, rms(g))`，所以 lr 语义比 Adam 小一个量级 |
@@ -608,6 +609,22 @@ res['adapters'][0].merge()          # 需要折回基座时可对每个适配器
 logits（`softmax` 输出层的导数恒为 1，不能用于独立损失反传）；`Model(...,
 loss_fn='cross_entropy')` 默认用 softmax 输出层，请直接传线性输出的 `MLP`；训练为逐样本
 SGD，不含 batch/Adam/clip。
+
+**通用 PEFT 微调入口**：同样的逐样本 SGD 训练循环也覆盖其余适配器——把
+`adapter` 换成 `"qlora"` / `"dora"` / `"adalora"` / `"vera"` / `"reft"` 即可，
+参数统计与 `finetune_lora` 一致：
+
+```python
+res = AI.finetune_adapter(model, xs, ys, adapter="dora", rank=4, lr=0.05,
+                          epochs=30)
+res = AI.finetune_adapter(model2, xs, ys, adapter="adalora", rank=8, lr=0.05,
+                          epochs=30, prune_keep=4)   # 每轮按重要性收缩秩
+```
+
+边界：同一批 helper 只做逐样本 SGD、不含 Adam/clip/批切分；`dora` 实现会同时训练
+幅度向量与低秩方向（该适配器 `params()` 里含基座拷贝 `V`，与只训 A/B 的纯 DoRA
+不同）；`qlora` 构造时会把基座量化成 NF4/int 表示（会改写 `layer.weights`），之后
+训练只更新适配器。
 
 ```python
 lm = CausalLM(vocab_size=8, d_model=32, num_heads=4, d_ff=64, num_layers=2,
@@ -5816,7 +5833,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2650 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2656 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -5898,6 +5915,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRougeExtraAndIA3` | ROUGE-S 的 skip-bigram 手算值/间隔限制/β 与非法参数；ROUGE-W 同串=1、断开匹配分数低于连续匹配、β 与非法参数；IA3 初始等价原层、`v`/`dx` 数值梯度、原层冻结、训练降 loss、参数量与非法参数 |
 | `TestPEFTAdapters` | QLoRA 与量化基座逐位等价、冻结基座、`merge()` 前后输出不变；VeRA 初始等基座、`d` 中心差分、`merge()` 等价、参数量；ReFT 初始等基座、`W`/`b` 中心差分、参数量；三者非法输入（类型/rank/alpha/bits/未 forward 调 backward） |
 | `TestFinetuneLoRA` | 基座权重冻结 + 损失下降、直接传 MLP、cross_entropy 类别训练、alpha/seed/shuffle、softmax 输出层拒绝、非法输入（类型/loss/rank/lr/epochs/维度/NaN/已含 LoRA） |
+| `TestFinetuneAdapter` | 六种适配器各自损失下降且基座冻结、参数计数、`adalora` 的 `prune_keep` 收缩秩、`cross_entropy`+shuffle、`Model` 包装、12 类非法输入（未知 adapter/rank/lr/loss/prune_keep/bits/shuffle/seed/epochs） |
 | `TestTrackingAndSurfaceMetrics` | ASSD/NSD/Surface Dice 的手算值与边界情形；MOTA/MOTP/IDF1 的手算值、完美匹配、id 互换（全局 IDF1 不降）与跨帧合并 id、非法输入 |
 | `TestHpoSearch` | TPE 在二次目标/混合空间上的收敛与最大化模式、同 seed 可复现、非法空间/参数；successive halving 的轮次/预算/评估次数、最大化模式与非法输入 |
 | `TestBertScoreAndSvd` | BERTScore 的贪心匹配手算值、IDF 与 β 公式、非法输入；SVD 对角矩阵、秩 1 重建、3×2 的 √70、非法矩阵/rank，以及全秩与截断重建的一致性 |
@@ -6291,6 +6309,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2650 个单元测试
+├── test_ai.py       # 2656 个单元测试
 └── README.md
 ```

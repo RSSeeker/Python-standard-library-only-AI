@@ -11308,6 +11308,196 @@ def finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50,
         "total_params": base_params + trainable_params,
     }
 
+# ---- 通用 PEFT 微调入口（finetune_adapter） ----
+
+
+_PEFT_ADAPTER_KINDS = ("lora", "qlora", "dora", "adalora", "vera", "reft")
+
+
+def _peft_check_kind(kind):
+    if not isinstance(kind, str):
+        raise TypeError(
+            f"finetune_adapter: adapter 必须是字符串，收到 {type(kind).__name__}")
+    name = kind.lower()
+    if name not in _PEFT_ADAPTER_KINDS:
+        raise ValueError(
+            "finetune_adapter: adapter 只支持 "
+            + " / ".join(_PEFT_ADAPTER_KINDS)
+            + f"，收到 {kind!r}")
+    return name
+
+
+def _peft_param_scalars(value):
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            total += _peft_param_scalars(item)
+        return total
+    return 1
+
+
+def _peft_adapter_param_count(adapter):
+    total = 0
+    for value, _grad in adapter.params():
+        total += _peft_param_scalars(value)
+    return total
+
+
+def _peft_sgd_update(value, grad, lr):
+    for k in range(len(value)):
+        if isinstance(value[k], list):
+            _peft_sgd_update(value[k], grad[k], lr)
+        else:
+            value[k] -= lr * grad[k]
+
+
+def _peft_build_adapter(kind, layer, rank, alpha, options):
+    if kind == "lora":
+        return LoRA(layer, rank, alpha)
+    if kind == "qlora":
+        return QLoRA(layer, rank, alpha, bits=options.get("bits", 4))
+    if kind == "dora":
+        return DoRALinear(layer, rank, alpha, eps=options.get("eps", 1e-8))
+    if kind == "adalora":
+        return AdaLoRALinear(layer, rank, alpha, ema=options.get("ema", 0.9),
+                             seed=options.get("seed", 0))
+    if kind == "vera":
+        return VeRA(layer, rank, alpha, seed=options.get("seed", 0))
+    if kind == "reft":
+        return ReFT(layer, rank, alpha)
+    raise ValueError(f"finetune_adapter: 未知 adapter {kind!r}")
+
+
+def finetune_adapter(model, xs, ys, adapter="lora", rank=4, alpha=None,
+                     lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False,
+                     prune_keep=None, **options):
+    """冻结基座、只训练指定 PEFT 适配器的一键微调。
+
+    ``adapter`` 支持 ``"lora"`` / ``"qlora"`` / ``"dora"`` / ``"adalora"`` /
+    ``"vera"`` / ``"reft"``；对 ``MLP`` 的每层各套一个适配器，基座权重冻结
+    （``QLoRA`` 例外：构造时会把基座量化成 NF4/int 表示，之后不再更新）。
+    ``adalora`` 可在每轮后用 ``prune_keep`` 把秩按重要性收缩到该数量。
+    其余关键字参数（``bits``、``eps``、``ema``、``seed``）透传给对应适配器。
+
+    ``model`` 可为 ``Model`` 或 ``MLP``；``loss`` 支持 ``"mse"`` 与
+    ``"cross_entropy"``。返回损失历史、适配器列表与参数计数。
+    """
+    if isinstance(model, Model):
+        mlp = model.model
+    elif isinstance(model, MLP):
+        mlp = model
+    else:
+        raise TypeError("finetune_adapter: model 必须是 Model 或 MLP 实例")
+    if not isinstance(mlp.layers, list) or not mlp.layers:
+        raise ValueError("finetune_adapter: MLP 至少需要一层")
+    kind = _peft_check_kind(adapter)
+    rank = _lora_ft_check_pos_int(rank, "rank")
+    if alpha is not None:
+        alpha = _lora_ft_check_pos_number(alpha, "alpha")
+    lr = _lora_ft_check_pos_number(lr, "学习率")
+    epochs = _lora_ft_check_pos_int(epochs, "epochs")
+    if loss not in ("mse", "cross_entropy"):
+        raise ValueError("finetune_adapter: loss 只支持 'mse' 或 'cross_entropy'")
+    if loss == "cross_entropy" and getattr(
+            mlp.layers[-1].act_fn, "__name__", "") == "_softmax":
+        raise ValueError(
+            "finetune_adapter: cross_entropy 模式要求输出层为线性 logits；"
+            "softmax 输出层的导数恒为 1，不能用于独立损失反传")
+    if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+        raise ValueError("finetune_adapter: xs 与 ys 必须是列表")
+    if not xs or len(xs) != len(ys):
+        raise ValueError("finetune_adapter: xs 与 ys 必须非空且等长")
+    if not isinstance(shuffle, bool):
+        raise TypeError("finetune_adapter: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("finetune_adapter: seed 必须是 int 或 None")
+    if prune_keep is not None:
+        prune_keep = _lora_ft_check_pos_int(prune_keep, "prune_keep")
+        if kind != "adalora":
+            raise ValueError(
+                "finetune_adapter: prune_keep 只对 adalora 有意义")
+        if prune_keep > rank:
+            raise ValueError(
+                f"finetune_adapter: prune_keep={prune_keep} 不能超过 rank={rank}")
+    if kind == "qlora":
+        bits = options.get("bits", 4)
+        if isinstance(bits, bool) or not isinstance(bits, int) or bits < 1:
+            raise ValueError(
+                f"finetune_adapter: qlora 的 bits 必须是正整数，收到 {bits!r}")
+    in_dim = mlp.layers[0].fan_in
+    out_dim = mlp.layers[-1].fan_out
+    clean_x = []
+    clean_y = []
+    for row in xs:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(
+                f"finetune_adapter: 每个输入必须是长度 {in_dim} 的列表")
+        values = []
+        for v in row:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v)):
+                raise ValueError("finetune_adapter: 输入必须只包含有限数字")
+            values.append(float(v))
+        clean_x.append(values)
+    for target in ys:
+        if loss == "mse":
+            if not isinstance(target, (list, tuple)) or len(target) != out_dim:
+                raise ValueError(
+                    f"finetune_adapter: 每个目标必须是长度 {out_dim} 的列表")
+            values = []
+            for v in target:
+                if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                        or not math.isfinite(v)):
+                    raise ValueError(
+                        "finetune_adapter: 目标必须只包含有限数字")
+                values.append(float(v))
+            clean_y.append(values)
+        else:
+            if isinstance(target, bool) or not isinstance(target, int):
+                raise ValueError(
+                    "finetune_adapter: cross_entropy 目标必须是整数类别下标")
+            clean_y.append(target)
+
+    adapters = []
+    for layer in mlp.layers:
+        adapters.append(_peft_build_adapter(kind, layer, rank, alpha, options))
+    base_params = sum(layer.fan_in * layer.fan_out + layer.fan_out
+                      for layer in mlp.layers)
+    trainable_params = sum(_peft_adapter_param_count(a) for a in adapters)
+    rng = random.Random(seed)
+    indices = list(range(len(clean_x)))
+    history = []
+    for _ in range(epochs):
+        if shuffle:
+            rng.shuffle(indices)
+        for a in adapters:
+            a.zero_grad()
+        order_x = [clean_x[i] for i in indices] if shuffle else clean_x
+        order_y = [clean_y[i] for i in indices] if shuffle else clean_y
+        outputs = [_lora_ft_forward_chain(adapters, row) for row in order_x]
+        epoch_loss, d_rows = _lora_ft_loss_and_dlogits(
+            outputs, order_y, loss)
+        for i in range(len(order_x) - 1, -1, -1):
+            _lora_ft_forward_chain(adapters, order_x[i])
+            d = d_rows[i]
+            for a in reversed(adapters):
+                d = a.backward(d)
+        for a in adapters:
+            for value, grad in a.params():
+                _peft_sgd_update(value, grad, lr)
+        if prune_keep is not None:
+            for a in adapters:
+                a.prune(prune_keep)
+        history.append({"loss": epoch_loss})
+    return {
+        "loss_history": history,
+        "adapters": adapters,
+        "adapter": kind,
+        "trainable_params": trainable_params,
+        "base_params": base_params,
+        "total_params": base_params + trainable_params,
+    }
+
 # ============================================================================
 #  Medusa 多头训练循环（train_medusa_heads）
 # ============================================================================

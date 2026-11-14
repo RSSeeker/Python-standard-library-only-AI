@@ -41858,3 +41858,123 @@ def test_ppo_entropy_gradient_matches_fd():
     _loss, dlogits, num = _ppo_entropy_fd()
     for j in range(len(dlogits)):
         assert abs(dlogits[j] - num[j]) < 1e-5
+
+
+import math
+import random
+import AI
+
+_XS = [[0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 1.0],
+       [1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0],
+       [0.5, 0.2, 0.1, 0.3], [0.2, 0.7, 0.4, 0.9],
+       [0.8, 0.3, 0.7, 0.2], [0.3, 0.9, 0.6, 0.5]]
+_YS = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+       [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0],
+       [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def _peft_make_mlp():
+    random.seed(2)
+    return AI.MLP([4, 16, 3], ["relu", "linear"])
+
+
+def _peft_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestFinetuneAdapter:
+    def test_lora_kind(self):
+        mlp = _peft_make_mlp()
+        w0 = [list(row) for row in mlp.layers[0].weights]
+        res = AI.finetune_adapter(
+            mlp, _XS, _YS, adapter="lora", rank=2, lr=0.2, epochs=60,
+            loss="mse", seed=0)
+        losses = [h["loss"] for h in res["loss_history"]]
+        assert losses[-1] < losses[0] * 0.75
+        assert res["adapter"] == "lora"
+        assert res["trainable_params"] == 78
+        assert res["base_params"] == 131
+        for j in range(len(w0)):
+            for i in range(len(w0[0])):
+                assert abs(mlp.layers[0].weights[j][i] - w0[j][i]) < 1e-15
+
+    def test_all_kinds_decrease(self):
+        expect_trainable = {"lora": 78, "qlora": 78, "dora": 209,
+                            "adalora": 78, "vera": 4, "reft": 42}
+        for kind, expected in expect_trainable.items():
+            mlp = _peft_make_mlp()
+            res = AI.finetune_adapter(
+                mlp, _XS, _YS, adapter=kind, rank=2, lr=0.2, epochs=60,
+                loss="mse", seed=0)
+            losses = [h["loss"] for h in res["loss_history"]]
+            assert losses[-1] < losses[0] * 0.85, (kind, losses[0], losses[-1])
+            assert res["trainable_params"] == expected, (kind,
+                                                         res["trainable_params"])
+
+    def test_adalora_prune(self):
+        mlp = _peft_make_mlp()
+        res = AI.finetune_adapter(
+            mlp, _XS, _YS, adapter="adalora", rank=4, lr=0.2, epochs=10,
+            loss="mse", seed=0, prune_keep=2)
+        active = [len(a.active_ranks()) for a in res["adapters"]]
+        assert all(v == 2 for v in active)
+        for a in res["adapters"]:
+            assert len(a.params()[0][0]) == 4
+
+    def test_cross_entropy_and_shuffle(self):
+        random.seed(5)
+        mlp = AI.MLP([3, 8, 4], ["relu", "linear"])
+        xs = [[0.9, 0.1, 0.0], [0.1, 0.8, 0.2], [0.5, 0.5, 0.5],
+              [0.2, 0.2, 0.9], [0.8, 0.7, 0.1], [0.3, 0.9, 0.4],
+              [0.1, 0.3, 0.8], [0.6, 0.1, 0.7]]
+        ys = [0, 1, 2, 3, 0, 1, 3, 2]
+        res = AI.finetune_adapter(
+            mlp, xs, ys, adapter="lora", rank=2, lr=0.1, epochs=60,
+            loss="cross_entropy", seed=1, shuffle=True)
+        losses = [h["loss"] for h in res["loss_history"]]
+        assert losses[-1] < losses[0] * 0.8
+
+    def test_model_wrapper(self):
+        random.seed(9)
+        model = AI.Model(AI.MLP([2, 8, 1], ["relu", "linear"]))
+        xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+        ys = [[1.0], [0.0], [0.0], [1.0]]
+        res = AI.finetune_adapter(
+            model, xs, ys, adapter="vera", rank=2, lr=0.1, epochs=40,
+            loss="mse", seed=0)
+        losses = [h["loss"] for h in res["loss_history"]]
+        assert losses[-1] < losses[0]
+        assert res["trainable_params"] > 0
+
+    def test_invalid_inputs(self):
+        ok = 0
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="bogus"))
+        ok += _peft_raises(lambda: AI.finetune_adapter(123, _XS, _YS,
+                                                       adapter="lora"))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), [], _YS, adapter="lora"))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", rank=0))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", lr=0.0))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", loss="huber"))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", prune_keep=2))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="adalora", rank=2,
+            prune_keep=3))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="qlora", bits=0))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", shuffle=1))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", seed=1.5))
+        ok += _peft_raises(lambda: AI.finetune_adapter(
+            _peft_make_mlp(), _XS, _YS, adapter="lora", epochs=0))
+        assert ok == 12
