@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2791 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2796 项）
 
 ## 特性
 
@@ -5070,6 +5070,8 @@ print(AI.snapshot_digest(snap))
 | `run_doctests(module=None, verbose=False, optionflags=None, require_examples=True)` | 跑 docstring 里的 `>>>` 示例，返回 `{"attempted","failed","failures"}`；找不到示例时报错而不是静默返回 0 |
 | `check_probability_rows(probs, tolerance=1e-9)` | 每行必须是非负且和为 1 的概率分布，返回最大偏差 |
 | `check_shape_consistency(model, x)` | 逐层核对 `len(输入)==fan_in` 与 `len(输出)==fan_out`，返回 `(out, info)` |
+| `mlp_property_report(model, trials=20, seed=None, tol=1e-4)` | 对 `MLP` 跑输出形状/有限性/确定性/参数计数/首层梯度中心差分 5 项检查，返回 `{"passed","checks","trials"}`，不抛断言 |
+| `fuzz_nonfinite_inputs(fn, dim, cases=50, seed=None)` | 随机注入 NaN/±Inf：非有限输入必须显式抛错、有限输入必须返回有限数字列表；返回 `{"ok","cases","rejected","accepted","failures"}` |
 
 三层校验各管一段，别指望一个工具全包：
 
@@ -5087,6 +5089,8 @@ print(AI.snapshot_digest(snap))
   Dropout 在 `eval()` 下恒等、**因果注意力下扰动后位 token 不影响前面输出**、Conv2d 输出形状公式、
   MaxPool2d 等于窗口最大值、IoU 对称且 ≤1、StandardScaler 后列均值为 0、`sigma=0` 噪声恒等且同种子可复现、
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
+
+上面这些是测试文件里手写的性质；`mlp_property_report` 把同一类不变量收敛成一个可直接调用的报告（形状、有限性、确定性、参数计数、首层梯度中心差分），适合改完层实现后先跑一遍再写测试。`fuzz_nonfinite_inputs` 则专门验证「坏输入要报错」：给一个函数和输入维度，随机混入 NaN/±Inf，非有限输入若被静默接受（或返回 NaN）就记为失败——它检查的是显式错误而非数值精度。
 
 ### 规则约束解码（神经符号的最小实现）
 
@@ -6283,7 +6287,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2791 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2796 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6601,6 +6605,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
 | `TestACDC` | 重放前向与 `CausalLM.forward` 逐位一致、threshold=0 不删节点、大 threshold 按 `max_remove` 删到剩余电路、结果可复现且字段齐全、9 类非法输入 |
+| `TestPropertyFuzz` | 属性测试报告 5 项检查全过且名称顺序固定、同 seed 结果一致；strict 函数 fuzz 正确拒绝非有限输入，loose 函数会被判 `nonfinite_silently_accepted`；9 类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6788,6 +6793,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2791 个单元测试
+├── test_ai.py       # 2796 个单元测试
 └── README.md
 ```

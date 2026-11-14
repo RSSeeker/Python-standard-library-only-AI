@@ -44922,3 +44922,72 @@ class TestACDC:
             lambda: AI.acdc_circuit(lm, [0, 1], True),
         ]
         assert all(_acdc_raises(f) for f in bad)
+
+
+def _pq_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestPropertyFuzz:
+    def test_mlp_property_report_passes(self):
+        model = AI.MLP([3, 4, 2], ["relu", "linear"])
+        rep = AI.mlp_property_report(model, trials=8, seed=5)
+        assert rep["passed"] is True
+        assert rep["trials"] == 8
+        assert [c["name"] for c in rep["checks"]] == [
+            "output_shape", "finite_outputs", "deterministic",
+            "param_count", "gradient_fd"]
+        assert all(c["ok"] for c in rep["checks"])
+
+    def test_property_report_deterministic(self):
+        model = AI.MLP([2, 3, 1], ["sigmoid", "linear"])
+        r1 = AI.mlp_property_report(model, trials=6, seed=9)
+        r2 = AI.mlp_property_report(model, trials=6, seed=9)
+        assert [(c["name"], c["ok"]) for c in r1["checks"]] == \
+               [(c["name"], c["ok"]) for c in r2["checks"]]
+
+    def test_fuzz_strict_function_passes(self):
+        def strict(vec):
+            if any(not math.isfinite(v) for v in vec):
+                raise ValueError("非有限输入")
+            return [sum(vec), max(vec)]
+
+        rep = AI.fuzz_nonfinite_inputs(strict, 3, cases=30, seed=2)
+        assert rep["ok"] is True
+        assert rep["cases"] == 30
+        assert rep["rejected"] + rep["accepted"] == 30
+        assert rep["rejected"] >= 1 and rep["accepted"] >= 1
+        assert rep["failures"] == []
+
+    def test_fuzz_detects_silent_nan(self):
+        def loose(vec):
+            return [sum(vec)]
+
+        rep = AI.fuzz_nonfinite_inputs(loose, 2, cases=25, seed=4)
+        assert rep["ok"] is False
+        assert len(rep["failures"]) >= 1
+        assert rep["failures"][0]["kind"] in (
+            "nonfinite_silently_accepted", "nonfinite_output")
+        assert rep["failures"][0]["kind"] == "nonfinite_silently_accepted"
+
+    def test_invalid_inputs(self):
+        model = AI.MLP([2, 1], ["linear"])
+        strict = lambda v: [sum(v)]
+        bad = [
+            lambda: AI.mlp_property_report(None),
+            lambda: AI.mlp_property_report(model, trials=0),
+            lambda: AI.mlp_property_report(model, trials=2.5),
+            lambda: AI.mlp_property_report(model, tol=-1e-3),
+            lambda: AI.mlp_property_report(model, seed=1.5),
+            lambda: AI.fuzz_nonfinite_inputs(3, 2),
+            lambda: AI.fuzz_nonfinite_inputs(strict, 0),
+            lambda: AI.fuzz_nonfinite_inputs(strict, 2, cases=0),
+            lambda: AI.fuzz_nonfinite_inputs(strict, 2, seed="x"),
+        ]
+        assert all(_pq_raises(f) for f in bad)

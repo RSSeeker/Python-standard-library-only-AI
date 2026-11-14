@@ -65976,6 +65976,162 @@ def baseline_model(layer_sizes=(3, 4, 2), seed=12345,
 #  集成测试 / doctest / 属性测试的运行时支撑
 # ============================================================================
 
+
+def _pq_check_mlp(model, who="mlp_property_report"):
+    if not isinstance(model, MLP):
+        raise TypeError(f"{who}: model 必须是 MLP 实例")
+    if not model.layers:
+        raise ValueError(f"{who}: MLP 至少需要一层")
+    return model
+
+
+def _pq_random_vector(rng, n):
+    return [rng.uniform(-1.0, 1.0) for _ in range(n)]
+
+
+def mlp_property_report(model, trials=20, seed=None, tol=1e-4):
+    """对 ``MLP`` 跑一组随机属性测试，返回逐项结果（不抛断言异常）。
+
+    - 输出形状与有限性：随机有限输入经过前向，输出长度 == 最后一层 fan_out，
+      且全部是有限浮点数；
+    - 确定性：同一输入连续两次前向结果逐位相同（eval 语义）；
+    - 参数计数：``param_count`` 等于逐层 ``fan_in*fan_out + fan_out`` 之和；
+    - 梯度一致性：以随机方向作为上游梯度，取首层一个权重做中心差分，与
+      ``_mlp_backward_with_input`` 的解析梯度比较（相对误差 <= ``tol``）。
+
+    ``trials`` 是形状/确定性用例数，``seed`` 控制随机源。返回
+    ``{"passed", "checks", "trials"}``，``checks`` 每项为
+    ``{"name", "ok", "detail"}``；调用方可自行检查 ``passed``。
+    """
+    who = "mlp_property_report"
+    model = _pq_check_mlp(model, who)
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        raise ValueError(f"{who}: trials 必须是正整数，收到 {trials!r}")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError(f"{who}: tol 必须是数字")
+    tol = float(tol)
+    if not math.isfinite(tol) or tol <= 0.0:
+        raise ValueError(f"{who}: tol 必须是正有限数")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError(f"{who}: seed 必须是 int 或 None")
+    rng = random.Random(seed)
+    checks = []
+    in_dim = model.layers[0].fan_in
+    out_dim = model.layers[-1].fan_out
+
+    shapes_ok = True
+    finite_ok = True
+    detail = ""
+    for _ in range(trials):
+        x = _pq_random_vector(rng, in_dim)
+        y = model.forward(x)
+        if len(y) != out_dim:
+            shapes_ok = False
+            detail = f"输出长度 {len(y)} != {out_dim}"
+            break
+        if not all(isinstance(v, float) and math.isfinite(v) for v in y):
+            finite_ok = False
+            detail = "输出含非有限值"
+            break
+    checks.append({"name": "output_shape", "ok": shapes_ok, "detail": detail or f"trials={trials}"})
+    checks.append({"name": "finite_outputs", "ok": finite_ok, "detail": detail})
+
+    x1 = _pq_random_vector(rng, in_dim)
+    y1 = model.forward(x1)
+    y2 = model.forward(x1)
+    det_ok = all(y1[i] == y2[i] for i in range(out_dim))
+    checks.append({"name": "deterministic", "ok": det_ok, "detail": ""})
+
+    expected = sum(layer.fan_in * layer.fan_out + layer.fan_out
+                   for layer in model.layers)
+    checks.append({"name": "param_count", "ok": model.param_count() == expected,
+                   "detail": f"{model.param_count()} vs {expected}"})
+
+    x = _pq_random_vector(rng, in_dim)
+    d_out = _pq_random_vector(rng, out_dim)
+    model.forward(x)
+    grads, _ = _mlp_backward_with_input(model, d_out)
+    gw0 = grads[0][0]
+
+    def loss_at():
+        y = model.forward(x)
+        return sum(d_out[i] * y[i] for i in range(out_dim))
+
+    layer0 = model.layers[0]
+    w = layer0.weights
+    h = 1e-6
+    w[0][0] += h
+    lp = loss_at()
+    w[0][0] -= 2 * h
+    lm = loss_at()
+    w[0][0] += h
+    fd = (lp - lm) / (2 * h)
+    denom = max(abs(fd), abs(gw0[0][0]), 1e-12)
+    rel = abs(fd - gw0[0][0]) / denom
+    checks.append({"name": "gradient_fd", "ok": rel <= tol,
+                   "detail": f"rel={rel:.3e}"})
+
+    return {"passed": all(c["ok"] for c in checks), "checks": checks,
+            "trials": trials}
+
+
+def fuzz_nonfinite_inputs(fn, dim, cases=50, seed=None):
+    """数值 fuzzing：随机把 NaN / ±Inf 混进输入，验证 ``fn`` 显式报错。
+
+    ``fn`` 接收长度 ``dim`` 的向量。对每种用例：
+    - 非有限输入：必须抛 ``ValueError`` 或 ``TypeError``（不允许静默返回 NaN）；
+    - 有限输入：必须返回有限数字列表（长度不限，元素为 int/float 且有限）。
+
+    返回 ``{"ok", "cases", "rejected", "accepted", "failures"}``；
+    ``failures`` 记录未按约定行为的用例（最多 5 条）。
+    """
+    who = "fuzz_nonfinite_inputs"
+    if not callable(fn):
+        raise TypeError(f"{who}: fn 必须可调用")
+    if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+        raise ValueError(f"{who}: dim 必须是正整数")
+    if isinstance(cases, bool) or not isinstance(cases, int) or cases < 1:
+        raise ValueError(f"{who}: cases 必须是正整数")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError(f"{who}: seed 必须是 int 或 None")
+    rng = random.Random(seed)
+    rejected = 0
+    accepted = 0
+    failures = []
+    sentinels = [float("nan"), float("inf"), float("-inf")]
+    for _ in range(cases):
+        vec = [rng.uniform(-1.0, 1.0) for _ in range(dim)]
+        bad = rng.randrange(4)  # 0=全有限，1..3=注入一种非有限值
+        if bad:
+            pos = rng.randrange(dim)
+            vec[pos] = sentinels[bad - 1]
+        try:
+            out = fn(list(vec))
+        except (ValueError, TypeError):
+            if bad:
+                rejected += 1
+            else:
+                failures.append({"kind": "finite_rejected", "input": list(vec)})
+            continue
+        except Exception as exc:
+            failures.append({"kind": "wrong_exception", "input": list(vec),
+                             "error": type(exc).__name__})
+            continue
+        if bad:
+            failures.append({"kind": "nonfinite_silently_accepted",
+                             "input": list(vec), "output": out})
+            continue
+        if (not isinstance(out, (list, tuple))
+                or not all((isinstance(v, (int, float)) and not isinstance(v, bool)
+                            and math.isfinite(float(v))) for v in out)):
+            failures.append({"kind": "nonfinite_output", "input": list(vec),
+                             "output": out})
+            continue
+        accepted += 1
+    return {"ok": not failures, "cases": cases, "rejected": rejected,
+            "accepted": accepted, "failures": failures[:5]}
+
+
 def run_doctests(module=None, verbose=False, optionflags=None, require_examples=True):
     """运行 docstring 里的 `>>>` 示例，返回 `{"attempted", "failed", "failures"}`。
 
