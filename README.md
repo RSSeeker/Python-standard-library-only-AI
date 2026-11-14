@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2801 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2807 项）
 
 ## 特性
 
@@ -3639,8 +3639,8 @@ losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
 | `dr_grpo_advantages(rewards, group_size=None)` | Dr. GRPO 优势：只减组内均值，不做标准差归一化（避免难题被放大） |
 | `dapo_token_losses(logit_seqs, old_logp_seqs, action_seqs, advantage_seqs, clip_ratio=0.2, clip_ratio_high=0.28, entropy_coef=0.0)` | DAPO 的 token 级裁剪损失（clip-higher：上界更松），按整批 token 总数归一化 |
 | `gspo_losses(logit_seqs, old_logp_seqs, action_seqs, sequence_advantages, clip_ratio=0.2, clip_ratio_high=None, entropy_coef=0.0)` | GSPO 的序列级重要性比裁剪：`s_i=exp(mean_t(logp_new-logp_old))`，梯度按 `s_i/T` 分摊到各 token |
-| `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0)` | GRPO rollout 训练循环：同一 prompt 采 `num_samples` 条回答 → `reward_fn` 打分 → 组内相对优势 → `grpo_losses` 逐步裁剪损失 → 反传 `adam_step`；`group_step` 单 prompt、`fit` 遍历 prompts |
-| `grpo_align(policy, reward_fn, prompts, num_samples=4, ..., epochs=1)` | 便捷入口：`GRPOTrainer(...).fit(...)`，返回每轮平均损失 |
+| `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0, method="grpo", clip_ratio_high=None)` | GRPO rollout 训练循环：同一 prompt 采 `num_samples` 条回答 → `reward_fn` 打分 → 组内相对优势 → 按 `method` 选 `grpo_losses`/`dapo_token_losses`/`gspo_losses` → 反传 `adam_step`；`group_step` 单 prompt、`fit` 遍历 prompts |
+| `grpo_align(policy, reward_fn, prompts, num_samples=4, ..., epochs=1, method="grpo", clip_ratio_high=None)` | 便捷入口：`GRPOTrainer(...).fit(...)`，返回每轮平均损失 |
 | `PPOKLTrainer(policy, reference, reward_fn, kl_coef=0.1, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=8, temperature=1.0, gamma=1.0, eos_id=0, seed=None)` | 带 KL 惩罚的 PPO 式 RLHF：`rollout` 采样、逐 token 奖励 `-kl_coef·(logp−ref_logp)`、`gamma` 折扣优势、`ppo_loss` 裁剪更新；`group_step` 单 prompt、`fit` 遍历 prompts |
 | `ppo_kl_align(policy, reference, reward_fn, prompts, ..., epochs=1)` | 便捷入口：`PPOKLTrainer(...).fit(...)`，返回每轮平均 loss/reward/kl |
 
@@ -3683,10 +3683,20 @@ def reward_fn(prompt, response):
 trainer = GRPOTrainer(policy, reward_fn, num_samples=4, lr=0.05,
                       max_new_tokens=8, temperature=1.5, entropy_coef=0.01)
 losses = trainer.fit([[1, 2, 3], [1, 2, 4]], epochs=3, seed=0)
+
+# 也可以切换损失口径：dapo 用 clip-higher，gspo 用序列级重要性比
+trainer_dapo = GRPOTrainer(policy, reward_fn, num_samples=4, lr=0.05,
+                           max_new_tokens=8, temperature=1.5,
+                           method="dapo")
 ```
 
+- `method` 选择损失口径：`"grpo"`（默认，token 级裁剪）、`"dapo"`
+  （token 级裁剪 + `clip_ratio_high` 更高上界，按整批 token 数归一化）、
+  `"gspo"`（序列级重要性比裁剪，每个回答一个标量优势）。三者共用同一套
+  rollout / 打分 / 更新循环，`clip_ratio_high` 只在 dapo/gspo 下生效
 - `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2,
-  entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0)`：
+  entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0,
+  method="grpo", clip_ratio_high=None)`：
   `group_step(prompt_ids, rng=None)` 单 prompt、`fit(prompts, epochs, lr, seed)`
   逐 prompt 更新；`loss_history` 与 `reward_history` 记录每一步均值
 - `reward_fn` 是普通可调用对象（返回有限数字），本库不内置奖励模型
@@ -6297,7 +6307,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2801 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2807 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6770,6 +6780,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
 | `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
 | `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
+| `TestGRPOMethods` | `method` 默认 grpo/clip_ratio_high 默认值、dapo 与 gspo 训练后奖励同样提升、多 token prompt 的 logits/old_logps 对齐、非法 method 与 clip_ratio_high 报错 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6804,6 +6815,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2801 个单元测试
+├── test_ai.py       # 2807 个单元测试
 └── README.md
 ```

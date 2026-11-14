@@ -12567,6 +12567,10 @@ class GRPOTrainer:
     4. ``adam_step`` 更新策略；``group_step`` 处理一个 prompt、``fit`` 依次跑
        prompts 并记录每步平均损失/奖励
 
+    ``method`` 选择损失口径：``"grpo"``（默认，token 级裁剪、组内序列内平均）、
+    ``"dapo"``（token 级裁剪 + clip-higher，按整批 token 数归一化）、
+    ``"gspo"``（序列级重要性比裁剪，每个回答一个标量优势）。三者共用同一套
+    rollout/打分/更新循环。
     ``reward_fn`` 是普通可调用对象（返回有限数字），本库不内置奖励模型。
     简化点：一组内每个回答的全部 token 共享同一个组优势（不按 token 细化）、
     逐 prompt 更新（不积累 batch）、不做参考模型 KL 惩罚、不打包/不分片。
@@ -12575,7 +12579,8 @@ class GRPOTrainer:
     def __init__(self, policy, reward_fn, num_samples: int = 4,
                  clip_ratio: float = 0.2, entropy_coef: float = 0.0,
                  lr: float = 0.01, max_new_tokens: int = 4,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, method: str = "grpo",
+                 clip_ratio_high: float = None):
         _rlhf_check_lm(policy, "GRPOTrainer(policy)")
         if not callable(reward_fn):
             raise TypeError("GRPOTrainer: reward_fn 必须可调用")
@@ -12592,6 +12597,22 @@ class GRPOTrainer:
         if not math.isfinite(self.entropy_coef) or self.entropy_coef < 0.0:
             raise ValueError(
                 f"GRPOTrainer: entropy_coef 必须是有限非负数，收到 {entropy_coef!r}")
+        if method not in ("grpo", "dapo", "gspo"):
+            raise ValueError(
+                "GRPOTrainer: method 必须是 'grpo'/'dapo'/'gspo'，"
+                f"收到 {method!r}")
+        self.method = method
+        if clip_ratio_high is None:
+            clip_ratio_high = 0.28 if method == "dapo" else self.clip_ratio
+        if isinstance(clip_ratio_high, bool) or not isinstance(
+                clip_ratio_high, (int, float)):
+            raise TypeError("GRPOTrainer: clip_ratio_high 必须是数字")
+        self.clip_ratio_high = float(clip_ratio_high)
+        if not math.isfinite(self.clip_ratio_high) or not (
+                0.0 < self.clip_ratio_high < 1.0):
+            raise ValueError(
+                "GRPOTrainer: clip_ratio_high 必须在 (0,1) 内，"
+                f"收到 {clip_ratio_high!r}")
         self.lr = _grpo_check_pos_number(lr, "lr")
         self.max_new_tokens = _grpo_check_pos_int(max_new_tokens, "max_new_tokens")
         self.temperature = _grpo_check_pos_number(temperature, "temperature")
@@ -12634,14 +12655,40 @@ class GRPOTrainer:
             ids = prompt + response
             logits, old_logps, actions = _grpo_seq_targets(
                 self.policy, ids, len(prompt))
+            offset = len(prompt) - 1
+            model_logits = logits[offset:]
+            padded = ([[0.0] * self.policy.vocab_size for _ in range(offset)]
+                      + model_logits) if offset > 0 else model_logits
             step_advs = [advantage] * len(actions)
-            loss, dlogits, _infos = grpo_losses(
-                logits, old_logps, actions, step_advs,
-                clip_ratio=self.clip_ratio,
-                entropy_coef=self.entropy_coef)
+            if self.method == "grpo":
+                loss, dlogits, _infos = grpo_losses(
+                    model_logits, old_logps, actions, step_advs,
+                    clip_ratio=self.clip_ratio,
+                    entropy_coef=self.entropy_coef)
+                grad_scale = 1.0 / self.num_samples
+            elif self.method == "dapo":
+                loss, dlogits, _infos = dapo_token_losses(
+                    [model_logits], [old_logps], [actions], [step_advs],
+                    clip_ratio=self.clip_ratio,
+                    clip_ratio_high=self.clip_ratio_high,
+                    entropy_coef=self.entropy_coef)
+                dlogits = dlogits[0]
+                grad_scale = 1.0
+            else:
+                loss, dlogits, _infos = gspo_losses(
+                    [model_logits], [old_logps], [actions], [advantage],
+                    clip_ratio=self.clip_ratio,
+                    clip_ratio_high=self.clip_ratio_high,
+                    entropy_coef=self.entropy_coef)
+                dlogits = dlogits[0]
+                grad_scale = 1.0
             total_loss += loss
-            _grpo_accumulate_grads(self.policy, dlogits,
-                                   scale=1.0 / self.num_samples)
+            if offset > 0:
+                aligned = ([[0.0] * self.policy.vocab_size
+                            for _ in range(offset)] + dlogits)
+            else:
+                aligned = dlogits
+            _grpo_accumulate_grads(self.policy, aligned, scale=grad_scale)
         self.policy.adam_step(self.lr)
         mean_loss = total_loss / self.num_samples
         mean_reward = sum(rewards) / len(rewards)
@@ -12675,12 +12722,14 @@ class GRPOTrainer:
 def grpo_align(policy, reward_fn, prompts, num_samples: int = 4,
                clip_ratio: float = 0.2, entropy_coef: float = 0.0,
                lr: float = 0.01, max_new_tokens: int = 4,
-               temperature: float = 1.0, epochs: int = 1, seed=None):
+               temperature: float = 1.0, epochs: int = 1, seed=None,
+               method: str = "grpo", clip_ratio_high: float = None):
     """GRPO 便捷入口：构 ``GRPOTrainer`` 并返回每轮平均损失。"""
     trainer = GRPOTrainer(
         policy, reward_fn, num_samples=num_samples, clip_ratio=clip_ratio,
         entropy_coef=entropy_coef, lr=lr, max_new_tokens=max_new_tokens,
-        temperature=temperature)
+        temperature=temperature, method=method,
+        clip_ratio_high=clip_ratio_high)
     return trainer.fit(prompts, epochs=epochs, seed=seed)
 
 

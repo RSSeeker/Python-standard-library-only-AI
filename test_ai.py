@@ -45136,3 +45136,79 @@ class TestChunkwise:
             lambda: AI.chunkwise_selective_scan_forward(x, a, B, C, chunk_size=0),
         ]
         assert all(_cw_raises(f) for f in bad)
+
+
+
+
+def _p81_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception as other:  # pragma: no cover - 诊断用
+        raise AssertionError(f"期望 {exc.__name__}，实际 {type(other).__name__}: {other}")
+    raise AssertionError(f"期望抛 {exc.__name__}，但没有抛")
+
+
+def _p81_before_after(method):
+    policy = _grpo_policy()
+    before = _grpo_mean_reward(policy)
+    trainer = AI.GRPOTrainer(
+        policy, _grpo_reward, num_samples=4, lr=0.05,
+        max_new_tokens=2, temperature=1.5, entropy_coef=0.01,
+        method=method)
+    history = trainer.fit([[0], [0], [1]], epochs=20, seed=2)
+    after = _grpo_mean_reward(policy)
+    return trainer, history, before, after
+
+
+class TestGRPOMethods:
+    def test_default_method_is_grpo(self):
+        policy = _grpo_policy()
+        trainer = AI.GRPOTrainer(policy, _grpo_reward, lr=0.01)
+        assert trainer.method == "grpo"
+        assert trainer.clip_ratio_high == trainer.clip_ratio
+
+    def test_dapo_training_improves_reward(self):
+        trainer, history, before, after = _p81_before_after("dapo")
+        assert len(history) == 20
+        assert all(math.isfinite(v) for v in history)
+        assert after > before + 0.3
+        assert trainer.method == "dapo"
+        assert trainer.clip_ratio_high == 0.28
+        assert len(trainer.reward_history) == len(history) * 3
+
+    def test_gspo_training_improves_reward(self):
+        trainer, history, before, after = _p81_before_after("gspo")
+        assert len(history) == 20
+        assert all(math.isfinite(v) for v in history)
+        assert after > before + 0.3
+        assert trainer.method == "gspo"
+        assert trainer.clip_ratio_high == trainer.clip_ratio
+
+    def test_multi_token_prompt_works(self):
+        for method in ("grpo", "dapo", "gspo"):
+            policy = _grpo_policy()
+            trainer = AI.GRPOTrainer(
+                policy, _grpo_reward, num_samples=2, lr=0.01,
+                max_new_tokens=2, temperature=1.0, method=method)
+            out = trainer.group_step([0, 1], rng=random.Random(7))
+            assert len(out["rewards"]) == 2
+            assert math.isfinite(out["loss"])
+
+    def test_grpo_align_method_passthrough(self):
+        policy = _grpo_policy()
+        trainer = AI.GRPOTrainer(policy, _grpo_reward, method="dapo")
+        assert trainer.method == "dapo"
+
+    def test_invalid_method_and_clip(self):
+        policy = _grpo_policy()
+        _p81_raises(lambda: AI.GRPOTrainer(
+            policy, _grpo_reward, method="ppo"))
+        _p81_raises(lambda: AI.GRPOTrainer(
+            policy, _grpo_reward, method="dapo", clip_ratio_high=0.0))
+        _p81_raises(lambda: AI.GRPOTrainer(
+            policy, _grpo_reward, method="dapo", clip_ratio_high=1.0))
+        _p81_raises(lambda: AI.GRPOTrainer(
+            policy, _grpo_reward, method="dapo", clip_ratio_high="x"),
+            TypeError)
