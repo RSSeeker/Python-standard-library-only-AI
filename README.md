@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2939 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2944 项）
 
 ## 特性
 
@@ -4936,6 +4936,26 @@ python -m ai serve  --checkpoint run/model.json --port 8000
 - `train --resume`：从 `run/checkpoints/manifest.json` 的最近检查点恢复权重与优化器动量后继续训练（epoch 编号连续）。
 - 出错统一输出 `{"error": "..."}` 到 stderr 并返回码 2。
 
+### 进程级分布式启动器（python -m ai.launch）
+
+`ai/launch.py` 用标准库 `multiprocessing`（spawn）在多个进程里并行执行同一个
+rank 函数，并收集返回值，相当于 torchrun 的极简教学替代：
+
+```bash
+python -m ai.launch --nproc_per_node 2 --steps 2
+```
+
+内置 demo 做数据并行梯度验证：每个 rank 只在自己的数据分片（按 `i % world_size`
+切分）上计算线性回归 MSE 梯度，协调端按样本数加权平均后与单进程全量梯度对比，
+输出 `{"nproc_per_node", "steps", "ranks", "samples_per_rank", "grad_b",
+"max_abs_diff_vs_single_process", "equivalent"}`——正常时 `equivalent=true`，
+差异约 1e-16。
+
+- `launch(fn, nproc_per_node, payload)`：`fn(rank, world_size, payload)` 必须可
+  被 spawn 序列化（模块顶层函数）；任一 rank 抛异常会整体失败并带上 traceback。
+- 边界：进程级启动器不做真实 GPU/NCCL 通信；TP/PP/ZeRO/Ring/FSDP 的数值模拟仍在
+  `AI.py` 里（可用它把每个 rank 跑成不同流水阶段来演示）。
+
 ### 检查点管理（滚动 + best-k + 训练循环恢复）
 
 `CheckpointManager` 在训练循环里同时维护两类检查点，取并集保留：
@@ -4959,19 +4979,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（26 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（31 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2939 项）。
+`tests/`（合计 2944 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 26 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2939 项
+pytest tests/ -q                 # 31 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2944 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6730,7 +6750,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2939 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2944 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
