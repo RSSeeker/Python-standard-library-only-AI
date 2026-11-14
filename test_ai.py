@@ -47148,3 +47148,94 @@ class TestTabNet:
         assert _tabn_raises(lambda: model.loss_and_backward([0.0, 0.0, 0.0, 0.0], 5))
         assert _tabn_raises(lambda: model.fit([], []))
         assert _tabn_raises(lambda: model.sgd_step(-1))
+
+
+# ---- Swin V2 block（residual post-norm）测试 ----
+
+
+def _sv2_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestSwinV2Block:
+    def test_forward_and_param_count(self):
+        blk = AI.SwinV2Block(4, 2, d_ff=8, seed=2)
+        out = blk.forward([[0.1, 0.2, -0.3, 0.4], [0.0, 0.5, 0.2, -0.1]])
+        assert len(out) == 2 and len(out[0]) == 4
+        assert blk.param_count() == 173
+
+    def test_numerical_gradients(self):
+        blk = AI.SwinV2Block(4, 2, d_ff=8, seed=2)
+        xs = [[1.0, -0.8, 1.2, -0.5], [0.5, 1.0, -0.3, 0.8],
+              [-1.0, 0.2, 0.6, -0.9]]
+        w = [[0.5, -0.5, 0.2, 0.1], [0.1, 0.3, -0.4, 0.2],
+             [0.2, 0.0, 0.5, -0.3]]
+
+        def loss():
+            out = blk.forward(xs)
+            return sum(out[t][i] * w[t][i] for t in range(3) for i in range(4))
+
+        def probe(gg, pg, ps, h=1e-5):
+            blk.zero_grad()
+            blk.forward(xs)
+            blk.backward(w)
+            a = gg()
+            p0 = pg()
+            ps(p0 + h)
+            lp = loss()
+            ps(p0 - h)
+            lm = loss()
+            ps(p0)
+            return a, (lp - lm) / (2 * h)
+
+        pairs = [
+            (lambda: blk.grad_W1[0][2][1], lambda: blk.W1.weights[2][1],
+             lambda v: blk.W1.weights[2].__setitem__(1, v), True),
+            (lambda: blk.grad_W2[0][1][0], lambda: blk.W2.weights[1][0],
+             lambda v: blk.W2.weights[1].__setitem__(0, v), True),
+            (lambda: blk.grad_ln_attn[0][1], lambda: blk.ln_attn.gamma[1],
+             lambda v: blk.ln_attn.gamma.__setitem__(1, v), True),
+            (lambda: blk.grad_ln_ffn[1][2], lambda: blk.ln_ffn.beta[2],
+             lambda v: blk.ln_ffn.beta.__setitem__(2, v), True),
+            (lambda: blk.attn.grads["o"][0][1][2], lambda: blk.attn.o.weights[1][2],
+             lambda v: blk.attn.o.weights[1].__setitem__(2, v), True),
+        ]
+        for gg, pg, ps, must_nonzero in pairs:
+            a, f = probe(gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+            if must_nonzero:
+                assert abs(f) > 1e-9
+
+    def test_post_norm_structure(self):
+        # post-norm：修改 attn 子层权重会改变输出，且 LN 在残差支路上
+        blk = AI.SwinV2Block(4, 1, d_ff=8, seed=3)
+        x = [[0.2, -0.4, 0.1, 0.5]]
+        out1 = blk.forward(x)
+        blk.W1.weights = [[0.0] * 4 for _ in range(8)]
+        blk.W1.biases = [0.5] * 8
+        out2 = blk.forward(x)
+        assert any(abs(a - b) > 1e-9 for a, b in zip(out1[0], out2[0]))
+
+    def test_sgd_step_changes(self):
+        blk = AI.SwinV2Block(4, 2, d_ff=8, seed=4)
+        xs = [[0.3, -0.1, 0.2, 0.0], [0.0, 0.4, -0.2, 0.1]]
+        blk.zero_grad()
+        blk.forward(xs)
+        blk.backward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        before = blk.W1.weights[0][0]
+        blk.sgd_step(0.1)
+        assert before != blk.W1.weights[0][0]
+
+    def test_invalid_inputs(self):
+        assert _sv2_raises(lambda: AI.SwinV2Block(4, 3))
+        assert _sv2_raises(lambda: AI.SwinV2Block(0, 1))
+        assert _sv2_raises(lambda: AI.SwinV2Block(4, 2, d_ff=0))
+        blk = AI.SwinV2Block(4, 2, d_ff=8, seed=1)
+        assert _sv2_raises(lambda: blk.forward([]))
+        assert _sv2_raises(lambda: blk.forward([[0.0, 1.0]]))
+        assert _sv2_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
+        assert _sv2_raises(lambda: blk.forward([[float("nan")] * 4]))

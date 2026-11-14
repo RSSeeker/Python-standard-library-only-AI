@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1806 个 def / 429 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1806 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8779,6 +8779,160 @@ class ScaledCosineAttention:
 
     def param_count(self):
         return 4 * (self.d_model * self.d_model + self.d_model) + 1
+
+
+# ---- Swin V2 block：residual post-norm + 缩放余弦注意力 ----
+
+
+class SwinV2Block:
+    """Swin V2 的 transformer block：残差**后归一化** + 缩放余弦注意力
+
+    与 V1 的 pre-norm 不同，V2 把 LayerNorm 放到子层输出上：
+
+    ``x1 = x + LN_attn(attn(x))``、``x2 = x1 + LN_ffn(ffn(x1))``。
+
+    ``attn`` 为缩放余弦注意力（Swin V2 的核心改动），``ffn`` 为两层 ReLU 全连接。
+    反向按 post-norm 链式反传：先过 LN_ffn 的雅可比，再过 W2/W1 与 attention。
+    这是教学用 block：单窗口（无窗口划分/移位）、无相对位置偏置、无 drop path。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff=None, eps=1e-5, seed=None):
+        for v, name in ((d_model, "d_model"), (num_heads, "num_heads")):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"SwinV2Block: {name} 必须是正整数")
+        if d_model % num_heads != 0:
+            raise ValueError("SwinV2Block: d_model 必须被 num_heads 整除")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        if isinstance(d_ff, bool) or not isinstance(d_ff, int) or d_ff < 1:
+            raise ValueError("SwinV2Block: d_ff 必须是正整数")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.attn = ScaledCosineAttention(d_model, num_heads, eps=eps, seed=seed)
+        self.ln_attn = LayerNorm(d_model, eps)
+        self.ln_ffn = LayerNorm(d_model, eps)
+        self.W1 = Layer(d_model, d_ff, "relu")
+        self.W2 = Layer(d_ff, d_model, "linear")
+
+        self.grad_ln_attn = ([0.0] * d_model, [0.0] * d_model)
+        self.grad_ln_ffn = ([0.0] * d_model, [0.0] * d_model)
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self._cache = None
+
+    @staticmethod
+    def _acc(acc, new):
+        if acc is None:
+            return ([[v for v in row] for row in new[0]], [v for v in new[1]])
+        for i, row in enumerate(new[0]):
+            for j in range(len(row)):
+                acc[0][i][j] += row[j]
+        for i, v in enumerate(new[1]):
+            acc[1][i] += v
+        return acc
+
+    def _layers(self):
+        return [self.W1, self.W2]
+
+    def zero_grad(self):
+        self.attn.zero_grad()
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self.grad_ln_attn = ([0.0] * self.d_model, [0.0] * self.d_model)
+        self.grad_ln_ffn = ([0.0] * self.d_model, [0.0] * self.d_model)
+
+    def param_count(self):
+        return (self.attn.param_count()
+                + _norm_param_count(self.ln_attn)
+                + _norm_param_count(self.ln_ffn)
+                + _dense_param_count(self.W1)
+                + _dense_param_count(self.W2))
+
+    @staticmethod
+    def _check_seq(seq, d_model, who):
+        if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+            raise ValueError(f"{who}: 输入必须是非空 (T, d_model) 列表")
+        rows = []
+        for row in seq:
+            if not isinstance(row, (list, tuple)) or len(row) != d_model:
+                raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+            vals = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: 元素必须是有限数字")
+                vals.append(float(v))
+            rows.append(vals)
+        return rows
+
+    def forward(self, x_seq):
+        x = self._check_seq(x_seq, self.d_model, "SwinV2Block")
+        attn_out = self.attn.forward(x)
+        a_norm, c_ln1 = _norm_rows_forward(self.ln_attn, attn_out)
+        x1 = [[x[t][i] + a_norm[t][i] for i in range(self.d_model)]
+              for t in range(len(x))]
+        f1, c_w1 = _dense_rows_forward(self.W1, x1)
+        f2, c_w2 = _dense_rows_forward(self.W2, f1)
+        f_norm, c_ln2 = _norm_rows_forward(self.ln_ffn, f2)
+        out = [[x1[t][i] + f_norm[t][i] for i in range(self.d_model)]
+               for t in range(len(x))]
+        self._cache = {
+            "x": x, "x1": x1, "c_ln1": c_ln1, "c_ln2": c_ln2,
+            "c_w1": c_w1, "c_w2": c_w2,
+        }
+        return out
+
+    def backward(self, d_out):
+        if self._cache is None:
+            raise RuntimeError("SwinV2Block: 必须先 forward 再 backward")
+        T = len(self._cache["x"])
+        d_out = self._check_seq(d_out, self.d_model, "SwinV2Block.backward")
+        c = self._cache
+
+        # x2 = x1 + LN_ffn(f2)
+        d_x1 = [row[:] for row in d_out]
+        d_fn = [row[:] for row in d_out]
+        g2, b2, d_f2 = _norm_rows_backward(self.ln_ffn, c["c_ln2"], d_fn)
+        for i in range(self.d_model):
+            self.grad_ln_ffn[0][i] += g2[i]
+            self.grad_ln_ffn[1][i] += b2[i]
+        gw2, gb2, d_f1 = _dense_rows_backward(self.W2, c["c_w2"], d_f2)
+        self.grad_W2 = self._acc(self.grad_W2, (gw2, gb2))
+        gw1, gb1, d_x1_ffn = _dense_rows_backward(self.W1, c["c_w1"], d_f1)
+        self.grad_W1 = self._acc(self.grad_W1, (gw1, gb1))
+        for t in range(T):
+            for i in range(self.d_model):
+                d_x1[t][i] += d_x1_ffn[t][i]
+
+        # x1 = x + LN_attn(attn_out)
+        d_x = [row[:] for row in d_x1]
+        d_an = [row[:] for row in d_x1]
+        g1, b1, d_attn = _norm_rows_backward(self.ln_attn, c["c_ln1"], d_an)
+        for i in range(self.d_model):
+            self.grad_ln_attn[0][i] += g1[i]
+            self.grad_ln_attn[1][i] += b1[i]
+        d_attn_in = self.attn.backward(d_attn)
+        for t in range(T):
+            for i in range(self.d_model):
+                d_x[t][i] += d_attn_in[t][i]
+        return d_x
+
+    def sgd_step(self, lr=0.01):
+        self.attn.sgd_step(lr)
+        _norm_apply_sgd(self.ln_attn, self.grad_ln_attn, lr)
+        _norm_apply_sgd(self.ln_ffn, self.grad_ln_ffn, lr)
+        if self.grad_W1 is not None:
+            _dense_apply_sgd(self.W1, self.grad_W1, lr)
+        if self.grad_W2 is not None:
+            _dense_apply_sgd(self.W2, self.grad_W2, lr)
+
+    def train(self):
+        self.attn.train()
+        return self
+
+    def eval(self):
+        self.attn.eval()
+        return self
 
 
 class ITransformer:

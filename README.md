@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2920 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2925 项）
 
 ## 特性
 
@@ -164,6 +164,7 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 | `MLPMixer(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, token_hidden=32, channel_hidden=32, num_classes=10)` | MLP-Mixer：每个 block 先做 **token 混合**（转置后逐通道跑同一个 MLP），再做**通道混合**（逐 token 跑 MLP），两段都是 pre-LN 残差；输出对 token 取均值池化。逐行批量前向/反向（cache 按行保存，不会互相覆盖），`backward` 梯度累加、`sgd_step`/`adam_step` 都有 |
 | `SwinTransformer(in_channels=3, image_size=8, patch_size=4, d_model=16, num_heads=4, d_ff=32, num_layers=2, window_size=2, num_classes=10, eps=1e-5, depths=None)` | Swin Transformer：PatchEmbedding → 交替（普通 / 移位 `window_size//2`）窗口块 → 全局均值池化 → 线性头。移位窗口按**原始窗口归属加 attention mask**（0 / -inf），跨窗口 token 不再互相关注；`depths` 给多个 stage 时，stage 之间自动插入 `PatchMerging`（2×2 下采样 + 通道翻倍）→ 层级式 Swin。窗口内注意力手写（共享 `q/k/v/o` 投影，按窗口切分后做缩放点积 + softmax），逐行批量 helper 保证 cache 不互相覆盖 |
 | `ScaledCosineAttention(d_model, num_heads, logit_scale=None, eps=1e-6, seed=None)` | Swin V2 的核心注意力：`q̂=q/(|q|+eps)`、`k̂=k/(|k|+eps)`、`s=logit_scale·q̂·k̂`（余弦相似度 + 可学习温度），手写反向覆盖 `W_q/W_k/W_v/W_o` 与 `logit_scale`。边界：单层、无窗口划分/相对位置偏置/causal，V2 的 residual post-norm 由调用方组合 |
+| `SwinV2Block(d_model, num_heads, d_ff=None, eps=1e-5, seed=None)` | Swin V2 的 transformer block：**residual post-norm**（`x1 = x + LN(attn(x))`、`x2 = x1 + LN(ffn(x1))`）+ 上面的缩放余弦注意力；手写反向按 post-norm 顺序反传（先 `LN_ffn` → `W2/W1`，再 `LN_attn` → attention）。边界：单窗口、无相对位置偏置/drop path；`param_count` 173（d=4, heads=2, d_ff=8） |
 | `PatchMerging(in_channels, eps=1e-5)` | Swin 的 patch merging：2×2 相邻 token 拼接成 `4C` → `LayerNorm(4C)` → 线性降到 `2C`；`forward(tokens, gh, gw)` 要求网格边长为偶数，`backward` 返回原 token 梯度，可插在任意 stage 之间 |
 | `GeMPooling(p=3.0)` | 广义平均池化：`(mean(x^p))^(1/p)`，`p=1` 是平均、`p→∞` 趋近最大；前后向都在 log 空间算，`p` 取到几千也不溢出 |
 | `Dropout` | Dropout 正则化（**推理前必须调 `eval()`**，见下方「训练 / 推理模式」） |
@@ -4892,6 +4893,20 @@ model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
 
 边界：教学用最小 TabNet——无 BatchNorm / 特征重缩放 / 注意力共享；`forward` 单样本、`n_steps` 固定、`lambda_sparse` 的熵正则在 `loss_and_backward` 里直接计入。
 
+### Swin V2 block（residual post-norm）
+
+```python
+blk = AI.SwinV2Block(4, 2, d_ff=8, seed=2)
+out = blk.forward([[0.1, 0.2, -0.3, 0.4], [0.0, 0.5, 0.2, -0.1]])
+```
+
+Swin V2 相对 V1 的两处核心改动在这个 block 里：
+
+- **缩放余弦注意力**（`ScaledCosineAttention`）：先把 q/k 归一化再接可学习 `logit_scale`，避免注意力 logits 随维度爆炸；
+- **residual post-norm**：`x1 = x + LN(attn(x))`、`x2 = x1 + LN(ffn(x1))`，把 LayerNorm 从子层输入移到子层输出（V2 论文做法），训练更稳。
+
+反向按 post-norm 链式顺序处理：`LN_ffn` → `W2/W1` → 残差相加 → `LN_attn` → attention → 残差相加，返回输入梯度。边界：单窗口（无窗口划分/移位）、无相对位置偏置与 drop path，属于组件级实现。
+
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
@@ -4899,7 +4914,7 @@ model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2920 项）。
+`tests/`（合计 2925 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -4907,7 +4922,7 @@ model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
 
 ```bash
 pytest tests/ -q                 # 12 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2920 项
+pytest -q                        # test_ai.py + tests/ 合计 2925 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6666,7 +6681,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2920 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2925 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6820,6 +6835,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMLPMixer` | 形状与参数量 891、`dx` 与 block 内 `t1/t2/c1/c2` 四组权重梯度中心差分、head 与 block 内 LayerNorm 梯度中心差分、两次 `backward` 线性累加且 `zero_grad` 清空、120 步 Adam 收敛且 4 张图全对、9 类非法输入 |
 | `TestSwinTransformer` | 窗口划分与移位 `perm` 语义、形状与参数量 1243、`dx` 与 block 内 `q/k/v/o/f1/f2` 六组权重梯度中心差分、head 与 block 内 LayerNorm 梯度、累加语义与 `zero_grad`、150 步 Adam 收敛且 4 张图全对、10 类非法输入 |
 | `TestScaledCosineAttention` | 前向/参数 289、W_q/W_o/logit_scale FD、logit_scale 对分布尖锐度的影响、SGD 更新、非法输入 |
+| `TestSwinV2Block` | 前向/参数 173、W1/W2/两个 LN/attn W_o 的 FD（要求非零）、post-norm 结构（改 FFN 改变输出）、SGD 更新、非法输入 |
 | `TestSwinMaskAndPatchMerging` | 移位窗口 mask 结构（同/异原始窗口的 0/-inf、跨窗口隔离）、`PatchMerging` 前向/反向与 reduction 权重中心差分、非法输入、层级 Swin（4×4→2×2）前向/反向/输入梯度差分、默认单 stage 参数 1243 兼容 |
 | `TestAdvancedMetrics` | Mahalanobis 距离与 OOD AUROC、conformal 分位/预测集合/覆盖率/集合大小、鲁棒准确率与攻击成功率、均等化胜率差、分组校准差，以及各函数非法输入 |
 | `TestRoPEScaling` | `rope_inv_freqs` 的 none/linear/NTK 闭式解、YaRN 两端点退化与逐项夹逼、MHA 默认频率不变、缩放后 `W_q/W_k/W_v/W_o` 梯度仍与中心差分一致 ≤1e-6、7 类非法参数 |
