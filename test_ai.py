@@ -46682,3 +46682,102 @@ class TestFTTransformer:
         assert _ftt_raises(lambda: m.loss_and_backward([1.0, 0.0, 0.0], 5))
         assert _ftt_raises(lambda: m.fit([], []))
         assert _ftt_raises(lambda: m.sgd_step(-1))
+
+
+# ---- iTransformer（变量维 token 的时序 Transformer） ----
+
+
+def _itr_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestITransformer:
+    def test_forward_and_loss(self):
+        model = AI.ITransformer(4, 3, d_model=8, num_heads=2, d_ff=16,
+                                num_layers=1, horizon=2, seed=1)
+        series = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.4, 0.3, 0.2], [1.0, 1.0, 1.0, 1.0]]
+        pred = model.forward(series)
+        assert len(pred) == 3 and len(pred[0]) == 2
+        loss = model.loss_and_backward(series, [[0.5, 0.6], [0.1, 0.0], [1.0, 1.0]])
+        assert loss > 0.0
+
+    def test_numerical_gradients(self):
+        rng = random.Random(0)
+        look, nf, hor = 4, 3, 2
+        model = AI.ITransformer(look, nf, d_model=8, num_heads=2, d_ff=16,
+                                num_layers=1, horizon=hor, seed=1)
+        series = [[rng.uniform(-1.0, 1.0) for _ in range(look)] for _ in range(nf)]
+        target = [[rng.uniform(-1.0, 1.0) for _ in range(hor)] for _ in range(nf)]
+
+        def mse():
+            pred = model.forward(series)
+            return sum((pred[j][h] - target[j][h]) ** 2
+                       for j in range(nf) for h in range(hor)) / (nf * hor)
+
+        model.zero_grad()
+        model.loss_and_backward(series, target)
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = mse()
+            param_set(p0 - h)
+            lm = mse()
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        for gg, pg, ps in [
+            (lambda: model.grad_W_embed[0][0][0], lambda: model.W_embed[0][0][0],
+             lambda v: model.W_embed[0][0].__setitem__(0, v)),
+            (lambda: model.grad_b_embed[1][0], lambda: model.b_embed[1][0],
+             lambda v: model.b_embed[1].__setitem__(0, v)),
+            (lambda: model.grad_W_out[0][1][0], lambda: model.W_out[0][1][0],
+             lambda v: model.W_out[0][1].__setitem__(0, v)),
+            (lambda: model.grad_b_out[2][1], lambda: model.b_out[2][1],
+             lambda v: model.b_out[2].__setitem__(1, v)),
+        ]:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+
+    def test_training_converges(self):
+        samples, targets = [], []
+        for a in range(8):
+            s = [[a * 0.1 + i * 0.2 for i in range(4)],
+                 [1.0 - a * 0.05 + i * 0.1 for i in range(4)],
+                 [0.5 for _ in range(4)]]
+            t = [[s[0][-1] + 0.2, s[0][-1] + 0.4],
+                 [s[1][-1] + 0.1, s[1][-1] + 0.2],
+                 [0.5, 0.5]]
+            samples.append(s)
+            targets.append(t)
+        model = AI.ITransformer(4, 3, d_model=8, num_heads=2, d_ff=16,
+                                num_layers=1, horizon=2, seed=2)
+        hist = model.fit(samples, targets, epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+        assert len(hist) == 40
+
+    def test_sgd_step_changes_params(self):
+        model = AI.ITransformer(3, 2, d_model=8, num_heads=2, d_ff=16,
+                                num_layers=1, horizon=1, seed=3)
+        before = [row[:] for row in model.W_embed[0]]
+        model.zero_grad()
+        model.loss_and_backward([[0.1, 0.2, 0.3], [2.0, 1.0, 0.0]], [[0.0], [0.0]])
+        model.sgd_step(0.05)
+        assert before != model.W_embed[0]
+
+    def test_invalid_inputs(self):
+        assert _itr_raises(lambda: AI.ITransformer(4, 3, d_model=8, num_heads=3))
+        assert _itr_raises(lambda: AI.ITransformer(0, 3))
+        assert _itr_raises(lambda: AI.ITransformer(4, 0))
+        m = AI.ITransformer(4, 2, d_model=8, num_heads=2, horizon=2, seed=1)
+        assert _itr_raises(lambda: m.forward([[0.0] * 4]))
+        assert _itr_raises(lambda: m.forward([[0.0, 1.0, 2.0, 3.0],
+                                              [0.0, 1.0, 2.0, float("nan")]]))
+        assert _itr_raises(lambda: m.loss_and_backward(
+            [[0.0] * 4, [1.0] * 4], [[0.0, 0.0]]))
+        assert _itr_raises(lambda: m.fit([], []))
+        assert _itr_raises(lambda: m.sgd_step(-1))

@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1786 个 def / 425 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1787 个 def / 426 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8134,6 +8134,168 @@ def _ftt_check_sample(sample, n_features, who="FTTransformer"):
             raise ValueError(f"{who}: 特征必须是有限数字")
         vals.append(float(v))
     return vals
+
+
+def _itr_check_matrix(rows, n_rows, n_cols, who, name):
+    if not isinstance(rows, (list, tuple)) or len(rows) != n_rows:
+        raise ValueError(f"{who}: {name} 必须是 {n_rows} 行的矩阵")
+    out = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != n_cols:
+            raise ValueError(f"{who}: {name} 每行长度必须为 {n_cols}")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: {name} 必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+class ITransformer:
+    """iTransformer（2024）：把每个「变量」的整段时间序列嵌成一个 token
+
+    与 PatchTST/TCN 把时间步当 token 不同，iTransformer 先对每个变量的
+    lookback 序列做线性嵌入得到 num_features 个 token，在**变量维**上做
+    自注意力（建模变量间相关），再对每个变量 token 单独投影出 horizon。
+
+    ```text
+    token_j = W_embed[j] · series_j + b_j       # series_j 长度 lookback
+    h = TransformerEncoder(tokens)              # 注意力在变量维
+    pred[j][h] = W_out[j] · h[j] + b_out[j]     # 每个变量独立预测未来
+    ```
+
+    边界：单样本（series = num_features × lookback 矩阵），无 batch/mask；
+    变量嵌入与输出投影都按变量独立（不共享）；无实例归一化/位置编码；
+    `fit` 为逐样本 SGD + MSE。
+    """
+
+    def __init__(self, lookback: int, num_features: int, d_model: int = 16,
+                 num_heads: int = 2, d_ff: int = 32, num_layers: int = 1,
+                 horizon: int = 1, seed: int = None):
+        def pos_int(v, name):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"ITransformer: {name} 必须是正整数，收到 {v!r}")
+            return v
+        self.lookback = pos_int(lookback, "lookback")
+        self.num_features = pos_int(num_features, "num_features")
+        self.d_model = pos_int(d_model, "d_model")
+        self.num_heads = pos_int(num_heads, "num_heads")
+        self.d_ff = pos_int(d_ff, "d_ff")
+        self.num_layers = pos_int(num_layers, "num_layers")
+        self.horizon = pos_int(horizon, "horizon")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("ITransformer: d_model 必须能被 num_heads 整除")
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / self.d_model)
+        def vec(n):
+            return [rng.gauss(0.0, std) for _ in range(n)]
+        self.W_embed = [[vec(self.lookback) for _ in range(self.d_model)]
+                        for _ in range(self.num_features)]
+        self.b_embed = [[0.0] * self.d_model for _ in range(self.num_features)]
+        self.W_out = [[vec(self.d_model) for _ in range(self.horizon)]
+                      for _ in range(self.num_features)]
+        self.b_out = [[0.0] * self.horizon for _ in range(self.num_features)]
+        self.encoder = TransformerEncoder(
+            self.d_model, self.num_heads, self.d_ff, self.num_layers,
+            dropout=0.0, causal=False)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_W_embed = [[[0.0] * self.lookback for _ in range(self.d_model)]
+                             for _ in range(self.num_features)]
+        self.grad_b_embed = [[0.0] * self.d_model for _ in range(self.num_features)]
+        self.grad_W_out = [[[0.0] * self.d_model for _ in range(self.horizon)]
+                           for _ in range(self.num_features)]
+        self.grad_b_out = [[0.0] * self.horizon for _ in range(self.num_features)]
+        self.encoder.zero_grad()
+
+    def forward(self, series):
+        xs = _itr_check_matrix(series, self.num_features, self.lookback,
+                               "ITransformer", "series")
+        tokens = []
+        for j in range(self.num_features):
+            row = xs[j]
+            tokens.append([sum(self.W_embed[j][k][i] * row[i]
+                               for i in range(self.lookback)) + self.b_embed[j][k]
+                           for k in range(self.d_model)])
+        enc = self.encoder.forward(tokens)
+        pred = []
+        for j in range(self.num_features):
+            pred.append([sum(self.W_out[j][h][k] * enc[j][k]
+                             for k in range(self.d_model)) + self.b_out[j][h]
+                         for h in range(self.horizon)])
+        self._x = xs
+        self._tokens = tokens
+        self._enc = enc
+        return pred
+
+    def loss_and_backward(self, series, target):
+        target = _itr_check_matrix(target, self.num_features, self.horizon,
+                                   "ITransformer", "target")
+        pred = self.forward(series)
+        n = self.num_features * self.horizon
+        loss = sum((pred[j][h] - target[j][h]) ** 2
+                   for j in range(self.num_features)
+                   for h in range(self.horizon)) / n
+        d_pred = [[2.0 * (pred[j][h] - target[j][h]) / n
+                   for h in range(self.horizon)]
+                  for j in range(self.num_features)]
+        d_enc = [[0.0] * self.d_model for _ in range(self.num_features)]
+        for j in range(self.num_features):
+            for h in range(self.horizon):
+                dp = d_pred[j][h]
+                self.grad_b_out[j][h] += dp
+                for k in range(self.d_model):
+                    self.grad_W_out[j][h][k] += dp * self._enc[j][k]
+                    d_enc[j][k] += dp * self.W_out[j][h][k]
+        d_tokens = self.encoder.backward(d_enc)
+        for j in range(self.num_features):
+            for k in range(self.d_model):
+                dt = d_tokens[j][k]
+                self.grad_b_embed[j][k] += dt
+                for i in range(self.lookback):
+                    if dt != 0.0 and self._x[j][i] != 0.0:
+                        self.grad_W_embed[j][k][i] += dt * self._x[j][i]
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+            raise TypeError("ITransformer: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("ITransformer: lr 必须是非负有限数字")
+        for j in range(self.num_features):
+            for k in range(self.d_model):
+                for i in range(self.lookback):
+                    self.W_embed[j][k][i] -= lr * self.grad_W_embed[j][k][i]
+                self.b_embed[j][k] -= lr * self.grad_b_embed[j][k]
+            for h in range(self.horizon):
+                for k in range(self.d_model):
+                    self.W_out[j][h][k] -= lr * self.grad_W_out[j][h][k]
+                self.b_out[j][h] -= lr * self.grad_b_out[j][h]
+        self.encoder.sgd_step(lr)
+
+    def fit(self, series_list, targets, epochs=20, lr=0.01, seed=0, shuffle=True):
+        if not isinstance(series_list, (list, tuple)) or len(series_list) == 0:
+            raise ValueError("ITransformer: series_list 必须是非空列表")
+        if len(targets) != len(series_list):
+            raise ValueError("ITransformer: targets 与 series_list 长度不一致")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("ITransformer: epochs 必须是正整数")
+        rng = random.Random(seed)
+        order = list(range(len(series_list)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(series_list[idx], targets[idx])
+                self.sgd_step(lr)
+            history.append(total / len(series_list))
+        return history
 
 
 class FTTransformer:

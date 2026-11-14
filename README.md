@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2877 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2882 项）
 
 ## 特性
 
@@ -4390,6 +4390,7 @@ shared_avg, privates = fedbn_average(updates)
 | `autoformer_aggregate(seasonal, period, top_k=2, weights=None)` | 按自相关挑 top-k 周期做加权平移平均 |
 | `PatchTSTEmbedding(patch_len=16, stride=8, d_model=32, seed=None)` | patch 切分 + 线性嵌入 + RevIN |
 | `DLinear(lookback, horizon, kernel_size=3, seed=None)` | 趋势/季节分解 + 共享线性映射：`trend=移动平均(x)`、`seasonal=x-trend`，分别接一层线性后求和；带反向（含移动平均的梯度分摊） |
+| `ITransformer(lookback, num_features, d_model=16, num_heads=2, d_ff=32, num_layers=1, horizon=1, seed=None)` | 变量维 token 化：每个变量的 lookback 序列线性嵌入成 token，在变量维上跑 `TransformerEncoder`，再逐变量投影出 horizon；带手写反向（特征嵌入/输出投影/encoder） |
 
 ```python
 tcn = TCN(in_channels=4, hidden=16, levels=3)
@@ -4405,6 +4406,11 @@ patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
 dl = DLinear(lookback=24, horizon=6, kernel_size=3)
 y = dl.forward(values[:24])      # 未来 6 步，所有通道共享线性层
 dx = dl.backward(dy)             # 反向到输入（趋势路径按窗口均摊）
+
+itr = ITransformer(lookback=24, num_features=4, horizon=6)
+pred = itr.forward(series_block)   # 4 个变量 × 6 步
+loss = itr.loss_and_backward(series_block, target)
+itr.zero_grad(); itr.sgd_step(0.01)
 ```
 
 三条边界：
@@ -4412,6 +4418,7 @@ dx = dl.backward(dy)             # 反向到输入（趋势路径按窗口均摊
 - `TCN` 是因果的（第 t 步只看 `<= t`），`kernel_size`/`dilation` 决定感受野；它只做「时序编码」，不含池化/预测头。
 - `prob_sparse_attention` 是 Informer 的**简化前向近似**：只让稀疏度评分最高的 u 个查询看全部键，其余查询退化为值的均值，没有反向实现；`Autoformer` 的聚合同样是简化版（无 FFT、无频域）。
 - `PatchTSTEmbedding` 只做 patch 嵌入与 RevIN 归一化/反归一化，不含通道独立的多变量建模与预测头。
+- `ITransformer` 是简化版：变量嵌入与输出投影按变量独立（不共享），没有实例归一化、无位置编码、无 batch/mask；`fit` 为逐样本 SGD + MSE。
 
 ### 推荐模型（矩阵分解 / NCF / Wide&Deep）
 
@@ -6574,7 +6581,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2877 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2882 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7059,6 +7066,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
+| `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
@@ -7096,6 +7104,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2877 个单元测试
+├── test_ai.py       # 2882 个单元测试
 └── README.md
 ```
