@@ -83029,6 +83029,451 @@ def quick_train(x, y, task='regression', hidden_layers=(32,), epochs=200,
 # ResNet 组合 Conv2d/BatchNorm2d/Bottleneck2d/AdaptiveAvgPool2d/Flatten。
 
 
+def _mixtral_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Mixtral: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _mixtral_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"Mixtral: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"Mixtral: {name} 必须是正有限数，收到 {value!r}")
+    return value
+
+
+class MixtralBlock:
+    """Mixtral 风格解码器块（pre-norm，FFN 换成稀疏 MoE）：
+
+        h1 = RMSNorm1(x)
+        x  = x + GQA_Attn(h1)      # 因果 + RoPE（可选）
+        h2 = RMSNorm2(x)
+        out = x + MoE(h2)          # 每个 token 只走 top_k 个专家
+
+    与 `LlamaBlock` 的唯一区别是第二个子层从 `SwiGLU` 换成 `MoE`；
+    反向按残差链式法则手写，MoE 内部（专家 FFN + 门控路由）的梯度
+    由 `MoE.backward` 累积。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff=None, num_experts=4,
+                 top_k=2, num_kv_heads=None, dropout=0.0, rope=True):
+        _mixtral_check_pos_int(d_model, "d_model")
+        _mixtral_check_pos_int(num_heads, "num_heads")
+        _mixtral_check_pos_int(num_experts, "num_experts")
+        _mixtral_check_pos_int(top_k, "top_k")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"MixtralBlock: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if top_k > num_experts:
+            raise ValueError(
+                f"MixtralBlock: top_k={top_k} 不能大于 num_experts={num_experts}")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _mixtral_check_pos_int(d_ff, "d_ff")
+        if not isinstance(dropout, (int, float)) or isinstance(dropout, bool) \
+                or not 0.0 <= float(dropout) < 1.0:
+            raise ValueError(f"MixtralBlock: dropout 必须在 [0,1)，收到 {dropout!r}")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.attn = MultiHeadAttention(d_model, num_heads, dropout,
+                                       causal=True, rope=bool(rope),
+                                       num_kv_heads=num_kv_heads)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.moe = MoE(d_model, d_ff, num_experts=num_experts,
+                       top_k=top_k, activation="gelu")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.attn.zero_grad()
+        self.moe.zero_grad()
+        self.grads = {
+            "ln1_gamma": [0.0] * self.d_model,
+            "ln2_gamma": [0.0] * self.d_model,
+        }
+
+    def train(self):
+        self.attn.train()
+        return self
+
+    def eval(self):
+        self.attn.eval()
+        return self
+
+    def forward(self, x_seq):
+        if not x_seq:
+            raise ValueError("MixtralBlock.forward: 输入序列为空")
+        d = self.d_model
+        if len(x_seq[0]) != d:
+            raise ValueError(
+                f"MixtralBlock.forward: 输入维度 {len(x_seq[0])} 与 d_model={d} 不一致")
+        seq = [list(row) for row in x_seq]
+        h1 = [self.ln1.forward(v) for v in seq]
+        attn_out = self.attn.forward(h1)
+        res1 = [[seq[t][j] + attn_out[t][j] for j in range(d)]
+                for t in range(len(seq))]
+        h2 = [self.ln2.forward(v) for v in res1]
+        moe_out = self.moe.forward(h2)
+        res2 = [[res1[t][j] + moe_out[t][j] for j in range(d)]
+                for t in range(len(seq))]
+        self._cache = (seq, h1, res1, h2, res2)
+        return res2
+
+    def backward(self, dout_seq):
+        if self._cache is None:
+            raise RuntimeError("MixtralBlock.backward: 必须先调用 forward()")
+        seq, h1, res1, h2, res2 = self._cache
+        T, d = len(seq), self.d_model
+        if len(dout_seq) != T or any(len(row) != d for row in dout_seq):
+            raise ValueError("MixtralBlock.backward: dout 形状与 forward 输入不一致")
+
+        # MoE 分支：out = res2 的直通 + MoE(ln2(res1))
+        d_res1 = [list(row) for row in dout_seq]
+        d_h2 = self.moe.backward(dout_seq)
+        g_ln2 = self.grads["ln2_gamma"]
+        for t in range(T):
+            self.ln2.forward(res1[t])
+            gg, dx = self.ln2.backward(d_h2[t])
+            for j in range(d):
+                g_ln2[j] += gg[j]
+                d_res1[t][j] += dx[j]
+
+        # 注意力分支：res1 的直通 + Attn(ln1(seq))
+        d_ln1_out = self.attn.backward(d_res1)
+        g_ln1 = self.grads["ln1_gamma"]
+        d_x = [list(row) for row in d_res1]
+        for t in range(T):
+            self.ln1.forward(seq[t])
+            gg, dx = self.ln1.backward(d_ln1_out[t])
+            for j in range(d):
+                g_ln1[j] += gg[j]
+                d_x[t][j] += dx[j]
+        return d_x
+
+    def param_count(self):
+        def count(p):
+            if p and isinstance(p[0], (list, tuple)):
+                return sum(len(row) for row in p)
+            return len(p)
+        total = 0
+        for key in ("W_q", "b_q", "W_k", "b_k", "W_v", "b_v", "W_o", "b_o"):
+            total += count(getattr(self.attn, key))
+        total += count(self.ln1.gamma) + count(self.ln2.gamma)
+        total += self.moe.param_count()
+        return total
+
+
+class MixtralModel:
+    """Mixtral 风格 MoE 语言模型（教学用组合类）
+
+    结构：Embedding → N × MixtralBlock(GQA + RoPE + 稀疏 MoE) → RMSNorm → 词表头。
+
+    与 `LlamaModel` 的区别：每个 block 的第二子层是 top_k 稀疏激活的 MoE
+    （`num_experts` 个 FFN 专家，每个 token 只走 `top_k` 个）。可选
+    `aux_coef > 0` 时在训练损失里附加负载均衡辅助损失（只对门控参数产生梯度）。
+
+    训练接口与 `LlamaModel` 对齐：`loss_and_backward`（teacher forcing CE）、
+    `fit`、`generate`、`adam_step`。
+
+    用法::
+
+        lm = MixtralModel(vocab_size=8, d_model=16, num_heads=2, num_layers=2,
+                          num_experts=4, top_k=2, max_len=32)
+        lm.fit([[0, 1, 2, 3]], epochs=20, lr=0.01)
+        lm.generate([0, 1, 2], max_new_tokens=8)
+    """
+
+    def __init__(self, vocab_size, d_model=32, num_heads=4, d_ff=None,
+                 num_layers=2, num_experts=4, top_k=2, num_kv_heads=None,
+                 max_len=256, dropout=0.0, rope=True, aux_coef=0.0, seed=None):
+        _mixtral_check_pos_int(vocab_size, "vocab_size")
+        _mixtral_check_pos_int(d_model, "d_model")
+        _mixtral_check_pos_int(num_heads, "num_heads")
+        _mixtral_check_pos_int(num_layers, "num_layers")
+        _mixtral_check_pos_int(num_experts, "num_experts")
+        _mixtral_check_pos_int(top_k, "top_k")
+        _mixtral_check_pos_int(max_len, "max_len")
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"MixtralModel: d_model={d_model} 必须能被 num_heads={num_heads} 整除")
+        if top_k > num_experts:
+            raise ValueError(
+                f"MixtralModel: top_k={top_k} 不能大于 num_experts={num_experts}")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _mixtral_check_pos_int(d_ff, "d_ff")
+        if not isinstance(aux_coef, (int, float)) or isinstance(aux_coef, bool):
+            raise TypeError("MixtralModel: aux_coef 必须是数字")
+        aux_coef = float(aux_coef)
+        if not math.isfinite(aux_coef) or aux_coef < 0.0:
+            raise ValueError(f"MixtralModel: aux_coef 必须是非负有限数，收到 {aux_coef!r}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_kv_heads = num_kv_heads
+        self.max_len = max_len
+        self.dropout = dropout
+        self.rope = bool(rope)
+        self.aux_coef = aux_coef
+
+        if seed is not None:
+            _state = random.getstate()
+            random.seed(seed)
+        else:
+            _state = None
+        self.embedding = Embedding(vocab_size, d_model)
+        self.blocks = [
+            MixtralBlock(d_model, num_heads, d_ff, num_experts, top_k,
+                         num_kv_heads=num_kv_heads, dropout=dropout, rope=self.rope)
+            for _ in range(num_layers)
+        ]
+        std = math.sqrt(2.0 / d_model)
+        self.W_out = [[random.gauss(0.0, std) for _ in range(d_model)]
+                      for _ in range(vocab_size)]
+        self.b_out = [0.0] * vocab_size
+        if _state is not None:
+            random.setstate(_state)
+        self.norm = RMSNorm(d_model)
+        self._adam_m = {}
+        self._adam_v = {}
+        self.step_count = 0
+        self._norm_in = None
+        self._norm_out = None
+        self.last_aux_loss = 0.0
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.embedding.zero_grad()
+        for block in self.blocks:
+            block.zero_grad()
+        self.grads = {
+            "norm_gamma": [0.0] * self.d_model,
+            "W_out": [[0.0] * self.d_model for _ in range(self.vocab_size)],
+            "b_out": [0.0] * self.vocab_size,
+        }
+
+    def _named_params(self):
+        yield "emb.weight", self.embedding.weight, self.embedding.grad_weight
+        for li, block in enumerate(self.blocks):
+            attn = block.attn
+            for key in ("W_q", "W_k", "W_v", "W_o", "b_q", "b_k", "b_v", "b_o"):
+                yield f"L{li}.attn.{key}", getattr(attn, key), attn.grads[key]
+            yield f"L{li}.ln1.gamma", block.ln1.gamma, block.grads["ln1_gamma"]
+            yield f"L{li}.ln2.gamma", block.ln2.gamma, block.grads["ln2_gamma"]
+            for name, param, grad in block.moe._named_params():
+                yield f"L{li}.moe.{name}", param, grad
+        yield "norm.gamma", self.norm.gamma, self.grads["norm_gamma"]
+        yield "out.W", self.W_out, self.grads["W_out"]
+        yield "out.b", self.b_out, self.grads["b_out"]
+
+    def param_count(self):
+        return sum(
+            (sum(len(row) for row in p) if p and isinstance(p[0], (list, tuple))
+             else len(p))
+            for _, p, _ in self._named_params())
+
+    def train(self):
+        for block in self.blocks:
+            block.train()
+        return self
+
+    def eval(self):
+        for block in self.blocks:
+            block.eval()
+        return self
+
+    def _check_ids(self, ids, who):
+        if not isinstance(ids, (list, tuple)) or not ids:
+            raise ValueError(f"{who}: ids 必须是非空列表")
+        if len(ids) > self.max_len:
+            raise ValueError(
+                f"{who}: 序列长度 {len(ids)} 超过 max_len={self.max_len}")
+        out = []
+        for i, v in enumerate(ids):
+            if isinstance(v, bool) or not isinstance(v, int) \
+                    or not 0 <= v < self.vocab_size:
+                raise ValueError(f"{who}: 第 {i} 个 token {v!r} 越界")
+            out.append(int(v))
+        return out
+
+    def forward(self, ids):
+        ids = self._check_ids(ids, "MixtralModel.forward")
+        x = self.embedding.forward(ids)
+        for block in self.blocks:
+            x = block.forward(x)
+        self._norm_in = x
+        norm_out = [self.norm.forward(v) for v in x]
+        self._norm_out = norm_out
+        logits = _matmul(norm_out, _transpose(self.W_out))
+        for t in range(len(norm_out)):
+            row = logits[t]
+            for v in range(self.vocab_size):
+                row[v] += self.b_out[v]
+        return logits
+
+    def _backward_from_logits(self, dlogits):
+        if self._norm_out is None:
+            raise RuntimeError(
+                "MixtralModel._backward_from_logits: 必须先调用 forward()")
+        T = len(dlogits)
+        V = self.vocab_size
+        d = self.d_model
+        norm_out = self._norm_out
+        grad_W = [[sum(dlogits[t][v] * norm_out[t][j] for t in range(T))
+                   for j in range(d)] for v in range(V)]
+        grad_b = [sum(dlogits[t][v] for t in range(T)) for v in range(V)]
+        for v in range(V):
+            row = self.grads["W_out"][v]
+            for j in range(d):
+                row[j] += grad_W[v][j]
+            self.grads["b_out"][v] += grad_b[v]
+        d_norm = _matmul(dlogits, self.W_out)
+        g_norm = self.grads["norm_gamma"]
+        d = []
+        for t in range(T):
+            self.norm.forward(self._norm_in[t])
+            gg, dx = self.norm.backward(d_norm[t])
+            for j in range(self.d_model):
+                g_norm[j] += gg[j]
+            d.append(dx)
+        for block in reversed(self.blocks):
+            d = block.backward(d)
+        self.embedding.backward(d)
+
+    def loss_and_backward(self, ids, targets=None):
+        seq = self._check_ids(ids, "MixtralModel.loss_and_backward")
+        if len(seq) < 2:
+            raise ValueError(
+                "MixtralModel.loss_and_backward: 序列至少需要 2 个 token")
+        if targets is None:
+            tgt = list(seq[1:])
+        else:
+            tgt = list(targets)
+            if len(tgt) != len(seq) - 1:
+                raise ValueError(
+                    f"MixtralModel.loss_and_backward: targets 长度 {len(tgt)} "
+                    f"应为 {len(seq) - 1}")
+        logits = self.forward(seq)
+        self.last_aux_loss = 0.0
+        if self.aux_coef > 0.0:
+            for block in self.blocks:
+                aux, _ = block.moe.load_balancing_loss_and_backward(self.aux_coef)
+                self.last_aux_loss += aux
+        T = len(seq)
+        n = T - 1
+        V = self.vocab_size
+        loss = 0.0
+        dlogits = [[0.0] * V for _ in range(T)]
+        for t in range(n):
+            y = tgt[t]
+            if not isinstance(y, int) or isinstance(y, bool) or not 0 <= y < V:
+                raise ValueError(
+                    f"MixtralModel.loss_and_backward: 第 {t} 个 target {y!r} 越界")
+            p = _softmax_row(logits[t])
+            loss -= math.log(max(p[y], 1e-12))
+            scale = 1.0 / n
+            row = dlogits[t]
+            for v in range(V):
+                row[v] = (p[v] - (1.0 if v == y else 0.0)) * scale
+        loss /= n
+        self._backward_from_logits(dlogits)
+        return loss
+
+    def adam_step(self, lr):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"MixtralModel.adam_step: lr 必须是非负数，收到 {lr!r}")
+        self.step_count += 1
+        t = self.step_count
+        for name, param, grad in self._named_params():
+            m = self._adam_m.get(name)
+            v = self._adam_v.get(name)
+            if m is None:
+                m = _zeros_like(param)
+                v = _zeros_like(param)
+                self._adam_m[name] = m
+                self._adam_v[name] = v
+            _adam_apply(param, grad, m, v, t, lr)
+
+    def fit(self, sequences, epochs=1, lr=3e-3, shuffle=True, seed=None,
+            verbose=False):
+        if not isinstance(sequences, (list, tuple)) or not sequences:
+            raise ValueError("MixtralModel.fit: sequences 必须是非空列表")
+        seqs = []
+        for i, s in enumerate(sequences):
+            checked = self._check_ids(s, f"MixtralModel.fit 第 {i} 条序列")
+            if len(checked) < 2:
+                raise ValueError(
+                    f"MixtralModel.fit: 第 {i} 条序列至少需要 2 个 token")
+            seqs.append(checked)
+        if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+            raise ValueError(f"MixtralModel.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr < 0:
+            raise ValueError(f"MixtralModel.fit: lr 必须是非负数，收到 {lr!r}")
+        rng = random.Random(seed)
+        order = list(range(len(seqs)))
+        history = []
+        for ep in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(seqs[idx])
+                self.adam_step(lr)
+            avg = total / len(seqs)
+            history.append(avg)
+            if verbose:
+                print(f"  Mixtral epoch {ep + 1}/{epochs} | loss {avg:.4f}")
+        return history
+
+    def generate(self, prompt_ids, max_new_tokens=16, temperature=1.0,
+                 top_k=0, seed=None):
+        prompt = self._check_ids(prompt_ids, "MixtralModel.generate")
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+                or max_new_tokens < 0:
+            raise ValueError(
+                f"MixtralModel.generate: max_new_tokens 必须是非负整数，"
+                f"收到 {max_new_tokens!r}")
+        rng = random.Random(seed)
+        out = prompt[-self.max_len:]
+        for _ in range(max_new_tokens):
+            ctx = out[-self.max_len:]
+            logits = self.forward(ctx)[-1]
+            out.append(self._sample(logits, temperature, top_k, rng))
+        return out
+
+    def _sample(self, logits, temperature, top_k, rng):
+        V = self.vocab_size
+        if temperature is None or temperature <= 0:
+            return max(range(V), key=lambda i: logits[i])
+        scaled = [v / temperature for v in logits]
+        if top_k and top_k > 0:
+            cand = sorted(range(V), key=lambda i: (-scaled[i], i))[:top_k]
+            row = [scaled[i] for i in cand]
+        else:
+            cand = list(range(V))
+            row = scaled
+        p = _softmax_row(row)
+        r = rng.random()
+        acc = 0.0
+        for tok, prob in zip(cand, p):
+            acc += prob
+            if r <= acc:
+                return tok
+        return cand[-1]
+
 class LlamaBlock:
     """LLaMA 解码器块（pre-norm）：
 

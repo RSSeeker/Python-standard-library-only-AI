@@ -43716,3 +43716,117 @@ class TestVMambaClassifier:
         fresh = _vmbc_make(seed=9)
         assert _vmbc_raises(lambda: fresh._backward_image([0.0, 0.0]),
                             RuntimeError)
+
+
+def _mixtral_t_model(seed=1):
+    return AI.MixtralModel(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                           num_layers=1, num_experts=3, top_k=2, max_len=16,
+                           seed=seed)
+
+
+class TestMixtralModel:
+    def test_forward_and_param_count(self):
+        m = _mixtral_t_model()
+        assert m.param_count() == 1281
+        logits = m.forward([0, 1, 2, 3])
+        assert len(logits) == 4
+        assert all(len(row) == 6 for row in logits)
+        # 2D 输出：因果 LM 的 logits 形状 (T, vocab)
+        assert m.blocks[0].param_count() > 0
+        gen = m.generate([0, 1], max_new_tokens=3, seed=0)
+        assert len(gen) == 5
+        assert all(0 <= t < 6 for t in gen)
+
+    def test_gradients_match_finite_difference(self):
+        ids = [0, 1, 2, 3, 1, 0, 2]
+        m = _mixtral_t_model()
+
+        def total_loss():
+            m.zero_grad()
+            return m.loss_and_backward(ids)
+
+        total_loss()
+        analytic = {
+            "attn.W_q": m.blocks[0].attn.grads["W_q"][0][1],
+            "moe.W_gate": m.blocks[0].moe.grad_W_gate[0][1],
+            "moe.expert.W1": m.blocks[0].moe.experts[0].grads["W1"][0][1],
+            "ln2.gamma": m.blocks[0].grads["ln2_gamma"][1],
+            "W_out": m.grads["W_out"][0][1],
+            "emb.weight": m.embedding.grad_weight[1][0],
+        }
+        getters = {
+            "attn.W_q": (lambda: m.blocks[0].attn.W_q[0][1],
+                         lambda v: m.blocks[0].attn.W_q[0].__setitem__(1, v)),
+            "moe.W_gate": (lambda: m.blocks[0].moe.W_gate[0][1],
+                           lambda v: m.blocks[0].moe.W_gate[0].__setitem__(1, v)),
+            "moe.expert.W1": (lambda: m.blocks[0].moe.experts[0].W1[0][1],
+                              lambda v: m.blocks[0].moe.experts[0].W1[0].__setitem__(1, v)),
+            "ln2.gamma": (lambda: m.blocks[0].ln2.gamma[1],
+                          lambda v: m.blocks[0].ln2.gamma.__setitem__(1, v)),
+            "W_out": (lambda: m.W_out[0][1],
+                      lambda v: m.W_out[0].__setitem__(1, v)),
+            "emb.weight": (lambda: m.embedding.weight[1][0],
+                           lambda v: m.embedding.weight[1].__setitem__(0, v)),
+        }
+        h = 1e-6
+        for name, (get_p, set_p) in getters.items():
+            p0 = get_p()
+            set_p(p0 + h)
+            lp = total_loss()
+            set_p(p0 - h)
+            lm = total_loss()
+            set_p(p0)
+            fd = (lp - lm) / (2.0 * h)
+            rel = abs(analytic[name] - fd) / max(1e-12, abs(fd) + abs(analytic[name]))
+            assert rel < 1e-5, f"{name}: rel={rel:.2e}"
+
+    def test_causal_and_training(self):
+        # 改变最后一个 token 不影响前面位置的 logits
+        m1 = _mixtral_t_model(seed=2)
+        m2 = _mixtral_t_model(seed=2)
+        base = m1.forward([0, 1, 2, 3])
+        changed = m2.forward([0, 1, 2, 5])
+        for t in range(3):
+            assert max(abs(base[t][v] - changed[t][v]) for v in range(6)) < 1e-9
+        # 训练收敛：固定序列的 next-token 交叉熵
+        m3 = AI.MixtralModel(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                             num_layers=1, num_experts=2, top_k=2, max_len=8,
+                             seed=3)
+        losses = m3.fit([[0, 1, 2, 3, 0, 1, 2, 3]], epochs=40, lr=0.02,
+                        shuffle=False)
+        assert losses[-1] < losses[0] * 0.1
+        assert all(0 <= t < 4 for t in m3.generate([0, 1], max_new_tokens=4, seed=1))
+
+    def test_aux_loss(self):
+        m = AI.MixtralModel(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, num_experts=2, top_k=1, max_len=8,
+                            seed=4, aux_coef=0.1)
+        loss = m.loss_and_backward([0, 1, 2, 3])
+        assert math.isfinite(loss)
+        assert m.last_aux_loss > 0.0
+        gate_sum = sum(abs(v) for row in m.blocks[0].moe.grad_W_gate for v in row)
+        assert gate_sum > 0.0
+        m0 = AI.MixtralModel(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                             num_layers=1, num_experts=2, top_k=2, max_len=8,
+                             seed=5, aux_coef=0.0)
+        m0.loss_and_backward([0, 1, 2, 3])
+        assert m0.last_aux_loss == 0.0
+
+    def test_invalid_inputs(self):
+        def raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+            try:
+                fn()
+                raise AssertionError("期望抛错")
+            except exc:
+                return
+        raises(lambda: AI.MixtralModel(vocab_size=0))
+        raises(lambda: AI.MixtralModel(vocab_size=8, d_model=8, num_heads=3))
+        raises(lambda: AI.MixtralModel(vocab_size=8, num_experts=2, top_k=3))
+        raises(lambda: AI.MixtralModel(vocab_size=8, aux_coef=-0.1))
+        raises(lambda: AI.MixtralModel(vocab_size=8, d_model=8, num_experts=0))
+        m = _mixtral_t_model()
+        raises(lambda: m.forward([0, 1, 6]))
+        raises(lambda: m.forward([0] * 17))
+        raises(lambda: m.loss_and_backward([0]))
+        raises(lambda: m.generate([0, 1], max_new_tokens=-1))
+        raises(lambda: AI.MixtralBlock(8, 2, num_experts=2, top_k=3))
