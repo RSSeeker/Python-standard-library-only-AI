@@ -46969,3 +46969,88 @@ class TestConsistencyModel:
         assert _cm_raises(lambda: AI.consistency_model_sample(lambda x, s: x, [0.1], [1.0]))
         assert _cm_raises(lambda: AI.consistency_model_sample(lambda x, s: x, [0.1],
                                                        [0.0, 1.0]))
+
+
+# ---- Swin V2 核心组件：余弦注意力 + 可学习 logit 缩放 ----
+
+
+def _sca_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestScaledCosineAttention:
+    def test_forward_and_param_count(self):
+        model = AI.ScaledCosineAttention(8, 2, seed=1)
+        out = model.forward([[0.1 * i for i in range(8)] for _ in range(3)])
+        assert len(out) == 3 and len(out[0]) == 8
+        assert model.param_count() == 4 * (8 * 8 + 8) + 1
+
+    def test_numerical_gradients(self):
+        rng = random.Random(0)
+        model = AI.ScaledCosineAttention(8, 2, seed=1)
+        xs = [[rng.uniform(-1.0, 1.0) for _ in range(8)] for _ in range(3)]
+        w = [[rng.uniform(-1.0, 1.0) for _ in range(8)] for _ in range(3)]
+
+        def loss():
+            out = model.forward(xs)
+            return sum(out[t][i] * w[t][i] for t in range(3) for i in range(8))
+
+        model.forward(xs)
+        model.zero_grad()
+        model.backward([row[:] for row in w])
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = loss()
+            param_set(p0 - h)
+            lm = loss()
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        pairs = [
+            (lambda: model.grads["q"][0][0][0], lambda: model.q.weights[0][0],
+             lambda v: model.q.weights[0].__setitem__(0, v)),
+            (lambda: model.grads["o"][0][1][2], lambda: model.o.weights[1][2],
+             lambda v: model.o.weights[1].__setitem__(2, v)),
+            (lambda: model.grad_logit_scale, lambda: model.logit_scale,
+             lambda v: setattr(model, "logit_scale", v)),
+        ]
+        for gg, pg, ps in pairs:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+
+    def test_logit_scale_sharpens(self):
+        model = AI.ScaledCosineAttention(4, 1, logit_scale=math.log(10.0), seed=2)
+        xs = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+        model.logit_scale = 1.0
+        model.forward(xs)
+        low_scale_probs = [row[:] for row in model._cache[7]]
+        model.logit_scale = 20.0
+        model.forward(xs)
+        high_scale_probs = model._cache[7]
+        # 更小的 logit_scale 更接近均匀分布
+        assert max(low_scale_probs[0]) < max(high_scale_probs[0])
+
+    def test_sgd_step_updates_logit_scale(self):
+        model = AI.ScaledCosineAttention(4, 1, seed=3)
+        xs = [[0.2, -0.1, 0.3, 0.0], [0.0, 0.5, -0.2, 0.1]]
+        model.forward(xs)
+        model.zero_grad()
+        model.backward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        before = model.logit_scale
+        model.sgd_step(0.1)
+        assert model.logit_scale != before
+
+    def test_invalid_inputs(self):
+        assert _sca_raises(lambda: AI.ScaledCosineAttention(8, 3))
+        assert _sca_raises(lambda: AI.ScaledCosineAttention(0, 1))
+        model = AI.ScaledCosineAttention(4, 1, seed=1)
+        assert _sca_raises(lambda: model.forward([]))
+        assert _sca_raises(lambda: model.forward([[0.0, 1.0]]))
+        assert _sca_raises(lambda: model.forward([[float("nan")] * 4] * 2))
+        assert _sca_raises(lambda: model.sgd_step(-1))

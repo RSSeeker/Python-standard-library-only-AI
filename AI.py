@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1802 个 def / 427 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1803 个 def / 428 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8566,6 +8566,219 @@ def consistency_model_sample(student, x_start, sigmas, sigma_data=0.5, seed=None
             x = list(x0_hat)
         states.append(list(x))
     return states, preds
+
+
+def _sca_check_pos_int(v, name):
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"ScaledCosineAttention: {name} 必须是正整数")
+    return v
+
+
+class ScaledCosineAttention:
+    """Swin Transformer V2 的核心注意力：用「余弦相似度 × 可学习 logit 缩放」打分
+
+    ```text
+    q̂_t = q_t / (|q_t| + eps)        # 每头、逐 token 归一化
+    k̂_j = k_j / (|k_j| + eps)
+    s_tj = logit_scale · (q̂_t · k̂_j)  # logit_scale 可学习（Swin V2 默认初始化 ln(10)）
+    out_t = Σ_j softmax_j(s_tj / τ) · v_j
+    ```
+
+    与点积注意力相比，余弦打分把「幅值」从分数里去掉，长训练时更稳；可学习
+    `logit_scale` 让模型自己找回温度。这里单层、无窗口/相对位置偏置/无 causal。
+
+    边界：单层、单头组共享 `W_q/W_k/W_v/W_o`；无相对位置偏置、无窗口划分、
+    无 post-norm 残差封装（V2 的 residual post-LN 由调用方组合）。
+    """
+
+    def __init__(self, d_model, num_heads, logit_scale=None, eps=1e-6, seed=None):
+        self.d_model = _sca_check_pos_int(d_model, "d_model")
+        self.num_heads = _sca_check_pos_int(num_heads, "num_heads")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("ScaledCosineAttention: d_model 必须能被 num_heads 整除")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError("ScaledCosineAttention: eps 必须是数字")
+        if not math.isfinite(float(eps)) or float(eps) <= 0.0:
+            raise ValueError("ScaledCosineAttention: eps 必须为正有限数字")
+        self.eps = float(eps)
+        if logit_scale is None:
+            logit_scale = math.log(10.0)
+        if isinstance(logit_scale, bool) or not isinstance(logit_scale, (int, float)):
+            raise TypeError("ScaledCosineAttention: logit_scale 必须是数字")
+        if not math.isfinite(float(logit_scale)):
+            raise ValueError("ScaledCosineAttention: logit_scale 必须是有限数字")
+        self.logit_scale = float(logit_scale)
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / self.d_model)
+
+        def layer():
+            lay = Layer(self.d_model, self.d_model, "linear")
+            lay.weights = [[rng.gauss(0.0, std) for _ in range(self.d_model)]
+                           for _ in range(self.d_model)]
+            lay.biases = [0.0] * self.d_model
+            return lay
+
+        self.q = layer()
+        self.k = layer()
+        self.v = layer()
+        self.o = layer()
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grads = {
+            "q": _layer_zero_grads(self.q),
+            "k": _layer_zero_grads(self.k),
+            "v": _layer_zero_grads(self.v),
+            "o": _layer_zero_grads(self.o),
+        }
+        self.grad_logit_scale = 0.0
+
+    def forward(self, x_seq):
+        if not isinstance(x_seq, (list, tuple)) or len(x_seq) == 0:
+            raise ValueError("ScaledCosineAttention: x_seq 不能为空")
+        for row in x_seq:
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(f"ScaledCosineAttention: 每个 token 维度必须是 {self.d_model}")
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError("ScaledCosineAttention: 输入必须是有限数字")
+        T = len(x_seq)
+        q, qc = _dense_rows_forward(self.q, x_seq)
+        k, kc = _dense_rows_forward(self.k, x_seq)
+        v, vc = _dense_rows_forward(self.v, x_seq)
+        h = self.num_heads
+        dk = self.d_model // h
+        scale = 1.0 / math.sqrt(dk)
+        probs = []
+        ctx = [[0.0] * self.d_model for _ in range(T)]
+        q_hat_all = [[0.0] * self.d_model for _ in range(T)]
+        k_hat_all = [[0.0] * self.d_model for _ in range(T)]
+        for t in range(T):
+            for hh in range(h):
+                qs = q[t][hh * dk:(hh + 1) * dk]
+                qn = math.sqrt(sum(a * a for a in qs)) + self.eps
+                qh = [a / qn for a in qs]
+        # 逐 token 预归一化（每头）
+        for t in range(T):
+            for hh in range(h):
+                off = hh * dk
+                qs = q[t][off:off + dk]
+                ks = k[t][off:off + dk]
+                qn = math.sqrt(sum(a * a for a in qs)) + self.eps
+                kn = math.sqrt(sum(a * a for a in ks)) + self.eps
+                for i in range(dk):
+                    q_hat_all[t][off + i] = qs[i] / qn
+                    k_hat_all[t][off + i] = ks[i] / kn
+        attn = []
+        for t in range(T):
+            row = []
+            for j in range(T):
+                s = 0.0
+                for hh in range(h):
+                    off = hh * dk
+                    s += sum(q_hat_all[t][off + i] * k_hat_all[j][off + i]
+                             for i in range(dk))
+                row.append(self.logit_scale * s)
+            attn.append(row)
+        for t in range(T):
+            m = max(attn[t])
+            ex = [math.exp(v - m) for v in attn[t]]
+            ssum = sum(ex)
+            p = [e / ssum for e in ex]
+            probs.append(p)
+            for j in range(T):
+                if p[j] == 0.0:
+                    continue
+                for i in range(self.d_model):
+                    ctx[t][i] += p[j] * v[j][i]
+        out, oc = _dense_rows_forward(self.o, ctx)
+        self._cache = (x_seq, q, k, v, q_hat_all, k_hat_all, attn, probs,
+                       ctx, qc, kc, vc, oc, dk, h)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("ScaledCosineAttention.backward: 必须先调用 forward()")
+        (x_seq, q, k, v, q_hat, k_hat, attn, probs, ctx,
+         qc, kc, vc, oc, dk, h) = self._cache
+        T = len(x_seq)
+        d = self.d_model
+        g_w, g_b, d_ctx = _dense_rows_backward(self.o, oc, dout)
+        for r in range(d):
+            for c in range(d):
+                self.grads["o"][0][r][c] += g_w[r][c]
+            self.grads["o"][1][r] += g_b[r]
+        d_attn = [[0.0] * T for _ in range(T)]
+        d_v = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            for j in range(T):
+                if probs[t][j] != 0.0:
+                    for i in range(d):
+                        d_v[j][i] += probs[t][j] * d_ctx[t][i]
+                    p = probs[t]
+                    dot = sum(p[j2] * 0.0 for j2 in range(T))
+                    # dL/ds_tj = p_tj*(dp_tj - Σ_k p_tk dp_tk)
+                    dp = sum(d_ctx[t][i] * v[j][i] for i in range(d))
+                    d_attn[t][j] = dp
+            p = probs[t]
+            base = sum(p[j2] * d_attn[t][j2] for j2 in range(T))
+            for j in range(T):
+                d_attn[t][j] = p[j] * (d_attn[t][j] - base)
+        d_qhat = [[0.0] * d for _ in range(T)]
+        d_khat = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            for j in range(T):
+                ds = d_attn[t][j]
+                if ds == 0.0:
+                    continue
+                self.grad_logit_scale += ds * sum(
+                    q_hat[t][i] * k_hat[j][i] for i in range(d))
+                for i in range(d):
+                    d_qhat[t][i] += ds * self.logit_scale * k_hat[j][i]
+                    d_khat[j][i] += ds * self.logit_scale * q_hat[t][i]
+        d_q = [[0.0] * d for _ in range(T)]
+        d_k = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            for hh in range(h):
+                off = hh * dk
+                qs = q[t][off:off + dk]
+                ks = k[t][off:off + dk]
+                qn = math.sqrt(sum(a * a for a in qs)) + self.eps
+                kn = math.sqrt(sum(a * a for a in ks)) + self.eps
+                qh = [qs[i] / qn for i in range(dk)]
+                kh = [ks[i] / kn for i in range(dk)]
+                for i in range(dk):
+                    d_q[t][off + i] = d_qhat[t][off + i] / qn \
+                        - qh[i] * sum(d_qhat[t][off + k2] * qh[k2] for k2 in range(dk)) / qn
+                    d_k[t][off + i] = d_khat[t][off + i] / kn \
+                        - kh[i] * sum(d_khat[t][off + k2] * kh[k2] for k2 in range(dk)) / kn
+        for name, layer, cache, grad_out in (
+                ("q", self.q, qc, d_q), ("k", self.k, kc, d_k),
+                ("v", self.v, vc, d_v)):
+            gw, gb, _dx = _dense_rows_backward(layer, cache, grad_out)
+            for r in range(d):
+                for c in range(d):
+                    self.grads[name][0][r][c] += gw[r][c]
+                self.grads[name][1][r] += gb[r]
+        return d_ctx
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+            raise TypeError("ScaledCosineAttention: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("ScaledCosineAttention: lr 必须是非负有限数字")
+        for layer, grads in ((self.q, self.grads["q"]), (self.k, self.grads["k"]),
+                             (self.v, self.grads["v"]), (self.o, self.grads["o"])):
+            for r in range(layer.fan_out):
+                for c in range(layer.fan_in):
+                    layer.weights[r][c] -= lr * grads[0][r][c]
+                layer.biases[r] -= lr * grads[1][r]
+        self.logit_scale -= lr * self.grad_logit_scale
+
+    def param_count(self):
+        return 4 * (self.d_model * self.d_model + self.d_model) + 1
 
 
 class ITransformer:
