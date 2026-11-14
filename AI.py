@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1882 个 def / 437 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1891 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -77081,6 +77081,286 @@ def qat_grads(model, xs, ys, bits=8):
     finally:
         for layer, original, _copy in saved:
             layer.weights = original
+
+
+# ============================================================================
+#  QAT 训练循环与梯度累积
+# ============================================================================
+
+def _qat2_check_model(model):
+    """校验 QAT / 梯度累积的模型参数，返回底层 MLP。"""
+    net = getattr(model, "model", model)
+    layers = getattr(net, "layers", None)
+    if not isinstance(layers, list) or not layers:
+        raise ValueError("QAT: model 必须是 MLP 或 MLP 包装器（需要 layers）")
+    return net
+
+
+def _qat2_check_data(net, xs, ys, who="QAT"):
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError(f"{who}: xs 不能为空")
+    if not isinstance(ys, (list, tuple)) or not ys:
+        raise ValueError(f"{who}: ys 不能为空")
+    if len(xs) != len(ys):
+        raise ValueError(f"{who}: xs 与 ys 必须等长，收到 {len(xs)} / {len(ys)}")
+    first = xs[0]
+    if not isinstance(first, (list, tuple)) or len(first) != net.layers[0].fan_in:
+        raise ValueError(f"{who}: 每行样本长度必须等于输入维度")
+    out_dim = net.layers[-1].fan_out
+    for i, y in enumerate(ys):
+        if isinstance(y, bool):
+            raise ValueError(f"{who}: 目标必须是数字，收到 bool")
+        if isinstance(y, (list, tuple)):
+            if len(y) != out_dim:
+                raise ValueError(
+                    f"{who}: 第 {i} 个目标是 {len(y)} 维，应为 {out_dim}")
+        elif not isinstance(y, (int, float)):
+            raise ValueError(f"{who}: 目标必须是数字或向量")
+    return out_dim
+
+
+def _qat2_quantize_in_place(net, bits):
+    saved = []
+    for layer in net.layers:
+        if hasattr(layer, "weights"):
+            original = layer.weights
+            saved.append((layer, original))
+            layer.weights = fake_quantize(original, bits=bits)
+    return saved
+
+
+def _qat2_restore(saved):
+    for layer, original in saved:
+        layer.weights = original
+
+
+def _qat2_target_vec(y, out_dim):
+    if isinstance(y, (list, tuple)):
+        return [float(v) for v in y]
+    return [float(y)]
+
+
+def qat_loss_and_grads(model, xs, ys, bits=8):
+    """在伪量化权重上做一次前向/反向，返回 (平均 MSE, STE 梯度)。
+
+    反向走 ``fake_quantize`` 的直通估计：权重在反向时恢复为全精度，
+    量化只影响前向数值；返回的梯度可直接交给 SGD/Adam 更新全精度权重。
+    """
+    _w15_check_bits(bits, "qat_loss_and_grads")
+    net = _qat2_check_model(model)
+    out_dim = _qat2_check_data(net, xs, ys, "qat_loss_and_grads")
+    saved = _qat2_quantize_in_place(net, bits)
+    try:
+        acc_w = None
+        acc_b = None
+        total = 0.0
+        for x, y in zip(xs, ys):
+            pred = [float(v) for v in net.forward(list(x))]
+            if len(pred) != out_dim:
+                raise ValueError("qat_loss_and_grads: 前向输出维度不一致")
+            target = _qat2_target_vec(y, out_dim)
+            if out_dim == 1:
+                target = [float(y)] if not isinstance(y, (list, tuple)) else target
+            dloss = []
+            for p, t in zip(pred, target):
+                diff = p - t
+                total += diff * diff
+                dloss.append(2.0 * diff / float(len(xs) * out_dim))
+            grads = _mlp_backward(net, dloss)
+            if acc_w is None:
+                acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                         for layer in net.layers]
+                acc_b = _mlp_acc_bias(net)
+            _mlp_accumulate(acc_w, acc_b, grads)
+        loss = total / float(len(xs) * out_dim)
+        return loss, list(zip(acc_w, acc_b))
+    finally:
+        _qat2_restore(saved)
+
+
+def _qat2_apply_sgd(net, grads, lr):
+    for layer, (gw, gb) in zip(net.layers, grads):
+        for j in range(layer.fan_out):
+            row = layer.weights[j]
+            g_row = gw[j]
+            for i in range(layer.fan_in):
+                row[i] -= lr * g_row[i]
+            layer.biases[j] -= lr * gb[j]
+
+
+def fit_qat(model, xs, ys, bits=8, epochs=20, lr=0.01, batch_size=None,
+            optimizer="sgd", seed=None, shuffle=True):
+    """量化感知训练（QAT）：前向用伪量化权重，反向按 STE 更新全精度权重。
+
+    返回每轮平均损失列表；``optimizer="adam"`` 时用本库的 ``Adam`` 更新。
+    注意这是**模拟** QAT：不省显存、不压缩存储，只验证「量化点处的梯度可用」。
+    """
+    _w15_check_bits(bits, "fit_qat")
+    net = _qat2_check_model(model)
+    out_dim = _qat2_check_data(net, xs, ys, "fit_qat")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError(f"fit_qat: epochs 必须是 >=1 的整数，收到 {epochs!r}")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0.0:
+        raise ValueError(f"fit_qat: lr 必须 > 0，收到 {lr!r}")
+    if batch_size is None:
+        batch_size = len(xs)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+            or batch_size < 1:
+        raise ValueError(f"fit_qat: batch_size 必须是 >=1 的整数，收到 {batch_size!r}")
+    if not isinstance(optimizer, str) or optimizer not in ("sgd", "adam"):
+        raise ValueError(f"fit_qat: optimizer 只支持 'sgd'/'adam'，收到 {optimizer!r}")
+    if not isinstance(shuffle, bool):
+        raise TypeError("fit_qat: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("fit_qat: seed 必须是 int 或 None")
+    rng = random.Random(seed)
+    opt = Adam(net, lr=lr) if optimizer == "adam" else None
+    history = []
+    n = len(xs)
+    for _ in range(epochs):
+        order = list(range(n))
+        if shuffle:
+            rng.shuffle(order)
+        epoch_loss = 0.0
+        batches = 0
+        for start in range(0, n, batch_size):
+            idx = order[start:start + batch_size]
+            bx = [xs[i] for i in idx]
+            by = [ys[i] for i in idx]
+            loss, grads = qat_loss_and_grads(net, bx, by, bits=bits)
+            if opt is None:
+                _qat2_apply_sgd(net, grads, lr)
+            else:
+                opt.step(grads)
+            epoch_loss += loss
+            batches += 1
+        history.append(epoch_loss / float(batches))
+    return history
+
+
+def qat_predict(model, xs, bits=8):
+    """在伪量化权重上做预测（推理侧误差评估）。"""
+    _w15_check_bits(bits, "qat_predict")
+    net = _qat2_check_model(model)
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("qat_predict: xs 不能为空")
+    saved = _qat2_quantize_in_place(net, bits)
+    try:
+        out = []
+        for x in xs:
+            if not isinstance(x, (list, tuple)) or len(x) != net.layers[0].fan_in:
+                raise ValueError("qat_predict: 样本长度与输入维度不一致")
+            out.append([float(v) for v in net.forward(list(x))])
+        return out
+    finally:
+        _qat2_restore(saved)
+
+
+class QATTrainer:
+    """QAT 薄封装：``fit`` 训练全精度权重，``predict`` 用伪量化权重推理。"""
+
+    def __init__(self, model, bits=8, lr=0.01, optimizer="sgd", seed=None):
+        _w15_check_bits(bits, "QATTrainer")
+        self.model = model
+        self.bits = bits
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0.0:
+            raise ValueError(f"QATTrainer: lr 必须 > 0，收到 {lr!r}")
+        if optimizer not in ("sgd", "adam"):
+            raise ValueError("QATTrainer: optimizer 只支持 'sgd'/'adam'")
+        self.lr = float(lr)
+        self.optimizer = optimizer
+        self.seed = seed
+        self.history = []
+
+    def fit(self, xs, ys, epochs=20, batch_size=None, shuffle=True):
+        self.history = fit_qat(
+            self.model, xs, ys, bits=self.bits, epochs=epochs, lr=self.lr,
+            batch_size=batch_size, optimizer=self.optimizer,
+            seed=self.seed, shuffle=shuffle)
+        return self.history
+
+    def predict(self, xs):
+        return qat_predict(self.model, xs, bits=self.bits)
+
+    def param_count(self):
+        net = _qat2_check_model(self.model)
+        return sum(layer.fan_out * (layer.fan_in + 1) for layer in net.layers)
+
+
+class GradAccumulator:
+    """梯度累积：攒 ``every`` 次梯度后取平均，再交给优化器更新一次。
+
+    用于显存受限时模拟大 batch：``accumulate`` 只累加，``step`` 在攒满时真正
+    更新并返回 True；``flush`` 处理最后一个不满的窗口。
+    """
+
+    def __init__(self, model, every=4, optimizer="sgd", lr=0.01):
+        net = _qat2_check_model(model)
+        if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+            raise ValueError(f"GradAccumulator: every 必须是 >=1 的整数，收到 {every!r}")
+        if optimizer not in ("sgd", "adam"):
+            raise ValueError("GradAccumulator: optimizer 只支持 'sgd'/'adam'")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0.0:
+            raise ValueError(f"GradAccumulator: lr 必须 > 0，收到 {lr!r}")
+        self.model = net
+        self.every = every
+        self.lr = float(lr)
+        self.optimizer = optimizer
+        self._acc_w = None
+        self._acc_b = None
+        self._count = 0
+
+    def accumulate(self, grads):
+        if not isinstance(grads, (list, tuple)) or len(grads) != len(self.model.layers):
+            raise ValueError("GradAccumulator: grads 层数与模型层数不一致")
+        for li, (gw, gb) in enumerate(grads):
+            layer = self.model.layers[li]
+            if not isinstance(gw, (list, tuple)) or not isinstance(gb, (list, tuple)):
+                raise ValueError("GradAccumulator: 每层梯度必须是 (grad_w, grad_b) 列表")
+            if len(gw) != layer.fan_out or any(len(r) != layer.fan_in for r in gw):
+                raise ValueError("GradAccumulator: grad_w 形状与层参数不一致")
+            if len(gb) != layer.fan_out:
+                raise ValueError("GradAccumulator: grad_b 形状与层参数不一致")
+        if self._acc_w is None:
+            self._acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                           for layer in self.model.layers]
+            self._acc_b = _mlp_acc_bias(self.model)
+        _mlp_accumulate(self._acc_w, self._acc_b, grads)
+        self._count += 1
+        return self._count >= self.every
+
+    def step(self):
+        if self._count == 0:
+            return False
+        if self._count < self.every:
+            return False
+        self._apply()
+        return True
+
+    def _apply(self):
+        scale = 1.0 / float(self._count)
+        avg = []
+        for aw, ab in zip(self._acc_w, self._acc_b):
+            gw = [[v * scale for v in row] for row in aw]
+            gb = [v * scale for v in ab]
+            avg.append((gw, gb))
+        if self.optimizer == "adam":
+            Adam(self.model, lr=self.lr).step(avg)
+        else:
+            _qat2_apply_sgd(self.model, avg, self.lr)
+        self._acc_w = None
+        self._acc_b = None
+        self._count = 0
+
+    def flush(self):
+        if self._count == 0:
+            return False
+        self._apply()
+        return True
+
+    @property
+    def pending(self):
+        return self._count
 
 
 def smooth_quant_scale(activation_peak, weight_peak, alpha=0.5):

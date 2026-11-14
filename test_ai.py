@@ -48208,3 +48208,141 @@ class TestQGaLore:
         assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=2.5))
         assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=1, bits=1))
         assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=1, bits=17))
+
+
+# ---- QAT 训练循环与梯度累积 ----
+
+
+def _qat_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _qat_batch_grads(model, bx, by):
+    acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+             for layer in model.layers]
+    acc_b = AI._mlp_acc_bias(model)
+    for x, y in zip(bx, by):
+        pred = model.forward(x)
+        dloss = [2.0 * (pred[i] - y[i]) / len(bx) for i in range(len(pred))]
+        AI._mlp_accumulate(acc_w, acc_b, AI._mlp_backward(model, dloss))
+    return acc_w, acc_b
+
+
+class TestQATAndGradAccumulator:
+    def test_qat_loss_and_grads_match_quantized_backward(self):
+        random.seed(0)
+        m = AI.MLP([3, 2], ["linear"])
+        xs = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(5)]
+        ys = [[random.uniform(-1, 1) for _ in range(2)] for _ in range(5)]
+        bits = 8
+        loss_qat, grads_qat = AI.qat_loss_and_grads(m, xs, ys, bits=bits)
+
+        saved = []
+        for layer in m.layers:
+            saved.append((layer, layer.weights))
+            layer.weights = AI.fake_quantize(layer.weights, bits=bits)
+        try:
+            acc_w = [[[0.0] * layer.fan_in for _ in range(layer.fan_out)]
+                     for layer in m.layers]
+            acc_b = AI._mlp_acc_bias(m)
+            total = 0.0
+            for x, y in zip(xs, ys):
+                pred = m.forward(list(x))
+                dloss = []
+                for p, t in zip(pred, y):
+                    diff = p - t
+                    total += diff * diff
+                    dloss.append(2.0 * diff / (len(xs) * len(y)))
+                AI._mlp_accumulate(acc_w, acc_b, AI._mlp_backward(m, dloss))
+            loss_ref = total / (len(xs) * 2)
+            max_grad_diff = max(
+                abs(grads_qat[li][0][j][i] - acc_w[li][j][i])
+                for li in range(len(m.layers))
+                for j in range(m.layers[li].fan_out)
+                for i in range(m.layers[li].fan_in))
+        finally:
+            for layer, orig in saved:
+                layer.weights = orig
+        assert abs(loss_qat - loss_ref) < 1e-12
+        assert max_grad_diff < 1e-12
+
+    def test_fit_qat_converges(self):
+        m = AI.MLP([2, 1], ["linear"])
+        random.seed(1)
+        xs = [[random.uniform(-1, 1), random.uniform(-1, 1)] for _ in range(16)]
+        ys = [[2.0 * x[0] - 1.0 * x[1] + 0.3] for x in xs]
+        hist = AI.fit_qat(m, xs, ys, bits=8, epochs=40, lr=0.05, seed=7)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.2
+
+    def test_qat_trainer_wrapper(self):
+        m = AI.MLP([2, 1], ["linear"])
+        random.seed(2)
+        xs = [[random.uniform(-1, 1), random.uniform(-1, 1)] for _ in range(8)]
+        ys = [[x[0] - 0.5 * x[1]] for x in xs]
+        tr = AI.QATTrainer(m, bits=8, lr=0.05, optimizer="adam")
+        hist = tr.fit(xs, ys, epochs=15, shuffle=False)
+        pred = tr.predict(xs[:3])
+        assert len(hist) == 15 and len(pred) == 3 and len(pred[0]) == 1
+        assert tr.param_count() == sum(
+            layer.fan_out * (layer.fan_in + 1) for layer in m.layers)
+
+    def test_grad_accumulator_equals_mean_gradient_step(self):
+        random.seed(3)
+        base = AI.MLP([2, 1], ["linear"])
+        clone = AI.MLP([2, 1], ["linear"])
+        clone.layers[0].weights = [row[:] for row in base.layers[0].weights]
+        clone.layers[0].biases = base.layers[0].biases[:]
+
+        xa, ya = [[0.2, -0.4], [0.7, 0.1]], [[0.5], [-0.2]]
+        xb, yb = [[-0.3, 0.6], [0.4, 0.9]], [[0.1], [1.0]]
+        gw_a, gb_a = _qat_batch_grads(base, xa, ya)
+        gw_b, gb_b = _qat_batch_grads(base, xb, yb)
+
+        ga = AI.GradAccumulator(base, every=2, optimizer="sgd", lr=0.1)
+        assert ga.accumulate(list(zip(gw_a, gb_a))) is False
+        assert ga.accumulate(list(zip(gw_b, gb_b))) is True
+        assert ga.step() is True
+        assert ga.pending == 0
+
+        layer = clone.layers[0]
+        for j in range(layer.fan_out):
+            for i in range(layer.fan_in):
+                mean_g = (gw_a[0][j][i] + gw_b[0][j][i]) / 2.0
+                layer.weights[j][i] -= 0.1 * mean_g
+            layer.biases[j] -= 0.1 * (gb_a[0][j] + gb_b[0][j]) / 2.0
+        for j in range(layer.fan_out):
+            for i in range(layer.fan_in):
+                assert abs(base.layers[0].weights[j][i]
+                           - clone.layers[0].weights[j][i]) < 1e-12
+
+    def test_grad_accumulator_flush_and_invalid(self):
+        m = AI.MLP([2, 1], ["linear"])
+        ga = AI.GradAccumulator(m, every=3, lr=0.01)
+        gw, gb = _qat_batch_grads(m, [[0.1, 0.2]], [[0.3]])
+        ga.accumulate(list(zip(gw, gb)))
+        assert ga.pending == 1
+        assert ga.flush() is True
+        assert ga.pending == 0
+        assert ga.flush() is False
+
+        assert _qat_raises(lambda: AI.qat_loss_and_grads(m, [], []))
+        assert _qat_raises(lambda: AI.qat_loss_and_grads(m, [[0.0, 0.0]], []))
+        assert _qat_raises(lambda: AI.qat_loss_and_grads(
+            m, [[0.0, 0.0]], [[0.0]], bits=17))
+        assert _qat_raises(lambda: AI.fit_qat(m, [[0.0, 0.0]], [[0.0]], epochs=0))
+        assert _qat_raises(lambda: AI.fit_qat(m, [[0.0, 0.0]], [[0.0]], lr=-1))
+        assert _qat_raises(lambda: AI.fit_qat(
+            m, [[0.0, 0.0]], [[0.0]], batch_size=0))
+        assert _qat_raises(lambda: AI.fit_qat(
+            m, [[0.0, 0.0]], [[0.0]], optimizer="lbfgs"))
+        assert _qat_raises(lambda: AI.qat_predict(m, []))
+        assert _qat_raises(lambda: AI.GradAccumulator(m, every=0))
+        assert _qat_raises(lambda: AI.GradAccumulator(m, lr=0.0))
+        ga2 = AI.GradAccumulator(m, every=2)
+        assert _qat_raises(lambda: ga2.accumulate([(0.0, 0.0)]))
+        assert _qat_raises(lambda: ga2.accumulate([([[0.0]], [0.0])]))

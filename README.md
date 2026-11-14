@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3018 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3023 项）
 
 ## 特性
 
@@ -3546,6 +3546,10 @@ c = concordance_index([1, 2], [True, True], [0.9, 0.1])      # C-index
 | `quantize_weights(model, bits=8)` | 训练后量化（PTQ）：每层一个 scale，写入反量化值并返回 `{"bits","scales","codes"}`（`codes` 是真 int 编码） |
 | `quantization_error(model, bits=8)` | 逐层量化前后的最大 / 平均绝对误差（不改模型） |
 | `qat_grads(model, xs, ys, bits=8)` | QAT 的直通估计梯度：在伪量化权重上前向反传，返回各层平均梯度 |
+| `qat_loss_and_grads(model, xs, ys, bits=8)` | QAT 单步：伪量化权重上前向算 MSE，反向按 STE 返回 `(loss, grads)`，可直接交给 SGD/Adam |
+| `fit_qat(model, xs, ys, bits=8, epochs=20, lr=0.01, ..., optimizer="sgd")` | 完整 QAT 训练循环：逐 batch 伪量化前向 + STE 反传 + 更新全精度权重，返回每轮平均损失 |
+| `QATTrainer(model, bits=8, lr=0.01, optimizer="sgd")` | QAT 薄封装：`fit` 复用 `fit_qat`，`predict` 用伪量化权重推理，`param_count` 统计全精度参数 |
+| `GradAccumulator(model, every=4, optimizer="sgd", lr=0.01)` | 梯度累积器：攒 `every` 次梯度取平均再更新一次，`flush()` 处理最后一个不满窗口 |
 | `smooth_quant_scale(activation_peak, weight_peak, alpha=0.5)` | SmoothQuant 缩放因子 `s = max\|x\|^α / max\|w\|^(1-α)` |
 | `smooth_quant_apply(layer, scales)` | 把缩放折进权重列（`W[:, j] *= s_j`），激活端需自行除以 `s_j` |
 | `NF4_LEVELS` | QLoRA 的 16 个 4-bit 正态分位点（从 −1 到 1，非均匀间隔） |
@@ -3565,11 +3569,13 @@ for row in quantization_error(net, bits=8):
 
 state = quantize_weights(net, bits=8)   # 写回的是反量化值，前向照常
 grads = qat_grads(net, xs, ys, bits=8)  # 直通估计梯度
+hist = fit_qat(net, xs, ys, bits=8, epochs=20, lr=0.01)  # 完整 QAT 循环
+acc = GradAccumulator(net, every=4, lr=0.01)               # 梯度累积
 ```
 
 - PTQ 是**对称 per-tensor**（每层一个 scale），不是 per-channel；`bits` 支持 2–16，8 位最常用。
-- QAT 只提供直通估计（STE）的**梯度**，反向不衰减，前向仍然走量化格点；完整的量化感知训练循环需要自己套 `optimizer.step`。
-- GPTQ / AWQ 未实现；SmoothQuant 只提供缩放因子与权重列迁移，激活端除以 `s` 由调用方完成。
+- QAT 的前向走量化格点、反向按 STE 不衰减；`fit_qat` / `QATTrainer` 提供完整训练循环，`GradAccumulator` 可在显存受限时模拟大 batch。
+- GPTQ / AWQ 见「量化压缩（GPTQ / AWQ 教学实现）」小节；SmoothQuant 只提供缩放因子与权重列迁移，激活端除以 `s` 由调用方完成。
 - 特征蒸馏（hint layer）复用 W1-C 的 `hint_loss`，这里不重复实现。
 
 ### 集成学习
@@ -5223,7 +5229,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3018 项）。
+`tests/`（合计 3023 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5231,7 +5237,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3018 项
+pytest -q                        # test_ai.py + tests/ 合计 3023 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7021,7 +7027,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3018 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3023 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7436,6 +7442,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestExplanationExtras` | TCAV、激活最大化、网络解剖、原型、反事实、影响分数的行为与参数校验（10 例） |
 | `TestStructuredPruning` | 通道分数、掩码式通道剪枝、头分数与剪枝、删层重建、稀疏度统计（8 例） |
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
+| `TestQATAndGradAccumulator` | QAT 损失/梯度与量化点精确反向一致、`fit_qat` 收敛、`QATTrainer` 封装、梯度累积与平均梯度单步等价、`flush` 尾窗、非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
@@ -7561,7 +7568,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2966 个单元测试
+├── test_ai.py       # 2971 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本
