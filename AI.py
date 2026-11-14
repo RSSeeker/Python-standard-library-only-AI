@@ -52165,6 +52165,159 @@ def bradley_terry_loss(chosen_scores, rejected_scores):
     return total / n, d_chosen, d_rejected
 
 
+# ============================================================================
+#  评估与安全：Elo / Bradley-Terry 排行榜求解
+# ============================================================================
+
+
+def _bt_check_results(results, min_players=2):
+    if not isinstance(results, (list, tuple)) or not results:
+        raise ValueError("Elo/BT: results 必须是非空列表")
+    players = []
+    seen = {}
+    clean = []
+    for k, item in enumerate(results):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(
+                f"Elo/BT: 第 {k} 条结果必须是 (player_a, player_b, score)，"
+                f"收到 {item!r}")
+        a, b, s = item
+        for name, p in (("player_a", a), ("player_b", b)):
+            if not isinstance(p, (str, int)) or isinstance(p, bool):
+                raise ValueError(
+                    f"Elo/BT: {name} 必须是 str/int，收到 {p!r}")
+            if p not in seen:
+                seen[p] = len(players)
+                players.append(p)
+        if a == b:
+            raise ValueError(f"Elo/BT: 第 {k} 条结果双方相同（{a!r}）")
+        if not isinstance(s, (int, float)) or isinstance(s, bool):
+            raise ValueError(f"Elo/BT: 第 {k} 条分数必须是数字，收到 {s!r}")
+        s = float(s)
+        if not math.isfinite(s) or not 0.0 <= s <= 1.0:
+            raise ValueError(
+                f"Elo/BT: 第 {k} 条分数必须在 [0,1]，收到 {s!r}")
+        clean.append((seen[a], seen[b], s))
+    if len(players) < min_players:
+        raise ValueError(
+            f"Elo/BT: 至少需要 {min_players} 个不同选手，收到 {len(players)}")
+    return players, clean
+
+
+def elo_ratings(results, k=32.0, initial=1500.0, scale=400.0, rounds=1):
+    """按 Elo 规则逐场更新评分，返回 ``{player: rating}`` 与更新次数。
+
+    ``score`` 取 1（a 胜）/ 0.5（平）/ 0（b 胜）；每轮可按给定顺序重复扫过
+    结果列表 `rounds` 次（默认只扫一遍）。
+    """
+    _pos = lambda v, name: (
+        isinstance(v, (int, float)) and not isinstance(v, bool)
+        and math.isfinite(float(v)) and v > 0)
+    if not _pos(k, "k") or not _pos(scale, "scale"):
+        raise ValueError("elo_ratings: k / scale 必须是有限正数")
+    if not _pos(initial, "initial"):
+        raise ValueError("elo_ratings: initial 必须是有限正数")
+    if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds <= 0:
+        raise ValueError("elo_ratings: rounds 必须是正整数")
+    players, clean = _bt_check_results(results)
+    rating = {p: float(initial) for p in players}
+    for _ in range(rounds):
+        for i, j, s in clean:
+            pi, pj = players[i], players[j]
+            expected = 1.0 / (1.0 + 10.0 ** ((rating[pj] - rating[pi]) / scale))
+            delta = float(k) * (s - expected)
+            rating[pi] += delta
+            rating[pj] -= delta
+    return rating
+
+
+def elo_expected(rating_a, rating_b, scale=400.0):
+    """Elo 期望得分：``1 / (1 + 10^((r_b - r_a)/scale))``。"""
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) \
+            or not math.isfinite(float(scale)) or scale <= 0:
+        raise ValueError("elo_expected: scale 必须是有限正数")
+    gap = (float(rating_b) - float(rating_a)) / float(scale)
+    if gap > 700:
+        return 0.0
+    if gap < -700:
+        return 1.0
+    return 1.0 / (1.0 + 10.0 ** gap)
+
+
+def bradley_terry_fit(results, lr=0.5, max_iters=500, l2=1e-3, tol=1e-10):
+    """用 Bradley-Terry 模型拟合选手强度（softmax 参数化 + 梯度上升）。
+
+    ``score`` 直接当作 a 的得分（0/0.5/1 或任意 [0,1] 的小数）。返回
+    ``(strengths, info)``：`strengths` 是 ``{player: p_i}``（均值为 1），
+    `info` 含 `iters`/`loss`/`stalled`。
+    """
+    if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+            or not math.isfinite(float(lr)) or lr <= 0:
+        raise ValueError("bradley_terry_fit: lr 必须是有限正数")
+    if not isinstance(max_iters, int) or isinstance(max_iters, bool) \
+            or max_iters <= 0:
+        raise ValueError("bradley_terry_fit: max_iters 必须是正整数")
+    if not isinstance(l2, (int, float)) or isinstance(l2, bool) \
+            or not math.isfinite(float(l2)) or l2 < 0:
+        raise ValueError("bradley_terry_fit: l2 必须是有限非负数")
+    players, clean = _bt_check_results(results)
+    n = len(players)
+    r = [0.0] * n
+
+    def loss_and_grad(r_vec):
+        grad = [0.0] * n
+        total = 0.0
+        for i, j, s in clean:
+            diff = r_vec[i] - r_vec[j]
+            # log σ(diff) = -softplus(-diff)，log(1-σ(diff)) = -softplus(diff)
+            if diff >= 0:
+                log_sig, log_one_minus = -math.log1p(math.exp(-diff)),                     -diff - math.log1p(math.exp(-diff))
+            else:
+                log_sig, log_one_minus = diff - math.log1p(math.exp(diff)),                     -math.log1p(math.exp(diff))
+            total += -(s * log_sig + (1.0 - s) * log_one_minus)
+            if diff >= 0:
+                prob = 1.0 / (1.0 + math.exp(-diff))
+            else:
+                prob = math.exp(diff) / (1.0 + math.exp(diff))
+            g = s - prob
+            grad[i] += g
+            grad[j] -= g
+        total /= len(clean)
+        reg = 0.0
+        for i in range(n):
+            grad[i] = grad[i] / len(clean) - 2.0 * l2 * r_vec[i]
+            reg += l2 * r_vec[i] * r_vec[i]
+        return total + reg, grad
+
+    iters = 0
+    stalled = False
+    last_loss = None
+    for it in range(max_iters):
+        loss, grad = loss_and_grad(r)
+        step = max(abs(g) for g in grad)
+        for i in range(n):
+            r[i] += lr * grad[i]
+        iters += 1
+        last_loss = loss
+        if step < tol:
+            stalled = True
+            break
+    total = sum(math.exp(v) for v in r)
+    strengths = {players[i]: math.exp(r[i]) * n / total for i in range(n)}
+    return strengths, {"iters": iters, "loss": last_loss, "stalled": stalled}
+
+
+def bradley_terry_expected(strength_a, strength_b):
+    """BT 模型下 a 的期望得分：``p_a / (p_a + p_b)``。"""
+    for name, v in (("strength_a", strength_a), ("strength_b", strength_b)):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(float(v)) or v < 0:
+            raise ValueError(f"bradley_terry_expected: {name} 必须是非负数")
+    pa, pb = float(strength_a), float(strength_b)
+    if pa + pb == 0.0:
+        raise ValueError("bradley_terry_expected: 双方强度不能同时为 0")
+    return pa / (pa + pb)
+
 def kl_penalty(logp, ref_logp):
     """逐 token 的 KL 惩罚（``logp - ref_logp`` 的求和），用于 RLHF 的奖励扣减。"""
     if not isinstance(logp, (list, tuple)) or not logp:

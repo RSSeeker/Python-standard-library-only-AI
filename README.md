@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2672 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2676 项）
 
 ## 特性
 
@@ -2835,6 +2835,31 @@ kv_offload_plan(10, 4, 1, 3)                    # 块 0 驻 GPU，块 1/2 驻 CP
 | `kv_offload_plan(seq_len, block_size, gpu_blocks, cpu_blocks=None)` | 逐块标注 `location` 为 `gpu`/`cpu`；容量不足抛 ValueError |
 
 - 边界：dims 必须是升序以外的任意正整数集合（逐一校验），不要求单调；KV offload 仅规划布局，不含真实数据搬移/抢占/换入换出，`cpu_blocks=None` 视为无限容量。
+
+### 排行榜求解（Elo / Bradley-Terry）
+
+把成对比较结果（谁赢/平/输）汇总成选手评分：`elo_ratings` 按 Elo 规则逐场
+更新，`bradley_terry_fit` 用 Bradley-Terry 模型（softmax 参数化 + 梯度上升 + L2）
+拟合强度，`elo_expected` / `bradley_terry_expected` 给出期望得分。
+
+```python
+results = [("A", "B", 1), ("A", "C", 0.5), ("B", "C", 1)]
+rating = AI.elo_ratings(results)                 # {player: 1500 附近}
+strengths, info = AI.bradley_terry_fit(results)  # 强度（均值 1）+ 迭代信息
+AI.elo_expected(1700, 1500)                      # ≈ 0.76
+AI.bradley_terry_expected(strengths["A"], strengths["B"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `elo_ratings(results, k=32.0, initial=1500.0, scale=400.0, rounds=1)` | 逐场 Elo 更新，`score` 取 0/0.5/1；`rounds` 可重复扫过结果列表 |
+| `elo_expected(rating_a, rating_b, scale=400.0)` | Elo 期望得分 `1/(1+10^((r_b−r_a)/scale))` |
+| `bradley_terry_fit(results, lr=0.5, max_iters=500, l2=1e-3, tol=1e-10)` | BT 强度拟合，返回 `({player: strength}, {iters, loss, stalled})`，强度归一化到均值 1 |
+| `bradley_terry_expected(strength_a, strength_b)` | BT 模型下 a 的期望得分 `p_a/(p_a+p_b)` |
+
+边界：`score` 在 BT 里按 a 的得分（可 0.5 表示平局）处理，不是严格的 Davidson 平局模型；
+Elo 的 `rounds` 与结果顺序会改变最终评分（顺序敏感是 Elo 的固有性质）；BT 拟合用梯度上升，
+`stalled` 表示相邻两步最大更新已小于 `tol`，不保证全局最优。
 
 ### Uplift 建模与 Qini 评估
 
@@ -5883,7 +5908,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2672 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2676 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6183,6 +6208,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
 | `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
 | `TestToxicity` | 比例与命中下标、非法输入 |
+| `TestEloBradleyTerry` | BT 恢复强度排序与比值（真值 2×/8×）、Elo 排序与期望得分、平局中性、rounds 累积、非法输入 |
 | `TestRankingMetricsCompat` | 已有 Recall@k / reciprocal_rank 语义回归 |
 | `TestToolRegistry` | 注册/分发/列表/注销与重复/缺失工具错误 |
 | `TestParseReAct` | 完整字段、仅 Final Answer 与中文冒号、无字段报错 |
@@ -6362,6 +6388,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2672 个单元测试
+├── test_ai.py       # 2676 个单元测试
 └── README.md
 ```

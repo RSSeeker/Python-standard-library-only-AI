@@ -42391,3 +42391,75 @@ class TestS4DBlock:
         blk.forward([[0.1] * 4] * 6)
         assert _s4d_raises(lambda: blk.backward([[0.1] * 3] * 6))
         assert _s4d_raises(lambda: blk.sgd_step(0.0))
+
+
+def _ebt_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _ebt_results(seed=0, n=4000):
+    true = {"A": 4.0, "B": 2.0, "C": 1.0, "D": 0.5}
+    names = list(true)
+    random.seed(seed)
+    results = []
+    for _ in range(n):
+        i, j = random.sample(names, 2)
+        p = true[i] / (true[i] + true[j])
+        results.append((i, j, 1 if random.random() < p else 0))
+    return results
+
+
+class TestEloBradleyTerry:
+    def test_bt_recovers_strength_order(self):
+        results = _ebt_results()
+        strengths, info = AI.bradley_terry_fit(results, lr=0.5,
+                                               max_iters=2000)
+        order = sorted(strengths, key=lambda k: -strengths[k])
+        assert order == ["A", "B", "C", "D"]
+        assert info["stalled"] is True
+        ratio_ab = strengths["A"] / strengths["B"]
+        assert 1.2 < ratio_ab < 3.2           # 真值 2.0
+        ratio_ad = strengths["A"] / strengths["D"]
+        assert 4.8 < ratio_ad < 12.8          # 真值 8.0
+
+    def test_elo_ranking_and_expected(self):
+        results = _ebt_results(seed=1)
+        rating = AI.elo_ratings(results)
+        order = sorted(rating, key=lambda k: -rating[k])
+        assert order == ["A", "B", "C", "D"]
+        assert abs(AI.elo_expected(1500, 1500) - 0.5) < 1e-12
+        assert AI.elo_expected(1700, 1500) > 0.7
+        assert AI.elo_expected(1500, 1700) < 0.3
+        assert abs(AI.bradley_terry_expected(2.0, 2.0) - 0.5) < 1e-12
+        assert abs(AI.bradley_terry_expected(4.0, 2.0) - 4.0 / 6.0) < 1e-12
+
+    def test_draws_and_rounds(self):
+        draw = [("A", "B", 0.5)] * 4
+        rating = AI.elo_ratings(draw)
+        assert abs(rating["A"] - 1500.0) < 1e-9
+        one_round = AI.elo_ratings([("A", "B", 1.0)], rounds=1)["A"]
+        two_rounds = AI.elo_ratings([("A", "B", 1.0)], rounds=2)["A"]
+        assert two_rounds > one_round
+
+    def test_invalid_inputs(self):
+        assert _ebt_raises(lambda: AI.elo_ratings([]))
+        assert _ebt_raises(lambda: AI.elo_ratings([("A", "B")]))
+        assert _ebt_raises(lambda: AI.elo_ratings([("A", "A", 1)]))
+        assert _ebt_raises(lambda: AI.elo_ratings([("A", "B", 2.0)]))
+        assert _ebt_raises(lambda: AI.elo_ratings([([1], "B", 1)]))
+        assert _ebt_raises(lambda: AI.elo_ratings([("A", "B", 1)], k=0))
+        assert _ebt_raises(lambda: AI.elo_ratings([("A", "B", 1)],
+                                                  rounds=0))
+        assert _ebt_raises(lambda: AI.bradley_terry_fit([("A", "B", 1)],
+                                                        lr=0))
+        assert _ebt_raises(lambda: AI.bradley_terry_fit([("A", "B", 1)],
+                                                        max_iters=0))
+        assert _ebt_raises(lambda: AI.bradley_terry_fit([("A", "B", 1)],
+                                                        l2=-1))
+        assert _ebt_raises(lambda: AI.bradley_terry_expected(0.0, 0.0))
