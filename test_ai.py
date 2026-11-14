@@ -41978,3 +41978,152 @@ class TestFinetuneAdapter:
         ok += _peft_raises(lambda: AI.finetune_adapter(
             _peft_make_mlp(), _XS, _YS, adapter="lora", epochs=0))
         assert ok == 12
+
+
+import math
+import random
+
+
+def _fnet_seq(t=6, d=4):
+    return [[0.5 + 0.2 * math.sin(1.3 * j + 0.7 * i) for i in range(d)]
+            for j in range(t)]
+
+
+def _fnet_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestFNetBlock:
+    def test_mixing_is_symmetric_linear(self):
+        random.seed(0)
+        rows = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(6)]
+        mixed = AI._fnet_mix_rows(rows)
+        # 反向 = 同一对称变换：<dout, M x> == <M dout, x>
+        d = [[0.7, -0.3, 0.2] for _ in range(6)]
+        lhs = sum(d[t][j] * mixed[t][j] for t in range(6) for j in range(3))
+        rhs = sum(AI._fnet_mix_rows(d)[t][j] * rows[t][j]
+                  for t in range(6) for j in range(3))
+        assert abs(lhs - rhs) < 1e-12
+        # 公式与直接定义一致
+        want = [[sum(rows[s][j] * math.cos(2 * math.pi * (t - s) / 6) / 6
+                     for s in range(6)) for j in range(3)] for t in range(6)]
+        err = max(abs(mixed[t][j] - want[t][j])
+                  for t in range(6) for j in range(3))
+        assert err < 1e-12
+
+    def test_forward_and_param_count(self):
+        block = AI.FNetBlock(4, d_ff=8, seed=5)
+        x = _fnet_seq()
+        out = block.forward(x)
+        assert len(out) == 6 and all(len(row) == 4 for row in out)
+        # 2*(4*8+8) + 2*(8*4+4) + 2*(2*4) + 2*(2*4) = 184
+        assert block.param_count() == 184
+
+    def test_numerical_gradients(self):
+        block = AI.FNetBlock(4, d_ff=8, seed=5)
+        x = _fnet_seq()
+        dout = [[0.3 if (i + j) % 2 == 0 else -0.2 for i in range(4)]
+                for j in range(6)]
+
+        def loss():
+            o = block.forward(x)
+            return sum(o[t][i] * dout[t][i]
+                       for t in range(6) for i in range(4))
+
+        def fd(get_grad, get_val, set_val, h=1e-6):
+            block.zero_grad()
+            block.forward(x)
+            block.backward(dout)
+            ana = get_grad()
+            v0 = get_val()
+            set_val(v0 + h)
+            lp = loss()
+            set_val(v0 - h)
+            lm = loss()
+            set_val(v0)
+            num = (lp - lm) / (2.0 * h)
+            return abs(ana - num) / max(1e-12, abs(ana) + abs(num))
+
+        assert fd(lambda: block.grads["W1"][0][1][2],
+                  lambda: block.W1.weights[1][2],
+                  lambda v: block.W1.weights[1].__setitem__(2, v)) < 1e-4
+        assert fd(lambda: block.grads["W2"][0][1][0],
+                  lambda: block.W2.weights[1][0],
+                  lambda v: block.W2.weights[1].__setitem__(0, v)) < 1e-4
+        assert fd(lambda: block.norm_grads["ln1"][0][1],
+                  lambda: block.ln1.gamma[1],
+                  lambda v: block.ln1.gamma.__setitem__(1, v)) < 1e-4
+        assert fd(lambda: block.norm_grads["ln2"][1][2],
+                  lambda: block.ln2.beta[2],
+                  lambda v: block.ln2.beta.__setitem__(2, v)) < 1e-4
+        # 输入梯度
+        block.zero_grad()
+        block.forward(x)
+        dx = block.backward(dout)
+        x2 = [row[:] for row in x]
+        h = 1e-6
+        x2[1][2] += h
+        o = block.forward(x2)
+        lp = sum(o[t][i] * dout[t][i] for t in range(6) for i in range(4))
+        x2[1][2] -= 2 * h
+        o = block.forward(x2)
+        lm = sum(o[t][i] * dout[t][i] for t in range(6) for i in range(4))
+        assert abs(dx[1][2] - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_global_mixing_and_training(self):
+        block = AI.FNetBlock(4, d_ff=8, seed=11)
+        x = _fnet_seq()
+        o1 = block.forward(x)
+        x2 = [row[:] for row in x]
+        x2[-1][0] += 1.0
+        o2 = block.forward(x2)
+        # FNet 的混合是全局的（非因果）：最后一个 token 会影响第一个位置
+        assert abs(o1[0][0] - o2[0][0]) > 1e-6
+
+        # 均值池化 + 线性头，学固定类别的简单任务，loss 应显著下降
+        head = AI.Layer(4, 2, "linear")
+        for _ in range(80):
+            block.zero_grad()
+            feats = block.forward(x)
+            pooled = [sum(feats[t][j] for t in range(len(feats)))
+                      / len(feats) for j in range(4)]
+            logits, cache = AI._dense_rows_forward(head, [pooled])
+            p = AI._softmax_row(logits[0])
+            dc = [p[0], p[1] - 1.0]
+            gw, gb, d_pooled = AI._dense_rows_backward(head, cache, [dc])
+            for i in range(2):
+                for j in range(4):
+                    head.weights[i][j] -= 0.2 * gw[i][j]
+                head.biases[i] -= 0.2 * gb[i]
+            d_feats = [[d_pooled[0][j] / len(feats) for j in range(4)]
+                       for _ in range(len(feats))]
+            block.backward(d_feats)
+            block.sgd_step(0.2)
+        feats = block.forward(x)
+        pooled = [sum(feats[t][j] for t in range(len(feats))) / len(feats)
+                  for j in range(4)]
+        logits, _ = AI._dense_rows_forward(head, [pooled])
+        p = AI._softmax_row(logits[0])
+        assert -math.log(max(p[1], 1e-12)) < 0.1
+
+    def test_invalid_inputs(self):
+        assert _fnet_raises(lambda: AI.FNetBlock(0))
+        assert _fnet_raises(lambda: AI.FNetBlock(4, d_ff=0))
+        assert _fnet_raises(lambda: AI.FNetBlock(4, eps=0.0))
+        assert _fnet_raises(lambda: AI.FNetBlock(4, seed=1.5),
+                            (ValueError, TypeError))
+        block = AI.FNetBlock(4, d_ff=8, seed=1)
+        assert _fnet_raises(lambda: block.forward([]))
+        assert _fnet_raises(lambda: block.forward([[0.1] * 4, [0.1] * 3]))
+        assert _fnet_raises(lambda: block.forward([["x"] * 4]))
+        assert _fnet_raises(lambda: block.backward([[0.1] * 4]), RuntimeError)
+        block.forward(_fnet_seq())
+        assert _fnet_raises(lambda: block.backward([[0.1] * 3] * 6))
+        assert _fnet_raises(lambda: block.sgd_step(0.0))
+        assert _fnet_raises(lambda: block.sgd_step(-0.1))

@@ -15445,6 +15445,191 @@ class Trainer:
     def predict(self, x):
         return self.model.predict(x)
 
+# ============================================================================
+#  FNet：用无参数傅里叶混合替代自注意力（FNetBlock）
+# ============================================================================
+
+
+def _fnet_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"FNet: {name} 必须是正整数，收到 {value!r}")
+
+
+def _fnet_check_positive(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"FNet: {name} 必须是正数，收到 {value!r}")
+    if not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"FNet: {name} 必须是有限正数，收到 {value!r}")
+
+
+def _fnet_check_seq(x_seq, d_model, who="FNet"):
+    if not isinstance(x_seq, (list, tuple)) or not x_seq:
+        raise ValueError(f"{who}: 输入必须是非空序列（list/tuple）")
+    rows = []
+    for row in x_seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(
+                f"{who}: 每行必须是长度为 {d_model} 的向量，收到 {row!r}")
+        out = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{who}: 输入必须是数字，收到 {v!r}")
+            out.append(float(v))
+        rows.append(out)
+    return rows
+
+
+def _fnet_mix_rows(rows):
+    """傅里叶 token 混合：y_t = (1/T) * Σ_s x_s * cos(2π(t-s)/T)（逐通道）。
+
+    这是实部 DFT 的逆变换形式（去掉虚部），混合矩阵 `M[t][s]` 对称，所以
+    反向传播就是同一变换；没有可训练参数。
+    """
+    T = len(rows)
+    d = len(rows[0])
+    out = []
+    for t in range(T):
+        acc = [0.0] * d
+        for s in range(T):
+            c = math.cos(2.0 * math.pi * (t - s) / T) / T
+            xs = rows[s]
+            for j in range(d):
+                acc[j] += c * xs[j]
+        out.append(acc)
+    return out
+
+
+def _fnet_mix_backward(d_rows):
+    """`_fnet_mix_rows` 的反向：矩阵对称，等于再做一次混合。"""
+    return _fnet_mix_rows(d_rows)
+
+
+class FNetBlock:
+    """FNet 编码 block：LN → 无参数傅里叶 token 混合 → 残差 → LN → FFN → 残差。
+
+    与 Transformer 的差别：token 混合是完全无参数的全局 cos 核（实部 DFT），
+    因此参数只来自 FFN 与两个 LayerNorm；O(T²) 实现只用于教学（真实 FNet 用
+    FFT 做到 O(T log T)）。
+    """
+
+    def __init__(self, d_model, d_ff=None, eps=1e-5, seed=None):
+        _fnet_check_pos_int(d_model, "d_model")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _fnet_check_pos_int(d_ff, "d_ff")
+        _fnet_check_positive(eps, "eps")
+        if seed is not None and (not isinstance(seed, int)
+                                 or isinstance(seed, bool)):
+            raise ValueError(f"FNet: seed 必须是 int 或 None，收到 {seed!r}")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.ln1 = LayerNorm(d_model, eps)
+        self.ln2 = LayerNorm(d_model, eps)
+        old = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            std = math.sqrt(2.0 / d_model)
+            self.W1 = Layer(d_model, d_ff, "relu")
+            self.W2 = Layer(d_ff, d_model, "linear")
+            for layer in (self.W1, self.W2):
+                layer.weights = [[random.gauss(0.0, 1.0) * std for _ in range(layer.fan_in)]
+                                 for _ in range(layer.fan_out)]
+                layer.biases = [0.0] * layer.fan_out
+        finally:
+            random.setstate(old)
+        self.grads = {"W1": _layer_zero_grads(self.W1),
+                      "W2": _layer_zero_grads(self.W2)}
+        self.norm_grads = {
+            "ln1": ([0.0] * d_model, [0.0] * d_model),
+            "ln2": ([0.0] * d_model, [0.0] * d_model),
+        }
+        self._cache = None
+
+    def zero_grad(self):
+        self.grads = {"W1": _layer_zero_grads(self.W1),
+                      "W2": _layer_zero_grads(self.W2)}
+        self.norm_grads = {
+            "ln1": ([0.0] * self.d_model, [0.0] * self.d_model),
+            "ln2": ([0.0] * self.d_model, [0.0] * self.d_model),
+        }
+        self._cache = None
+        return self
+
+    def param_count(self):
+        return (2 * _dense_param_count(self.W1)
+                + 2 * _dense_param_count(self.W2)
+                + 2 * _norm_param_count(self.ln1)
+                + 2 * _norm_param_count(self.ln2))
+
+    def forward(self, x_seq):
+        rows = _fnet_check_seq(x_seq, self.d_model)
+        h, ln1_cache = _norm_rows_forward(self.ln1, rows)
+        mixed = _fnet_mix_rows(h)
+        y = [[rows[t][j] + mixed[t][j] for j in range(self.d_model)]
+             for t in range(len(rows))]
+        z, ln2_cache = _norm_rows_forward(self.ln2, y)
+        u, w1_cache = _dense_rows_forward(self.W1, z)
+        v, w2_cache = _dense_rows_forward(self.W2, u)
+        out = [[y[t][j] + v[t][j] for j in range(self.d_model)]
+               for t in range(len(rows))]
+        self._cache = {"rows": rows, "ln1": ln1_cache, "y": y,
+                       "ln2": ln2_cache, "z": z, "u": u,
+                       "w1_cache": w1_cache, "w2_cache": w2_cache}
+        return out
+
+    def backward(self, dout_seq):
+        if self._cache is None:
+            raise RuntimeError("FNetBlock.backward: 必须先调用 forward()")
+        cache = self._cache
+        T = len(dout_seq)
+        dout = _fnet_check_seq(dout_seq, self.d_model, "FNetBlock.backward")
+        # FFN 分支
+        grad_w2, grad_b2, du = _dense_rows_backward(
+            self.W2, cache["w2_cache"], dout)
+        grad_w1, grad_b1, dz = _dense_rows_backward(
+            self.W1, cache["w1_cache"], du)
+        gg1, gb1, d_y_ln = _norm_rows_backward(self.ln2, cache["ln2"], dz)
+        # 混合分支：残差直通 + LN 回传
+        d_y = [[dout[t][j] + d_y_ln[t][j] for j in range(self.d_model)]
+               for t in range(T)]
+        d_mixed = d_y
+        d_h = _fnet_mix_backward(d_mixed)
+        gg0, gb0, d_x_ln = _norm_rows_backward(self.ln1, cache["ln1"], d_h)
+        d_x = [[d_y[t][j] + d_x_ln[t][j] for j in range(self.d_model)]
+               for t in range(T)]
+        # 写回累积梯度
+        for i in range(self.d_ff):
+            for j in range(self.d_model):
+                self.grads["W1"][0][i][j] += grad_w1[i][j]
+            self.grads["W1"][1][i] += grad_b1[i]
+        for i in range(self.d_model):
+            for j in range(self.d_ff):
+                self.grads["W2"][0][i][j] += grad_w2[i][j]
+            self.grads["W2"][1][i] += grad_b2[i]
+        for c in range(self.d_model):
+            self.norm_grads["ln1"][0][c] += gg0[c]
+            self.norm_grads["ln1"][1][c] += gb0[c]
+            self.norm_grads["ln2"][0][c] += gg1[c]
+            self.norm_grads["ln2"][1][c] += gb1[c]
+        return d_x
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+                or not math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError(f"FNetBlock.sgd_step: lr 必须是正数，收到 {lr!r}")
+        _dense_apply_sgd(self.W1, self.grads["W1"], lr)
+        _dense_apply_sgd(self.W2, self.grads["W2"], lr)
+        _norm_apply_sgd(self.ln1, self.norm_grads["ln1"], lr)
+        _norm_apply_sgd(self.ln2, self.norm_grads["ln2"], lr)
+        return self
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2656 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2661 项）
 
 ## 特性
 
@@ -708,6 +708,29 @@ lm.fit(seqs, epochs=50, lr=3e-3, batch_size=2)             # 3 条 → 2 步/轮
 同理 `top_k` 必须是 `>= 0` 的整数（`0.5` 会被截成 0 → 候选集为空 → 采样恒取最后一类），
 token id 必须是 `[0, vocab)` 内的整数（负索引原来会被悄悄当成「最后一类」），
 logits 若出现 NaN/Inf 会直接报错而不是把 loss clamp 成 27.63。
+
+### FNet（傅里叶 token 混合）
+
+用**无参数**的全局余弦混合替代自注意力：`y_t = (1/T)·Σ_s x_s·cos(2π(t−s)/T)`
+（实部 DFT 的逆变换形式，只保留实部），混合矩阵对称，因此反向传播就是同一变换；
+可训练参数只剩 FFN 与两个 LayerNorm。`FNetBlock` 是 encoder 式的 pre-norm 残差 block，
+这里用逐元素 O(T²) 实现保证数值透明（真实 FNet 用 FFT 做到 O(T log T)）。
+
+```python
+block = AI.FNetBlock(d_model=16, d_ff=64, seed=0)
+x = [[0.1] * 16 for _ in range(8)]
+y = block.forward(x)           # 8×16，token 维度已全局混合（非因果）
+block.zero_grad()
+dx = block.backward(y)         # 输入梯度；FFN/两个 LayerNorm 梯度已累积
+block.sgd_step(0.01)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `FNetBlock(d_model, d_ff=None, eps=1e-5, seed=None)` | `x += Mix(LN1(x))`（Mix 无参数）→ `x += FFN(LN2(x))`；`forward` / `backward` / `zero_grad` / `sgd_step` / `param_count`；参数量 `2·(d·d_ff+d_ff) + 2·(d_ff·d+d) + 2·2d` |
+
+边界：傅里叶混合是**非因果**的（全序列互相可见），只适合 encoder/双向任务；没有走 FFT，
+长序列的 O(T²) 循环会比较慢；不处理 batch/变长 padding。
 
 ### 组合模型（LLaMA / ResNet）
 
@@ -5833,7 +5856,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2656 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2661 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6109,6 +6132,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHyena` | 长卷积手算、逐元素门控、非法输入 |
 | `TestLinearAttentionBackward` | naive/lightning/GLA/DeltaNet/Hyena 的 dq/dk/dv 与门控/衰减/卷积核梯度中心差分、lightning 与 naive 梯度一致、非法输入 |
 | `TestHyenaBlock` | 完整 block 的前向/参数计数、三个投影/两个卷积核/LayerNorm 的梯度中心差分、输入梯度与因果性、SGD/Adam 更新、非法输入 |
+| `TestFNetBlock` | 傅里叶混合公式与对称性（反向 = 同一变换）、前向形状与参数量 184、W1/W2/两个 LayerNorm/输入梯度中心差分、全局非因果性质、均值池化+线性头 80 步收敛、非法输入 |
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
@@ -6309,6 +6333,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2656 个单元测试
+├── test_ai.py       # 2661 个单元测试
 └── README.md
 ```
