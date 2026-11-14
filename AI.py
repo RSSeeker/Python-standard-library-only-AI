@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1831 个 def / 431 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1833 个 def / 432 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -24981,6 +24981,207 @@ class ConvNeXtV2Block:
         ddw = self.dw.backward(du)
         return [[[ddw[c][h][w] + dout[c][h][w] for w in range(W)]
                  for h in range(H)] for c in range(C)]
+
+
+# ---- FCMAE（掩码图像重建预训练，ConvNeXt V2 风格简化） ----
+
+
+def _fcmae_check_images(images, channels):
+    if not isinstance(images, (list, tuple)) or not images:
+        raise ValueError("FCMAE: images 必须是非空 list")
+    for img in images:
+        _cnv2_check_image(img, channels, "FCMAE")
+    return images
+
+
+def fcmae_patch_mask(height, width, patch_size, mask_ratio, seed=None):
+    """生成 patch 级掩码（True=被遮住），全部随机的简化版 FCMAE。"""
+    _cnv2_check_pos_int(height, "height")
+    _cnv2_check_pos_int(width, "width")
+    _cnv2_check_pos_int(patch_size, "patch_size")
+    if height % patch_size or width % patch_size:
+        raise ValueError("fcmae_patch_mask: H/W 必须能被 patch_size 整除")
+    if isinstance(mask_ratio, bool) or not isinstance(mask_ratio, (int, float)) \
+            or not (0.0 < float(mask_ratio) < 1.0):
+        raise ValueError("fcmae_patch_mask: mask_ratio 必须在 (0,1) 内")
+    gh, gw = height // patch_size, width // patch_size
+    total = gh * gw
+    n_mask = max(1, int(round(total * float(mask_ratio))))
+    if n_mask >= total:
+        n_mask = total - 1
+    rng = random.Random(seed)
+    picked = set(rng.sample(range(total), n_mask))
+    grid = [[(r * gw + c) in picked for c in range(gw)] for r in range(gh)]
+    return [[grid[r][c] for c in range(gw)] for r in range(gh)]
+
+
+class FCMAEReconstructor:
+    """FCMAE 简化实现：patch 置为可学习 mask 值 → ConvNeXt V2 blocks → 逐像素线性重建
+
+    只在**被遮住**的 patch 上计算 MSE；反向覆盖解码器、blocks 与 mask 值。
+    用于教学演示掩码预训练的「遮挡建模」目标，不做稀疏卷积。
+    """
+
+    def __init__(self, channels, patch_size=2, num_blocks=1, mask_ratio=0.5,
+                 layer_scale_init=0.1, seed=None):
+        _cnv2_check_pos_int(channels, "channels")
+        _cnv2_check_pos_int(patch_size, "patch_size")
+        _cnv2_check_pos_int(num_blocks, "num_blocks")
+        if isinstance(mask_ratio, bool) or not isinstance(mask_ratio, (int, float)) \
+                or not (0.0 < float(mask_ratio) < 1.0):
+            raise ValueError("FCMAEReconstructor: mask_ratio 必须在 (0,1) 内")
+        self.channels = channels
+        self.patch_size = patch_size
+        self.mask_ratio = float(mask_ratio)
+        self.rng = random.Random(seed)
+        self.mask_value = [0.0] * channels
+        self.grad_mask_value = [0.0] * channels
+        self.blocks = [ConvNeXtV2Block(channels, kernel_size=3, expansion=2,
+                                       layer_scale_init=layer_scale_init)
+                       for _ in range(num_blocks)]
+        self.decoder = Layer(channels, channels * patch_size * patch_size,
+                             "linear")
+        self.grad_dec_w = [[0.0] * self.decoder.fan_in
+                           for _ in range(self.decoder.fan_out)]
+        self.grad_dec_b = [0.0] * self.decoder.fan_out
+        self._cache = None
+
+    def zero_grad(self):
+        self.grad_mask_value = [0.0] * self.channels
+        for blk in self.blocks:
+            blk.zero_grad()
+        self.grad_dec_w = [[0.0] * self.decoder.fan_in
+                           for _ in range(self.decoder.fan_out)]
+        self.grad_dec_b = [0.0] * self.decoder.fan_out
+
+    def param_count(self):
+        return (sum(blk.param_count() for blk in self.blocks)
+                + _dense_param_count(self.decoder) + self.channels)
+
+    def _masked_input(self, image, mask):
+        C, H, W = len(image), len(image[0]), len(image[0][0])
+        p = self.patch_size
+        out = [[row[:] for row in ch] for ch in image]
+        for ph in range(H // p):
+            for pw in range(W // p):
+                if not mask[ph][pw]:
+                    continue
+                for c in range(C):
+                    for r in range(p):
+                        for s in range(p):
+                            out[c][ph * p + r][pw * p + s] = self.mask_value[c]
+        return out
+
+    def forward(self, image):
+        C, H, W = _cnv2_check_image(image, self.channels, "FCMAEReconstructor")
+        mask = fcmae_patch_mask(H, W, self.patch_size, self.mask_ratio,
+                                self.rng.random())
+        x = self._masked_input(image, mask)
+        for blk in self.blocks:
+            x = blk.forward(x)
+        rows = [[x[c][h][w] for c in range(C)]
+                for h in range(H) for w in range(W)]
+        pred_rows, dec_cache = _dense_rows_forward(self.decoder, rows)
+        p = self.patch_size
+        pp = p * p
+        pred = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for ph in range(H // p):
+            for pw in range(W // p):
+                if not mask[ph][pw]:
+                    continue
+                t = (ph * p) * W + pw * p
+                vec = pred_rows[t]
+                for c in range(C):
+                    for r in range(p):
+                        for s in range(p):
+                            pred[c][ph * p + r][pw * p + s] = vec[c * pp + r * p + s]
+        self._cache = (image, mask, x, dec_cache, pred_rows, C, H, W)
+        return pred
+
+    def loss_and_backward(self, image):
+        C, H, W = _cnv2_check_image(image, self.channels, "FCMAEReconstructor")
+        pred = self.forward(image)
+        image_c, mask, x_enc, dec_cache, pred_rows, C, H, W = self._cache
+        p = self.patch_size
+        count = 0
+        loss = 0.0
+        d_pred = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for ph in range(H // p):
+            for pw in range(W // p):
+                if not mask[ph][pw]:
+                    continue
+                for c in range(C):
+                    for r in range(p):
+                        for s in range(p):
+                            hh, ww = ph * p + r, pw * p + s
+                            diff = pred[c][hh][ww] - image_c[c][hh][ww]
+                            loss += diff * diff
+                            d_pred[c][hh][ww] = 2.0 * diff
+                            count += 1
+        loss /= float(count)
+        # d_pred -> d_pred_rows
+        pp = p * p
+        d_rows = [[0.0] * (self.channels * pp) for _ in range(H * W)]
+        for ph in range(H // p):
+            for pw in range(W // p):
+                if not mask[ph][pw]:
+                    continue
+                t = (ph * p) * W + pw * p
+                for c in range(C):
+                    for r in range(p):
+                        for s in range(p):
+                            hh, ww = ph * p + r, pw * p + s
+                            d_rows[t][c * pp + r * p + s] = d_pred[c][hh][ww] / float(count)
+        gw_dec, gb_dec, d_x_rows = _dense_rows_backward(
+            self.decoder, dec_cache, d_rows)
+        for r in range(self.decoder.fan_out):
+            for c in range(self.decoder.fan_in):
+                self.grad_dec_w[r][c] += gw_dec[r][c]
+            self.grad_dec_b[r] += gb_dec[r]
+        d_x = [[[d_x_rows[h * W + w][c] for w in range(W)]
+                for h in range(H)] for c in range(C)]
+        for blk in reversed(self.blocks):
+            d_x = blk.backward(d_x)
+        # mask 值梯度：被遮像素处输入为常数
+        grad_mask = [0.0] * C
+        for ph in range(H // p):
+            for pw in range(W // p):
+                if not mask[ph][pw]:
+                    continue
+                for c in range(C):
+                    for r in range(p):
+                        for s in range(p):
+                            grad_mask[c] += d_x[c][ph * p + r][pw * p + s]
+        self.grad_mask_value = grad_mask
+        return loss
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("FCMAEReconstructor.sgd_step: lr 必须是非负有限数字")
+        for blk in self.blocks:
+            blk.sgd_step(lr)
+        _dense_apply_sgd(self.decoder,
+                         (self.grad_dec_w, self.grad_dec_b), lr)
+        for c in range(self.channels):
+            self.mask_value[c] -= lr * self.grad_mask_value[c]
+
+    def fit(self, images, epochs=20, lr=0.01, seed=None):
+        _fcmae_check_images(images, self.channels)
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("FCMAEReconstructor.fit: epochs 必须是正整数")
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(images)))
+            rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(images[idx])
+                self.sgd_step(lr)
+            history.append(total / len(images))
+        return history
 
 class ConvNeXtBlock:
     """ConvNeXt 块：`7x7 depthwise Conv -> LayerNorm(跨通道) -> 1x1 升维 -> GELU -> 1x1 降维` + 残差

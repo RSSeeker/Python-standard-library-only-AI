@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2979 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2984 项）
 
 ## 特性
 
@@ -4862,6 +4862,19 @@ prob = model.predict(features[0])
   Layer Scale；含手写反向（depthwise/两个 1x1 卷积、跨通道 LN、GRN、
   Layer Scale）与 `sgd_step/param_count`。
 
+### FCMAE 掩码重建预训练（ConvNeXt V2 风格简化）
+
+- `fcmae_patch_mask(height, width, patch_size, mask_ratio, seed=None)`：
+  按 patch 随机遮挡（True=被遮），要求 H/W 能被 patch_size 整除。
+- `FCMAEReconstructor(channels, patch_size=2, num_blocks=1, mask_ratio=0.5,
+  layer_scale_init=0.1, seed=None)`：把被遮 patch 置为可学习 mask 值 →
+  N 个 `ConvNeXtV2Block` → 逐像素线性解码器，只在被遮 patch 上算 MSE；
+  `forward/loss_and_backward/zero_grad/sgd_step/fit/param_count`，
+  反向覆盖解码器、blocks 与 mask 值。
+
+边界：教学版「遮挡建模」流程，不做 FCMAE 的稀疏卷积与轻量解码器；
+`mask_value` 是每通道可学习标量而非 patch 向量；与论文实现不逐位一致。
+
 边界：只提供单个 block（不含 V2 的分类头与 FCMAE 稀疏卷积预训练流程），
 Layer Scale 初值 1e-6 使初始近似恒等；与论文的 FCMAE 预训练实现不逐位一致。
 
@@ -5102,19 +5115,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（54 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（55 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2979 项）。
+`tests/`（合计 2984 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 54 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2979 项
+pytest tests/ -q                 # 55 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2984 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6873,7 +6886,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2979 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2984 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7367,6 +7380,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestFCMAEReconstructor` | FCMAE 掩码重建/梯度/训练 |
 | `TestConvNeXtV2Block` | ConvNeXt V2 block 前向/梯度/训练 |
 | `TestCNNArchitectures` | 轻量 CNN 前向（复合缩放/倒残差/MBConv） |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |

@@ -47513,3 +47513,120 @@ class TestConvNeXtV2Block:
         assert _cnv2_raises(lambda: block.backward([[[0.1, 0.2], [0.3, 0.4]],
                                                     [[0.1, 0.2], [0.3, 0.4]]]))
         assert _cnv2_raises(lambda: block.sgd_step(-0.1))
+# ---- FCMAE 掩码重建预训练测试 ----
+
+
+def _fcmae_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _fcmae_images(channels=2, h=4, w=4, seed=3):
+    import random as _random
+    rng = _random.Random(seed)
+    return [[[rng.uniform(-1.0, 1.0) for _ in range(w)] for _ in range(h)]
+            for _ in range(channels)]
+
+
+class _FixedMaskRng:
+    def random(self):
+        return 0.0
+
+
+class TestFCMAEReconstructor:
+    def test_patch_mask_and_forward(self):
+        mask = AI.fcmae_patch_mask(4, 4, 2, 0.5, seed=1)
+        assert len(mask) == 2 and len(mask[0]) == 2
+        assert sum(1 for row in mask for v in row if v) == 2
+        assert AI.fcmae_patch_mask(4, 4, 2, 0.5, seed=1) == mask
+        net = AI.FCMAEReconstructor(2, patch_size=2, num_blocks=1,
+                                    mask_ratio=0.5, seed=7)
+        assert net.param_count() == 82
+        pred = net.forward(_fcmae_images())
+        assert len(pred) == 2 and len(pred[0]) == 4 and len(pred[0][0]) == 4
+
+    def test_numerical_gradients(self):
+        image = _fcmae_images(seed=3)
+        net = AI.FCMAEReconstructor(2, patch_size=2, num_blocks=1,
+                                    mask_ratio=0.5, seed=7)
+        net.rng = _FixedMaskRng()
+
+        def loss_value():
+            pred = net.forward(image)
+            mask = net._cache[1]
+            p = net.patch_size
+            total = 0.0
+            cnt = 0
+            for ph in range(2):
+                for pw in range(2):
+                    if not mask[ph][pw]:
+                        continue
+                    for c in range(2):
+                        for r in range(p):
+                            for s in range(p):
+                                hh, ww = ph * p + r, pw * p + s
+                                total += (pred[c][hh][ww] - image[c][hh][ww]) ** 2
+                                cnt += 1
+            return total / cnt
+
+        def fd(grad_get, param_get, param_set, tag="", h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = loss_value()
+            param_set(p0 - h)
+            lm = loss_value()
+            param_set(p0)
+            net.zero_grad()
+            net.loss_and_backward(image)
+            a = grad_get()
+            f = (lp - lm) / (2.0 * h)
+            rel = abs(a - f) / max(abs(f), 1e-9)
+            assert rel < 1e-4, (tag, a, f, rel)
+
+        fd(lambda: net.grad_mask_value[0], lambda: net.mask_value[0],
+           lambda v: net.mask_value.__setitem__(0, v), "mask_value")
+        fd(lambda: net.grad_dec_w[0][0], lambda: net.decoder.weights[0][0],
+           lambda v: net.decoder.weights[0].__setitem__(0, v), "decoder")
+        fd(lambda: net.blocks[0].pw2.grad_w[0][0][0][0],
+           lambda: net.blocks[0].pw2.weights[0][0][0][0],
+           lambda v: net.blocks[0].pw2.weights[0][0][0].__setitem__(0, v),
+           "block_pw2")
+
+    def test_fit_reduces_loss(self):
+        image = _fcmae_images(seed=5)
+        net = AI.FCMAEReconstructor(2, patch_size=2, num_blocks=1,
+                                    mask_ratio=0.5, seed=11)
+        hist = net.fit([image], epochs=20, lr=0.02, seed=1)
+        assert len(hist) == 20
+        assert hist[-1] < hist[0], (hist[0], hist[-1])
+
+    def test_sgd_step_changes_mask_value_and_decoder(self):
+        image = _fcmae_images(seed=3)
+        net = AI.FCMAEReconstructor(2, patch_size=2, num_blocks=1,
+                                    mask_ratio=0.5, seed=7)
+        net.rng = _FixedMaskRng()
+        net.zero_grad()
+        net.loss_and_backward(image)
+        before_mask = net.mask_value[0]
+        before_w = net.decoder.weights[0][0]
+        net.sgd_step(0.05)
+        assert net.mask_value[0] != before_mask
+        assert net.decoder.weights[0][0] != before_w
+
+    def test_invalid_inputs(self):
+        assert _fcmae_raises(lambda: AI.FCMAEReconstructor(0))
+        assert _fcmae_raises(lambda: AI.FCMAEReconstructor(2, patch_size=0))
+        assert _fcmae_raises(lambda: AI.FCMAEReconstructor(2, num_blocks=0))
+        assert _fcmae_raises(lambda: AI.FCMAEReconstructor(2, mask_ratio=1.0))
+        assert _fcmae_raises(lambda: AI.fcmae_patch_mask(3, 4, 2, 0.5))
+        assert _fcmae_raises(lambda: AI.fcmae_patch_mask(4, 4, 2, 0.0))
+        net = AI.FCMAEReconstructor(2, patch_size=2, seed=7)
+        assert _fcmae_raises(lambda: net.forward(_fcmae_images(channels=3)))
+        assert _fcmae_raises(lambda: net.forward([]))
+        assert _fcmae_raises(lambda: net.loss_and_backward(_fcmae_images(channels=1)))
+        assert _fcmae_raises(lambda: net.fit([], epochs=2))
+        assert _fcmae_raises(lambda: net.fit([_fcmae_images()], epochs=0))
+        assert _fcmae_raises(lambda: net.sgd_step(-0.1))
