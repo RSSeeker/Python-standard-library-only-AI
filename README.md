@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2867 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2872 项）
 
 ## 特性
 
@@ -2544,6 +2544,11 @@ soup = model_soup([w_a, w_b, w_c])              # 算术平均
 mid  = slerp_merge(w_a, w_b, t=0.5)             # 球面线性插值（保范数）
 ties = ties_merge([w_a, w_b], base=w0, trim_fraction=0.2, density=0.5)
 dare = dare_merge([w_a, w_b], base=w0, drop_rate=0.5, seed=0)
+
+tau = task_vector(w_finetuned, w0)              # 任务向量
+mixed = task_arithmetic(w0, [tau_a, tau_b], scaling=[1.0, -0.5])
+robust = wise_ft(w0, w_finetuned, alpha=0.5)    # WiSE-FT 插值
+soup = greedy_soup([w_a, w_b, w_c], evaluate=score_fn)["weights"]
 ```
 
 | API | 说明 |
@@ -2552,6 +2557,9 @@ dare = dare_merge([w_a, w_b], base=w0, drop_rate=0.5, seed=0)
 | `slerp_merge(a, b, t=0.5, eps=1e-8)` | 球面线性插值：同向/零向量退化为线性插值，`t=0/1` 返回端点 |
 | `ties_merge(weights, base=None, trim_fraction=0.2, density=1.0)` | TIES：裁剪最小 `trim_fraction` 的任务向量、逐坐标符号选举、同号取均值，`density<1` 时只保留幅值最大的坐标 |
 | `dare_merge(weights, base=None, drop_rate=0.5, rescale=True, seed=None)` | DARE：随机丢弃任务向量元素（`rescale=True` 时按 `1/(1-p)` 放大）后平均 |
+| `task_vector(finetuned, base)` / `task_arithmetic(base, task_vectors, scaling=1.0)` | 任务向量 = 微调权重 − 基座；任务算术 = `base + Σ s_i·tau_i`（`scaling` 可为标量或逐任务列表，负权重表示遗忘任务） |
+| `wise_ft(zero_shot, finetuned, alpha=0.5)` | WiSE-FT：`(1-alpha)·zero_shot + alpha·finetuned` 权重空间集成，兼顾分布内精度与 OOD 鲁棒性 |
+| `greedy_soup(candidates, evaluate, maximize=True, max_models=None)` | 贪心选子集：每轮尝试加入剩余权重，若平均后 `evaluate` 更好则保留；返回 `{indices, weights, score, history}` |
 
 - 边界：只做参数空间合并，不含推理时的权重加载/格式转换；TIES/DARE 的 `base` 缺省视为 0（即把权重本身当任务向量）；张量只支持 1D/2D 嵌套 list；`dare_merge` 用 `random.Random(seed)` 保证可复现。
 
@@ -6542,7 +6550,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2867 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2872 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7028,6 +7036,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
+| `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7062,6 +7071,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2867 个单元测试
+├── test_ai.py       # 2872 个单元测试
 └── README.md
 ```

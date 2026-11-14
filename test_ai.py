@@ -46521,3 +46521,76 @@ class TestTrainingEngineeringTools:
         assert _eng2_raises(lambda: AI.export_history_json("x", "p"))
         assert _eng2_raises(lambda: AI.export_history_json([], ""))
         assert _eng2_raises(lambda: AI.load_history_json(""))
+
+
+# ---- Task Arithmetic / WiSE-FT / Greedy Soup ----
+
+
+def _tricks_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestTaskTricks:
+    def test_task_vector_and_arithmetic(self):
+        base = [[1.0, 2.0], [3.0, 4.0]]
+        w1 = [[2.0, 2.0], [3.0, 5.0]]
+        w2 = [[1.0, 3.0], [3.0, 4.0]]
+        tau1 = AI.task_vector(w1, base)
+        tau2 = AI.task_vector(w2, base)
+        assert tau1 == [[1.0, 0.0], [0.0, 1.0]]
+        assert tau2 == [[0.0, 1.0], [0.0, 0.0]]
+        assert AI.task_arithmetic(base, [tau1, tau2]) == [[2.0, 3.0], [3.0, 5.0]]
+        assert AI.task_arithmetic(base, [tau1, tau2], scaling=[2.0, -1.0]) \
+            == [[3.0, 1.0], [3.0, 6.0]]
+        assert AI.task_arithmetic(base, [tau1], scaling=0.0) == base
+
+    def test_wise_ft(self):
+        base = [[1.0, 2.0], [3.0, 4.0]]
+        fine = [[2.0, 2.0], [3.0, 5.0]]
+        assert AI.wise_ft(base, fine, 0.0) == base
+        assert AI.wise_ft(base, fine, 1.0) == fine
+        assert AI.wise_ft(base, fine, 0.5) == [[1.5, 2.0], [3.0, 4.5]]
+
+    def test_greedy_soup(self):
+        cands = [
+            [[10.0, 10.0], [10.0, 10.0]],
+            [[1.0, 1.0], [1.0, 1.0]],
+            [[0.2, 0.2], [0.2, 0.2]],
+            [[5.0, 5.0], [5.0, 5.0]],
+        ]
+
+        def score(w):
+            return -sum(w[r][c] ** 2 for r in range(2) for c in range(2))
+
+        res = AI.greedy_soup(cands, score, maximize=True)
+        assert res["indices"] == [2]  # 加任何其它成员都会把均值拉差
+        assert abs(res["score"] + 0.16) < 1e-12
+        res2 = AI.greedy_soup(cands, score, maximize=True, max_models=1)
+        assert res2["indices"] == [2]
+
+    def test_greedy_soup_improves(self):
+        # 两个相近的好模型，平均后比任一都好（需要贪心能加进去）
+        a = [[1.0, 0.0], [0.0, 1.0]]
+        b = [[0.8, 0.0], [0.0, 1.2]]
+
+        def score(w):
+            return -(abs(w[0][0] - 0.9) + abs(w[1][1] - 1.1))
+
+        res = AI.greedy_soup([a, b], score, maximize=True)
+        assert len(res["indices"]) == 2
+        assert res["score"] > score(a) and res["score"] > score(b)
+
+    def test_invalid_inputs(self):
+        base = [[1.0, 2.0]]
+        assert _tricks_raises(lambda: AI.task_vector(base, [[1.0]]))
+        assert _tricks_raises(lambda: AI.task_arithmetic(base, []))
+        assert _tricks_raises(lambda: AI.task_arithmetic(base, [base], scaling=[1.0, 2.0]))
+        assert _tricks_raises(lambda: AI.wise_ft(base, base, 2.0))
+        assert _tricks_raises(lambda: AI.wise_ft(base, base, "x"))
+        assert _tricks_raises(lambda: AI.greedy_soup([], lambda w: 0.0))
+        assert _tricks_raises(lambda: AI.greedy_soup([base], "not callable"))
+        assert _tricks_raises(lambda: AI.greedy_soup([base], lambda w: 0.0, max_models=0))

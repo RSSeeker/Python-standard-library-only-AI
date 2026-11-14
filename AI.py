@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1777 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1785 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -5153,6 +5153,135 @@ def slerp_merge(a, b, t: float = 0.5, eps: float = 1e-8):
     wb = math.sin(float(t) * theta) / sin_theta
     out = [wa * fa[i] + wb * fb[i] for i in range(len(fa))]
     return _merge_unflatten(out, shape)
+
+
+def _tricks_check_tensors(tensors, who="tricks"):
+    if not isinstance(tensors, (list, tuple)) or len(tensors) == 0:
+        raise ValueError(f"{who}: 需要非空的张量列表")
+    for t in tensors:
+        _merge_same_shape([t])  # 复用合并模块的形状/数值校验
+
+def _tricks_map2(a, b, fn):
+    if isinstance(a, list):
+        if not isinstance(b, list) or len(a) != len(b):
+            raise ValueError("tricks: 两个张量形状不一致")
+        return [_tricks_map2(x, y, fn) for x, y in zip(a, b)]
+    return fn(a, b)
+
+
+def _tricks_scale(t, s):
+    if isinstance(t, list):
+        return [_tricks_scale(x, s) for x in t]
+    return t * s
+
+
+def _tricks_add(a, b):
+    return _tricks_map2(a, b, lambda x, y: x + y)
+
+
+def task_vector(finetuned, base):
+    """任务向量：`tau = finetuned - base`（逐元素差，形状必须一致）
+
+    与 `model_soup` / `ties_merge` 配合：先把多个任务微调模型转成任务向量，
+    再做加权组合，就能实现「一个基座 + 多个任务方向」。
+    """
+    _tricks_check_tensors([finetuned, base], "task_vector")
+    return _tricks_map2(finetuned, base, lambda x, y: x - y)
+
+
+def task_arithmetic(base, task_vectors, scaling=1.0):
+    """Task Arithmetic：`base + scaling * sum(task_vectors)`
+
+    `scaling` 可为标量（所有任务同权）或与 `task_vectors` 等长的列表
+    （逐任务权重，负权重表示「忘掉」该任务）。
+    """
+    _tricks_check_tensors([base], "task_arithmetic")
+    if not isinstance(task_vectors, (list, tuple)) or len(task_vectors) == 0:
+        raise ValueError("task_arithmetic: task_vectors 必须是非空列表")
+    n = len(task_vectors)
+    if isinstance(scaling, (int, float)) and not isinstance(scaling, bool):
+        scales = [float(scaling)] * n
+    elif isinstance(scaling, (list, tuple)) and len(scaling) == n:
+        scales = []
+        for s in scaling:
+            if not isinstance(s, (int, float)) or isinstance(s, bool) \
+                    or not math.isfinite(float(s)):
+                raise ValueError("task_arithmetic: scaling 必须是有限数字")
+            scales.append(float(s))
+    else:
+        raise ValueError(
+            "task_arithmetic: scaling 必须是数字或与 task_vectors 等长的列表")
+    out = base
+    for tau, s in zip(task_vectors, scales):
+        out = _tricks_add(out, _tricks_scale(tau, s))
+    return out
+
+
+def wise_ft(zero_shot, finetuned, alpha=0.5):
+    """WiSE-FT：`(1-alpha) * zero_shot + alpha * finetuned`（权重空间集成）
+
+    微调后再与零样本权重插值，可在几乎不损失分布内精度的同时恢复分布外
+    鲁棒性（WiSE-FT 论文的结论）。`alpha=0` 退化为零样本、`alpha=1` 纯微调。
+    """
+    _tricks_check_tensors([zero_shot, finetuned], "wise_ft")
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+        raise TypeError(f"wise_ft: alpha 必须是数字，收到 {alpha!r}")
+    if not math.isfinite(float(alpha)) or not (0.0 <= float(alpha) <= 1.0):
+        raise ValueError("wise_ft: alpha 必须在 [0,1]")
+    a = float(alpha)
+    return _tricks_add(_tricks_scale(zero_shot, 1.0 - a),
+                       _tricks_scale(finetuned, a))
+
+
+def greedy_soup(candidates, evaluate, maximize=True, max_models=None):
+    """Greedy Soup：从候选权重里贪心挑子集，使 `evaluate(子集均值)` 最优
+
+    `candidates` 是等形状权重列表，`evaluate(merged)` 返回数值分数；每轮尝试
+    把剩余候选加入当前子集，若分数提升（按 `maximize`）则保留，直到没有提升
+    或达到 `max_models`。返回 `{"indices", "weights", "score", "history"}`。
+
+    这是「权重平均」的贪心版本：相比全量平均，避免把差模型平均进来。
+    """
+    if not isinstance(candidates, (list, tuple)) or len(candidates) == 0:
+        raise ValueError("greedy_soup: candidates 必须是非空列表")
+    _tricks_check_tensors(candidates, "greedy_soup")
+    if not callable(evaluate):
+        raise TypeError("greedy_soup: evaluate 必须可调用")
+    if max_models is not None:
+        if isinstance(max_models, bool) or not isinstance(max_models, int) \
+                or max_models < 1:
+            raise ValueError("greedy_soup: max_models 必须是正整数或 None")
+    idx = []
+    history = []
+    best_score = None
+    while True:
+        if max_models is not None and len(idx) >= max_models:
+            break
+        best_try = None
+        for cand in range(len(candidates)):
+            if cand in idx:
+                continue
+            merged = model_soup([candidates[i] for i in idx + [cand]])
+            score = evaluate(merged)
+            if not isinstance(score, (int, float)) or isinstance(score, bool) \
+                    or not math.isfinite(float(score)):
+                raise ValueError("greedy_soup: evaluate 必须返回有限数字")
+            if best_try is None or (
+                    score > best_try[1] if maximize else score < best_try[1]):
+                best_try = (cand, float(score), merged)
+        if best_try is None:
+            break
+        improved = (best_score is None
+                    or (best_try[1] > best_score if maximize else best_try[1] < best_score))
+        if not improved:
+            break
+        idx.append(best_try[0])
+        best_score = best_try[1]
+        history.append({"step": len(idx) - 1, "added": best_try[0],
+                        "score": best_score})
+    merged = model_soup([candidates[i] for i in idx])
+    return {"indices": idx, "weights": merged, "score": best_score,
+            "history": history}
 
 
 def ties_merge(weights, base=None, trim_fraction: float = 0.2,
