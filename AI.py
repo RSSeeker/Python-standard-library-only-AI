@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1845 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1853 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -10375,6 +10375,189 @@ def step_warmup_lr(step, base_lr, warmup_steps, total_steps=None,
         return base - (base - lo) * p
     return lo + (base - lo) * 0.5 * (1.0 + math.cos(math.pi * p))
 
+
+
+# ---- 进阶 HPO：TPE / Hyperband / PBT（教学简化版） ----
+
+
+def _hpo2_check_space(space, who):
+    if not isinstance(space, (list, tuple)) or not space:
+        raise ValueError(f"{who}: space 必须是非空 [(name, low, high), ...]")
+    names = []
+    for item in space:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(f"{who}: space 每项必须是 (name, low, high)")
+        name, lo, hi = item
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{who}: 参数名必须是非空字符串")
+        for v in (lo, hi):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 参数边界必须是有限数字")
+        if float(lo) >= float(hi):
+            raise ValueError(f"{who}: 参数 {name} 的 low 必须小于 high")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{who}: 参数名不能重复")
+
+
+def _hpo2_check_objective(objective):
+    if not callable(objective):
+        raise ValueError("HPO: objective 必须是可调用对象")
+
+
+def _hpo2_sample(space, rng):
+    return {name: rng.uniform(float(lo), float(hi)) for name, lo, hi in space}
+
+
+def _hpo2_gauss_pdf(value, center, sigma):
+    sigma = max(float(sigma), 1e-9)
+    z = (value - center) / sigma
+    return math.exp(-0.5 * z * z)
+
+
+def tpe_lite(objective, space, n_startup=5, n_iter=20, gamma=0.25,
+             candidates=24, seed=None):
+    """TPE（Tree-structured Parzen Estimator）的教学简化版。
+
+    前 n_startup 次随机探索；此后用「好点」的混合高斯与「坏点」的混合高斯
+    估计密度比 l(x)/g(x)，从好点附近采样若干候选并选密度比最大者。目标函数
+    按**最小化**处理。
+    """
+    _hpo2_check_objective(objective)
+    _hpo2_check_space(space, "tpe_lite")
+    for name, v in (("n_startup", n_startup), ("n_iter", n_iter),
+                    ("candidates", candidates)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"tpe_lite: {name} 必须是非负整数")
+    if n_iter <= 0:
+        raise ValueError("tpe_lite: n_iter 必须是正整数")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) \
+            or not 0.0 < float(gamma) < 1.0:
+        raise ValueError("tpe_lite: gamma 必须在 (0,1) 内")
+    rng = random.Random(seed)
+    history = []
+    best = None
+    for step in range(n_startup + n_iter):
+        if step < n_startup or len(history) < 3:
+            params = _hpo2_sample(space, rng)
+        else:
+            order = sorted(history, key=lambda h: h["value"])
+            n_good = max(1, int(math.ceil(gamma * len(order))))
+            good = order[:n_good]
+            bad = order[n_good:]
+            spans = {name: float(hi) - float(lo) for name, lo, hi in space}
+            cand = []
+            for _ in range(candidates):
+                params = {}
+                for name, lo, hi in space:
+                    src = good[rng.randrange(len(good))]["params"]
+                    sigma = 0.25 * spans[name]
+                    params[name] = min(float(hi), max(float(lo),
+                                                     rng.gauss(src[name], sigma)))
+                score = 1.0
+                for name, lo, hi in space:
+                    good_dens = sum(_hpo2_gauss_pdf(params[name], g["params"][name],
+                                                   spans[name] * 0.2)
+                                    for g in good)
+                    bad_dens = sum(_hpo2_gauss_pdf(params[name], b["params"][name],
+                                                  spans[name] * 0.2)
+                                   for b in bad) if bad else 0.0
+                    score *= (good_dens + 1e-12) / (bad_dens + 1e-12)
+                cand.append((score, params))
+            cand.sort(key=lambda item: item[0], reverse=True)
+            params = cand[0][1]
+        value = float(objective(dict(params)))
+        history.append({"params": params, "value": value})
+        if best is None or value < best["value"]:
+            best = {"params": dict(params), "value": value}
+    return {"best_params": dict(best["params"]), "best_value": best["value"],
+            "history": history}
+
+
+def _hpo_brackets(max_resource, factor):
+    n = 0
+    r = float(max_resource)
+    while r > 1.0:
+        r /= factor
+        n += 1
+    return n + 1
+
+
+def hyperband(objective, space, max_resource=27, factor=3, seed=None):
+    """Hyperband：多轮 successive halving。
+
+    `objective(params, resource)` 返回给定资源预算下的损失（最小化）。
+    """
+    _hpo2_check_objective(objective)
+    _hpo2_check_space(space, "hyperband")
+    for name, v in (("max_resource", max_resource), ("factor", factor)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)) or float(v) < 1.0:
+            raise ValueError(f"hyperband: {name} 必须是 >=1 的数字")
+    rng = random.Random(seed)
+    maxr = int(round(float(max_resource)))
+    fac = float(factor)
+    brackets = _hpo_brackets(maxr, fac)
+    evaluated = 0
+    best = None
+    for s in range(brackets - 1, -1, -1):
+        n_configs = int(math.ceil(fac ** s * (brackets) / (s + 1)))
+        resource = maxr / (fac ** s)
+        configs = [_hpo2_sample(space, rng) for _ in range(n_configs)]
+        for rnd in range(s + 1):
+            scored = []
+            for params in configs:
+                value = float(objective(params, max(1, int(round(resource)))))
+                evaluated += 1
+                scored.append((value, params))
+                if best is None or value < best["value"]:
+                    best = {"params": dict(params), "value": value,
+                            "resource": max(1, int(round(resource)))}
+            scored.sort(key=lambda item: item[0])
+            keep = max(1, int(math.ceil(len(scored) / fac)))
+            configs = [p for _v, p in scored[:keep]]
+            resource *= fac
+    return {"best_params": dict(best["params"]), "best_value": best["value"],
+            "evaluations": evaluated}
+
+
+def pbt(objective, space, population=8, generations=5, top_ratio=0.25,
+        perturb=0.2, seed=None):
+    """PBT（Population Based Training）：每代评估→保留 top→复制并扰动。"""
+    _hpo2_check_objective(objective)
+    _hpo2_check_space(space, "pbt")
+    for name, v in (("population", population), ("generations", generations)):
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError(f"pbt: {name} 必须是正整数")
+    if isinstance(top_ratio, bool) or not isinstance(top_ratio, (int, float)) \
+            or not 0.0 < float(top_ratio) <= 1.0:
+        raise ValueError("pbt: top_ratio 必须在 (0,1] 内")
+    if isinstance(perturb, bool) or not isinstance(perturb, (int, float)) \
+            or not 0.0 <= float(perturb) <= 2.0:
+        raise ValueError("pbt: perturb 必须在 [0,2] 内")
+    rng = random.Random(seed)
+    members = [_hpo2_sample(space, rng) for _ in range(population)]
+    values = [float(objective(dict(m))) for m in members]
+    best = None
+    history = []
+    for gen in range(generations):
+        order = sorted(range(population), key=lambda i: values[i])
+        if best is None or values[order[0]] < best["value"]:
+            best = {"params": dict(members[order[0]]), "value": values[order[0]]}
+        history.append(values[order[0]])
+        n_top = max(1, int(math.ceil(top_ratio * population)))
+        tops = order[:n_top]
+        for rank, idx in enumerate(order[n_top:]):
+            src = tops[rank % n_top]
+            child = {}
+            for name, lo, hi in space:
+                val = members[src][name] * math.exp(rng.gauss(0.0, perturb))
+                child[name] = min(float(hi), max(float(lo), val))
+            members[idx] = child
+        values = [float(objective(dict(m))) for m in members]
+    return {"best_params": dict(best["params"]), "best_value": best["value"],
+            "best_history": history}
 
 def grid_search(param_grid, objective, maximize=False):
     """网格搜索（HPO 薄封装）

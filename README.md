@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2994 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2998 项）
 
 ## 特性
 
@@ -1108,6 +1108,31 @@ m._loss_and_backward(src, tgt, src_mask=[1, 1, 1, 0], tgt_mask=[1, 1, 1, 0])
 （同一份 `src_mask`）——softmax 后填充位置权重恰为 0，反向自动零梯度。梯度按 token 数加权
 （`grad_scale = 该样本目标 token 数 / 整批目标 token 总数`），所以 `batch_size=4` 一步等于
 把 4 条序列的目标 token 拉平后取平均；不传掩码时与逐条训练**逐位一致**。
+
+### 进阶超参搜索（TPE 变体 / Hyperband / PBT）
+
+- `tpe_lite(objective, space, n_startup=5, n_iter=20, gamma=0.25,
+  candidates=32, seed=None)`：连续空间的 TPE 简化版（`space` 为
+  `[(name, low, high), ...]`，最小化）；前 `n_startup` 次随机，之后按
+  「好点混合高斯 / 差点混合高斯」密度比挑候选。更丰富的嵌套空间请用
+  上面表中的 `tpe_search`。
+- `hyperband(objective, space, max_resource=27, factor=3, seed=None)`：
+  多轮 successive halving；`objective(params, resource)` 返回该资源预算下
+  的损失。
+- `pbt(objective, space, population=8, generations=5, top_ratio=0.25,
+  perturb=0.2, seed=None)`：Population Based Training，每代保留 top、
+  复制到差个体并做对数正态扰动，返回 `best_history`（best-so-far 曲线）。
+
+```python
+best = AI.tpe_lite(lambda p: (p["x"] - 0.3) ** 2,
+                   [("x", -2.0, 2.0)], n_startup=5, n_iter=40, seed=1)
+hb = AI.hyperband(lambda p, r: p["x"] ** 2 + 1.0 / r,
+                  [("x", -2.0, 2.0)], max_resource=27)
+```
+
+边界：三者都是**教学实现**，只处理连续参数（`tpe_search` 支持 int/choice）；
+`hyperband` 的资源是正整数预算，目标函数必须是确定性的；`pbt` 的扰动是
+启发式（无 exploit/explore 比例控制），不保证单调改进。
 
 ### 训练工程化工具
 
@@ -5147,7 +5172,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2994 项）。
+`tests/`（合计 2998 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5155,7 +5180,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2994 项
+pytest -q                        # test_ai.py + tests/ 合计 2998 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6914,7 +6939,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2994 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2998 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7408,6 +7433,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestAdvancedHPO` | TPE-lite/Hyperband/PBT 收敛与非法输入 |
 | `TestClassicCNNComponents` | DenseNet transition/ASPP/ROI Align/U-Net++ |
 | `TestTransformerXL` | Transformer-XL 段级循环/记忆/梯度 |
 | `TestFCMAEReconstructor` | FCMAE 掩码重建/梯度/训练 |

@@ -47815,3 +47815,67 @@ class TestClassicCNNComponents:
         assert _ccnn_raises(lambda: AI.densenet_transition([], 2))
         assert _ccnn_raises(lambda: AI.aspp([[[1.0, float("nan")]]]))
         assert _ccnn_raises(lambda: AI.roi_align([], (0.0, 0.0, 1.0, 1.0)))
+
+
+# ---- 进阶 HPO：TPE / Hyperband / PBT ----
+
+
+def _hpo_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestAdvancedHPO:
+    def test_tpe_finds_optimum(self):
+        space = [("x", -2.0, 2.0), ("y", -2.0, 2.0)]
+
+        def quad(params):
+            return (params["x"] - 0.3) ** 2 + (params["y"] + 0.4) ** 2
+
+        r = AI.tpe_lite(quad, space, n_startup=6, n_iter=50, seed=1)
+        assert r["best_value"] < 0.05
+        assert abs(r["best_params"]["x"] - 0.3) < 0.25
+        assert abs(r["best_params"]["y"] + 0.4) < 0.25
+        assert r == AI.tpe_lite(quad, space, n_startup=6, n_iter=50, seed=1)
+        assert len(r["history"]) == 56
+
+    def test_hyperband(self):
+        space = [("x", -2.0, 2.0), ("y", -2.0, 2.0)]
+
+        def res_quad(params, resource):
+            return ((params["x"] - 0.3) ** 2 + (params["y"] + 0.4) ** 2
+                    + 1.0 / resource)
+
+        hb = AI.hyperband(res_quad, space, max_resource=27, factor=3, seed=2)
+        assert hb["best_value"] < 1.0
+        assert hb["evaluations"] > 0
+        assert "best_params" in hb
+
+    def test_pbt(self):
+        def obj(params):
+            return (params["x"] - 0.5) ** 2
+
+        pb = AI.pbt(obj, [("x", 0.01, 2.0)], population=8, generations=6,
+                    seed=3)
+        assert pb["best_value"] < 0.01
+        hist = pb["best_history"]
+        assert all(hist[i] >= hist[i + 1] for i in range(len(hist) - 1))
+
+    def test_invalid_inputs(self):
+        space = [("x", 0.0, 1.0)]
+
+        def obj(params, resource=None):
+            return params["x"]
+
+        assert _hpo_raises(lambda: AI.tpe_lite(obj, []))
+        assert _hpo_raises(lambda: AI.tpe_lite(obj, space, gamma=1.5))
+        assert _hpo_raises(lambda: AI.tpe_lite(obj, space, n_iter=0))
+        assert _hpo_raises(lambda: AI.tpe_lite(obj, [("x", 1.0, 0.0)]))
+        assert _hpo_raises(lambda: AI.hyperband(None, space))
+        assert _hpo_raises(lambda: AI.hyperband(obj, space, factor=0.5))
+        assert _hpo_raises(lambda: AI.pbt(obj, space, population=0))
+        assert _hpo_raises(lambda: AI.pbt(obj, space, top_ratio=1.5))
+        assert _hpo_raises(lambda: AI.pbt(obj, space, perturb=3.0))
