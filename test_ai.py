@@ -45666,3 +45666,120 @@ class TestMetricLosses:
         assert _ml_raises(lambda: AI.circle_loss([], []))
         assert _ml_raises(lambda: AI.circle_loss([1.5], [0.1]))
         assert _ml_raises(lambda: AI.circle_loss([0.5], [0.1], gamma=0.0))
+
+
+class TestRKDAndDKD:
+    """RKD（距离/角度）与 DKD（TCKD+NCKD）损失。"""
+
+    def _feats(self):
+        return ([[0.2, -0.4, 0.7], [0.9, 0.1, -0.2],
+                 [-0.3, 0.5, 0.4], [0.6, -0.7, -0.1]],
+                [[0.1, -0.2, 0.9], [0.8, 0.3, -0.1],
+                 [-0.5, 0.4, 0.2], [0.3, -0.6, 0.0]])
+
+    def _fd(self, fn, feats, i, d):
+        h = 1e-5
+        a = [row[:] for row in feats]
+        b = [row[:] for row in feats]
+        a[i][d] += h
+        b[i][d] -= h
+        fd = (fn(a) - fn(b)) / (2 * h)
+        return fd
+
+    def test_rkd_distance(self):
+        stu, tea = self._feats()
+        loss, grad = AI.rkd_distance_loss(stu, tea)
+        assert loss > 0.0
+        assert len(grad) == 4 and len(grad[0]) == 3
+        assert all(len(row) == 3 for row in grad)
+        fn = lambda x: AI.rkd_distance_loss(x, tea)[0]
+        for i in range(4):
+            for d in range(3):
+                fd = self._fd(fn, stu, i, d)
+                assert abs(grad[i][d] - fd) < 1e-6, (i, d, grad[i][d], fd)
+
+    def test_rkd_angle(self):
+        stu, tea = self._feats()
+        loss, grad = AI.rkd_angle_loss(stu, tea)
+        assert loss >= 0.0
+        fn = lambda x: AI.rkd_angle_loss(x, tea)[0]
+        for i in range(4):
+            for d in range(3):
+                fd = self._fd(fn, stu, i, d)
+                assert abs(grad[i][d] - fd) < 1e-6, (i, d, grad[i][d], fd)
+        # 学生等于教师时角度损失为 0、梯度全 0
+        loss0, grad0 = AI.rkd_angle_loss(tea, tea)
+        assert abs(loss0) < 1e-12
+        assert all(abs(v) < 1e-12 for row in grad0 for v in row)
+
+    def test_rkd_combined(self):
+        stu, tea = self._feats()
+        ld, _ = AI.rkd_distance_loss(stu, tea)
+        la, _ = AI.rkd_angle_loss(stu, tea)
+        loss, grad = AI.rkd_loss(stu, tea, distance_weight=0.5, angle_weight=2.0)
+        assert abs(loss - (0.5 * ld + 2.0 * la)) < 1e-12
+        fn = lambda x: AI.rkd_loss(x, tea, 0.5, 2.0)[0]
+        for i in range(4):
+            for d in range(3):
+                fd = self._fd(fn, stu, i, d)
+                assert abs(grad[i][d] - fd) < 1e-6, (i, d, grad[i][d], fd)
+        # 权重为 0 时退化为另一项
+        only_d, gd = AI.rkd_loss(stu, tea, 1.0, 0.0)
+        assert abs(only_d - ld) < 1e-12
+        assert all(abs(gd[i][d] - AI.rkd_distance_loss(stu, tea)[1][i][d]) < 1e-12
+                   for i in range(4) for d in range(3))
+
+    def test_dkd(self):
+        stu_logits = [1.2, -0.3, 0.4, 0.1]
+        tea_logits = [2.0, -1.0, 0.2, 0.5]
+        loss, grad = AI.dkd_loss(stu_logits, tea_logits, 0)
+        assert loss > 0.0
+        assert len(grad) == 4
+        h = 1e-5
+        for k in range(4):
+            a = list(stu_logits)
+            b = list(stu_logits)
+            a[k] += h
+            b[k] -= h
+            fd = (AI.dkd_loss(a, tea_logits, 0)[0]
+                  - AI.dkd_loss(b, tea_logits, 0)[0]) / (2 * h)
+            assert abs(grad[k] - fd) < 1e-6, (k, grad[k], fd)
+        # 教师=学生：loss=0、梯度=0
+        loss0, grad0 = AI.dkd_loss(tea_logits, tea_logits, 2)
+        assert abs(loss0) < 1e-12
+        assert all(abs(v) < 1e-12 for v in grad0)
+        # alpha/beta/T 组合也做一次 FD
+        loss2, grad2 = AI.dkd_loss(stu_logits, tea_logits, 2,
+                                   alpha=0.5, beta=1.5, temperature=3.0)
+        for k in range(4):
+            a = list(stu_logits)
+            b = list(stu_logits)
+            a[k] += h
+            b[k] -= h
+            fd = (AI.dkd_loss(a, tea_logits, 2, 0.5, 1.5, 3.0)[0]
+                  - AI.dkd_loss(b, tea_logits, 2, 0.5, 1.5, 3.0)[0]) / (2 * h)
+            assert abs(grad2[k] - fd) < 1e-6, (k, grad2[k], fd)
+
+    def test_invalid_inputs(self):
+        def bad(fn):
+            try:
+                fn()
+            except (ValueError, TypeError):
+                return True
+            return False
+
+        stu, tea = self._feats()
+        assert bad(lambda: AI.rkd_distance_loss([], tea))
+        assert bad(lambda: AI.rkd_distance_loss(stu, tea[:3]))
+        assert bad(lambda: AI.rkd_distance_loss([[1.0], ["x"]], tea))
+        assert bad(lambda: AI.rkd_distance_loss([[1.0, 2.0], [3.0]], tea[:2]))
+        assert bad(lambda: AI.rkd_angle_loss(stu, [[1.0]] * 4))
+        assert bad(lambda: AI.rkd_loss(stu, tea, distance_weight=-1.0))
+        assert bad(lambda: AI.rkd_loss(stu, tea, angle_weight=float("inf")))
+        assert bad(lambda: AI.dkd_loss([1.0], [1.0, 2.0], 0))
+        assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0], 0))
+        assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], 2))
+        assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], -1))
+        assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], 0, temperature=0.0))
+        assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], 0, alpha=-0.5))
+        assert bad(lambda: AI.dkd_loss([float("nan"), 1.0], [0.0, 1.0], 0))

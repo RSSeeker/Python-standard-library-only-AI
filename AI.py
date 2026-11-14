@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1748 个 def / 418 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1757 个 def / 418 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -84919,6 +84919,255 @@ def circle_loss(s_pos, s_neg, margin=0.25, gamma=64.0):
         dsn[k] = wprod * wn[k] * dterm
     return loss, dsp, dsn
 
+
+
+def _rkd_check_feats(feats, name):
+    """RKD 特征校验：非空样本列表，每个样本是非空数字向量。"""
+    if not isinstance(feats, (list, tuple)) or len(feats) < 2:
+        raise ValueError(f"{name}: 至少需要 2 个样本，收到 "
+                         f"{len(feats) if isinstance(feats, (list, tuple)) else feats!r}")
+    out = []
+    dim = None
+    for row in feats:
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise ValueError(f"{name}: 每个样本必须是非空数字向量")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"{name}: 特征必须是数字，收到 {v!r}")
+            fv = float(v)
+            if not (fv == fv) or fv in (float("inf"), float("-inf")):
+                raise ValueError(f"{name}: 特征必须是有限数字")
+            vals.append(fv)
+        if dim is None:
+            dim = len(vals)
+        elif len(vals) != dim:
+            raise ValueError(f"{name}: 所有样本维度必须一致")
+        out.append(vals)
+    return out
+
+
+def _rkd_dist2(a, b):
+    """两个向量的平方欧氏距离。"""
+    s = 0.0
+    for x, y in zip(a, b):
+        d = x - y
+        s += d * d
+    return s
+
+
+def rkd_distance_loss(student_feat, teacher_feat):
+    """RKD 的距离蒸馏：对齐学生/教师两两距离
+
+    对每对样本 `(i, j)` 计算平方欧氏距离 `d`，损失为
+    `mean_{i<j} (d_s - d_t)^2`（`d_t` 视为常数）。
+    返回 `(loss, grad)`，`grad` 相对 `student_feat`。
+
+    注意 RKD 原文用 `L2` 距离再取 L2 罚项，这里用**平方距离**做均方，梯度更稳定、
+    且对整体缩放不敏感；教学实现保留这一个版本。
+    """
+    stu = _rkd_check_feats(student_feat, "rkd_distance_loss")
+    tea = _rkd_check_feats(teacher_feat, "rkd_distance_loss")
+    if len(stu) != len(tea):
+        raise ValueError("rkd_distance_loss: 学生与教师样本数必须一致")
+    if len(stu[0]) != len(tea[0]):
+        raise ValueError("rkd_distance_loss: 学生与教师特征维度必须一致")
+    n = len(stu)
+    dim = len(stu[0])
+    diffs = []
+    loss = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            diff = _rkd_dist2(stu[i], stu[j]) - _rkd_dist2(tea[i], tea[j])
+            diffs.append((i, j, diff))
+            loss += diff * diff
+    pairs = len(diffs)
+    loss /= pairs
+    grad = [[0.0] * dim for _ in range(n)]
+    for (i, j, diff) in diffs:
+        g = 4.0 * diff / pairs
+        for k in range(dim):
+            d = stu[i][k] - stu[j][k]
+            grad[i][k] += g * d
+            grad[j][k] -= g * d
+    return loss, grad
+
+
+def _rkd_angle(stu, i, j, k, dim):
+    """在点 j 处由 (i, j, k) 构成的夹角余弦。"""
+    u = [stu[i][d] - stu[j][d] for d in range(dim)]
+    v = [stu[k][d] - stu[j][d] for d in range(dim)]
+    nu = math.sqrt(sum(x * x for x in u))
+    nv = math.sqrt(sum(x * x for x in v))
+    if nu <= 1e-12 or nv <= 1e-12:
+        return None, u, v, nu, nv
+    cos = 0.0
+    for a, b in zip(u, v):
+        cos += a * b
+    return cos / (nu * nv), u, v, nu, nv
+
+
+def rkd_angle_loss(student_feat, teacher_feat):
+    """RKD 的角度蒸馏：对齐三元组 `(i, j, k)` 在中心点处的夹角余弦
+
+    对每个无序三元组计算 `cos`（中心是 j），损失为
+    `mean (cos_s - cos_t)^2`；退化的三元组（某条边长度近 0）跳过。
+    返回 `(loss, grad)`，`grad` 相对 `student_feat`。
+    """
+    stu = _rkd_check_feats(student_feat, "rkd_angle_loss")
+    tea = _rkd_check_feats(teacher_feat, "rkd_angle_loss")
+    if len(stu) != len(tea):
+        raise ValueError("rkd_angle_loss: 学生与教师样本数必须一致")
+    if len(stu[0]) != len(tea[0]):
+        raise ValueError("rkd_angle_loss: 学生与教师特征维度必须一致")
+    n = len(stu)
+    dim = len(stu[0])
+    grad = [[0.0] * dim for _ in range(n)]
+    triples = []
+    for i in range(n):
+        for j in range(n):
+            if j == i:
+                continue
+            for k in range(i + 1, n):
+                if k == j:
+                    continue
+                triples.append((i, j, k))
+    if not triples:
+        return 0.0, grad
+    loss = 0.0
+    for (i, j, k) in triples:
+        cs, u, v, nu, nv = _rkd_angle(stu, i, j, k, dim)
+        ct, _, _, _, _ = _rkd_angle(tea, i, j, k, dim)
+        if cs is None or ct is None:
+            continue
+        diff = cs - ct
+        loss += diff * diff
+        g = 2.0 * diff / len(triples)
+        dot = sum(a * b for a, b in zip(u, v))
+        # d cos / d u = v/(|u||v|) - cos*u/|u|^2
+        du = [v[d] / (nu * nv)
+              - (dot / (nu * nu * nu * nv)) * u[d] for d in range(dim)]
+        dv = [u[d] / (nu * nv)
+              - (dot / (nu * nv * nv * nv)) * v[d] for d in range(dim)]
+        for d in range(dim):
+            grad[i][d] += g * du[d]
+            grad[j][d] += -g * (du[d] + dv[d])
+            grad[k][d] += g * dv[d]
+    return loss / len(triples), grad
+
+
+def rkd_loss(student_feat, teacher_feat, distance_weight: float = 1.0,
+             angle_weight: float = 1.0):
+    """RKD（Relational Knowledge Distillation）总损失
+
+    `distance_weight * rkd_distance_loss + angle_weight * rkd_angle_loss`，
+    返回 `(loss, grad)`；两个权重都必须是非负有限数字。
+    """
+    for name, w in (("distance_weight", distance_weight),
+                    ("angle_weight", angle_weight)):
+        if not isinstance(w, (int, float)) or isinstance(w, bool):
+            raise TypeError(f"rkd_loss: {name} 必须是数字，收到 {w!r}")
+        fw = float(w)
+        if not (fw >= 0.0 and fw == fw and fw != float("inf")):
+            raise ValueError(f"rkd_loss: {name} 必须是非负有限数字")
+    ld, gd = rkd_distance_loss(student_feat, teacher_feat)
+    la, ga = rkd_angle_loss(student_feat, teacher_feat)
+    loss = distance_weight * ld + angle_weight * la
+    grad = [[distance_weight * gd[i][d] + angle_weight * ga[i][d]
+             for d in range(len(ga[i]))] for i in range(len(ga))]
+    return loss, grad
+
+
+def _dkd_check_logits(logits, name):
+    """DKD logits 校验：非空数字向量。"""
+    if not isinstance(logits, (list, tuple)) or len(logits) < 2:
+        raise ValueError(f"{name}: logits 至少要有 2 个类")
+    out = []
+    for v in logits:
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise TypeError(f"{name}: logits 必须是数字，收到 {v!r}")
+        fv = float(v)
+        if not (fv == fv) or fv in (float("inf"), float("-inf")):
+            raise ValueError(f"{name}: logits 必须是有限数字")
+        out.append(fv)
+    return out
+
+
+def _dkd_temp(temperature, who):
+    if not isinstance(temperature, (int, float)) or isinstance(temperature, bool):
+        raise TypeError(f"{who}: temperature 必须是数字，收到 {temperature!r}")
+    t = float(temperature)
+    if not (t > 0.0) or not (t == t) or t == float("inf"):
+        raise ValueError(f"{who}: temperature 必须是 > 0 的有限数字")
+    return t
+
+
+def dkd_loss(student_logits, teacher_logits, label: int, alpha: float = 1.0,
+             beta: float = 1.0, temperature: float = 2.0):
+    """DKD（Decoupled Knowledge Distillation）
+
+    把经典 KD 的 KL 拆成两部分：
+
+    - TCKD（target-class KD）：只监督目标类 vs 非目标类这个二分类，权重 `alpha`；
+    - NCKD（non-target-class KD）：只在非目标类内部做 softmax + KL，权重 `beta`。
+
+    `student_logits` / `teacher_logits` 等长且至少 2 类，`label` 是目标类索引；
+    返回 `(loss, d_student_logits)`。
+    """
+    stu = _dkd_check_logits(student_logits, "dkd_loss student_logits")
+    tea = _dkd_check_logits(teacher_logits, "dkd_loss teacher_logits")
+    if len(stu) != len(tea):
+        raise ValueError("dkd_loss: 学生与教师 logits 维度必须一致")
+    c = len(stu)
+    if not isinstance(label, int) or isinstance(label, bool) or not 0 <= label < c:
+        raise ValueError(f"dkd_loss: label 必须是 [0, {c}) 内的整数，收到 {label!r}")
+    for name, w in (("alpha", alpha), ("beta", beta)):
+        if not isinstance(w, (int, float)) or isinstance(w, bool):
+            raise TypeError(f"dkd_loss: {name} 必须是数字，收到 {w!r}")
+        fw = float(w)
+        if not (fw >= 0.0 and fw == fw and fw != float("inf")):
+            raise ValueError(f"dkd_loss: {name} 必须是非负有限数字")
+    T = _dkd_temp(temperature, "dkd_loss")
+
+    def lse(vals):
+        mx = max(vals)
+        return mx + math.log(sum(math.exp(v - mx) for v in vals))
+
+    # ---- TCKD：目标类 vs 其余 ----
+    t_rest = [tea[k] / T for k in range(c) if k != label]
+    s_rest = [stu[k] / T for k in range(c) if k != label]
+    t_bin = [tea[label] / T, lse(t_rest)]
+    s_bin = [stu[label] / T, lse(s_rest)]
+    pt_bin = _softmax_with_temp(t_bin, 1.0)
+    ps_bin = _softmax_with_temp(s_bin, 1.0)
+    tckd = 0.0
+    for a, b in zip(ps_bin, pt_bin):
+        if b > 0.0:
+            tckd += b * math.log(b / max(a, 1e-300))
+    tckd *= T * T
+    g_tckd = [T * (ps_bin[0] - pt_bin[0]),
+              T * (ps_bin[1] - pt_bin[1])]
+    d_tckd = [0.0] * c
+    d_tckd[label] += g_tckd[0]
+    w_rest = _softmax_with_temp(s_rest, 1.0)
+    for idx, k in enumerate(k for k in range(c) if k != label):
+        d_tckd[k] += g_tckd[1] * w_rest[idx]
+
+    # ---- NCKD：非目标类内部 ----
+    nq_t = _softmax_with_temp(t_rest, 1.0)
+    nq_s = _softmax_with_temp(s_rest, 1.0)
+    nckd = 0.0
+    for a, b in zip(nq_s, nq_t):
+        if b > 0.0:
+            nckd += b * math.log(b / max(a, 1e-300))
+    nckd *= T * T
+    d_nckd = [0.0] * c
+    for idx, k in enumerate(k for k in range(c) if k != label):
+        d_nckd[k] = T * (nq_s[idx] - nq_t[idx])
+
+    loss = alpha * tckd + beta * nckd
+    grad = [alpha * d_tckd[k] + beta * d_nckd[k] for k in range(c)]
+    return loss, grad
 
 
 class FlowMatching:

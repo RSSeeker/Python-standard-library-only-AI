@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2828 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2833 项）
 
 ## 特性
 
@@ -1230,6 +1230,38 @@ l_cir, g_pos, g_neg = circle_loss([0.9, 0.7], [0.1, 0.2], margin=0.25, gamma=64.
 边界：`supcon_loss` 对 embedding 做行内 L2 归一化（不修改输入），温度必须为正；
 ArcFace/CosFace 的 `cos_theta` 必须已裁剪到 `[-1, 1]`，且 `labels` 小于类别数；
 `circle_loss` 允许一侧为空（如只有正样本），但两侧都空会报错。
+
+
+### 关系蒸馏与解耦蒸馏（RKD / DKD）
+
+普通知识蒸馏只对齐「每个样本的输出分布」。RKD（Relational KD）转而约束**样本之间的关系**：
+距离项对齐两两样本距离，角度项对齐三元组在中心点处的夹角余弦，因此学生即使类别数不同，
+也能学到教师特征空间的几何结构。DKD（Decoupled KD）则把经典 KL 拆成
+「目标类 vs 非目标类」的二分类（TCKD）与非目标类内部的 KL（NCKD），可以分别加权。
+
+```python
+from AI import rkd_distance_loss, rkd_angle_loss, rkd_loss, dkd_loss
+
+s_feat = [[0.2, -0.4], [0.9, 0.1], [-0.3, 0.5]]
+t_feat = [[0.1, -0.2], [0.8, 0.3], [-0.5, 0.4]]
+loss_d, g_d = rkd_distance_loss(s_feat, t_feat)
+loss_a, g_a = rkd_angle_loss(s_feat, t_feat)
+loss_r, g_r = rkd_loss(s_feat, t_feat, distance_weight=1.0, angle_weight=1.0)
+
+loss_kd, g_logits = dkd_loss([1.2, -0.3, 0.4], [2.0, -1.0, 0.2], label=0,
+                             alpha=1.0, beta=1.0, temperature=2.0)
+```
+
+| API | 说明 |
+|------|------|
+| `rkd_distance_loss(student_feat, teacher_feat)` | 两两平方距离的均方误差；返回 `(loss, d student_feat)` |
+| `rkd_angle_loss(student_feat, teacher_feat)` | 三元组中心点夹角余弦的均方误差；退化三元组跳过 |
+| `rkd_loss(..., distance_weight=1.0, angle_weight=1.0)` | 两项加权和，返回 `(loss, grad)` |
+| `dkd_loss(student_logits, teacher_logits, label, alpha=1.0, beta=1.0, temperature=2.0)` | TCKD + NCKD，返回 `(loss, d student_logits)` |
+
+边界：RKD 是**批级**接口（需要同一批样本的特征），学生/教师特征维度与样本数必须一致；
+距离项用平方距离而原文用 L2 距离，属于教学简化。DKD 是**单样本**接口，logits 至少 2 类；
+当类别数等于 2 时非目标类只剩一个，NCKD 恒为 0，只剩 TCKD 生效。
 
 
 ### 优化器
@@ -6404,7 +6436,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2828 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2833 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6882,6 +6914,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGriffinBlock` | 局部注意力 + RG-LRU 前向与参数计数、四个参数的中心差分、因果性、30 步训练 loss 下降到 50% 以下、非法输入 |
 | `TestGumbelSparsemax` | Gumbel-Softmax 采样（同 seed 复现/硬采样/温度）、反向中心差分、Sparsemax 已知值/平移不变/稀疏性、Entmax α=2 与 sparsemax 一致、非法输入 |
 | `TestMetricLosses` | SupCon/ArcFace/CosFace/Circle 损失的前向取值、梯度中心差分、margin/温度行为、空正/负样本与 13 类非法输入 |
+| `TestRKDAndDKD` | RKD 距离/角度/加权组合的梯度中心差分、学生=教师时零损失、DKD 单项与 alpha/beta/T 组合的 FD、14 类非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6916,6 +6949,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2828 个单元测试
+├── test_ai.py       # 2833 个单元测试
 └── README.md
 ```
