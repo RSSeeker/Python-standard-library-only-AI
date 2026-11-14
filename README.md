@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2872 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2877 项）
 
 ## 特性
 
@@ -4841,6 +4841,30 @@ prob = model.predict(features[0])
 输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
 无 batch/Adam/正则；注意力权重不做可视化导出。
 
+### FT-Transformer（表格特征 token + Transformer）
+
+```python
+from AI import FTTransformer
+
+model = FTTransformer(n_features=8, num_classes=3, d_model=16, num_heads=2,
+                      d_ff=32, num_layers=1, seed=1)
+logits = model.forward([0.5, -0.2, 1.0, 0.0, 0.3, -1.0, 2.0, 0.1])
+loss = model.loss_and_backward(sample, label)
+history = model.fit(samples, labels, epochs=100, lr=0.01, seed=1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `FTTransformer(n_features, num_classes, d_model=16, num_heads=2, d_ff=32, num_layers=1, seed=None)` | 每个特征 `x_j*W_j+b_j` 成一个 token，前置可学习 `[CLS]`，复用 `TransformerEncoder`（无因果掩码） |
+| `forward(sample)` | 单样本（长度 `n_features` 的 list）→ `num_classes` 维 logits |
+| `loss_and_backward(sample, label)` | 交叉熵，反传特征嵌入/CLS/分类头/encoder，返回损失 |
+| `fit(samples, labels, epochs, lr, seed, shuffle)` | 逐样本 SGD，返回每 epoch 平均损失 |
+| `zero_grad()` / `sgd_step(lr)` | 清零梯度 / 一步 SGD |
+
+边界：简化版 FT-Transformer——单样本前向（无 batch、无 mask）；每个特征独立标量嵌入
+（不是类别字段的 embedding table）；单层线性分类头；注意力复用库内 `TransformerEncoder`
+（无 LayerNorm 预归一化以外的论文改动）；`fit` 是逐样本 SGD，无 Adam/正则。
+
 ### 工程便利件（unwrap_model / Trainer / benchmark_forward）
 
 ```python
@@ -6550,7 +6574,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2872 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2877 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7037,6 +7061,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
+| `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7071,6 +7096,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2872 个单元测试
+├── test_ai.py       # 2877 个单元测试
 └── README.md
 ```

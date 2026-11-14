@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1785 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1786 个 def / 425 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8122,6 +8122,160 @@ def _dl_check_seq(seq, lookback, channels):
             vals.append(float(v))
         rows.append(vals)
     return rows
+
+
+def _ftt_check_sample(sample, n_features, who="FTTransformer"):
+    if not isinstance(sample, (list, tuple)) or len(sample) != n_features:
+        raise ValueError(f"{who}: 样本长度必须为 {n_features}，收到 {sample!r}")
+    vals = []
+    for v in sample:
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(float(v)):
+            raise ValueError(f"{who}: 特征必须是有限数字")
+        vals.append(float(v))
+    return vals
+
+
+class FTTransformer:
+    """FT-Transformer（2021）：把表格的每个特征变成一个 token，再跑 Transformer
+
+    ```text
+    token_0 = [CLS]（可学习）
+    token_j = x_j * W_j + b_j          # 第 j 个特征 -> d_model 维
+    h = TransformerEncoder(tokens)     # 无因果掩码
+    logits = W_head · h[0] + b_head    # 用 CLS 位置做分类
+    ```
+
+    与「把一行特征拼成向量接 MLP」相比，每个特征独立嵌入 + 注意力能显式建模
+    特征交互。这里复用库里的 `TransformerEncoder`（含 dropout=0 的简化配置），
+    反向覆盖特征嵌入、CLS 与分类头。
+
+    边界：单样本前向（样本 = 长度 n_features 的 list），无 batch/mask；分类头
+    为单层线性；`fit` 用 SGD + 交叉熵。
+    """
+
+    def __init__(self, n_features: int, num_classes: int, d_model: int = 16,
+                 num_heads: int = 2, d_ff: int = 32, num_layers: int = 1,
+                 seed: int = None):
+        def pos_int(v, name):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"FTTransformer: {name} 必须是正整数，收到 {v!r}")
+            return v
+        self.n_features = pos_int(n_features, "n_features")
+        self.num_classes = pos_int(num_classes, "num_classes")
+        self.d_model = pos_int(d_model, "d_model")
+        self.num_heads = pos_int(num_heads, "num_heads")
+        self.d_ff = pos_int(d_ff, "d_ff")
+        self.num_layers = pos_int(num_layers, "num_layers")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError("FTTransformer: d_model 必须能被 num_heads 整除")
+        rng = random.Random(seed)
+        std = math.sqrt(2.0 / self.d_model)
+        def vec(n):
+            return [rng.gauss(0.0, std) for _ in range(n)]
+        self.W = [vec(self.d_model) for _ in range(self.n_features)]
+        self.b = [[0.0] * self.d_model for _ in range(self.n_features)]
+        self.cls = vec(self.d_model)
+        self.encoder = TransformerEncoder(
+            self.d_model, self.num_heads, self.d_ff, self.num_layers,
+            dropout=0.0, causal=False)
+        self.head = Layer(self.d_model, self.num_classes, "linear")
+        self.head.weights = [[rng.gauss(0.0, std) for _ in range(self.d_model)]
+                             for _ in range(self.num_classes)]
+        self.head.biases = [0.0] * self.num_classes
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_W = [[0.0] * self.d_model for _ in range(self.n_features)]
+        self.grad_b = [[0.0] * self.d_model for _ in range(self.n_features)]
+        self.grad_cls = [0.0] * self.d_model
+        self.encoder.zero_grad()
+        self.grad_head_w = [[0.0] * self.d_model for _ in range(self.num_classes)]
+        self.grad_head_b = [0.0] * self.num_classes
+
+    def forward(self, sample):
+        xs = _ftt_check_sample(sample, self.n_features)
+        tokens = [list(self.cls)]
+        for j in range(self.n_features):
+            tokens.append([xs[j] * self.W[j][k] + self.b[j][k]
+                           for k in range(self.d_model)])
+        enc = self.encoder.forward(tokens)
+        self._x = xs
+        self._tokens = tokens
+        self._enc = enc
+        logits, self._head_cache = _dense_rows_forward(self.head, [enc[0]])
+        return logits[0]
+
+    def _softmax(self, logits):
+        m = max(logits)
+        ex = [math.exp(v - m) for v in logits]
+        s = sum(ex)
+        return [v / s for v in ex]
+
+    def loss_and_backward(self, sample, label):
+        if isinstance(label, bool) or not isinstance(label, int) \
+                or not (0 <= label < self.num_classes):
+            raise ValueError(f"FTTransformer: label 必须在 [0,{self.num_classes})")
+        logits = self.forward(sample)
+        probs = self._softmax(logits)
+        loss = -math.log(max(probs[label], 1e-300))
+        dlogits = probs[:]
+        dlogits[label] -= 1.0
+        grad_w, grad_b, d_enc0 = _dense_rows_backward(
+            self.head, self._head_cache, [dlogits])
+        for r in range(self.num_classes):
+            for c in range(self.d_model):
+                self.grad_head_w[r][c] += grad_w[r][c]
+            self.grad_head_b[r] += grad_b[r]
+        d_seq = [[0.0] * self.d_model for _ in range(self.n_features + 1)]
+        d_seq[0] = d_enc0[0]
+        d_tokens = self.encoder.backward(d_seq)
+        for k in range(self.d_model):
+            self.grad_cls[k] += d_tokens[0][k]
+        for j in range(self.n_features):
+            xj = self._x[j]
+            for k in range(self.d_model):
+                self.grad_W[j][k] += d_tokens[j + 1][k] * xj
+                self.grad_b[j][k] += d_tokens[j + 1][k]
+        return loss
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool):
+            raise TypeError("FTTransformer: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("FTTransformer: lr 必须是非负有限数字")
+        for j in range(self.n_features):
+            for k in range(self.d_model):
+                self.W[j][k] -= lr * self.grad_W[j][k]
+                self.b[j][k] -= lr * self.grad_b[j][k]
+        for k in range(self.d_model):
+            self.cls[k] -= lr * self.grad_cls[k]
+        for r in range(self.num_classes):
+            for c in range(self.d_model):
+                self.head.weights[r][c] -= lr * self.grad_head_w[r][c]
+            self.head.biases[r] -= lr * self.grad_head_b[r]
+        self.encoder.sgd_step(lr)
+
+    def fit(self, samples, labels, epochs=20, lr=0.01, seed=0, shuffle=True):
+        if not isinstance(samples, (list, tuple)) or len(samples) == 0:
+            raise ValueError("FTTransformer: samples 必须是非空列表")
+        if len(labels) != len(samples):
+            raise ValueError("FTTransformer: labels 与 samples 长度不一致")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("FTTransformer: epochs 必须是正整数")
+        rng = random.Random(seed)
+        order = list(range(len(samples)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                self.zero_grad()
+                total += self.loss_and_backward(samples[idx], labels[idx])
+                self.sgd_step(lr)
+            history.append(total / len(samples))
+        return history
 
 
 class DLinear:

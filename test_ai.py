@@ -46594,3 +46594,91 @@ class TestTaskTricks:
         assert _tricks_raises(lambda: AI.greedy_soup([], lambda w: 0.0))
         assert _tricks_raises(lambda: AI.greedy_soup([base], "not callable"))
         assert _tricks_raises(lambda: AI.greedy_soup([base], lambda w: 0.0, max_models=0))
+
+
+# ---- FT-Transformer（表格特征 token + Transformer 分类） ----
+
+
+def _ftt_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestFTTransformer:
+    def test_forward_and_loss(self):
+        model = AI.FTTransformer(3, 2, d_model=8, num_heads=2, d_ff=16,
+                                 num_layers=1, seed=1)
+        logits = model.forward([0.5, -0.3, 1.2])
+        assert len(logits) == 2
+        loss = model.loss_and_backward([0.5, -0.3, 1.2], 1)
+        assert loss > 0.0
+
+    def test_numerical_gradients(self):
+        rng = random.Random(0)
+        sample = [rng.uniform(-1.0, 1.0) for _ in range(3)]
+        label = 1
+        model = AI.FTTransformer(3, 2, d_model=8, num_heads=2, d_ff=16,
+                                 num_layers=1, seed=1)
+
+        def ce():
+            lg = model.forward(sample)
+            mx = max(lg)
+            ex = [math.exp(v - mx) for v in lg]
+            s = sum(ex)
+            return -math.log(ex[label] / s)
+
+        model.zero_grad()
+        model.loss_and_backward(sample, label)
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = ce()
+            param_set(p0 - h)
+            lm = ce()
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        for gg, pg, ps in [
+            (lambda: model.grad_W[0][0], lambda: model.W[0][0],
+             lambda v: model.W[0].__setitem__(0, v)),
+            (lambda: model.grad_b[1][0], lambda: model.b[1][0],
+             lambda v: model.b[1].__setitem__(0, v)),
+            (lambda: model.grad_cls[0], lambda: model.cls[0],
+             lambda v: model.cls.__setitem__(0, v)),
+            (lambda: model.grad_head_w[0][1], lambda: model.head.weights[0][1],
+             lambda v: model.head.weights[0].__setitem__(1, v)),
+        ]:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+
+    def test_training_converges(self):
+        samples = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        model = AI.FTTransformer(3, 3, d_model=8, num_heads=2, d_ff=16,
+                                 num_layers=1, seed=2)
+        hist = model.fit(samples, [0, 1, 2], epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.5
+        assert len(hist) == 40
+
+    def test_sgd_step_changes_params(self):
+        model = AI.FTTransformer(2, 2, d_model=8, num_heads=2, d_ff=16,
+                                 num_layers=1, seed=3)
+        before = model.W[0][:]
+        model.zero_grad()
+        model.loss_and_backward([0.3, -0.7], 0)
+        model.sgd_step(0.05)
+        assert before != model.W[0]
+
+    def test_invalid_inputs(self):
+        assert _ftt_raises(lambda: AI.FTTransformer(3, 2, d_model=8, num_heads=3))
+        assert _ftt_raises(lambda: AI.FTTransformer(0, 2))
+        assert _ftt_raises(lambda: AI.FTTransformer(3, 0))
+        m = AI.FTTransformer(3, 2, d_model=8, num_heads=2, seed=1)
+        assert _ftt_raises(lambda: m.forward([1.0]))
+        assert _ftt_raises(lambda: m.forward([1.0, float("nan"), 0.0]))
+        assert _ftt_raises(lambda: m.loss_and_backward([1.0, 0.0, 0.0], 5))
+        assert _ftt_raises(lambda: m.fit([], []))
+        assert _ftt_raises(lambda: m.sgd_step(-1))
