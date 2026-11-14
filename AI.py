@@ -13078,6 +13078,224 @@ def finetune_adapter(model, xs, ys, adapter="lora", rank=4, alpha=None,
         "total_params": base_params + trainable_params,
     }
 
+def _eagle_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"EAGLE: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _eagle_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"EAGLE: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"EAGLE: {name} 必须是有限非负数，收到 {value!r}")
+    return value
+
+
+def _eagle_accumulate(acc_w, acc_b, gw, gb):
+    for i in range(len(acc_w)):
+        for j in range(len(acc_w[i])):
+            acc_w[i][j] += gw[i][j]
+        acc_b[i] += gb[i]
+
+
+def _eagle_zero(rows, cols):
+    return [[0.0] * cols for _ in range(rows)]
+
+
+class EAGLEDraftHead:
+    """EAGLE 风格的「特征级」草稿头（简化教学版）。
+
+    EAGLE 与 Medusa 的关键区别：草稿模型不直接从隐藏态预测 token，而是先预测
+    **下一个隐藏特征** ``h_{t+1}``，再用它预测 ``x_{t+1}``；训练损失因此是
+    「token 交叉熵 + 特征回归」之和。本类实现：
+
+    ``z = relu(W_h · h_t + b_h)``、``f = W_f · z + b_f``（预测 h_{t+1}）、
+    ``logits = W_l · z + b_l``（预测 token），损失::
+
+        CE(logits, x_{t+1}) + feature_weight * mean((f - h_{t+1})^2)
+
+    ``forward(hidden_row) -> (feature, logits)``；``loss_and_backward`` 一次
+    处理一个 batch 的行并累积梯度；``sgd_step`` 用普通 SGD。
+    """
+
+    def __init__(self, d_model, vocab_size, d_hidden=None, feature_weight=0.5,
+                 seed=None):
+        d_model = _eagle_check_pos_int(d_model, "d_model")
+        vocab_size = _eagle_check_pos_int(vocab_size, "vocab_size")
+        d_hidden = d_model if d_hidden is None else _eagle_check_pos_int(
+            d_hidden, "d_hidden")
+        feature_weight = _eagle_check_pos_number(feature_weight, "feature_weight")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise TypeError("EAGLE: seed 必须是 int 或 None")
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.d_hidden = d_hidden
+        self.feature_weight = feature_weight
+        if seed is None:
+            self.hidden = Layer(d_model, d_hidden, "relu")
+        else:
+            saved = random.getstate()
+            random.seed(seed)
+            try:
+                self.hidden = Layer(d_model, d_hidden, "relu")
+            finally:
+                random.setstate(saved)
+        self.feat = Layer(d_hidden, d_model, "linear")
+        self.logit = Layer(d_hidden, vocab_size, "linear")
+        self._cache = None
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grads = {
+            "hidden": (_eagle_zero(self.d_hidden, self.d_model),
+                       [0.0] * self.d_hidden),
+            "feat": (_eagle_zero(self.d_model, self.d_hidden), [0.0] * self.d_model),
+            "logit": (_eagle_zero(self.vocab_size, self.d_hidden),
+                      [0.0] * self.vocab_size),
+        }
+
+    def param_count(self):
+        return (self.d_model * self.d_hidden + self.d_hidden
+                + self.d_hidden * self.d_model + self.d_model
+                + self.d_hidden * self.vocab_size + self.vocab_size)
+
+    def forward(self, hidden_row):
+        if not isinstance(hidden_row, (list, tuple)) or len(hidden_row) != self.d_model:
+            raise ValueError(
+                f"EAGLEDraftHead.forward: 输入必须是长度 {self.d_model} 的隐藏态")
+        z, c_h = _dense_rows_forward(self.hidden, [list(hidden_row)])
+        f, c_f = _dense_rows_forward(self.feat, z)
+        logits, c_l = _dense_rows_forward(self.logit, z)
+        self._cache = (z, c_h, c_f, c_l)
+        return f[0], logits[0]
+
+    def loss_and_backward(self, rows, tokens, next_features):
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise ValueError("EAGLE: rows 不能为空")
+        if len(rows) != len(tokens) or len(rows) != len(next_features):
+            raise ValueError("EAGLE: rows / tokens / next_features 必须等长")
+        self.zero_grad()
+        total = 0.0
+        for i, (row, token, target) in enumerate(zip(rows, tokens, next_features)):
+            if isinstance(token, bool) or not isinstance(token, int):
+                raise ValueError(f"EAGLE: tokens[{i}] 必须是整数")
+            if token < 0 or token >= self.vocab_size:
+                raise ValueError(f"EAGLE: tokens[{i}]={token} 超出词表")
+            if (not isinstance(target, (list, tuple))
+                    or len(target) != self.d_model):
+                raise ValueError(
+                    f"EAGLE: next_features[{i}] 必须是长度 {self.d_model} 的列表")
+            feat, logits = self.forward(row)
+            z, c_h, c_f, c_l = self._cache
+
+            # token 交叉熵
+            m = max(logits)
+            lse = m + math.log(sum(math.exp(v - m) for v in logits))
+            total += lse - logits[token]
+            d_logits = [math.exp(v - lse) for v in logits]
+            d_logits[token] -= 1.0
+
+            # 特征回归（MSE）
+            diffs = [feat[j] - float(target[j]) for j in range(self.d_model)]
+            total += self.feature_weight * sum(d * d for d in diffs) / self.d_model
+            d_feat = [self.feature_weight * 2.0 * d / self.d_model for d in diffs]
+
+            gw_l, gb_l, d_z_l = _dense_rows_backward(
+                self.logit, c_l, [d_logits])
+            gw_f, gb_f, d_z_f = _dense_rows_backward(self.feat, c_f, [d_feat])
+            d_z = [d_z_l[0][j] + d_z_f[0][j] for j in range(self.d_hidden)]
+            gw_h, gb_h, _ = _dense_rows_backward(self.hidden, c_h, [d_z])
+
+            _eagle_accumulate(self.grads["hidden"][0], self.grads["hidden"][1],
+                              gw_h, gb_h)
+            _eagle_accumulate(self.grads["feat"][0], self.grads["feat"][1],
+                              gw_f, gb_f)
+            _eagle_accumulate(self.grads["logit"][0], self.grads["logit"][1],
+                              gw_l, gb_l)
+        n = float(len(rows))
+        for gw, gb in self.grads.values():
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    gw[i][j] /= n
+                gb[i] /= n
+        return total / n
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError(f"EAGLEDraftHead.sgd_step: lr 必须是正有限数，收到 {lr!r}")
+        for name, layer in (("hidden", self.hidden), ("feat", self.feat),
+                            ("logit", self.logit)):
+            _dense_apply_sgd(layer, self.grads[name], lr)
+        self._cache = None
+
+
+def train_eagle_heads(target, draft, sequences, epochs=10, lr=0.01):
+    """用冻结目标模型收集隐藏态，训练 EAGLE 风格草稿头。
+
+    对每条序列 ``ids``：``target.forward(ids)`` 后从 ``target.h`` 取隐藏态
+    ``h_t``；位置 ``r`` 的样本是 ``(h_r, ids[r+1], h_{r+1})``。只更新草稿头，
+    目标模型保持不变。返回 ``{"loss_history", "rows", "epochs",
+    "feature_weight"}``。
+    """
+    if not callable(getattr(target, "forward", None)):
+        raise TypeError("train_eagle_heads: target 必须有 forward 方法")
+    if not isinstance(draft, EAGLEDraftHead):
+        raise TypeError("train_eagle_heads: draft 必须是 EAGLEDraftHead 实例")
+    vocab_size = getattr(target, "vocab_size", None)
+    d_model = getattr(target, "d_model", None)
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 1:
+        raise ValueError("train_eagle_heads: target 必须有正整数 vocab_size 属性")
+    if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+        raise ValueError("train_eagle_heads: target 必须有正整数 d_model 属性")
+    if draft.d_model != d_model or draft.vocab_size != vocab_size:
+        raise ValueError(
+            "train_eagle_heads: draft 的 d_model / vocab_size 与目标模型不一致")
+    epochs = _eagle_check_pos_int(epochs, "epochs")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise TypeError("train_eagle_heads: 学习率必须是数字")
+    lr = float(lr)
+    if not math.isfinite(lr) or lr <= 0.0:
+        raise ValueError(f"train_eagle_heads: 学习率必须是正有限数，收到 {lr!r}")
+    if not isinstance(sequences, (list, tuple)) or not sequences:
+        raise ValueError("train_eagle_heads: sequences 必须是非空列表")
+
+    rows, tokens, features = [], [], []
+    for i, seq in enumerate(sequences):
+        if not isinstance(seq, (list, tuple)) or len(seq) < 2:
+            raise ValueError(f"train_eagle_heads: 第 {i} 条序列至少需要 2 个 token")
+        clean = []
+        for tok in seq:
+            if isinstance(tok, bool) or not isinstance(tok, int):
+                raise ValueError("train_eagle_heads: token 必须是整数")
+            if tok < 0 or tok >= vocab_size:
+                raise ValueError(
+                    f"train_eagle_heads: token {tok} 超出词表 [0, {vocab_size})")
+            clean.append(tok)
+        target.forward(clean)
+        hidden = getattr(target, "h", None)
+        if (not isinstance(hidden, (list, tuple)) or len(hidden) != len(clean)
+                or not all(isinstance(row, (list, tuple)) and len(row) == d_model
+                           for row in hidden)):
+            raise RuntimeError(
+                "train_eagle_heads: target.forward 后 target.h 必须是 [T, d_model] 的隐藏态")
+        for r in range(len(clean) - 1):
+            rows.append([float(v) for v in hidden[r]])
+            tokens.append(clean[r + 1])
+            features.append([float(v) for v in hidden[r + 1]])
+    history = []
+    for _ in range(epochs):
+        loss = draft.loss_and_backward(rows, tokens, features)
+        draft.sgd_step(lr)
+        history.append({"loss": loss})
+    return {
+        "loss_history": history,
+        "rows": len(rows),
+        "epochs": epochs,
+        "feature_weight": draft.feature_weight,
+    }
+
 # ============================================================================
 #  Medusa 多头训练循环（train_medusa_heads）
 # ============================================================================

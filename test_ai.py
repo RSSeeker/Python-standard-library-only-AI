@@ -44734,3 +44734,123 @@ class TestTensorParallelBackward:
             lambda: AI.sequence_parallel_layer_norm_backward([[0.1]], [[0.1]], eps=0),
         ]
         assert all(_tpb_raises(f) for f in bad)
+
+
+def _eagle_raises(fn, exc=(ValueError, TypeError)):
+    if not callable(fn):
+        raise TypeError("_eagle_raises: 需要可调用对象")
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _eagle_loss(draft, rows, tokens, features):
+    import math as _m
+    total = 0.0
+    for row, token, target in zip(rows, tokens, features):
+        feat, logits = draft.forward(row)
+        mx = max(logits)
+        lse = mx + _m.log(sum(_m.exp(v - mx) for v in logits))
+        total += lse - logits[token]
+        total += draft.feature_weight * sum(
+            (feat[j] - target[j]) ** 2 for j in range(draft.d_model)) / draft.d_model
+    return total / len(rows)
+
+
+class TestEAGLEDraftHead:
+    def test_param_count_and_forward(self):
+        d = AI.EAGLEDraftHead(4, 5, d_hidden=3, feature_weight=0.5, seed=1)
+        expect = 4 * 3 + 3 + 3 * 4 + 4 + 3 * 5 + 5
+        assert d.param_count() == expect
+        feat, logits = d.forward([0.1, -0.2, 0.3, 0.0])
+        assert len(feat) == 4 and len(logits) == 5
+
+    def test_gradients_fd(self):
+        d = AI.EAGLEDraftHead(4, 5, d_hidden=3, feature_weight=0.5, seed=2)
+        rows = [[0.1, -0.2, 0.3, 0.0], [0.5, 0.1, -0.4, 0.2]]
+        tokens = [2, 3]
+        features = [[0.0, 0.2, -0.1, 0.4], [0.3, -0.2, 0.1, 0.0]]
+        d.loss_and_backward(rows, tokens, features)
+        anal = {
+            ("hidden", 0, 1): d.grads["hidden"][0][0][1],
+            ("hidden_b", 0, 0): d.grads["hidden"][1][0],
+            ("feat", 0, 1): d.grads["feat"][0][0][1],
+            ("feat_b", 0, 0): d.grads["feat"][1][0],
+            ("logit", 0, 1): d.grads["logit"][0][0][1],
+            ("logit_b", 0, 0): d.grads["logit"][1][0],
+        }
+        h = 1e-6
+        layers = {"hidden": d.hidden, "feat": d.feat, "logit": d.logit}
+        for key, grad in anal.items():
+            name, r, c = key
+            if name.endswith("_b"):
+                layer = layers[name[:-2]]
+                arr = layer.biases
+                arr[r] += h
+                lp = _eagle_loss(d, rows, tokens, features)
+                arr[r] -= 2 * h
+                lm = _eagle_loss(d, rows, tokens, features)
+                arr[r] += h
+            else:
+                arr = layers[name].weights
+                arr[r][c] += h
+                lp = _eagle_loss(d, rows, tokens, features)
+                arr[r][c] -= 2 * h
+                lm = _eagle_loss(d, rows, tokens, features)
+                arr[r][c] += h
+            fd = (lp - lm) / (2 * h)
+            assert abs(fd - grad) < 1e-6, (key, fd, grad)
+
+    def test_training_descends_and_target_frozen(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16, dropout=0.0)
+        seqs = [[0, 1, 2, 3, 4, 0], [1, 2, 3, 4, 5, 1]]
+        draft = AI.EAGLEDraftHead(8, 6, d_hidden=8, feature_weight=0.5, seed=2)
+        before = [row[:] for row in lm.embedding.weight]
+        res = AI.train_eagle_heads(lm, draft, seqs, epochs=30, lr=0.05)
+        first = res["loss_history"][0]["loss"]
+        last = res["loss_history"][-1]["loss"]
+        assert res["rows"] == 10
+        assert last < first * 0.7
+        assert lm.embedding.weight == before
+
+    def test_feature_weight_zeroes_feature_gradients(self):
+        d = AI.EAGLEDraftHead(4, 5, d_hidden=3, feature_weight=0.0, seed=3)
+        rows = [[0.1, -0.2, 0.3, 0.0]]
+        tokens = [1]
+        features = [[0.5, 0.2, -0.1, 0.3]]
+        d.loss_and_backward(rows, tokens, features)
+        for row in d.grads["feat"][0]:
+            assert all(v == 0.0 for v in row)
+        assert all(v == 0.0 for v in d.grads["feat"][1])
+
+    def test_invalid_inputs(self):
+        lm = AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16, dropout=0.0)
+        seqs = [[0, 1, 2, 3, 4, 0], [1, 2, 3, 4, 5, 1]]
+        draft = AI.EAGLEDraftHead(8, 6, d_hidden=6, seed=4)
+        small = AI.EAGLEDraftHead(4, 5, seed=5)
+        bad = [
+            lambda: AI.EAGLEDraftHead(0, 5),
+            lambda: AI.EAGLEDraftHead(4, 0),
+            lambda: AI.EAGLEDraftHead(4, 5, d_hidden=0),
+            lambda: AI.EAGLEDraftHead(4, 5, feature_weight=-0.1),
+            lambda: AI.EAGLEDraftHead(4, 5, seed=1.5),
+            lambda: small.forward([0.1, 0.2]),
+            lambda: small.loss_and_backward([], [], []),
+            lambda: small.loss_and_backward([[0, 0, 0, 0]], [], []),
+            lambda: small.loss_and_backward([[0, 0, 0, 0]], [9], [[0, 0, 0, 0]]),
+            lambda: small.loss_and_backward([[0, 0, 0, 0]], [1], [[0, 0]]),
+            lambda: small.sgd_step(0),
+            lambda: AI.train_eagle_heads(lm, small, seqs),
+            lambda: AI.train_eagle_heads(lm, draft, []),
+            lambda: AI.train_eagle_heads(lm, draft, [[1]]),
+            lambda: AI.train_eagle_heads(lm, draft, [[1, 2, 9]]),
+            lambda: AI.train_eagle_heads(lm, draft, seqs, epochs=0),
+            lambda: AI.train_eagle_heads(lm, draft, seqs, lr=-0.1),
+        ]
+        assert all(_eagle_raises(f) for f in bad)
