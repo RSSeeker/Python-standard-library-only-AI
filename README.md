@@ -5083,7 +5083,7 @@ print(AI.snapshot_digest(snap))
 - **doctest**（`TestDoctests`）保证文档示例不腐烂：`hz_to_mel`/`mel_to_hz`/`box_area`/`discounted_returns`
   的 `>>>` 示例都在 `AI.run_doctests()` 里跑；另有一条反例测试故意写错示例并断言 `failed == 1`，
   证明这套机制真的会抓错。注意 `run_doctests` 依赖 `sys.modules` 里的模块名，
-  临时模块要自己注册进去。
+  临时模块要自己注册进去。为了让「核心 API 有示例」不只停留在机制层，已给 `check_probability_rows`、`math_equivalent`、`pass_at_k`、`kv_cache_evict`、`zero_memory_bytes`、`mlp_property_report` 等纯函数补了 `>>>` 示例（当前共 18 个示例）；`TestDoctests` 同时断言示例数 ≥15，防止示例被无声删掉。
 - **属性测试**（`TestInvariants`）对随机输入验证不变量，全部用固定 seed 的 `random.Random`，
   不引入第三方库：softmax 行和、MSE 对称且非负、LayerNorm 零均值单位方差（受 eps 影响放 2e-3）、
   Dropout 在 `eval()` 下恒等、**因果注意力下扰动后位 token 不影响前面输出**、Conv2d 输出形状公式、
@@ -5091,6 +5091,12 @@ print(AI.snapshot_digest(snap))
   K 折划分恰好覆盖全部下标一次、pinball loss 非负。
 
 上面这些是测试文件里手写的性质；`mlp_property_report` 把同一类不变量收敛成一个可直接调用的报告（形状、有限性、确定性、参数计数、首层梯度中心差分），适合改完层实现后先跑一遍再写测试。`fuzz_nonfinite_inputs` 则专门验证「坏输入要报错」：给一个函数和输入维度，随机混入 NaN/±Inf，非有限输入若被静默接受（或返回 NaN）就记为失败——它检查的是显式错误而非数值精度。
+
+### 单文件结构与拆包评估
+
+本仓库刻意保持单文件（`AI.py` + `test_ai.py`）：实现可直接 import、复制或嵌进教学环境，不引入包结构与依赖。代价是 `AI.py` 已约 8.8 万行，IDE 导航、并行修改与代码审阅都更吃力。
+
+评估过的拆包方案是按 `core/`、`nn/`、`train/`、`eval/`、`apps/` 分目录，但需要改动 2796 个测试的导入路径，且 `run_doctests` 依赖 `sys.modules` 里的模块名，迁移成本高；换来的是导航与团队并行收益，在「零依赖工具箱」的定位下不划算，所以保持单文件，并用横幅和 TOC 维持结构。若未来要拆包，优先按依赖方向单向切分（core → nn → train → eval），并保留 `AI` 聚合模块做 re-export，避免测试大面积改写。
 
 ### 规则约束解码（神经符号的最小实现）
 

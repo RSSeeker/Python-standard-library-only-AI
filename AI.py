@@ -6868,11 +6868,25 @@ def math_canonical(expr):
 
 
 def math_equivalent(expr_a, expr_b):
-    """判断两个算术表达式在化简后是否同构（不是完整符号代数证明）。"""
+    """判断两个算术表达式在化简后是否同构（不是完整符号代数证明）。
+
+    >>> math_equivalent("x + x", "2 * x")
+    True
+    >>> math_equivalent("x / 2", "0.5 * x")
+    True
+    >>> math_equivalent("2 * (x + 3)", "2 * x + 6")
+    False
+    """
     return math_canonical(expr_a) == math_canonical(expr_b)
 
 def pass_at_k(n: int, c: int, k: int):
-    """pass@k 无偏估计：1 - C(n-c,k)/C(n,k)（n 总样本，c 正确数）。"""
+    """pass@k 无偏估计：1 - C(n-c,k)/C(n,k)（n 总样本，c 正确数）。
+
+    >>> pass_at_k(10, 5, 1)
+    0.5
+    >>> pass_at_k(3, 3, 1)
+    1.0
+    """
     _eval_check_int(n, "n", allow_zero=False)
     _eval_check_int(c, "c")
     _eval_check_int(k, "k", allow_zero=False)
@@ -7399,6 +7413,12 @@ def kv_cache_evict(keys, values, budget, scores=None, policy="h2o",
     - ``"streaming"``：StreamingLLM，保留前 ``sink`` 个 + 最近 ``budget-sink`` 个；
     - ``"h2o"``：按 ``scores`` 的累计注意力保留 top token（额外保留 sink 与最近 ``recent``）；
     - ``"snapkv"``：只用最后 ``obs`` 行 query 的分数聚合后选 top。
+
+
+    >>> out = kv_cache_evict([[1], [2], [3], [4]], [[10], [20], [30], [40]],
+    ...                      2, policy="streaming", sink=1)
+    >>> out["kept_indices"]
+    [0, 3]
     """
     keys, values = _kve_check_cache(keys, values)
     seq_len = len(keys)
@@ -59108,6 +59128,10 @@ def zero_memory_bytes(num_params, world_size, zero_stage=2, dtype_bytes=4,
     stage=1：参数与梯度复制一份 + 优化器状态分片；
     stage=2：参数复制 + 梯度分片 + 优化器状态分片；
     stage=3：参数、梯度、优化器状态都按分片。
+
+
+    >>> zero_memory_bytes(1000, 4, zero_stage=3)["total_bytes"]
+    4000
     """
     if isinstance(num_params, bool) or not isinstance(num_params, int) or num_params < 1:
         raise ValueError("zero_memory_bytes: num_params 必须是正整数")
@@ -66002,6 +66026,14 @@ def mlp_property_report(model, trials=20, seed=None, tol=1e-4):
     ``trials`` 是形状/确定性用例数，``seed`` 控制随机源。返回
     ``{"passed", "checks", "trials"}``，``checks`` 每项为
     ``{"name", "ok", "detail"}``；调用方可自行检查 ``passed``。
+
+
+    >>> rep = mlp_property_report(MLP([2, 3, 1], ["relu", "linear"]),
+    ...                           trials=3, seed=0)
+    >>> rep["passed"]
+    True
+    >>> len(rep["checks"])
+    5
     """
     who = "mlp_property_report"
     model = _pq_check_mlp(model, who)
@@ -66175,7 +66207,13 @@ def _w18d_check_matrix(rows, who, width=None):
 
 
 def check_probability_rows(probs, tolerance=1e-9):
-    """属性检查：每行都是概率分布（非负、和为 1），返回最大偏差。"""
+    """属性检查：每行都是概率分布（非负、和为 1），返回最大偏差。
+
+    >>> check_probability_rows([[0.5, 0.5]])
+    0.0
+    >>> check_probability_rows([[0.5, 0.5], [0.25, 0.75]])
+    0.0
+    """
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
         raise TypeError("check_probability_rows: tolerance 必须是数字")
     if tolerance < 0:

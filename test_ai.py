@@ -25816,7 +25816,7 @@ class TestDoctests:
     def test_run_doctests_all_pass(self):
         result = AI.run_doctests()
         assert result["failed"] == 0, result["failures"]
-        assert result["attempted"] >= 5
+        assert result["attempted"] >= 15
 
     def test_run_doctests_rejects_bad_flags(self):
         with pytest.raises(TypeError):
