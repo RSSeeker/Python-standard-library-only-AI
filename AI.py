@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1829 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1831 个 def / 431 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -24780,6 +24780,207 @@ class DenseBlock:
             raise ValueError("DenseBlock.backward: 回传到输入的通道数不符")
         return dcum
 
+
+
+# ---- ConvNeXt V2 block（GRN + Layer Scale，可训练） ----
+
+
+def _cnv2_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"ConvNeXtV2Block: {name} 必须是正整数，收到 {value!r}")
+
+
+def _cnv2_check_image(x, channels, who="ConvNeXtV2Block"):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 输入必须是 (C,H,W) 非空嵌套 list")
+    if len(x) != channels:
+        raise ValueError(
+            f"{who}: 通道数 {len(x)} 与 channels={channels} 不一致")
+    h = len(x[0]) if isinstance(x[0], (list, tuple)) else 0
+    if h <= 0:
+        raise ValueError(f"{who}: 输入必须是 (C,H,W) 非空嵌套 list")
+    w = len(x[0][0]) if x[0] and isinstance(x[0][0], (list, tuple)) else 0
+    if w <= 0:
+        raise ValueError(f"{who}: 输入必须是 (C,H,W) 非空嵌套 list")
+    for ch in x:
+        if not isinstance(ch, (list, tuple)) or len(ch) != h:
+            raise ValueError(f"{who}: 输入必须是规则的 (C,H,W) 嵌套 list")
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or len(row) != w:
+                raise ValueError(f"{who}: 输入必须是规则的 (C,H,W) 嵌套 list")
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: 像素必须是有限数字")
+    return len(x), h, w
+
+
+class ConvNeXtV2Block:
+    """ConvNeXt V2 block：depthwise conv + LN + 升维 + GELU + GRN + 降维 + Layer Scale
+
+    `y = x + layer_scale * pw2(GRN(GELU(pw1(LN(dw(x))))))`
+
+    与 V1 的差别是 GELU 之后加 `GRN`（全局通道响应归一化），残差分支乘一个
+    每通道可学习的 Layer Scale（初始 1e-6），让深层 block 起步时接近恒等。
+    手写反向覆盖 depthwise/两个 1x1 卷积、跨通道 LN、GRN 与 layer scale。
+    """
+
+    def __init__(self, channels, kernel_size=7, expansion=4,
+                 layer_scale_init=1e-6, eps=1e-6):
+        _cnv2_check_pos_int(channels, "channels")
+        _cnv2_check_pos_int(kernel_size, "kernel_size")
+        _cnv2_check_pos_int(expansion, "expansion")
+        if kernel_size % 2 == 0:
+            raise ValueError("ConvNeXtV2Block: kernel_size 必须是奇数")
+        if isinstance(layer_scale_init, bool) \
+                or not isinstance(layer_scale_init, (int, float)) \
+                or not math.isfinite(float(layer_scale_init)):
+            raise ValueError("ConvNeXtV2Block: layer_scale_init 必须是有限数字")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) \
+                or not math.isfinite(float(eps)) or float(eps) <= 0.0:
+            raise ValueError("ConvNeXtV2Block: eps 必须是正有限数字")
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.expansion = expansion
+        self.hidden = channels * expansion
+        self.eps = float(eps)
+        self.dw = Conv2d(channels, channels, kernel_size, stride=1,
+                         padding=kernel_size // 2, groups=channels)
+        self.pw1 = Conv2d(channels, self.hidden, 1)
+        self.pw2 = Conv2d(self.hidden, channels, 1)
+        self.gamma = [1.0] * channels
+        self.beta = [0.0] * channels
+        self.norm_grads = {"gamma": [0.0] * channels,
+                           "beta": [0.0] * channels}
+        self.layer_scale = [float(layer_scale_init)] * channels
+        self.grad_layer_scale = [0.0] * channels
+        self.grn = GRN(self.hidden, eps=self.eps)
+        self.training = True
+        self._cache = None
+
+    def zero_grad(self):
+        self.dw.zero_grad()
+        self.pw1.zero_grad()
+        self.pw2.zero_grad()
+        self.norm_grads["gamma"] = [0.0] * self.channels
+        self.norm_grads["beta"] = [0.0] * self.channels
+        self.grad_layer_scale = [0.0] * self.channels
+        self.grn.zero_grad()
+
+    def param_count(self):
+        return (_conv_param_count(self.dw) + _conv_param_count(self.pw1)
+                + _conv_param_count(self.pw2) + 2 * self.channels
+                + 2 * self.hidden + self.channels)
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def sgd_step(self, lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("ConvNeXtV2Block.sgd_step: lr 必须是非负有限数字")
+        _conv_sgd(self.dw, lr)
+        _conv_sgd(self.pw1, lr)
+        _conv_sgd(self.pw2, lr)
+        for c in range(self.channels):
+            self.gamma[c] -= lr * self.norm_grads["gamma"][c]
+            self.beta[c] -= lr * self.norm_grads["beta"][c]
+            self.layer_scale[c] -= lr * self.grad_layer_scale[c]
+        self.grn.sgd_step(lr)
+
+    def forward(self, x):
+        C, H, W = _cnv2_check_image(x, self.channels)
+        u = self.dw.forward(x)
+        # 跨通道 LayerNorm（每个空间位置独立）
+        n = float(C)
+        xhat = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        inv = [[0.0] * W for _ in range(H)]
+        for h in range(H):
+            for w in range(W):
+                mu = sum(u[c][h][w] for c in range(C)) / n
+                acc = 0.0
+                for c in range(C):
+                    d = u[c][h][w] - mu
+                    acc += d * d
+                iv = 1.0 / math.sqrt(acc / n + self.eps)
+                inv[h][w] = iv
+                for c in range(C):
+                    xhat[c][h][w] = (u[c][h][w] - mu) * iv
+        z = [[[self.gamma[c] * xhat[c][h][w] + self.beta[c]
+               for w in range(W)] for h in range(H)] for c in range(C)]
+        g1 = self.pw1.forward(z)
+        act = [[[_gelu_scalar(v) for v in row] for row in ch] for ch in g1]
+        rows = [[act[c][h][w] for c in range(self.hidden)]
+                for h in range(H) for w in range(W)]
+        grn_rows = self.grn.forward(rows)
+        act2 = [[[grn_rows[h * W + w][c] for w in range(W)]
+                 for h in range(H)] for c in range(self.hidden)]
+        g2 = self.pw2.forward(act2)
+        out = [[[self.layer_scale[c] * g2[c][h][w] + x[c][h][w]
+                 for w in range(W)] for h in range(H)] for c in range(C)]
+        self._cache = (x, u, xhat, inv, z, g1, act, grn_rows, g2)
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("ConvNeXtV2Block.backward: 必须先调用 forward")
+        x, u, xhat, inv, z, g1, act, grn_rows, g2 = self._cache
+        C, H, W = len(x), len(x[0]), len(x[0][0])
+        _cnv2_check_image(dout, C, "ConvNeXtV2Block.backward")
+        # dout 形状校验
+        if len(dout[0]) != H or len(dout[0][0]) != W:
+            raise ValueError("ConvNeXtV2Block.backward: dout 形状与输入不符")
+        # 1) layer scale + 残差
+        dg2 = [[[dout[c][h][w] * self.layer_scale[c] for w in range(W)]
+                for h in range(H)] for c in range(C)]
+        for c in range(C):
+            s = 0.0
+            for h in range(H):
+                for w in range(W):
+                    s += dout[c][h][w] * g2[c][h][w]
+            self.grad_layer_scale[c] = s
+        dact2 = self.pw2.backward(dg2)
+        # 2) GRN 反向（把 (hidden,H,W) 重排成 T 行）
+        d_rows = [[dact2[c][h][w] for c in range(self.hidden)]
+                  for h in range(H) for w in range(W)]
+        d_grn = self.grn.backward(d_rows)
+        dact = [[[d_grn[h * W + w][c] for w in range(W)]
+                 for h in range(H)] for c in range(self.hidden)]
+        # 3) GELU
+        dg1 = [[[dact[c][h][w] * _dgelu_scalar(g1[c][h][w]) for w in range(W)]
+                for h in range(H)] for c in range(self.hidden)]
+        dz = self.pw1.backward(dg1)
+        # 4) 跨通道 LN 反向
+        n = float(C)
+        du = [[[0.0] * W for _ in range(H)] for _ in range(C)]
+        for h in range(H):
+            for w in range(W):
+                dg = [dz[c][h][w] for c in range(C)]
+                for c in range(C):
+                    self.norm_grads["gamma"][c] += dg[c] * xhat[c][h][w]
+                    self.norm_grads["beta"][c] += dg[c]
+                iv = inv[h][w]
+                mean_dxhat = 0.0
+                mean_dxhat_xhat = 0.0
+                for c in range(C):
+                    dxhat = dg[c] * self.gamma[c]
+                    mean_dxhat += dxhat
+                    mean_dxhat_xhat += dxhat * xhat[c][h][w]
+                mean_dxhat /= n
+                mean_dxhat_xhat /= n
+                for c in range(C):
+                    dxhat = dg[c] * self.gamma[c]
+                    du[c][h][w] = (dxhat - mean_dxhat
+                                   - xhat[c][h][w] * mean_dxhat_xhat) * iv
+        # 5) depthwise conv + 残差
+        ddw = self.dw.backward(du)
+        return [[[ddw[c][h][w] + dout[c][h][w] for w in range(W)]
+                 for h in range(H)] for c in range(C)]
 
 class ConvNeXtBlock:
     """ConvNeXt 块：`7x7 depthwise Conv -> LayerNorm(跨通道) -> 1x1 升维 -> GELU -> 1x1 降维` + 残差

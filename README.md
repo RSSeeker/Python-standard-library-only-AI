@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2974 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2979 项）
 
 ## 特性
 
@@ -4854,6 +4854,17 @@ prob = model.predict(features[0])
 输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
 无 batch/Adam/正则；注意力权重不做可视化导出。
 
+### ConvNeXt V2 block（GRN + Layer Scale）
+
+- `ConvNeXtV2Block(channels, kernel_size=7, expansion=4, layer_scale_init=1e-6, eps=1e-6)`：
+  `y = x + layer_scale * pw2(GRN(GELU(pw1(LN(dw(x))))))`，即 ConvNeXt V1
+  块在 GELU 之后接入 GRN（全局通道响应归一化）、残差分支乘每通道可学习的
+  Layer Scale；含手写反向（depthwise/两个 1x1 卷积、跨通道 LN、GRN、
+  Layer Scale）与 `sgd_step/param_count`。
+
+边界：只提供单个 block（不含 V2 的分类头与 FCMAE 稀疏卷积预训练流程），
+Layer Scale 初值 1e-6 使初始近似恒等；与论文的 FCMAE 预训练实现不逐位一致。
+
 ### 量化压缩（GPTQ / AWQ 教学实现）
 
 - `gptq_quantize_matrix(weight, hessian=None, bits=4, percdamp=0.01)`：
@@ -5091,19 +5102,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（53 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（54 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2974 项）。
+`tests/`（合计 2979 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 53 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2974 项
+pytest tests/ -q                 # 54 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2979 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6862,7 +6873,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2974 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2979 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7356,6 +7367,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestConvNeXtV2Block` | ConvNeXt V2 block 前向/梯度/训练 |
 | `TestCNNArchitectures` | 轻量 CNN 前向（复合缩放/倒残差/MBConv） |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestTabNet` | 前向/参数 133、五组权重 FD（head/W1/W2/Wd/W_mask）、40 步收敛、掩码稀疏性与单纯形约束、非法输入 |

@@ -47378,3 +47378,138 @@ class TestGPTQAWQ:
         assert _q_raises(lambda: AI.gptq_weighted_error(w, [[0.0] * 6], h))
         assert _q_raises(lambda: AI.awq_scale_weights(w, [1.0] * 3))
         assert _q_raises(lambda: AI.awq_compensate_input([0.0] * 6, [1.0] * 3))
+
+
+# ---- ConvNeXt V2 block 测试 ----
+
+
+def _cnv2_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _cnv2_data(seed=5, channels=2, h=4, w=4):
+    import random as _random
+    rng = _random.Random(seed)
+    x = [[[rng.uniform(-1.0, 1.0) for _ in range(w)] for _ in range(h)]
+         for _ in range(channels)]
+    target = [[[0.3 * __import__("math").sin(hh + ww + c)
+                for ww in range(w)] for hh in range(h)]
+              for c in range(channels)]
+    return x, target
+
+
+def _cnv2_loss_and_grads(block, x, target):
+    import math as _math
+    ch, h, w = len(x), len(x[0]), len(x[0][0])
+    block.zero_grad()
+    out = block.forward(x)
+    loss = sum((out[c][hh][ww] - target[c][hh][ww]) ** 2
+               for c in range(ch) for hh in range(h)
+               for ww in range(w)) / (ch * h * w)
+    dout = [[[2.0 * (out[c][hh][ww] - target[c][hh][ww]) / (ch * h * w)
+              for ww in range(w)] for hh in range(h)] for c in range(ch)]
+    block.backward(dout)
+    return loss
+
+
+def _cnv2_loss(block, x, target):
+    ch, h, w = len(x), len(x[0]), len(x[0][0])
+    block.zero_grad()
+    out = block.forward(x)
+    return sum((out[c][hh][ww] - target[c][hh][ww]) ** 2
+               for c in range(ch) for hh in range(h)
+               for ww in range(w)) / (ch * h * w)
+
+
+class TestConvNeXtV2Block:
+    def test_forward_and_param_count(self):
+        block = AI.ConvNeXtV2Block(2, kernel_size=3, expansion=2)
+        assert block.param_count() == 56
+        x, _t = _cnv2_data()
+        out = block.forward(x)
+        assert len(out) == 2 and len(out[0]) == 4 and len(out[0][0]) == 4
+
+    def test_initial_layer_scale_is_near_identity(self):
+        block = AI.ConvNeXtV2Block(2, kernel_size=3, expansion=2)
+        x, _t = _cnv2_data()
+        out = block.forward(x)
+        max_diff = max(abs(out[c][h][w] - x[c][h][w])
+                       for c in range(2) for h in range(4) for w in range(4))
+        assert max_diff < 1e-4, max_diff
+
+    def test_numerical_gradients(self):
+        x, target = _cnv2_data()
+        block = AI.ConvNeXtV2Block(2, kernel_size=3, expansion=2,
+                                   layer_scale_init=0.5)
+        _cnv2_loss_and_grads(block, x, target)
+
+        def fd(grad_get, param_get, param_set, tag="", h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = _cnv2_loss(block, x, target)
+            param_set(p0 - h)
+            lm = _cnv2_loss(block, x, target)
+            param_set(p0)
+            _cnv2_loss_and_grads(block, x, target)
+            a = grad_get()
+            f = (lp - lm) / (2.0 * h)
+            rel = abs(a - f) / max(abs(f), 1e-9)
+            assert rel < 1e-4, (tag, a, f, rel)
+
+        fd(lambda: block.dw.grad_w[0][0][1][1],
+           lambda: block.dw.weights[0][0][1][1],
+           lambda v: block.dw.weights[0][0][1].__setitem__(1, v), "dw")
+        fd(lambda: block.pw1.grad_w[1][1][0][0],
+           lambda: block.pw1.weights[1][1][0][0],
+           lambda v: block.pw1.weights[1][1][0].__setitem__(0, v), "pw1")
+        fd(lambda: block.pw2.grad_w[0][1][0][0],
+           lambda: block.pw2.weights[0][1][0][0],
+           lambda v: block.pw2.weights[0][1][0].__setitem__(0, v), "pw2")
+        fd(lambda: block.norm_grads["gamma"][1],
+           lambda: block.gamma[1],
+           lambda v: block.gamma.__setitem__(1, v), "ln_gamma")
+        fd(lambda: block.grad_layer_scale[0],
+           lambda: block.layer_scale[0],
+           lambda v: block.layer_scale.__setitem__(0, v), "layer_scale")
+        fd(lambda: block.grn.grad_gamma[1],
+           lambda: block.grn.gamma[1],
+           lambda v: block.grn.gamma.__setitem__(1, v), "grn_gamma")
+
+    def test_training_converges(self):
+        x, target = _cnv2_data(seed=9, h=3, w=3)
+        random.seed(123)
+        block = AI.ConvNeXtV2Block(2, kernel_size=3, expansion=2,
+                                   layer_scale_init=0.5)
+        first = None
+        last = None
+        for _ in range(60):
+            loss = _cnv2_loss_and_grads(block, x, target)
+            if first is None:
+                first = loss
+            last = loss
+            block.sgd_step(0.02)
+        assert last < first * 0.5, (first, last)
+
+    def test_sgd_step_changes_params_and_invalid_inputs(self):
+        block = AI.ConvNeXtV2Block(2, kernel_size=3, expansion=2)
+        x, target = _cnv2_data(seed=3)
+        before = [row[:] for row in block.dw.weights[0][0]]
+        _cnv2_loss_and_grads(block, x, target)
+        before_ls = block.layer_scale[0]
+        block.sgd_step(0.05)
+        assert before != block.dw.weights[0][0]
+        assert block.layer_scale[0] != before_ls
+
+        assert _cnv2_raises(lambda: AI.ConvNeXtV2Block(0))
+        assert _cnv2_raises(lambda: AI.ConvNeXtV2Block(2, kernel_size=4))
+        assert _cnv2_raises(lambda: AI.ConvNeXtV2Block(2, expansion=0))
+        assert _cnv2_raises(lambda: AI.ConvNeXtV2Block(2, eps=0.0))
+        assert _cnv2_raises(lambda: block.forward([]))
+        assert _cnv2_raises(lambda: block.forward([[[0.1]]]))
+        assert _cnv2_raises(lambda: block.backward([[[0.1, 0.2], [0.3, 0.4]],
+                                                    [[0.1, 0.2], [0.3, 0.4]]]))
+        assert _cnv2_raises(lambda: block.sgd_step(-0.1))
