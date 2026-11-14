@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3008 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3009 项）
 
 ## 特性
 
@@ -5135,6 +5135,10 @@ int/str。边界：不支持 F16/Q4 等量化类型、不支持多层嵌套的�
   `delta_current < 512KB`。
 - **API 稳定性约定**：`API_STABILITY.md` 由 `tools/api_stability.py` 生成并
   `--check` 校验表中名字真实存在；分「逐位一致 / 教学数值 / 仅演示」三类。
+- **PyTorch 对拍**：`tools/torch_parity.py` 用固定权重把 MLP 前向/反向、
+  LayerNorm、Conv2d 前向与权重梯度、交叉熵、Adam 一步与等价 PyTorch 模块比较
+  （容差 1e-5～1e-6），`tests/test_parity.py` 以 subprocess 调用它；本机装了
+  torch 时 7/7 通过，未安装 torch 的环境自动 skip（因此默认 CI 不受影响）。
 
 ### 类型存根（AI.pyi + py.typed）
 
@@ -5213,20 +5217,20 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（55 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2957 项）；`tests/` 目录再放
+一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3008 项）。
+`tests/`（合计 3009 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3008 项
+pytest tests/ -q                 # 52 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 3009 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6985,7 +6989,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3008 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3009 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7523,10 +7527,12 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2908 个单元测试
-├── tests/           # 12 个快速冒烟测试（pytest 自动发现）
+├── test_ai.py       # 2957 个单元测试
+├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
-│   └── numeric_regression.py  # 数值回归快照脚本
+│   ├── numeric_regression.py  # 数值回归快照脚本
+│   ├── api_stability.py       # API 稳定性约定表生成/校验
+│   └── torch_parity.py        # 与 PyTorch 的数值对拍
 ├── mypy.ini         # 渐进类型化配置模板
 ├── py.typed         # 类型标记（仓库非可安装包，仅作标记）
 └── README.md
