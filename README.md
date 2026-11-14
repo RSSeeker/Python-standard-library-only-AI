@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2903 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2915 项）
 
 ## 特性
 
@@ -4877,6 +4877,24 @@ history = model.fit(samples, labels, epochs=100, lr=0.01, seed=1)
 （不是类别字段的 embedding table）；单层线性分类头；注意力复用库内 `TransformerEncoder`
 （无 LayerNorm 预归一化以外的论文改动）；`fit` 是逐样本 SGD，无 Adam/正则。
 
+### 冒烟测试目录（tests/）与类型检查配置
+
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2903 项）；`tests/` 目录再放
+一组**快速冒烟测试**（12 项，`pytest tests/ -q` 约 0.1 秒），只检查公开 API 能否
+跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
+系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
+适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
+`tests/`（合计 2915 项）。
+
+类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
+类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
+标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
+
+```bash
+pytest tests/ -q                 # 12 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2915 项
+```
+
 ### 工程便利件（unwrap_model / Trainer / benchmark_forward）
 
 ```python
@@ -6627,7 +6645,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2903 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2915 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7155,5 +7173,8 @@ CI（GitHub Actions）执行 flake8 + pytest。
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
 ├── test_ai.py       # 2903 个单元测试
+├── tests/           # 12 个快速冒烟测试（pytest 自动发现）
+├── mypy.ini         # 渐进类型化配置模板
+├── py.typed         # 类型标记（仓库非可安装包，仅作标记）
 └── README.md
 ```

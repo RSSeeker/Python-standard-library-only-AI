@@ -86735,16 +86735,19 @@ def sparsemax(logits):
     n = len(z)
     order = sorted(range(n), key=lambda i: -z[i])
     cum = 0.0
+    sum_k = 0.0
     k = 0
     for j in range(n):
-        cum += z[order[j]]
-        if z[order[j]] - (cum - 1.0) / (j + 1) <= 0.0:
+        cand = cum + z[order[j]]
+        if z[order[j]] - (cand - 1.0) / (j + 1) <= 0.0:
             break
+        cum = cand
+        sum_k = cand
         k = j + 1
     if k == 0:
         # 理论上不会发生（τ 收敛时至少有一个支撑），兜底给均匀
         return [1.0 / n] * n
-    tau = (cum - 1.0) / k
+    tau = (sum_k - 1.0) / k
     out = []
     for v in z:
         p = v - tau
