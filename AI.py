@@ -10444,6 +10444,136 @@ def _rlhf_seq_logprob(model, prompt_ids, response_ids, grad_scale=None):
     return avg
 
 
+# ---- KTO 训练循环（KTOTrainer / kto_align） ----
+
+
+def _kto_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"KTOTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"KTOTrainer: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def _kto_check_baseline(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"KTOTrainer: baseline 必须是数字或 None，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"KTOTrainer: baseline 必须是有限数字，收到 {value!r}")
+    return value
+
+
+def _kto_check_samples(pairs):
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("KTOTrainer: samples 必须是非空列表")
+    out = []
+    for i, item in enumerate(pairs):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(
+                f"KTOTrainer: 第 {i} 个样本必须是 (prompt, response, desirable)")
+        prompt, response, desirable = item
+        if not isinstance(desirable, bool):
+            raise TypeError(
+                f"KTOTrainer: 第 {i} 个样本的 desirable 必须是 bool，"
+                f"收到 {type(desirable).__name__}")
+        out.append((prompt, response, desirable))
+    return out
+
+
+class KTOTrainer:
+    """把 ``kto_loss`` 串成可用的 KTO（Kahneman-Tversky 优化）训练循环
+
+    KTO 只用「单条回答 + 它是否合意」的二元标签，不需要成对偏好数据：
+
+    - ``policy``：待训练 ``CausalLM``；``reference``：参考模型（固定）
+    - 每条样本 ``(prompt_ids, response_ids, desirable)``：
+      ``z = logπ(response) − logπ_ref(response)``（均为长度归一化平均 logp），
+      ``kto_loss`` 给出损失与 ``d_logp``，再以该标量为系数对 policy 重放一次反传
+    - ``baseline``：``z`` 的参考点（KTO 原文用参考策略的平均 KL 估计）；为
+      ``None`` 时每轮按当前样本的 ``mean z`` 现估（不参与梯度），也可显式给定
+    - ``sample_step`` 更新一条样本并返回其损失；``fit`` 逐条 ``adam_step`` 并
+      记录每轮平均损失与 baseline
+
+    简化点：平均 token logp（不做 token 级 mask/加权）、逐条更新（不积累 batch）、
+    reference 固定不更新、不做打包与分布式。
+    """
+
+    def __init__(self, policy, reference, beta: float = 0.1,
+                 baseline=None, lr: float = 0.01):
+        _rlhf_check_lm(policy, "KTOTrainer(policy)")
+        _rlhf_check_lm(reference, "KTOTrainer(reference)")
+        self.policy = policy
+        self.reference = reference
+        self.beta = _kto_check_pos_number(beta, "beta")
+        self.lr = _kto_check_pos_number(lr, "lr")
+        if baseline is None:
+            self.baseline = None
+        else:
+            self.baseline = _kto_check_baseline(baseline)
+        self.loss_history = []
+        self.baseline_history = []
+
+    def _estimate_baseline(self, samples):
+        total = 0.0
+        for prompt, response, _desirable in samples:
+            pc = _rlhf_seq_logprob(self.policy, prompt, response)
+            rc = _rlhf_seq_logprob(self.reference, prompt, response)
+            total += pc - rc
+        return total / len(samples)
+
+    def sample_step(self, prompt_ids, response_ids, desirable, baseline):
+        pc = _rlhf_seq_logprob(self.policy, prompt_ids, response_ids)
+        rc = _rlhf_seq_logprob(self.reference, prompt_ids, response_ids)
+        loss, d_logp = kto_loss(pc, rc, desirable=desirable,
+                                beta=self.beta, baseline=baseline)
+        self.policy.zero_grad()
+        _rlhf_seq_logprob(self.policy, prompt_ids, response_ids,
+                          grad_scale=d_logp)
+        self.policy.adam_step(self.lr)
+        self.loss_history.append(loss)
+        return loss
+
+    def fit(self, samples, epochs: int = 1, lr: float = None,
+            shuffle: bool = True, seed=None):
+        samples = _kto_check_samples(samples)
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(
+                f"KTOTrainer.fit: epochs 必须是正整数，收到 {epochs!r}")
+        if lr is not None:
+            self.lr = _kto_check_pos_number(lr, "lr")
+        if not isinstance(shuffle, bool):
+            raise TypeError("KTOTrainer.fit: shuffle 必须是 bool")
+        rng = random.Random(seed)
+        order = list(range(len(samples)))
+        history = []
+        for _ in range(epochs):
+            if shuffle:
+                rng.shuffle(order)
+            if self.baseline is None:
+                baseline = self._estimate_baseline(samples)
+            else:
+                baseline = self.baseline
+            self.baseline_history.append(baseline)
+            losses = []
+            for idx in order:
+                prompt, response, desirable = samples[idx]
+                losses.append(self.sample_step(
+                    prompt, response, desirable, baseline))
+            history.append(sum(losses) / len(losses))
+        return history
+
+
+def kto_align(policy, reference, samples, beta: float = 0.1, baseline=None,
+              lr: float = 0.01, epochs: int = 1, shuffle: bool = True,
+              seed=None):
+    """KTO 便捷入口：构 ``KTOTrainer`` 并返回每轮平均损失。"""
+    trainer = KTOTrainer(policy, reference, beta=beta, baseline=baseline, lr=lr)
+    return trainer.fit(samples, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
 class RLHFTrainer:
     """把 ``preference_loss`` 串成可用的偏好对齐训练循环（DPO/IPO/SimPO/CPO/ORPO）
 

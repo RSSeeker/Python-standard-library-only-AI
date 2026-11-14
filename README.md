@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2632 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2637 项）
 
 ## 特性
 
@@ -1035,6 +1035,8 @@ print(best["path"], best["score"])
 | `RLHFTrainer(policy, reference=None, method='dpo', beta=0.1, ...)` | 把偏好损失串成训练循环：序列 log 概率 → `preference_loss` → 以 `d_chosen`/`d_rejected` 重放反传 → Adam；`pair_step` 单对、`fit` 逐对更新 |
 | `rlhf_align(policy, pairs, reference, method='dpo', ..., epochs=1)` | 便捷入口：`RLHFTrainer(...).fit(...)`，返回每轮平均损失 |
 | `kto_loss(logp, ref_logp, desirable=True, beta=0.1, baseline=0.0)` | KTO：单条样本「好/坏」二元反馈即可，不需要成对偏好数据 |
+| `KTOTrainer(policy, reference, beta=0.1, baseline=None, lr=0.01)` | KTO 训练循环：单条样本 `(prompt, response, desirable)` → `kto_loss` → 以 `d_logp` 重放反传 → Adam；`baseline=None` 时每轮按 `mean(logπ−logπ_ref)` 现估、`sample_step` 单条、`fit` 逐条更新 |
+| `kto_align(policy, reference, samples, beta=0.1, ..., epochs=1)` | 便捷入口：`KTOTrainer(...).fit(...)`，返回每轮平均损失 |
 
 | 损失名（`Model(loss=...)`） | 需要的输出层 | 目标形式 |
 |------|------|------|
@@ -1087,6 +1089,29 @@ losses = rlhf_align(policy, pairs, reference=ref, method="dpo", beta=0.1,
 - 边界：用完整回答序列的平均 logp（不做 token 级 mask/加权）、每对立即更新（不积累 batch）、
   参考模型固定不更新、不打包/不分片；`simpo`/`orpo` 不需要 `reference`；
   只有 DPO/IPO/CPO 需要参考模型（构造时缺 `reference` 会抛 ValueError）
+
+### KTO 训练循环（KTOTrainer）
+
+`kto_loss` 只给单条样本的损失和 `d_logp`；`KTOTrainer` 把「策略模型 / 参考模型 /
+(prompt, response, desirable) 样本」串成能直接跑的循环：算 `z = logπ − logπ_ref`，
+交给 `kto_loss`，再以返回的 `d_logp` 为系数重放一次反传累积梯度，最后 `adam_step`。
+`baseline` 是 `z` 的参考点（KTO 原文用参考策略的平均 KL 估计）；缺省 `None` 时每轮按
+当前样本的 `mean z` 现估并且不参与梯度，也可以显式传固定值。
+
+```python
+policy = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+ref = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+samples = [([1, 2, 3], [4, 5, 6], True), ([1, 2, 3], [7, 8, 9], False)]
+losses = kto_align(policy, ref, samples, beta=0.1, baseline=None, lr=0.01,
+                   epochs=3, seed=0)
+```
+
+- `KTOTrainer(policy, reference, beta=0.1, baseline=None, lr=0.01)`：
+  `sample_step(prompt_ids, response_ids, desirable, baseline)` 单条、
+  `fit(samples, epochs, lr, shuffle, seed)` 逐条更新；
+  `loss_history` 与 `baseline_history` 记录每轮均值
+- 边界：用完整回答序列的平均 logp（不做 token 级 mask/加权）、逐条立即更新（不积累 batch）、
+  参考模型固定不更新、不打包/不分片；`reference` 必需（`z` 需要参考模型的对数概率）
 
 `ohem_loss` 是**批级**接口（一次吃一批概率向量、返回整批梯度），不能塞进 `Model(loss_fn=...)`
 （那是逐样本调用约定）；类别不平衡的两个可选项已经接进映射表，用法：
@@ -5724,7 +5749,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2632 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2637 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6163,6 +6188,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDistillAndHint` | 蒸馏损失：T² 缩放与 KL 对齐、梯度差分、T 校验、hint 均方误差与 weight、Model 接线与激活守卫 |
 | `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
 | `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
+| `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
@@ -6196,6 +6222,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2632 个单元测试
+├── test_ai.py       # 2637 个单元测试
 └── README.md
 ```

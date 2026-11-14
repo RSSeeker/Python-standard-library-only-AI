@@ -41467,3 +41467,112 @@ class TestGradScalerFit:
             lambda: AI.fit_grad_scaler(model, xs, [[1.0, 2.0]] * len(xs)),
         ]
         assert all(_gsf_raises(fn) for fn in bad)
+
+
+import math
+
+
+def _kto_make_pair(seed=3):
+    random.seed(seed)
+    policy = AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=12)
+    random.seed(seed)
+    reference = AI.CausalLM(vocab_size=4, d_model=8, num_heads=2, d_ff=16,
+                            num_layers=1, max_len=12)
+    assert policy.embedding.weight == reference.embedding.weight
+    return policy, reference
+
+
+def _kto_samples():
+    return [([0], [1, 2], True), ([0], [1, 1], True),
+            ([0], [3, 3], False), ([0], [3, 2], False)]
+
+
+def _kto_mean_logp(model, responses):
+    return sum(AI._rlhf_seq_logprob(model, [0], r) for r in responses) / len(responses)
+
+
+def _kto_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestKTOTrainer:
+    def test_fit_moves_desirable_and_undesirable_logp(self):
+        policy, reference = _kto_make_pair()
+        samples = _kto_samples()
+        des_resp = [x[1] for x in samples if x[2]]
+        und_resp = [x[1] for x in samples if not x[2]]
+        des_before = _kto_mean_logp(policy, des_resp)
+        und_before = _kto_mean_logp(policy, und_resp)
+        trainer = AI.KTOTrainer(policy, reference, beta=0.5, baseline=None, lr=0.05)
+        history = trainer.fit(samples, epochs=25, shuffle=True, seed=1)
+        assert len(history) == 25
+        assert all(math.isfinite(v) for v in history)
+        assert history[-1] < history[0]
+        des_after = _kto_mean_logp(policy, des_resp)
+        und_after = _kto_mean_logp(policy, und_resp)
+        assert des_after > des_before
+        assert und_after < und_before
+        # reference 固定不变
+        _, fresh_ref = _kto_make_pair()
+        assert reference.embedding.weight == fresh_ref.embedding.weight
+
+    def test_explicit_baseline_is_used(self):
+        policy, reference = _kto_make_pair()
+        trainer = AI.KTOTrainer(policy, reference, beta=0.5, baseline=0.0, lr=0.05)
+        history = trainer.fit(_kto_samples(), epochs=3, seed=2)
+        assert len(history) == 3
+        assert trainer.baseline_history == [0.0, 0.0, 0.0]
+        assert all(math.isfinite(v) for v in history)
+
+    def test_estimated_baseline_starts_at_zero(self):
+        policy, reference = _kto_make_pair()
+        trainer = AI.KTOTrainer(policy, reference, beta=0.5, baseline=None, lr=0.05)
+        trainer.fit(_kto_samples(), epochs=2, seed=1)
+        assert len(trainer.baseline_history) == 2
+        assert abs(trainer.baseline_history[0]) < 1e-9
+        assert math.isfinite(trainer.baseline_history[1])
+
+    def test_sample_step_matches_kto_loss(self):
+        policy, reference = _kto_make_pair()
+        prompt, response, desirable = [0], [1, 2], True
+        pc = AI._rlhf_seq_logprob(policy, prompt, response)
+        rc = AI._rlhf_seq_logprob(reference, prompt, response)
+        expected, expected_d = AI.kto_loss(pc, rc, desirable=desirable,
+                                           beta=0.4, baseline=0.3)
+        trainer = AI.KTOTrainer(policy, reference, beta=0.4, baseline=0.3, lr=0.01)
+        loss = trainer.sample_step(prompt, response, desirable, 0.3)
+        assert abs(loss - expected) < 1e-12
+        assert len(trainer.loss_history) == 1
+        # d_logp 与有限差分一致（验证 kto_loss 返回的解析梯度方向与大小）
+        eps = 1e-6
+        plus = AI.kto_loss(pc + eps, rc, desirable, 0.4, 0.3)[0]
+        minus = AI.kto_loss(pc - eps, rc, desirable, 0.4, 0.3)[0]
+        fd = (plus - minus) / (2 * eps)
+        assert abs(fd - expected_d) < 1e-6
+
+    def test_invalid_inputs(self):
+        policy, reference = _kto_make_pair()
+        samples = _kto_samples()
+        bad = [
+            lambda: AI.KTOTrainer("policy", reference),
+            lambda: AI.KTOTrainer(policy, "reference"),
+            lambda: AI.KTOTrainer(policy, reference, beta=0.0),
+            lambda: AI.KTOTrainer(policy, reference, beta="0.1"),
+            lambda: AI.KTOTrainer(policy, reference, lr=-1.0),
+            lambda: AI.KTOTrainer(policy, reference, baseline=float("nan")),
+            lambda: AI.KTOTrainer(policy, reference, baseline="x"),
+            lambda: AI.KTOTrainer(policy, reference).fit([], epochs=1),
+            lambda: AI.KTOTrainer(policy, reference).fit(
+                [([0], [1])], epochs=1),
+            lambda: AI.KTOTrainer(policy, reference).fit(
+                [([0], [1], "yes")], epochs=1),
+            lambda: AI.KTOTrainer(policy, reference).fit(samples, epochs=0),
+            lambda: AI.KTOTrainer(policy, reference).fit(
+                samples, epochs=1, shuffle=1),
+        ]
+        assert all(_kto_raises(fn) for fn in bad)
