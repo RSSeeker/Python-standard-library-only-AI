@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2708 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2712 项）
 
 ## 特性
 
@@ -452,6 +452,7 @@ model.train()     # 回到训练
 | `PrefixCacheStore(num_layers, d_model, max_entries=8, min_prefix=1)` | 跨请求 KV 前缀缓存：`put` 写入、`match` 找最长已缓存前缀、`get` 精确命中、`stats`/`clear`；超出 `max_entries` 按 LRU 淘汰 |
 | `make_needle_haystack(total_tokens=256, depth=0.5, needle='NEEDLE', seed=None)` | 生成 needle-in-a-haystack 长上下文：返回 `{'tokens','needle_index','needle'}`，`depth` 控制针的相对位置 |
 | `llm_judge_prompt(question, answer, reference=None, scale=10)` / `parse_judge_verdict(text, scale=10)` / `judge_agreement(scores, tolerance=1.0)` | LLM-as-judge 三件套：评审提示词模板、解析 `Score:`/`Verdict:` 输出（截断到 `[0, scale]`）、多评审打分的均值/标准差/最大差/一致率 |
+| `judge_calibration(scores, labels, lr=0.1, epochs=300, l2=1e-4, bins=10)` | judge 打分校准：把 score 的 logit 当特征做 Platt scaling `p=sigmoid(a·x+b)`，用 NLL+L2 拟合 `a,b`，返回校准前后的 NLL/Brier/ECE 与 `loss_history` |
 | `CausalLM` | 字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头，自带 Adam、`fit` / `evaluate` / `generate`；`rope=True` 时改用旋转位置编码（默认关掉绝对位置编码），`window=N` 用滑动窗口，`generate(use_cache=True)` 走 KV cache，`top_p` / `min_p` 做截尾采样、`repetition_penalty` / `presence_penalty` / `frequency_penalty` / `no_repeat_ngram_size` 抗重复，`num_beams>1` 走束搜索；`save` / `load` 支持 JSON 存档（可选带 Adam 状态做逐位续训）；`attn_impl='flash'` 时每层自注意力改用分块在线 softmax（要求 dropout=0 且不启用 rope/window/alibi） |
 | `MTPLanguageModel` | 带多 token 预测头的因果语言模型：在 `CausalLM` 之上为未来 1–8 个偏移各加一个线性头，训练损失 = 主交叉熵 + `mtp_weight`×各未来头交叉熵均值；其余训练/生成接口与 `CausalLM` 相同 |
 | `MaskedLM` | 掩码语言模型（BERT 式）：双向 Transformer，随机遮 15% 位置（80% 换 `mask_id` / 10% 随机 / 10% 保留），只在被遮位置算交叉熵；自带 Adam、`fit` / `evaluate` / `predict`（填空）、`mask_tokens` |
@@ -1891,6 +1892,11 @@ for row in reliability_diagram(y, p, n_bins=5):
   置信度大量重复时边界会去重，实际箱数可能少于 `n_bins`。
 - ECE/MCE 只统计非空箱，所以输出恒为「有样本的箱」的加权或最大值；概率要求落在
   `[0,1]`（不做归一化，softmax 输出可直接传）。
+
+`judge_calibration(scores, labels)` 面向「LLM 当裁判」的概率校准：它把每个 score
+先转成 logit，再用 Platt scaling 拟合一个标量温度 `a` 与偏置 `b`（`a>1` 表示裁判
+过度自信、需要平滑），返回 `{"a","b","nll_before","nll_after","brier_before",
+"brier_after","ece_before","ece_after"}`，便于直接在评测报告里对比校准前后。
 
 ### 高级评估（OOD / Conformal / 鲁棒性）
 
@@ -6086,7 +6092,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2708 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2712 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6388,6 +6394,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestInterpretability` | logit lens softmax/偏置、top-k 排序、残差方向/投影、steer 与 patching delta、非法输入 |
 | `TestTunedLens` | 每层探针形状与 loss 下降、深层可读性（accuracy 升 / KL 降）、seed 可复现、非法输入（空列表 / 长度不一致 / 维度不一致 / V<2） |
 | `TestKnowledgeEditing` | ROME 单条编辑输出精确性/偏置不变/最小范数、MEMIT 多条编辑精确性、键线性相关与维度不匹配等非法输入 |
+| `TestJudgeCalibration` | 合成 1.8 温度数据恢复 `a≈1.8` 且 NLL/Brier/ECE 下降、ECE 在完全正确预测下为 0、全正标签仍有限、九类非法输入（空/不等长/越界标签/NaN/lr/epochs/l2/bins） |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6574,6 +6581,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2708 个单元测试
+├── test_ai.py       # 2712 个单元测试
 └── README.md
 ```

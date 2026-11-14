@@ -43225,3 +43225,74 @@ class TestKnowledgeEditing:
         # 数量不一致
         assert _re_raises(lambda: AI.memit_edit(
             layer, [[1, 0, 0, 0], [0, 1, 0, 0]], [[1.0, 2.0]]))
+
+
+import random
+import math
+
+
+def _jc_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _jc_data(seed=0, N=2000):
+    rng = random.Random(seed)
+    xs = [rng.gauss(0, 1.5) for _ in range(N)]
+    labels = [1.0 if rng.random() < 1 / (1 + math.exp(-1.8 * x)) else 0.0
+              for x in xs]
+    scores = [1 / (1 + math.exp(-x)) for x in xs]
+    return scores, labels
+
+
+class TestJudgeCalibration:
+    def test_platt_recovers_temperature(self):
+        scores, labels = _jc_data()
+        res = AI.judge_calibration(scores, labels, lr=0.5, epochs=400)
+        assert abs(res["a"] - 1.8) < 0.15
+        assert res["n"] == 2000
+        assert res["nll_after"] < res["nll_before"]
+        assert res["brier_after"] < res["brier_before"]
+        assert res["ece_after"] < res["ece_before"]
+        assert len(res["loss_history"]) == 400
+        assert res["loss_history"][-1] < res["loss_history"][0]
+
+    def test_ece_computation(self):
+        # 完全准确的预测 -> ECE 接近 0
+        ece = AI.expected_calibration_error(
+            [1, 0] * 50, [1.0, 0.0] * 50, n_bins=10)
+        assert ece < 1e-12
+        # 一半 0.9 时对、一半 0.1 时错 -> ECE ≈ 0.1
+        ece2 = AI.expected_calibration_error(
+            [1] * 10 + [0] * 10, [0.9] * 10 + [0.1] * 10, n_bins=10)
+        assert abs(ece2 - 0.1) < 1e-12
+
+    def test_all_positive_labels(self):
+        res = AI.judge_calibration([0.2, 0.5, 0.8, 0.9], [1, 1, 1, 1],
+                                   lr=0.2, epochs=50)
+        assert math.isfinite(res["a"]) and math.isfinite(res["b"])
+        assert res["nll_after"] <= res["nll_before"] + 1e-9
+
+    def test_invalid_inputs(self):
+        scores, labels = _jc_data(N=10)
+        assert _jc_raises(lambda: AI.judge_calibration([], []))
+        assert _jc_raises(lambda: AI.judge_calibration(scores, labels[:-1]))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            [0.5, 0.5], [1, 2]))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            [0.5, float("nan")], [1, 0]))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            scores, labels, lr=0.0))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            scores, labels, epochs=0))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            scores, labels, l2=-0.1))
+        assert _jc_raises(lambda: AI.judge_calibration(
+            scores, labels, bins=0))
+        assert _jc_raises(lambda: AI.expected_calibration_error(
+            [0.5], [1], n_bins=0))

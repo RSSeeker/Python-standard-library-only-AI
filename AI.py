@@ -29989,6 +29989,141 @@ def parse_judge_verdict(text, scale: int = 10):
     return {'score': score, 'verdict': verdict}
 
 
+
+"""LLM-as-judge 的校准：Platt scaling（温度 + 偏置）+ ECE / 可靠性分箱。
+
+judge 输出的概率往往**过度自信**或**系统性偏松**。这里只用一个标量特征
+``x``（score 的 logit）拟合 ``p = sigmoid(a·x + b)``，用带 L2 的逻辑回归
+最小化 NLL；再给出校准前后的 NLL、Brier、ECE 与可靠性分箱，便于检查
+「自信度与准确率是否对齐」。
+"""
+
+
+def _jc_eps():
+    return 1e-12
+
+
+def _jc_check_scores(scores, labels):
+    if not isinstance(scores, (list, tuple)) or len(scores) == 0:
+        raise ValueError("judge_calibration: scores 必须是非空列表")
+    if not isinstance(labels, (list, tuple)) or len(labels) != len(scores):
+        raise ValueError("judge_calibration: labels 必须与 scores 等长")
+    ss = []
+    for v in scores:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            raise ValueError("judge_calibration: score 必须是有限数字")
+        ss.append(float(v))
+    ls = []
+    for v in labels:
+        if isinstance(v, bool):
+            ls.append(1.0 if v else 0.0)
+        elif isinstance(v, (int, float)) and v in (0, 0.0, 1, 1.0):
+            ls.append(float(v))
+        else:
+            raise ValueError("judge_calibration: label 必须是 0/1")
+    return ss, ls
+
+
+def _jc_logit(score):
+    """把 [0,1] 的 judge 概率转 logit；区间外按 logit 直接使用。"""
+    if 0.0 < score < 1.0:
+        return math.log(score / (1.0 - score))
+    if score <= 0.0:
+        return math.log(_jc_eps() / (1.0 - _jc_eps()))
+    return math.log((1.0 - _jc_eps()) / _jc_eps())
+
+
+def _jc_sigmoid(z):
+    if z >= 0.0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+def _jc_nll(probs, labels):
+    total = 0.0
+    for p, y in zip(probs, labels):
+        p = min(max(p, _jc_eps()), 1.0 - _jc_eps())
+        total -= y * math.log(p) + (1.0 - y) * math.log(1.0 - p)
+    return total / len(probs)
+
+
+def _jc_brier(probs, labels):
+    return sum((p - y) ** 2 for p, y in zip(probs, labels)) / len(probs)
+
+
+def _jc_ece(probs, labels, bins=10):
+    """ECE：按预测概率分箱，累加 |平均置信度 − 准确率| 的加权和。"""
+    if not isinstance(bins, int) or isinstance(bins, bool) or bins < 1:
+        raise ValueError("judge_calibration: bins 必须是正整数")
+    ps, ls = _jc_check_scores(probs, labels)
+    for v in ps:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("judge_calibration: 概率必须在 [0,1]")
+    buckets = [[] for _ in range(bins)]
+    for p, y in zip(ps, ls):
+        idx = min(bins - 1, int(p * bins))
+        buckets[idx].append((p, y))
+    n = len(ps)
+    ece = 0.0
+    for bucket in buckets:
+        if not bucket:
+            continue
+        avg_conf = sum(p for p, _ in bucket) / len(bucket)
+        acc = sum(y for _, y in bucket) / len(bucket)
+        ece += len(bucket) / n * abs(avg_conf - acc)
+    return ece
+
+
+def judge_calibration(scores, labels, lr=0.1, epochs=300, l2=1e-4, bins=10):
+    """用 Platt scaling 校准 judge 分数，返回校准参数与前后指标。"""
+    ss, ls = _jc_check_scores(scores, labels)
+    if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+            or not math.isfinite(lr) or lr <= 0.0:
+        raise ValueError("judge_calibration: lr 必须是正数")
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+        raise ValueError("judge_calibration: epochs 必须是正整数")
+    if not isinstance(l2, (int, float)) or isinstance(l2, bool) \
+            or not math.isfinite(l2) or l2 < 0.0:
+        raise ValueError("judge_calibration: l2 必须是非负有限数")
+    if not isinstance(bins, int) or isinstance(bins, bool) or bins < 1:
+        raise ValueError("judge_calibration: bins 必须是正整数")
+    n = len(ss)
+    xs = [_jc_logit(s) for s in ss]
+    # 初始化为恒等映射：a=1, b=0
+    a, b = 1.0, 0.0
+    history = []
+    for _ in range(epochs):
+        ga, gb = 0.0, 0.0
+        loss = 0.0
+        for x, y in zip(xs, ls):
+            p = _jc_sigmoid(a * x + b)
+            p = min(max(p, _jc_eps()), 1.0 - _jc_eps())
+            loss -= y * math.log(p) + (1.0 - y) * math.log(1.0 - p)
+            g = p - y
+            ga += g * x
+            gb += g
+        loss = loss / n + l2 * (a * a + b * b)
+        history.append(loss)
+        a -= lr * (ga / n + 2.0 * l2 * a)
+        b -= lr * (gb / n + 2.0 * l2 * b)
+
+    before = [_jc_sigmoid(x) for x in xs]
+    after = [_jc_sigmoid(a * x + b) for x in xs]
+    return {
+        "a": a,
+        "b": b,
+        "n": n,
+        "loss_history": history,
+        "nll_before": _jc_nll(before, ls),
+        "nll_after": _jc_nll(after, ls),
+        "brier_before": _jc_brier(before, ls),
+        "brier_after": _jc_brier(after, ls),
+        "ece_before": _jc_ece(before, ls, bins),
+        "ece_after": _jc_ece(after, ls, bins),
+    }
+
 def judge_agreement(scores, tolerance: float = 1.0):
     """多个 judge 打分的均值/标准差/最大差与一致率。
 
