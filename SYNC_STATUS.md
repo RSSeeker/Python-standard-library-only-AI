@@ -32,6 +32,7 @@ C 仓库通过 `c/tools/*_reference.py` 从 Python `AI.py` 导出参考 JSON，
 | 可解释性 | SAE（重建 + L1、手写反向、激活统计） | 逐位 |
 | 服务与推理 | 树状注意力；PagedAttention 块分配器（分配/共享/COW/swap/统计） | 逐位 |
 | 幻觉检测 | 余弦/句向量相似度、NLI 比例、token 级支撑检测 | 逐位 |
+| KV cache 淘汰 | StreamingLLM / H2O / SnapKV 保留下标选择与 K/V 压缩（21 用例） | 39 项逐位全同 |
 | 语音 | TextToMel、Griffin-Lim、Mel 反演 | 逐位 |
 | KAN | B 样条边函数前向 + 手写反向 | 267/267 |
 | 模型类（前向） | LLaMA、BERT、ViT、ELECTRA、RWKV、RetNet、xLSTM、Mamba、DeBERTa | 逐位 |
@@ -47,6 +48,7 @@ C 仓库通过 `c/tools/*_reference.py` 从 Python `AI.py` 导出参考 JSON，
 | RWKV-5/6/7 time-mixing | `270c9c8` | `exp(-exp(w))` ≤1 ULP，1e-12 容差 |
 | 模型合并 | `edba066` | SLERP 的 sqrt/acos/sin ≤1 ULP；DARE 要求显式 seed |
 | 参考导出确定性 | `8c4399e` | 5 个参考脚本固定 `random.seed(20261113)`，消除 `make check` 抖动 |
+| KV cache 淘汰 | `36e4995` | 21 用例 39 项逐位；obs=-1 表示自动窗口，budget==seq_len 全保留 |
 
 ## 2. 未同步到 C 的清单
 
@@ -220,3 +222,83 @@ C 引擎是独立轨道，不在 Web 的同步范围内。
 ## 8. 变更记录（补充）
 
 - 2026-11-14：新增本节，记录 Python 批 1–41 的能力清单与同步建议；C/Web 侧尚未开始本批同步。
+
+## 9. 2026-11-14 17:50 同步暂停快照
+
+用户要求：**先停止同步，把「未同步」状态记录清楚**（本文件即同步看板）。
+以下为暂停时刻的三仓事实。
+
+### 9.1 三仓快照
+
+| 仓库 | HEAD | 状态 |
+| --- | --- | --- |
+| Python（主） | `89a5057` | 2818 tests，`pytest test_ai.py` 全绿；工作区 clean |
+| C | `36e4995` | `mingw32-make check` 两次 EXIT=0；仅未跟踪 `c/tools/__pycache__/`（下次提交前删除） |
+| Web | `09faa7a` | 工作区 clean；`node tools/check.js` ALL PASS (303 checks) |
+
+### 9.2 本轮已完成的同步（仅 C · KV cache 淘汰）
+
+- C 提交 `36e4995 feat(kv_evict): 新增 KV cache 淘汰策略 StreamingLLM/H2O/SnapKV（同步 Python 0347761）`：
+  `c/kv_evict.h` / `c/kv_evict.c`、`c/tools/kv_evict_reference.py`（21 个用例）、
+  `c/tests/compare_kv_evict.c`；`c/Makefile` 的 `check`/`clean` 已接线；`c/README.md`
+  补了功能表行、命令列表与说明 bullet。
+- 本地对拍：**39 项检查、逐位相同 39、失败 0、最大绝对差 0.000e+00**。
+- CI：run `43581709093`（CI Build Check）与 `43581709092`（Build and Release）均 **success**。
+- 该能力已并入第 1 节「已同步到 C 的能力」。
+
+### 9.3 本轮 Web 侧：没有产生任何同步提交
+
+- kv_evict 的 Web 移植曾在工作区试插：`index.html` 新增 `llmKvInt/llmKvBudget/llmKvScores/
+  llmStreamingKvKeep/llmKvAggregate/llmKvTopIndices/llmH2oKvKeep/llmSnapkvKvKeep/llmKvCacheEvict`，
+  `tools/extract_page_js.js` 注册 9 个函数名，`tools/llm_core_test.js` 新增 `testKvEviction`
+  （约 40 条断言）。
+- `node tools/check.js` → **1 FAILURE / 331 checks**，未提交；按用户「不要同步了」的指示已
+  `git checkout -- index.html tools/extract_page_js.js tools/llm_core_test.js` 回退，Web 工作区 clean。
+- 因此 Web 侧自 `09faa7a` 文档之后**没有任何新增同步**；README 同步范围表仍是 6 ✅ / 9 ⛔。
+- 回退的脚本保留在 `C:\Users\Jiang\AppData\Local\Temp\ai-verify\web_kv_insert.py` 与
+  `web_kv_test_add.py`，恢复同步时可复用；那 1 处失败大概率是 h2o recent 或 snapkv
+  `obs=-1`（自动窗口）的期望值/语义不一致，需对照 `c/kv_evict_reference.json` 逐例核对。
+
+### 9.4 仍未同步到 C 的能力
+
+第 7 节八类清单中，除「推理 / KV cache 淘汰」一项已完成 C 侧对拍外，其余**全部未同步**：
+
+- **注意力 / 状态空间**：GLA / DeltaNet / LightningAttention 手写反向、完整 MLA（Q 低秩 + 解耦 RoPE）、
+  Hyena 完整 block、MoE capacity/token dropping/aux 反向、RetNet/Mamba2 chunkwise、S4D、S5、
+  RG-LRU、Perceiver IO、FNet、Griffin block（Hawk 是 RG-LRU 别名）。
+- **大模型组合**：Mixtral 风格 MoE-LLM、DeepSeek-V3 风格 MLA+MoE+MTP、VMamba 完整分类器。
+- **训练循环**：KTO、GRPO/DAPO/GSPO、PPO-with-KL、通用 PEFT 入口 `finetune_adapter`
+  （LoRA/QLoRA/DoRA/AdaLoRA/VeRA/ReFT）、GradScaler 动态缩放、通用梯度检查点。
+- **优化器 / 并行**：Sophia Hutchinson 对角估计、Shampoo Newton 逆根 + Adam grafting、GaLore、
+  8-bit Adam、ZeRO-2/3、1F1B 调度、TP/SP 反向。
+- **推理**（KV 淘汰已同步）：Prompt 前缀缓存管理 `PromptCacheManager`、Lookahead decoding、
+  EAGLE 草稿头训练。
+- **评估 / 安全**：Elo/Bradley-Terry、judge 校准、PII/canary/越狱扫描、工具调用评测、RULER、
+  数据污染检测、数学等价 AST。
+- **可解释性**：归纳头/线性探针、tuned lens、ROME/MEMIT、causal tracing、ACDC。
+- **工程质量**：核心 API doctest 示例、MLP 属性测试报告、数值 fuzzing、单文件与拆包评估结论。
+
+另外第 2 节列出的旧缺口（模型级、训练与后训练、Agent/RAG、领域模型、数据/检索/可解释性/部署杂项）
+也仍然存在，未在本轮处理。
+
+### 9.5 仍未同步到 Web 的能力
+
+按第 3 节定位（浏览器单文件演示，不做训练循环/指标计算/C 引擎移植/研究型组件），以下均未同步：
+训练与后训练、RL、指标族、C 引擎移植、研究型组件；本轮唯一试插的 KV 淘汰也已回退，
+所以 Web 相对 `09faa7a` 没有变化。
+
+### 9.6 恢复同步时的起点建议
+
+1. **C 侧先做纯函数组**（不依赖训练循环，最容易逐位对拍）：Elo/BT、judge 校准 Platt scaling、
+   数学等价 AST、PII/canary/越狱扫描、工具调用解析、RULER 的纯文本部分、induction head 分数、
+   tuned lens 的纯矩阵部分。
+2. 再考虑 KV 管理族里剩下的一项：`PromptCacheManager`（前缀索引 + LRU + token 预算，纯 list/dict 逻辑）。
+3. 训练循环类（KTO/GRPO/PPO-KL/PEFT fit）需要 C 侧先补「回调 + 优化器状态」协议，建议最后统一设计。
+4. **Web 若恢复**：先完成 kv_evict 并修掉那 1 处失败，再按 README 同步范围表逐项补；
+   训练/指标/RL 类按定位仍不进入 Web。
+
+### 9.7 变更记录（本轮）
+
+- 2026-11-14：用户要求「不要同步了，先记录未同步的」；新增本节，记录三仓 HEAD、C 侧仅
+  kv_evict 已同步（提交 + CI + 对拍数）、Web 侧试插已回退且无新增、剩余未同步清单索引
+  （详细见第 2、7 节）与恢复同步的起点建议。
