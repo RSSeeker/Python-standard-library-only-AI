@@ -58414,6 +58414,157 @@ def zero_optimizer_step(flat_params, flat_grads, lr, world_size):
     return fsdp_all_gather([(s, e, updated[s:e]) for s, e, _ in shards]), updates
 
 
+
+def _zero_check_flat(flat, who):
+    """校验扁平参数/梯度列表：非空、逐项有限数字。"""
+    if not isinstance(flat, (list, tuple)) or not flat:
+        raise ValueError(f"{who}: 必须是非空列表")
+    out = []
+    for v in flat:
+        if isinstance(v, bool) or not _is_num(v) or not math.isfinite(float(v)):
+            raise ValueError(f"{who}: 每个元素必须是有限数字")
+        out.append(float(v))
+    return out
+
+
+def _zero_check_world(world_size, who):
+    if isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1:
+        raise ValueError(f"{who}: world_size 必须是正整数")
+    return world_size
+
+
+def _zero_adam_shard(params, grads, m, v, step, lr, beta1, beta2, eps):
+    """对一段分片做 Adam 更新（含偏差修正），返回 (new_params, m, v)。"""
+    c1 = 1.0 - beta1 ** step
+    c2 = 1.0 - beta2 ** step
+    new_params = []
+    new_m = []
+    new_v = []
+    for i, p in enumerate(params):
+        g = grads[i]
+        mi = beta1 * m[i] + (1.0 - beta1) * g
+        vi = beta2 * v[i] + (1.0 - beta2) * g * g
+        m_hat = mi / c1
+        v_hat = vi / c2
+        new_params.append(p - lr * m_hat / (math.sqrt(v_hat) + eps))
+        new_m.append(mi)
+        new_v.append(vi)
+    return new_params, new_m, new_v
+
+
+def _zero_split_count(total, world_size):
+    """把 total 个元素尽量均匀切成 world_size 段，返回 [(start, end), ...]。"""
+    base = total // world_size
+    rem = total % world_size
+    out = []
+    start = 0
+    for r in range(world_size):
+        size = base + (1 if r < rem else 0)
+        out.append((start, start + size))
+        start += size
+    return out
+
+
+def zero_adam_step(flat_params, rank_grads, states=None, zero_stage=2,
+                   lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+    """模拟 ZeRO-2/3 的 Adam 单步更新（纯数值，无通信）。
+
+    - ``rank_grads``：每个 rank 的完整梯度（数据并行副本，取平均后等价于全局梯度）。
+    - stage=2：参数完整复制；每 rank 只保留自己分片的 Adam 状态，reduce-scatter 后
+      只更新分片，再 all-gather 拼回完整参数。
+    - stage=3：参数与梯度都按分片持有（模拟参数分片 + forward 时 all-gather）；
+      每 rank 的 ``params_shard`` / ``m`` / ``v`` 只覆盖自己那段。
+
+    返回 ``{'zero_stage','params','states','shards','params_shards','world_size'}``。
+    """
+    who = "zero_adam_step"
+    params = _zero_check_flat(flat_params, who + "(flat_params)")
+    world = _zero_check_world(len(rank_grads) if isinstance(rank_grads, (list, tuple)) else 0,
+                              who)
+    if zero_stage not in (2, 3):
+        raise ValueError(f"{who}: zero_stage 只支持 2 或 3")
+    if isinstance(lr, bool) or not _is_num(lr) or lr < 0:
+        raise ValueError(f"{who}: lr 必须是非负数")
+    grads_all = []
+    for r, g in enumerate(rank_grads):
+        grads_all.append(_zero_check_flat(g, f"{who}(rank_grads[{r}])"))
+        if len(grads_all[-1]) != len(params):
+            raise ValueError(f"{who}: 每个 rank 的梯度长度必须与参数长度一致")
+    avg = [sum(g[i] for g in grads_all) / world for i in range(len(params))]
+
+    n = len(params)
+    shards = _zero_split_count(n, world)
+    prev = states or {}
+    step = int(prev.get("step", 0)) + 1
+    old_m = prev.get("m")
+    old_v = prev.get("v")
+    if old_m is None:
+        old_m = [[0.0] * (e - s) for s, e in shards]
+        old_v = [[0.0] * (e - s) for s, e in shards]
+
+    params_shards = []
+    new_m = []
+    new_v = []
+    full = list(params)
+    rank_states = []
+    for r, (s, e) in enumerate(shards):
+        p_shard = params[s:e]
+        g_shard = avg[s:e]
+        m_shard = old_m[r] if r < len(old_m) else [0.0] * (e - s)
+        v_shard = old_v[r] if r < len(old_v) else [0.0] * (e - s)
+        new_p, m2, v2 = _zero_adam_shard(p_shard, g_shard, m_shard, v_shard,
+                                         step, lr, beta1, beta2, eps)
+        params_shards.append(new_p)
+        new_m.append(m2)
+        new_v.append(v2)
+        full[s:e] = new_p
+        rank_states.append({
+            "rank": r,
+            "range": (s, e),
+            "params": list(new_p) if zero_stage == 3 else None,
+            "m": m2,
+            "v": v2,
+        })
+    return {
+        "zero_stage": zero_stage,
+        "world_size": world,
+        "step": step,
+        "params": full,
+        "params_shards": params_shards,
+        "rank_states": rank_states,
+        "shards": shards,
+        "states": {"step": step, "m": new_m, "v": new_v},
+    }
+
+
+def zero_memory_bytes(num_params, world_size, zero_stage=2, dtype_bytes=4,
+                      state_multiples=2):
+    """估算每 rank 的参数/梯度/优化器状态字节数（教学用，不含临时缓冲）。
+
+    stage=1：参数与梯度复制一份 + 优化器状态分片；
+    stage=2：参数复制 + 梯度分片 + 优化器状态分片；
+    stage=3：参数、梯度、优化器状态都按分片。
+    """
+    if isinstance(num_params, bool) or not isinstance(num_params, int) or num_params < 1:
+        raise ValueError("zero_memory_bytes: num_params 必须是正整数")
+    world = _zero_check_world(world_size, "zero_memory_bytes")
+    if zero_stage not in (1, 2, 3):
+        raise ValueError("zero_memory_bytes: zero_stage 只支持 1/2/3")
+    if isinstance(state_multiples, bool) or not isinstance(state_multiples, int) or state_multiples < 0:
+        raise ValueError("zero_memory_bytes: state_multiples 必须是非负整数")
+    shard = math.ceil(num_params / world)
+    param_bytes = shard * dtype_bytes if zero_stage == 3 else num_params * dtype_bytes
+    grad_bytes = num_params * dtype_bytes if zero_stage == 1 else shard * dtype_bytes
+    state_bytes = shard * dtype_bytes * state_multiples
+    return {
+        "zero_stage": zero_stage,
+        "world_size": world,
+        "params_bytes": param_bytes,
+        "grads_bytes": grad_bytes,
+        "optimizer_bytes": state_bytes,
+        "total_bytes": param_bytes + grad_bytes + state_bytes,
+    }
+
 def fsdp_reduce_scatter(rank_grads, world_size):
     """模拟 FSDP 的 reduce-scatter：各 rank 先对完整梯度求平均，再按住分片。
 

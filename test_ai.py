@@ -44242,3 +44242,99 @@ class TestPromptCacheManager:
         ]
         results = [_pcm_raises(f) for f in bad]
         assert all(results), results
+
+
+def _zero_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _zero_ref_adam(params, avg, m, v, step, lr, b1=0.9, b2=0.999, eps=1e-8):
+    c1 = 1 - b1 ** step
+    c2 = 1 - b2 ** step
+    out = []
+    nm = []
+    nv = []
+    for i, p in enumerate(params):
+        g = avg[i]
+        mi = b1 * m[i] + (1 - b1) * g
+        vi = b2 * v[i] + (1 - b2) * g * g
+        out.append(p - lr * (mi / c1) / (math.sqrt(vi / c2) + eps))
+        nm.append(mi)
+        nv.append(vi)
+    return out, nm, nv
+
+
+import math
+
+
+class TestZero23:
+    def test_zero2_single_step_matches_adam(self):
+        params = [0.5, -0.2, 0.1, 0.7, -0.4]
+        g1 = [0.1, -0.3, 0.2, 0.0, 0.05]
+        g2 = [0.05, -0.1, -0.2, 0.1, 0.0]
+        out = AI.zero_adam_step(params, [g1, g2], zero_stage=2, lr=1e-2)
+        avg = [(a + b) / 2 for a, b in zip(g1, g2)]
+        exp = _zero_ref_adam(params, avg, [0.0] * 5, [0.0] * 5, 1, 1e-2)[0]
+        assert max(abs(a - b) for a, b in zip(out["params"], exp)) < 1e-15
+
+    def test_zero2_state_recurrence(self):
+        params = [0.5, -0.2, 0.1, 0.7, -0.4]
+        pairs = [([0.1, -0.3, 0.2, 0.0, 0.05], [0.05, -0.1, -0.2, 0.1, 0.0]),
+                 ([0.2, 0.1, -0.1, 0.0, 0.3], [0.0, 0.2, 0.1, -0.2, 0.1]),
+                 ([0.05, -0.05, 0.0, 0.3, 0.1], [0.1, 0.0, -0.2, 0.0, 0.2])]
+        cur = list(params)
+        ref = list(params)
+        m = [0.0] * 5
+        v = [0.0] * 5
+        state = None
+        for step, (ga, gb) in enumerate(pairs, start=1):
+            out = AI.zero_adam_step(cur, [ga, gb], states=state, zero_stage=2, lr=1e-2)
+            cur = out["params"]
+            state = out["states"]
+            avg = [(a + b) / 2 for a, b in zip(ga, gb)]
+            ref, m, v = _zero_ref_adam(ref, avg, m, v, step, 1e-2)
+        assert max(abs(a - b) for a, b in zip(cur, ref)) < 1e-12
+
+    def test_zero3_shards_and_numerics(self):
+        params = [0.5, -0.2, 0.1, 0.7, -0.4]
+        grads = [[0.1, -0.3, 0.2, 0.0, 0.05], [0.05, -0.1, -0.2, 0.1, 0.0]]
+        r2 = AI.zero_adam_step(params, grads, zero_stage=2, lr=1e-2)
+        r3 = AI.zero_adam_step(params, grads, zero_stage=3, lr=1e-2)
+        assert max(abs(a - b) for a, b in zip(r2["params"], r3["params"])) < 1e-15
+        sizes = [e - s for s, e in r3["shards"]]
+        assert sum(sizes) == len(params) and max(sizes) - min(sizes) <= 1
+        owned = []
+        for st, (s, e) in zip(r3["rank_states"], r3["shards"]):
+            assert len(st["params"]) == e - s
+            owned.extend(st["params"])
+        assert owned == r3["params"]
+
+    def test_zero_memory_estimate(self):
+        mem1 = AI.zero_memory_bytes(1000, 4, zero_stage=1)
+        mem2 = AI.zero_memory_bytes(1000, 4, zero_stage=2)
+        mem3 = AI.zero_memory_bytes(1000, 4, zero_stage=3)
+        assert mem1["total_bytes"] > mem2["total_bytes"] > mem3["total_bytes"]
+        assert mem3["grads_bytes"] == 250 * 4
+        assert mem3["optimizer_bytes"] == 250 * 4 * 2
+
+    def test_invalid_inputs(self):
+        params = [0.5, -0.2, 0.1]
+        g = [0.1, 0.2, 0.3]
+        bad = [
+            lambda: AI.zero_adam_step([], [[0.0]], zero_stage=2),
+            lambda: AI.zero_adam_step(params, [], zero_stage=2),
+            lambda: AI.zero_adam_step(params, [g[:2]], zero_stage=2),
+            lambda: AI.zero_adam_step(params, [g], zero_stage=4),
+            lambda: AI.zero_adam_step(params, [g], zero_stage=2, lr=-0.1),
+            lambda: AI.zero_adam_step(params, [[0.1, "x", 0.3]], zero_stage=2),
+            lambda: AI.zero_memory_bytes(0, 4),
+            lambda: AI.zero_memory_bytes(10, 0),
+            lambda: AI.zero_memory_bytes(10, 4, zero_stage=5),
+            lambda: AI.zero_memory_bytes(10, 4, state_multiples=-1),
+        ]
+        results = [_zero_raises(f) for f in bad]
+        assert all(results), results
