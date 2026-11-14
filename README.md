@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2944 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2952 项）
 
 ## 特性
 
@@ -4936,6 +4936,40 @@ python -m ai serve  --checkpoint run/model.json --port 8000
 - `train --resume`：从 `run/checkpoints/manifest.json` 的最近检查点恢复权重与优化器动量后继续训练（epoch 编号连续）。
 - 出错统一输出 `{"error": "..."}` 到 stderr 并返回码 2。
 
+### HF 目录约定兼容层（config.json / tokenizer.json / model.safetensors）
+
+`ai/hf_compat.py` 提供「像 HuggingFace 目录那样」的读写适配器：
+
+```python
+from ai import hf_compat
+hf_compat.save_hf_directory(model, "ckpt_hf", tokenizer=["<pad>", "hello"],
+                            num_labels=2)
+art = hf_compat.load_hf_directory("ckpt_hf")
+art["model"].forward([0.1, 0.2, 0.3])
+```
+
+- `config.json`：`architectures`/`model_type`/`hidden_size`/`num_hidden_layers`/
+  `activation_function`/`framework` + 自定义 `ai_layers`（每层 in/out/activation，
+  用于精确重建）；`tokenizer.json` 为可选 wordlevel 词表；
+- `model.safetensors`：张量名 `model.layers.<i>.weight` / `.bias`，底层走
+  `AI.safetensors_save/load`；
+- 边界：只支持本库 MLP，不是 transformers 的完整配置语义；tokenizer 只有 wordlevel。
+
+### GGUF 读写（教学简化版）
+
+`ai/gguf.py` 实现 GGUF v3 的最小读写：header/元数据/张量描述符按 llama.cpp 布局，
+张量数据只支持 F32（行主序）：
+
+```python
+from ai import gguf
+gguf.save_gguf(gguf.model_to_gguf_tensors(model), "m.gguf",
+               metadata={"ai.arch": "mlp", "ai.hidden": 4})
+out = gguf.load_gguf("m.gguf")   # {"metadata", "tensors", "dims"}
+```
+
+权重矩阵的 dims 记为 `[in, out]`（形状 `[out][in]`），bias 记 `[out]`；元数据支持
+int/str。边界：不支持 F16/Q4 等量化类型、不支持多层嵌套的元数据数组。
+
 ### 进程级分布式启动器（python -m ai.launch）
 
 `ai/launch.py` 用标准库 `multiprocessing`（spawn）在多个进程里并行执行同一个
@@ -4979,19 +5013,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（31 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（39 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2944 项）。
+`tests/`（合计 2952 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 31 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2944 项
+pytest tests/ -q                 # 39 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2952 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6750,7 +6784,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2944 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2952 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
