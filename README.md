@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2959 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2964 项）
 
 ## 特性
 
@@ -4970,6 +4970,18 @@ out = gguf.load_gguf("m.gguf")   # {"metadata", "tensors", "dims"}
 权重矩阵的 dims 记为 `[in, out]`（形状 `[out][in]`），bias 记 `[out]`；元数据支持
 int/str。边界：不支持 F16/Q4 等量化类型、不支持多层嵌套的元数据数组。
 
+### 质量保障（golden 快照 / 并发 / 内存 / API 约定）
+
+- **golden 数值快照**：`tools/numeric_regression.py --check` 在 CI 里比对 12 组固定
+  计算（`tools/numeric_snapshot.json`，容差 1e-6），等价于「固定 seed → 固定数值」
+  的最小对拍套件；`--update` 显式更新基线。
+- **并发/线程安全**：`tests/test_quality.py` 覆盖多线程并行前向确定性、
+  `VersionedStore` 并发写入与同名多版本读取。
+- **内存泄漏检测**：用 `AI.track_memory` 包住 3000 次前向循环，断言
+  `delta_current < 512KB`。
+- **API 稳定性约定**：`API_STABILITY.md` 由 `tools/api_stability.py` 生成并
+  `--check` 校验表中名字真实存在；分「逐位一致 / 教学数值 / 仅演示」三类。
+
 ### 类型存根（AI.pyi + py.typed）
 
 `AI.pyi` 为最常用的公开 API（`Layer`/`MLP`/`Model`/`Optimizer` 系列、
@@ -5048,19 +5060,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（46 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（51 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2959 项）。
+`tests/`（合计 2964 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 46 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2959 项
+pytest tests/ -q                 # 51 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2964 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6819,7 +6831,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2959 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2964 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
