@@ -42263,3 +42263,131 @@ class TestAdam8bit:
         assert _b8t_raises(lambda: opt.step([]))
         assert _b8t_raises(lambda: opt.step([([[float("inf")] * 3], [0.0])]))
         assert _b8t_raises(lambda: opt.load_state_dict([]))
+
+
+def _s4d_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestS4DBlock:
+    def test_forward_and_param_count(self):
+        blk = AI.S4DBlock(4, d_ff=8, seed=5)
+        x = [[0.5 + 0.2 * math.sin(1.3 * j + 0.7 * i) for i in range(4)]
+             for j in range(6)]
+        out = blk.forward(x)
+        assert len(out) == 6 and all(len(row) == 4 for row in out)
+        # 4*d + 3 个 Linear + 2 个 LayerNorm
+        # 4 + (4*4+4) + (4*8+8) + (8*4+4) + 2*2*4 = 128
+        assert blk.param_count() == 128
+
+    def test_numerical_gradients(self):
+        blk = AI.S4DBlock(4, d_ff=8, seed=5)
+        x = [[0.5 + 0.2 * math.sin(1.3 * j + 0.7 * i) for i in range(4)]
+             for j in range(6)]
+        dout = [[0.3 if (i + j) % 2 == 0 else -0.2 for i in range(4)]
+                for j in range(6)]
+
+        def loss_at(xx):
+            o = blk.forward(xx)
+            return sum(o[t][i] * dout[t][i]
+                       for t in range(6) for i in range(4))
+
+        def fd(getg, getv, setv, h=1e-6):
+            blk.zero_grad()
+            blk.forward(x)
+            blk.backward(dout)
+            ana = getg()
+            v = getv()
+            setv(v + h)
+            lp = loss_at(x)
+            setv(v - h)
+            lm = loss_at(x)
+            setv(v)
+            num = (lp - lm) / (2.0 * h)
+            return abs(ana - num) / max(1e-12, abs(ana) + abs(num))
+
+        assert fd(lambda: blk.grad_A_log[1], lambda: blk.A_log[1],
+                  lambda v: blk.A_log.__setitem__(1, v)) < 1e-4
+        assert fd(lambda: blk.grad_B[2], lambda: blk.B[2],
+                  lambda v: blk.B.__setitem__(2, v)) < 1e-4
+        assert fd(lambda: blk.grad_C[1], lambda: blk.C[1],
+                  lambda v: blk.C.__setitem__(1, v)) < 1e-4
+        assert fd(lambda: blk.grad_D[3], lambda: blk.D[3],
+                  lambda v: blk.D.__setitem__(3, v)) < 1e-4
+        assert fd(lambda: blk.grads["W_o"][0][1][2],
+                  lambda: blk.W_o.weights[1][2],
+                  lambda v: blk.W_o.weights[1].__setitem__(2, v)) < 1e-4
+        assert fd(lambda: blk.grads["W1"][0][1][2],
+                  lambda: blk.W1.weights[1][2],
+                  lambda v: blk.W1.weights[1].__setitem__(2, v)) < 1e-4
+        assert fd(lambda: blk.norm_grads["ln1"][0][1],
+                  lambda: blk.ln1.gamma[1],
+                  lambda v: blk.ln1.gamma.__setitem__(1, v)) < 1e-4
+        # 输入梯度
+        blk.zero_grad()
+        blk.forward(x)
+        dx = blk.backward(dout)
+        x2 = [row[:] for row in x]
+        h = 1e-6
+        x2[1][2] += h
+        lp = loss_at(x2)
+        x2[1][2] -= 2 * h
+        lm = loss_at(x2)
+        assert abs(dx[1][2] - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_decay_and_long_sequence(self):
+        blk = AI.S4DBlock(4, d_ff=8, seed=2)
+        assert all(0.0 < v <= 1.0 for v in blk._decays())
+        out = blk.forward([[0.1] * 4 for _ in range(300)])
+        assert all(math.isfinite(v) for row in out for v in row)
+
+    def test_training_decreases_loss(self):
+        random.seed(7)
+        blk = AI.S4DBlock(4, d_ff=8, seed=3)
+        x = [[0.5 + 0.2 * math.sin(1.3 * j + 0.7 * i) for i in range(4)]
+             for j in range(6)]
+        head = AI.Layer(4, 2, "linear")
+        for _ in range(100):
+            blk.zero_grad()
+            feats = blk.forward(x)
+            pooled = [sum(feats[t][j] for t in range(len(feats)))
+                      / len(feats) for j in range(4)]
+            logits, cache = AI._dense_rows_forward(head, [pooled])
+            p = AI._softmax_row(logits[0])
+            dc = [p[0], p[1] - 1.0]
+            gw, gb, d_pooled = AI._dense_rows_backward(head, cache, [dc])
+            for i in range(2):
+                for j in range(4):
+                    head.weights[i][j] -= 0.3 * gw[i][j]
+                head.biases[i] -= 0.3 * gb[i]
+            d_feats = [[d_pooled[0][j] / len(feats) for j in range(4)]
+                       for _ in range(len(feats))]
+            blk.backward(d_feats)
+            blk.sgd_step(0.3)
+        feats = blk.forward(x)
+        pooled = [sum(feats[t][j] for t in range(len(feats))) / len(feats)
+                  for j in range(4)]
+        logits, _ = AI._dense_rows_forward(head, [pooled])
+        p = AI._softmax_row(logits[0])
+        assert -math.log(max(p[1], 1e-12)) < 0.2
+
+    def test_invalid_inputs(self):
+        assert _s4d_raises(lambda: AI.S4DBlock(0))
+        assert _s4d_raises(lambda: AI.S4DBlock(4, d_ff=0))
+        assert _s4d_raises(lambda: AI.S4DBlock(4, dt=0.0))
+        assert _s4d_raises(lambda: AI.S4DBlock(4, seed=1.5),
+                           (ValueError, TypeError))
+        blk = AI.S4DBlock(4, d_ff=8, seed=1)
+        assert _s4d_raises(lambda: blk.forward([]))
+        assert _s4d_raises(lambda: blk.forward([[0.1] * 3]))
+        assert _s4d_raises(lambda: blk.forward([["x"] * 4]))
+        assert _s4d_raises(lambda: blk.backward([[0.1] * 4]), RuntimeError)
+        blk.forward([[0.1] * 4] * 6)
+        assert _s4d_raises(lambda: blk.backward([[0.1] * 3] * 6))
+        assert _s4d_raises(lambda: blk.sgd_step(0.0))

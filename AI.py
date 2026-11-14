@@ -15630,6 +15630,243 @@ class FNetBlock:
     def eval(self):
         return self
 
+# ============================================================================
+#  S4/S5 家族：对角状态空间模型（S4D）block
+# ============================================================================
+
+
+def _s4d_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"S4D: {name} 必须是正整数，收到 {value!r}")
+
+
+def _s4d_check_positive(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"S4D: {name} 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"S4D: {name} 必须是有限正数，收到 {value!r}")
+
+
+def _s4d_softplus(v):
+    if v > 30.0:
+        return v
+    return math.log1p(math.exp(v))
+
+
+class S4DBlock:
+    """S4D（diagonal S4）的逐通道递推 block。
+
+    每个通道 j 单独维护一个标量状态：
+      ``state_t = decay_j * state_{t-1} + B_j * x_t``
+      ``y_t     = C_j * state_t + D_j * x_t``
+    其中 ``decay_j = exp(-softplus(dt) * exp(A_log_j))`` 由可训练的 ``A_log`` 控制；
+    ``dt`` 是固定的步长超参（这里不训练）。外层是 pre-norm 残差 block：
+    ``x += W_o · SSM(LN1(x))`` → ``x += FFN(LN2(x))``。
+    """
+
+    def __init__(self, d_model, d_ff=None, dt=0.01, eps=1e-5, seed=None):
+        _s4d_check_pos_int(d_model, "d_model")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _s4d_check_pos_int(d_ff, "d_ff")
+        _s4d_check_positive(dt, "dt")
+        _s4d_check_positive(eps, "eps")
+        if seed is not None and (not isinstance(seed, int)
+                                 or isinstance(seed, bool)):
+            raise ValueError(f"S4D: seed 必须是 int 或 None，收到 {seed!r}")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.dt = float(dt)
+        self.dt_eff = _s4d_softplus(self.dt)
+        old = random.getstate()
+        try:
+            if seed is not None:
+                random.seed(seed)
+            std = math.sqrt(2.0 / d_model)
+            self.A_log = [random.gauss(0.0, 0.1) for _ in range(d_model)]
+            self.B = [random.gauss(0.0, 1.0) for _ in range(d_model)]
+            self.C = [random.gauss(0.0, 1.0) for _ in range(d_model)]
+            self.D = [1.0] * d_model
+            self.ln1 = LayerNorm(d_model, eps)
+            self.ln2 = LayerNorm(d_model, eps)
+            self.W_o = Layer(d_model, d_model, "linear")
+            self.W1 = Layer(d_model, d_ff, "relu")
+            self.W2 = Layer(d_ff, d_model, "linear")
+            for layer in (self.W_o, self.W1, self.W2):
+                layer.weights = [[random.gauss(0.0, std)
+                                  for _ in range(layer.fan_in)]
+                                 for _ in range(layer.fan_out)]
+                layer.biases = [0.0] * layer.fan_out
+        finally:
+            random.setstate(old)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_A_log = [0.0] * self.d_model
+        self.grad_B = [0.0] * self.d_model
+        self.grad_C = [0.0] * self.d_model
+        self.grad_D = [0.0] * self.d_model
+        self.grads = {"W_o": _layer_zero_grads(self.W_o),
+                      "W1": _layer_zero_grads(self.W1),
+                      "W2": _layer_zero_grads(self.W2)}
+        self.norm_grads = {
+            "ln1": ([0.0] * self.d_model, [0.0] * self.d_model),
+            "ln2": ([0.0] * self.d_model, [0.0] * self.d_model),
+        }
+        self._cache = None
+        return self
+
+    def param_count(self):
+        return (4 * self.d_model
+                + _dense_param_count(self.W_o)
+                + _dense_param_count(self.W1)
+                + _dense_param_count(self.W2)
+                + _norm_param_count(self.ln1)
+                + _norm_param_count(self.ln2))
+
+    @staticmethod
+    def _check_seq(x_seq, d_model):
+        if not isinstance(x_seq, (list, tuple)) or not x_seq:
+            raise ValueError("S4D: 输入必须是非空序列")
+        rows = []
+        for row in x_seq:
+            if not isinstance(row, (list, tuple)) or len(row) != d_model:
+                raise ValueError(
+                    f"S4D: 每行长度必须是 {d_model}，收到 {row!r}")
+            out = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(f"S4D: 输入必须是数字，收到 {v!r}")
+                out.append(float(v))
+            rows.append(out)
+        return rows
+
+    def _decays(self):
+        out = []
+        for a in self.A_log:
+            ea = math.exp(a)
+            out.append(math.exp(-self.dt_eff * ea))
+        return out
+
+    def forward(self, x_seq):
+        rows = self._check_seq(x_seq, self.d_model)
+        decay = self._decays()
+        h, ln1_cache = _norm_rows_forward(self.ln1, rows)
+        states = []
+        y = []
+        for t in range(len(rows)):
+            if t == 0:
+                state = [self.B[j] * h[0][j] for j in range(self.d_model)]
+            else:
+                prev = states[-1]
+                state = [decay[j] * prev[j] + self.B[j] * h[t][j]
+                         for j in range(self.d_model)]
+            states.append(state)
+            y.append([self.C[j] * state[j] + self.D[j] * h[t][j]
+                      for j in range(self.d_model)])
+        u, wo_cache = _dense_rows_forward(self.W_o, y)
+        y1 = [[rows[t][j] + u[t][j] for j in range(self.d_model)]
+              for t in range(len(rows))]
+        z, ln2_cache = _norm_rows_forward(self.ln2, y1)
+        f1, w1_cache = _dense_rows_forward(self.W1, z)
+        f2, w2_cache = _dense_rows_forward(self.W2, f1)
+        out = [[y1[t][j] + f2[t][j] for j in range(self.d_model)]
+               for t in range(len(rows))]
+        self._cache = {"rows": rows, "decay": decay, "h": h,
+                       "ln1": ln1_cache, "states": states, "y": y,
+                       "wo_cache": wo_cache, "y1": y1, "ln2": ln2_cache,
+                       "z": z, "w1_cache": w1_cache, "w2_cache": w2_cache}
+        return out
+
+    def backward(self, dout_seq):
+        if self._cache is None:
+            raise RuntimeError("S4DBlock.backward: 必须先调用 forward()")
+        cache = self._cache
+        T = len(dout_seq)
+        dout = self._check_seq(dout_seq, self.d_model)
+        d = self.d_model
+        grad_w2, grad_b2, dx2 = _dense_rows_backward(
+            self.W2, cache["w2_cache"], dout)
+        grad_w1, grad_b1, dz = _dense_rows_backward(
+            self.W1, cache["w1_cache"], dx2)
+        gg1, gb1, dy1_ln = _norm_rows_backward(self.ln2, cache["ln2"], dz)
+        dy1 = [[dout[t][j] + dy1_ln[t][j] for j in range(d)]
+               for t in range(T)]
+        grad_wo, grad_bo, dy = _dense_rows_backward(
+            self.W_o, cache["wo_cache"], dy1)
+        h = cache["h"]
+        states = cache["states"]
+        decay = cache["decay"]
+        dh = [[0.0] * d for _ in range(T)]
+        grad_d = [0.0] * d
+        grad_c = [0.0] * d
+        grad_b = [0.0] * d
+        grad_a = [0.0] * d
+        for j in range(d):
+            d_state = 0.0
+            d_decay = 0.0
+            for t in range(T - 1, -1, -1):
+                d_state += self.C[j] * dy[t][j]
+                grad_c[j] += dy[t][j] * states[t][j]
+                grad_d[j] += dy[t][j] * h[t][j]
+                dh[t][j] += self.D[j] * dy[t][j] + d_state * self.B[j]
+                grad_b[j] += d_state * h[t][j]
+                if t > 0:
+                    d_decay += d_state * states[t - 1][j]
+                    d_state = d_state * decay[j]
+                else:
+                    d_state = 0.0
+            ea = math.exp(self.A_log[j])
+            grad_a[j] = d_decay * decay[j] * (-self.dt_eff * ea)
+        gg0, gb0, dh_ln = _norm_rows_backward(self.ln1, cache["ln1"], dh)
+        dx = [[dy1[t][j] + dh_ln[t][j] for j in range(d)]
+              for t in range(T)]
+        for j in range(d):
+            self.grad_A_log[j] += grad_a[j]
+            self.grad_B[j] += grad_b[j]
+            self.grad_C[j] += grad_c[j]
+            self.grad_D[j] += grad_d[j]
+        for i in range(d):
+            for j in range(d):
+                self.grads["W_o"][0][i][j] += grad_wo[i][j]
+            self.grads["W_o"][1][i] += grad_bo[i]
+        for i in range(self.d_ff):
+            for j in range(d):
+                self.grads["W1"][0][i][j] += grad_w1[i][j]
+            self.grads["W1"][1][i] += grad_b1[i]
+        for i in range(d):
+            for j in range(self.d_ff):
+                self.grads["W2"][0][i][j] += grad_w2[i][j]
+            self.grads["W2"][1][i] += grad_b2[i]
+        for c in range(d):
+            self.norm_grads["ln1"][0][c] += gg0[c]
+            self.norm_grads["ln1"][1][c] += gb0[c]
+            self.norm_grads["ln2"][0][c] += gg1[c]
+            self.norm_grads["ln2"][1][c] += gb1[c]
+        return dx
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) \
+                or not math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError(f"S4DBlock.sgd_step: lr 必须是正数，收到 {lr!r}")
+        for j in range(self.d_model):
+            self.A_log[j] -= lr * self.grad_A_log[j]
+            self.B[j] -= lr * self.grad_B[j]
+            self.C[j] -= lr * self.grad_C[j]
+            self.D[j] -= lr * self.grad_D[j]
+        _dense_apply_sgd(self.W_o, self.grads["W_o"], lr)
+        _dense_apply_sgd(self.W1, self.grads["W1"], lr)
+        _dense_apply_sgd(self.W2, self.grads["W2"], lr)
+        _norm_apply_sgd(self.ln1, self.norm_grads["ln1"], lr)
+        _norm_apply_sgd(self.ln2, self.norm_grads["ln2"], lr)
+        return self
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
