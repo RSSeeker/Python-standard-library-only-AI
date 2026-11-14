@@ -48060,3 +48060,96 @@ class TestDistillAndLowRankVariants:
             lambda: AI.self_distillation_loss([1.0, 2.0], [1.0]))
         assert _dd_raises(
             lambda: AI.multi_teacher_distill_loss([1.0, 2.0], []))
+
+
+"""批 p115 测试：潜在扩散 / CFG / DDIM / ControlNet 零卷积。"""
+
+import math
+import random
+
+
+def _ld_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestLatentDiffusion:
+    def test_cfg_combine(self):
+        assert AI.cfg_combine([1.0, 2.0], [3.0, 4.0], 0.0) == [1.0, 2.0]
+        assert AI.cfg_combine([1.0], [3.0], 1.0) == [3.0]
+        out = AI.cfg_combine([0.0, 1.0], [1.0, 3.0], 2.0)
+        assert out == [2.0, 5.0]
+
+    def test_ddim_step(self):
+        x0 = [0.5, -0.3]
+        eps = [0.2, 0.1]
+        abar_t, abar_prev = 0.36, 0.64
+        x_t = [math.sqrt(abar_t) * v + math.sqrt(1 - abar_t) * e
+               for v, e in zip(x0, eps)]
+        got = AI.ddim_step(x_t, eps, abar_t, abar_prev)
+        want = [math.sqrt(abar_prev) * v + math.sqrt(1 - abar_prev) * e
+                for v, e in zip(x0, eps)]
+        assert max(abs(a - b) for a, b in zip(got, want)) < 1e-12
+        # abar_prev=1.0 时返回纯 x0
+        pure = AI.ddim_step(x_t, eps, abar_t, 1.0)
+        assert max(abs(a - b) for a, b in zip(pure, x0)) < 1e-12
+
+    def test_controlnet_zero_conv(self):
+        blk = AI.ControlNetZeroConv(2, control_channels=1, hidden=2, seed=1)
+        random.seed(0)
+        features = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+                    for _ in range(2)]
+        control = [[[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]]
+        out = blk.forward(features, control)
+        assert max(abs(out[c][i][j] - features[c][i][j])
+                   for c in range(2) for i in range(3) for j in range(3)) < 1e-12
+        w = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(3)]
+        d_out = [w, w]
+        blk.forward(features, control)
+        blk.backward(d_out)
+        gw = blk.zero_conv.grad_w
+        h = 1e-5
+
+        def loss(v):
+            old = blk.zero_conv.weights[0][0][1][1]
+            blk.zero_conv.weights[0][0][1][1] = v
+            o = blk.forward(features, control)
+            blk.zero_conv.weights[0][0][1][1] = old
+            return sum(o[c][i][j] * w[i][j]
+                       for c in range(2) for i in range(3) for j in range(3))
+
+        p0 = blk.zero_conv.weights[0][0][1][1]
+        fd = (loss(p0 + h) - loss(p0 - h)) / (2 * h)
+        assert abs(gw[0][0][1][1] - fd) < 1e-7
+
+    def test_latent_diffusion_train_and_sample(self):
+        ld = AI.LatentDiffusion(image_size=8, latent_dim=8, hidden=8, cond_dim=4,
+                                steps=10, seed=2)
+        img = [[[0.1 * i - 0.35 for j in range(8)] if i % 2 == 0 else
+                [0.05 * j - 0.2 for j in range(8)] for i in range(8)]]
+        lat = ld.encode(img)
+        assert len(lat) == 8
+        rec = ld.decode(lat)
+        assert len(rec) == 1 and len(rec[0]) == 8 and len(rec[0][0]) == 8
+        hist = ld.fit([img], [[0.1, -0.2, 0.3, 0.0]], epochs=20, lr=0.02, seed=3)
+        assert hist[-1] < hist[0]
+        s1 = ld.sample([0.1, -0.2, 0.3, 0.0], cfg_scale=3.0, seed=5, num_steps=5)
+        s2 = ld.sample([0.1, -0.2, 0.3, 0.0], cfg_scale=3.0, seed=5, num_steps=5)
+        assert s1 == s2
+        s3 = ld.sample([0.1, -0.2, 0.3, 0.0], cfg_scale=0.0, seed=5, num_steps=5)
+        assert any(abs(a - b) > 1e-9 for a, b in zip(s1, s3))
+
+    def test_invalid_inputs(self):
+        assert _ld_raises(lambda: AI.cfg_combine([1.0], [1.0, 2.0]))
+        assert _ld_raises(lambda: AI.ddim_step([1.0], [1.0], 0.0, 0.5))
+        assert _ld_raises(lambda: AI.LatentDiffusion(image_size=0))
+        assert _ld_raises(lambda: AI.LatentDiffusion(beta_start=0.1, beta_end=0.05))
+        ld = AI.LatentDiffusion(image_size=8, latent_dim=4, hidden=4, cond_dim=2,
+                                steps=5, seed=1)
+        assert _ld_raises(lambda: ld.fit([], []))
+        assert _ld_raises(lambda: ld.sample([0.1], cfg_scale=1.0))
+        assert _ld_raises(lambda: ld.sample([0.1, 0.2], cfg_scale=-1.0))
+

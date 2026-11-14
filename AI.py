@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1872 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1879 个 def / 437 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -88440,6 +88440,307 @@ class GAN:
             d_loss, g_loss = self.step(data, rng=rng, lr_d=lr_d, lr_g=lr_g)
             history.append((d_loss, g_loss))
         return history
+
+"""潜在扩散（latent diffusion）教学实现 + classifier-free guidance + ControlNet 零卷积。"""
+
+import math
+import random
+
+
+# ---------------- 校验/工具 ----------------
+
+
+def _ld_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"latent diffusion: {name} 必须是数字，收到 {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"latent diffusion: {name} 必须为正有限数，收到 {value!r}")
+    return value
+
+
+def _ld_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"latent diffusion: {name} 必须是整数，收到 {value!r}")
+    if value < 1:
+        raise ValueError(f"latent diffusion: {name} 必须 >= 1，收到 {value!r}")
+    return value
+
+
+def _ld_check_vector(vec, dim, name):
+    if not isinstance(vec, (list, tuple)) or len(vec) != dim:
+        raise ValueError(f"latent diffusion: {name} 长度应为 {dim}")
+    out = []
+    for v in vec:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError(f"latent diffusion: {name} 必须是数字列表")
+        v = float(v)
+        if not math.isfinite(v):
+            raise ValueError(f"latent diffusion: {name} 含非有限值")
+        out.append(v)
+    return out
+
+
+def _ld_check_image(image, size, channels=1):
+    if not isinstance(image, (list, tuple)) or len(image) != channels:
+        raise ValueError(f"latent diffusion: image 通道数应为 {channels}")
+    out = []
+    for ch in image:
+        if not isinstance(ch, (list, tuple)) or len(ch) != size:
+            raise ValueError(f"latent diffusion: image 高度应为 {size}")
+        rows = []
+        for row in ch:
+            rows.append(_ld_check_vector(row, size, "image 行"))
+        out.append(rows)
+    return out
+
+
+def _ld_sin_cos(t, steps, dim):
+    out = []
+    for i in range(dim // 2):
+        freq = 1.0 / (10000.0 ** (2.0 * i / max(1, dim)))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    if dim % 2 == 1:
+        out.append(math.sin(t * 0.5))
+    return out
+
+
+# ---------------- CFG / DDIM ----------------
+
+
+def cfg_combine(eps_uncond, eps_cond, scale=7.5):
+    """classifier-free guidance: eps = eps_uncond + scale*(eps_cond-eps_uncond)。"""
+    scale = float(scale)
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError("cfg_combine: scale 必须是 >=0 的有限数")
+    if len(eps_uncond) != len(eps_cond):
+        raise ValueError("cfg_combine: 两个 eps 长度必须相同")
+    out = []
+    for u, c in zip(eps_uncond, eps_cond):
+        u = float(u)
+        c = float(c)
+        if not (math.isfinite(u) and math.isfinite(c)):
+            raise ValueError("cfg_combine: eps 含非有限值")
+        out.append(u + scale * (c - u))
+    return out
+
+
+def ddim_step(x_t, eps, abar_t, abar_prev):
+    """确定性 DDIM 一步：先由 (x_t, eps) 估计 x0，再用 abar_prev 组合回去。"""
+    abar_t = float(abar_t)
+    abar_prev = float(abar_prev)
+    if not (0.0 < abar_t <= 1.0) or not (0.0 < abar_prev <= 1.0):
+        raise ValueError("ddim_step: abar 必须在 (0,1] 内")
+    if len(x_t) != len(eps):
+        raise ValueError("ddim_step: x_t 与 eps 长度必须相同")
+    x0 = []
+    for x, e in zip(x_t, eps):
+        x = float(x)
+        e = float(e)
+        if not (math.isfinite(x) and math.isfinite(e)):
+            raise ValueError("ddim_step: 输入含非有限值")
+        x0.append((x - math.sqrt(1.0 - abar_t) * e) / math.sqrt(abar_t))
+    st = math.sqrt(abar_prev)
+    sn = math.sqrt(1.0 - abar_prev)
+    return [st * a + sn * e for a, e in zip(x0, eps)]
+
+
+# ---------------- ControlNet 零卷积 ----------------
+
+
+class ControlNetZeroConv:
+    """ControlNet 的零初始化输出卷积：初始时残差恒为 0，训练后逐渐接入控制分支。
+
+    结构 ``res = zero_conv(relu(conv_control(control)))``，返回 ``features + res``。
+    zero_conv 权重与 bias 都初始化为 0，因此初始前向恒等于 features。
+    """
+
+    def __init__(self, features, control_channels=1, hidden=None, seed=None):
+        self.features = _ld_check_pos_int(features, "features")
+        self.control_channels = _ld_check_pos_int(control_channels, "control_channels")
+        self.hidden = _ld_check_pos_int(hidden or features, "hidden")
+        old = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        self.conv_control = Conv2d(self.control_channels, self.hidden, 3, padding=1)
+        self.zero_conv = Conv2d(self.hidden, self.features, 3, padding=1)
+        for out in range(self.features):
+            for cin in range(self.hidden):
+                for kh in range(3):
+                    for kw in range(3):
+                        self.zero_conv.weights[out][cin][kh][kw] = 0.0
+            self.zero_conv.biases[out] = 0.0
+        if seed is not None:
+            random.setstate(old)
+        self.conv_control.zero_grad()
+        self.zero_conv.zero_grad()
+        self._cache = None
+
+    def forward(self, features, control):
+        size = len(features[0])
+        feats = _ld_check_image(features, size, self.features)
+        ctrl = _ld_check_image(control, size, self.control_channels)
+        h = self.conv_control.forward(ctrl)
+        relu = [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in h]
+        r = self.zero_conv.forward(relu)
+        out = [[[feats[c][i][j] + r[c][i][j] for j in range(size)]
+                for i in range(size)] for c in range(self.features)]
+        self._cache = (ctrl, relu)
+        return out
+
+    def backward(self, d_out):
+        if self._cache is None:
+            raise RuntimeError("ControlNetZeroConv.backward: 必须先 forward")
+        ctrl, relu = self._cache
+        d_r = _ld_check_image(d_out, len(d_out[0]), self.features)
+        d_relu = self.zero_conv.backward(d_r)
+        d_control = self.conv_control.backward(d_relu)
+        self._cache = None
+        return d_control
+
+    def sgd_step(self, lr):
+        _conv_sgd(self.conv_control, lr)
+        _conv_sgd(self.zero_conv, lr)
+
+    def param_count(self):
+        return _conv_param_count(self.conv_control) + _conv_param_count(self.zero_conv)
+
+
+# ---------------- 潜在扩散主类 ----------------
+
+
+class LatentDiffusion:
+    """极简潜在扩散：固定编码/解码器 + MLP 去噪器 + DDIM 采样（CFG）。
+
+    编码器把 ``image_size × image_size`` 单通道图压成 ``latent_dim`` 维潜向量
+    （固定随机线性投影，不训练）；去噪器是 MLP
+    ``[latent + t_emb + cond] -> hidden -> hidden -> latent``，只训练它。
+    """
+
+    def __init__(self, image_size=8, latent_dim=16, hidden=32, cond_dim=8,
+                 steps=20, beta_start=1e-4, beta_end=0.02, seed=None):
+        self.image_size = _ld_check_pos_int(image_size, "image_size")
+        self.latent_dim = _ld_check_pos_int(latent_dim, "latent_dim")
+        self.hidden = _ld_check_pos_int(hidden, "hidden")
+        self.cond_dim = _ld_check_pos_int(cond_dim, "cond_dim")
+        self.steps = _ld_check_pos_int(steps, "steps")
+        beta_start = _ld_check_positive(beta_start, "beta_start")
+        beta_end = _ld_check_positive(beta_end, "beta_end")
+        if not 0.0 < beta_start < beta_end < 1.0:
+            raise ValueError("LatentDiffusion: 需要 0 < beta_start < beta_end < 1")
+        self.t_dim = 8
+        self.betas = [beta_start + (beta_end - beta_start) * i / max(1, self.steps - 1)
+                      for i in range(self.steps)]
+        self.alphas = [1.0 - b for b in self.betas]
+        self.abar = []
+        prod = 1.0
+        for a in self.alphas:
+            prod *= a
+            self.abar.append(prod)
+        old = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        pix = self.image_size * self.image_size
+        self.enc = Layer(pix, latent_dim, activation="linear")
+        self.dec = Layer(latent_dim, pix, activation="linear")
+        self.unet = MLP([latent_dim + self.t_dim + self.cond_dim,
+                         hidden, hidden, latent_dim],
+                        ["relu", "relu", "linear"])
+        if seed is not None:
+            random.setstate(old)
+
+    def _encode(self, image):
+        img = _ld_check_image(image, self.image_size, 1)
+        flat = []
+        for row in img[0]:
+            flat.extend(row)
+        out, _ = _dense_rows_forward(self.enc, [flat])
+        return out[0]
+
+    def encode(self, image):
+        return self._encode(image)
+
+    def decode(self, latent):
+        lat = _ld_check_vector(latent, self.latent_dim, "latent")
+        out, _ = _dense_rows_forward(self.dec, [lat])
+        flat = out[0]
+        side = self.image_size
+        return [[[flat[i * side + j] for j in range(side)] for i in range(side)]]
+
+    def loss_and_grads(self, image, cond, seed=None):
+        img = _ld_check_image(image, self.image_size, 1)
+        cond = _ld_check_vector(cond, self.cond_dim, "cond")
+        rng = random.Random(seed) if seed is not None else random
+        x0 = self._encode(img)
+        t = rng.randrange(self.steps)
+        noise = [rng.gauss(0.0, 1.0) for _ in range(self.latent_dim)]
+        a = math.sqrt(self.abar[t])
+        b = math.sqrt(1.0 - self.abar[t])
+        x_t = [a * v + b * n for v, n in zip(x0, noise)]
+        temb = _ld_sin_cos(t, self.steps, self.t_dim)
+        inp = list(x_t) + temb + list(cond)
+        pred = self.unet.forward(inp)
+        diff = [pred[i] - noise[i] for i in range(self.latent_dim)]
+        loss = sum(d * d for d in diff) / self.latent_dim
+        d_pred = [2.0 * d / self.latent_dim for d in diff]
+        grads, _dx = _mlp_backward_with_input(self.unet, d_pred)
+        return loss, grads
+
+    def fit(self, images, conds, epochs=20, lr=0.01, seed=None):
+        if not isinstance(images, (list, tuple)) or not isinstance(conds, (list, tuple)):
+            raise ValueError("LatentDiffusion.fit: images/conds 必须是列表")
+        if len(images) != len(conds):
+            raise ValueError("LatentDiffusion.fit: images 与 conds 长度必须相同")
+        if not images:
+            raise ValueError("LatentDiffusion.fit: images 不能为空")
+        if not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("LatentDiffusion.fit: epochs 必须 >= 1")
+        lr = _ld_check_positive(lr, "lr")
+        rng = random.Random(seed) if seed is not None else random
+        opt = Adam(self.unet, lr=lr)
+        history = []
+        order = list(range(len(images)))
+        for _epoch in range(epochs):
+            rng.shuffle(order)
+            total = 0.0
+            count = 0
+            for idx in order:
+                step_seed = rng.randrange(1 << 30) if seed is not None else None
+                loss, grads = self.loss_and_grads(images[idx], conds[idx],
+                                                  seed=step_seed)
+                opt.step(grads)
+                total += loss
+                count += 1
+            history.append(total / max(1, count))
+        return history
+
+    def sample(self, cond, cfg_scale=7.5, seed=None, num_steps=None,
+               zero_cond=None):
+        cond = _ld_check_vector(cond, self.cond_dim, "cond")
+        if zero_cond is None:
+            zero_cond = [0.0] * self.cond_dim
+        zero_cond = _ld_check_vector(zero_cond, self.cond_dim, "zero_cond")
+        cfg_scale = float(cfg_scale)
+        if not math.isfinite(cfg_scale) or cfg_scale < 0.0:
+            raise ValueError("LatentDiffusion.sample: cfg_scale 必须 >=0 的有限数")
+        num_steps = _ld_check_pos_int(num_steps or min(self.steps, 8), "num_steps")
+        num_steps = min(num_steps, self.steps)
+        rng = random.Random(seed) if seed is not None else random
+        times = sorted({int(round(i * (self.steps - 1) / max(1, num_steps - 1)))
+                        for i in range(num_steps)}, reverse=True)
+        x = [rng.gauss(0.0, 1.0) for _ in range(self.latent_dim)]
+        for i, t in enumerate(times):
+            temb = _ld_sin_cos(t, self.steps, self.t_dim)
+            eps_c = self.unet.forward(x + temb + cond)
+            eps_u = self.unet.forward(x + temb + zero_cond)
+            eps = cfg_combine(eps_u, eps_c, cfg_scale)
+            abar_prev = self.abar[times[i + 1]] if i + 1 < len(times) else 1.0
+            x = ddim_step(x, eps, self.abar[t], abar_prev)
+        return x
+
+    def param_count(self):
+        return sum(_dense_param_count(layer) for layer in self.unet.layers)
 
 
 class DDPM:

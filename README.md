@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3009 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3014 项）
 
 ## 特性
 
@@ -5222,7 +5222,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3009 项）。
+`tests/`（合计 3014 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5230,7 +5230,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3009 项
+pytest -q                        # test_ai.py + tests/ 合计 3014 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6802,6 +6802,37 @@ moe.adam_step(lr=1e-3)
 梯度，可与其他损失相加）；其路由梯度公式为
 `dL/dlogit_{t,k} = coef · E / T · p_{t,k} · (f_k − Σ_i f_i · p_{t,i})`，`p` 为全专家 softmax。
 
+## 潜在扩散（Latent Diffusion + CFG）与 ControlNet
+
+在像素空间做扩散很贵；latent diffusion 先把图像压到小潜空间，再在潜空间上训练
+扩散模型，采样后再解码。本库给的是**最小可运行教学版**：固定的线性编码/解码器 +
+MLP 去噪器 + 确定性 DDIM 采样 + classifier-free guidance，另附 ControlNet 的
+零初始化残差卷积。
+
+```python
+ld = AI.LatentDiffusion(image_size=8, latent_dim=16, hidden=32, cond_dim=8,
+                        steps=20, seed=0)
+hist = ld.fit(images, conds, epochs=30, lr=0.01)   # 只训练潜空间去噪器
+latent = ld.sample(conds[0], cfg_scale=7.5, seed=1) # CFG：cond 与 zero_cond 两支
+image = ld.decode(latent)
+
+cfg = AI.ControlNetZeroConv(features=4, control_channels=1, seed=0)
+out = cfg.forward(features, control)   # 初始恒等于 features
+```
+
+| API | 说明 |
+| --- | --- |
+| `LatentDiffusion(image_size=8, latent_dim=16, hidden=32, cond_dim=8, steps=20, beta_start=1e-4, beta_end=0.02, seed=None)` | 固定线性编码器把图压成 `latent_dim` 维潜向量，MLP 去噪器输入 `[潜向量 + t 正弦特征 + 条件向量]` 预测噪声；`encode` / `decode` / `loss_and_grads` / `fit` / `sample` / `param_count` |
+| `cfg_combine(eps_uncond, eps_cond, scale=7.5)` | classifier-free guidance：`eps = eps_uncond + scale·(eps_cond − eps_uncond)`；`scale=0` 退化为无条件 |
+| `ddim_step(x_t, eps, abar_t, abar_prev)` | 确定性 DDIM 一步：由 `(x_t, eps)` 估计 `x0`，再用 `abar_prev` 组合回上一时刻；`abar_prev=1` 时直接返回 `x0` |
+| `ControlNetZeroConv(features, control_channels=1, hidden=None, seed=None)` | 控制分支残差 `zero_conv(relu(conv_control(control)))`；`zero_conv` 权重与 bias 初始为 0，故初始 `forward` 恒等于输入特征；`backward` 返回控制图梯度，`sgd_step` / `param_count` |
+
+边界：编码/解码器是**固定随机线性投影**（不训练 VAE，没有 KL 项），去噪器是 MLP
+而非 UNet/UNet+CrossAttention；采样是确定性 DDIM，不含随机 DDPM 反噪。ControlNet
+这里只实现「零初始化输出卷积 + 残差相加」这个关键机制，不和完整 UNet 编码器连接。
+
+---
+
 ## 生成模型：VAE / GAN / DDPM
 
 三个生成模型都只用标准库实现，可单独训练并采样：
@@ -6989,7 +7020,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3009 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3014 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7527,7 +7558,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2957 个单元测试
+├── test_ai.py       # 2962 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本
