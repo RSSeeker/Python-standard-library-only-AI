@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1803 个 def / 428 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1806 个 def / 429 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8924,6 +8924,249 @@ class ITransformer:
                 self.sgd_step(lr)
             history.append(total / len(series_list))
         return history
+
+
+# ---- TabNet（attentive transformer + feature transformer 的表格分类） ----
+
+
+def _tab_check_vector(v, n, who, name="sample"):
+    if not isinstance(v, (list, tuple)) or len(v) != n:
+        raise ValueError(f"{who}: {name} 必须是长度 {n} 的向量")
+    out = []
+    for x in v:
+        if not isinstance(x, (int, float)) or isinstance(x, bool) \
+                or not math.isfinite(float(x)):
+            raise ValueError(f"{who}: {name} 的元素必须是有限数字")
+        out.append(float(x))
+    return out
+
+
+def _tab_softmax(logits):
+    m = max(logits)
+    ex = [math.exp(v - m) for v in logits]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _tab_relu(v):
+    return v if v > 0.0 else 0.0
+
+
+class TabNetClassifier:
+    """简化版 TabNet（表格分类）：逐步选择特征 + 决策聚合
+
+    每个 step ``t``：
+
+    - attentive transformer：``logits_t = W_mask h_{t-1}``，
+      ``mask_t = sparsemax(logits_t)``（特征选择，天然稀疏）；
+    - feature transformer：把 ``x ⊙ mask_t`` 过两层 ReLU 得到 ``h_t``；
+    - decision：``d_t = ReLU(W_d h_t)``，各步 ``d_t`` 相加后接线性分类头。
+
+    训练目标为交叉熵 + ``lambda_sparse`` 的掩码熵正则（entmin），
+    反向覆盖 sparsemax 掩码梯度与逐步 BPTT（``h_{t-1}`` 影响第 ``t`` 步掩码）。
+    这是教学用的最小 TabNet，不含 BatchNorm / 特征重缩放 / 多步注意力共享层。
+    """
+
+    def __init__(self, n_features, num_classes, n_steps=3, d_model=8,
+                 d_dec=4, lambda_sparse=1e-3, seed=None):
+        for v, name in ((n_features, "n_features"), (num_classes, "num_classes"),
+                        (n_steps, "n_steps"), (d_model, "d_model"),
+                        (d_dec, "d_dec")):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"TabNet: {name} 必须是正整数")
+        if isinstance(lambda_sparse, bool) or \
+                not isinstance(lambda_sparse, (int, float)) or \
+                not math.isfinite(float(lambda_sparse)) or float(lambda_sparse) < 0.0:
+            raise ValueError("TabNet: lambda_sparse 必须是非负有限数字")
+        self.n_features = int(n_features)
+        self.num_classes = int(num_classes)
+        self.n_steps = int(n_steps)
+        self.d_model = int(d_model)
+        self.d_dec = int(d_dec)
+        self.lambda_sparse = float(lambda_sparse)
+
+        rng = random.Random(seed)
+
+        def layer(fan_in, fan_out, act):
+            lay = Layer(fan_in, fan_out, act)
+            std = math.sqrt(2.0 / max(fan_in, 1))
+            lay.weights = [[rng.gauss(0.0, std) for _ in range(fan_in)]
+                           for _ in range(fan_out)]
+            lay.biases = [0.0] * fan_out
+            return lay
+
+        self.W_mask = layer(d_model, n_features, "linear")
+        self.W1 = layer(n_features, d_model, "relu")
+        self.W2 = layer(d_model, d_model, "relu")
+        self.Wd = layer(d_model, d_dec, "relu")
+        self.head = layer(d_dec, num_classes, "linear")
+
+        self.grad_W_mask = None
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self.grad_Wd = None
+        self.grad_head = None
+        self._cache = None
+        self._out_cache = None
+        self.last_masks = None
+
+    # ---------- 工具 ----------
+
+    def _layers(self):
+        return [self.W_mask, self.W1, self.W2, self.Wd, self.head]
+
+    def zero_grad(self):
+        self.grad_W_mask = None
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self.grad_Wd = None
+        self.grad_head = None
+
+    def param_count(self):
+        return (_dense_param_count(self.W_mask) + _dense_param_count(self.W1)
+                + _dense_param_count(self.W2) + _dense_param_count(self.Wd)
+                + _dense_param_count(self.head))
+
+    @staticmethod
+    def _acc(acc, new):
+        if new is None:
+            return None
+        if acc is None:
+            return ([[v for v in row] for row in new[0]], [v for v in new[1]])
+        for i, row in enumerate(new[0]):
+            for j in range(len(row)):
+                acc[0][i][j] += row[j]
+        for i, v in enumerate(new[1]):
+            acc[1][i] += v
+        return acc
+
+    # ---------- 前向 ----------
+
+    def forward(self, sample):
+        x = _tab_check_vector(sample, self.n_features, "TabNet", "sample")
+        h_prev = [0.0] * self.d_model
+        steps = []
+        rep = [0.0] * self.d_dec
+        for _t in range(self.n_steps):
+            mask_logits, c_mask = _dense_rows_forward(self.W_mask, [h_prev])
+            mask = sparsemax(mask_logits[0])
+            xm = [x[i] * mask[i] for i in range(self.n_features)]
+            h1, c1 = _dense_rows_forward(self.W1, [xm])
+            h2, c2 = _dense_rows_forward(self.W2, [h1[0]])
+            d1, cd = _dense_rows_forward(self.Wd, [h2[0]])
+            for i in range(self.d_dec):
+                rep[i] += d1[0][i]
+            steps.append({
+                "h_prev": h_prev,
+                "mask": mask,
+                "x": xm,
+                "x_raw": x,
+                "mask_cache": c_mask,
+                "h1_cache": c1,
+                "h1": h1[0],
+                "h2_cache": c2,
+                "h2": h2[0],
+                "d_cache": cd,
+                "d": d1[0],
+            })
+            h_prev = h2[0]
+        logits, c_out = _dense_rows_forward(self.head, [rep])
+        self._cache = steps
+        self._out_cache = c_out
+        self._rep = rep
+        self.last_masks = [s["mask"] for s in steps]
+        return logits[0]
+
+    def _entropy_grad(self, probs):
+        grad = []
+        for p in probs:
+            if p > 0.0:
+                grad.append(-(math.log(p) + 1.0))
+            else:
+                grad.append(0.0)
+        return grad
+
+    def loss_and_backward(self, sample, label):
+        if isinstance(label, bool) or not isinstance(label, int) or \
+                label < 0 or label >= self.num_classes:
+            raise ValueError("TabNet: label 必须是 [0, num_classes) 的整数")
+        logits = self.forward(sample)
+        probs = _tab_softmax(logits)
+        loss = -math.log(max(probs[label], 1e-300))
+
+        ent = 0.0
+        for s in self._cache:
+            mask = s["mask"]
+            for p in mask:
+                if p > 0.0:
+                    ent -= p * math.log(p)
+        ent /= (self.n_steps * self.n_features)
+        loss += self.lambda_sparse * ent
+
+        d_logits = [v for v in probs]
+        d_logits[label] -= 1.0
+        gw, gb, d_rep = _dense_rows_backward(self.head, self._out_cache, [d_logits])
+        self.grad_head = self._acc(self.grad_head, (gw, gb))
+
+        x = self._cache[0]["x_raw"]
+        d_h_future = None
+        d_rep_arr = d_rep[0]
+        for t in range(self.n_steps - 1, -1, -1):
+            s = self._cache[t]
+            gw, gb, d_h2 = _dense_rows_backward(self.Wd, s["d_cache"], [d_rep_arr])
+            self.grad_Wd = self._acc(self.grad_Wd, (gw, gb))
+            d_h2_row = [d_h2[0][i] + (d_h_future[i] if d_h_future is not None else 0.0)
+                        for i in range(self.d_model)]
+            gw, gb, d_h1 = _dense_rows_backward(self.W2, s["h2_cache"], [d_h2_row])
+            self.grad_W2 = self._acc(self.grad_W2, (gw, gb))
+            gw, gb, d_xm = _dense_rows_backward(self.W1, s["h1_cache"], [d_h1[0]])
+            self.grad_W1 = self._acc(self.grad_W1, (gw, gb))
+            d_mask = [d_xm[0][i] * x[i] for i in range(self.n_features)]
+            ent_grad = self._entropy_grad(s["mask"])
+            lam = self.lambda_sparse / (self.n_steps * self.n_features)
+            d_mask = [d_mask[i] + lam * ent_grad[i] for i in range(self.n_features)]
+            d_logits_mask = sparsemax_backward(d_mask, s["mask"])
+            gw, gb, d_h_prev = _dense_rows_backward(
+                self.W_mask, s["mask_cache"], [d_logits_mask])
+            self.grad_W_mask = self._acc(self.grad_W_mask, (gw, gb))
+            d_h_future = d_h_prev[0]
+
+        return loss
+
+    # ---------- 训练 ----------
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float))                 or not math.isfinite(float(lr)) or float(lr) <= 0.0:
+            raise ValueError("TabNet.sgd_step: lr 必须是正有限数字")
+        for layer, grads in ((self.W_mask, self.grad_W_mask),
+                             (self.W1, self.grad_W1),
+                             (self.W2, self.grad_W2),
+                             (self.Wd, self.grad_Wd),
+                             (self.head, self.grad_head)):
+            if grads is None:
+                continue
+            _dense_apply_sgd(layer, grads, lr)
+
+    def fit(self, samples, labels, epochs=20, lr=0.05, seed=None, shuffle=True):
+        if not isinstance(samples, (list, tuple)) or len(samples) == 0:
+            raise ValueError("TabNet.fit: samples 必须是非空列表")
+        if not isinstance(labels, (list, tuple)) or len(labels) != len(samples):
+            raise ValueError("TabNet.fit: labels 必须与 samples 等长")
+        xs = [_tab_check_vector(s, self.n_features, "TabNet.fit", "samples")
+              for s in samples]
+        order = list(range(len(xs)))
+        rng = random.Random(seed)
+        hist = []
+        for _e in range(int(epochs)):
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            self.zero_grad()
+            for i in order:
+                total += self.loss_and_backward(xs[i], labels[i])
+            self.sgd_step(lr)
+            hist.append(total / len(xs))
+        return hist
 
 
 class FTTransformer:

@@ -47054,3 +47054,97 @@ class TestScaledCosineAttention:
         assert _sca_raises(lambda: model.forward([[0.0, 1.0]]))
         assert _sca_raises(lambda: model.forward([[float("nan")] * 4] * 2))
         assert _sca_raises(lambda: model.sgd_step(-1))
+
+
+# ---- TabNet 测试辅助与用例 ----
+
+
+def _tabn_tabn_tabn_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol
+
+
+def _tabn_tabn_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol
+
+
+def _tabn_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _tabn_probe(model, xs, gg, pg, ps, label=1, h=1e-5):
+    model.zero_grad()
+    model.loss_and_backward(xs, label)
+    a = gg()
+    p0 = pg()
+    ps(p0 + h)
+    lp = model.loss_and_backward(xs, label)
+    ps(p0 - h)
+    lm = model.loss_and_backward(xs, label)
+    ps(p0)
+    return a, (lp - lm) / (2.0 * h)
+
+
+class TestTabNet:
+    def test_forward_and_param_count(self):
+        model = AI.TabNetClassifier(4, 3, n_steps=2, d_model=6, d_dec=3, seed=1)
+        logits = model.forward([0.5, -0.3, 1.2, 0.0])
+        assert len(logits) == 3
+        assert model.param_count() == 133
+        masks = model.last_masks
+        assert len(masks) == 2
+        for m in masks:
+            assert _tabn_tabn_close(sum(m), 1.0)
+
+    def test_numerical_gradients(self):
+        import random as _random
+        rng = _random.Random(0)
+        model = AI.TabNetClassifier(4, 3, n_steps=2, d_model=6, d_dec=3, seed=1)
+        xs = [rng.uniform(-1.0, 1.0) for _ in range(4)]
+        pairs = [
+            (lambda: model.grad_head[0][0][1], lambda: model.head.weights[0][1],
+             lambda v: model.head.weights[0].__setitem__(1, v)),
+            (lambda: model.grad_W1[0][2][0], lambda: model.W1.weights[2][0],
+             lambda v: model.W1.weights[2].__setitem__(0, v)),
+            (lambda: model.grad_W2[0][1][3], lambda: model.W2.weights[1][3],
+             lambda v: model.W2.weights[1].__setitem__(3, v)),
+            (lambda: model.grad_Wd[0][0][2], lambda: model.Wd.weights[0][2],
+             lambda v: model.Wd.weights[0].__setitem__(2, v)),
+            (lambda: model.grad_W_mask[0][2][1], lambda: model.W_mask.weights[2][1],
+             lambda v: model.W_mask.weights[2].__setitem__(1, v)),
+        ]
+        for gg, pg, ps in pairs:
+            a, f = _tabn_probe(model, xs, gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+
+    def test_training_converges(self):
+        samples = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],
+                   [0, 0, 0, 1], [1, 1, 0, 0], [0, 0, 1, 1]]
+        labels = [0, 1, 2, 0, 0, 2]
+        model = AI.TabNetClassifier(4, 3, n_steps=2, d_model=6, d_dec=3, seed=2)
+        hist = model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
+        assert hist[-1] < hist[0] * 0.6
+        assert len(hist) == 40
+
+    def test_masks_are_sparse_and_valid(self):
+        model = AI.TabNetClassifier(6, 2, n_steps=3, d_model=8, d_dec=3, seed=3)
+        model.forward([0.1, -0.2, 0.3, 0.0, 0.5, -0.4])
+        for mask in model.last_masks:
+            assert _tabn_tabn_close(sum(mask), 1.0)
+            assert all(v >= 0.0 for v in mask)
+            assert all(0.0 <= v <= 1.0 for v in mask)
+
+    def test_invalid_inputs(self):
+        assert _tabn_raises(lambda: AI.TabNetClassifier(0, 3))
+        assert _tabn_raises(lambda: AI.TabNetClassifier(4, 0))
+        assert _tabn_raises(lambda: AI.TabNetClassifier(4, 3, n_steps=0))
+        assert _tabn_raises(lambda: AI.TabNetClassifier(4, 3, lambda_sparse=-0.1))
+        model = AI.TabNetClassifier(4, 3, seed=1)
+        assert _tabn_raises(lambda: model.forward([1.0, 2.0]))
+        assert _tabn_raises(lambda: model.forward([1.0, float("nan"), 0.0, 0.0]))
+        assert _tabn_raises(lambda: model.loss_and_backward([0.0, 0.0, 0.0, 0.0], 5))
+        assert _tabn_raises(lambda: model.fit([], []))
+        assert _tabn_raises(lambda: model.sgd_step(-1))

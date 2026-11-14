@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2915 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2920 项）
 
 ## 特性
 
@@ -4877,14 +4877,29 @@ history = model.fit(samples, labels, epochs=100, lr=0.01, seed=1)
 （不是类别字段的 embedding table）；单层线性分类头；注意力复用库内 `TransformerEncoder`
 （无 LayerNorm 预归一化以外的论文改动）；`fit` 是逐样本 SGD，无 Adam/正则。
 
+### TabNet（attentive transformer + feature transformer）
+
+```python
+model = AI.TabNetClassifier(4, 3, n_steps=2, d_model=6, d_dec=3, seed=1)
+logits = model.forward([0.5, -0.3, 1.2, 0.0])   # 每步 sparsemax 选特征
+loss = model.loss_and_backward([0.5, -0.3, 1.2, 0.0], 1)  # CE + 掩码熵正则
+model.fit(samples, labels, epochs=40, lr=0.05, seed=1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `TabNetClassifier(n_features, num_classes, n_steps=3, d_model=8, d_dec=4, lambda_sparse=1e-3, seed=None)` | 每步 `mask = sparsemax(W_mask·h_{t-1})`、特征变换 `W1(relu)→W2(relu)` 得到 `h_t`、决策 `W_d(relu)` 各步相加后接线性分类头；手写反向覆盖 sparsemax 掩码梯度与逐步 BPTT |
+
+边界：教学用最小 TabNet——无 BatchNorm / 特征重缩放 / 注意力共享；`forward` 单样本、`n_steps` 固定、`lambda_sparse` 的熵正则在 `loss_and_backward` 里直接计入。
+
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2903 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
 一组**快速冒烟测试**（12 项，`pytest tests/ -q` 约 0.1 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2915 项）。
+`tests/`（合计 2920 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -4892,7 +4907,7 @@ history = model.fit(samples, labels, epochs=100, lr=0.01, seed=1)
 
 ```bash
 pytest tests/ -q                 # 12 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2915 项
+pytest -q                        # test_ai.py + tests/ 合计 2920 项
 ```
 
 ### 工程便利件（unwrap_model / Trainer / benchmark_forward）
@@ -6645,7 +6660,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2915 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2920 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7138,6 +7153,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
+| `TestTabNet` | 前向/参数 133、五组权重 FD（head/W1/W2/Wd/W_mask）、40 步收敛、掩码稀疏性与单纯形约束、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7172,7 +7188,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2903 个单元测试
+├── test_ai.py       # 2908 个单元测试
 ├── tests/           # 12 个快速冒烟测试（pytest 自动发现）
 ├── mypy.ini         # 渐进类型化配置模板
 ├── py.typed         # 类型标记（仓库非可安装包，仅作标记）
