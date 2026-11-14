@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2776 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2781 项）
 
 ## 特性
 
@@ -4014,14 +4014,17 @@ pinn.predict(0.5)   # ≈ 0.125
 
 
 | `tensor_parallel_linear_forward(weight, bias, x, world_size, mode='column')` | Megatron 式列/行并行线性层前向，数值与稠密前向一致 |
+| `tensor_parallel_linear_backward(weight, bias, x, dy, world_size, mode='column')` | 与列/行并行前向配套的反向：返回完整 `dx`/`dweight`/`dbias` 与每个 rank 的局部梯度，column 模式各 rank 只算自己那几行 `dW` 并汇总 `dx`，row 模式 `bias` 梯度只由 rank 0 负责 |
 | `sequence_parallel_layer_norm(x_seq, eps=1e-5)` | 序列并行 LayerNorm：每个 token 独立归一化，按序列切分不改变结果 |
+| `sequence_parallel_layer_norm_backward(x_seq, dout_seq, eps=1e-5)` | 序列并行 LayerNorm 的反向：逐 token 解析梯度，每行梯度之和为 0 |
 
 ```python
 updated, ranges = AI.zero_optimizer_step(params, grads, lr=0.1, world_size=4)
 y, shards = AI.tensor_parallel_linear_forward(W, b, x, world_size=2, mode="column")
+dx = AI.tensor_parallel_linear_backward(W, b, x, dout, world_size=2, mode="column")["dx"]
 ```
 
-边界：这些是**教学用纯数值模拟**——不做真实通信/多进程/显存节省，只验证「分片-聚合后的数值与单机等价」；ZeRO 提供 1/2/3 三档分片（3 档参数也分片）但仍是同一进程内的数值模拟；1F1B 只生成调度并做逐段数值反传，事件按「ticks + 依赖」模拟、不建模真实通信延迟；张量并行只实现线性层前向对照，不含反向与通信 overlap。
+边界：这些是**教学用纯数值模拟**——不做真实通信/多进程/显存节省，只验证「分片-聚合后的数值与单机等价」；ZeRO 提供 1/2/3 三档分片（3 档参数也分片）但仍是同一进程内的数值模拟；1F1B 只生成调度并做逐段数值反传，事件按「ticks + 依赖」模拟、不建模真实通信延迟；张量并行提供列/行两种切分的线性层前向与配套反向（column 按输出行、row 按输入列分片，bias 梯度只在 rank 0 归约），序列并行 LayerNorm 也有逐 token 反向；仍不含真实通信与计算 overlap。
 
 ### RL 基础设施与 RLHF 奖励
 
@@ -6257,7 +6260,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2776 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2781 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6288,6 +6291,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestZero23` | ZeRO-2 单步与手写 Adam 逐位一致、三步状态递推一致、ZeRO-3 分片数值等价且覆盖完整、显存估算随 stage 递减、非法输入 |
 | `TestPipeline1F1B` | 1F1B 平均梯度与单机逐样本反传一致（err < 1e-12）、调度顺序与每段 F/B 计数、单段退化、bubble 比例公式、非法输入 |
 | `TestCheckpointed` | 单样本检查点梯度与普通反传一致、不同 `segments` 等价、`cross_entropy` 整数标签路径、`fit_checkpointed` 与手写 SGD 逐位一致且 loss 下降、13 类非法输入 |
+| `TestTensorParallelBackward` | 列/行并行线性层反向与稠密反传逐位一致、权重/输入数值梯度、rank 分片覆盖与 bias 梯度归属、序列并行 LayerNorm 反向中心差分且每行梯度和为 0、12 类非法输入 |
 | `TestGradScalerFit` | 正常混合精度训练收敛、溢出时跳过更新且权重不变、`growth_interval` 到点后 scale 翻倍、`state_dict` 往返、非法输入 |
 | `TestVAE` | 重参数化 `z = mu + eps·std`、`KL ≥ 0`、`loss == 重构 + beta·KL`、`dec2`/`enc2` 权重中心差分、120 轮训练降 3 倍、采样形状与有限性、构造与输入校验 |
 | `TestGAN` | D 输出落在 (0,1)、D 与 G 梯度中心差分、300 步后生成均值明显靠近数据、空 batch 报错 |
@@ -6759,6 +6763,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2776 个单元测试
+├── test_ai.py       # 2781 个单元测试
 └── README.md
 ```

@@ -58964,6 +58964,126 @@ def pipeline_1f1b_grads(model, xs, ys, splits):
         "ticks": schedule["ticks"],
         "bubble_fraction": schedule["bubble_fraction"],
     }
+def _tpb_check_matrix(weight, who, tag="weight"):
+    if not isinstance(weight, (list, tuple)) or not weight:
+        raise ValueError(f"{who}: {tag} 不能为空")
+    cols = len(weight[0])
+    if cols < 1:
+        raise ValueError(f"{who}: {tag} 每行不能为空")
+    for r in weight:
+        if not isinstance(r, (list, tuple)) or len(r) != cols:
+            raise ValueError(f"{who}: {tag} 必须是矩形矩阵")
+    return len(weight), cols
+
+
+def _tpb_check_vector(vec, length, who, tag):
+    if not isinstance(vec, (list, tuple)) or len(vec) != length:
+        raise ValueError(f"{who}: {tag} 长度必须是 {length}")
+    return [float(v) for v in vec]
+
+
+def tensor_parallel_linear_backward(weight, bias, x, dy, world_size,
+                                    mode="column"):
+    """张量并行线性层的反向（与 ``tensor_parallel_linear_forward`` 配套）。
+
+    - ``mode="column"``：权重按输出行切分。各 rank 只见到自己那段 ``dy``，
+      算出该段 ``dW``/``db``，并把 ``W_shardᵀ dy_shard`` 求和成完整 ``dx``。
+    - ``mode="row"``：权重按输入列切分，``x`` 也按列切分。各 rank 见到完整
+      ``dy``，算 ``dW_shard = dy ⊗ x_shard``、``dx_shard = W_shardᵀ dy``，
+      最后把 ``dx`` 分片拼回；``bias`` 的梯度只由 rank 0 负责（前向只加一次）。
+
+    返回 ``{"mode","world_size","dx","dweight","dbias","rank_grads"}``，
+    ``rank_grads[r]`` 是该 rank 实际持有的局部梯度。
+    """
+    who = "tensor_parallel_linear_backward"
+    rows, cols = _tpb_check_matrix(weight, who)
+    x = _tpb_check_vector(x, cols, who, "x")
+    dy = _tpb_check_vector(dy, rows, who, "dy")
+    if bias is not None and len(bias) != rows:
+        raise ValueError(f"{who}: bias 长度必须是 {rows}")
+    world_size = _parallel_check_world(world_size, who)
+    limit = rows if mode == "column" else cols
+    if world_size > limit:
+        raise ValueError(f"{who}: world_size={world_size} 超过该模式可切分的维度 {limit}")
+
+    dweight = [[0.0] * cols for _ in range(rows)]
+    dbias = [0.0] * rows
+    dx = [0.0] * cols
+    rank_grads = []
+
+    if mode == "column":
+        ranges = _split_ranges(rows, world_size, who)
+        dx = [0.0] * cols
+        for start, end in ranges:
+            dW_r = [[dy[r] * x[c] for c in range(cols)] for r in range(start, end)]
+            db_r = [dy[r] for r in range(start, end)]
+            for r in range(start, end):
+                dweight[r] = list(dW_r[r - start])
+                dbias[r] = dy[r]
+                for c in range(cols):
+                    dx[c] += weight[r][c] * dy[r]
+            rank_grads.append({"dweight_rows": (start, end), "dweight": dW_r,
+                               "dbias": db_r})
+        return {"mode": mode, "world_size": world_size, "dx": dx,
+                "dweight": dweight, "dbias": dbias, "rank_grads": rank_grads}
+
+    if mode == "row":
+        ranges = _split_ranges(cols, world_size, who)
+        dx = [0.0] * cols
+        for ri, (start, end) in enumerate(ranges):
+            dW_r = [[dy[r] * x[c] for c in range(start, end)] for r in range(rows)]
+            db_r = [dy[r] for r in range(rows)] if ri == 0 else [0.0] * rows
+            for r in range(rows):
+                for c in range(start, end):
+                    dweight[r][c] = dW_r[r][c - start]
+                if ri == 0:
+                    dbias[r] = dy[r]
+            for c in range(start, end):
+                acc = 0.0
+                for r in range(rows):
+                    acc += weight[r][c] * dy[r]
+                dx[c] = acc
+            rank_grads.append({"dweight_cols": (start, end), "dweight": dW_r,
+                               "dbias": db_r})
+        return {"mode": mode, "world_size": world_size, "dx": dx,
+                "dweight": dweight, "dbias": dbias, "rank_grads": rank_grads}
+
+    raise ValueError(f"{who}: mode 只支持 'column'/'row'，收到 {mode!r}")
+
+
+def sequence_parallel_layer_norm_backward(x_seq, dout_seq, eps=1e-5):
+    """序列并行 LayerNorm（无仿射参数）的反向。
+
+    前向见 ``sequence_parallel_layer_norm``：逐 token 标准化。反向按行独立，
+    ``dx = (dy - mean(dy) - xhat * mean(dy * xhat)) / denom``。返回与 ``x_seq``
+    同形状的梯度，并额外返回每个 token 的中间量（供教学查看）。
+    """
+    who = "sequence_parallel_layer_norm_backward"
+    if not isinstance(x_seq, (list, tuple)) or not x_seq:
+        raise ValueError(f"{who}: x_seq 不能为空")
+    if not isinstance(dout_seq, (list, tuple)) or len(dout_seq) != len(x_seq):
+        raise ValueError(f"{who}: dout_seq 必须与 x_seq 等长")
+    if (not isinstance(eps, (int, float)) or isinstance(eps, bool)
+            or not math.isfinite(eps) or eps <= 0):
+        raise ValueError(f"{who}: eps 必须是正有限数，收到 {eps!r}")
+    out = []
+    for i, (row, drow) in enumerate(zip(x_seq, dout_seq)):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: x_seq[{i}] 必须是非空向量")
+        if not isinstance(drow, (list, tuple)) or len(drow) != len(row):
+            raise ValueError(f"{who}: dout_seq[{i}] 必须与 x_seq[{i}] 等长")
+        vals = [float(v) for v in row]
+        dvals = [float(v) for v in drow]
+        d = len(vals)
+        mu = sum(vals) / d
+        var = sum((v - mu) ** 2 for v in vals) / d
+        denom = math.sqrt(var + eps)
+        xhat = [(v - mu) / denom for v in vals]
+        mean_d = sum(dvals) / d
+        mean_dx = sum(dvals[j] * xhat[j] for j in range(d)) / d
+        out.append([(dvals[j] - mean_d - xhat[j] * mean_dx) / denom
+                    for j in range(d)])
+    return out
 
 def tensor_parallel_linear_forward(weight, bias, x, world_size, mode="column"):
     """模拟 Megatron 式张量并行线性层（不做反向，只对照前向数值）。

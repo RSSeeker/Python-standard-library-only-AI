@@ -44599,3 +44599,138 @@ class TestCheckpointed:
             lambda: AI.checkpointed_sample_grads(model, [0.1], [0.1]),
         ]
         assert all(_cp_raises(f) for f in bad)
+
+
+def _tpb_raises(fn, exc=(ValueError, TypeError)):
+    if not callable(fn):
+        raise TypeError("_tpb_raises: 需要可调用对象")
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _tpb_toy_layer():
+    layer = AI.Layer(4, 3, "linear")
+    layer.weights = [
+        [0.1, 0.2, -0.1, 0.05],
+        [0.3, -0.2, 0.4, 0.1],
+        [-0.1, 0.5, 0.2, -0.3],
+    ]
+    layer.biases = [0.05, -0.1, 0.2]
+    return layer
+
+
+class TestTensorParallelBackward:
+    def test_column_and_row_match_dense(self):
+        layer = _tpb_toy_layer()
+        x = [0.3, -0.7, 0.2, 0.9]
+        dy = [0.5, -0.4, 0.8]
+        _, cache = AI._dense_rows_forward(layer, [x])
+        gw, gb, dx_ref = AI._dense_rows_backward(layer, cache, [dy])
+        dx_ref = dx_ref[0]
+
+        col = AI.tensor_parallel_linear_backward(
+            layer.weights, layer.biases, x, dy, 2, mode="column")
+        row = AI.tensor_parallel_linear_backward(
+            layer.weights, layer.biases, x, dy, 2, mode="row")
+        for res in (col, row):
+            for r in range(3):
+                assert abs(res["dbias"][r] - gb[r]) < 1e-12
+                for c in range(4):
+                    assert abs(res["dweight"][r][c] - gw[r][c]) < 1e-12
+            for c in range(4):
+                assert abs(res["dx"][c] - dx_ref[c]) < 1e-12
+
+    def test_numerical_gradients(self):
+        layer = _tpb_toy_layer()
+        x = [0.3, -0.7, 0.2, 0.9]
+        dy = [0.5, -0.4, 0.8]
+
+        def loss(ww, xx):
+            total = 0.0
+            for r in range(3):
+                acc = sum(ww[r][c] * xx[c] for c in range(4)) + layer.biases[r]
+                total += dy[r] * acc
+            return total
+
+        res = AI.tensor_parallel_linear_backward(
+            layer.weights, layer.biases, x, dy, 2, mode="column")
+        h = 1e-6
+        for r in range(3):
+            for c in range(4):
+                w2 = [[v for v in row] for row in layer.weights]
+                w2[r][c] += h
+                lp = loss(w2, x)
+                w2[r][c] -= 2 * h
+                lm = loss(w2, x)
+                fd = (lp - lm) / (2 * h)
+                assert abs(fd - res["dweight"][r][c]) < 1e-7
+        for c in range(4):
+            xp = list(x)
+            xp[c] += h
+            xm = list(x)
+            xm[c] -= h
+            fd = (loss(layer.weights, xp) - loss(layer.weights, xm)) / (2 * h)
+            assert abs(fd - res["dx"][c]) < 1e-7
+
+    def test_shard_coverage(self):
+        layer = _tpb_toy_layer()
+        x = [0.3, -0.7, 0.2, 0.9]
+        dy = [0.5, -0.4, 0.8]
+        col = AI.tensor_parallel_linear_backward(
+            layer.weights, layer.biases, x, dy, 2, mode="column")
+        row = AI.tensor_parallel_linear_backward(
+            layer.weights, layer.biases, x, dy, 2, mode="row")
+        assert [g["dweight_rows"] for g in col["rank_grads"]] == [(0, 2), (2, 3)]
+        assert [g["dweight_cols"] for g in row["rank_grads"]] == [(0, 2), (2, 4)]
+        # rank0 负责 bias 梯度，其余 rank 不做重复归约
+        assert row["rank_grads"][0]["dbias"] == [0.5, -0.4, 0.8]
+        assert row["rank_grads"][1]["dbias"] == [0.0, 0.0, 0.0]
+
+    def test_sequence_parallel_layer_norm_backward(self):
+        x_seq = [[0.2, -0.5, 0.9, 1.1], [1.0, 0.0, -1.0, 0.3]]
+        dout = [[0.4, -0.2, 0.1, 0.5], [-0.3, 0.7, 0.2, -0.1]]
+
+        def loss(seq):
+            norm = AI.sequence_parallel_layer_norm(seq)
+            return sum(dout[i][j] * norm[i][j]
+                       for i in range(len(seq)) for j in range(len(seq[0])))
+
+        dx = AI.sequence_parallel_layer_norm_backward(x_seq, dout)
+        h = 1e-6
+        for i in range(2):
+            for j in range(4):
+                xp = [list(r) for r in x_seq]
+                xp[i][j] += h
+                xm = [list(r) for r in x_seq]
+                xm[i][j] -= h
+                fd = (loss(xp) - loss(xm)) / (2 * h)
+                assert abs(fd - dx[i][j]) < 1e-6
+        for row in dx:
+            assert abs(sum(row)) < 1e-12
+
+    def test_invalid_inputs(self):
+        layer = _tpb_toy_layer()
+        x = [0.3, -0.7, 0.2, 0.9]
+        dy = [0.5, -0.4, 0.8]
+        bad = [
+            lambda: AI.tensor_parallel_linear_backward([], layer.biases, x, dy, 2),
+            lambda: AI.tensor_parallel_linear_backward(layer.weights, layer.biases, [0.1], dy, 2),
+            lambda: AI.tensor_parallel_linear_backward(layer.weights, layer.biases, x, [0.1], 2),
+            lambda: AI.tensor_parallel_linear_backward(layer.weights, [0.1], x, dy, 2),
+            lambda: AI.tensor_parallel_linear_backward(layer.weights, layer.biases, x, dy, 0),
+            lambda: AI.tensor_parallel_linear_backward(layer.weights, layer.biases, x, dy, 5),
+            lambda: AI.tensor_parallel_linear_backward(
+                layer.weights, layer.biases, x, dy, 2, mode="both"),
+            lambda: AI.tensor_parallel_linear_backward(
+                [[1.0, 2.0], [3.0]], layer.biases, x, dy, 2),
+            lambda: AI.sequence_parallel_layer_norm_backward([], []),
+            lambda: AI.sequence_parallel_layer_norm_backward([[0.1]], []),
+            lambda: AI.sequence_parallel_layer_norm_backward([[0.1]], [[0.1, 0.2]]),
+            lambda: AI.sequence_parallel_layer_norm_backward([[0.1]], [[0.1]], eps=0),
+        ]
+        assert all(_tpb_raises(f) for f in bad)
