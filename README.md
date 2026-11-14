@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2696 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2700 项）
 
 ## 特性
 
@@ -780,6 +780,28 @@ block.sgd_step(0.01)
 
 边界：门控只依赖当前输入（Griffin/Hawk 的简化版，不含循环门）；状态是逐通道标量，
 没有分块并行扫描；序列很长时仍是 O(T) Python 循环；不支持 batch/变长 padding。
+
+### S5（MIMO 对角状态空间层）
+
+S4D 每个状态通道只看自己的输入通道（纯对角），S5 则换成**矩阵 B / C**：
+``h_t = decay ⊙ h_{t-1} + B·u_t``、``y_t = C·h_t + D·u_t``，输入输出维度可以
+不同，是真正的多输入多输出 SSM。A 仍取对角（每通道一个可训练衰减），所以
+反传可以按时间逐通道递推。
+
+```python
+layer = AI.S5Block(d_input=2, d_state=8, d_output=3, dt=0.01, seed=0)
+y = layer.forward(us)        # (T, 2) → (T, 3)
+layer.zero_grad()
+d_us = layer.backward(dy)    # 手写 BPTT
+layer.sgd_step(0.05)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `S5Block(d_input, d_state, d_output, dt=0.01, seed=None)` | 对角 A（`A_log` 可训练）、矩阵 `B (d_state×d_input)`、`C (d_output×d_state)`、`D (d_output×d_input)`；``decay = exp(-softplus(dt)·exp(A_log))``；`forward` / `backward`（逐时间步 BPTT，含 `A_log` 链式因子）/ `zero_grad` / `sgd_step` / `param_count` |
+
+边界：A 是对角矩阵（不是完整 S5 的 DPLR 参数化）；没有 FFN/残差包装，是「一层
+SSM」，可直接嵌进自定义网络；仍是 O(T) Python 循环，不支持 batch/变长 padding。
 
 ### Perceiver IO（潜变量交叉注意力压缩）
 
@@ -6022,7 +6044,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2696 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2700 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6304,6 +6326,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestS4DBlock` | 前向形状与参数量 128、`A_log/B/C/D`/W_o/W1/两个 LayerNorm/输入梯度中心差分、衰减系数范围与 300 步长序列数值稳定、均值池化+线性头 100 步收敛、非法输入 |
 | `TestRGLRUBlock` | 前向形状与参数量 152、因果性（改末 token 不影响前缀）、`W_i/W_a/W_o/W1/W2` 与输入梯度中心差分、150 步池化+线性头训练收敛、非法输入（含未 forward 先 backward） |
 | `TestPerceiverIO` | 前向形状与参数量 1890、`W_in/W_out`/潜变量/交叉与自注意力权重/交叉 LN 的 gamma、输入梯度中心差分、200 步训练收敛、非法输入（含未 forward 先 backward） |
+| `TestS5Block` | 前向形状与参数 19、衰减系数范围、`B/C/D/A_log` 与输入梯度中心差分、300 步序列回归收敛、非法输入（含未 forward 先 backward） |
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
@@ -6507,6 +6530,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2696 个单元测试
+├── test_ai.py       # 2700 个单元测试
 └── README.md
 ```

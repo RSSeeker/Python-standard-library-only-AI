@@ -42968,3 +42968,115 @@ class TestPerceiverIO:
         assert _perc_raises(lambda: m.backward([[0.1] * 3] * 3))
         assert _perc_raises(lambda: m.sgd_step(0.0))
         assert _perc_raises(lambda: m.sgd_step(-0.1))
+
+
+import random
+
+
+def _s5_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestS5Block:
+    def test_forward_param_and_decay(self):
+        m = AI.S5Block(2, 3, 2, seed=4)
+        assert m.param_count() == 19
+        us = [[0.1, -0.2], [0.3, 0.0], [-0.5, 0.4], [0.2, 0.7]]
+        ys = m.forward(us)
+        assert len(ys) == 4 and len(ys[0]) == 2
+        dec = m.decay()
+        assert len(dec) == 3 and all(0.0 < v <= 1.0 for v in dec)
+        # 同输入两次前向一致
+        assert ys == m.forward(us)
+
+    def test_numerical_gradients(self):
+        random.seed(2)
+        m = AI.S5Block(2, 3, 2, seed=4)
+        T = 4
+        us = [[random.gauss(0, 1) for _ in range(2)] for _ in range(T)]
+
+        def loss_at(model, uu):
+            ys = model.forward(uu)
+            return sum(ys[t][i] * (0.3 * t + 0.1 * i)
+                       for t in range(T) for i in range(2))
+
+        def fd(name, getter, ana, setter):
+            m.zero_grad()
+            m.forward(us)
+            w = [[0.3 * t + 0.1 * i for i in range(2)] for t in range(T)]
+            dout = [[w[t][i] for i in range(2)] for t in range(T)]
+            m.backward(dout)
+            a = ana()
+            p0 = getter()
+            setter(p0 + 1e-5)
+            lp = loss_at(m, us)
+            setter(p0 - 1e-5)
+            lm = loss_at(m, us)
+            setter(p0)
+            assert abs(a - (lp - lm) / 2e-5) < 1e-5, (name, a)
+
+        fd("B", lambda: m.B[1][0], lambda: m.grad_B[1][0],
+           lambda v: m.B[1].__setitem__(0, v))
+        fd("C", lambda: m.C[0][2], lambda: m.grad_C[0][2],
+           lambda v: m.C[0].__setitem__(2, v))
+        fd("D", lambda: m.D[1][0], lambda: m.grad_D[1][0],
+           lambda v: m.D[1].__setitem__(0, v))
+        fd("A_log", lambda: m.A_log[1], lambda: m.grad_A_log[1],
+           lambda v: m.A_log.__setitem__(1, v))
+
+        m.zero_grad()
+        m.forward(us)
+        w = [[0.3 * t + 0.1 * i for i in range(2)] for t in range(T)]
+        dout = [[w[t][i] for i in range(2)] for t in range(T)]
+        d_us = m.backward(dout)
+        err = 0.0
+        for t in range(T):
+            for k in range(2):
+                old = us[t][k]
+                us[t][k] = old + 1e-5
+                lp = loss_at(m, us)
+                us[t][k] = old - 1e-5
+                lm = loss_at(m, us)
+                us[t][k] = old
+                err = max(err, abs((lp - lm) / 2e-5 - d_us[t][k]))
+        assert err < 1e-5, err
+
+    def test_training_reduces_loss(self):
+        m = AI.S5Block(2, 3, 2, seed=4)
+        rng = random.Random(11)
+        us = [[rng.gauss(0, 1) for _ in range(2)] for _ in range(6)]
+        target = [[0.5, -0.2] for _ in range(6)]
+        losses = []
+        for _ in range(300):
+            ys = m.forward(us)
+            losses.append(sum((ys[t][i] - target[t][i]) ** 2
+                              for t in range(6) for i in range(2)))
+            dout = [[2.0 * (ys[t][i] - target[t][i]) / 12.0 for i in range(2)]
+                    for t in range(6)]
+            m.zero_grad()
+            m.backward(dout)
+            m.sgd_step(0.1)
+        assert losses[-1] < losses[0] * 0.05, (losses[0], losses[-1])
+
+    def test_invalid_inputs(self):
+        assert _s5_raises(lambda: AI.S5Block(0, 3, 2))
+        assert _s5_raises(lambda: AI.S5Block(2, 0, 2))
+        assert _s5_raises(lambda: AI.S5Block(2, 3, 0))
+        assert _s5_raises(lambda: AI.S5Block(2, 3, 2, dt=0.0))
+        assert _s5_raises(lambda: AI.S5Block(2, 3, 2, seed=1.5))
+        m = AI.S5Block(2, 3, 2, seed=4)
+        assert _s5_raises(lambda: m.forward([]))
+        assert _s5_raises(lambda: m.forward([[0.1]]))
+        assert _s5_raises(lambda: m.forward([[0.1, "x"]]))
+        assert _s5_raises(lambda: m.forward([[0.1, float("nan")]]))
+        assert _s5_raises(lambda: m.backward([[0.1, 0.2]]), RuntimeError)
+        m.forward([[0.1, 0.2], [0.3, 0.4]])
+        assert _s5_raises(lambda: m.backward([[0.1, 0.2]]))
+        assert _s5_raises(lambda: m.sgd_step(0.0))
+        assert _s5_raises(lambda: m.sgd_step(-1.0))

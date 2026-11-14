@@ -16076,6 +16076,214 @@ def _s4d_softplus(v):
     return math.log1p(math.exp(v))
 
 
+
+"""S5 风格的多输入多输出对角状态空间层（教学简化）。
+
+与 S4D 的「逐通道标量递推」不同，S5 的每个状态通道接收**所有输入通道**的线性
+组合（B 是矩阵），输出也由所有状态通道线性组合（C 是矩阵），因此是真正的 MIMO
+SSM：``h_t = decay ⊙ h_{t-1} + B·u_t``、``y_t = C·h_t + D·u_t``。
+"""
+
+
+def _s5_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"S5Block: {name} 必须是正整数，收到 {value!r}")
+
+
+def _s5_check_pos_number(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) \
+            or not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"S5Block: {name} 必须是正有限数，收到 {value!r}")
+
+
+def _s5_check_seq(us, d_input):
+    if not isinstance(us, (list, tuple)) or len(us) == 0:
+        raise ValueError("S5Block: 输入序列必须是非空二维列表")
+    out = []
+    for row in us:
+        if not isinstance(row, (list, tuple)) or len(row) != d_input:
+            raise ValueError(
+                f"S5Block: 每个时间步必须是长度 {d_input} 的列表")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError("S5Block: 输入必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+class S5Block:
+    """对角 A、矩阵 B/C/D 的 MIMO SSM 层。
+
+    ``u``: ``(T, d_input)``；``y``: ``(T, d_output)``。
+    状态初始为 0；``decay = exp(-softplus(dt)·exp(A_log))`` 保证每通道 (0,1]。
+    """
+
+    def __init__(self, d_input, d_state, d_output, dt=0.01, seed=None):
+        _s5_check_pos_int(d_input, "d_input")
+        _s5_check_pos_int(d_state, "d_state")
+        _s5_check_pos_int(d_output, "d_output")
+        _s5_check_pos_number(dt, "dt")
+        self.d_input = d_input
+        self.d_state = d_state
+        self.d_output = d_output
+        self.dt = float(dt)
+
+        if seed is not None:
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                raise ValueError("S5Block: seed 必须是整数或 None")
+            state = random.getstate()
+            random.seed(seed)
+            try:
+                self._init_params()
+            finally:
+                random.setstate(state)
+        else:
+            self._init_params()
+        self.zero_grad()
+        self._cache = None
+
+    def _init_params(self):
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        # A_log 取较小的值，让 softplus(dt)*exp(A_log) 落在合理范围
+        self.A_log = [math.log(0.5) + 0.1 * i for i in range(ds)]
+        std_b = math.sqrt(2.0 / di)
+        std_c = math.sqrt(2.0 / ds)
+        self.B = [[random.gauss(0.0, std_b) for _ in range(di)]
+                  for _ in range(ds)]
+        self.C = [[random.gauss(0.0, std_c) for _ in range(ds)]
+                  for _ in range(do)]
+        self.D = [[0.0 for _ in range(di)] for _ in range(do)]
+
+    def zero_grad(self):
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        self.grad_A_log = [0.0] * ds
+        self.grad_B = [[0.0] * di for _ in range(ds)]
+        self.grad_C = [[0.0] * ds for _ in range(do)]
+        self.grad_D = [[0.0] * di for _ in range(do)]
+
+    def decay(self):
+        vals = []
+        for a in self.A_log:
+            vals.append(math.exp(-_softplus(self.dt) * math.exp(a)))
+        return vals
+
+    def _check_seq(self, us):
+        return _s5_check_seq(us, self.d_input)
+
+    def forward(self, us):
+        xs = self._check_seq(us)
+        T = len(xs)
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        dec = self.decay()
+        states = []
+        ys = []
+        h = [0.0] * ds
+        for t in range(T):
+            hs = [dec[j] * h[j] for j in range(ds)]
+            for j in range(ds):
+                acc = hs[j]
+                row = self.B[j]
+                ut = xs[t]
+                for k in range(di):
+                    acc += row[k] * ut[k]
+                hs[j] = acc
+            states.append(hs)
+            y = [0.0] * do
+            for i in range(do):
+                acc = 0.0
+                crow = self.C[i]
+                for j in range(ds):
+                    acc += crow[j] * hs[j]
+                drow = self.D[i]
+                for k in range(di):
+                    acc += drow[k] * xs[t][k]
+                y[i] = acc
+            ys.append(y)
+            h = hs
+        self._cache = {"xs": xs, "states": states, "dec": dec}
+        return ys
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("S5Block: 必须先 forward 再 backward")
+        xs = self._cache["xs"]
+        states = self._cache["states"]
+        dec = self._cache["dec"]
+        T = len(xs)
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        if not isinstance(dout, (list, tuple)) or len(dout) != T:
+            raise ValueError("S5Block: dout 长度必须等于时间步数")
+        for t in range(T):
+            row = dout[t]
+            if not isinstance(row, (list, tuple)) or len(row) != do:
+                raise ValueError(
+                    f"S5Block: dout 每行必须是长度 {do} 的列表")
+        # 输出层梯度
+        for t in range(T):
+            for i in range(do):
+                g = dout[t][i]
+                for j in range(ds):
+                    self.grad_C[i][j] += g * states[t][j]
+                for k in range(di):
+                    self.grad_D[i][k] += g * xs[t][k]
+        # 反向递推状态
+        dh_next = [0.0] * ds
+        d_us = [[0.0] * di for _ in range(T)]
+        for t in range(T - 1, -1, -1):
+            dh = [0.0] * ds
+            for i in range(do):
+                g = dout[t][i]
+                crow = self.C[i]
+                for j in range(ds):
+                    dh[j] += g * crow[j]
+            for j in range(ds):
+                dh[j] += dh_next[j]
+            # h_t 对 A_log、B、输入、上一状态的贡献
+            for j in range(ds):
+                # dh[j] 是 h_t[j] 的梯度
+                d_prev = dh[j] * dec[j]
+                if t > 0:
+                    self.grad_A_log[j] += dh[j] * states[t - 1][j]
+                bj = self.B[j]
+                for k in range(di):
+                    self.grad_B[j][k] += dh[j] * xs[t][k]
+                    d_us[t][k] += dh[j] * bj[k]
+                dh_next[j] = d_prev
+        # A_log 的链式：d decay/d A_log = -softplus(dt)*exp(A_log)*decay
+        sp = _softplus(self.dt)
+        for j in range(ds):
+            self.grad_A_log[j] *= (-sp * math.exp(self.A_log[j]) * dec[j])
+        return d_us
+
+    def sgd_step(self, lr=0.01, lr_a=None):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0.0:
+            raise ValueError("S5Block: lr 必须是正数")
+        if lr_a is None:
+            lr_a = lr
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        for j in range(ds):
+            self.A_log[j] -= lr_a * self.grad_A_log[j]
+            for k in range(di):
+                self.B[j][k] -= lr * self.grad_B[j][k]
+        for i in range(do):
+            for j in range(ds):
+                self.C[i][j] -= lr * self.grad_C[i][j]
+            for k in range(di):
+                self.D[i][k] -= lr * self.grad_D[i][k]
+
+    def param_count(self):
+        ds, di, do = self.d_state, self.d_input, self.d_output
+        return ds + ds * di + do * ds + do * di
+
+
+def _softplus(x):
+    if x > 20.0:
+        return x
+    return math.log1p(math.exp(x))
+
 class S4DBlock:
     """S4D（diagonal S4）的逐通道递推 block。
 
