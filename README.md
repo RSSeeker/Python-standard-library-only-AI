@@ -7261,6 +7261,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDeepONet2D` | 二维 DeepONet 前向与 param_count、branch/trunk 权重中心差分、拟合 `sin(πx)cos(πy)` 收敛、非法输入 |
 | `TestFNO1d` | 前向形状与参数计数、lift/A/B/skip/输出权重中心差分、拟合求导算子收敛、非法输入 |
 | `TestDiT` | 前向/参数计数/采样可复现、conv/head/时间 MLP 梯度中心差分、拟合降 loss、时间调制改变输出、非法输入 |
+| `TestLatentDiffusion` | 编码/解码往返、DDIM 单步与解析式一致、CFG 分支合并、ControlNet 零卷积初始恒等、5 类梯度中心差分、非法输入 |
 | `TestSafetensors` | 1D/2D 往返、header 偏移/8 字节对齐、float32 精度、`__metadata__` 跳过、非法张量、截断/坏 JSON/坏 dtype/offsets 不匹配 |
 | `TestPagedBlockManager` | 分配/扩块/复用、`fork` 引用计数、COW 隔离、换出/换回（共享块复用）、非法参数与块耗尽、统计守恒 |
 | `TestPrefixCacheStore` | 最长前缀匹配、精确命中、LRU 淘汰、`min_prefix` 与非法 token/cache |

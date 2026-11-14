@@ -302,3 +302,100 @@ C 引擎是独立轨道，不在 Web 的同步范围内。
 - 2026-11-14：用户要求「不要同步了，先记录未同步的」；新增本节，记录三仓 HEAD、C 侧仅
   kv_evict 已同步（提交 + CI + 对拍数）、Web 侧试插已回退且无新增、剩余未同步清单索引
   （详细见第 2、7 节）与恢复同步的起点建议。
+
+## 10. 2026-11-15 新增 Python 能力（p84–p116，尚未同步到 C / Web）
+
+### 10.1 三仓快照
+
+| 仓库 | HEAD | 测试/对拍 | 工作区 |
+| --- | --- | --- | --- |
+| Python（本仓库） | `dc1fcea` | 3018 tests（CI success） | clean |
+| C（`D:\vscode\AI_C`） | `36e4995` | `mingw32-make check` EXIT=0 | clean |
+| Web（`D:\vscode\RSSeeker.github.io`） | `09faa7a` | 303 checks ALL PASS | clean |
+
+用户 m17412「不要同步了，先记录未同步的」仍然有效：本轮**只做 Python**，
+C / Web 没有任何新提交。
+
+### 10.2 本轮新增内容（两批清单）
+
+**m17439「能加的加」清单（p84–p103）**
+
+- 稀疏/离散重参数化：`gumbel_softmax`（straight-through）、`sparsemax`/`entmax` 及其反传；
+- 度量学习：`supcon_loss`、`arcface_loss`、`cosface_loss`、`circle_loss`；
+- 蒸馏：`rkd_distance_loss`/`rkd_angle_loss`/`rkd_loss`、`dkd_loss`（TCKD+NCKD）；
+- 优化器：`SAMOptimizer`（SGD/Adam 两步）、`BAdam`、`LLRDAdam` + `layerwise_lr_decay`；
+- PEFT：`pissa_lora`、`lora_plus_step`；
+- 视觉架构：PoolFormer/MetaFormer、ConvNeXt V2 的 `GRN`、Swin V2 的
+  `ScaledCosineAttention`；时序：`DLinear`、`ITransformer`；表格：`FT-Transformer`、`TabNet`；
+- 训练工具：`step_warmup_lr`、`grid_search`/`random_search`、`export_history_json`/`load_history_json`；
+- 训练技巧：`task_vector`/`task_arithmetic`、`wise_ft`、`greedy_soup`、`AugMix`、
+  `tent_adapt`/`TENTClassifier`、Consistency Model 完整版（预条件/σ 调度/蒸馏/采样）；
+- 工程化：`tests/` 冒烟测试目录、`mypy.ini` + `py.typed`、`tools/numeric_regression.py`
+  （12 组固定数值快照，CI 逐位检查）。
+
+**m18422 清单（p105–p116）**
+
+- 工程化：`python -m ai train/eval/export/serve`（`ai/` 包）、`CheckpointManager` +
+  `CheckpointCallback` + CLI `--resume`、`ai.launch` 数据并行启动器、`ai/hf_compat.py`
+  （HF 目录约定）、`ai/gguf.py`（GGUF v3 最小读写）、`ai/report.py`（profile/内存报告、
+  模型卡/数据卡）、`AI.pyi` + `py.typed`、`tools/api_stability.py` + `API_STABILITY.md`；
+- 视觉：`depthwise_conv`/`pointwise_conv`/`inverted_residual_block`/`mobilenet_v2_forward`/
+  `mobilenet_v3_forward`/`efficientnet_compound_scale`/`mbconv_block`/`efficientnet_lite_forward`、
+  `ConvNeXtV2Block`、`FCMAEReconstructor`（掩码重建预训练）、`densenet_transition`、`aspp`、
+  `roi_align`、`unet_plus_plus_forward`；
+- 序列：`TransformerXL`（段级循环、memory stop-gradient）；
+- 生成：`LatentDiffusion`（固定线性编码器 + MLP 去噪器 + DDIM + CFG）、
+  `ControlNetZeroConv`（零初始化残差）、`cfg_combine`/`ddim_step`；
+- 量化/PEFT：`gptq_quantize_matrix`/`gptq_weighted_error`、`awq_scale_weights`/
+  `awq_compensate_input`、`q_galore_quantize`、`multiclass_distill_loss`/
+  `self_distillation_loss`/`multi_teacher_distill_loss`、`rslora_scale`/`rslora_delta`/
+  `loha_delta`/`lokr_delta`；
+- 训练/搜索：`gradient_noise`、`semdedup`、`quality_filter`、
+  `noisy_student_loss_and_backward`、`tpe_lite`、`hyperband`、`pbt`；
+- 质量保障：`tools/torch_parity.py` + `tests/test_parity.py`（与 PyTorch 数值对拍，
+  torch 缺失自动 skip）、并发/内存泄漏测试、API 稳定性约定表。
+
+### 10.3 未同步到 C 的分类清单（按可实现性排序）
+
+1. **纯函数/标量组（最适合首批逐位对拍）**：`gumbel_softmax`/`sparsemax`/`entmax`、
+   `supcon_loss`/`arcface_loss`/`cosface_loss`/`circle_loss`、RKD/DKD、
+   `multiclass_distill_loss`/`self_distillation_loss`/`multi_teacher_distill_loss`、
+   `rslora_scale`/`rslora_delta`/`loha_delta`/`lokr_delta`、`gptq_quantize_matrix`/
+   `gptq_weighted_error`、`awq_scale_weights`/`awq_compensate_input`、
+   `q_galore_quantize`、`gradient_noise`、`semdedup`、`quality_filter`、
+   `densenet_transition`/`aspp`/`roi_align` 中的纯数值部分、`cfg_combine`/`ddim_step`。
+2. **无训练循环的架构前向**：MobileNetV2/V3、EfficientNet-lite、`ConvNeXtV2Block`、
+   `FCMAEReconstructor`（mask + 前向）、`TransformerXL`（前向/记忆）、`FTTransformer`、
+   `ITransformer`、`TabNet`、`DLinear`、`PoolFormerBlock`、`GRN`、`SwinV2Block`、
+   `LatentDiffusion`（forward/sample 部分）、`ControlNetZeroConv`。
+3. **训练循环/优化器（需先给 C 侧补回调 + 状态协议）**：`SAMOptimizer`、`BAdam`、
+   `LLRDAdam`、`tent_adapt`/`TENTClassifier`、`noisy_student_loss_and_backward`、
+   `tpe_lite`/`hyperband`/`pbt`（迭代式，依赖回调）、`fit` 系 API。
+4. **工程化设施**：`ai/` 命令行入口、`CheckpointManager`/`CheckpointCallback`、
+   `ai.launch`、`ai/hf_compat.py`、`ai/gguf.py`、`ai/report.py`、`AI.pyi`、
+   `tools/numeric_regression.py`/`torch_parity.py`/`api_stability.py`、`tests/` 目录结构。
+   这些是仓库级设施，C 侧是否跟进需单独设计（不建议逐行移植）。
+
+### 10.4 Web 未同步
+
+按 Web 的单文件浏览器演示定位，上述训练循环、C 引擎移植、命令行/检查点/HF/GGUF 等
+均不进入 Web；纯 JS 可做的候选仍是「纯函数组」里的：`gumbel_softmax`/`sparsemax`/`entmax`、
+度量学习损失、RKD/DKD、`gradient_noise`/`semdedup`/`quality_filter`、AugMix JSD、
+`cfg_combine` 等。恢复 Web 同步前，需先修掉第 9.3 节记录的 1 处 `tools/check.js` 失败。
+
+### 10.5 恢复同步时的建议批次
+
+- **C-S10**：gumbel/sparsemax/entmax + 度量学习四损失（纯标量，逐位对拍，体量小）。
+- **C-S11**：RKD/DKD + 自/多教师蒸馏 + rsLoRA/LoHa/LoKr（标量 + 小矩阵）。
+- **C-S12**：GPTQ/AWQ/Q-GaLore + `gradient_noise`/`semdedup`/`quality_filter`。
+- **C-S13**：经典 CNN 组件（transition/ASPP/ROI Align）与轻量 CNN 前向。
+- 训练循环/工程化设施留待与 C 侧协议一起设计。
+- **Web-W1**：`gumbel_softmax`/`sparsemax`/`entmax` + 度量损失（先修 1 处失败再提交）。
+
+### 10.6 变更记录（本轮）
+
+- 2026-11-15：用户要求「检查readme和注释然后记录未同步内容」；已核对 README 计数
+  3018 四处一致、AI.py 注释无过时「只做前向/未实现反向」表述（仅 `adain_style` 与
+  `_causal_conv` 的正常函数语义），修正 AI.py 目录头 def 计数（1880 → 1882，实测
+  `grep -c "^def "`=1882、`^class `=437），README 测试表补 `TestLatentDiffusion` 行；
+  新增本节，记录 p84–p116 新增能力的未同步分类与建议批次。C / Web 本轮无改动。
