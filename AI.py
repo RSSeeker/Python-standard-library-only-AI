@@ -63635,6 +63635,132 @@ def eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=
         },
     }
 
+def _la_check_pos_int(value, name, minimum=1):
+    """校验正整数。"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"lookahead: {name} 必须是整数")
+    if value < minimum:
+        raise ValueError(f"lookahead: {name} 必须 >= {minimum}")
+    return value
+
+
+def _la_ngram_pool(tokens, ngram_size=3):
+    """用已见 tokens 建 n-gram 池：后缀元组 -> 下一个 token。"""
+    pool = {}
+    for size in range(1, ngram_size + 1):
+        for i in range(len(tokens) - size):
+            key = tuple(tokens[i:i + size])
+            pool[key] = tokens[i + size]
+    return pool
+
+
+def _lookahead_ngram_draft(tokens, pool, lookahead):
+    """从 n-gram 池取最长后缀匹配，续出最多 lookahead 个草稿 token。"""
+    drafts = []
+    size = min(lookahead, len(pool))
+    for _ in range(lookahead):
+        best = None
+        limit = min(len(tokens), 4)
+        for k in range(limit, 0, -1):
+            key = tuple(tokens[-k:])
+            if key in pool:
+                best = pool[key]
+                break
+        if best is None:
+            break
+        drafts.append(best)
+        tokens = tokens + [best]
+    return drafts
+
+
+def lookahead_decode(model, prompt_ids, max_new_tokens=8, lookahead=3,
+                     jacobi_steps=None, eos_id=None, ngram_size=3):
+    """Lookahead decoding 简化版：并行的 Jacobi 式草稿 + 一次前向验证。
+
+    每一轮把 ``lookahead`` 个位置的草稿一起送进模型，用位置对齐的 argmax
+    迭代修正草稿（Jacobi 式），收敛后一次性接受；因此每轮只花少量前向
+    就能推进多个 token。``jacobi_steps`` 缺省等于 ``lookahead``（保证收敛
+    到贪心解）。草稿可用 n-gram 池预热，池为空时退化为「重复上一个贪心
+    token」的初始猜测。
+    """
+    vocab = getattr(model, "vocab_size", None)
+    if vocab is None:
+        raise TypeError("lookahead_decode: model 必须有 vocab_size")
+    if not callable(getattr(model, "forward", None)):
+        raise TypeError("lookahead_decode: model 必须有 forward")
+    prompt = _me_check_ids(prompt_ids, vocab, "prompt_ids")
+    n = _la_check_pos_int(max_new_tokens, "max_new_tokens")
+    gamma = _la_check_pos_int(lookahead, "lookahead")
+    steps = gamma if jacobi_steps is None else _la_check_pos_int(
+        jacobi_steps, "jacobi_steps")
+    if eos_id is not None:
+        if not isinstance(eos_id, int) or isinstance(eos_id, bool):
+            raise TypeError("lookahead_decode: eos_id 必须是整数")
+        if eos_id < 0 or eos_id >= vocab:
+            raise ValueError("lookahead_decode: eos_id 必须在词表内")
+    ngram_size = _la_check_pos_int(ngram_size, "ngram_size")
+
+    max_len = getattr(model, "max_len", None)
+    ctx = list(prompt)
+    out = []
+    drafted = 0
+    accepted = 0
+    forward_calls = 0
+    pool = _la_ngram_pool(ctx, ngram_size) if len(ctx) > 1 else {}
+    while len(out) < n:
+        remaining = n - len(out)
+        if max_len is not None and len(ctx) + 1 > max_len:
+            break
+        logits = model.forward(ctx)
+        forward_calls += 1
+        greedy = _me_argmax(logits[-1])
+        if remaining == 1 or (max_len is not None
+                              and len(ctx) + gamma > max_len):
+            tok = greedy
+            out.append(tok)
+            ctx.append(tok)
+            if eos_id is not None and tok == eos_id:
+                break
+            continue
+        bound = gamma if remaining >= gamma else remaining
+        drafts = _lookahead_ngram_draft(ctx, pool, bound)
+        if not drafts:
+            drafts = [greedy] * bound
+        while len(drafts) < bound:
+            drafts.append(drafts[-1])
+        for _ in range(steps):
+            trial = model.forward(ctx + drafts)
+            forward_calls += 1
+            fresh = [_me_argmax(trial[len(ctx) - 1 + i])
+                     for i in range(bound)]
+            if fresh == drafts:
+                break
+            drafts = fresh
+        drafted += bound
+        stop = False
+        for tok in drafts:
+            if len(out) >= n:
+                break
+            out.append(tok)
+            accepted += 1
+            ctx.append(tok)
+            if eos_id is not None and tok == eos_id:
+                stop = True
+                break
+        if stop or len(out) >= n:
+            break
+    return {
+        "ids": list(prompt) + out,
+        "tokens": out,
+        "stats": {
+            "drafted": drafted,
+            "accepted": accepted,
+            "forward_calls": forward_calls,
+            "accept_rate": (accepted / drafted) if drafted else 0.0,
+        },
+    }
+
+
 # ============================================================================
 #  领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
 # ============================================================================

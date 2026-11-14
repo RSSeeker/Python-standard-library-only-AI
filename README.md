@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2807 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2813 项）
 
 ## 特性
 
@@ -5597,6 +5597,7 @@ print(out["ids"], out["stats"]["accept_rate"])
 | `train_eagle_heads(target, draft, sequences, epochs=10, lr=0.01)` | 用冻结目标模型收集 `(h_t, x_{t+1}, h_{t+1})` 三元组训练 `EAGLEDraftHead`：每条序列取 `T-1` 行，只更新草稿头，返回 `loss_history`/`rows`/`epochs`/`feature_weight` |
 | `EagleDrafter(d_model, vocab_size, hidden=64, seed=None)` | 特征级草稿器：`tanh(W_f·feature + W_e·emb(prev) + b)` → 词表 logits；`draft(feature, prev_token, k, embed_weight, vocab_size)` 自回归出 k 个草稿 token |
 | `eagle_decode(target, prompt_ids, drafter, max_new_tokens=8, gamma=4, eos_id=None)` | 用目标模型最后隐藏状态当 `feature`，先取目标贪心 token 起头，再让草稿器连出 `gamma-1` 个，一次前向验证整条链；返回结构同 `medusa_decode` |
+| `lookahead_decode(model, prompt_ids, max_new_tokens=8, lookahead=3, jacobi_steps=None, eos_id=None, ngram_size=3)` | 并行 lookahead 解码：把 `lookahead` 个位置一次送进模型，用位置对齐 argmax 做 Jacobi 式迭代修正草稿，收敛后整段接受（草稿可用 n-gram 池预热）；返回 `{"ids", "tokens", "stats"}`，`stats` 含 `drafted/accepted/forward_calls/accept_rate` |
 
 ```python
 lm = AI.CausalLM(vocab_size=32, d_model=16, num_heads=2, num_layers=1)
@@ -5606,6 +5607,8 @@ print(res["tokens"], res["stats"]["accept_rate"])
 
 drafter = AI.EagleDrafter(16, 32, hidden=32)
 res2 = AI.eagle_decode(lm, [1, 2, 3], drafter, max_new_tokens=8, gamma=4)
+res3 = AI.lookahead_decode(lm, [1, 2, 3], max_new_tokens=8, lookahead=4)
+print(res3["stats"]["forward_calls"])
 
 draft = AI.EAGLEDraftHead(16, 32, d_hidden=16)
 AI.train_eagle_heads(lm, draft, [[1, 2, 3, 4], [2, 3, 4, 5]], epochs=20)
@@ -5618,6 +5621,7 @@ AI.train_eagle_heads(lm, draft, [[1, 2, 3, 4], [2, 3, 4, 5]], epochs=20)
   「目标模型逐 token 贪心生成」逐位一致。采样温度、树形候选、top-k 分叉都没有实现。
 - `stats` 里 `drafted` / `accepted` / `target_calls` / `accept_rate` 只统计本函数内的调用；
   草稿全被拒时 `accept_rate` 为 0，是合法结果，不代表接口坏了。
+- `lookahead_decode` 是并行草稿的简化教学版：每轮把 `lookahead` 个位置一起验证，Jacobi 迭代收敛后按贪心解整段接受，因此结果与逐 token 贪心一致，但完成 n 个 token 只需少量前向；未实现动态窗口、树形候选或 GPU 并行。
 
 ### Progressive Growing（渐进式增长，ProGAN）
 
@@ -6307,7 +6311,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2807 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2813 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6781,6 +6785,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
 | `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
 | `TestGRPOMethods` | `method` 默认 grpo/clip_ratio_high 默认值、dapo 与 gspo 训练后奖励同样提升、多 token prompt 的 logits/old_logps 对齐、非法 method 与 clip_ratio_high 报错 |
+| `TestLookaheadDecoding` | 贪心等价（多种 lookahead/jacobi_steps 组合）、ids 拼接与 stats、forward 调用上界、n-gram 池最长后缀草稿、EOS 提前停止且为贪心前缀、合法性校验、max_len 截断 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6815,6 +6820,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2807 个单元测试
+├── test_ai.py       # 2813 个单元测试
 └── README.md
 ```

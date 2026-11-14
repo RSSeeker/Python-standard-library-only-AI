@@ -45212,3 +45212,105 @@ class TestGRPOMethods:
         _p81_raises(lambda: AI.GRPOTrainer(
             policy, _grpo_reward, method="dapo", clip_ratio_high="x"),
             TypeError)
+
+
+def _la_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _la_greedy(model, prompt, n):
+    ctx = list(prompt)
+    out = []
+    for _ in range(n):
+        logits = model.forward(ctx)
+        tok = AI._me_argmax(logits[-1])
+        out.append(tok)
+        ctx.append(tok)
+    return out
+
+
+def _la_model():
+    random.seed(1)
+    return AI.CausalLM(vocab_size=6, d_model=8, num_heads=2, d_ff=16,
+                       num_layers=1, max_len=16)
+
+
+class TestLookaheadDecoding:
+    def test_greedy_equivalence_and_stats(self):
+        model = _la_model()
+        prompt = [0, 1, 2]
+        ref = _la_greedy(model, prompt, 8)
+        out = AI.lookahead_decode(model, prompt, max_new_tokens=8,
+                                  lookahead=3)
+        assert out["tokens"] == ref
+        assert out["ids"] == prompt + out["tokens"]
+        stats = out["stats"]
+        assert set(stats) == {"drafted", "accepted", "forward_calls",
+                              "accept_rate"}
+        assert stats["drafted"] >= 8
+        assert stats["accepted"] == len(out["tokens"])
+        assert stats["accept_rate"] == pytest.approx(
+            stats["accepted"] / stats["drafted"])
+        assert 0 < stats["forward_calls"] <= len(ref)
+
+    def test_lookahead_and_jacobi_variants(self):
+        model = _la_model()
+        prompt = [0, 1, 2]
+        ref = _la_greedy(model, prompt, 8)
+        for gamma, steps in ((1, None), (2, None), (3, 1), (4, None)):
+            out = AI.lookahead_decode(model, prompt, max_new_tokens=8,
+                                      lookahead=gamma,
+                                      jacobi_steps=steps)
+            assert out["tokens"] == ref
+
+    def test_ngram_pool_and_draft(self):
+        tokens = [1, 2, 3, 4, 1, 2, 3, 4]
+        pool = AI._la_ngram_pool(tokens, 3)
+        assert AI._lookahead_ngram_draft([1, 2], pool, 2) == [3, 4]
+        assert AI._lookahead_ngram_draft([5, 5], pool, 2) == []
+        assert AI._la_ngram_pool([], 3) == {}
+
+    def test_eos_stops_and_prefix(self):
+        model = _la_model()
+        prompt = [0, 1, 2]
+        ref = _la_greedy(model, prompt, 8)
+        eos = ref[2]
+        out = AI.lookahead_decode(model, prompt, max_new_tokens=8,
+                                  lookahead=2, eos_id=eos)
+        toks = out["tokens"]
+        assert toks and toks[-1] == eos
+        assert toks == ref[:len(toks)]
+
+    def test_invalid_inputs(self):
+        model = _la_model()
+        assert _la_raises(lambda: AI.lookahead_decode(
+            object(), [0], max_new_tokens=2))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [99], max_new_tokens=2))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=0))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=2, lookahead=0))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=2, jacobi_steps=0))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=2, ngram_size=0))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=2, eos_id=-1))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, [0], max_new_tokens=2, eos_id=6))
+        assert _la_raises(lambda: AI.lookahead_decode(
+            model, "abc", max_new_tokens=2))
+
+    def test_max_len_stop(self):
+        model = _la_model()
+        prompt = [0, 1, 2, 3, 4, 5]
+        out = AI.lookahead_decode(model, prompt, max_new_tokens=20,
+                                  lookahead=3)
+        assert len(out["tokens"]) <= 16 - len(prompt)
