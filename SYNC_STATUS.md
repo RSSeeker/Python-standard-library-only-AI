@@ -193,3 +193,30 @@ C 引擎是独立轨道，不在 Web 的同步范围内。
 
 - 2026-11-13：初版。记录 C 侧已同步（含最近 FIM/QK-Norm/RoPE/线性注意力/RWKV/模型合并）
   与未同步分类清单、Web 同步范围说明、后续批次建议。
+
+## 7. 2026-11-14 新增 Python 能力（尚未同步到 C / Web）
+
+本段对应 Python 仓库 `e4aed9b..0715a5f` 的 41 个能力提交（测试 2602 → 2818）。按能力域归纳：
+
+| 能力域 | 新增内容 |
+| --- | --- |
+| 注意力 / 状态空间 | 线性注意力手写反向、完整 MLA（Q 低秩 + 解耦 RoPE）、Hyena block、MoE capacity/token dropping/aux 反向、RetNet/Mamba2 chunkwise、S4D、S5、RG-LRU、Perceiver IO、FNet、Griffin block 与 Hawk 别名 |
+| 大模型组合 | Mixtral 风格 MoE-LLM、DeepSeek-V3 风格 MLA+MoE+MTP、VMamba 完整分类器 |
+| 训练循环 | KTO、GRPO/DAPO/GSPO、PPO-with-KL、通用 PEFT 入口 `finetune_adapter`（LoRA/QLoRA/DoRA/AdaLoRA/VeRA/ReFT）、GradScaler 动态缩放、通用梯度检查点 |
+| 优化器 / 并行 | Sophia Hutchinson、Shampoo Newton 逆根与 grafting、GaLore、8-bit Adam、ZeRO-2/3、1F1B 调度、TP/SP 反向 |
+| 推理 | KV cache 淘汰（H2O/SnapKV/StreamingLLM）、Prompt 前缀缓存管理、Lookahead decoding、EAGLE 草稿头训练 |
+| 评估 / 安全 | Elo/Bradley-Terry、judge 校准、PII/canary/越狱扫描、工具调用评测、RULER、数据污染检测、数学等价 AST |
+| 可解释性 | 归纳头/线性探针、tuned lens、ROME/MEMIT、causal tracing、ACDC |
+| 工程质量 | 核心 API doctest 示例、MLP 属性测试报告、数值 fuzzing、单文件与拆包评估结论 |
+
+同步建议：
+
+- 优先级最高的是「纯函数 + 损失/指标」组（评估/安全、可解释性、KV 淘汰、Lookahead 解码），
+  这些不依赖训练循环，可按 C-S8 的方式逐位对拍；
+- 训练循环类（KTO/GRPO/DAPO/GSPO/PPO-KL/PEFT fit）需要 C 侧先补「回调 + 优化器状态」
+  协议，建议放到后面统一设计（类似 C-S9 的 Agent 组）；
+- 架构类（Mixtral/DeepSeek-V3/VMamba 分类器）体量大、依赖多，建议仅在需要时抽样同步前向。
+
+## 8. 变更记录（补充）
+
+- 2026-11-14：新增本节，记录 Python 批 1–41 的能力清单与同步建议；C/Web 侧尚未开始本批同步。
