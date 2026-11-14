@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2964 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2969 项）
 
 ## 特性
 
@@ -4854,6 +4854,23 @@ prob = model.predict(features[0])
 输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
 无 batch/Adam/正则；注意力权重不做可视化导出。
 
+### 轻量 CNN 架构（MobileNetV2 / MobileNetV3 / EfficientNet）
+
+- `inverted_residual_block(x, out_ch, stride=1, expand_ratio=6, use_se=False,
+  activation="relu6", seed=0)`：倒残差 + 线性瓶颈，`stride=1` 且通道相同时加残差。
+- `mobilenet_v2_forward(x, num_classes=10, width_mult=1.0, seed=0)`：
+  MobileNetV2-lite（4 个倒残差块 + 全局池化 + 线性头）。
+- `mobilenet_v3_forward(...)`：同上但带 SE 与 hardswish。
+- `efficientnet_compound_scale(base_width=32, base_depth=1, base_res=224,
+  alpha=1.2, beta=1.1, gamma=1.15, phi=1.0)`：复合缩放
+  `width=α^φ, depth=β^φ, resolution=γ^φ`，通道对齐到 8 的倍数。
+- `mbconv_block(...)` / `efficientnet_lite_forward(...)`：MBConv（expand →
+  depthwise → SE → project）与 EfficientNet-lite 前向。
+
+边界：这些是**前向/结构对照**实现（不含手写反向），卷积核是教学用的通道平均核
+（不训练）；用于对照倒残差、线性瓶颈、SE、复合缩放，不承诺与 TensorFlow 实现
+数值一致。
+
 ### FT-Transformer（表格特征 token + Transformer）
 
 ```python
@@ -5060,19 +5077,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（51 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2964 项）。
+`tests/`（合计 2969 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 51 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2964 项
+pytest tests/ -q                 # 52 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2969 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6831,7 +6848,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2964 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2969 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7324,6 +7341,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConsistencyModel` | 预条件系数极限与单调性、Karras 调度单调、同函数损失为 0/不同为正、多步采样、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
+| `TestCNNArchitectures` | 轻量 CNN 前向（复合缩放/倒残差/MBConv） |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestTabNet` | 前向/参数 133、五组权重 FD（head/W1/W2/Wd/W_mask）、40 步收敛、掩码稀疏性与单纯形约束、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |

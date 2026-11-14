@@ -47239,3 +47239,66 @@ class TestSwinV2Block:
         assert _sv2_raises(lambda: blk.forward([[0.0, 1.0]]))
         assert _sv2_raises(lambda: blk.backward([[0.0] * 4]), RuntimeError)
         assert _sv2_raises(lambda: blk.forward([[float("nan")] * 4]))
+# ---- 轻量 CNN 架构（MobileNetV2/V3 / EfficientNet，前向教学实现） ----
+
+_ARCH_IMG = [[[0.1 * (y + 1) + 0.05 * (x + 1) for x in range(4)] for y in range(4)]]
+
+
+def _arch_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestCNNArchitectures:
+    def test_compound_scaling(self):
+        cfg = AI.efficientnet_compound_scale(phi=1.0)
+        assert cfg == {"channels": 40, "depth": 1, "resolution": 258}
+        cfg2 = AI.efficientnet_compound_scale(phi=2.0, base_width=16)
+        assert cfg2["channels"] == 24 and cfg2["resolution"] == 296
+        # 通道对齐到 8 的倍数
+        assert cfg["channels"] % 8 == 0
+
+    def test_inverted_residual_block(self):
+        out = AI.inverted_residual_block(_ARCH_IMG, 8, stride=2, expand_ratio=2,
+                                         use_se=True, seed=3)
+        assert len(out) == 8 and len(out[0]) == 2 and len(out[0][0]) == 2
+        same = AI.inverted_residual_block(_ARCH_IMG, 3, stride=1, expand_ratio=2)
+        assert len(same) == 3 and len(same[0]) == 4
+        # 确定性：同 seed 两次结果一致（SE 权重受 seed 控制）
+        a = AI.inverted_residual_block(_ARCH_IMG, 4, stride=2, use_se=True, seed=7)
+        b = AI.inverted_residual_block(_ARCH_IMG, 4, stride=2, use_se=True, seed=7)
+        assert a == b
+
+    def test_mobilenet_v2_v3_forward(self):
+        v2 = AI.mobilenet_v2_forward(_ARCH_IMG, num_classes=5, width_mult=0.5, seed=1)
+        v3 = AI.mobilenet_v3_forward(_ARCH_IMG, num_classes=5, seed=1)
+        assert len(v2) == 1 and len(v2[0]) == 5
+        assert len(v3) == 1 and len(v3[0]) == 5
+        assert AI.mobilenet_v2_forward(_ARCH_IMG, 5, 0.5, 1) == v2
+        assert AI.mobilenet_v3_forward(_ARCH_IMG, 5, seed=1) == v3
+
+    def test_mbconv_and_efficientnet_lite(self):
+        mb = AI.mbconv_block(_ARCH_IMG, 12, stride=2, kernel=5, use_se=True, seed=2)
+        assert len(mb) == 12 and len(mb[0]) == 2
+        mb3 = AI.mbconv_block(_ARCH_IMG, 6, stride=1, kernel=3, use_se=False,
+                              activation="relu6", seed=1)
+        assert len(mb3) == 6 and len(mb3[0]) == 4
+        eff = AI.efficientnet_lite_forward(_ARCH_IMG, num_classes=4, phi=1.0, seed=0)
+        assert len(eff) == 1 and len(eff[0]) == 4
+        eff2 = AI.efficientnet_lite_forward(_ARCH_IMG, num_classes=4, phi=0.5, seed=0)
+        assert len(eff2[0]) == 4
+
+    def test_invalid_inputs(self):
+        assert _arch_raises(lambda: AI.efficientnet_compound_scale(phi=-1.0))
+        assert _arch_raises(lambda: AI.efficientnet_compound_scale(base_depth=0))
+        assert _arch_raises(lambda: AI.inverted_residual_block(_ARCH_IMG, 4, stride=3))
+        assert _arch_raises(lambda: AI.inverted_residual_block(_ARCH_IMG, 4, activation="gelu"))
+        assert _arch_raises(lambda: AI.inverted_residual_block(_ARCH_IMG, 0))
+        assert _arch_raises(lambda: AI.mbconv_block(_ARCH_IMG, 4, kernel=7))
+        assert _arch_raises(lambda: AI.mbconv_block(_ARCH_IMG, 4, activation="mish"))
+        assert _arch_raises(lambda: AI.mobilenet_v2_forward(_ARCH_IMG, num_classes=0))
+        assert _arch_raises(lambda: AI.mobilenet_v2_forward(_ARCH_IMG, width_mult=0.0))
+        assert _arch_raises(lambda: AI.depthwise_conv([], 3))

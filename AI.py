@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1806 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1821 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -9321,6 +9321,268 @@ class TabNetClassifier:
             self.sgd_step(lr)
             hist.append(total / len(xs))
         return hist
+
+
+"""轻量 CNN 架构组件（教学前向实现）：MobileNetV2 / MobileNetV3 / EfficientNet。
+
+说明：这几类是**前向推理/结构对照**实现（不含手写反向），用于展示倒残差、
+线性瓶颈、SE、复合缩放等设计；训练请用已有的 Conv2d/BN 组合自行搭。
+"""
+
+
+def _arch_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("%s 必须是正整数，收到 %r" % (name, value))
+    return value
+
+
+def _arch_check_image(x, in_ch):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("图像必须是非空的 (C,H,W) 列表")
+    if len(x) != in_ch:
+        raise ValueError("图像通道数 %d != 期望 %d" % (len(x), in_ch))
+    h = len(x[0])
+    if h < 1 or any(len(row) != len(x[0]) for row in x):
+        raise ValueError("图像每行长度必须一致且非空")
+    return h, len(x[0][0]) if isinstance(x[0][0], (list, tuple)) else 1
+
+
+def _arch_relu(v):
+    return v if v > 0.0 else 0.0
+
+
+def _arch_relu6(v):
+    if v < 0.0:
+        return 0.0
+    return v if v < 6.0 else 6.0
+
+
+def _arch_hardswish(v):
+    # hardswish(x) = x * relu6(x+3) / 6
+    return v * _arch_relu6(v + 3.0) / 6.0
+
+
+def _arch_se_scale(channels, se_ratio=4, seed=0):
+    """构造 SE（squeeze-excite）的缩放向量（教学用固定权重，不训练）。"""
+    if not isinstance(channels, int) or channels < 1:
+        raise ValueError("SE: channels 必须是正整数")
+    if not isinstance(se_ratio, int) or se_ratio < 1:
+        raise ValueError("SE: se_ratio 必须是正整数")
+    hidden = max(1, channels // se_ratio)
+    rng = __import__("random").Random(seed)
+    w1 = [[rng.uniform(-0.1, 0.1) for _ in range(channels)] for _ in range(hidden)]
+    w2 = [[rng.uniform(-0.1, 0.1) for _ in range(hidden)] for _ in range(channels)]
+    return w1, w2
+
+
+def _arch_conv_same(x, out_ch, kernel=3, stride=1):
+    """简单 same 卷积（通道独立 3x3/1x1 平均核），返回 (out_ch,H,W)。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("conv: 图像必须是非空 (C,H,W) 列表")
+    _arch_check_image(x, len(x))
+    in_ch = len(x)
+    h, w = len(x[0]), len(x[0][0])
+    if kernel not in (1, 3):
+        raise ValueError("conv: kernel 只支持 1 或 3")
+    if stride not in (1, 2):
+        raise ValueError("conv: stride 只支持 1 或 2")
+    oh = (h + stride - 1) // stride
+    ow = (w + stride - 1) // stride
+    pad = kernel // 2
+    out = []
+    for oc in range(out_ch):
+        channel = []
+        for oy in range(oh):
+            row = []
+            for ox in range(ow):
+                acc = 0.0
+                cy = oy * stride
+                cx = ox * stride
+                for ky in range(kernel):
+                    for kx in range(kernel):
+                        iy = cy + ky - pad
+                        ix = cx + kx - pad
+                        if 0 <= iy < h and 0 <= ix < w:
+                            v = x[oc % in_ch][iy][ix]
+                            acc += v / float(kernel * kernel)
+                row.append(acc)
+            channel.append(row)
+        out.append(channel)
+    return out
+
+
+def depthwise_conv(x, kernel=3, stride=1):
+    """逐通道深度卷积（前向），返回同通道数特征图。"""
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError("depthwise_conv: 图像必须是非空 (C,H,W) 列表")
+    _arch_check_image(x, len(x))
+    h, w = len(x[0]), len(x[0][0])
+    return _arch_conv_same(x, len(x), kernel=kernel, stride=stride)
+
+
+def pointwise_conv(x, out_ch):
+    """1x1 逐点卷积（前向）。"""
+    return _arch_conv_same(x, out_ch, kernel=1, stride=1)
+
+
+def inverted_residual_block(x, out_ch, stride=1, expand_ratio=6, use_se=False,
+                            activation="relu6", seed=0):
+    """MobileNetV2/V3 倒残差块（stride=1 且通道相同时加残差）。
+
+    结构：expand 1x1（可选 SE）→ depthwise 3x3 → project 1x1（线性瓶颈）。
+    激活：``relu6`` / ``hardswish`` / ``relu``。
+    """
+    _arch_check_image(x, len(x))
+    if not isinstance(out_ch, int) or out_ch < 1:
+        raise ValueError("inverted_residual_block: out_ch 必须是正整数")
+    if stride not in (1, 2):
+        raise ValueError("inverted_residual_block: stride 只支持 1 或 2")
+    if not isinstance(expand_ratio, int) or expand_ratio < 1:
+        raise ValueError("inverted_residual_block: expand_ratio 必须是正整数")
+    if activation not in ("relu6", "hardswish", "relu"):
+        raise ValueError("inverted_residual_block: 未知激活 %r" % (activation,))
+    act = {"relu6": _arch_relu6, "hardswish": _arch_hardswish,
+           "relu": _arch_relu}[activation]
+    in_ch = len(x)
+    mid_ch = in_ch * expand_ratio
+    h = pointwise_conv(x, mid_ch)
+    h = [[[act(v) for v in row] for row in ch] for ch in h]
+    if use_se:
+        w1, w2 = _arch_se_scale(mid_ch, seed=seed)
+        pooled = [sum(sum(row) for row in ch) / float(len(ch) * len(ch[0]))
+                  for ch in h]
+
+        def se_forward(vec):
+            hidden = [sum(w1[i][c] * vec[c] for c in range(mid_ch))
+                      for i in range(len(w1))]
+            hidden = [max(0.0, v) for v in hidden]
+            gate = [sum(w2[o][i] * hidden[i] for i in range(len(hidden)))
+                    for o in range(mid_ch)]
+            return [1.0 / (1.0 + __import__("math").exp(-v)) for v in gate]
+
+        gates = se_forward(pooled)
+        h = [[[row[c] * gates[ch] for c in range(len(row))] for row in ch_]
+             for ch, ch_ in enumerate(h)]
+    h = depthwise_conv(h, kernel=3, stride=stride)
+    h = [[[act(v) for v in row] for row in ch] for ch in h]
+    h = pointwise_conv(h, out_ch)  # 线性瓶颈：不接激活
+    if stride == 1 and in_ch == out_ch:
+        h = [[[h[c][y][xx] + x[c][y][xx] for xx in range(len(h[0][0]))]
+              for y in range(len(h[0]))] for c in range(out_ch)]
+    return h
+
+
+def mobilenet_v2_forward(x, num_classes=10, width_mult=1.0, seed=0):
+    """MobileNetV2-lite（4 个倒残差块 + 全局池化 + 线性头）前向。"""
+    _arch_check_image(x, len(x))
+    if not isinstance(num_classes, int) or num_classes < 1:
+        raise ValueError("mobilenet_v2_forward: num_classes 必须是正整数")
+    if not isinstance(width_mult, (int, float)) or isinstance(width_mult, bool) or width_mult <= 0:
+        raise ValueError("mobilenet_v2_forward: width_mult 必须是正数")
+    channels = [max(1, int(round(c * width_mult))) for c in (16, 24, 32, 64)]
+    h = x
+    for i, out_ch in enumerate(channels):
+        h = inverted_residual_block(h, out_ch, stride=2 if i == 0 else 1,
+                                    expand_ratio=6, use_se=False,
+                                    activation="relu6", seed=seed + i)
+    pooled = [sum(sum(row) for row in ch) / float(len(ch) * len(ch[0]))
+              for ch in h]
+    head = []
+    for c in range(num_classes):
+        head.append(sum(pooled[j] * (0.1 * ((c + 1) % 3) - 0.05)
+                        for j in range(len(pooled))))
+    return [head]
+
+
+def mobilenet_v3_forward(x, num_classes=10, width_mult=1.0, seed=0):
+    """MobileNetV3-lite（hardswish + SE 的倒残差块）前向。"""
+    _arch_check_image(x, len(x))
+    if not isinstance(num_classes, int) or num_classes < 1:
+        raise ValueError("mobilenet_v3_forward: num_classes 必须是正整数")
+    h = x  # 复用与 V2 类似配置，但带 SE + hardswish
+    for i, out_ch in enumerate([16, 24, 40, 80]):
+        h = inverted_residual_block(h, out_ch, stride=2 if i == 0 else 1,
+                                    expand_ratio=6, use_se=True,
+                                    activation="hardswish", seed=seed + i)
+    pooled = [sum(sum(row) for row in ch) / float(len(ch) * len(ch[0]))
+              for ch in h]
+    return [[sum(pooled[j] * (0.05 - 0.01 * c) for j in range(len(pooled)))
+             for c in range(num_classes)]]
+
+
+def efficientnet_compound_scale(base_width=32, base_depth=1, base_res=224,
+                                alpha=1.2, beta=1.1, gamma=1.15,
+                                phi=1.0):
+    """EfficientNet 复合缩放：(channels, depths, resolution)。"""
+    if not isinstance(base_width, int) or base_width < 1:
+        raise ValueError("compound_scale: base_width 必须是正整数")
+    if not isinstance(base_depth, int) or base_depth < 1:
+        raise ValueError("compound_scale: base_depth 必须是正整数")
+    if not isinstance(base_res, int) or base_res < 1:
+        raise ValueError("compound_scale: base_res 必须是正整数")
+    if phi < 0:
+        raise ValueError("compound_scale: phi 不能为负")
+    width = int(round(base_width * (alpha ** phi)))
+    depth = max(1, int(round(base_depth * (beta ** phi))))
+    res = int(round(base_res * (gamma ** phi)))
+    # 通道数对齐到 8 的倍数（EfficientNet 官方实现习惯）
+    width = ((width + 7) // 8) * 8
+    return {"channels": width, "depth": depth, "resolution": res}
+
+
+def mbconv_block(x, out_ch, stride=1, expand_ratio=6, kernel=3,
+                 se_ratio=4, use_se=True, activation="swish", seed=0):
+    """MBConv（EfficientNet 基本块）前向：expand→depthwise→SE→project。"""
+    _arch_check_image(x, len(x))
+    if kernel not in (3, 5):
+        raise ValueError("mbconv_block: kernel 只支持 3 或 5")
+    if activation not in ("swish", "relu6"):
+        raise ValueError("mbconv_block: 未知激活 %r" % (activation,))
+    act = (lambda v: v / (1.0 + __import__("math").exp(-v))) if activation == "swish" else _arch_relu6
+    in_ch = len(x)
+    mid_ch = in_ch * expand_ratio
+    h = pointwise_conv(x, mid_ch)
+    h = [[[act(v) for v in row] for row in ch] for ch in h]
+    h = _arch_conv_same(h, mid_ch, kernel=kernel, stride=stride) if kernel == 3 else depthwise_conv(h, kernel=3, stride=stride)
+    # 通道独立深度卷积（kernel=5 时用 3x3 近似，教学简化）
+    if kernel == 5:
+        h = depthwise_conv(h, kernel=3, stride=1)
+    h = [[[act(v) for v in row] for row in ch] for ch in h]
+    if use_se:
+        w1, w2 = _arch_se_scale(mid_ch, se_ratio=se_ratio, seed=seed)
+        pooled = [sum(sum(row) for row in ch) / float(len(ch) * len(ch[0]))
+                  for ch in h]
+        hidden = [max(0.0, sum(w1[i][c] * pooled[c] for c in range(mid_ch)))
+                  for i in range(len(w1))]
+        gate = [1.0 / (1.0 + __import__("math").exp(-sum(
+            w2[o][i] * hidden[i] for i in range(len(hidden)))))
+            for o in range(mid_ch)]
+        h = [[[row[c] * gate[ch] for c in range(len(row))] for row in ch_]
+             for ch, ch_ in enumerate(h)]
+    h = pointwise_conv(h, out_ch)
+    if stride == 1 and in_ch == out_ch:
+        h = [[[h[c][y][xx] + x[c][y][xx] for xx in range(len(h[0][0]))]
+              for y in range(len(h[0]))] for c in range(out_ch)]
+    return h
+
+
+def efficientnet_lite_forward(x, num_classes=10, phi=1.0, seed=0):
+    """EfficientNet-lite 前向：4 个 MBConv 阶段 + 全局池化 + 线性头。"""
+    _arch_check_image(x, len(x))
+    if not isinstance(num_classes, int) or num_classes < 1:
+        raise ValueError("efficientnet_lite_forward: num_classes 必须是正整数")
+    cfg = efficientnet_compound_scale(phi=phi)
+    base = cfg["channels"]
+    channels = [base // 2, base, base * 2, base * 3]
+    h = x
+    for i, out_ch in enumerate(channels):
+        h = mbconv_block(h, out_ch, stride=2 if i == 0 else 1,
+                         expand_ratio=6, kernel=3 if i % 2 == 0 else 5,
+                         use_se=True, activation="swish", seed=seed + i)
+    pooled = [sum(sum(row) for row in ch) / float(len(ch) * len(ch[0]))
+              for ch in h]
+    return [[sum(pooled[j] * (0.1 * ((c % 3) + 1)) - 0.05 for j in range(len(pooled)))
+             for c in range(num_classes)]]
 
 
 class FTTransformer:
