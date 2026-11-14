@@ -43598,3 +43598,121 @@ class TestCausalTracing:
         assert _ct_raises(lambda: AI.causal_trace(
             lm, [0, 1], [0, 1], token_id=9))
         assert _ct_raises(lambda: AI.causal_trace(lm, [0] * 9, [0] * 9))
+
+
+import math
+
+import AI
+
+
+def _vmbc_img(pos, size=8):
+    img = [[[0.0] * size for _ in range(size)]]
+    c0 = 1 if pos in (1, 3) else 4
+    r0 = 1 if pos in (2, 3) else 4
+    for r in range(r0, r0 + 2):
+        for c in range(c0, c0 + 2):
+            img[0][r][c] = 1.0
+    return img
+
+
+def _vmbc_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _vmbc_make(num_classes=2, seed=3):
+    return AI.VMambaClassifier(in_channels=1, image_size=8, patch_size=4,
+                               d_model=8, num_layers=1, d_state=3,
+                               num_classes=num_classes, seed=seed)
+
+
+def _vmbc_loss(m, images, labels):
+    return m.loss_and_backward(images, labels)
+
+
+class TestVMambaClassifier:
+    def test_forward_and_param_count(self):
+        m = _vmbc_make(num_classes=3)
+        logits = m.forward([_vmbc_img(0), _vmbc_img(1)])
+        assert len(logits) == 2
+        assert all(len(row) == 3 for row in logits)
+        assert isinstance(m.param_count(), int) and m.param_count() > 0
+        assert m.param_count() == m.backbone.param_count() + (
+            len(m.head.weights) * len(m.head.weights[0]) + len(m.head.biases))
+
+    def test_gradient_matches_finite_difference(self):
+        images = [_vmbc_img(0)]
+        labels = [0]
+        m = _vmbc_make(seed=5)
+        m.zero_grad()
+        _vmbc_loss(m, images, labels)
+        h = 1e-6
+
+        # 分类头权重
+        g = m.grad_head[0][0][1]
+        p = m.head.weights[0][1]
+        m.head.weights[0][1] = p + h
+        lp = _vmbc_loss(m, images, labels)
+        m.head.weights[0][1] = p - h
+        lm = _vmbc_loss(m, images, labels)
+        m.head.weights[0][1] = p
+        num = (lp - lm) / (2 * h)
+        assert abs(g - num) / max(abs(num), 1e-10) < 1e-5
+
+        # patch 卷积权重
+        m.zero_grad()
+        _vmbc_loss(m, images, labels)
+        g = m.backbone.embed.grad_w[0][0][1][1]
+        p = m.backbone.embed.weights[0][0][1][1]
+        m.backbone.embed.weights[0][0][1][1] = p + h
+        lp = _vmbc_loss(m, images, labels)
+        m.backbone.embed.weights[0][0][1][1] = p - h
+        lm = _vmbc_loss(m, images, labels)
+        m.backbone.embed.weights[0][0][1][1] = p
+        num = (lp - lm) / (2 * h)
+        assert abs(g - num) / max(abs(num), 1e-10) < 1e-5
+
+    def test_fit_and_predict(self):
+        images = [_vmbc_img(i) for i in range(4)]
+        labels = [0, 1, 0, 1]
+        m = _vmbc_make(seed=5)
+        res = m.fit(images, labels, epochs=40, lr=0.02, batch_size=2,
+                    shuffle=True, seed=1)
+        hist = res["loss_history"]
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.05
+        assert hist[-1] < 1e-2
+        assert m.predict(images) == labels
+
+    def test_adam_state_reset_and_zero_grad(self):
+        m = _vmbc_make()
+        m.fit([_vmbc_img(0), _vmbc_img(1)], [0, 1], epochs=3, lr=0.02,
+              batch_size=2, shuffle=False)
+        assert len(m._adam_state) > 0
+        m.reset_optimizer_state()
+        assert m._adam_state == {} and m._adam_t == 0
+        m.zero_grad()
+        assert m.grad_head is None
+        assert m.grad_ln1 == [None]
+        assert m.grad_ln_out is None
+        assert m._cache is None
+
+    def test_invalid_inputs(self):
+        m = _vmbc_make()
+        images = [_vmbc_img(0)]
+        assert _vmbc_raises(lambda: m.forward([[0.0] * 8 for _ in range(8)]))
+        assert _vmbc_raises(lambda: m.forward([[[0.0] * 7 for _ in range(8)]]))
+        assert _vmbc_raises(lambda: m.loss_and_backward(images, [2]))
+        assert _vmbc_raises(lambda: m.loss_and_backward(images, [0, 1]))
+        assert _vmbc_raises(lambda: m.loss_and_backward(images, [0.0]))
+        assert _vmbc_raises(lambda: m.fit(images, [0], epochs=0))
+        assert _vmbc_raises(lambda: m.fit(images, [0], epochs=1, lr=-0.1))
+        assert _vmbc_raises(lambda: m.fit(images, [0], epochs=1, batch_size=0))
+        assert _vmbc_raises(lambda: m.fit(images, [0], epochs=1, seed=1.5))
+        assert _vmbc_raises(lambda: m.sgd_step(-0.1))
+        fresh = _vmbc_make(seed=9)
+        assert _vmbc_raises(lambda: fresh._backward_image([0.0, 0.0]),
+                            RuntimeError)

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2731 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2736 项）
 
 ## 特性
 
@@ -3480,7 +3480,9 @@ history = trainer.fit(images, epochs=10, lr=0.02, seed=1)
 
 `VMambaBlock` 把 Mamba 的选择性扫描推广到二维网格：沿行优先、行逆序、列优先、
 列逆序四个方向各做一次扫描，结果取平均后乘 SiLU 门控，再经输出投影加残差。
-`VMamba` 在此基础上做 patch 嵌入 + 多层 pre-LN 残差块，输出图像级特征向量。
+`VMamba` 在此基础上做 patch 嵌入 + 多层 pre-LN 残差块，输出图像级特征向量；
+`VMambaClassifier` 再把特征接到线性分类头上，补齐逐图反向（分类头、输出 LN、
+均值池化、各块、patch 卷积）与 `fit`/`predict`，用内置 Adam 更新。
 
 ```python
 blk = VMambaBlock(d_model=4, d_state=3, seed=1)
@@ -3489,16 +3491,23 @@ out = blk.forward(grid)
 blk.backward(out)                     # 块级反向（可自定义训练循环）
 model = VMamba(in_channels=2, image_size=8, patch_size=4, d_model=6)
 feats = model.forward([img])          # 每张图一个 d_model 维特征
+
+clf = VMambaClassifier(in_channels=1, image_size=8, patch_size=4,
+                       d_model=8, num_layers=1, d_state=3, num_classes=2)
+clf.fit(images, labels, epochs=40, lr=0.02, batch_size=2)  # 内置 Adam
+pred = clf.predict(images)
 ```
 
 | API | 说明 |
 | --- | --- |
 | `VMambaBlock(d_model, d_state=4)` | 四方向 2D 选择性扫描 + SiLU 门控 + 残差；`forward(grid)`、`backward(dout)`、`sgd_step(lr)`、`param_count` |
 | `VMamba(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, d_state=4)` | patch 嵌入 + 多层 VMamba 块，`forward(images)` 返回图像级特征；`param_count` |
+| `VMambaClassifier(in_channels=3, image_size=8, patch_size=4, d_model=16, num_layers=2, d_state=4, num_classes=10)` | 图像分类：`forward(images)` 返回各类 logits；`loss_and_backward(images, labels)`（逐图前向后立即反向）、`adam_step(lr)`、`sgd_step(lr)`、`fit(images, labels, epochs=20, lr=0.02, batch_size=None, shuffle=True, seed=None)`、`predict`、`param_count` |
 
 边界：这是教学用的简化 VMamba——2D 选择性扫描用四个一维方向平均近似（不是 VSSD
-的交叉扫描合并），没有 CUDA 融合/并行扫描；`VMamba` 只提供前向特征提取，不包含
-分类头与端到端训练接口；块反向后参数梯度不累加，由调用方在 `sgd_step` 前自行汇总。
+的交叉扫描合并），没有 CUDA 融合/并行扫描；`VMamba` 只提供前向特征提取，
+`VMambaClassifier` 才带分类头与端到端训练（内置 Adam，避免不同参数组梯度尺度
+差异大时纯 SGD 需要逐组调 lr）；块缓存是单份的，损失按逐图前向后立即反向计算。
 
 ### Titans 神经记忆（TitansMemory / TitansSequenceMemory）
 
@@ -6169,7 +6178,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2731 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2736 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6412,6 +6421,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTitansSequenceMemory` | 逐 token 读写、process(update=False) 不改记忆、非法输入 |
 | `TestVMambaBlock` | 前向形状/参数、四项中心差分、SGD 更新、非法输入 |
 | `TestVMamba` | 图像级前向特征/参数计数、非法输入 |
+| `TestVMambaClassifier` | 前向/参数计数、分类头与 patch 卷积梯度中心差分、fit 收敛与预测、Adam 状态与 zero_grad、非法输入 |
 | `TestDINOv2Loss` / `TestDINOv2Views` / `TestDINOv2Trainer` | 自蒸馏损失/梯度、多视图、教师 EMA 与学生更新、非法输入 |
 | `TestVersionedStore` | 磁盘/内存 roundtrip、版本回滚、篡改检测、非法 name/version/metadata |
 | `TestBlockMask` / `TestiBOTLoss` / `TestCenterUpdate` / `TestiBOTTrainer` | 块掩码、掩码软目标损失/梯度、中心动量、学生-教师训练步 |
@@ -6662,6 +6672,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2731 个单元测试
+├── test_ai.py       # 2736 个单元测试
 └── README.md
 ```

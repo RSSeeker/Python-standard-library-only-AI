@@ -3430,6 +3430,393 @@ def _vm_dirs(gh, gw):
     return [row_major, row_rev, col_major, col_rev]
 
 
+
+def _vmb_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"VMambaClassifier: {name} 必须是正整数，收到 {value!r}")
+
+
+def _vmb_check_labels(labels, num_classes):
+    if not isinstance(labels, (list, tuple)):
+        raise ValueError("VMambaClassifier: labels 必须是整数列表")
+    out = []
+    for idx, y in enumerate(labels):
+        if isinstance(y, bool) or not isinstance(y, int):
+            raise ValueError(f"VMambaClassifier: 标签[{idx}] 必须是整数，收到 {y!r}")
+        if y < 0 or y >= num_classes:
+            raise ValueError(
+                f"VMambaClassifier: 标签[{idx}] 必须在 [0, {num_classes})，收到 {y}")
+        out.append(y)
+    return out
+
+
+def _vmb_flatten_grid(grid):
+    gh = len(grid)
+    gw = len(grid[0])
+    return [grid[r][c] for r in range(gh) for c in range(gw)]
+
+
+def _vmb_unflatten_rows(rows, gh, gw):
+    return [[rows[r * gw + c] for c in range(gw)] for r in range(gh)]
+
+
+def _vmb_add_grid(a, b):
+    gh = len(a)
+    gw = len(a[0])
+    d = len(a[0][0])
+    return [[[a[r][c][j] + b[r][c][j] for j in range(d)]
+             for c in range(gw)] for r in range(gh)]
+
+
+
+
+def _vmb_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"VMambaClassifier: {name} 必须是正整数，收到 {value!r}")
+
+
+def _vmb_check_labels(labels, num_classes):
+    if not isinstance(labels, (list, tuple)):
+        raise ValueError("VMambaClassifier: labels 必须是整数列表")
+    out = []
+    for idx, y in enumerate(labels):
+        if isinstance(y, bool) or not isinstance(y, int):
+            raise ValueError(f"VMambaClassifier: 标签[{idx}] 必须是整数，收到 {y!r}")
+        if y < 0 or y >= num_classes:
+            raise ValueError(
+                f"VMambaClassifier: 标签[{idx}] 必须在 [0, {num_classes})，收到 {y}")
+        out.append(y)
+    return out
+
+
+def _vmb_flatten_grid(grid):
+    gh = len(grid)
+    gw = len(grid[0])
+    return [grid[r][c] for r in range(gh) for c in range(gw)]
+
+
+def _vmb_unflatten_rows(rows, gh, gw):
+    return [[rows[r * gw + c] for c in range(gw)] for r in range(gh)]
+
+
+def _vmb_add_grid(a, b):
+    gh = len(a)
+    gw = len(a[0])
+    d = len(a[0][0])
+    return [[[a[r][c][j] + b[r][c][j] for j in range(d)]
+             for c in range(gw)] for r in range(gh)]
+
+
+def _vmb_zeros_like(tree):
+    if isinstance(tree, list):
+        return [_vmb_zeros_like(v) for v in tree]
+    return 0.0
+
+
+def _vmb_adam_list(params, grads, m, v, t, lr, beta1, beta2, eps):
+    """对嵌套 list 里的每个标量做 Adam 更新（原地）"""
+    c1 = 1.0 - beta1 ** t
+    c2 = 1.0 - beta2 ** t
+    for i in range(len(params)):
+        p = params[i]
+        g = grads[i]
+        if isinstance(p, list):
+            _vmb_adam_list(p, g, m[i], v[i], t, lr, beta1, beta2, eps)
+        else:
+            m_i = beta1 * m[i] + (1.0 - beta1) * g
+            v_i = beta2 * v[i] + (1.0 - beta2) * g * g
+            m[i] = m_i
+            v[i] = v_i
+            params[i] = p - lr * (m_i / c1) / (math.sqrt(v_i / c2) + eps)
+
+
+class VMambaClassifier:
+    """VMamba 图像分类器：patch 嵌入 + 2D 选择性扫描块 + 均值池化 + 线性分类头。
+
+    在 ``VMamba`` 特征提取器基础上补齐训练接口：手写反向覆盖分类头、输出
+    LayerNorm、均值池化、各块的网格反传与 patch 卷积。块缓存是单份的，
+    所以损失按「逐图前向后立即反向」计算；``fit`` 用内置 Adam 更新（不同参数
+    组梯度尺度差异很大，纯 SGD 需要逐组调 lr）。
+    """
+
+    def __init__(self, in_channels=3, image_size=8, patch_size=4, d_model=16,
+                 num_layers=2, d_state=4, num_classes=10, seed=None):
+        for name, val in (("in_channels", in_channels), ("image_size", image_size),
+                          ("patch_size", patch_size), ("d_model", d_model),
+                          ("num_layers", num_layers), ("d_state", d_state),
+                          ("num_classes", num_classes)):
+            _vmb_check_pos_int(val, name)
+        if image_size % patch_size != 0:
+            raise ValueError("VMambaClassifier: image_size 必须能被 patch_size 整除")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VMambaClassifier: seed 必须是整数或 None")
+        self.in_channels = in_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.grid = image_size // patch_size
+        self.backbone = VMamba(in_channels, image_size, patch_size, d_model,
+                               num_layers, d_state, seed)
+        self.head = Layer(d_model, num_classes, "linear")
+        rng = random.Random(seed + 1 if seed is not None else None)
+        self.head.weights = [[rng.gauss(0.0, math.sqrt(2.0 / d_model))
+                              for _ in range(d_model)] for _ in range(num_classes)]
+        self.head.biases = [0.0] * num_classes
+        self.grad_head = None
+        self.grad_ln1 = [None] * num_layers
+        self.grad_ln_out = None
+        self._cache = None
+        self._adam_state = {}
+        self._adam_t = 0
+
+    # ---------- 参数管理 ----------
+    def zero_grad(self):
+        self.backbone.embed.zero_grad()
+        for blk in self.backbone.blocks:
+            blk.zero_grad()
+        self.grad_head = None
+        self.grad_ln1 = [None] * self.num_layers
+        self.grad_ln_out = None
+        self._cache = None
+
+    def reset_optimizer_state(self):
+        self._adam_state = {}
+        self._adam_t = 0
+
+    def param_count(self):
+        return self.backbone.param_count() + _dense_param_count(self.head)
+
+    # ---------- 前向 ----------
+    def _forward_image(self, image):
+        _vm_check_img([image], self.in_channels, self.image_size,
+                      who="VMambaClassifier")
+        d = self.d_model
+        gh = gw = self.grid
+        feat = self.backbone.embed.forward(image)
+        grid = [[[feat[j][r][c] for j in range(d)] for c in range(gw)]
+                for r in range(gh)]
+        ln_caches = []
+        for ln, blk in zip(self.backbone.ln1, self.backbone.blocks):
+            rows = _vmb_flatten_grid(grid)
+            normed, ncache = _norm_rows_forward(ln, rows)
+            g2 = _vmb_unflatten_rows(normed, gh, gw)
+            g3 = blk.forward(g2)
+            grid = _vmb_add_grid(grid, g3)
+            ln_caches.append(ncache)
+        rows = _vmb_flatten_grid(grid)
+        pooled_rows, ocache = _norm_rows_forward(self.backbone.ln_out, rows)
+        p = len(pooled_rows)
+        feature = [sum(pooled_rows[i][j] for i in range(p)) / p
+                   for j in range(d)]
+        logits_rows, head_cache = _dense_rows_forward(self.head, [feature])
+        self._cache = {
+            "ln_caches": ln_caches,
+            "out_cache": ocache,
+            "p": p,
+            "feature": feature,
+            "logits": logits_rows[0],
+            "head_cache": head_cache,
+        }
+        return self._cache["logits"]
+
+    def forward(self, images):
+        _vm_check_img(images, self.in_channels, self.image_size,
+                      who="VMambaClassifier")
+        return [self._forward_image(image) for image in images]
+
+    # ---------- 反向 ----------
+    @staticmethod
+    def _softmax_row(values):
+        m = max(values)
+        exps = [math.exp(v - m) for v in values]
+        total = sum(exps)
+        return [v / total for v in exps]
+
+    def _backward_image(self, dlogits):
+        if self._cache is None:
+            raise RuntimeError("VMambaClassifier: 必须先调用 forward()")
+        d = self.d_model
+        gh = gw = self.grid
+        cache = self._cache
+        gw_head, gb_head, dx_rows = _dense_rows_backward(
+            self.head, cache["head_cache"], [dlogits])
+        if self.grad_head is None:
+            self.grad_head = (gw_head, gb_head)
+        else:
+            for i in range(len(gw_head)):
+                for j in range(len(gw_head[i])):
+                    self.grad_head[0][i][j] += gw_head[i][j]
+            for i in range(len(gb_head)):
+                self.grad_head[1][i] += gb_head[i]
+        d_feature = dx_rows[0]
+        p = cache["p"]
+        d_rows = [[d_feature[j] / p for j in range(d)] for _ in range(p)]
+        gg, gbeta, dx_rows = _norm_rows_backward(
+            self.backbone.ln_out, cache["out_cache"], d_rows)
+        self._accum_norm("grad_ln_out", gg, gbeta)
+        d_grid = _vmb_unflatten_rows(dx_rows, gh, gw)
+        for li in range(len(self.backbone.blocks) - 1, -1, -1):
+            blk = self.backbone.blocks[li]
+            ln = self.backbone.ln1[li]
+            d_block_in = blk.backward(d_grid)
+            rows = _vmb_flatten_grid(d_block_in)
+            gg, gbeta, dx_rows = _norm_rows_backward(
+                ln, cache["ln_caches"][li], rows)
+            if self.grad_ln1[li] is None:
+                self.grad_ln1[li] = (gg, gbeta)
+            else:
+                for j in range(len(gg)):
+                    self.grad_ln1[li][0][j] += gg[j]
+                    self.grad_ln1[li][1][j] += gbeta[j]
+            d_grid = _vmb_add_grid(d_grid, _vmb_unflatten_rows(dx_rows, gh, gw))
+        dout = [[[d_grid[r][c][j] for c in range(gw)] for r in range(gh)]
+                for j in range(d)]
+        return self.backbone.embed.backward(dout)
+
+    def _accum_norm(self, name, gg, gbeta):
+        current = getattr(self, name)
+        if current is None:
+            setattr(self, name, (gg[:], gbeta[:]))
+        else:
+            for j in range(len(gg)):
+                current[0][j] += gg[j]
+                current[1][j] += gbeta[j]
+
+    def loss_and_backward(self, images, labels):
+        _vm_check_img(images, self.in_channels, self.image_size,
+                      who="VMambaClassifier")
+        targets = _vmb_check_labels(labels, self.num_classes)
+        if len(images) != len(targets):
+            raise ValueError("VMambaClassifier: images 与 labels 数量必须一致")
+        total = 0.0
+        n = len(images)
+        for image, target in zip(images, targets):
+            logits = self._forward_image(image)
+            probs = self._softmax_row(logits)
+            total += -math.log(max(probs[target], 1e-300))
+            dlogits = [v / n for v in probs]
+            dlogits[target] -= 1.0 / n
+            self._backward_image(dlogits)
+        return total / n
+
+    # ---------- 优化 ----------
+    @staticmethod
+    def _check_lr(lr):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(lr) or lr < 0.0:
+            raise ValueError("VMambaClassifier: lr 必须是非负有限数")
+
+    def sgd_step(self, lr=0.01):
+        self._check_lr(lr)
+        _conv_sgd(self.backbone.embed, lr)
+        for blk in self.backbone.blocks:
+            blk.sgd_step(lr)
+        for li, ln in enumerate(self.backbone.ln1):
+            if self.grad_ln1[li] is not None:
+                _norm_apply_sgd(ln, self.grad_ln1[li], lr)
+        if self.grad_ln_out is not None:
+            _norm_apply_sgd(self.backbone.ln_out, self.grad_ln_out, lr)
+        if self.grad_head is not None:
+            _dense_apply_sgd(self.head, self.grad_head, lr)
+        self._cache = None
+
+    def adam_step(self, lr=0.02, beta1=0.9, beta2=0.999, eps=1e-8):
+        self._check_lr(lr)
+        self._adam_t += 1
+        t = self._adam_t
+
+        def group(key, params, grads):
+            st = self._adam_state.get(key)
+            if st is None:
+                st = (_vmb_zeros_like(params), _vmb_zeros_like(params))
+                self._adam_state[key] = st
+            _vmb_adam_list(params, grads, st[0], st[1], t, lr,
+                           beta1, beta2, eps)
+
+        embed = self.backbone.embed
+        group("conv_w", embed.weights, embed.grad_w)
+        group("conv_b", embed.biases, embed.grad_b)
+        for li, ln in enumerate(self.backbone.ln1):
+            if self.grad_ln1[li] is not None:
+                group(f"ln1_{li}_g", ln.gamma, self.grad_ln1[li][0])
+                group(f"ln1_{li}_b", ln.beta, self.grad_ln1[li][1])
+        if self.grad_ln_out is not None:
+            group("ln_out_g", self.backbone.ln_out.gamma, self.grad_ln_out[0])
+            group("ln_out_b", self.backbone.ln_out.beta, self.grad_ln_out[1])
+        for bi, blk in enumerate(self.backbone.blocks):
+            for name, grads in blk.grads.items():
+                if grads is None:
+                    continue
+                group(f"blk{bi}_{name}_w", getattr(blk, name).weights, grads[0])
+                group(f"blk{bi}_{name}_b", getattr(blk, name).biases, grads[1])
+            group(f"blk{bi}_Alog", blk.A_log, blk.grad_A_log)
+            group(f"blk{bi}_D", blk.D, blk.grad_D)
+        if self.grad_head is not None:
+            group("head_w", self.head.weights, self.grad_head[0])
+            group("head_b", self.head.biases, self.grad_head[1])
+
+        self.backbone.embed.zero_grad()
+        for blk in self.backbone.blocks:
+            blk.zero_grad()
+        self.grad_head = None
+        self.grad_ln1 = [None] * self.num_layers
+        self.grad_ln_out = None
+        self._cache = None
+
+    def fit(self, images, labels, epochs=20, lr=0.02, batch_size=None,
+            shuffle=True, seed=None, verbose=False):
+        _vm_check_img(images, self.in_channels, self.image_size,
+                      who="VMambaClassifier")
+        targets = _vmb_check_labels(labels, self.num_classes)
+        if len(images) != len(targets):
+            raise ValueError("VMambaClassifier: images 与 labels 数量必须一致")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("VMambaClassifier: epochs 必须是正整数")
+        if batch_size is not None and (isinstance(batch_size, bool)
+                                       or not isinstance(batch_size, int)
+                                       or batch_size <= 0):
+            raise ValueError("VMambaClassifier: batch_size 必须是正整数或 None")
+        if not isinstance(shuffle, bool):
+            raise ValueError("VMambaClassifier: shuffle 必须是 bool")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VMambaClassifier: seed 必须是整数或 None")
+        n = len(images)
+        bs = n if batch_size is None else min(batch_size, n)
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(n))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for start in range(0, n, bs):
+                idxs = order[start:start + bs]
+                self.zero_grad()
+                for i in idxs:
+                    total += self._loss_single(images[i], targets[i],
+                                               1.0 / len(idxs))
+                self.adam_step(lr)
+            history.append(total / n)
+            if verbose:
+                print(f"epoch {len(history)}: loss {history[-1]:.6f}")
+        return {"loss_history": history, "epochs": epochs,
+                "batches": (n + bs - 1) // bs}
+
+    def _loss_single(self, image, target, scale=1.0):
+        logits = self._forward_image(image)
+        probs = self._softmax_row(logits)
+        dlogits = [v * scale for v in probs]
+        dlogits[target] -= scale
+        self._backward_image(dlogits)
+        return -math.log(max(probs[target], 1e-300))
+
+    def predict(self, images):
+        return [max(range(self.num_classes), key=lambda c: logits[c])
+                for logits in self.forward(images)]
+
+
 class VMambaBlock:
     """VMamba 的 2D 选择性扫描块（简化版）：四个方向扫描后取平均，再乘 SiLU 门控。"""
 
