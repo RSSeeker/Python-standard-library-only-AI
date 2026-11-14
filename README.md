@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2833 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2838 项）
 
 ## 特性
 
@@ -1281,6 +1281,33 @@ loss_kd, g_logits = dkd_loss([1.2, -0.3, 0.4], [2.0, -1.0, 0.2], label=0,
 | `SGD` | 随机梯度下降 |
 | `SGDMomentum` | 带动量的 SGD |
 | `RMSprop` | RMSprop |
+
+### SAM（Sharpness-Aware Minimization）两步优化器
+
+SAM 不直接沿梯度下降：先沿梯度方向把权重扰动到邻域内「最陡」的点，在该点重新求梯度，
+再用**原始权重**做一步更新。它常能显著改善泛化，代价是每步需要两次前向/反向。
+
+```python
+from AI import SAMOptimizer
+
+# grads 的格式与 MLP.sgd_step / Adam.step 一致：[(grad_w, grad_b), ...]
+opt = SAMOptimizer(model, base="sgd", lr=0.05, rho=0.1)   # 或 base="adam"
+grads = model_backward(...)          # 原始权重处的梯度
+opt.first_step(grads)                # 备份权重并扰动到最陡点
+grads_adv = model_backward(...)      # 扰动权重处的梯度
+opt.second_step(grads_adv)           # 恢复原始权重并更新
+```
+
+| API | 说明 |
+|------|------|
+| `SAMOptimizer(model, base="sgd"\|"adam", lr=0.01, rho=0.05, beta1=0.9, beta2=0.999, eps=1e-12)` | 只支持 `MLP`；`base` 选择第二步的基优化器 |
+| `.first_step(grads)` | 备份权重并扰动 `w + rho·g/(‖g‖+eps)`；返回扰动幅度（梯度为 0 时不扰动） |
+| `.second_step(grads)` | 恢复备份权重，再用给定梯度做一步 SGD/Adam 更新；未先 `first_step` 会报错 |
+| `.step_count` | 已完成的 SAM 步数 |
+
+边界：只支持 `MLP`；没有 weight decay、混合精度与状态存档；两次前向之间的
+`model` 必须保持同一批数据形状（线性层缓存会重算，不依赖旧缓存）。
+
 
 ### μP 参数化（mup_target_std / mup_init / mup_lr / MuPAdam）
 
@@ -6436,7 +6463,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2833 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2838 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6915,6 +6942,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGumbelSparsemax` | Gumbel-Softmax 采样（同 seed 复现/硬采样/温度）、反向中心差分、Sparsemax 已知值/平移不变/稀疏性、Entmax α=2 与 sparsemax 一致、非法输入 |
 | `TestMetricLosses` | SupCon/ArcFace/CosFace/Circle 损失的前向取值、梯度中心差分、margin/温度行为、空正/负样本与 13 类非法输入 |
 | `TestRKDAndDKD` | RKD 距离/角度/加权组合的梯度中心差分、学生=教师时零损失、DKD 单项与 alpha/beta/T 组合的 FD、14 类非法输入 |
+| `TestSAMOptimizer` | first_step 扰动幅度与零梯度不变、second_step 恢复后更新、SAM-SGD/SAM-Adam 训练收敛、9 类非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6949,6 +6977,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2833 个单元测试
+├── test_ai.py       # 2838 个单元测试
 └── README.md
 ```

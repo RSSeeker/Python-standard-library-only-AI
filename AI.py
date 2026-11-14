@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1757 个 def / 418 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1760 个 def / 419 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -7666,6 +7666,184 @@ def sam_weights(weights, grads, rho: float = 0.05, eps: float = 1e-12):
         adv = [flat_w[i] + float(rho) * flat_g[i] / (norm + float(eps))
                for i in range(len(flat_w))]
     return _opt_unflat(adv, w, is_2d)
+
+
+def _sam_check_model(model):
+    """SAM 只支持 MLP（需要能直接读写每层 weights/biases）。"""
+    if not isinstance(model, MLP):
+        raise ValueError(f"sam: model 必须是 MLP，收到 {type(model).__name__}")
+    return model
+
+
+def _sam_check_grads(model, all_grads):
+    """校验梯度结构与模型层数、每层形状一致，返回浮点化的副本。"""
+    if not isinstance(all_grads, (list, tuple)):
+        raise ValueError("sam: all_grads 必须是 [(grad_w, grad_b), ...] 列表")
+    if len(all_grads) != len(model.layers):
+        raise ValueError(
+            f"sam: 梯度层数 {len(all_grads)} 与模型层数 {len(model.layers)} 不一致")
+    out = []
+    for idx, (layer, pair) in enumerate(zip(model.layers, all_grads)):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(f"sam: 第 {idx} 层梯度必须是 (grad_w, grad_b) 二元组")
+        gw, gb = pair
+        if not isinstance(gw, (list, tuple)) or len(gw) != len(layer.weights):
+            raise ValueError(f"sam: 第 {idx} 层 grad_w 形状不匹配")
+        rows = []
+        for r, row in enumerate(gw):
+            if not isinstance(row, (list, tuple)) or len(row) != len(layer.weights[r]):
+                raise ValueError(f"sam: 第 {idx} 层 grad_w[{r}] 形状不匹配")
+            cur = []
+            for v in row:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise TypeError(f"sam: 第 {idx} 层 grad_w 必须是数字")
+                fv = float(v)
+                if not math.isfinite(fv):
+                    raise ValueError(f"sam: 第 {idx} 层 grad_w 必须是有限数字")
+                cur.append(fv)
+            rows.append(cur)
+        if not isinstance(gb, (list, tuple)) or len(gb) != len(layer.biases):
+            raise ValueError(f"sam: 第 {idx} 层 grad_b 形状不匹配")
+        bias = []
+        for v in gb:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"sam: 第 {idx} 层 grad_b 必须是数字")
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"sam: 第 {idx} 层 grad_b 必须是有限数字")
+            bias.append(fv)
+        out.append((rows, bias))
+    return out
+
+
+def _sam_grad_norm(all_grads):
+    total = 0.0
+    for gw, gb in all_grads:
+        for row in gw:
+            for v in row:
+                total += v * v
+        for v in gb:
+            total += v * v
+    return math.sqrt(total)
+
+
+class SAMOptimizer:
+    """Sharpness-Aware Minimization（完整两步版）
+
+    SAM 不直接沿梯度下降，而是先沿梯度方向走 `rho` 到「最陡」的邻域点，
+    再在那个点重新算梯度、用原始权重做一步更新：
+
+    1. `first_step(grads)`：备份当前权重，把权重扰动到
+       `w + rho * g / (||g|| + eps)`；
+    2. 在扰动后的权重上前向/反向，得到新梯度 `g_adv`；
+    3. `second_step(g_adv)`：恢复备份权重，再用 `g_adv` 做基优化器更新
+       （`base="sgd"` 为 `w -= lr*g`；`base="adam"` 为带一阶/二阶矩的 Adam）。
+
+    `grads` 的格式与 `MLP` 的 `sgd_step`/`Adam.step` 一致：
+    `[(grad_w, grad_b), ...]`，每项与对应层的 `weights`/`biases` 同形。
+
+    边界：只支持 `MLP`；不支持 weight decay / 混合精度；`second_step` 之后
+    才能再次 `first_step`。
+    """
+
+    def __init__(self, model, base: str = "sgd", lr: float = 0.01,
+                 rho: float = 0.05, beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-12):
+        _sam_check_model(model)
+        if base not in ("sgd", "adam"):
+            raise ValueError(f"sam: base 必须是 'sgd' 或 'adam'，收到 {base!r}")
+        for name, v in (("lr", lr), ("rho", rho)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"sam: {name} 必须是数字，收到 {v!r}")
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"sam: {name} 必须是有限数字")
+            if name == "lr" and fv <= 0.0:
+                raise ValueError("sam: lr 必须 > 0")
+            if name == "rho" and fv < 0.0:
+                raise ValueError("sam: rho 必须 >= 0")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+            raise TypeError("sam: eps 必须是数字")
+        if not (float(eps) > 0.0) or not math.isfinite(float(eps)):
+            raise ValueError("sam: eps 必须是 > 0 的有限数字")
+        self.model = model
+        self.base = base
+        self.lr = float(lr)
+        self.rho = float(rho)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.step_count = 0
+        self._backup = None
+        self._m = None
+        self._v = None
+
+    def first_step(self, all_grads):
+        """备份权重并扰动到最陡点；返回扰动幅度（0 表示梯度为 0 未扰动）。"""
+        grads = _sam_check_grads(self.model, all_grads)
+        norm = _sam_grad_norm(grads)
+        self._backup = [([w[:] for w in layer.weights], layer.biases[:])
+                        for layer in self.model.layers]
+        if norm == 0.0:
+            return 0.0
+        scale = self.rho / (norm + self.eps)
+        for layer, (gw, gb) in zip(self.model.layers, grads):
+            for r in range(len(layer.weights)):
+                for c in range(len(layer.weights[r])):
+                    layer.weights[r][c] += scale * gw[r][c]
+            for k in range(len(layer.biases)):
+                layer.biases[k] += scale * gb[k]
+        return self.rho * norm / (norm + self.eps)
+
+    def second_step(self, all_grads):
+        """恢复备份权重，并用给定的（扰动点）梯度做一次基优化器更新。"""
+        if self._backup is None:
+            raise RuntimeError("sam: 必须先调用 first_step 再 second_step")
+        grads = _sam_check_grads(self.model, all_grads)
+        for layer, (saved_w, saved_b) in zip(self.model.layers, self._backup):
+            for r in range(len(layer.weights)):
+                layer.weights[r] = saved_w[r][:]
+            layer.biases[:] = saved_b[:]
+        self._backup = None
+        self.step_count += 1
+        if self.base == "sgd":
+            for layer, (gw, gb) in zip(self.model.layers, grads):
+                for r in range(len(layer.weights)):
+                    for c in range(len(layer.weights[r])):
+                        layer.weights[r][c] -= self.lr * gw[r][c]
+                for k in range(len(layer.biases)):
+                    layer.biases[k] -= self.lr * gb[k]
+            return
+        # Adam 基优化器
+        if self._m is None:
+            self._m = [([ [0.0] * len(row) for row in gw], [0.0] * len(gb))
+                       for gw, gb in grads]
+            self._v = [([ [0.0] * len(row) for row in gw], [0.0] * len(gb))
+                       for gw, gb in grads]
+        b1, b2 = self.beta1, self.beta2
+        c1 = 1.0 - b1 ** self.step_count
+        c2 = 1.0 - b2 ** self.step_count
+        for li, (layer, (gw, gb)) in enumerate(zip(self.model.layers, grads)):
+            mw, mb = self._m[li]
+            vw, vb = self._v[li]
+            for r in range(len(gw)):
+                for c in range(len(gw[r])):
+                    g = gw[r][c]
+                    mw[r][c] = b1 * mw[r][c] + (1.0 - b1) * g
+                    vw[r][c] = b2 * vw[r][c] + (1.0 - b2) * g * g
+                    mh = mw[r][c] / c1
+                    vh = vw[r][c] / c2
+                    layer.weights[r][c] -= self.lr * mh / (math.sqrt(vh) + 1e-8)
+            for k in range(len(gb)):
+                g = gb[k]
+                mb[k] = b1 * mb[k] + (1.0 - b1) * g
+                vb[k] = b2 * vb[k] + (1.0 - b2) * g * g
+                mh = mb[k] / c1
+                vh = vb[k] / c2
+                layer.biases[k] -= self.lr * mh / (math.sqrt(vh) + 1e-8)
+
+    def zero_grad(self):
+        """占位：SAM 的梯度由调用方（MLP 反向）给出，无需自行清零。"""
 
 
 def gradient_centralize(grads, mode: str = "rows"):

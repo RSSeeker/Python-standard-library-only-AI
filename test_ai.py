@@ -45783,3 +45783,131 @@ class TestRKDAndDKD:
         assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], 0, temperature=0.0))
         assert bad(lambda: AI.dkd_loss([1.0, 2.0], [1.0, 2.0], 0, alpha=-0.5))
         assert bad(lambda: AI.dkd_loss([float("nan"), 1.0], [0.0, 1.0], 0))
+
+
+def _sam87_forward(model, x):
+    caches = []
+    cur = list(x)
+    for layer in model.layers:
+        out, cache = AI._dense_rows_forward(layer, [cur])
+        caches.append(cache)
+        cur = out[0]
+    return cur, caches
+
+
+def _sam87_grads(model, xs, ys):
+    acc_w = [[[0.0] * len(row) for row in layer.weights] for layer in model.layers]
+    acc_b = [[0.0] * len(layer.biases) for layer in model.layers]
+    n = len(xs)
+    out_dim = len(model.layers[-1].weights)
+    for x, y in zip(xs, ys):
+        pred, caches = _sam87_forward(model, x)
+        d = [2.0 * (pred[i] - y[i]) / (n * out_dim) for i in range(out_dim)]
+        drows = [d]
+        for li in range(len(model.layers) - 1, -1, -1):
+            gw, gb, dx = AI._dense_rows_backward(model.layers[li], caches[li], drows)
+            for r in range(len(acc_w[li])):
+                for c in range(len(acc_w[li][r])):
+                    acc_w[li][r][c] += gw[r][c]
+            for k in range(len(acc_b[li])):
+                acc_b[li][k] += gb[k]
+            drows = dx
+    return list(zip(acc_w, acc_b))
+
+
+def _sam87_loss(model, xs, ys):
+    total = 0.0
+    for x, y in zip(xs, ys):
+        out, _ = _sam87_forward(model, x)
+        for a, b in zip(out, y):
+            total += (a - b) ** 2
+    return total / (len(xs) * len(ys[0]))
+
+
+class TestSAMOptimizer:
+    """SAM 完整两步优化器。"""
+
+    def test_first_step_perturbation(self):
+        m = AI.MLP([1, 1], ["linear"])
+        w0 = m.layers[0].weights[0][0]
+        b0 = m.layers[0].biases[0]
+        grads = [([[3.0]], [4.0])]
+        opt = AI.SAMOptimizer(m, base="sgd", lr=0.1, rho=0.5)
+        delta = opt.first_step(grads)
+        assert abs(delta - 0.5) < 1e-12
+        assert abs((m.layers[0].weights[0][0] - w0) - 0.3) < 1e-12
+        assert abs((m.layers[0].biases[0] - b0) - 0.4) < 1e-12
+        # 零梯度不扰动
+        m2 = AI.MLP([1, 1], ["linear"])
+        w2 = m2.layers[0].weights[0][0]
+        opt2 = AI.SAMOptimizer(m2, rho=0.3)
+        assert opt2.first_step([([[0.0]], [0.0])]) == 0.0
+        assert m2.layers[0].weights[0][0] == w2
+
+    def test_second_step_restore_and_update(self):
+        m = AI.MLP([1, 1], ["linear"])
+        w0 = m.layers[0].weights[0][0]
+        b0 = m.layers[0].biases[0]
+        grads = [([[3.0]], [4.0])]
+        opt = AI.SAMOptimizer(m, base="sgd", lr=0.1, rho=0.5)
+        opt.first_step(grads)
+        opt.second_step(grads)
+        assert abs(m.layers[0].weights[0][0] - (w0 - 0.3)) < 1e-12
+        assert abs(m.layers[0].biases[0] - (b0 - 0.4)) < 1e-12
+        assert opt.step_count == 1
+        # 未 first_step 就 second_step 报错
+        with pytest.raises(RuntimeError):
+            AI.SAMOptimizer(m).second_step([([[0.0]], [0.0])])
+
+    def test_sam_sgd_training(self):
+        import random
+        rng = random.Random(0)
+        xs = [[rng.uniform(-1, 1)] for _ in range(12)]
+        ys = [[2.0 * x[0] + 0.5] for x in xs]
+        m = AI.MLP([1, 1], ["linear"])
+        opt = AI.SAMOptimizer(m, base="sgd", lr=0.05, rho=0.1)
+        loss0 = _sam87_loss(m, xs, ys)
+        for _ in range(80):
+            g = _sam87_grads(m, xs, ys)
+            opt.first_step(g)
+            g_adv = _sam87_grads(m, xs, ys)
+            opt.second_step(g_adv)
+        loss1 = _sam87_loss(m, xs, ys)
+        assert loss1 < loss0 * 0.1
+        assert opt.step_count == 80
+
+    def test_sam_adam_training(self):
+        import random
+        rng = random.Random(1)
+        xs = [[rng.uniform(-1, 1), rng.uniform(-1, 1)] for _ in range(16)]
+        ys = [[x[0] - 0.5 * x[1] + 0.2] for x in xs]
+        m = AI.MLP([2, 2, 1], ["sigmoid", "linear"])
+        opt = AI.SAMOptimizer(m, base="adam", lr=0.05, rho=0.05)
+        loss0 = _sam87_loss(m, xs, ys)
+        for _ in range(120):
+            g = _sam87_grads(m, xs, ys)
+            opt.first_step(g)
+            g_adv = _sam87_grads(m, xs, ys)
+            opt.second_step(g_adv)
+        loss1 = _sam87_loss(m, xs, ys)
+        assert loss1 < loss0 * 0.2
+        assert opt.step_count == 120
+
+    def test_invalid_inputs(self):
+        def bad(fn):
+            try:
+                fn()
+            except (ValueError, TypeError, RuntimeError):
+                return True
+            return False
+
+        m = AI.MLP([1, 1], ["linear"])
+        assert bad(lambda: AI.SAMOptimizer("x"))
+        assert bad(lambda: AI.SAMOptimizer(m, base="lion"))
+        assert bad(lambda: AI.SAMOptimizer(m, lr=0.0))
+        assert bad(lambda: AI.SAMOptimizer(m, lr=float("nan")))
+        assert bad(lambda: AI.SAMOptimizer(m, rho=-0.1))
+        assert bad(lambda: AI.SAMOptimizer(m, eps=0.0))
+        assert bad(lambda: AI.SAMOptimizer(m).first_step([([[[1.0, 2.0]]], [0.0])]))
+        assert bad(lambda: AI.SAMOptimizer(m).first_step("x"))
+        assert bad(lambda: AI.SAMOptimizer(m).second_step([([[0.0]], [0.0])]))
