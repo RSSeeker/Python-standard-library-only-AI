@@ -6398,6 +6398,149 @@ def causal_trace(lm, clean_ids, corrupt_ids, target_pos=None, token_id=None):
         "best_layer": best["layer"],
         "best_restoration": best["restoration"],
     }
+def _acdc_check_lm(model):
+    if not callable(getattr(model, "forward", None)):
+        raise TypeError("acdc_circuit: model 必须有 forward 方法")
+    if not hasattr(model, "encoder") or not hasattr(model.encoder, "layers"):
+        raise ValueError("acdc_circuit: model 需要 transformer 编码器（如 CausalLM）")
+    if not hasattr(model, "W_out") or not hasattr(model, "embedding"):
+        raise ValueError("acdc_circuit: model 需要 embedding / W_out（如 CausalLM）")
+    return model
+
+
+def _acdc_check_ids(model, ids, who="acdc_circuit"):
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"{who}: ids 必须是非空列表")
+    vocab = getattr(model, "vocab_size", None)
+    out = []
+    for i, tok in enumerate(ids):
+        if isinstance(tok, bool) or not isinstance(tok, int):
+            raise ValueError(f"{who}: ids[{i}] 必须是整数")
+        if vocab is not None and (tok < 0 or tok >= vocab):
+            raise ValueError(f"{who}: ids[{i}]={tok} 超出词表 [0, {vocab})")
+        out.append(tok)
+    return out
+
+
+def _acdc_forward_logits(model, ids, removed):
+    """按 CausalLM 的前向结构重放，并对 ``removed`` 中节点做零化。"""
+    emb = model.embedding.forward(ids)
+    x = model.pos.forward(emb) if model.use_abs_pos else emb
+    for li, layer in enumerate(model.encoder.layers):
+        d_model = layer.self_attn.d_model
+        attn_out = layer.self_attn.forward(x)
+        if (li, "attn") in removed:
+            attn_out = [[0.0] * d_model for _ in range(len(x))]
+        else:
+            attn_out = [layer.dropout1.forward(v) for v in attn_out]
+        res1 = [[x[t][j] + attn_out[t][j] for j in range(d_model)]
+                for t in range(len(x))]
+        ln1_out = [layer.ln1.forward(v) for v in res1]
+        ffn_out = layer.ffn.forward(ln1_out)
+        if (li, "ffn") in removed:
+            ffn_out = [[0.0] * d_model for _ in range(len(x))]
+        else:
+            ffn_out = [layer.dropout2.forward(v) for v in ffn_out]
+        res2 = [[ln1_out[t][j] + ffn_out[t][j] for j in range(d_model)]
+                for t in range(len(x))]
+        x = [layer.ln2.forward(v) for v in res2]
+    logits = _matmul(x, _transpose(model.W_out))
+    for t in range(len(logits)):
+        for v in range(len(model.b_out)):
+            logits[t][v] += model.b_out[v]
+    return logits
+
+
+def _acdc_score(model, ids, target_token, target_pos, removed):
+    logits = _acdc_forward_logits(model, ids, removed)
+    return logits[target_pos][target_token]
+
+
+def acdc_circuit(model, clean_ids, target_token, target_pos=None,
+                 threshold=0.1, max_remove=None):
+    """ACDC 简化版：基于零化消融的自动电路发现（节点级）。
+
+    ACDC（Automatic Circuit DisCovery）的中心思想：把模型拆成候选「节点」
+    （这里取每层的 attention 子层与 FFN 子层），逐个零化并测量任务指标下降，
+    反复删掉「影响最小」的节点，剩下的节点就是完成该任务的最小电路近似。
+
+    - ``target_token``：被读取的输出 token id；``target_pos`` 缺省为最后一个位置。
+    - ``threshold``：归一化影响 < ``threshold`` 的节点会被循环移除；取 0 时
+      一个都不删（除非某个节点的影响恰好为 0），取很大时删到只剩一个节点。
+    - ``max_remove``：可选上限。
+
+    返回 ``{"circuit", "removed", "cleanness", "initial_score", "final_score",
+    "importances", "iterations"}``；``importances`` 是每轮记录的
+    ``[(layer, kind), 归一化影响]``。
+    """
+    who = "acdc_circuit"
+    _acdc_check_lm(model)
+    clean_ids = _acdc_check_ids(model, clean_ids, who)
+    vocab = getattr(model, "vocab_size", None)
+    if isinstance(target_token, bool) or not isinstance(target_token, int):
+        raise ValueError(f"{who}: target_token 必须是整数")
+    if vocab is not None and (target_token < 0 or target_token >= vocab):
+        raise ValueError(f"{who}: target_token={target_token} 超出词表")
+    if target_pos is None:
+        target_pos = len(clean_ids) - 1
+    if isinstance(target_pos, bool) or not isinstance(target_pos, int):
+        raise ValueError(f"{who}: target_pos 必须是整数")
+    if target_pos < 0 or target_pos >= len(clean_ids):
+        raise ValueError(f"{who}: target_pos={target_pos} 超出序列长度")
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold) or threshold < 0.0):
+        raise ValueError(f"{who}: threshold 必须是有限非负数")
+    if max_remove is not None:
+        if (isinstance(max_remove, bool) or not isinstance(max_remove, int)
+                or max_remove < 0):
+            raise ValueError(f"{who}: max_remove 必须是 >= 0 的整数或 None")
+    if not hasattr(model, "eval"):
+        raise ValueError(f"{who}: model 需要 eval() 关闭 dropout")
+    model.eval()
+
+    nodes = [(li, kind) for li in range(len(model.encoder.layers))
+             for kind in ("attn", "ffn")]
+    if not nodes:
+        raise ValueError(f"{who}: encoder 没有节点")
+    removed = set()
+    initial = _acdc_score(model, clean_ids, target_token, target_pos, frozenset())
+    scale = max(abs(initial), 1e-12)
+    importances = []
+    iterations = 0
+    limit = len(nodes) - 1
+    if max_remove is not None:
+        limit = min(limit, max_remove)
+    while len(removed) < limit:
+        base = _acdc_score(model, clean_ids, target_token, target_pos,
+                           frozenset(removed))
+        best_node = None
+        best_drop = None
+        for node in nodes:
+            if node in removed:
+                continue
+            ablated = _acdc_score(model, clean_ids, target_token, target_pos,
+                                  frozenset(removed | {node}))
+            drop = abs(base - ablated) / scale
+            importances.append((node, drop))
+            if best_drop is None or drop < best_drop:
+                best_drop = drop
+                best_node = node
+        iterations += 1
+        if best_node is None or best_drop is None or best_drop >= threshold:
+            break
+        removed.add(best_node)
+    circuit = [node for node in nodes if node not in removed]
+    final = _acdc_score(model, clean_ids, target_token, target_pos,
+                        frozenset(removed))
+    return {
+        "circuit": circuit,
+        "removed": sorted(removed),
+        "cleanness": final / initial if abs(initial) > 1e-12 else 0.0,
+        "initial_score": initial,
+        "final_score": final,
+        "importances": importances,
+        "iterations": iterations,
+    }
 
 def patching_delta(clean_rows, patched_rows, direction):
     """激活替换效应：patched 与 clean 在 direction 上平均投影之差。"""

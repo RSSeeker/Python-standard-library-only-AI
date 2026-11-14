@@ -44854,3 +44854,71 @@ class TestEAGLEDraftHead:
             lambda: AI.train_eagle_heads(lm, draft, seqs, lr=-0.1),
         ]
         assert all(_eagle_raises(f) for f in bad)
+
+
+def _acdc_raises(fn, exc=(ValueError, TypeError)):
+    if not callable(fn):
+        raise TypeError("_acdc_raises: 需要可调用对象")
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestACDC:
+    def test_replay_forward_matches_causal_lm(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=16, dropout=0.0)
+        ids = [0, 1, 2, 3, 4]
+        ref = lm.forward(ids)
+        got = AI._acdc_forward_logits(lm, ids, frozenset())
+        err = max(abs(ref[t][v] - got[t][v])
+                  for t in range(len(ids)) for v in range(8))
+        assert err < 1e-12
+
+    def test_threshold_zero_keeps_all(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=16, dropout=0.0)
+        res = AI.acdc_circuit(lm, [0, 1, 2, 3], 5, threshold=0.0)
+        assert res["removed"] == []
+        assert len(res["circuit"]) == 4
+
+    def test_removal_with_max_remove(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=16, dropout=0.0)
+        res = AI.acdc_circuit(lm, [0, 1, 2, 3], 5, threshold=1e9, max_remove=2)
+        assert len(res["removed"]) == 2
+        assert len(res["circuit"]) == 2
+        assert res["iterations"] == 2
+        assert len(res["importances"]) >= 2
+        assert all(isinstance(node, tuple) and len(node) == 2
+                   for node, _ in res["importances"])
+
+    def test_deterministic_and_cleanness(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=2, max_len=16, dropout=0.0)
+        r1 = AI.acdc_circuit(lm, [0, 1, 2, 3], 5, threshold=0.25, max_remove=1)
+        r2 = AI.acdc_circuit(lm, [0, 1, 2, 3], 5, threshold=0.25, max_remove=1)
+        assert r1["removed"] == r2["removed"]
+        assert r1["circuit"] == r2["circuit"]
+        expected = r1["final_score"] / r1["initial_score"]
+        assert abs(r1["cleanness"] - expected) < 1e-12
+
+    def test_invalid_inputs(self):
+        lm = AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                         num_layers=1, max_len=16, dropout=0.0)
+        bad = [
+            lambda: AI.acdc_circuit(None, [0, 1], 2),
+            lambda: AI.acdc_circuit(lm, [], 2),
+            lambda: AI.acdc_circuit(lm, [0, -1, 2], 2),
+            lambda: AI.acdc_circuit(lm, [0, 1], 99),
+            lambda: AI.acdc_circuit(lm, [0, 1], 2, target_pos=9),
+            lambda: AI.acdc_circuit(lm, [0, 1], 2, target_pos=-1),
+            lambda: AI.acdc_circuit(lm, [0, 1], 2, threshold=-0.5),
+            lambda: AI.acdc_circuit(lm, [0, 1], 2, max_remove=-1),
+            lambda: AI.acdc_circuit(lm, [0, 1], True),
+        ]
+        assert all(_acdc_raises(f) for f in bad)

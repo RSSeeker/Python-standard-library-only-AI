@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2786 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2791 项）
 
 ## 特性
 
@@ -2483,6 +2483,24 @@ print(r["best_layer"])
 `0` 表示仍是 corrupt 的预测、`1` 表示完全恢复 clean；`layer=0` 是词嵌入之后、
 `layer=p` 是第 p 层之后。边界：只支持单点、单个 target token；clean 与 corrupt
 必须等长才能按位置对齐；数值可能超过 1（后续层是非线性的）。
+
+### ACDC（自动电路发现，简化版）
+
+| 函数 | 说明 |
+|---|---|
+| `acdc_circuit(model, clean_ids, target_token, target_pos=None, threshold=0.1, max_remove=None)` | 节点级 ACDC：把每层的 attention 子层与 FFN 子层当候选节点，逐个零化并测量目标 token logit 的归一化变化；每轮删掉「影响最小」且低于 `threshold` 的节点，返回保留电路、删除列表、cleanness、初始/最终分数与每轮影响记录 |
+
+```python
+lm = CausalLM(vocab_size=8, d_model=8, num_heads=2, num_layers=2)
+r = acdc_circuit(lm, [0, 1, 2, 3, 4], target_token=5, threshold=0.25, max_remove=2)
+print(r["circuit"], r["cleanness"])
+```
+
+口径：节点是「层 × (attn/FFN)」，不是细到单个 head 或单条边；影响按
+`|base − ablated| / |初始分数|` 归一化，`threshold` 越大删得越多（取 0 时除非影响恰为 0
+否则不删，取很大时删到只剩一个节点）；`max_remove` 可限制删除数。边界：模型需像
+`CausalLM` 一样提供 `embedding/pos/encoder.layers/W_out/b_out` 与 `eval()`；只做前向消融，
+不需要梯度；每轮重新前向，复杂度约 `O(节点数² × 前向成本)`。
 
 ### 可解释性工具（logit lens / 残差方向 / activation patching）
 
@@ -6265,7 +6283,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2786 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2791 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6582,6 +6600,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
+| `TestACDC` | 重放前向与 `CausalLM.forward` 逐位一致、threshold=0 不删节点、大 threshold 按 `max_remove` 删到剩余电路、结果可复现且字段齐全、9 类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6769,6 +6788,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2786 个单元测试
+├── test_ai.py       # 2791 个单元测试
 └── README.md
 ```
