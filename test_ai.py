@@ -48346,3 +48346,90 @@ class TestQATAndGradAccumulator:
         ga2 = AI.GradAccumulator(m, every=2)
         assert _qat_raises(lambda: ga2.accumulate([(0.0, 0.0)]))
         assert _qat_raises(lambda: ga2.accumulate([([[0.0]], [0.0])]))
+
+
+# ---- 对齐便捷入口（DPO / ORPO / CPO / 迭代拒绝采样 DPO） ----
+
+
+def _al_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _al_make_lm():
+    return AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                      num_layers=1, max_len=16)
+
+
+class TestAlignHelpers:
+    def test_dpo_align_runs(self):
+        policy = _al_make_lm()
+        reference = _al_make_lm()
+        pairs = [([0, 1], [2, 3], [4, 5]), ([0], [6], [7])]
+        hist = AI.dpo_align(policy, reference, pairs, beta=0.1, epochs=2,
+                            lr=0.01, seed=0)
+        assert len(hist) == 2
+        assert all(isinstance(v, float) and math.isfinite(v) for v in hist)
+
+    def test_orpo_align_no_reference(self):
+        policy = _al_make_lm()
+        pairs = [([0, 1], [2, 3], [4, 5])]
+        hist = AI.orpo_align(policy, pairs, beta=0.1, sft_weight=0.1,
+                             epochs=1, lr=0.01, seed=1)
+        assert len(hist) == 1 and math.isfinite(hist[0])
+
+    def test_cpo_align_runs(self):
+        policy = _al_make_lm()
+        reference = _al_make_lm()
+        pairs = [([0], [2], [3])]
+        hist = AI.cpo_align(policy, reference, pairs, beta=0.1,
+                            sft_weight=0.1, epochs=1, lr=0.01, seed=2)
+        assert len(hist) == 1 and math.isfinite(hist[0])
+
+    def test_iterative_rejection_dpo(self):
+        random.seed(11)
+        policy = _al_make_lm()
+        reference = _al_make_lm()
+
+        def reward(prompt, response):
+            return float(sum(response) % 5) - float(len(response))
+
+        out = AI.iterative_rejection_dpo(
+            policy, reference, [[0, 1], [2]], reward, num_samples=4,
+            top_ratio=0.5, beta=0.1, iterations=2, max_new_tokens=3,
+            temperature=1.5, lr=0.01, seed=3)
+        assert out["total_pairs"] >= 1
+        assert len(out["iterations"]) == 2
+        for item in out["iterations"]:
+            assert item["pairs"] >= 1 and math.isfinite(item["loss"])
+        # 同 seed 重跑结果一致
+        random.seed(11)
+        policy2 = _al_make_lm()
+        reference2 = _al_make_lm()
+        out2 = AI.iterative_rejection_dpo(
+            policy2, reference2, [[0, 1], [2]], reward, num_samples=4,
+            top_ratio=0.5, beta=0.1, iterations=2, max_new_tokens=3,
+            temperature=1.5, lr=0.01, seed=3)
+        assert out2["total_pairs"] == out["total_pairs"]
+        assert [round(i["loss"], 12) for i in out2["iterations"]] == \
+            [round(i["loss"], 12) for i in out["iterations"]]
+
+    def test_invalid_inputs(self):
+        policy = _al_make_lm()
+        reference = _al_make_lm()
+        pairs = [([0], [1], [2])]
+        assert _al_raises(lambda: AI.dpo_align(policy, reference, []))
+        assert _al_raises(lambda: AI.dpo_align(policy, reference, [([0], [1])]))
+        assert _al_raises(lambda: AI.orpo_align(policy, [([0], [], [2])]))
+        assert _al_raises(lambda: AI.dpo_align(policy, None, pairs))
+        assert _al_raises(lambda: AI.iterative_rejection_dpo(
+            policy, reference, [[0]], None))
+        assert _al_raises(lambda: AI.iterative_rejection_dpo(
+            policy, reference, [[0]], lambda p, r: 1.0, num_samples=1))
+        assert _al_raises(lambda: AI.iterative_rejection_dpo(
+            policy, reference, [[0]], lambda p, r: 1.0, top_ratio=1.0))
+        assert _al_raises(lambda: AI.iterative_rejection_dpo(
+            policy, reference, [[0]], lambda p, r: float("nan")))

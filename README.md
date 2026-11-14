@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3023 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3028 项）
 
 ## 特性
 
@@ -1547,6 +1547,10 @@ print(best["path"], best["score"])
 | `preference_loss(chosen_logp, rejected_logp, ref_*, method='dpo', beta=0.1)` | 偏好对齐，五种：`dpo` / `ipo` / `simpo` / `cpo` / `orpo`；吃**一对**序列的 log 概率，返回对两者的梯度 |
 | `RLHFTrainer(policy, reference=None, method='dpo', beta=0.1, ...)` | 把偏好损失串成训练循环：序列 log 概率 → `preference_loss` → 以 `d_chosen`/`d_rejected` 重放反传 → Adam；`pair_step` 单对、`fit` 逐对更新 |
 | `rlhf_align(policy, pairs, reference, method='dpo', ..., epochs=1)` | 便捷入口：`RLHFTrainer(...).fit(...)`，返回每轮平均损失 |
+| `dpo_align(policy, reference, pairs, beta=0.1, epochs=1, lr=None, seed=None)` | DPO 便捷入口（需要参考模型） |
+| `orpo_align(policy, pairs, beta=0.1, sft_weight=0.1, ...)` | ORPO 便捷入口（不需要参考模型） |
+| `cpo_align(policy, reference, pairs, beta=0.1, sft_weight=0.1, ...)` | CPO 便捷入口（DPO + chosen 的 SFT 项） |
+| `iterative_rejection_dpo(policy, reference, prompts, reward_fn, ...)` | 迭代拒绝采样 + DPO：采样 → 打分 → 过滤 → 构偏好对 → DPO |
 | `kto_loss(logp, ref_logp, desirable=True, beta=0.1, baseline=0.0)` | KTO：单条样本「好/坏」二元反馈即可，不需要成对偏好数据 |
 | `KTOTrainer(policy, reference, beta=0.1, baseline=None, lr=0.01)` | KTO 训练循环：单条样本 `(prompt, response, desirable)` → `kto_loss` → 以 `d_logp` 重放反传 → Adam；`baseline=None` 时每轮按 `mean(logπ−logπ_ref)` 现估、`sample_step` 单条、`fit` 逐条更新 |
 | `kto_align(policy, reference, samples, beta=0.1, ..., epochs=1)` | 便捷入口：`KTOTrainer(...).fit(...)`，返回每轮平均损失 |
@@ -1602,6 +1606,34 @@ losses = rlhf_align(policy, pairs, reference=ref, method="dpo", beta=0.1,
 - 边界：用完整回答序列的平均 logp（不做 token 级 mask/加权）、每对立即更新（不积累 batch）、
   参考模型固定不更新、不打包/不分片；`simpo`/`orpo` 不需要 `reference`；
   只有 DPO/IPO/CPO 需要参考模型（构造时缺 `reference` 会抛 ValueError）
+
+### 对齐便捷入口（dpo_align / orpo_align / cpo_align / iterative_rejection_dpo）
+
+`RLHFTrainer` 需要自己拼训练循环；下面四个入口把常见组合直接封装成一次调用：
+
+```python
+pairs = [([1, 2, 3], [4, 5, 6], [7, 8, 9])]
+dpo_align(policy, ref, pairs, beta=0.1, epochs=3, seed=0)      # 需要参考模型
+orpo_align(policy, pairs, beta=0.1, epochs=3, seed=0)          # 不需要参考模型
+cpo_align(policy, ref, pairs, beta=0.1, sft_weight=0.1, seed=0)
+
+def reward(prompt_ids, response_ids):
+    return 1.0 if response_ids and response_ids[-1] == 3 else 0.0
+
+stats = iterative_rejection_dpo(
+    policy, ref, [[1, 2], [4]], reward, num_samples=4, top_ratio=0.5,
+    beta=0.1, iterations=2, max_new_tokens=8, seed=0)
+# -> {"iterations": [{"iteration", "pairs", "loss"}, ...], "total_pairs": n}
+```
+
+- 三个 `*_align` 都是 `RLHFTrainer(...).fit(...)` 的薄封装，返回每轮平均损失；
+  `orpo` 不需要 `reference`，`dpo`/`cpo` 需要
+- `iterative_rejection_dpo`：每轮对每个 prompt 采样 `num_samples` 条回答，
+  `reward_fn(prompt_ids, response_ids)` 打分，按 `top_ratio` 用
+  `rejection_sampling_filter` 保留高分、丢弃低分，组成 `(prompt, chosen, rejected)`
+  偏好对做一轮 DPO；同一 `seed` 下结果可复现
+- 边界：每轮只取一条 kept / 一条 dropped（不做配对枚举）、`reward_fn` 必须是
+  有限数值、`top_ratio` 需在 (0,1) 内、`num_samples >= 2`
 
 ### KTO 训练循环（KTOTrainer）
 
@@ -5229,7 +5261,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3023 项）。
+`tests/`（合计 3028 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5237,7 +5269,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3023 项
+pytest -q                        # test_ai.py + tests/ 合计 3028 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7027,7 +7059,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3023 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3028 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7504,6 +7536,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPreferenceLoss` | DPO/IPO/SimPO/CPO/ORPO/KTO：闭式解、双向中心差分、数值稳定（β=50 不溢出）、9 类非法输入 |
 | `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
 | `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
+| `TestAlignHelpers` | DPO/ORPO/CPO 便捷入口收敛、迭代拒绝采样 DPO 的 total_pairs 与同 seed 复现、非法输入 |
 | `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
 | `TestGRPOMethods` | `method` 默认 grpo/clip_ratio_high 默认值、dapo 与 gspo 训练后奖励同样提升、多 token prompt 的 logits/old_logps 对齐、非法 method 与 clip_ratio_high 报错 |
 | `TestLookaheadDecoding` | 贪心等价（多种 lookahead/jacobi_steps 组合）、ids 拼接与 stats、forward 调用上界、n-gram 池最长后缀草稿、EOS 提前停止且为贪心前缀、合法性校验、max_len 截断 |
@@ -7568,7 +7601,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2971 个单元测试
+├── test_ai.py       # 2976 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本

@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1891 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1896 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -15828,6 +15828,146 @@ def kto_align(policy, reference, samples, beta: float = 0.1, baseline=None,
     """KTO 便捷入口：构 ``KTOTrainer`` 并返回每轮平均损失。"""
     trainer = KTOTrainer(policy, reference, beta=beta, baseline=baseline, lr=lr)
     return trainer.fit(samples, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
+# ---- 对齐便捷入口（B2）：DPO / ORPO / CPO / 迭代拒绝采样 DPO ----
+
+
+def _al_check_pairs(pairs, who):
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError(f"{who}: pairs 必须是非空列表")
+    out = []
+    for i, item in enumerate(pairs):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(
+                f"{who}: pairs[{i}] 必须是 (prompt_ids, chosen_ids, rejected_ids)")
+        prompt, chosen, rejected = item
+        for tag, ids in (("prompt", prompt), ("chosen", chosen),
+                         ("rejected", rejected)):
+            if not isinstance(ids, (list, tuple)) or not ids:
+                raise ValueError(
+                    f"{who}: pairs[{i}] 的 {tag} 必须是非空 id 列表")
+            for token in ids:
+                if isinstance(token, bool) or not isinstance(token, int):
+                    raise ValueError(
+                        f"{who}: pairs[{i}] 的 {tag} 必须是整数 id 列表")
+        out.append((list(prompt), list(chosen), list(rejected)))
+    return out
+
+
+def dpo_align(policy, reference, pairs, beta: float = 0.1,
+              epochs: int = 1, lr: float = None, shuffle: bool = True,
+              seed=None):
+    """DPO 便捷入口：构 ``RLHFTrainer(method="dpo")`` 并返回每轮平均损失。"""
+    pairs = _al_check_pairs(pairs, "dpo_align")
+    trainer = RLHFTrainer(policy, reference, method="dpo", beta=beta,
+                          lr=0.01 if lr is None else lr)
+    return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
+def orpo_align(policy, pairs, beta: float = 0.1, sft_weight: float = 0.1,
+               epochs: int = 1, lr: float = None, shuffle: bool = True,
+               seed=None):
+    """ORPO 便捷入口：不需要参考模型，损失里混合 SFT 项。"""
+    pairs = _al_check_pairs(pairs, "orpo_align")
+    trainer = RLHFTrainer(policy, None, method="orpo", beta=beta,
+                          sft_weight=sft_weight,
+                          lr=0.01 if lr is None else lr)
+    return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
+def cpo_align(policy, reference, pairs, beta: float = 0.1,
+              sft_weight: float = 0.1, epochs: int = 1, lr: float = None,
+              shuffle: bool = True, seed=None):
+    """CPO 便捷入口：DPO 项 + chosen 的 SFT 项（需要参考模型）。"""
+    pairs = _al_check_pairs(pairs, "cpo_align")
+    trainer = RLHFTrainer(policy, reference, method="cpo", beta=beta,
+                          sft_weight=sft_weight,
+                          lr=0.01 if lr is None else lr)
+    return trainer.fit(pairs, epochs=epochs, shuffle=shuffle, seed=seed)
+
+
+def iterative_rejection_dpo(policy, reference, prompts, reward_fn,
+                            num_samples: int = 4, top_ratio: float = 0.5,
+                            beta: float = 0.1, iterations: int = 1,
+                            max_new_tokens: int = 8, temperature: float = 1.0,
+                            lr: float = None, seed=None):
+    """迭代拒绝采样 + DPO（RFT/online-DPO 的轻量教学版）。
+
+    每轮对每个 prompt 用当前 policy 采样 ``num_samples`` 条回答，
+    ``reward_fn(prompt_ids, response_ids)`` 打分，``rejection_sampling_filter``
+    按 ``top_ratio`` 保留高分回答；保留的第一条作 chosen，被丢弃的第一条作
+    rejected，组成偏好对交给 DPO 更新。返回 ``{"iterations": [...], "total_pairs": n}``，
+    每轮记录 ``{"iteration", "pairs", "loss"}``。
+    """
+    if not callable(reward_fn):
+        raise TypeError("iterative_rejection_dpo: reward_fn 必须可调用")
+    _rlhf_check_lm(policy, "iterative_rejection_dpo(policy)")
+    _rlhf_check_lm(reference, "iterative_rejection_dpo(reference)")
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError("iterative_rejection_dpo: prompts 必须是非空列表")
+    for i, prompt in enumerate(prompts):
+        if not isinstance(prompt, (list, tuple)) or not prompt:
+            raise ValueError(
+                f"iterative_rejection_dpo: prompts[{i}] 必须是非空 id 列表")
+    if isinstance(num_samples, bool) or not isinstance(num_samples, int) \
+            or num_samples < 2:
+        raise ValueError(
+            "iterative_rejection_dpo: num_samples 必须是 >= 2 的整数")
+    if isinstance(iterations, bool) or not isinstance(iterations, int) \
+            or iterations < 1:
+        raise ValueError("iterative_rejection_dpo: iterations 必须是正整数")
+    if isinstance(top_ratio, bool) or not isinstance(top_ratio, (int, float)) \
+            or not math.isfinite(float(top_ratio)) \
+            or not (0.0 < float(top_ratio) < 1.0):
+        raise ValueError("iterative_rejection_dpo: top_ratio 必须在 (0,1) 内")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) \
+            or max_new_tokens < 1:
+        raise ValueError(
+            "iterative_rejection_dpo: max_new_tokens 必须是正整数")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("iterative_rejection_dpo: temperature 必须 > 0")
+    lr = 0.01 if lr is None else lr
+    rng = random.Random(seed)
+    history = []
+    total_pairs = 0
+    for it in range(iterations):
+        pairs = []
+        for prompt in prompts:
+            prompt_ids = list(prompt)
+            responses = []
+            for _ in range(num_samples):
+                seq = policy.generate(
+                    prompt_ids, max_new_tokens=max_new_tokens,
+                    temperature=float(temperature), rng=rng)
+                responses.append(list(seq[len(prompt_ids):]))
+            rewards = []
+            for i, response in enumerate(responses):
+                value = reward_fn(prompt_ids, response)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(float(value)):
+                    raise ValueError(
+                        f"iterative_rejection_dpo: reward_fn 返回值必须是有限数字，"
+                        f"prompt 索引 {i}")
+                rewards.append(float(value))
+            kept, kept_idx = rejection_sampling_filter(
+                responses, rewards, top_ratio=float(top_ratio))
+            keep_set = set(kept_idx)
+            dropped = [responses[i] for i in range(len(responses))
+                       if i not in keep_set]
+            if kept and dropped:
+                pairs.append((prompt_ids, kept[0], dropped[0]))
+        if not pairs:
+            break
+        trainer = RLHFTrainer(policy, reference, method="dpo",
+                              beta=beta, lr=lr)
+        losses = trainer.fit(pairs, epochs=1, shuffle=False,
+                             seed=rng.randrange(1 << 30))
+        history.append({"iteration": it + 1, "pairs": len(pairs),
+                        "loss": sum(losses) / len(losses)})
+        total_pairs += len(pairs)
+    return {"iterations": history, "total_pairs": total_pairs}
 
 
 class RLHFTrainer:
