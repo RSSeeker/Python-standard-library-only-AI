@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2957 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2959 项）
 
 ## 特性
 
@@ -4970,6 +4970,20 @@ out = gguf.load_gguf("m.gguf")   # {"metadata", "tensors", "dims"}
 权重矩阵的 dims 记为 `[in, out]`（形状 `[out][in]`），bias 记 `[out]`；元数据支持
 int/str。边界：不支持 F16/Q4 等量化类型、不支持多层嵌套的元数据数组。
 
+### 类型存根（AI.pyi + py.typed）
+
+`AI.pyi` 为最常用的公开 API（`Layer`/`MLP`/`Model`/`Optimizer` 系列、
+`CheckpointManager`、`ExperimentTracker`、`profile_model`、`safetensors_*` 等）
+提供渐进类型签名；根目录 `py.typed` 让类型检查器把本库视为「已类型化」，配合
+`mypy.ini`（`files=AI.py`，宽松渐进配置）即可增量检查：
+
+```bash
+mypy --config-file mypy.ini
+```
+
+边界：存根只覆盖常用入口（约几十个名字），不是 90k 行单文件的完整类型注解；
+未覆盖名字按 `Any` 处理，运行时签名以 `AI.py` 为准。
+
 ### 报告导出（profiler / 内存 / 模型卡 / 数据卡）
 
 `ai/report.py` 把运行期数据落成可交付文件：
@@ -5034,19 +5048,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（44 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（46 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2957 项）。
+`tests/`（合计 2959 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 44 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2957 项
+pytest tests/ -q                 # 46 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2959 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6805,7 +6819,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2957 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2959 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
