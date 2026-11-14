@@ -40,5 +40,6 @@ jobs:
     - name: Numeric regression snapshot
       run: |
         python tools/numeric_regression.py --check
-      - name: API stability names
-        run: python tools/api_stability.py --check
+    - name: API stability names
+      run: |
+        python tools/api_stability.py --check
