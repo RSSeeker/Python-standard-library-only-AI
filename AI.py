@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1896 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1902 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -45901,6 +45901,134 @@ class MaskedLM:
             out.append(best)
         return out
 
+
+
+
+# ---- 推理 / 部署便利件（B3）：流式生成、SSE、OpenAI 风格响应 ----
+
+
+def _sv_check_prompt(prompt_ids, who):
+    if not isinstance(prompt_ids, (list, tuple)) or not prompt_ids:
+        raise ValueError(f"{who}: prompt_ids 必须是非空 id 列表")
+    for token in prompt_ids:
+        if isinstance(token, bool) or not isinstance(token, int):
+            raise ValueError(f"{who}: prompt_ids 必须是整数 id 列表")
+
+
+def generate_stream(model, prompt_ids, max_new_tokens: int = 16,
+                    temperature: float = 1.0, top_k: int = 0, seed=None,
+                    eos_id=None):
+    """逐 token 流式生成：每次调用 ``generate`` 只前进一步，yield 新 token。
+
+    适合演示「服务端一边生成一边推给客户端」：返回值是生成器，消费多少算多少；
+    与一次性 ``model.generate(..., max_new_tokens=N)`` 相比，随机数消耗方式不同，
+    因此同 seed 下不保证与一次性调用逐位相同（流式语义以逐 token 为准）。
+    """
+    _sv_check_prompt(prompt_ids, "generate_stream")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) \
+            or max_new_tokens < 0:
+        raise ValueError("generate_stream: max_new_tokens 必须是 >= 0 的整数")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("generate_stream: temperature 必须 > 0")
+    if eos_id is not None and (isinstance(eos_id, bool)
+                               or not isinstance(eos_id, int)):
+        raise ValueError("generate_stream: eos_id 必须是整数或 None")
+    if not hasattr(model, "generate"):
+        raise TypeError("generate_stream: model 必须提供 generate 方法")
+    rng = random.Random(seed)
+    seq = list(prompt_ids)
+    for _ in range(max_new_tokens):
+        out = model.generate(seq, max_new_tokens=1,
+                             temperature=float(temperature), top_k=top_k,
+                             rng=rng)
+        token = out[-1]
+        yield token
+        seq.append(token)
+        if eos_id is not None and token == eos_id:
+            break
+
+
+def sse_event(data, event=None):
+    """把一段文本/JSON 编成 Server-Sent Events 帧（``event:`` 可选）。"""
+    if not isinstance(data, str):
+        raise TypeError("sse_event: data 必须是字符串")
+    if event is not None and not isinstance(event, str):
+        raise TypeError("sse_event: event 必须是字符串或 None")
+    head = "" if event is None else f"event: {event}\n"
+    return f"{head}data: {data}\n\n"
+
+
+def openai_chat_chunk(token, model_name: str = "ai-lite", index: int = 0,
+                      finish_reason=None):
+    """构造一个 OpenAI Chat Completions 风格的流式 chunk（delta 里放一个 token）。"""
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("openai_chat_chunk: model_name 必须是非空字符串")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("openai_chat_chunk: index 必须是 >= 0 的整数")
+    return {
+        "id": "chatcmpl-ai",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model_name,
+        "choices": [{
+            "index": index,
+            "delta": {"content": str(token)},
+            "finish_reason": finish_reason,
+        }],
+    }
+
+
+def stream_openai_chat(model, prompt_ids, model_name: str = "ai-lite",
+                       max_new_tokens: int = 16, temperature: float = 1.0,
+                       top_k: int = 0, seed=None, eos_id=None,
+                       include_done: bool = True):
+    """把 ``generate_stream`` 包成 SSE 帧序列：每个 token 一帧，最后可选 ``[DONE]``。"""
+    if not isinstance(include_done, bool):
+        raise TypeError("stream_openai_chat: include_done 必须是 bool")
+    for token in generate_stream(model, prompt_ids,
+                                 max_new_tokens=max_new_tokens,
+                                 temperature=temperature, top_k=top_k,
+                                 seed=seed, eos_id=eos_id):
+        payload = openai_chat_chunk(token, model_name=model_name)
+        yield sse_event(json.dumps(payload, ensure_ascii=False))
+    if include_done:
+        yield sse_event("[DONE]")
+
+
+def openai_chat_response(content, model_name: str = "ai-lite",
+                         finish_reason: str = "stop",
+                         prompt_tokens=None, completion_tokens=None):
+    """构造一个非流式的 OpenAI Chat Completions 风格响应体（纯 dict）。"""
+    if not isinstance(content, str):
+        raise TypeError("openai_chat_response: content 必须是字符串")
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("openai_chat_response: model_name 必须是非空字符串")
+    if not isinstance(finish_reason, str) or not finish_reason:
+        raise ValueError("openai_chat_response: finish_reason 必须是非空字符串")
+    usage = None
+    if prompt_tokens is not None or completion_tokens is not None:
+        for name, value in (("prompt_tokens", prompt_tokens),
+                            ("completion_tokens", completion_tokens)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"openai_chat_response: {name} 必须是 >= 0 的整数")
+        pt = 0 if prompt_tokens is None else prompt_tokens
+        ct = 0 if completion_tokens is None else completion_tokens
+        usage = {"prompt_tokens": pt, "completion_tokens": ct,
+                 "total_tokens": pt + ct}
+    return {
+        "id": "chatcmpl-ai",
+        "object": "chat.completion",
+        "created": 0,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    }
 
 class CausalLM:
     """字符/词级因果语言模型（GPT 式）：Embedding → 位置编码 → 因果 Transformer → 词表头

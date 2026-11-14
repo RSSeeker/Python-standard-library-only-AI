@@ -48433,3 +48433,85 @@ class TestAlignHelpers:
             policy, reference, [[0]], lambda p, r: 1.0, top_ratio=1.0))
         assert _al_raises(lambda: AI.iterative_rejection_dpo(
             policy, reference, [[0]], lambda p, r: float("nan")))
+
+
+# ---- 推理 / 部署便利件（流式生成 / SSE / OpenAI 风格响应） ----
+
+
+def _sv_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _sv_make_lm():
+    return AI.CausalLM(vocab_size=8, d_model=8, num_heads=2, d_ff=16,
+                      num_layers=1, max_len=16)
+
+
+class TestServingHelpers:
+    def test_generate_stream(self):
+        random.seed(0)
+        lm = _sv_make_lm()
+        a = list(AI.generate_stream(lm, [0, 1], max_new_tokens=5, seed=1))
+        b = list(AI.generate_stream(lm, [0, 1], max_new_tokens=5, seed=1))
+        assert len(a) == 5 and a == b
+        assert all(isinstance(t, int) for t in a)
+        assert list(AI.generate_stream(lm, [0], max_new_tokens=0)) == []
+
+    def test_generate_stream_eos(self):
+        random.seed(0)
+        lm = _sv_make_lm()
+        first = list(AI.generate_stream(lm, [0], max_new_tokens=1, seed=2))[0]
+        early = list(AI.generate_stream(lm, [0], max_new_tokens=10, seed=2,
+                                        eos_id=first))
+        assert early == [first]
+
+    def test_sse_event_format(self):
+        assert AI.sse_event("hello") == "data: hello\n\n"
+        assert AI.sse_event('{"a": 1}', event="message") == \
+            'event: message\ndata: {"a": 1}\n\n'
+
+    def test_openai_chunk(self):
+        chunk = AI.openai_chat_chunk(7, model_name="m")
+        assert chunk["object"] == "chat.completion.chunk"
+        assert chunk["model"] == "m"
+        assert chunk["choices"][0]["delta"]["content"] == "7"
+        assert chunk["choices"][0]["finish_reason"] is None
+
+    def test_stream_openai_chat(self):
+        random.seed(0)
+        lm = _sv_make_lm()
+        frames = list(AI.stream_openai_chat(lm, [0, 1], model_name="m",
+                                            max_new_tokens=3, seed=3))
+        assert frames[-1] == "data: [DONE]\n\n"
+        payloads = []
+        for frame in frames[:-1]:
+            assert frame.startswith("data: ") and frame.endswith("\n\n")
+            payloads.append(json.loads(frame[len("data: "):-2]))
+        assert len(payloads) == 3
+        for item in payloads:
+            assert item["model"] == "m"
+            assert item["choices"][0]["delta"]["content"].isdigit()
+
+    def test_openai_chat_response_and_invalid(self):
+        resp = AI.openai_chat_response("hi", model_name="m",
+                                       prompt_tokens=2, completion_tokens=1)
+        assert resp["object"] == "chat.completion"
+        assert resp["choices"][0]["message"] == {
+            "role": "assistant", "content": "hi"}
+        assert resp["choices"][0]["finish_reason"] == "stop"
+        assert resp["usage"]["total_tokens"] == 3
+        assert AI.openai_chat_response("x")["usage"] is None
+        assert _sv_raises(lambda: AI.openai_chat_response(1))
+        assert _sv_raises(lambda: AI.openai_chat_response(
+            "x", prompt_tokens=-1))
+        assert _sv_raises(lambda: AI.sse_event(1))
+        assert _sv_raises(lambda: AI.openai_chat_chunk(1, model_name=""))
+        assert _sv_raises(lambda: list(AI.generate_stream(None, [0])))
+        assert _sv_raises(lambda: list(AI.generate_stream(
+            _sv_make_lm(), [], max_new_tokens=1)))
+        assert _sv_raises(lambda: list(AI.generate_stream(
+            _sv_make_lm(), [0], temperature=0.0)))

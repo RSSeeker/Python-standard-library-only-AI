@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3028 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3034 项）
 
 ## 特性
 
@@ -1480,6 +1480,33 @@ opt = AI.MuPAdam(m, base_lr=1e-3)       # 按 lrs 逐层更新
 
 边界：这是简化版 μP，只覆盖小型 MLP 的宽度参数化；不包含完整 Tensor Programs 谱系、
 attention / embedding 的 μP 特化，也不改变反向传播。
+
+### 推理 / 服务便利件（流式生成、SSE、OpenAI 风格响应）
+
+`CausalLM.generate` 一次返回完整序列；做服务端时通常需要「边生成边推送」，
+以及和客户端约定好的 JSON / SSE 格式：
+
+```python
+lm = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2)
+for token in generate_stream(lm, [1, 2, 3], max_new_tokens=16, seed=0):
+    print(token)                      # 逐 token 产出（支持 eos_id 提前停）
+
+chunks = stream_openai_chat(lm, [1, 2, 3], model_name="ai-lite",
+                            max_new_tokens=16, seed=0)
+response = openai_chat_response("你好", model_name="ai-lite",
+                                prompt_tokens=3, completion_tokens=2)
+```
+
+- `generate_stream(model, prompt_ids, max_new_tokens=16, temperature=1.0,
+  top_k=0, seed=None, eos_id=None)`：生成器，逐 token yield；每步只推进一格，
+  适合演示流式服务（随机数消耗与一次性 `generate` 不同，不承诺逐位相同）
+- `sse_event(data, event=None)`：编码成 `data: ...\n\n` 的 SSE 帧（可选 `event:`）
+- `openai_chat_chunk(token, model_name='ai-lite', index=0, finish_reason=None)`：
+  流式 chunk 的 dict；`openai_chat_response(content, ..., usage)`：非流式响应体
+- `stream_openai_chat(model, prompt_ids, ...)`：把逐 token 输出包成 SSE 帧序列，
+  默认最后追加 `data: [DONE]`
+- 边界：只做「文本/token 形状」的适配，不实现 HTTP 路由、鉴权、并发与背压；
+  非流式 `openai_chat_response` 不负责调用模型
 
 ### 推理搜索（MCTS / Tree-of-Thought）
 
@@ -5261,7 +5288,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3028 项）。
+`tests/`（合计 3034 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5269,7 +5296,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3028 项
+pytest -q                        # test_ai.py + tests/ 合计 3034 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7059,7 +7086,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3028 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3034 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7074,6 +7101,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestValDataFormats` / `TestCrossEntropyTargets` | `val_data` 三种写法、CE 的 target 规范化 |
 | `TestCausalMask` | 因果掩码的**因果性**（改未来 token 不改过去输出）、掩码权重精确为 0、`W_v` 梯度 vs 数值梯度 |
 | `TestCausalLM` | 小语料过拟合（loss → <0.05）、贪心续写接上周期、前缀 logits 与未来无关、生成可复现、非法输入 |
+| `TestServingHelpers` | 流式生成可复现/`eos_id` 提前停、SSE 帧格式、OpenAI chunk 与响应体形状、流式帧可 JSON 解析、非法输入 |
 | `TestMaskedLM` | 遮罩的 80/10/10 比例与 `mask_id` 在词表外、双向性（改末位影响前面的 logits）、`out.W` 梯度 vs 数值、全遮罩记忆后能填空还原、`evaluate` 可复现且不改模式、19 块参数去重、非法输入 |
 | `TestAttentionMaps` | MHA 形状/行和/因果上三角、eval 两次一致、TEL 与 Encoder 多层与 `layer_index`、CausalLM 只读且模式复原、ASCII 结构与抽样、六类非法输入 |
 | `TestConfigDriven` | `build_model` 结构与维度推断（部分给、全不给、显式覆盖）、八类配置错误、五种调度器构造、`train_from_config` 训练与收敛、同 seed 曲线与权重逐位一致、JSON 路径与 `data`/`x` 冲突 |
@@ -7601,7 +7629,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2976 个单元测试
+├── test_ai.py       # 2982 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本
