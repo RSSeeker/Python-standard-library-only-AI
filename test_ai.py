@@ -46249,3 +46249,94 @@ class TestPoolFormerBlock:
         assert _pool_raises(lambda: m.forward([[1.0, 2.0]]))
         assert _pool_raises(lambda: m.backward([[1.0] * 4]), RuntimeError)
         assert _pool_raises(lambda: m.sgd_step(-1))
+
+
+# ---- ConvNeXt V2 的 GRN（Global Response Normalization） ----
+
+
+def _grn_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _grn_loss(layer, xs, w):
+    out = layer.forward(xs)
+    return sum(out[t][c] * w[t][c]
+               for t in range(len(xs)) for c in range(len(xs[0])))
+
+
+class TestGRN:
+    def test_identity_init_and_param_count(self):
+        xs = [[0.3, -0.2, 1.1], [0.5, 0.7, -0.4]]
+        grn = AI.GRN(3)
+        out = grn.forward(xs)
+        for t in range(2):
+            for c in range(3):
+                assert abs(out[t][c] - xs[t][c]) < 1e-15
+        assert grn.param_count() == 6
+
+    def test_forward_backward_numerical(self):
+        rng = random.Random(11)
+        xs = [[rng.uniform(-1.0, 1.0) for _ in range(3)] for _ in range(4)]
+        w = [[rng.uniform(-1.0, 1.0) for _ in range(3)] for _ in range(4)]
+        grn = AI.GRN(3)
+        grn.gamma = [0.5, -0.3, 0.8]
+        grn.beta = [0.1, 0.0, -0.2]
+        grn.forward(xs)
+        dx = grn.backward(w)
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = _grn_loss(grn, xs, w)
+            param_set(p0 - h)
+            lm = _grn_loss(grn, xs, w)
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        for gg, pg, ps in [
+            (lambda: grn.grad_gamma[1], lambda: grn.gamma[1],
+             lambda v: grn.gamma.__setitem__(1, v)),
+            (lambda: grn.grad_beta[2], lambda: grn.beta[2],
+             lambda v: grn.beta.__setitem__(2, v)),
+        ]:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-6, (a, f)
+        # 输入梯度（含跨通道项）
+        for (t, c) in [(0, 1), (2, 0)]:
+            a = dx[t][c]
+            x0 = xs[t][c]
+            xs[t][c] = x0 + 1e-5
+            lp = _grn_loss(grn, xs, w)
+            xs[t][c] = x0 - 1e-5
+            lm = _grn_loss(grn, xs, w)
+            xs[t][c] = x0
+            assert abs(a - (lp - lm) / (2e-5)) < 1e-6
+
+    def test_sgd_step_updates(self):
+        grn = AI.GRN(2)
+        grn.forward([[1.0, 2.0], [3.0, 4.0]])
+        grn.backward([[1.0, 0.5], [-0.5, 1.0]])
+        g0 = grn.gamma[:]
+        grn.sgd_step(0.1)
+        assert any(abs(grn.gamma[i] - g0[i]) > 0 for i in range(2))
+
+    def test_zero_global_response(self):
+        grn = AI.GRN(2)
+        out = grn.forward([[0.0, 0.0]])
+        assert out == [[0.0, 0.0]]
+        dx = grn.backward([[1.0, 1.0]])
+        assert dx == [[1.0, 1.0]]
+
+    def test_invalid_inputs(self):
+        assert _grn_raises(lambda: AI.GRN(0))
+        assert _grn_raises(lambda: AI.GRN(3, eps=0.0))
+        m = AI.GRN(3)
+        assert _grn_raises(lambda: m.forward([]))
+        assert _grn_raises(lambda: m.forward([[1.0, 2.0]]))
+        assert _grn_raises(lambda: m.backward([[1.0] * 3]), RuntimeError)
+        assert _grn_raises(lambda: m.sgd_step(0.01), RuntimeError)
+        assert _grn_raises(lambda: m.sgd_step(-1))

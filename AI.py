@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1767 个 def / 422 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1768 个 def / 423 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -7970,6 +7970,137 @@ def _pool_check_seq(seq, d_model):
             vals.append(float(v))
         rows.append(vals)
     return rows
+
+
+def _grn_check_seq(seq, num_features, who="GRN"):
+    if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+        raise ValueError(f"{who}: 输入必须是非空 (T, C) 列表")
+    rows = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != num_features:
+            raise ValueError(f"{who}: 每行长度必须为 {num_features}，收到 {row!r}")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 输入必须是有限数字")
+            vals.append(float(v))
+        rows.append(vals)
+    return rows
+
+
+class GRN:
+    """Global Response Normalization（ConvNeXt V2 的通道响应归一化层）
+
+    对 (T, C) 序列（T 个 token、C 个通道），逐通道先算全局 L2 响应：
+
+    `g_c = sqrt(sum_t x[t][c]^2)`，再在通道间归一化：
+
+    `n_c = g_c / (mean(g) + eps)`，最后做带残差的门控：
+
+    `y[t][c] = x[t][c] + gamma_c * n_c * x[t][c] + beta_c`。
+
+    `gamma`/`beta` 是每通道可训练参数（初始 0），因此初始时该层是恒等
+    映射；`gamma` 学起来后抑制/增强那些「全局响应过大」的通道，用于提升
+    特征多样性（ConvNeXt V2 论文的核心改进）。
+
+    边界：`mean` 按通道维求平均；`g_c == 0` 时该通道的归一化与梯度都取 0。
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-6):
+        if isinstance(num_features, bool) or not isinstance(num_features, int) \
+                or num_features < 1:
+            raise ValueError(f"GRN: num_features 必须是正整数，收到 {num_features!r}")
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool):
+            raise TypeError(f"GRN: eps 必须是数字，收到 {eps!r}")
+        if not math.isfinite(float(eps)) or float(eps) <= 0.0:
+            raise ValueError("GRN: eps 必须是 > 0 的有限数字")
+        self.num_features = num_features
+        self.eps = float(eps)
+        self.gamma = [0.0] * num_features
+        self.beta = [0.0] * num_features
+        self.grad_gamma = None
+        self.grad_beta = None
+
+    def zero_grad(self):
+        self.grad_gamma = [0.0] * self.num_features
+        self.grad_beta = [0.0] * self.num_features
+
+    def param_count(self):
+        return 2 * self.num_features
+
+    def forward(self, seq):
+        rows = _grn_check_seq(seq, self.num_features)
+        T = len(rows)
+        C = self.num_features
+        g = [0.0] * C
+        for t in range(T):
+            for c in range(C):
+                g[c] += rows[t][c] * rows[t][c]
+        g = [math.sqrt(v) for v in g]
+        gmean = sum(g) / C
+        denom = gmean + self.eps
+        n = [g[c] / denom for c in range(C)]
+        out = [[0.0] * C for _ in range(T)]
+        for t in range(T):
+            for c in range(C):
+                out[t][c] = rows[t][c] * (1.0 + self.gamma[c] * n[c]) + self.beta[c]
+        self._x = rows
+        self._g = g
+        self._n = n
+        self._denom = denom
+        return out
+
+    def backward(self, d_out):
+        if not hasattr(self, "_x"):
+            raise RuntimeError("GRN: 反向前必须先调用 forward")
+        rows = self._x
+        T = len(rows)
+        C = self.num_features
+        g, n, denom = self._g, self._n, self._denom
+        d_x = [[0.0] * C for _ in range(T)]
+        self.grad_gamma = [0.0] * C
+        self.grad_beta = [0.0] * C
+        d_n_from_y = [0.0] * C
+        # 每个通道：d_y 对 gamma/beta 的直接贡献、以及经 n_c 收集 dL/dn_c
+        for c in range(C):
+            d_gamma = 0.0
+            d_beta = 0.0
+            for t in range(T):
+                do = float(d_out[t][c])
+                x = rows[t][c]
+                d_gamma += do * n[c] * x
+                d_beta += do
+                d_n_from_y[c] += do * self.gamma[c] * x
+                d_x[t][c] += do * (1.0 + self.gamma[c] * n[c])
+            self.grad_gamma[c] = d_gamma
+            self.grad_beta[c] = d_beta
+        # n_c = g_c / (mean(g)+eps)，mean(g) 依赖所有 g_j，故有跨通道项：
+        # dL/dg_j = (dL/dn_j)/D - (1/(C*D)) * sum_c (dL/dn_c * n_c)
+        corr = sum(d_n_from_y[c] * n[c] for c in range(C))
+        for c in range(C):
+            d_g = (d_n_from_y[c] - corr / C) / denom
+            if g[c] > 0.0:
+                for t in range(T):
+                    d_x[t][c] += d_g * rows[t][c] / g[c]
+        return d_x
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool):
+            raise TypeError("GRN: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("GRN: lr 必须是非负有限数字")
+        if self.grad_gamma is None:
+            raise RuntimeError("GRN: 更新前必须先 backward")
+        for c in range(self.num_features):
+            self.gamma[c] -= lr * self.grad_gamma[c]
+            self.beta[c] -= lr * self.grad_beta[c]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
 
 
 class PoolFormerBlock:

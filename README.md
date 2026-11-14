@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2852 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2857 项）
 
 ## 特性
 
@@ -999,6 +999,31 @@ probs = m.detect(ids)   # 每个位置「被破坏」概率
 **边界**：这是简化版 ELECTRA——生成器只做「遮罩替换」不做 80/10/10 采样，判别器标签因此是
 「该位置是否被遮罩」而不是「生成器采样出的 token 是否与原 token 不同」；判别器输入允许
 `mask_id`（词表外一行）出现。
+
+### ConvNeXt V2 的 GRN（Global Response Normalization）
+
+GRN 逐通道先算全局 L2 响应 `g_c = sqrt(sum_t x[t][c]^2)`，再在通道间归一化
+`n_c = g_c / (mean(g) + eps)`，最后做带残差的门控：
+
+`y[t][c] = x[t][c] + gamma_c * n_c * x[t][c] + beta_c`
+
+`gamma`/`beta` 初始 0（初始恒等映射），训练后抑制「全局响应过大」的通道，
+用于提升特征多样性——ConvNeXt V2 的核心改动，也可插进任意 CNN/序列 block。
+
+```python
+grn = AI.GRN(64, eps=1e-6)
+out = grn.forward(seq)      # seq: (T, 64)
+d_x = grn.backward(d_out)
+grn.sgd_step(0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `GRN(num_features, eps=1e-6)` | 参数 `gamma`/`beta` 各 C 个（初始 0），`forward/backward/zero_grad/sgd_step/param_count` |
+| 反向 | 含 `mean(g)` 引起的跨通道耦合项：`dL/dg_j = (dL/dn_j - corr/C)/D`，`corr = Σ_c dL/dn_c · n_c` |
+
+边界：输入是 `(T, C)` 的 list（不跨 batch），全局响应按整个序列求；单层封装，
+不含卷积/分类头。
 
 ### PoolFormer / MetaFormer（平均池化 token 混合）
 
@@ -6490,7 +6515,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2852 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2857 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6973,6 +6998,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPEFTVariants` | PiSSA 前向等价与残差重建、LoRA+ 双学习率步长、BAdam 分块交替更新与训练收敛、10 类非法输入 |
 | `TestLLRD` | 逐层衰减值/`min_lr` 截断、逐层步长比 2.0、训练收敛、非法输入 |
 | `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
+| `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7007,6 +7033,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2852 个单元测试
+├── test_ai.py       # 2857 个单元测试
 └── README.md
 ```
