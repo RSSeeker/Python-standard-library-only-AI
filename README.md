@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2847 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2852 项）
 
 ## 特性
 
@@ -999,6 +999,29 @@ probs = m.detect(ids)   # 每个位置「被破坏」概率
 **边界**：这是简化版 ELECTRA——生成器只做「遮罩替换」不做 80/10/10 采样，判别器标签因此是
 「该位置是否被遮罩」而不是「生成器采样出的 token 是否与原 token 不同」；判别器输入允许
 `mask_id`（词表外一行）出现。
+
+### PoolFormer / MetaFormer（平均池化 token 混合）
+
+PoolFormer 指出「token mixing 不一定要用注意力」：只要保留 MetaFormer 骨架
+（先混合 token、再逐 token 变换），用最便宜的池化也能训练。本实现用窗口平均
+池化做 token mixer，几乎不增加参数：
+
+```python
+blk = AI.PoolFormerBlock(32, pool_size=3, d_ff=64, seed=7)
+out = blk.forward(seq)       # seq: (T, 32) 的 list
+d_x = blk.backward(d_out)    # 返回 (T, 32) 输入梯度
+blk.sgd_step(0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `PoolFormerBlock(d_model, pool_size=3, d_ff=None, eps=1e-5, seed=None)` | LN → 平均池化 → 残差 → LN → 两层 MLP → 残差；`pool_size` 为奇数窗口（偶数自动减 1），`d_ff` 默认 `2*d_model` |
+| `MetaFormerBlock` | `PoolFormerBlock` 的别名 |
+| `forward(seq)` / `backward(d_out)` | 前向返回 (T, d_model)；反向返回输入梯度并累积 `grad_W1/grad_b1/grad_W2/grad_b2/grad_ln1/grad_ln2` |
+| `param_count()` / `sgd_step(lr)` | 参数只来自两个 LayerNorm 与两层 MLP；池化本身无参数 |
+
+边界：池化窗口不跨 batch、无 padding/stride，纯 Python 循环；不做分类头或
+`fit` 封装（与其它 block 一样作为可训练组件嵌入调用方循环）。
 
 ### 组合模型（ConvNeXt）
 
@@ -6467,7 +6490,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2847 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2852 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6949,6 +6972,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSAMOptimizer` | first_step 扰动幅度与零梯度不变、second_step 恢复后更新、SAM-SGD/SAM-Adam 训练收敛、9 类非法输入 |
 | `TestPEFTVariants` | PiSSA 前向等价与残差重建、LoRA+ 双学习率步长、BAdam 分块交替更新与训练收敛、10 类非法输入 |
 | `TestLLRD` | 逐层衰减值/`min_lr` 截断、逐层步长比 2.0、训练收敛、非法输入 |
+| `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6983,6 +7007,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2847 个单元测试
+├── test_ai.py       # 2852 个单元测试
 └── README.md
 ```

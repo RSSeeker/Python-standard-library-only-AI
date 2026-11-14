@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1765 个 def / 421 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1767 个 def / 422 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -7946,6 +7946,179 @@ class LLRDAdam:
                 vb[k] = b2 * vb[k] + (1.0 - b2) * g * g
                 layer.biases[k] -= lr * (mb[k] / c1) / (
                     math.sqrt(vb[k] / c2) + self.eps)
+
+
+def _pool_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"PoolFormer: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _pool_check_seq(seq, d_model):
+    if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+        raise ValueError("PoolFormer: 序列必须是非空 (T, d_model) 列表")
+    rows = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(
+                f"PoolFormer: 每行长度必须为 {d_model}，收到 {row!r}")
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                    or not math.isfinite(float(v)):
+                raise ValueError("PoolFormer: 输入必须是有限数字")
+            vals.append(float(v))
+        rows.append(vals)
+    return rows
+
+
+class PoolFormerBlock:
+    """PoolFormer / MetaFormer 风格 block：用平均池化代替注意力
+
+    PoolFormer 的观察是 token mixing 不必是注意力——只要「先混合 token、再
+    逐 token 变换」的 MetaFormer 骨架即可。本实现用因果无关的窗口平均池化：
+
+    ```text
+    h1 = LayerNorm1(x)
+    h1 = AvgPool(h1, pool_size)        # 每个通道在时间维上做滑动平均
+    y  = x + h1
+    h2 = LayerNorm2(y)
+    h2 = W2 · relu(W1 · h2)
+    out = y + h2
+    ```
+
+    平均池化没有可训练参数（这也是 PoolFormer「几乎零参数 token mixer」的
+    含义），反向对每个输出把梯度均匀分给窗口内的输入。
+
+    参数：`pool_size` 为奇数窗口（自动向下取整到奇数），`d_ff` 默认 `2*d_model`。
+    """
+
+    def __init__(self, d_model: int, pool_size: int = 3, d_ff: int = None,
+                 eps: float = 1e-5, seed: int = None):
+        self.d_model = _pool_check_pos_int(d_model, "d_model")
+        self.pool_size = _pool_check_pos_int(pool_size, "pool_size")
+        if self.pool_size % 2 == 0:
+            self.pool_size -= 1
+        if self.pool_size < 1:
+            self.pool_size = 1
+        self.half = self.pool_size // 2
+        if d_ff is None:
+            d_ff = 2 * self.d_model
+        self.d_ff = _pool_check_pos_int(d_ff, "d_ff")
+        rng = random.Random(seed)
+        def gauss(shape):
+            if isinstance(shape, int):
+                return [rng.gauss(0.0, math.sqrt(2.0 / self.d_model))
+                        for _ in range(shape)]
+            return [gauss(s) for s in shape]
+        self.ln1 = LayerNorm(self.d_model, eps=eps)
+        self.ln2 = LayerNorm(self.d_model, eps=eps)
+        self.W1 = Layer(self.d_model, self.d_ff, "relu")
+        self.W2 = Layer(self.d_ff, self.d_model, "linear")
+        self.zero_grad()
+
+    # ---- 池化 ----
+    def _pool(self, seq):
+        T = len(seq)
+        out = [[0.0] * self.d_model for _ in range(T)]
+        for t in range(T):
+            lo = max(0, t - self.half)
+            hi = min(T, t + self.half + 1)
+            inv = 1.0 / (hi - lo)
+            for j in range(self.d_model):
+                s = 0.0
+                for u in range(lo, hi):
+                    s += seq[u][j]
+                out[t][j] = s * inv
+        return out
+
+    def _pool_backward(self, d_out):
+        T = len(d_out)
+        d_in = [[0.0] * self.d_model for _ in range(T)]
+        for t in range(T):
+            lo = max(0, t - self.half)
+            hi = min(T, t + self.half + 1)
+            inv = 1.0 / (hi - lo)
+            for j in range(self.d_model):
+                g = d_out[t][j] * inv
+                for u in range(lo, hi):
+                    d_in[u][j] += g
+        return d_in
+
+    # ---- 前向 ----
+    def forward(self, seq):
+        rows = _pool_check_seq(seq, self.d_model)
+        self._x = rows
+        h1, self._c1 = _norm_rows_forward(self.ln1, rows)
+        p = self._pool(h1)
+        y = [[rows[t][j] + p[t][j] for j in range(self.d_model)]
+             for t in range(len(rows))]
+        h2, self._c2 = _norm_rows_forward(self.ln2, y)
+        a1, self._c3 = _dense_rows_forward(self.W1, h2)
+        a2, self._c4 = _dense_rows_forward(self.W2, a1)
+        self._y = y
+        self._p = p
+        self._h1 = h1
+        return [[y[t][j] + a2[t][j] for j in range(self.d_model)]
+                for t in range(len(y))]
+
+    # ---- 反向 ----
+    def backward(self, d_out):
+        if not hasattr(self, "_c4"):
+            raise RuntimeError("PoolFormer: 反向前必须先调用 forward")
+        T = len(d_out)
+        d_y = [[d_out[t][j] for j in range(self.d_model)] for t in range(T)]
+        ga2 = [[d_out[t][j] for j in range(self.d_model)] for t in range(T)]
+        gW2, gb2, d_a1 = _dense_rows_backward(self.W2, self._c4, ga2)
+        gW1, gb1, d_h2 = _dense_rows_backward(self.W1, self._c3, d_a1)
+        g_ln2, gle2, d_y2 = _norm_rows_backward(self.ln2, self._c2, d_h2)
+        for t in range(T):
+            for j in range(self.d_model):
+                d_y[t][j] += d_y2[t][j]
+        d_p = d_y
+        d_h1 = self._pool_backward(d_p)
+        g_ln1, gle1, d_x = _norm_rows_backward(self.ln1, self._c1, d_h1)
+        self.grad_W1 = gW1
+        self.grad_b1 = gb1
+        self.grad_W2 = gW2
+        self.grad_b2 = gb2
+        self.grad_ln1 = (g_ln1, gle1)
+        self.grad_ln2 = (g_ln2, gle2)
+        return [[d_y[t][j] + d_x[t][j] for j in range(self.d_model)]
+                for t in range(T)]
+
+    def zero_grad(self):
+        self.grad_W1 = None
+        self.grad_b1 = None
+        self.grad_W2 = None
+        self.grad_b2 = None
+        self.grad_ln1 = None
+        self.grad_ln2 = None
+
+    def param_count(self):
+        return (_dense_param_count(self.W1) + _dense_param_count(self.W2)
+                + _norm_param_count(self.ln1) + _norm_param_count(self.ln2)
+                + 0)
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool):
+            raise TypeError("PoolFormer: lr 必须是数字")
+        if not math.isfinite(float(lr)) or float(lr) < 0.0:
+            raise ValueError("PoolFormer: lr 必须是非负有限数字")
+        if self.grad_W1 is not None:
+            _dense_apply_sgd(self.W1, (self.grad_W1, self.grad_b1), lr)
+            _dense_apply_sgd(self.W2, (self.grad_W2, self.grad_b2), lr)
+            _norm_apply_sgd(self.ln1, self.grad_ln1, lr)
+            _norm_apply_sgd(self.ln2, self.grad_ln2, lr)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+MetaFormerBlock = PoolFormerBlock
 
 
 def gradient_centralize(grads, mode: str = "rows"):

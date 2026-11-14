@@ -46132,3 +46132,120 @@ class TestLLRD:
         assert _llrd_raises(lambda: AI.LLRDAdam(model, eps=0.0))
         assert _llrd_raises(lambda: AI.LLRDAdam(model, decay=2.0))
         assert _llrd_raises(lambda: AI.layerwise_lr_decay(0.01, 3, min_lr=-1.0))
+
+
+# ---- PoolFormer / MetaFormer block ----
+
+
+def _pool_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _pool_seq(T=5, d=4, seed=0):
+    rng = random.Random(seed)
+    return [[rng.uniform(-1.0, 1.0) for _ in range(d)] for _ in range(T)]
+
+
+def _pool_loss(blk, xs, w):
+    out = blk.forward(xs)
+    return sum(out[t][j] * w[t][j]
+               for t in range(len(xs)) for j in range(len(xs[0])))
+
+
+class TestPoolFormerBlock:
+    def test_forward_and_param_count(self):
+        xs = _pool_seq()
+        blk = AI.PoolFormerBlock(4, pool_size=3, d_ff=8, seed=2)
+        out = blk.forward(xs)
+        assert len(out) == 5 and len(out[0]) == 4
+        assert blk.param_count() == 92
+        assert AI.MetaFormerBlock is AI.PoolFormerBlock
+        # pool_size 偶数向下取整到奇数：4 -> 3
+        assert AI.PoolFormerBlock(4, pool_size=4, seed=1).pool_size == 3
+
+    def test_numerical_gradients(self):
+        xs = _pool_seq(seed=0)
+        rng = random.Random(5)
+        w = [[rng.uniform(-1.0, 1.0) for _ in range(4)] for _ in range(5)]
+        blk = AI.PoolFormerBlock(4, pool_size=3, d_ff=8, seed=2)
+        blk.forward(xs)
+        blk.backward(w)
+
+        def fd(grad_get, param_get, param_set, h=1e-5):
+            p0 = param_get()
+            param_set(p0 + h)
+            lp = _pool_loss(blk, xs, w)
+            param_set(p0 - h)
+            lm = _pool_loss(blk, xs, w)
+            param_set(p0)
+            return grad_get(), (lp - lm) / (2 * h)
+
+        cases = [
+            (lambda: blk.grad_W1[0][1], lambda: blk.W1.weights[0][1],
+             lambda v: blk.W1.weights[0].__setitem__(1, v)),
+            (lambda: blk.grad_W2[1][2], lambda: blk.W2.weights[1][2],
+             lambda v: blk.W2.weights[1].__setitem__(2, v)),
+            (lambda: blk.grad_ln1[0][1], lambda: blk.ln1.gamma[1],
+             lambda v: blk.ln1.gamma.__setitem__(1, v)),
+            (lambda: blk.grad_ln2[0][2], lambda: blk.ln2.gamma[2],
+             lambda v: blk.ln2.gamma.__setitem__(2, v)),
+        ]
+        for gg, pg, ps in cases:
+            a, f = fd(gg, pg, ps)
+            assert abs(a - f) < 1e-5, (a, f)
+        # 输入梯度（残差 + 池化 + LN 全路径）
+        dx = blk.backward(w)
+        x0 = xs[0][1]
+        xs[0][1] = x0 + 1e-5
+        lp = _pool_loss(blk, xs, w)
+        xs[0][1] = x0 - 1e-5
+        lm = _pool_loss(blk, xs, w)
+        xs[0][1] = x0
+        assert abs(dx[0][1] - (lp - lm) / (2e-5)) < 1e-6
+
+    def test_training_converges(self):
+        seq = [[math.sin(0.4 * t + 0.3 * j) for j in range(4)] for t in range(6)]
+        target = [[0.5 * seq[t][j] - 0.1 * seq[(t - 1) % 6][j] for j in range(4)]
+                  for t in range(6)]
+        blk = AI.PoolFormerBlock(4, pool_size=3, d_ff=8, seed=3)
+
+        def mse():
+            out = blk.forward(seq)
+            return sum((out[t][j] - target[t][j]) ** 2
+                       for t in range(6) for j in range(4)) / 24.0
+
+        first = mse()
+        for _ in range(150):
+            blk.zero_grad()
+            out = blk.forward(seq)
+            d = [[2.0 * (out[t][j] - target[t][j]) / 24.0 for j in range(4)]
+                 for t in range(6)]
+            blk.backward(d)
+            blk.sgd_step(0.02)
+        assert mse() < first * 0.5
+
+    def test_sequential_blocks(self):
+        xs = _pool_seq(seed=3)
+        blk1 = AI.PoolFormerBlock(4, pool_size=3, d_ff=8, seed=4)
+        blk2 = AI.PoolFormerBlock(4, pool_size=3, d_ff=8, seed=5)
+        w = [[1.0] * 4 for _ in range(5)]
+        out1 = blk1.forward(xs)
+        out2 = blk2.forward(out1)
+        assert len(out2) == 5
+        d2 = blk2.backward(w)
+        d1 = blk1.backward(d2)
+        assert len(d1) == 5 and blk1.grad_W1 is not None and blk2.grad_W1 is not None
+
+    def test_invalid_inputs(self):
+        assert _pool_raises(lambda: AI.PoolFormerBlock(0))
+        assert _pool_raises(lambda: AI.PoolFormerBlock(4, pool_size=0))
+        assert _pool_raises(lambda: AI.PoolFormerBlock(4, d_ff=0))
+        m = AI.PoolFormerBlock(4, seed=1)
+        assert _pool_raises(lambda: m.forward([]))
+        assert _pool_raises(lambda: m.forward([[1.0, 2.0]]))
+        assert _pool_raises(lambda: m.backward([[1.0] * 4]), RuntimeError)
+        assert _pool_raises(lambda: m.sgd_step(-1))
