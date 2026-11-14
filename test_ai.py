@@ -42834,3 +42834,137 @@ class TestRGLRUBlock:
         blk.forward([[0.1] * 4] * 3)
         assert _rglru_raises(lambda: blk.backward([[0.1] * 4] * 2))
         assert _rglru_raises(lambda: blk.sgd_step(-0.1))
+
+
+import random
+
+
+def _perc_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _perc_model(seed=1):
+    return AI.PerceiverIO(in_dim=4, out_dim=2, d_model=8, num_latents=3,
+                          num_heads=2, d_ff=16, num_layers=2, seed=seed)
+
+
+def _perc_xs(seed=3, T=5):
+    rng = random.Random(seed)
+    return [[rng.gauss(0, 1) for _ in range(4)] for _ in range(T)]
+
+
+class TestPerceiverIO:
+    def test_forward_shape_and_param_count(self):
+        m = _perc_model()
+        xs = _perc_xs()
+        out = m.forward(xs)
+        assert len(out) == 3 and len(out[0]) == 2
+        expected = (8 * 4 + 8) + (3 * 8) + (2 * 8 + 2)
+        for _ in range(2):
+            expected += 2 * 8 + 4 * (8 * 8 + 8) + 4 * (8 * 8 + 8) \
+                + (8 * 16 + 16) + (16 * 8 + 8) + 4 * 8
+        assert m.param_count() == expected
+        assert m.param_count() == 1890
+        # 两次前向结果一致（eval 无 dropout）
+        out2 = m.forward(xs)
+        assert out == out2
+
+    def test_numerical_gradients(self):
+        m = _perc_model()
+        xs = _perc_xs()
+        w = [[0.1 * (i + 1) + 0.02 * j for j in range(2)] for i in range(3)]
+
+        def loss_at(model, xx):
+            o = model.forward(xx)
+            return sum(o[i][j] * w[i][j] for i in range(3) for j in range(2))
+
+        def fd(name, getter, analytic, setter):
+            m.zero_grad()
+            m.forward(xs)
+            d_out = [[w[i][j] for j in range(2)] for i in range(3)]
+            m.backward(d_out)
+            ana = analytic()
+            p0 = getter()
+            setter(p0 + 1e-5)
+            lp = loss_at(m, xs)
+            setter(p0 - 1e-5)
+            lm = loss_at(m, xs)
+            setter(p0)
+            num = (lp - lm) / 2e-5
+            assert abs(ana - num) < 1e-4, (name, ana, num)
+
+        fd("in_proj", lambda: m.in_proj.weights[1][2],
+           lambda: m.grad_in_proj[1][2],
+           lambda v: m.in_proj.weights[1].__setitem__(2, v))
+        fd("out_proj", lambda: m.out_proj.weights[0][1],
+           lambda: m.grad_out_proj[0][1],
+           lambda v: m.out_proj.weights[0].__setitem__(1, v))
+        fd("latents", lambda: m.latents[1][3],
+           lambda: m.grad_latents[1][3],
+           lambda v: m.latents[1].__setitem__(3, v))
+        fd("cross_Wq", lambda: m.cross[0].W_q[2][1],
+           lambda: m.cross[0].grads["W_q"][2][1],
+           lambda v: m.cross[0].W_q[2].__setitem__(1, v))
+        fd("self_Wq", lambda: m.self_layers[0].self_attn.W_q[0][2],
+           lambda: m.self_layers[0].self_attn.grads["W_q"][0][2],
+           lambda v: m.self_layers[0].self_attn.W_q[0].__setitem__(2, v))
+        fd("ln_gamma", lambda: m.ln_cross[1].gamma[3],
+           lambda: m.grad_ln_cross[1][0][3],
+           lambda v: m.ln_cross[1].gamma.__setitem__(3, v))
+
+        # 输入梯度
+        m.zero_grad()
+        m.forward(xs)
+        d_out = [[w[i][j] for j in range(2)] for i in range(3)]
+        d_x = m.backward(d_out)
+        err = 0.0
+        for t in range(5):
+            for j in range(4):
+                old = xs[t][j]
+                xs[t][j] = old + 1e-5
+                lp = loss_at(m, xs)
+                xs[t][j] = old - 1e-5
+                lm = loss_at(m, xs)
+                xs[t][j] = old
+                err = max(err, abs((lp - lm) / 2e-5 - d_x[t][j]))
+        assert err < 1e-4, err
+
+    def test_training_reduces_loss(self):
+        m = _perc_model()
+        xs = _perc_xs()
+        target = [[0.3] * 2 for _ in range(3)]
+        losses = []
+        for _ in range(200):
+            o = m.forward(xs)
+            losses.append(sum((o[i][j] - target[i][j]) ** 2
+                              for i in range(3) for j in range(2)))
+            d_out = [[2.0 * (o[i][j] - target[i][j]) / 6.0 for j in range(2)]
+                     for i in range(3)]
+            m.zero_grad()
+            m.backward(d_out)
+            m.sgd_step(0.05)
+        assert losses[-1] < losses[0] * 0.1, (losses[0], losses[-1])
+
+    def test_invalid_inputs(self):
+        assert _perc_raises(lambda: AI.PerceiverIO(in_dim=0))
+        assert _perc_raises(lambda: AI.PerceiverIO(out_dim=0))
+        assert _perc_raises(lambda: AI.PerceiverIO(d_model=8, num_heads=3))
+        assert _perc_raises(lambda: AI.PerceiverIO(seed=1.5))
+        m = _perc_model()
+        assert _perc_raises(lambda: m.forward([]))
+        assert _perc_raises(lambda: m.forward([[0.1] * 3]))
+        assert _perc_raises(lambda: m.forward([[0.1, 0.2, 0.3, "x"]]))
+        assert _perc_raises(
+            lambda: m.forward([[0.1, 0.2, 0.3, float("inf")]]))
+        assert _perc_raises(lambda: m.backward([[0.1] * 2] * 3), RuntimeError)
+        m.forward(_perc_xs())
+        assert _perc_raises(lambda: m.backward([[0.1] * 2] * 2))
+        assert _perc_raises(lambda: m.backward([[0.1] * 3] * 3))
+        assert _perc_raises(lambda: m.sgd_step(0.0))
+        assert _perc_raises(lambda: m.sgd_step(-0.1))

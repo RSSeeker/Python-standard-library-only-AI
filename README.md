@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2692 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2696 项）
 
 ## 特性
 
@@ -780,6 +780,30 @@ block.sgd_step(0.01)
 
 边界：门控只依赖当前输入（Griffin/Hawk 的简化版，不含循环门）；状态是逐通道标量，
 没有分块并行扫描；序列很长时仍是 O(T) Python 循环；不支持 batch/变长 padding。
+
+### Perceiver IO（潜变量交叉注意力压缩）
+
+Perceiver 的思路是把**输入长度与计算量解耦**：先维护一小撮可学习的潜变量，
+用交叉注意力把任意长的输入「读」进潜变量，之后所有自注意力与 FFN 都只在潜变量
+之间做；需要逐位置输出时，再把潜变量作为 key/value 用另一组 query 读出来。
+本实现取分类/回归常用的简化版：输出直接是 `(num_latents, out_dim)`。
+
+```python
+perc = AI.PerceiverIO(in_dim=8, out_dim=4, d_model=16, num_latents=6,
+                      num_heads=2, d_ff=32, num_layers=2, seed=0)
+out = perc.forward(x_seq)     # (num_latents, out_dim)
+perc.zero_grad()
+dx = perc.backward(d_out)     # 反传到输入 token
+perc.sgd_step(0.01)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `PerceiverIO(in_dim, out_dim, d_model=16, num_latents=6, num_heads=2, d_ff=32, num_layers=2, seed=None)` | `W_in` 投影输入 → 每个 block：潜变量对输入做交叉注意力（残差+LN）→ 潜变量自注意力+FFN（`TransformerEncoderLayer`）→ 输出投影；`forward` / `backward`（手写反向：交叉注意力的 dmemory 按层累加后回传 `W_in`）/ `zero_grad` / `sgd_step` / `param_count` |
+
+边界：每个 block 复用同一份输入表示（不做逐层重采样）；没有位置编码（需要时由调用方
+把位置信息拼进输入特征）；输出是潜变量矩阵而不是逐 token 序列；不支持 batch/变长
+padding；`TransformerEncoderLayer` 的 dropout 固定为 0，方便小样本教学与数值校验。
 
 ### 组合模型（LLaMA / ResNet）
 
@@ -5998,7 +6022,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2692 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2696 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6279,6 +6303,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestFNetBlock` | 傅里叶混合公式与对称性（反向 = 同一变换）、前向形状与参数量 184、W1/W2/两个 LayerNorm/输入梯度中心差分、全局非因果性质、均值池化+线性头 80 步收敛、非法输入 |
 | `TestS4DBlock` | 前向形状与参数量 128、`A_log/B/C/D`/W_o/W1/两个 LayerNorm/输入梯度中心差分、衰减系数范围与 300 步长序列数值稳定、均值池化+线性头 100 步收敛、非法输入 |
 | `TestRGLRUBlock` | 前向形状与参数量 152、因果性（改末 token 不影响前缀）、`W_i/W_a/W_o/W1/W2` 与输入梯度中心差分、150 步池化+线性头训练收敛、非法输入（含未 forward 先 backward） |
+| `TestPerceiverIO` | 前向形状与参数量 1890、`W_in/W_out`/潜变量/交叉与自注意力权重/交叉 LN 的 gamma、输入梯度中心差分、200 步训练收敛、非法输入（含未 forward 先 backward） |
 | `TestRWKV5` | decay=1 闭式展开、逐 channel 衰减矩阵参考、非法输入 |
 | `TestRWKV6` | 常数 w 与 RWKV-5 等价、非法输入 |
 | `TestRWKV7` | delta=0 退化为 RWKV-6、首步公式、非法输入 |
@@ -6482,6 +6507,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2692 个单元测试
+├── test_ai.py       # 2696 个单元测试
 └── README.md
 ```

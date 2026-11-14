@@ -16495,6 +16495,213 @@ class RGLRUBlock:
         _norm_apply_sgd(self.ln2, self.grad_ln2, lr)
         return self
 
+
+"""Perceiver IO 简化实现：潜变量数组通过交叉注意力压缩输入，再经潜变量自注意力与 FFN。"""
+
+
+def _perc_check_pos_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"PerceiverIO: {name} 必须是正整数，收到 {value!r}")
+
+
+def _perc_check_seq(x_seq, in_dim):
+    if not isinstance(x_seq, (list, tuple)) or len(x_seq) == 0:
+        raise ValueError("PerceiverIO: x_seq 必须是非空二维列表")
+    out = []
+    for row in x_seq:
+        if not isinstance(row, (list, tuple)) or len(row) != in_dim:
+            raise ValueError(f"PerceiverIO: 每个 token 必须是长度 {in_dim} 的列表")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise ValueError("PerceiverIO: 输入必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+class PerceiverIO:
+    """潜变量数组 + 交叉注意力压缩 + 潜变量自注意力。
+
+    ``mem = W_in·x``；每个 block 做一次交叉注意力（潜变量作 query，输入 token
+    作 key/value），再做一次潜变量自注意力 + FFN；最后线性头输出
+    ``(num_latents, out_dim)``。
+    """
+
+    def __init__(self, in_dim=8, out_dim=4, d_model=16, num_latents=6,
+                 num_heads=2, d_ff=32, num_layers=2, seed=None):
+        for name, value in (("in_dim", in_dim), ("out_dim", out_dim),
+                            ("d_model", d_model), ("num_latents", num_latents),
+                            ("num_heads", num_heads), ("d_ff", d_ff),
+                            ("num_layers", num_layers)):
+            _perc_check_pos_int(value, name)
+        if d_model % num_heads != 0:
+            raise ValueError("PerceiverIO: d_model 必须能被 num_heads 整除")
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.d_model = d_model
+        self.num_latents = num_latents
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_layers = num_layers
+
+        if seed is not None:
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                raise ValueError("PerceiverIO: seed 必须是整数或 None")
+            state = random.getstate()
+            random.seed(seed)
+            try:
+                self._init_params()
+            finally:
+                random.setstate(state)
+        else:
+            self._init_params()
+
+        self.zero_grad()
+        self._cache = None
+
+    def _init_params(self):
+        d, nl = self.d_model, self.num_latents
+        self.in_proj = Layer(self.in_dim, d, "linear")
+        self.out_proj = Layer(d, self.out_dim, "linear")
+        std = math.sqrt(2.0 / d)
+        self.latents = [[random.gauss(0.0, std) for _ in range(d)]
+                        for _ in range(nl)]
+        self.cross = []
+        self.self_layers = []
+        self.ln_cross = []
+        for _ in range(self.num_layers):
+            self.cross.append(CrossAttention(d, self.num_heads, dropout=0.0))
+            self.self_layers.append(TransformerEncoderLayer(
+                d, self.num_heads, self.d_ff, dropout=0.0))
+            self.ln_cross.append(LayerNorm(d))
+
+    def zero_grad(self):
+        d, nl = self.d_model, self.num_latents
+        self.grad_in_proj = [[0.0] * self.in_dim for _ in range(d)]
+        self.grad_in_bias = [0.0] * d
+        self.grad_out_proj = [[0.0] * d for _ in range(self.out_dim)]
+        self.grad_out_bias = [0.0] * self.out_dim
+        self.grad_latents = [[0.0] * d for _ in range(nl)]
+        self.grad_ln_cross = [([0.0] * d, [0.0] * d)
+                              for _ in range(self.num_layers)]
+        for c in self.cross:
+            c.zero_grad()
+        for enc in self.self_layers:
+            enc.zero_grad()
+
+    def train(self):
+        for c in self.cross:
+            c.train()
+        for enc in self.self_layers:
+            enc.train()
+        return self
+
+    def eval(self):
+        for c in self.cross:
+            c.eval()
+        for enc in self.self_layers:
+            enc.eval()
+        return self
+
+    def _check_seq(self, x_seq):
+        return _perc_check_seq(x_seq, self.in_dim)
+
+    def forward(self, x_seq):
+        xs = self._check_seq(x_seq)
+        mem, cache_in = _dense_rows_forward(self.in_proj, xs)
+        lat = [row[:] for row in self.latents]
+        caches = []
+        for cross, enc, ln in zip(self.cross, self.self_layers,
+                                  self.ln_cross):
+            z, ln_cache = _norm_rows_forward(ln, lat)
+            c = cross.forward(z, mem)
+            lat = [[lat[i][j] + c[i][j] for j in range(self.d_model)]
+                   for i in range(self.num_latents)]
+            lat = enc.forward(lat)
+            caches.append({"ln_cache": ln_cache, "c": c})
+        out, cache_out = _dense_rows_forward(self.out_proj, lat)
+        self._cache = {"cache_in": cache_in, "cache_out": cache_out,
+                       "caches": caches, "lat": lat}
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("PerceiverIO: 必须先 forward 再 backward")
+        if not isinstance(dout, (list, tuple)) \
+                or len(dout) != self.num_latents:
+            raise ValueError("PerceiverIO: dout 行数必须等于 num_latents")
+        for row in dout:
+            if not isinstance(row, (list, tuple)) \
+                    or len(row) != self.out_dim:
+                raise ValueError("PerceiverIO: dout 列数必须等于 out_dim")
+        gw, gb, d_lat = _dense_rows_backward(self.out_proj,
+                                             self._cache["cache_out"], dout)
+        for i in range(self.out_dim):
+            self.grad_out_bias[i] += gb[i]
+            for j in range(self.d_model):
+                self.grad_out_proj[i][j] += gw[i][j]
+
+        d_mem = [[0.0] * self.d_model
+                 for _ in range(len(self._cache["cache_in"]))]
+        for idx in range(self.num_layers - 1, -1, -1):
+            enc = self.self_layers[idx]
+            d_lat = enc.backward(d_lat)
+            d_c = d_lat
+            dz, dmem = self.cross[idx].backward(d_c)
+            for t in range(len(d_mem)):
+                for j in range(self.d_model):
+                    d_mem[t][j] += dmem[t][j]
+            gg, gbeta, dx = _norm_rows_backward(
+                self.ln_cross[idx], self._cache["caches"][idx]["ln_cache"], dz)
+            for j in range(self.d_model):
+                self.grad_ln_cross[idx][0][j] += gg[j]
+                self.grad_ln_cross[idx][1][j] += gbeta[j]
+            d_lat = [[d_lat[i][j] + dx[i][j] for j in range(self.d_model)]
+                     for i in range(self.num_latents)]
+        for i in range(self.num_latents):
+            for j in range(self.d_model):
+                self.grad_latents[i][j] += d_lat[i][j]
+        gw, gb, dx = _dense_rows_backward(self.in_proj,
+                                          self._cache["cache_in"], d_mem)
+        for i in range(self.d_model):
+            self.grad_in_bias[i] += gb[i]
+            for j in range(self.in_dim):
+                self.grad_in_proj[i][j] += gw[i][j]
+        return dx
+
+    def sgd_step(self, lr=0.01):
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or lr <= 0.0:
+            raise ValueError("PerceiverIO: lr 必须是正数")
+        for i in range(self.d_model):
+            self.in_proj.biases[i] -= lr * self.grad_in_bias[i]
+            for j in range(self.in_dim):
+                self.in_proj.weights[i][j] -= lr * self.grad_in_proj[i][j]
+        for i in range(self.out_dim):
+            self.out_proj.biases[i] -= lr * self.grad_out_bias[i]
+            for j in range(self.d_model):
+                self.out_proj.weights[i][j] -= lr * self.grad_out_proj[i][j]
+        for i in range(self.num_latents):
+            for j in range(self.d_model):
+                self.latents[i][j] -= lr * self.grad_latents[i][j]
+        for idx in range(self.num_layers):
+            gg, gb = self.grad_ln_cross[idx]
+            _norm_apply_sgd(self.ln_cross[idx], (gg, gb), lr)
+            self.cross[idx].sgd_step(lr)
+            self.self_layers[idx].sgd_step(lr)
+
+    def param_count(self):
+        d, nl = self.d_model, self.num_latents
+        total = (d * self.in_dim + d) + (nl * d) + (self.out_dim * d + self.out_dim)
+        for _ in range(self.num_layers):
+            total += 2 * d                                   # cross LN
+            total += 4 * (d * d + d)                         # CrossAttention
+            total += 4 * (d * d + d)                         # 自注意力
+            total += (d * self.d_ff + self.d_ff) + (self.d_ff * d + d)  # FFN
+            total += 4 * d                                   # 两个 LN
+        return total
+
 class MLP:
     """多层感知机（PyTorch 风格）"""
 
