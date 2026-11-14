@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2989 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2994 项）
 
 ## 特性
 
@@ -4892,6 +4892,20 @@ Layer Scale 初值 1e-6 使初始近似恒等；与论文的 FCMAE 预训练实�
 流水线、act-order、packing 或与论文逐位一致。测试用固定随机种子，断言
 GPTQ 的**平均**加权误差低于 round-to-nearest（单例可能更差）。
 
+### 经典 CNN 组件（DenseNet transition / ASPP / ROI Align / U-Net++）
+
+- `densenet_transition(x, out_channels, seed=None)`：1×1 卷积降维 +
+  2×2 平均池化，空间尺寸减半。
+- `aspp(x, out_channels=None, rates=(1, 2, 3), seed=None)`：DeepLab 的
+  空洞空间金字塔池化，多膨胀率 3×3 卷积分支拼接后 1×1 融合。
+- `roi_align(feature, box, output_size=2, sampling_ratio=2, aligned=True)`：
+  双线性采样 + 平均池化的 ROI Align，box 为绝对坐标 `(x1,y1,x2,y2)`。
+- `unet_plus_plus_forward(images, channels=8, seed=None)`：两级
+  U-Net++ 前向（嵌套 skip 连接），输入 H/W 需为 >=4 的偶数。
+
+边界：都是**前向教学实现**，不做反向与训练；卷积核随机初始化、可用
+`seed` 复现；ROI Align 只支持单个 box、特征图坐标原点在左上角。
+
 ### Transformer-XL（段级循环，简化版）
 
 - `TransformerXL(vocab_size, d_model=32, num_heads=4, d_ff=64,
@@ -5133,7 +5147,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2989 项）。
+`tests/`（合计 2994 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5141,7 +5155,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 55 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2989 项
+pytest -q                        # test_ai.py + tests/ 合计 2994 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6900,7 +6914,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2989 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2994 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7394,6 +7408,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
 | `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
+| `TestClassicCNNComponents` | DenseNet transition/ASPP/ROI Align/U-Net++ |
 | `TestTransformerXL` | Transformer-XL 段级循环/记忆/梯度 |
 | `TestFCMAEReconstructor` | FCMAE 掩码重建/梯度/训练 |
 | `TestConvNeXtV2Block` | ConvNeXt V2 block 前向/梯度/训练 |

@@ -47747,3 +47747,71 @@ class TestTransformerXL:
         assert _xl_raises(lambda: model.sgd_step(-1))
         assert _xl_raises(lambda: model.fit([], epochs=2))
         assert _xl_raises(lambda: model.fit([([1], [1])], epochs=0))
+
+
+# ---- 经典 CNN 组件（DenseNet transition / ASPP / ROI Align / U-Net++） ----
+
+
+def _ccnn_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _ccnn_img(c=2, h=8, w=8, seed=0):
+    rng = random.Random(seed)
+    return [[[rng.uniform(-1.0, 1.0) for _ in range(w)] for _ in range(h)]
+            for _ in range(c)]
+
+
+class TestClassicCNNComponents:
+    def test_densenet_transition(self):
+        img = _ccnn_img()
+        out = AI.densenet_transition(img, 4, seed=1)
+        assert len(out) == 4 and len(out[0]) == 4 and len(out[0][0]) == 4
+        assert out == AI.densenet_transition(img, 4, seed=1)
+        assert _ccnn_raises(lambda: AI.densenet_transition(img, 0))
+        assert _ccnn_raises(lambda: AI.densenet_transition([[1.0], [2.0]], 2))
+
+    def test_aspp(self):
+        img = _ccnn_img()
+        a = AI.aspp(img, out_channels=3, rates=(1, 2, 3), seed=2)
+        assert len(a) == 3 and len(a[0]) == 8 and len(a[0][0]) == 8
+        assert a == AI.aspp(img, out_channels=3, rates=(1, 2, 3), seed=2)
+        assert a != AI.aspp(img, out_channels=3, rates=(1, 2), seed=2)
+        assert _ccnn_raises(lambda: AI.aspp(img, rates=()))
+        assert _ccnn_raises(lambda: AI.aspp(img, rates=(0,)))
+
+    def test_roi_align(self):
+        const = [[[0.5] * 8 for _ in range(8)] for _ in range(2)]
+        r = AI.roi_align(const, (0.0, 0.0, 8.0, 8.0), output_size=2,
+                         sampling_ratio=2, aligned=False)
+        assert all(abs(v - 0.5) < 1e-12 for ch in r for row in ch for v in row)
+        lin = [[[float(x) for x in range(8)] for _ in range(8)]]
+        r2 = AI.roi_align(lin, (0.0, 0.0, 8.0, 8.0), output_size=2,
+                          sampling_ratio=2, aligned=False)
+        assert abs(r2[0][0][0] - 2.0) < 1e-9
+        assert abs(r2[0][0][1] - 6.0) < 1e-9
+        r3 = AI.roi_align(lin, (0.0, 0.0, 8.0, 8.0), output_size=1,
+                          sampling_ratio=1, aligned=False)
+        assert abs(r3[0][0][0] - 4.0) < 1e-9
+        assert _ccnn_raises(lambda: AI.roi_align(lin, (1.0, 1.0, 1.0, 2.0)))
+        assert _ccnn_raises(lambda: AI.roi_align(lin, (0.0, 0.0, 8.0, 8.0),
+                                                 output_size=0))
+
+    def test_unet_plus_plus(self):
+        img = _ccnn_img()
+        u = AI.unet_plus_plus_forward(img, channels=4, seed=3)
+        assert len(u) == 2 and len(u[0]) == 8 and len(u[0][0]) == 8
+        assert u == AI.unet_plus_plus_forward(img, channels=4, seed=3)
+        assert _ccnn_raises(
+            lambda: AI.unet_plus_plus_forward(_ccnn_img(h=5)))
+        assert _ccnn_raises(
+            lambda: AI.unet_plus_plus_forward(img, channels=0))
+
+    def test_invalid_image(self):
+        assert _ccnn_raises(lambda: AI.densenet_transition([], 2))
+        assert _ccnn_raises(lambda: AI.aspp([[[1.0, float("nan")]]]))
+        assert _ccnn_raises(lambda: AI.roi_align([], (0.0, 0.0, 1.0, 1.0)))

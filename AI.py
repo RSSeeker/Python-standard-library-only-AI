@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1834 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1845 个 def / 435 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -25200,6 +25200,217 @@ def _xl_check_memory(memory, d_model, who="TransformerXL"):
                     or not math.isfinite(float(v)):
                 raise ValueError(f"{who}: memory 必须是有限数字")
 
+
+
+# ---- 经典 CNN 组件（DenseNet transition / ASPP / ROI Align / U-Net++） ----
+
+
+def _cnn_check_image(x, who, min_side=1):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 输入必须是非空 (C,H,W) 列表")
+    if not isinstance(x[0], (list, tuple)) or not x[0]:
+        raise ValueError(f"{who}: 输入必须是非空 (C,H,W) 列表")
+    h = len(x[0])
+    w = len(x[0][0]) if isinstance(x[0][0], (list, tuple)) else 0
+    if h < min_side or w < min_side:
+        raise ValueError(f"{who}: H/W 不能小于 {min_side}")
+    for ch in x:
+        if not isinstance(ch, (list, tuple)) or len(ch) != h:
+            raise ValueError(f"{who}: 各通道 H 必须一致")
+        for row in ch:
+            if not isinstance(row, (list, tuple)) or len(row) != w:
+                raise ValueError(f"{who}: 各通道 W 必须一致")
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(float(v)):
+                    raise ValueError(f"{who}: 输入必须是有限数字")
+
+
+def _cnn_relu(x):
+    return [[[v if v > 0.0 else 0.0 for v in row] for row in ch] for ch in x]
+
+
+def _cnn_avgpool2(x):
+    c = len(x)
+    h = len(x[0])
+    w = len(x[0][0])
+    oh, ow = h // 2, w // 2
+    out = [[[0.0] * ow for _ in range(oh)] for _ in range(c)]
+    for ch in range(c):
+        for i in range(oh):
+            for j in range(ow):
+                s = 0.0
+                for dr in range(2):
+                    for dc in range(2):
+                        s += x[ch][2 * i + dr][2 * j + dc]
+                out[ch][i][j] = s / 4.0
+    return out
+
+
+def _cnn_upsample2(x):
+    c = len(x)
+    h = len(x[0])
+    w = len(x[0][0])
+    out = [[[0.0] * (2 * w) for _ in range(2 * h)] for _ in range(c)]
+    for ch in range(c):
+        for i in range(h):
+            for j in range(w):
+                v = x[ch][i][j]
+                out[ch][2 * i][2 * j] = v
+                out[ch][2 * i][2 * j + 1] = v
+                out[ch][2 * i + 1][2 * j] = v
+                out[ch][2 * i + 1][2 * j + 1] = v
+    return out
+
+
+def _cnn_concat(channels):
+    if not channels:
+        raise ValueError("_cnn_concat: 至少需要一个特征图")
+    return [ch[:] for feat in channels for ch in feat]
+
+
+def _cnn_conv(x, out_channels, kernel_size, stride=1, padding=0,
+              dilation=1, seed=None):
+    c = len(x)
+    state = random.getstate()
+    if seed is not None:
+        random.seed(seed)
+    try:
+        conv = Conv2d(c, out_channels, kernel_size, stride=stride,
+                      padding=padding, dilation=dilation)
+    finally:
+        if seed is not None:
+            random.setstate(state)
+    return conv.forward(x)
+
+
+def densenet_transition(x, out_channels, seed=None):
+    """DenseNet 的 transition layer：1×1 卷积降维 + 2×2 平均池化。"""
+    _cnn_check_image(x, "densenet_transition")
+    if isinstance(out_channels, bool) or not isinstance(out_channels, int) \
+            or out_channels <= 0:
+        raise ValueError("densenet_transition: out_channels 必须是正整数")
+    if len(x[0]) < 2 or len(x[0][0]) < 2:
+        raise ValueError("densenet_transition: H/W 至少为 2")
+    out = _cnn_conv(x, out_channels, 1, seed=seed)
+    return _cnn_avgpool2(_cnn_relu(out))
+
+
+def aspp(x, out_channels=None, rates=(1, 2, 3), seed=None):
+    """DeepLab 的 ASPP：多个膨胀率 3×3 卷积分支 + 1×1 融合。"""
+    _cnn_check_image(x, "aspp")
+    if not isinstance(rates, (list, tuple)) or not rates:
+        raise ValueError("aspp: rates 必须是非空 list")
+    if out_channels is None:
+        out_channels = len(x)
+    if isinstance(out_channels, bool) or not isinstance(out_channels, int) \
+            or out_channels <= 0:
+        raise ValueError("aspp: out_channels 必须是正整数")
+    for r in rates:
+        if isinstance(r, bool) or not isinstance(r, int) or r <= 0:
+            raise ValueError("aspp: rates 每一项必须是正整数")
+    branches = []
+    for i, r in enumerate(rates):
+        h = _cnn_conv(x, out_channels, 3, padding=r, dilation=r,
+                      seed=None if seed is None else seed + i)
+        branches.append(_cnn_relu(h))
+    merged = _cnn_concat(branches)
+    fused = _cnn_conv(merged, out_channels, 1,
+                      seed=None if seed is None else seed + 100)
+    return _cnn_relu(fused)
+
+
+def _cnn_bilinear(feat, y, x):
+    c = len(feat)
+    h = len(feat[0])
+    w = len(feat[0][0])
+    if y < 0.0 or x < 0.0 or y > h - 1.0 or x > w - 1.0:
+        return [0.0] * c
+    y0 = int(math.floor(y))
+    x0 = int(math.floor(x))
+    y1 = min(y0 + 1, h - 1)
+    x1 = min(x0 + 1, w - 1)
+    ly = y - y0
+    lx = x - x0
+    out = [0.0] * c
+    for ch in range(c):
+        v00 = feat[ch][y0][x0]
+        v01 = feat[ch][y0][x1]
+        v10 = feat[ch][y1][x0]
+        v11 = feat[ch][y1][x1]
+        out[ch] = (v00 * (1 - ly) * (1 - lx) + v01 * (1 - ly) * lx
+                   + v10 * ly * (1 - lx) + v11 * ly * lx)
+    return out
+
+
+def roi_align(feature, box, output_size=2, sampling_ratio=2, aligned=True):
+    """ROI Align：双线性采样 + 平均池化，box 为绝对坐标 (x1,y1,x2,y2)。"""
+    _cnn_check_image(feature, "roi_align")
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        raise ValueError("roi_align: box 必须是 (x1,y1,x2,y2)")
+    vals = []
+    for v in box:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            raise ValueError("roi_align: box 必须是有限数字")
+        vals.append(float(v))
+    x1, y1, x2, y2 = vals
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("roi_align: box 必须满足 x2>x1 且 y2>y1")
+    for name, v in (("output_size", output_size),
+                    ("sampling_ratio", sampling_ratio)):
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError(f"roi_align: {name} 必须是正整数")
+    c = len(feature)
+    offset = 0.5 if aligned else 0.0
+    bin_w = (x2 - x1) / output_size
+    bin_h = (y2 - y1) / output_size
+    out = [[[0.0] * output_size for _ in range(output_size)]
+           for _ in range(c)]
+    for i in range(output_size):
+        for j in range(output_size):
+            start_x = x1 + j * bin_w - offset
+            start_y = y1 + i * bin_h - offset
+            step_x = bin_w / sampling_ratio
+            step_y = bin_h / sampling_ratio
+            acc = [0.0] * c
+            for sy in range(sampling_ratio):
+                for sx in range(sampling_ratio):
+                    py = start_y + (sy + 0.5) * step_y
+                    px = start_x + (sx + 0.5) * step_x
+                    v = _cnn_bilinear(feature, py, px)
+                    for ch in range(c):
+                        acc[ch] += v[ch]
+            n = float(sampling_ratio * sampling_ratio)
+            for ch in range(c):
+                out[ch][i][j] = acc[ch] / n
+    return out
+
+
+def unet_plus_plus_forward(images, channels=8, seed=None):
+    """两级 U-Net++ 前向：嵌套 skip 连接（教学简化版）。"""
+    _cnn_check_image(images, "unet_plus_plus_forward")
+    if isinstance(channels, bool) or not isinstance(channels, int) \
+            or channels <= 0:
+        raise ValueError("unet_plus_plus_forward: channels 必须是正整数")
+    c = len(images)
+    h = len(images[0])
+    w = len(images[0][0])
+    if h < 4 or w < 4 or h % 2 or w % 2:
+        raise ValueError("unet_plus_plus_forward: H/W 必须是 >=4 的偶数")
+    base = seed if seed is None else seed
+    x0 = _cnn_relu(_cnn_conv(images, channels, 3, padding=1, seed=base))
+    pooled = _cnn_avgpool2(x0)
+    x1 = _cnn_relu(_cnn_conv(pooled, channels, 3, padding=1,
+                             seed=None if seed is None else seed + 1))
+    up1 = _cnn_upsample2(x1)
+    d1 = _cnn_relu(_cnn_conv(_cnn_concat([x0, up1]), channels, 3, padding=1,
+                             seed=None if seed is None else seed + 2))
+    up2 = _cnn_upsample2(d1)
+    d2 = _cnn_relu(_cnn_conv(_cnn_concat([x0, up2]), channels, 3, padding=1,
+                             seed=None if seed is None else seed + 3))
+    out = _cnn_conv(d2, c, 1, seed=None if seed is None else seed + 4)
+    return out
 
 class TransformerXL:
     """Transformer-XL 的段级循环（教学简化：无相对位置编码）
