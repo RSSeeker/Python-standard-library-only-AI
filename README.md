@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2862 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2867 项）
 
 ## 特性
 
@@ -1132,6 +1132,28 @@ print(AI.ascii_plot(model.history))
 > `grad_check` 的 `CausalLM` / `Seq2SeqLM` 分支默认抽查 24 个标量参数（整模型逐个差分太慢），
 > 可用 `max_params=` 调整；它已经把「梯度错」和「数值误差」区分开——人为改坏一个
 > 梯度元素时 `worst_rel` 会到 1.0 量级。
+
+#### 训练循环辅助：step warmup / HPO / history 导出
+
+| API | 说明 |
+| --- | --- |
+| `step_warmup_lr(step, base_lr, warmup_steps, total_steps=None, min_lr=0.0, schedule="cosine")` | 按 step 的线性 warmup + cosine/linear/constant 衰减；`step` 从 0 计，`step>=warmup_steps` 后按 `total_steps` 衰减到 `min_lr` |
+| `grid_search(param_grid, objective, maximize=False)` | 网格搜索：`param_grid` 为 `{name: [候选]}`，返回 `{best_params, best_score, trials}` |
+| `random_search(param_grid, objective, num_trials=10, seed=None, maximize=False)` | 随机搜索（同一接口），每参数从候选里独立均匀采样 |
+| `export_history_json(history, path)` / `load_history_json(path)` | 把 `list[dict]` 或 `dict[str, list]` 的 history 写成/读回 JSON（UTF-8、缩进、键排序） |
+
+```python
+for step in range(1, total_steps + 1):
+    lr = AI.step_warmup_lr(step, 3e-4, warmup_steps=100, total_steps=2000)
+    ...
+
+best = AI.grid_search({"lr": [1e-3, 3e-4], "rank": [4, 8]},
+                      lambda lr, rank: train_eval(lr, rank), maximize=True)
+AI.export_history_json(history, "history.json")
+```
+
+边界：`grid_search` 是对 `param_grid` 的笛卡尔积暴力枚举（组合数大时会很慢）；
+`objective` 必须返回有限数字；JSON 只支持标准库 `json` 能序列化的类型。
 
 ### 断点续训
 
@@ -6520,7 +6542,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2862 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2867 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7005,6 +7027,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
+| `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -7039,6 +7062,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2862 个单元测试
+├── test_ai.py       # 2867 个单元测试
 └── README.md
 ```

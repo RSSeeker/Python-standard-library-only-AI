@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1770 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1777 个 def / 424 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -8433,6 +8433,168 @@ class PoolFormerBlock:
 
 
 MetaFormerBlock = PoolFormerBlock
+
+
+def _eng2_check_pos(value, name, allow_zero=False):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"training_tools: {name} 必须是非负整数，收到 {value!r}")
+    if not allow_zero and value == 0:
+        raise ValueError(f"training_tools: {name} 必须 > 0")
+    return value
+
+
+def _eng2_check_lr(value, name="lr"):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"training_tools: {name} 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)) or float(value) < 0.0:
+        raise ValueError(f"training_tools: {name} 必须是非负有限数字")
+    return float(value)
+
+
+def step_warmup_lr(step, base_lr, warmup_steps, total_steps=None,
+                   min_lr=0.0, schedule="cosine"):
+    """按 step 计的 warmup + 衰减学习率（LLM 训练的常用写法）
+
+    第 1..`warmup_steps` 步从 `min_lr` 线性升到 `base_lr`；之后按
+    `schedule` 衰减到 `min_lr`：
+
+    - `"cosine"`：`min_lr + (base_lr-min_lr)*0.5*(1+cos(pi*p))`
+    - `"linear"`：`base_lr - (base_lr-min_lr)*p`
+    - `"constant"`：保持 `base_lr`
+
+    其中 `p = (step-warmup_steps)/(total_steps-warmup_steps)`（clamp 到 [0,1]）。
+    与按 epoch 的 `WarmupLR` 互补：训练循环按 step 调它即可。
+    """
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"step_warmup_lr: step 必须是非负整数，收到 {step!r}")
+    base = _eng2_check_lr(base_lr, "base_lr")
+    lo = _eng2_check_lr(min_lr, "min_lr")
+    if lo > base:
+        raise ValueError("step_warmup_lr: min_lr 不能大于 base_lr")
+    warm = _eng2_check_pos(warmup_steps, "warmup_steps")
+    if schedule not in ("cosine", "linear", "constant"):
+        raise ValueError(
+            f"step_warmup_lr: schedule 必须是 cosine/linear/constant，收到 {schedule!r}")
+    if total_steps is None:
+        total_steps = max(warm, step)
+    total = _eng2_check_pos(total_steps, "total_steps")
+    if total < warm:
+        raise ValueError("step_warmup_lr: total_steps 不能小于 warmup_steps")
+    if step < warm:
+        return lo + (base - lo) * (step / float(warm))
+    if schedule == "constant":
+        return base
+    denom = float(total - warm)
+    if denom <= 0.0:
+        return base
+    p = (step - warm) / denom
+    p = 0.0 if p < 0.0 else (1.0 if p > 1.0 else p)
+    if schedule == "linear":
+        return base - (base - lo) * p
+    return lo + (base - lo) * 0.5 * (1.0 + math.cos(math.pi * p))
+
+
+def grid_search(param_grid, objective, maximize=False):
+    """网格搜索（HPO 薄封装）
+
+    `param_grid` 为 `{name: [候选值, ...]}`，`objective(**params)` 返回数值。
+    返回 `{"best_params", "best_score", "trials"}`；`maximize=False` 取最小。
+    """
+    if not isinstance(param_grid, dict) or not param_grid:
+        raise ValueError("grid_search: param_grid 必须是非空 dict")
+    if not callable(objective):
+        raise TypeError("grid_search: objective 必须可调用")
+    names = list(param_grid.keys())
+    for name in names:
+        vals = param_grid[name]
+        if not isinstance(vals, (list, tuple)) or len(vals) == 0:
+            raise ValueError(f"grid_search: {name} 的候选必须是非空列表")
+    trials = []
+    best_params = None
+    best_score = None
+    def walk(i, cur):
+        nonlocal best_params, best_score
+        if i == len(names):
+            params = dict(cur)
+            score = objective(**params)
+            if not isinstance(score, (int, float)) or isinstance(score, bool) \
+                    or not math.isfinite(float(score)):
+                raise ValueError("grid_search: objective 必须返回有限数字")
+            trials.append({"params": params, "score": float(score)})
+            better = (best_score is None
+                      or (score > best_score if maximize else score < best_score))
+            if better:
+                best_score = float(score)
+                best_params = params
+            return
+        name = names[i]
+        for v in param_grid[name]:
+            cur[name] = v
+            walk(i + 1, cur)
+        cur.pop(name, None)
+    walk(0, {})
+    return {"best_params": best_params, "best_score": best_score, "trials": trials}
+
+
+def random_search(param_grid, objective, num_trials=10, seed=None,
+                  maximize=False):
+    """随机搜索（HPO 薄封装）：从每个参数的候选里独立均匀采样"""
+    if not isinstance(param_grid, dict) or not param_grid:
+        raise ValueError("random_search: param_grid 必须是非空 dict")
+    if not callable(objective):
+        raise TypeError("random_search: objective 必须可调用")
+    n = _eng2_check_pos(num_trials, "num_trials")
+    rng = random.Random(seed)
+    names = list(param_grid.keys())
+    for name in names:
+        vals = param_grid[name]
+        if not isinstance(vals, (list, tuple)) or len(vals) == 0:
+            raise ValueError(f"random_search: {name} 的候选必须是非空列表")
+    trials = []
+    best_params = None
+    best_score = None
+    for _ in range(n):
+        params = {name: rng.choice(list(param_grid[name])) for name in names}
+        score = objective(**params)
+        if not isinstance(score, (int, float)) or isinstance(score, bool) \
+                or not math.isfinite(float(score)):
+            raise ValueError("random_search: objective 必须返回有限数字")
+        trials.append({"params": params, "score": float(score)})
+        better = (best_score is None
+                  or (score > best_score if maximize else score < best_score))
+        if better:
+            best_score = float(score)
+            best_params = params
+    return {"best_params": best_params, "best_score": best_score,
+            "trials": trials}
+
+
+def export_history_json(history, path):
+    """把训练 history（list[dict] 或 dict[str, list]）写成 JSON 文件"""
+    if isinstance(history, dict):
+        rec = dict(history)
+    elif isinstance(history, (list, tuple)):
+        rec = []
+        for row in history:
+            if not isinstance(row, dict):
+                raise ValueError("export_history_json: history 每项必须是 dict")
+            rec.append({str(k): v for k, v in row.items()})
+    else:
+        raise ValueError(
+            "export_history_json: history 必须是 list[dict] 或 dict[str, list]")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("export_history_json: path 必须是非空字符串")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    return path
+
+
+def load_history_json(path):
+    """读回 `export_history_json` 写出的文件"""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("load_history_json: path 必须是非空字符串")
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def gradient_centralize(grads, mode: str = "rows"):

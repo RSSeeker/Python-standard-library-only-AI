@@ -46449,3 +46449,75 @@ class TestDLinear:
         m.forward([[0.0, 0.0]] * 4)
         assert _dl_raises(lambda: m.backward([[1.0] * 2]))  # 长度不对
         assert _dl_raises(lambda: m.sgd_step(-1))
+
+
+# ---- 训练工程化工具 II：step warmup / HPO / history JSON ----
+
+
+def _eng2_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _eng2_quad(x, y):
+    return -(x - 2) ** 2 - (y + 1) ** 2
+
+
+class TestTrainingEngineeringTools:
+    def test_step_warmup_lr(self):
+        assert AI.step_warmup_lr(0, 1.0, 10, 100) == 0.0
+        assert abs(AI.step_warmup_lr(10, 1.0, 10, 100) - 1.0) < 1e-12
+        assert abs(AI.step_warmup_lr(55, 1.0, 10, 100, min_lr=0.1) - 0.55) < 1e-12
+        assert abs(AI.step_warmup_lr(100, 1.0, 10, 100, min_lr=0.1) - 0.1) < 1e-12
+        assert abs(AI.step_warmup_lr(55, 1.0, 10, 100, schedule="linear") - 0.5) < 1e-12
+        assert AI.step_warmup_lr(55, 1.0, 10, 100, schedule="constant") == 1.0
+        # 超过 total_steps 后 clamp 到 min_lr
+        assert abs(AI.step_warmup_lr(500, 1.0, 10, 100, min_lr=0.1) - 0.1) < 1e-12
+
+    def test_grid_search(self):
+        res = AI.grid_search({"x": [0, 1, 2, 3], "y": [-2, -1, 0]},
+                             _eng2_quad, maximize=True)
+        assert res["best_params"] == {"x": 2, "y": -1}
+        assert abs(res["best_score"]) < 1e-12
+        assert len(res["trials"]) == 12
+        # 默认最小化
+        res_min = AI.grid_search({"x": [0, 1, 2]}, lambda x: (x - 1) ** 2)
+        assert res_min["best_params"] == {"x": 1}
+        assert res_min["best_score"] == 0.0
+
+    def test_random_search(self):
+        res = AI.random_search({"x": [0, 1, 2, 3, 4], "y": [-2, -1, 0, 1]},
+                               _eng2_quad, num_trials=60, seed=7, maximize=True)
+        assert res["best_params"] == {"x": 2, "y": -1}
+        assert len(res["trials"]) == 60
+        assert res["best_score"] >= -1.0
+
+    def test_history_json_roundtrip(self):
+        import tempfile
+        import os
+        hist = [{"epoch": 0, "loss": 1.5, "acc": 0.4},
+                {"epoch": 1, "loss": 0.7, "acc": 0.8}]
+        path = os.path.join(tempfile.gettempdir(), "ai_p93_history.json")
+        try:
+            AI.export_history_json(hist, path)
+            assert AI.load_history_json(path) == hist
+            AI.export_history_json({"loss": [1.5, 0.7]}, path)
+            assert AI.load_history_json(path) == {"loss": [1.5, 0.7]}
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_invalid_inputs(self):
+        assert _eng2_raises(lambda: AI.step_warmup_lr(-1, 1.0, 10))
+        assert _eng2_raises(lambda: AI.step_warmup_lr(1, 1.0, 10, min_lr=2.0))
+        assert _eng2_raises(lambda: AI.step_warmup_lr(1, 1.0, 10, schedule="bad"))
+        assert _eng2_raises(lambda: AI.grid_search({}, _eng2_quad))
+        assert _eng2_raises(lambda: AI.grid_search({"x": []}, _eng2_quad))
+        assert _eng2_raises(lambda: AI.random_search({"x": []}, _eng2_quad))
+        assert _eng2_raises(lambda: AI.random_search({"x": [1]}, _eng2_quad, num_trials=0))
+        assert _eng2_raises(lambda: AI.export_history_json("x", "p"))
+        assert _eng2_raises(lambda: AI.export_history_json([], ""))
+        assert _eng2_raises(lambda: AI.load_history_json(""))
