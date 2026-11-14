@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1731 个 def / 418 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1748 个 def / 418 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -84634,6 +84634,290 @@ def entmax(logits, alpha=1.5):
         out.append(d ** (1.0 / (a - 1.0)) if d > 0.0 else 0.0)
     total = sum(out)
     return [v / total for v in out]
+
+
+
+# ---------- 有监督对比 / 度量学习损失：SupCon、ArcFace、CosFace、Circle ----------
+def _metric_check_rows(rows, who):
+    if not isinstance(rows, (list, tuple)) or len(rows) == 0:
+        raise ValueError(f"{who}: 输入必须是非空行列表")
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空列表")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"{who}: 第 {i} 行第 {j} 列必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _metric_check_labels(labels, n, who):
+    if not isinstance(labels, (list, tuple)) or len(labels) != n:
+        raise ValueError(f"{who}: labels 长度必须与样本数 {n} 一致")
+    out = []
+    for i, v in enumerate(labels):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"{who}: labels[{i}] 必须是非负整数")
+        out.append(int(v))
+    return out
+
+
+def _metric_unit_rows(rows):
+    out = []
+    for row in rows:
+        nrm = math.sqrt(sum(v * v for v in row))
+        if nrm <= 0.0:
+            raise ValueError("SupCon: 嵌入行不能全为 0")
+        out.append([v / nrm for v in row])
+    return out
+
+
+def _metric_logsumexp(rows):
+    mx = max(rows)
+    return mx + math.log(sum(math.exp(v - mx) for v in rows))
+
+
+def supcon_loss(embeddings, labels, temperature=0.1):
+    """Supervised Contrastive Loss（Khosla et al., 2020）。
+
+    对每个锚点 ``i``：正样本 ``P(i) = {j != i : y_j = y_i}``，
+    ``L_i = -1/|P(i)| Σ_{p∈P(i)} [ s_ip - logsumexp_{a != i}(s_ia) ]``，
+    ``s_ij = ẑ_i · ẑ_j / T``（行内先做 L2 归一化）。返回
+    ``(loss, grad_embeddings)``；没有任何正样本的锚点不参与平均。
+
+    梯度链：先对单位向量求 ``dL/dẑ``，再穿过 L2 归一化回到原始嵌入。
+    """
+    z = _metric_check_rows(embeddings, "supcon_loss")
+    n = len(z)
+    y = _metric_check_labels(labels, n, "supcon_loss")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError("supcon_loss: temperature 必须是数字")
+    t = float(temperature)
+    if not (t > 0.0 and math.isfinite(t)):
+        raise ValueError(f"supcon_loss: temperature 必须是有限正数，收到 {temperature!r}")
+    dim = len(z[0])
+    for i, row in enumerate(z):
+        if len(row) != dim:
+            raise ValueError("supcon_loss: 所有嵌入行必须等长")
+    zn = _metric_unit_rows(z)
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sim[i][j] = sum(zn[i][d] * zn[j][d] for d in range(dim)) / t
+    valid = []
+    for i in range(n):
+        if any(j != i and y[j] == y[i] for j in range(n)):
+            valid.append(i)
+    anchors = len(valid)
+    total = 0.0
+    dsim = [[0.0] * n for _ in range(n)]
+    for i in valid:
+        pos = [j for j in range(n) if j != i and y[j] == y[i]]
+        others = [j for j in range(n) if j != i]
+        lse = _metric_logsumexp([sim[i][j] for j in others])
+        total += -sum(sim[i][p] for p in pos) / len(pos) + lse
+        probs = {}
+        for j in others:
+            probs[j] = math.exp(sim[i][j] - lse)
+        scale = 1.0 / (len(pos) * anchors)
+        for j in others:
+            dsim[i][j] = (probs[j] - (1.0 if j in pos else 0.0)) * scale
+    # 归一化分母固定为有效锚点数
+    g_unit = [[0.0] * dim for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            w = dsim[i][j]
+            if w == 0.0:
+                continue
+            for d in range(dim):
+                g_unit[i][d] += w * zn[j][d] / t
+                g_unit[j][d] += w * zn[i][d] / t
+    grad = []
+    for i in range(n):
+        nrm = math.sqrt(sum(v * v for v in z[i]))
+        dot = sum(zn[i][d] * g_unit[i][d] for d in range(dim))
+        grad.append([(g_unit[i][d] - zn[i][d] * dot) / nrm for d in range(dim)])
+    if anchors == 0:
+        return 0.0, [[0.0] * dim for _ in range(n)]
+    return total / anchors, grad
+
+
+def _face_check_cos(cos_theta, who):
+    rows = _metric_check_rows(cos_theta, who)
+    for i, row in enumerate(rows):
+        for j, v in enumerate(row):
+            if v < -1.0 or v > 1.0:
+                raise ValueError(f"{who}: cos_theta[{i}][{j}] 必须在 [-1, 1] 内，收到 {v!r}")
+    return rows
+
+
+def arcface_loss(cos_theta, labels, margin=0.5, scale=64.0):
+    """ArcFace：目标类角度加 margin 后做 softmax。
+
+    ``logits[target] = s·cos(θ + m)``（用 ``cosθ cos m − sinθ sin m`` 展开），
+    其余类 ``s·cosθ``；返回 ``(loss, d_cos)``，``d_cos`` 是逐元素的
+    ``dL/dcosθ``（不含嵌入侧链式法则）。
+    """
+    cos = _face_check_cos(cos_theta, "arcface_loss")
+    n = len(cos)
+    y = _metric_check_labels(labels, n, "arcface_loss")
+    for k, name in (("margin", margin), ("scale", scale)):
+        if isinstance(name, bool) or not isinstance(name, (int, float)):
+            raise TypeError(f"arcface_loss: {k} 必须是数字")
+    m = float(margin)
+    sf = float(scale)
+    if not (0.0 <= m < math.pi / 2.0):
+        raise ValueError(f"arcface_loss: margin 必须在 [0, pi/2) 内，收到 {margin!r}")
+    if not (sf > 0.0 and math.isfinite(sf)):
+        raise ValueError(f"arcface_loss: scale 必须是有限正数，收到 {scale!r}")
+    width = len(cos[0])
+    for i in range(len(cos)):
+        if len(cos[i]) != width:
+            raise ValueError("arcface_loss: 所有行必须等长")
+    for i in range(n):
+        if y[i] >= width:
+            raise ValueError(f"arcface_loss: labels[{i}]={y[i]} 超出类别数 {width}")
+    cos_m = math.cos(m)
+    sin_m = math.sin(m)
+    logits = []
+    dcos_factor = []
+    for i in range(n):
+        row = list(cos[i])
+        c = row[y[i]]
+        sin_t = math.sqrt(max(0.0, 1.0 - c * c))
+        target = c * cos_m - sin_t * sin_m
+        target = max(-1.0, min(1.0, target))
+        out = [sf * v for v in row]
+        out[y[i]] = sf * target
+        dcos = [sf] * len(row)
+        # d cos(θ+m) / d cosθ = cos m + cosθ·sin m / sinθ（端点上 sinθ→0，按 cos m 处理）
+        dcos[y[i]] = sf * (cos_m + (c * sin_m / sin_t if sin_t > 1e-12 else cos_m))
+        logits.append(out)
+        dcos_factor.append(dcos)
+    loss = 0.0
+    dcos_out = [[0.0] * len(cos[0]) for _ in range(n)]
+    for i in range(n):
+        lse = _metric_logsumexp(logits[i])
+        loss += -(logits[i][y[i]] - lse)
+        for j in range(len(cos[0])):
+            p = math.exp(logits[i][j] - lse)
+            dlogit = p - (1.0 if j == y[i] else 0.0)
+            dcos_out[i][j] = dlogit * dcos_factor[i][j]
+    return loss / n, [[v / n for v in row] for row in dcos_out]
+
+
+def cosface_loss(cos_theta, labels, margin=0.35, scale=64.0):
+    """CosFace：``logits[target] = s·(cosθ − m)``，其余类 ``s·cosθ``，CE 后返回 ``(loss, d_cos)``。"""
+    cos = _face_check_cos(cos_theta, "cosface_loss")
+    n = len(cos)
+    y = _metric_check_labels(labels, n, "cosface_loss")
+    for name, val in (("margin", margin), ("scale", scale)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise TypeError(f"cosface_loss: {name} 必须是数字")
+    m = float(margin)
+    sf = float(scale)
+    if not (0.0 <= m < 1.0):
+        raise ValueError(f"cosface_loss: margin 必须在 [0, 1) 内，收到 {margin!r}")
+    if not (sf > 0.0 and math.isfinite(sf)):
+        raise ValueError(f"cosface_loss: scale 必须是有限正数，收到 {scale!r}")
+    loss = 0.0
+    dcos_out = []
+    width = len(cos[0])
+    for i in range(n):
+        if len(cos[i]) != width:
+            raise ValueError("cosface_loss: 所有行必须等长")
+    for i in range(n):
+        if y[i] >= width:
+            raise ValueError(f"cosface_loss: labels[{i}]={y[i]} 超出类别数 {width}")
+    for i in range(n):
+        logits = [sf * v for v in cos[i]]
+        logits[y[i]] = sf * (cos[i][y[i]] - m)
+        lse = _metric_logsumexp(logits)
+        loss += -(logits[y[i]] - lse)
+        row = []
+        for j in range(width):
+            p = math.exp(logits[j] - lse)
+            dlogit = p - (1.0 if j == y[i] else 0.0)
+            row.append(dlogit * sf)
+        dcos_out.append([v / n for v in row])
+    return loss / n, dcos_out
+
+
+def circle_loss(s_pos, s_neg, margin=0.25, gamma=64.0):
+    """Circle Loss（Sun et al., 2020）在给定正/负相似度对上的形式。
+
+    ``α_p = 1 + m − s_p``、``α_n = m + s_n``、``Δ_p = 1 − m``、``Δ_n = m``；
+    ``L = log(1 + Σ_p exp(−γ α_p (s_p − Δ_p)) · Σ_n exp(γ α_n (s_n − Δ_n)))``。
+    返回 ``(loss, d_s_pos, d_s_neg)``。
+    """
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)):
+        raise TypeError("circle_loss: margin 必须是数字")
+    m = float(margin)
+    if not (0.0 <= m < 1.0):
+        raise ValueError(f"circle_loss: margin 必须在 [0, 1) 内，收到 {margin!r}")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("circle_loss: gamma 必须是数字")
+    g = float(gamma)
+    if not (g > 0.0 and math.isfinite(g)):
+        raise ValueError(f"circle_loss: gamma 必须是有限正数，收到 {gamma!r}")
+    def _check_sim(vals, who):
+        if not isinstance(vals, (list, tuple)):
+            raise ValueError(f"{who}: 必须是相似度列表")
+        out = []
+        for i, v in enumerate(vals):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"{who}[{i}] 必须是有限数字")
+            fv = float(v)
+            if fv < -1.0 or fv > 1.0:
+                raise ValueError(f"{who}[{i}] 必须在 [-1, 1] 内，收到 {v!r}")
+            out.append(fv)
+        return out
+    sp = _check_sim(s_pos, "circle_loss.s_pos")
+    sn = _check_sim(s_neg, "circle_loss.s_neg")
+    term_p = []
+    for v in sp:
+        a = 1.0 + m - v
+        d = 1.0 - m
+        term_p.append(-g * a * (v - d))
+    term_n = []
+    for v in sn:
+        a = m + v
+        d = m
+        term_n.append(g * a * (v - d))
+    lse_p = _metric_logsumexp(term_p) if term_p else -math.inf
+    lse_n = _metric_logsumexp(term_n) if term_n else -math.inf
+    if not term_p and not term_n:
+        raise ValueError("circle_loss: s_pos 与 s_neg 不能同时为空")
+    if term_p:
+        log_z = lse_p + (lse_n if term_n else 0.0)
+    else:
+        log_z = lse_n
+    loss = _metric_logsumexp([0.0, log_z])
+    # 权重
+    wp = [math.exp(t - lse_p) for t in term_p] if term_p else []
+    wn = [math.exp(t - lse_n) for t in term_n] if term_n else []
+    dsp = [0.0] * len(sp)
+    dsn = [0.0] * len(sn)
+    wprod = 0.0
+    if term_p and term_n:
+        wprod = 1.0 / (1.0 + math.exp(-log_z))
+    elif term_p or term_n:
+        wprod = 1.0 / (1.0 + math.exp(-log_z))
+    # dL/dterm_p[k] = wprod * wp[k]; term_p = -γ(1+m-s_p)(s_p-(1-m))
+    # 令 a=1+m-s, d=1-m → term=-γ a (s-d)；dterm/ds = -γ( -1*(s-d) + a ) = -γ(a - (s-d))
+    for k, v in enumerate(sp):
+        a = 1.0 + m - v
+        dterm = -g * (a - (v - (1.0 - m)))
+        dsp[k] = wprod * wp[k] * dterm
+    # term_n = γ(m+s)(s-m) → dterm/ds = γ((s-m)+(m+s)) = γ(2s)
+    for k, v in enumerate(sn):
+        dterm = g * (2.0 * v)
+        dsn[k] = wprod * wn[k] * dterm
+    return loss, dsp, dsn
 
 
 

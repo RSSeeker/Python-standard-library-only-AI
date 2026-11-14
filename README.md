@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2823 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2828 项）
 
 ## 特性
 
@@ -1195,6 +1195,41 @@ print(entmax([1.0, 0.5, -1.0], alpha=1.5))   # α=2 时退化为 sparsemax
 边界：`gumbel_softmax` 的 `seed` 只控制本次噪声、不污染全局随机；`entmax` 只提供前向
 （α-entmax 的雅可比是稀疏分段形式，这里没有实现反向）；Sparsemax/Entmax 只支持一维
 logits，没有批量版。
+
+
+### 度量学习损失（SupCon / ArcFace / CosFace / Circle）
+
+分类损失默认「每类一个独立权重」，但检索/人脸/度量学习更需要直接约束样本之间的相似度，
+或者给目标类一个角度 margin。这里实现四类常用目标：
+
+- **SupCon**：同一标签的样本互为正例，其余为负例；用归一化 embedding 的对比损失把同类拉近；
+- **ArcFace / CosFace**：在目标类 logit 上加角度或余弦 margin，再乘 scale 做 CE，让类间更有间隔；
+- **Circle**：对正/负相似度分别加 margin，并用 `gamma` 缩放，属于 pair-based 的间隔损失。
+
+```python
+from AI import (supcon_loss, arcface_loss, cosface_loss, circle_loss)
+
+emb = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
+loss, grad = supcon_loss(emb, [0, 0, 1, 1], temperature=0.1)
+print(loss, grad[0])                     # 标量 loss + 与 embedding 同形状的梯度
+
+cos_theta = [[0.8, 0.3, 0.1], [0.2, 0.9, 0.2]]
+l_arc, g_arc = arcface_loss(cos_theta, [0, 1], margin=0.5, scale=64.0)
+l_cos, g_cos = cosface_loss(cos_theta, [0, 1], margin=0.35, scale=64.0)
+
+l_cir, g_pos, g_neg = circle_loss([0.9, 0.7], [0.1, 0.2], margin=0.25, gamma=64.0)
+```
+
+| API | 说明 |
+|------|------|
+| `supcon_loss(embeddings, labels, temperature=0.1)` | 返回 `(loss, grad)`；同类样本少于 2 个时 loss=0、梯度全 0 |
+| `arcface_loss(cos_theta, labels, margin=0.5, scale=64.0)` | 目标类 logit 用 `cos(θ+margin)`，其余为 `scale·cosθ`；返回 `(loss, d cos_theta)` |
+| `cosface_loss(cos_theta, labels, margin=0.35, scale=64.0)` | 目标类减 margin（余弦间隔），其余不变 |
+| `circle_loss(s_pos, s_neg, margin=0.25, gamma=64.0)` | 正/负相似度分别加 margin；返回 `(loss, d s_pos, d s_neg)` |
+
+边界：`supcon_loss` 对 embedding 做行内 L2 归一化（不修改输入），温度必须为正；
+ArcFace/CosFace 的 `cos_theta` 必须已裁剪到 `[-1, 1]`，且 `labels` 小于类别数；
+`circle_loss` 允许一侧为空（如只有正样本），但两侧都空会报错。
 
 
 ### 优化器
@@ -6369,7 +6404,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2823 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2828 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6846,6 +6881,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestLookaheadDecoding` | 贪心等价（多种 lookahead/jacobi_steps 组合）、ids 拼接与 stats、forward 调用上界、n-gram 池最长后缀草稿、EOS 提前停止且为贪心前缀、合法性校验、max_len 截断 |
 | `TestGriffinBlock` | 局部注意力 + RG-LRU 前向与参数计数、四个参数的中心差分、因果性、30 步训练 loss 下降到 50% 以下、非法输入 |
 | `TestGumbelSparsemax` | Gumbel-Softmax 采样（同 seed 复现/硬采样/温度）、反向中心差分、Sparsemax 已知值/平移不变/稀疏性、Entmax α=2 与 sparsemax 一致、非法输入 |
+| `TestMetricLosses` | SupCon/ArcFace/CosFace/Circle 损失的前向取值、梯度中心差分、margin/温度行为、空正/负样本与 13 类非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6880,6 +6916,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2823 个单元测试
+├── test_ai.py       # 2828 个单元测试
 └── README.md
 ```

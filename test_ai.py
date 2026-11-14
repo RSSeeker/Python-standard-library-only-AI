@@ -45547,3 +45547,122 @@ class TestGumbelSparsemax:
         assert _gsm_raises(lambda: AI.entmax([1.0, 2.0], alpha=0.5))
         assert _gsm_raises(lambda: AI.entmax([1.0, 2.0], alpha="x"))
         assert _gsm_raises(lambda: AI.gumbel_softmax_backward([1.0], [0.5, 0.5]))
+
+
+def _ml_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestMetricLosses:
+    """SupCon / ArcFace / CosFace / Circle 损失。"""
+
+    def test_supcon(self):
+        emb = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
+        labels = [0, 0, 1, 1]
+        loss, grad = AI.supcon_loss(emb, labels, temperature=0.1)
+        assert loss > 0.0
+        assert len(grad) == 4 and len(grad[0]) == 2
+        # 有正样本时 loss 随温度变化（低温更尖锐）
+        hot, _ = AI.supcon_loss(emb, labels, temperature=1.0)
+        assert hot != loss and hot > 0.0
+        # 中心差分
+        h = 1e-6
+        for i in range(4):
+            for d in range(2):
+                ep = [row[:] for row in emb]
+                em = [row[:] for row in emb]
+                ep[i][d] += h
+                em[i][d] -= h
+                fd = (AI.supcon_loss(ep, labels, 0.1)[0]
+                      - AI.supcon_loss(em, labels, 0.1)[0]) / (2 * h)
+                assert abs(grad[i][d] - fd) < 1e-6
+        # 没有同标签样本：loss=0、梯度全 0
+        loss0, grad0 = AI.supcon_loss([[1.0, 0.0], [0.0, 1.0]], [0, 1])
+        assert loss0 == 0.0
+        assert all(v == 0.0 for row in grad0 for v in row)
+
+    def test_arcface(self):
+        cos = [[0.8, 0.3, 0.1], [0.2, 0.9, 0.2]]
+        labels = [0, 1]
+        loss, grad = AI.arcface_loss(cos, labels, margin=0.5, scale=64.0)
+        assert loss > 0.0
+        # margin 越大目标类 logit 越小、loss 越大
+        loss_big, _ = AI.arcface_loss(cos, labels, margin=0.6, scale=64.0)
+        assert loss_big > loss
+        h = 1e-6
+        for i in range(2):
+            for d in range(3):
+                cp = [row[:] for row in cos]
+                cm = [row[:] for row in cos]
+                cp[i][d] = max(-1.0, min(1.0, cp[i][d] + h))
+                cm[i][d] = max(-1.0, min(1.0, cm[i][d] - h))
+                fd = (AI.arcface_loss(cp, labels, 0.5, 64.0)[0]
+                      - AI.arcface_loss(cm, labels, 0.5, 64.0)[0]) / (2 * h)
+                assert abs(grad[i][d] - fd) < 1e-6
+
+    def test_cosface(self):
+        cos = [[0.8, 0.3, 0.1], [0.2, 0.9, 0.2]]
+        labels = [0, 1]
+        loss, grad = AI.cosface_loss(cos, labels, margin=0.35, scale=64.0)
+        assert loss > 0.0
+        loss_zero, _ = AI.cosface_loss(cos, labels, margin=0.0, scale=64.0)
+        plain = 0.0
+        for i in range(2):
+            logits = [64.0 * v for v in cos[i]]
+            mx = max(logits)
+            lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
+            plain += -(logits[labels[i]] - lse)
+        assert abs(loss_zero - plain / 2) < 1e-12
+        h = 1e-6
+        for i in range(2):
+            for d in range(3):
+                cp = [row[:] for row in cos]
+                cm = [row[:] for row in cos]
+                cp[i][d] = max(-1.0, min(1.0, cp[i][d] + h))
+                cm[i][d] = max(-1.0, min(1.0, cm[i][d] - h))
+                fd = (AI.cosface_loss(cp, labels, 0.35, 64.0)[0]
+                      - AI.cosface_loss(cm, labels, 0.35, 64.0)[0]) / (2 * h)
+                assert abs(grad[i][d] - fd) < 1e-6
+
+    def test_circle(self):
+        s_pos = [0.9, 0.7]
+        s_neg = [0.1, 0.2]
+        loss, gp, gn = AI.circle_loss(s_pos, s_neg, margin=0.25, gamma=64.0)
+        assert loss > 0.0
+        h = 1e-6
+        for k in range(len(s_pos)):
+            a, b = list(s_pos), list(s_pos)
+            a[k] += h
+            b[k] -= h
+            fd = (AI.circle_loss(a, s_neg, 0.25, 64.0)[0]
+                  - AI.circle_loss(b, s_neg, 0.25, 64.0)[0]) / (2 * h)
+            assert abs(gp[k] - fd) < 1e-6
+        for k in range(len(s_neg)):
+            a, b = list(s_neg), list(s_neg)
+            a[k] += h
+            b[k] -= h
+            fd = (AI.circle_loss(s_pos, a, 0.25, 64.0)[0]
+                  - AI.circle_loss(s_pos, b, 0.25, 64.0)[0]) / (2 * h)
+            assert abs(gn[k] - fd) < 1e-6
+        # 只有正样本（没有负样本）也能算
+        loss_p, _, _ = AI.circle_loss([0.9], [], margin=0.25, gamma=64.0)
+        assert loss_p > 0.0
+
+    def test_invalid_inputs(self):
+        assert _ml_raises(lambda: AI.supcon_loss([], [0]))
+        assert _ml_raises(lambda: AI.supcon_loss([[1.0]], [0, 1]))
+        assert _ml_raises(lambda: AI.supcon_loss([[1.0]], [-1]))
+        assert _ml_raises(lambda: AI.supcon_loss([[1.0]], [0], temperature=0.0))
+        assert _ml_raises(lambda: AI.supcon_loss([[0.0, 0.0]], [0]))
+        assert _ml_raises(lambda: AI.arcface_loss([[1.5, 0.0]], [0]))
+        assert _ml_raises(lambda: AI.arcface_loss([[0.5]], [2]))
+        assert _ml_raises(lambda: AI.arcface_loss([[0.5]], [0], margin=2.0))
+        assert _ml_raises(lambda: AI.arcface_loss([[0.5]], [0], scale=0.0))
+        assert _ml_raises(lambda: AI.cosface_loss([[0.5]], [0], margin=1.2))
+        assert _ml_raises(lambda: AI.circle_loss([], []))
+        assert _ml_raises(lambda: AI.circle_loss([1.5], [0.1]))
+        assert _ml_raises(lambda: AI.circle_loss([0.5], [0.1], gamma=0.0))
