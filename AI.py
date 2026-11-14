@@ -18496,6 +18496,150 @@ class RGLRUBlock:
 
 """Perceiver IO 简化实现：潜变量数组通过交叉注意力压缩输入，再经潜变量自注意力与 FFN。"""
 
+"""Griffin / Hawk 教学实现：RG-LRU 与局部注意力交替（简化版）
+
+论文里的 Griffin 把「局部注意力层」与「RG-LRU 层」交替堆叠，Hawk 则完全
+不用注意力、只保留 RG-LRU + MLP。本文件在同一个 block 里同时演示两条路：
+
+- `GriffinBlock`：LN → 局部窗口因果注意力（残差）→ `RGLRUBlock`
+  （其内部是 LN → RG-LRU 混合（残差）→ LN → FFN（残差））。
+- `HawkBlock`：直接复用 `RGLRUBlock`（RG-LRU 混合 + MLP），不引入注意力。
+
+这是**教学简化**：Griffin 原文把两条路按层交替并在各层共享位置编码细节，
+这里把局部注意力与 RG-LRU 放在同一 block 内顺序执行，参数按实际形状计。
+"""
+
+
+def _grif_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Griffin: {name} 必须是正整数，收到 {value!r}")
+    if value < 1:
+        raise ValueError(f"Griffin: {name} 必须 >= 1，收到 {value!r}")
+
+
+class GriffinBlock:
+    """Griffin 简化 block：局部因果注意力子层 + RG-LRU 子层。"""
+
+    def __init__(self, d_model, num_heads, d_ff=None, local_window=4,
+                 eps=1e-5, seed=None):
+        _grif_check_pos_int(d_model, "d_model")
+        _grif_check_pos_int(num_heads, "num_heads")
+        _grif_check_pos_int(local_window, "local_window")
+        if d_model % num_heads != 0:
+            raise ValueError("Griffin: d_model 必须能被 num_heads 整除")
+        if eps is None or not isinstance(eps, (int, float)) or isinstance(eps, bool):
+            raise ValueError("Griffin: eps 必须是正数")
+        eps = float(eps)
+        if not eps > 0.0 or not math.isfinite(eps):
+            raise ValueError("Griffin: eps 必须是有限正数")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.local_window = local_window
+        self.eps = eps
+        self.ln_attn = LayerNorm(d_model, eps)
+        self.attn = MultiHeadAttention(
+            d_model, num_heads, dropout=0.0, causal=True, window=local_window)
+        self.rglru = RGLRUBlock(d_model, d_ff=d_ff, eps=eps, seed=seed)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.attn.zero_grad()
+        self.rglru.zero_grad()
+        self.grad_ln_attn = None
+
+    def train(self):
+        self.attn.train()
+        self.rglru.train()
+        return self
+
+    def eval(self):
+        self.attn.eval()
+        self.rglru.eval()
+        return self
+
+    def _check_seq(self, x_seq):
+        if not isinstance(x_seq, (list, tuple)) or len(x_seq) == 0:
+            raise ValueError("Griffin: 输入必须是非空 (seq_len, d_model) 列表")
+        rows = []
+        for row in x_seq:
+            if not isinstance(row, (list, tuple)) or len(row) != self.d_model:
+                raise ValueError(
+                    f"Griffin: 每行长度必须为 {self.d_model}")
+            vals = [float(v) for v in row]
+            if any(not math.isfinite(v) for v in vals):
+                raise ValueError("Griffin: 输入必须是有限数字")
+            rows.append(vals)
+        return rows
+
+    def forward(self, x_seq):
+        rows = self._check_seq(x_seq)
+        T = len(rows)
+        dm = self.d_model
+        a_in, c_ln_attn = _norm_rows_forward(self.ln_attn, rows)
+        attn_out = self.attn.forward(a_in)
+        x1 = [[rows[t][j] + attn_out[t][j] for j in range(dm)]
+              for t in range(T)]
+        out = self.rglru.forward(x1)
+        self._cache = {"T": T, "rows": rows, "c_ln_attn": c_ln_attn, "x1": x1}
+        return out
+
+    def backward(self, d_out):
+        if self._cache is None:
+            raise RuntimeError("Griffin: 必须先 forward 再 backward")
+        c = self._cache
+        T = c["T"]
+        dm = self.d_model
+        if not isinstance(d_out, (list, tuple)) or len(d_out) != T:
+            raise ValueError("Griffin: d_out 长度必须与输入序列一致")
+        d_x1 = self.rglru.backward(d_out)
+        d_attn_in = self.attn.backward(d_x1)
+        g_ln, b_ln, d_ln_in = _norm_rows_backward(
+            self.ln_attn, c["c_ln_attn"], d_attn_in)
+        self.grad_ln_attn = (g_ln, b_ln)
+        d_rows = [[d_x1[t][j] + d_attn_in[t][j] for j in range(dm)]
+                  for t in range(T)]
+        return d_rows
+
+    def sgd_step(self, lr=0.01):
+        if not math.isfinite(float(lr)) or not float(lr) > 0.0:
+            raise ValueError("Griffin: lr 必须是正数")
+        lr = float(lr)
+        for wkey, bkey in (("W_q", "b_q"), ("W_k", "b_k"),
+                           ("W_v", "b_v"), ("W_o", "b_o")):
+            weight = getattr(self.attn, wkey)
+            grad_w = self.attn.grads[wkey]
+            for i in range(len(weight)):
+                wi = weight[i]
+                gi = grad_w[i]
+                for j in range(len(wi)):
+                    wi[j] -= lr * gi[j]
+            bias = getattr(self.attn, bkey)
+            grad_b = self.attn.grads[bkey]
+            for i in range(len(bias)):
+                bias[i] -= lr * grad_b[i]
+        if self.grad_ln_attn is not None:
+            _norm_apply_sgd(self.ln_attn, self.grad_ln_attn, lr)
+        self.rglru.sgd_step(lr)
+        return self
+
+    def param_count(self):
+        def count(p):
+            if p and isinstance(p[0], (list, tuple)):
+                return sum(len(row) for row in p)
+            return len(p)
+        total = 0
+        for key in ("W_q", "b_q", "W_k", "b_k", "W_v", "b_v", "W_o", "b_o"):
+            total += count(getattr(self.attn, key))
+        total += _norm_param_count(self.ln_attn)
+        total += self.rglru.param_count()
+        return total
+
+
+# Hawk 完全不使用注意力：就是「RG-LRU 混合 + MLP」的重复堆叠，
+# 与 `RGLRUBlock` 的结构一致，因此直接用别名，避免复制同一份实现。
+HawkBlock = RGLRUBlock
+
 
 def _perc_check_pos_int(value, name):
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:

@@ -45314,3 +45314,124 @@ class TestLookaheadDecoding:
         out = AI.lookahead_decode(model, prompt, max_new_tokens=20,
                                   lookahead=3)
         assert len(out["tokens"]) <= 16 - len(prompt)
+
+
+
+
+def _griff_raises(fn, exc=ValueError):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _griff_seq(rows=5, dim=4, seed=3):
+    import random as _r
+    rng = _r.Random(seed)
+    return [[rng.uniform(-1.0, 1.0) for _ in range(dim)] for _ in range(rows)]
+
+
+def _griff_loss(blk, xs, w):
+    out = blk.forward(xs)
+    return sum(out[t][j] * w[j] for t in range(len(out)) for j in range(len(w)))
+
+
+def _griff_fd(blk, xs, w, grad_getter, param_getter, param_setter, h=1e-6):
+    blk.zero_grad()
+    out = blk.forward(xs)
+    d_out = [[w[j] for j in range(len(w))] for _ in range(len(out))]
+    blk.backward(d_out)
+    analytic = grad_getter()
+    p0 = param_getter()
+    param_setter(p0 + h)
+    lp = _griff_loss(blk, xs, w)
+    param_setter(p0 - h)
+    lm = _griff_loss(blk, xs, w)
+    param_setter(p0)
+    fd = (lp - lm) / (2.0 * h)
+    return abs(analytic - fd) / max(1.0, abs(fd))
+
+
+class TestGriffinBlock:
+    def test_forward_and_param_count(self):
+        blk = AI.GriffinBlock(4, 2, d_ff=8, local_window=3, seed=2)
+        out = blk.forward(_griff_seq())
+        assert len(out) == 5 and len(out[0]) == 4
+        assert blk.param_count() == 240
+        assert AI.HawkBlock is AI.RGLRUBlock
+        hawk = AI.HawkBlock(4, d_ff=8, seed=3)
+        assert hawk.param_count() == 152
+        assert len(hawk.forward(_griff_seq())) == 5
+
+    def test_numerical_gradients(self):
+        blk = AI.GriffinBlock(4, 2, d_ff=8, local_window=3, seed=2)
+        xs = _griff_seq(seed=4)
+        w = [0.3, -0.2, 0.5, 0.1]
+        cases = [
+            (lambda: blk.grad_ln_attn[0][1],
+             lambda: blk.ln_attn.gamma[1],
+             lambda v: blk.ln_attn.gamma.__setitem__(1, v)),
+            (lambda: blk.attn.grads["W_q"][0][1],
+             lambda: blk.attn.W_q[0][1],
+             lambda v: blk.attn.W_q[0].__setitem__(1, v)),
+            (lambda: blk.attn.grads["W_o"][1][2],
+             lambda: blk.attn.W_o[1][2],
+             lambda v: blk.attn.W_o[1].__setitem__(2, v)),
+            (lambda: blk.rglru.grad_W_i[0][1],
+             lambda: blk.rglru.W_i.weights[0][1],
+             lambda v: blk.rglru.W_i.weights[0].__setitem__(1, v)),
+        ]
+        for grad_getter, param_getter, param_setter in cases:
+            rel = _griff_fd(blk, xs, w, grad_getter, param_getter, param_setter)
+            assert rel < 1e-4, rel
+
+    def test_causal(self):
+        blk = AI.GriffinBlock(4, 2, d_ff=8, local_window=3, seed=2)
+        xs = _griff_seq(seed=5)
+        base = [row[:] for row in blk.forward(xs)]
+        xs2 = [row[:] for row in xs]
+        xs2[-1][0] += 1.0
+        pert = blk.forward(xs2)
+        for t in range(len(xs) - 1):
+            for j in range(4):
+                assert base[t][j] == pert[t][j]
+
+    def test_training_reduces_loss(self):
+        import random as _r
+        blk = AI.GriffinBlock(4, 2, d_ff=8, local_window=3, seed=2)
+        head = AI.Layer(4, 2, "linear")
+        target = [0.05, -0.03]
+        rng = _r.Random(11)
+        first = None
+        last = None
+        for _ in range(30):
+            xs_t = [[rng.uniform(-0.1, 0.1) for _ in range(4)] for _ in range(5)]
+            blk.zero_grad()
+            out = blk.forward(xs_t)
+            logits, ch = AI._dense_rows_forward(head, [out[-1]])
+            diff = [logits[0][i] - target[i] for i in range(2)]
+            loss = sum(d * d for d in diff)
+            dlogits = [[diff[i] for i in range(2)]]
+            gw, gb, _ = AI._dense_rows_backward(head, ch, dlogits)
+            AI._dense_apply_sgd(head, (gw, gb), 0.005)
+            d_out = [[0.0] * 4 for _ in range(5)]
+            for j in range(4):
+                d_out[-1][j] = sum(dlogits[0][i] * head.weights[i][j] for i in range(2))
+            blk.backward(d_out)
+            blk.sgd_step(0.001)
+            if first is None:
+                first = loss
+            last = loss
+        assert last < first * 0.5, (first, last)
+
+    def test_invalid_inputs(self):
+        assert _griff_raises(lambda: AI.GriffinBlock(0, 1))
+        assert _griff_raises(lambda: AI.GriffinBlock(4, 3))
+        assert _griff_raises(lambda: AI.GriffinBlock(4, 2, local_window=0))
+        assert _griff_raises(lambda: AI.GriffinBlock(4, 2, eps=-1.0))
+        assert _griff_raises(lambda: AI.GriffinBlock(4, 2, local_window=2.5))
+        blk = AI.GriffinBlock(4, 2, d_ff=8, seed=2)
+        assert _griff_raises(lambda: blk.forward([]))
+        assert _griff_raises(lambda: blk.forward([[0.0] * 3]))
+        assert _griff_raises(lambda: blk.backward([[0.0] * 4] * 5), RuntimeError)

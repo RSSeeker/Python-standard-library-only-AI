@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2813 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2818 项）
 
 ## 特性
 
@@ -833,6 +833,28 @@ block.sgd_step(0.01)
 
 边界：门控只依赖当前输入（Griffin/Hawk 的简化版，不含循环门）；状态是逐通道标量，
 没有分块并行扫描；序列很长时仍是 O(T) Python 循环；不支持 batch/变长 padding。
+
+### Griffin（局部注意力 + RG-LRU 混合）
+
+Griffin 是「局部注意力 + 门控线性循环」的混合结构：前半段用滑动窗口因果注意力看
+最近 `local_window` 个 token，后半段接 RG-LRU 做线性代价的状态传递。相比纯注意力，
+长序列上把 O(T²) 压成 O(T·window)；相比纯循环，又保留了短程精确注意。
+
+```python
+blk = AI.GriffinBlock(d_model=16, num_heads=4, d_ff=64, local_window=8, seed=0)
+y = blk.forward(x)            # T × 16
+blk.zero_grad()
+dx = blk.backward(dy)         # 局部注意力 + RG-LRU 的手写反向
+blk.sgd_step(0.01)
+```
+
+| 类 | 结构 / 说明 |
+|----|------|
+| `GriffinBlock(d_model, num_heads, d_ff=None, local_window=4, eps=1e-5, seed=None)` | `x += Attn(LN(x))`（`MultiHeadAttention(causal=True, window=local_window)`）→ `x += RGLRUBlock(x)`（其内部自带 pre-norm RG-LRU 与 FFN 残差）；`forward` / `backward`（注意力反传后再做 LN 反传，RG-LRU 段复用 `RGLRUBlock.backward`）/ `zero_grad` / `sgd_step` / `param_count` |
+| `HawkBlock` | `RGLRUBlock` 的别名（Hawk 相当于只保留 RG-LRU + MLP 的纯循环版本） |
+
+边界：局部窗口固定为 `local_window`，没有分层/学习式窗口；Hawk 只是别名，不另写一套
+门控；仍是 O(T·window) Python 循环，不支持 batch/变长 padding 与真实 kernel 融合。
 
 ### S5（MIMO 对角状态空间层）
 
@@ -6311,7 +6333,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2813 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2818 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6786,6 +6808,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
 | `TestGRPOMethods` | `method` 默认 grpo/clip_ratio_high 默认值、dapo 与 gspo 训练后奖励同样提升、多 token prompt 的 logits/old_logps 对齐、非法 method 与 clip_ratio_high 报错 |
 | `TestLookaheadDecoding` | 贪心等价（多种 lookahead/jacobi_steps 组合）、ids 拼接与 stats、forward 调用上界、n-gram 池最长后缀草稿、EOS 提前停止且为贪心前缀、合法性校验、max_len 截断 |
+| `TestGriffinBlock` | 局部注意力 + RG-LRU 前向与参数计数、四个参数的中心差分、因果性、30 步训练 loss 下降到 50% 以下、非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6820,6 +6843,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2813 个单元测试
+├── test_ai.py       # 2818 个单元测试
 └── README.md
 ```
