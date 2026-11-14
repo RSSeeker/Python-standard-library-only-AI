@@ -47302,3 +47302,79 @@ class TestCNNArchitectures:
         assert _arch_raises(lambda: AI.mobilenet_v2_forward(_ARCH_IMG, num_classes=0))
         assert _arch_raises(lambda: AI.mobilenet_v2_forward(_ARCH_IMG, width_mult=0.0))
         assert _arch_raises(lambda: AI.depthwise_conv([], 3))
+
+
+# ---- GPTQ / AWQ 教学实现（Hessian 误差补偿 + 激活感知缩放） ----
+
+
+def _q_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _q_random_problem(seed=0, rows=3, cols=6):
+    import random as _random
+    rng = _random.Random(seed)
+    w = [[rng.uniform(-1.0, 1.0) for _ in range(cols)] for _ in range(rows)]
+    h = [[0.0] * cols for _ in range(cols)]
+    for i in range(cols):
+        for j in range(cols):
+            h[i][j] = 0.85 ** abs(i - j) * (1.2 if i == j else 1.0)
+    return w, h
+
+
+class TestGPTQAWQ:
+    def test_gptq_column_scales_and_grid(self):
+        w, h = _q_random_problem()
+        wq, scales = AI.gptq_quantize_matrix(w, h, bits=4)
+        assert len(wq) == len(w)
+        assert len(scales) == len(w[0]) and all(s > 0.0 for s in scales)
+        for r in range(len(w)):
+            for c in range(len(w[r])):
+                q = wq[r][c] / scales[c]
+                assert abs(q - round(q)) < 1e-9
+
+    def test_gptq_average_beats_round_to_nearest(self):
+        err_gptq = 0.0
+        err_rtn = 0.0
+        for seed in range(8):
+            w, h = _q_random_problem(seed)
+            wq, scales = AI.gptq_quantize_matrix(w, h, bits=4)
+            err_gptq += AI.gptq_weighted_error(w, wq, h)
+            w_rtn = [[min(7, max(-7, int(round(v / scales[c])))) * scales[c]
+                      for c, v in enumerate(row)] for row in w]
+            err_rtn += AI.gptq_weighted_error(w, w_rtn, h)
+        assert err_gptq < err_rtn, (err_gptq, err_rtn)
+
+    def test_gptq_deterministic_and_identity_hessian(self):
+        w, _h = _q_random_problem(2)
+        wq, scales = AI.gptq_quantize_matrix(w, None, bits=4)
+        wq2, scales2 = AI.gptq_quantize_matrix(w, None, bits=4)
+        assert wq == wq2 and scales == scales2
+
+    def test_awq_equivalence(self):
+        rng = __import__("random").Random(0)
+        w, _h = _q_random_problem(3)
+        act = [abs(v) + 0.1 for v in w[0]]
+        ws, s = AI.awq_scale_weights(w, act, alpha=0.5)
+        assert len(s) == len(w[0]) and all(v > 0.0 for v in s)
+        x = [rng.uniform(-1.0, 1.0) for _ in range(len(w[0]))]
+        direct = [sum(w[r][c] * x[c] for c in range(len(x))) for r in range(len(w))]
+        comp = [sum(ws[r][c] * (x[c] / s[c]) for c in range(len(x))) for r in range(len(w))]
+        assert max(abs(direct[r] - comp[r]) for r in range(len(w))) < 1e-12
+        ws0, s0 = AI.awq_scale_weights(w, act, alpha=0.0)
+        assert all(v == 1.0 for v in s0) and ws0 == w
+        assert AI.awq_compensate_input(x, s) == [x[c] / s[c] for c in range(len(x))]
+
+    def test_invalid_inputs(self):
+        w, h = _q_random_problem()
+        assert _q_raises(lambda: AI.gptq_quantize_matrix([], h))
+        assert _q_raises(lambda: AI.gptq_quantize_matrix(w, h, bits=5))
+        assert _q_raises(lambda: AI.gptq_quantize_matrix(w, [[1, 0], [0, 1]]))
+        assert _q_raises(lambda: AI.gptq_quantize_matrix(w, h, percdamp=1.0))
+        assert _q_raises(lambda: AI.gptq_weighted_error(w, [[0.0] * 6], h))
+        assert _q_raises(lambda: AI.awq_scale_weights(w, [1.0] * 3))
+        assert _q_raises(lambda: AI.awq_compensate_input([0.0] * 6, [1.0] * 3))

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2969 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2974 项）
 
 ## 特性
 
@@ -4854,6 +4854,20 @@ prob = model.predict(features[0])
 输入（不是稀疏类别字段的 embedding table），没有 field embedding 共享表；`fit` 是逐样本 SGD，
 无 batch/Adam/正则；注意力权重不做可视化导出。
 
+### 量化压缩（GPTQ / AWQ 教学实现）
+
+- `gptq_quantize_matrix(weight, hessian=None, bits=4, percdamp=0.01)`：
+  按输入通道（列）共享对称 scale，逐列量化并按 Hessian 逆做误差补偿
+  （已量化列的误差由后续列吸收），返回 `(W_quant, scales)`。
+- `gptq_weighted_error(weight, quantized, hessian=None)`：加权重建误差
+  `trace((W-Wq) H (W-Wq)^T)`。
+- `awq_scale_weights(weight, act_scale, alpha=0.5)` / `awq_compensate_input(x, scales)`：
+  激活感知缩放 `w' = w * act^alpha`，对应输入除以同一 scale 保持等价。
+
+边界：教学实现，只处理二维权重矩阵与对称 per-column 量化；未做真实逐层
+流水线、act-order、packing 或与论文逐位一致。测试用固定随机种子，断言
+GPTQ 的**平均**加权误差低于 round-to-nearest（单例可能更差）。
+
 ### 轻量 CNN 架构（MobileNetV2 / MobileNetV3 / EfficientNet）
 
 - `inverted_residual_block(x, out_ch, stride=1, expand_ratio=6, use_se=False,
@@ -5077,19 +5091,19 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 ### 冒烟测试目录（tests/）与类型检查配置
 
 仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2908 项）；`tests/` 目录再放
-一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
+一组**快速冒烟测试**（53 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 2969 项）。
+`tests/`（合计 2974 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
 标注，因此 `mypy` 只宜作为后续逐步补注解的配置模板，而非当前 CI 门槛。
 
 ```bash
-pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 2969 项
+pytest tests/ -q                 # 53 项冒烟测试
+pytest -q                        # test_ai.py + tests/ 合计 2974 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6848,7 +6862,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2969 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2974 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7341,6 +7355,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestConsistencyModel` | 预条件系数极限与单调性、Karras 调度单调、同函数损失为 0/不同为正、多步采样、非法输入 |
 | `TestTrainingEngineeringTools` | step warmup 曲线（含 clamp）、网格/随机搜索命中已知最优、history JSON 往返、非法输入 |
 | `TestTaskTricks` | 任务向量/任务算术（含逐任务缩放）、WiSE-FT 端点与插值、贪心 soup 选子集与改进、非法输入 |
+| `TestGPTQAWQ` | GPTQ 列量化/误差补偿、AWQ 缩放等价 |
 | `TestCNNArchitectures` | 轻量 CNN 前向（复合缩放/倒残差/MBConv） |
 | `TestFTTransformer` | 前向/CE 损失、特征嵌入/CLS/分类头 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestTabNet` | 前向/参数 133、五组权重 FD（head/W1/W2/Wd/W_mask）、40 步收敛、掩码稀疏性与单纯形约束、非法输入 |

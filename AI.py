@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1821 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1829 个 def / 430 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -9583,6 +9583,156 @@ def efficientnet_lite_forward(x, num_classes=10, phi=1.0, seed=0):
               for ch in h]
     return [[sum(pooled[j] * (0.1 * ((c % 3) + 1)) - 0.05 for j in range(len(pooled)))
              for c in range(num_classes)]]
+
+
+"""GPTQ / AWQ 教学实现（基于 Hessian 的逐层权重量化与激活感知缩放）。
+
+只处理二维权重矩阵（行=输出通道，列=输入通道），量化采用对称 per-row 的
+round-to-nearest，按列顺序做误差补偿（GPTQ 的核心），块内不依赖第三方库。
+"""
+
+
+def _q_check_bits(bits):
+    if not isinstance(bits, int) or isinstance(bits, bool) or bits not in (2, 3, 4, 8):
+        raise ValueError("quant: bits 只支持 2/3/4/8，收到 %r" % (bits,))
+    return bits
+
+
+def _q_check_matrix(m, name):
+    if not isinstance(m, (list, tuple)) or not m:
+        raise ValueError("%s 必须是非空二维矩阵" % name)
+    rows = []
+    for row in m:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("%s 每行必须是非空列表" % name)
+        vals = []
+        for v in row:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not __import__("math").isfinite(v):
+                raise ValueError("%s 必须只包含有限数字" % name)
+            vals.append(float(v))
+        rows.append(vals)
+    if any(len(r) != len(rows[0]) for r in rows):
+        raise ValueError("%s 每行长度必须一致" % name)
+    return rows
+
+
+def _q_inverse(matrix):
+    """Gauss-Jordan 求逆（带部分主元），用于 Hessian 逆。"""
+    n = len(matrix)
+    a = [row[:] + [1.0 if i == j else 0.0 for j in range(n)]
+         for i, row in enumerate(matrix)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-12:
+            raise ValueError("quant: Hessian 不可逆（存在零主元）")
+        if piv != col:
+            a[col], a[piv] = a[piv], a[col]
+        pv = a[col][col]
+        a[col] = [v / pv for v in a[col]]
+        for r in range(n):
+            if r == col:
+                continue
+            f = a[r][col]
+            if f != 0.0:
+                a[r] = [a[r][c] - f * a[col][c] for c in range(2 * n)]
+    return [row[n:] for row in a]
+
+
+def gptq_quantize_matrix(weight, hessian=None, bits=4, percdamp=0.01):
+    """GPTQ：按列顺序量化，并用 Hessian 逆的列间信息补偿已量化误差。
+
+    返回 ``(W_quant, scales)``；``hessian`` 缺省用单位阵（退化为按列 RTN）。
+    """
+    W = _q_check_matrix(weight, "gptq_quantize_matrix: weight")
+    _q_check_bits(bits)
+    rows, cols = len(W), len(W[0])
+    if hessian is None:
+        H = [[1.0 if i == j else 0.0 for j in range(cols)] for i in range(cols)]
+    else:
+        H = _q_check_matrix(hessian, "gptq_quantize_matrix: hessian")
+        if len(H) != cols or len(H[0]) != cols:
+            raise ValueError("gptq_quantize_matrix: hessian 必须是 %dx%d" % (cols, cols))
+        if any(abs(H[i][j] - H[j][i]) > 1e-9 for i in range(cols) for j in range(cols)):
+            raise ValueError("gptq_quantize_matrix: hessian 必须对称")
+    if not isinstance(percdamp, (int, float)) or isinstance(percdamp, bool) \
+            or not (0.0 <= percdamp < 1.0):
+        raise ValueError("gptq_quantize_matrix: percdamp 必须在 [0,1)")
+
+    damp = percdamp * sum(H[i][i] for i in range(cols)) / cols
+    if damp == 0.0:
+        damp = 1e-8
+    Hd = [[H[i][j] + (damp if i == j else 0.0) for j in range(cols)]
+          for i in range(cols)]
+    Hinv = _q_inverse(Hd)
+
+    Wq = [row[:] for row in W]
+    qmax = 2 ** (bits - 1) - 1
+    # 按输入通道（列）共享一个缩放因子，与 GPTQ 原论文一致
+    scales = [(max(abs(W[r][c]) for r in range(rows)) / float(qmax)) or 1.0
+              for c in range(cols)]
+    w = [row[:] for row in W]
+    for j in range(cols):
+        scale = scales[j]
+        for r in range(rows):
+            v = w[r][j]
+            q = int(round(v / scale))
+            q = max(-qmax, min(qmax, q))
+            wq = q * scale
+            err = v - wq
+            w[r][j] = wq
+            Wq[r][j] = wq
+            if err != 0.0 and j + 1 < cols:
+                denom = Hinv[j][j]
+                if denom > 0.0:
+                    for k in range(j + 1, cols):
+                        w[r][k] -= err * Hinv[j][k] / denom
+    return Wq, scales
+
+
+def gptq_weighted_error(weight, quantized, hessian=None):
+    """加权重建误差 ``trace((W-Wq) H (W-Wq)^T)``，hessian 缺省为单位阵。"""
+    W = _q_check_matrix(weight, "gptq_weighted_error: weight")
+    Wq = _q_check_matrix(quantized, "gptq_weighted_error: quantized")
+    if len(W) != len(Wq) or len(W[0]) != len(Wq[0]):
+        raise ValueError("gptq_weighted_error: 形状不一致")
+    cols = len(W[0])
+    if hessian is None:
+        H = [[1.0 if i == j else 0.0 for j in range(cols)] for i in range(cols)]
+    else:
+        H = _q_check_matrix(hessian, "gptq_weighted_error: hessian")
+        if len(H) != cols or len(H[0]) != cols:
+            raise ValueError("gptq_weighted_error: hessian 维度不匹配")
+    total = 0.0
+    for r in range(len(W)):
+        d = [W[r][c] - Wq[r][c] for c in range(cols)]
+        for i in range(cols):
+            for j in range(cols):
+                total += d[i] * H[i][j] * d[j]
+    return total
+
+
+def awq_scale_weights(weight, act_scale, alpha=0.5):
+    """AWQ：按输入通道激活幅度缩放权重（``w' = w * s``，``s = act^alpha``）。
+
+    返回 ``(W_scaled, scales)``；对应激活需除以 ``scales`` 保持数学等价。
+    """
+    W = _q_check_matrix(weight, "awq_scale_weights: weight")
+    _q_check_matrix([list(act_scale)], "awq_scale_weights: act_scale")
+    if len(act_scale) != len(W[0]):
+        raise ValueError("awq_scale_weights: act_scale 长度必须等于输入通道数")
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+        raise ValueError("awq_scale_weights: alpha 必须是数字")
+    scales = [float(v) ** alpha if v > 0.0 else 1.0 for v in act_scale]
+    Ws = [[W[r][c] * scales[c] for c in range(len(W[0]))] for r in range(len(W))]
+    return Ws, scales
+
+
+def awq_compensate_input(x, scales):
+    """AWQ 的等价输入补偿：``x / scales``（逐特征）。"""
+    vec = [float(v) for v in x]
+    if len(vec) != len(scales):
+        raise ValueError("awq_compensate_input: 维度不一致")
+    return [vec[i] / scales[i] for i in range(len(vec))]
 
 
 class FTTransformer:
