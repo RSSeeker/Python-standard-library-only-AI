@@ -41692,3 +41692,169 @@ class TestGRPOTrainer:
             lambda: AI.GRPOTrainer(policy, lambda p, r: float("nan")).group_step([0]),
         ]
         assert all(_grpo_raises(fn) for fn in bad)
+
+
+import math
+import random
+import AI
+
+
+def _ppokl_build_pair():
+    random.seed(7)
+    policy = AI.CausalLM(8, 8, 2, 16, 1, 16)
+    random.seed(7)
+    reference = AI.CausalLM(8, 8, 2, 16, 1, 16)
+    return policy, reference
+
+
+def _ppokl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestPPOKLTrainer:
+    def test_training_improves_reward(self):
+        policy, reference = _ppokl_build_pair()
+
+        def reward_fn(prompt, response):
+            return 1.0 if response and response[-1] == 3 else 0.0
+
+        trainer = AI.PPOKLTrainer(
+            policy, reference, reward_fn, kl_coef=0.0, lr=0.1,
+            max_new_tokens=3, temperature=1.0, seed=3)
+        history = trainer.fit([[1, 2], [1, 4]], epochs=20)
+        first = history["reward"][0]
+        last3 = sum(history["reward"][-3:]) / 3.0
+        assert last3 > first + 0.2
+        assert len(history["loss"]) == 20
+        assert len(trainer.loss_history) == 40
+
+    def test_kl_penalty_keeps_policy_close(self):
+        policy, reference = _ppokl_build_pair()
+        trainer = AI.PPOKLTrainer(
+            policy, reference, lambda p, r: 0.0, kl_coef=5.0, lr=0.1,
+            max_new_tokens=2, temperature=1.0, seed=4)
+        history = trainer.fit([[1, 2]], epochs=10)
+        max_abs_kl = max(abs(v) for v in history["kl"])
+        assert max_abs_kl < 0.25
+
+    def test_rollout_deterministic(self):
+        p1, r1 = _ppokl_build_pair()
+        t1 = AI.PPOKLTrainer(p1, r1, lambda p, r: 0.0, lr=0.01,
+                             max_new_tokens=3, seed=11)
+        resp_a, old_a, ids_a = t1.rollout([1, 2])
+        p2, r2 = _ppokl_build_pair()
+        t2 = AI.PPOKLTrainer(p2, r2, lambda p, r: 0.0, lr=0.01,
+                             max_new_tokens=3, seed=11)
+        resp_b, old_b, ids_b = t2.rollout([1, 2])
+        assert resp_a == resp_b
+        assert ids_a == ids_b
+        assert len(old_a) == len(resp_a)
+        for k in range(len(old_a)):
+            assert abs(old_a[k] - old_b[k]) < 1e-12
+
+    def test_group_step_structure_and_reference_frozen(self):
+        policy, reference = _ppokl_build_pair()
+        before = AI._rlhf_seq_logprob(reference, [1], [2])
+        trainer = AI.PPOKLTrainer(
+            policy, reference, lambda p, r: 0.5, kl_coef=0.1, lr=0.05,
+            max_new_tokens=2, seed=5)
+        info = trainer.group_step([1, 2])
+        after = AI._rlhf_seq_logprob(reference, [1], [2])
+        assert abs(before - after) < 1e-12
+        for key in ("loss", "reward", "kl", "advantages", "ratios",
+                    "responses", "old_logps", "ref_logps"):
+            assert key in info
+        assert len(info["advantages"]) == len(info["responses"])
+        assert len(info["ratios"]) == len(info["responses"])
+        assert len(info["old_logps"]) == len(info["responses"])
+        assert len(info["ref_logps"]) == len(info["responses"])
+
+    def test_ppo_kl_align_convenience(self):
+        policy, reference = _ppokl_build_pair()
+        history = AI.ppo_kl_align(
+            policy, reference, lambda p, r: 0.2, [[1, 2]],
+            kl_coef=0.0, lr=0.05, max_new_tokens=2, epochs=2, seed=9)
+        assert set(history.keys()) == {"loss", "reward", "kl"}
+        assert len(history["loss"]) == 2
+
+    def test_invalid_inputs(self):
+        policy, reference = _ppokl_build_pair()
+        ok = 0
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    kl_coef=-0.1))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    clip_ratio=1.0))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    entropy_coef=float("nan")))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    lr=0.0))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    max_new_tokens=0))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    temperature=-1.0))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    gamma=0.0))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    gamma=1.5))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    eos_id=99))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, 5))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(policy, reference, lambda p, r: 0.0,
+                                    seed=1.5))
+        trainer = AI.PPOKLTrainer(
+            policy, reference, lambda p, r: 0.0, lr=0.01,
+            max_new_tokens=2, seed=1)
+        ok += _ppokl_raises(lambda: trainer.rollout([]))
+        ok += _ppokl_raises(lambda: trainer.group_step([99]))
+        ok += _ppokl_raises(
+            lambda: AI.PPOKLTrainer(
+                policy, reference,
+                lambda p, r: float("inf"), lr=0.01,
+                max_new_tokens=1).group_step([1, 2]))
+        ok += _ppokl_raises(lambda: trainer.fit([]))
+        ok += _ppokl_raises(lambda: trainer.fit([[1]], epochs=0))
+        assert ok == 16
+
+
+# ---- 回归：ppo_loss 熵正则梯度符号（P4 修正） ----
+def _ppo_entropy_fd():
+    logits = [0.2, -0.4, 1.1]
+    old = math.log(0.5)
+    action = 2
+    adv = 0.7
+    loss, dlogits, _info = AI.ppo_loss(
+        logits, old, action, adv, clip_ratio=0.2, entropy_coef=0.3)
+    eps = 1e-6
+    num = []
+    for j in range(len(logits)):
+        hi = list(logits)
+        lo = list(logits)
+        hi[j] += eps
+        lo[j] -= eps
+        num.append((AI.ppo_loss(hi, old, action, adv,
+                                clip_ratio=0.2, entropy_coef=0.3)[0]
+                    - AI.ppo_loss(lo, old, action, adv,
+                                  clip_ratio=0.2, entropy_coef=0.3)[0])
+                   / (2.0 * eps))
+    return loss, dlogits, num
+
+
+def test_ppo_entropy_gradient_matches_fd():
+    _loss, dlogits, num = _ppo_entropy_fd()
+    for j in range(len(dlogits)):
+        assert abs(dlogits[j] - num[j]) < 1e-5

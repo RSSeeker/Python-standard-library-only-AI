@@ -10541,6 +10541,277 @@ def _grpo_accumulate_grads(model, d_logits, scale):
     model.embedding.backward(d_seq)
 
 
+
+
+# ---- PPO-with-KL 的 RLHF 训练循环（PPOKLTrainer / ppo_kl_align） ----
+
+
+def _ppokl_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"PPOKLTrainer: {name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _ppokl_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"PPOKLTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"PPOKLTrainer: {name} 必须是正的有限数字，收到 {value!r}")
+    return value
+
+
+def _ppokl_check_nonneg_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"PPOKLTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"PPOKLTrainer: {name} 必须是非负有限数字，收到 {value!r}")
+    return value
+
+
+def _ppokl_check_ratio(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"PPOKLTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or not (0.0 < value < 1.0):
+        raise ValueError(f"PPOKLTrainer: {name} 必须在 (0,1) 内，收到 {value!r}")
+    return value
+
+
+def _ppokl_check_gamma(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"PPOKLTrainer: {name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or not (0.0 < value <= 1.0):
+        raise ValueError(f"PPOKLTrainer: {name} 必须在 (0,1] 内，收到 {value!r}")
+    return value
+
+
+class PPOKLTrainer:
+    """带 KL 惩罚的 PPO 式 RLHF 循环（rollout + 奖励 + KL + 裁剪更新）
+
+    一条轨迹的逐步奖励为 ``r_t = -kl_coef * (logp_t - ref_logp_t)``，最后一个
+    token 额外加 ``reward_fn`` 给的结果；优势用 ``gamma`` 折扣从后往前累加
+    （无价值网络、``lambda=1`` 的简化 GAE）。更新时对每个回答位置调用
+    ``ppo_loss`` 做裁剪，再用与 ``_rlhf_seq_logprob`` 相同的路径手工反传。
+
+    ``reward_fn(prompt_ids, response_ids)`` 是普通可调用对象（返回有限数字），
+    本库不内置奖励模型；参考模型 ``reference`` 在整个训练中冻结。
+    """
+
+    def __init__(self, policy, reference, reward_fn, kl_coef=0.1,
+                 clip_ratio=0.2, entropy_coef=0.0, lr=0.01,
+                 max_new_tokens=8, temperature=1.0, gamma=1.0,
+                 eos_id=0, seed=None):
+        _rlhf_check_lm(policy, "PPOKLTrainer.policy")
+        _rlhf_check_lm(reference, "PPOKLTrainer.reference")
+        if policy.vocab_size != reference.vocab_size:
+            raise ValueError(
+                "PPOKLTrainer: policy 与 reference 的词表大小必须一致")
+        if policy.max_len != reference.max_len:
+            raise ValueError(
+                "PPOKLTrainer: policy 与 reference 的 max_len 必须一致")
+        if not callable(reward_fn):
+            raise TypeError("PPOKLTrainer: reward_fn 必须是可调用对象")
+        if isinstance(eos_id, bool) or not isinstance(eos_id, int):
+            raise TypeError("PPOKLTrainer: eos_id 必须是整数")
+        if not (0 <= eos_id < policy.vocab_size):
+            raise ValueError(
+                f"PPOKLTrainer: eos_id 必须在 0..{policy.vocab_size - 1} 内")
+        if isinstance(seed, bool) or (seed is not None and not isinstance(seed, int)):
+            raise TypeError("PPOKLTrainer: seed 必须是整数或 None")
+        self.policy = policy
+        self.reference = reference
+        self.reward_fn = reward_fn
+        self.kl_coef = _ppokl_check_nonneg_number(kl_coef, "kl_coef")
+        self.clip_ratio = _ppokl_check_ratio(clip_ratio, "clip_ratio")
+        self.entropy_coef = _ppokl_check_nonneg_number(
+            entropy_coef, "entropy_coef")
+        self.lr = _ppokl_check_pos_number(lr, "lr")
+        self.max_new_tokens = _ppokl_check_pos_int(
+            max_new_tokens, "max_new_tokens")
+        self.temperature = _ppokl_check_pos_number(temperature, "temperature")
+        self.gamma = _ppokl_check_gamma(gamma, "gamma")
+        self.eos_id = eos_id
+        self.rng = random.Random(seed) if seed is not None else random.Random()
+        self.loss_history = []
+        self.reward_history = []
+        self.kl_history = []
+
+    # ---------- 采样 ----------
+
+    def _scaled_logits(self, logits):
+        t = self.temperature
+        if t == 1.0:
+            return list(logits)
+        return [float(v) / t for v in logits]
+
+    def rollout(self, prompt_ids, rng=None):
+        """按当前策略采一条回答，返回 (response, old_logps, ids)。"""
+        prompt = _check_token_ids(
+            prompt_ids, self.policy.vocab_size, "PPOKLTrainer(prompt_ids)")
+        if not prompt:
+            raise ValueError("PPOKLTrainer: prompt_ids 不能为空")
+        if len(prompt) >= self.policy.max_len:
+            raise ValueError(
+                "PPOKLTrainer: prompt 长度必须小于 max_len（否则无法生成）")
+        rng = self.rng if rng is None else rng
+        ids = list(prompt)
+        response = []
+        old_logps = []
+        for _ in range(self.max_new_tokens):
+            if len(ids) >= self.policy.max_len:
+                break
+            logits = self.policy.forward(ids)
+            probs = _softmax_row(self._scaled_logits(logits[-1]))
+            u = rng.random()
+            acc = 0.0
+            token = len(probs) - 1
+            for v in range(len(probs)):
+                acc += probs[v]
+                if u <= acc:
+                    token = v
+                    break
+            p = probs[token]
+            old_logps.append(
+                math.log(p) if p > 1e-12 else math.log(1e-12))
+            ids.append(token)
+            response.append(token)
+            if token == self.eos_id:
+                break
+        return response, old_logps, ids
+
+    def group_step(self, prompt_ids, rng=None):
+        """采一条回答、算奖励/KL/优势，并做一次裁剪更新。"""
+        prompt = _check_token_ids(
+            prompt_ids, self.policy.vocab_size, "PPOKLTrainer(prompt_ids)")
+        response, old_logps, ids = self.rollout(prompt, rng)
+        if not response:
+            raise RuntimeError("PPOKLTrainer: 本次 rollout 未生成任何 token")
+        reward = self.reward_fn(prompt, response)
+        if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+            raise TypeError(
+                "PPOKLTrainer: reward_fn 必须返回数字，收到 "
+                f"{type(reward).__name__}")
+        reward = float(reward)
+        if not math.isfinite(reward):
+            raise ValueError("PPOKLTrainer: reward_fn 的返回值必须是有限数字")
+
+        prompt_len = len(prompt)
+        ref_logps = []
+        for i in range(prompt_len, len(ids)):
+            logits = self.reference.forward(ids[:i])
+            probs = _softmax_row(self._scaled_logits(logits[-1]))
+            p = probs[ids[i]]
+            ref_logps.append(
+                math.log(p) if p > 1e-12 else math.log(1e-12))
+
+        logits = self.policy.forward(ids[:-1])
+        new_logps = []
+        for k, i in enumerate(range(prompt_len, len(ids))):
+            probs = _softmax_row(self._scaled_logits(logits[i - 1]))
+            p = probs[ids[i]]
+            new_logps.append(
+                math.log(p) if p > 1e-12 else math.log(1e-12))
+
+        kls = [new_logps[k] - ref_logps[k] for k in range(len(response))]
+
+        # 逐步奖励 r_t = -kl_coef * kl_t，末步加 reward；无价值网络的折扣优势
+        advantages = [0.0] * len(response)
+        future = 0.0
+        for k in range(len(response) - 1, -1, -1):
+            r = -self.kl_coef * kls[k]
+            if k == len(response) - 1:
+                r += reward
+            future = r + self.gamma * future
+            advantages[k] = future
+
+        self.policy.zero_grad()
+        d_logits = [[0.0] * self.policy.vocab_size
+                    for _ in range(len(ids) - 1)]
+        total_loss = 0.0
+        ratios = []
+        inv_temp = 1.0 / self.temperature
+        for k, i in enumerate(range(prompt_len, len(ids))):
+            t = i - 1
+            row = self._scaled_logits(logits[t])
+            loss, drow, info = ppo_loss(
+                row, old_logps[k], ids[i], advantages[k],
+                clip_ratio=self.clip_ratio, entropy_coef=self.entropy_coef)
+            total_loss += loss
+            ratios.append(info["ratio"])
+            if inv_temp != 1.0:
+                drow = [v * inv_temp for v in drow]
+            for v in range(self.policy.vocab_size):
+                d_logits[t][v] += drow[v]
+        _grpo_accumulate_grads(
+            self.policy, d_logits, 1.0 / len(response))
+        self.policy.adam_step(self.lr)
+
+        mean_loss = total_loss / len(response)
+        mean_kl = sum(kls) / len(kls)
+        self.loss_history.append(mean_loss)
+        self.reward_history.append(reward)
+        self.kl_history.append(mean_kl)
+        return {
+            "loss": mean_loss,
+            "reward": reward,
+            "kl": mean_kl,
+            "advantages": advantages,
+            "ratios": ratios,
+            "responses": response,
+            "old_logps": old_logps,
+            "ref_logps": ref_logps,
+        }
+
+    def fit(self, prompts, epochs=1, lr=None, seed=None):
+        """按 prompts 逐条 rollout 更新，返回每轮平均指标。"""
+        if not isinstance(prompts, (list, tuple)) or not prompts:
+            raise ValueError("PPOKLTrainer: prompts 必须是非空列表")
+        epochs = _ppokl_check_pos_int(epochs, "epochs")
+        if lr is not None:
+            old_lr = self.lr
+            self.lr = _ppokl_check_pos_number(lr, "lr")
+        else:
+            old_lr = None
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise TypeError("PPOKLTrainer: seed 必须是整数")
+            self.rng = random.Random(seed)
+        order = list(range(len(prompts)))
+        history = {"loss": [], "reward": [], "kl": []}
+        for _ in range(epochs):
+            self.rng.shuffle(order)
+            ep_loss = 0.0
+            ep_reward = 0.0
+            ep_kl = 0.0
+            for i in order:
+                info = self.group_step(prompts[i])
+                ep_loss += info["loss"]
+                ep_reward += info["reward"]
+                ep_kl += info["kl"]
+            n = len(prompts)
+            history["loss"].append(ep_loss / n)
+            history["reward"].append(ep_reward / n)
+            history["kl"].append(ep_kl / n)
+        if old_lr is not None:
+            self.lr = old_lr
+        return history
+
+
+def ppo_kl_align(policy, reference, reward_fn, prompts, kl_coef=0.1,
+                 clip_ratio=0.2, entropy_coef=0.0, lr=0.01,
+                 max_new_tokens=8, temperature=1.0, gamma=1.0,
+                 eos_id=0, epochs=1, seed=None):
+    """便捷入口：``PPOKLTrainer(...).fit(prompts, epochs=epochs, seed=seed)``。"""
+    trainer = PPOKLTrainer(
+        policy, reference, reward_fn, kl_coef=kl_coef,
+        clip_ratio=clip_ratio, entropy_coef=entropy_coef, lr=lr,
+        max_new_tokens=max_new_tokens, temperature=temperature,
+        gamma=gamma, eos_id=eos_id, seed=seed)
+    return trainer.fit(prompts, epochs=epochs)
+
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
 

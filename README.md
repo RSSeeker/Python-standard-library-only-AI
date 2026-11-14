@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2643 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2650 项）
 
 ## 特性
 
@@ -3213,6 +3213,8 @@ losses = seq.fit([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], epochs=10)
 | `gspo_losses(logit_seqs, old_logp_seqs, action_seqs, sequence_advantages, clip_ratio=0.2, clip_ratio_high=None, entropy_coef=0.0)` | GSPO 的序列级重要性比裁剪：`s_i=exp(mean_t(logp_new-logp_old))`，梯度按 `s_i/T` 分摊到各 token |
 | `GRPOTrainer(policy, reward_fn, num_samples=4, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=4, temperature=1.0)` | GRPO rollout 训练循环：同一 prompt 采 `num_samples` 条回答 → `reward_fn` 打分 → 组内相对优势 → `grpo_losses` 逐步裁剪损失 → 反传 `adam_step`；`group_step` 单 prompt、`fit` 遍历 prompts |
 | `grpo_align(policy, reward_fn, prompts, num_samples=4, ..., epochs=1)` | 便捷入口：`GRPOTrainer(...).fit(...)`，返回每轮平均损失 |
+| `PPOKLTrainer(policy, reference, reward_fn, kl_coef=0.1, clip_ratio=0.2, entropy_coef=0.0, lr=0.01, max_new_tokens=8, temperature=1.0, gamma=1.0, eos_id=0, seed=None)` | 带 KL 惩罚的 PPO 式 RLHF：`rollout` 采样、逐 token 奖励 `-kl_coef·(logp−ref_logp)`、`gamma` 折扣优势、`ppo_loss` 裁剪更新；`group_step` 单 prompt、`fit` 遍历 prompts |
+| `ppo_kl_align(policy, reference, reward_fn, prompts, ..., epochs=1)` | 便捷入口：`PPOKLTrainer(...).fit(...)`，返回每轮平均 loss/reward/kl |
 
 示例：
 
@@ -3266,6 +3268,38 @@ losses = trainer.fit([[1, 2, 3], [1, 2, 4]], epochs=3, seed=0)
 - 顺带修正：`ppo_loss` 的熵正则解析梯度此前符号相反（会**压低**熵），已改为
   `grad -= entropy_coef·dH/dz` 并补中心差分回归测试；`entropy_coef>0` 现在确实
   起熵奖励作用
+
+### PPO-with-KL 的 RLHF（PPOKLTrainer）
+
+`rlhf_reward` / `kl_penalty` / `ppo_loss` 各自只解决一步；`PPOKLTrainer` 把它们
+串成完整的 RLHF 循环：策略先按当前分布 rollout 一条回答，参考模型给出每 token
+的 `ref_logp`，于是逐步奖励为 `r_t = -kl_coef·(logp_t - ref_logp_t)`（最后一步
+再加上 `reward_fn` 的终局奖励），用 `gamma` 从后往前累加成优势，再对每个回答
+位置做 `ppo_loss` 裁剪更新——梯度沿与 `_rlhf_seq_logprob` 相同的路径手工回传，
+参考模型全程冻结。
+
+```python
+policy = CausalLM(vocab_size=64, d_model=32, num_heads=4, num_layers=2, max_len=64)
+reference = ...  # 与 policy 同结构；通常由 SFT 检查点复制
+
+def reward_fn(prompt, response):
+    return 1.0 if response and response[-1] == 1 else 0.0
+
+trainer = PPOKLTrainer(policy, reference, reward_fn, kl_coef=0.1,
+                       clip_ratio=0.2, lr=0.05, max_new_tokens=8,
+                       temperature=1.0, seed=0)
+history = trainer.fit([[1, 2, 3], [1, 2, 4]], epochs=10)
+```
+
+- `rollout(prompt_ids, rng=None)` 用 `temperature` 缩放后的 softmax 逐 token
+  采样并记录 `old_logps`；`group_step` 完成奖励/KL/优势/更新；`fit` 逐 prompt
+  更新并返回每轮 `loss/reward/kl` 均值
+- `reward_fn(prompt_ids, response_ids)` 是普通可调用对象，返回有限数字；本库
+  不内置奖励模型（可接任意打分器/偏好模型），参考模型需调用方提供
+- 边界：单条回答立即更新（不组 batch、不做优势标准化）、无价值网络（`gamma`
+  折扣的无基线优势，等价 `lambda=1`）、KL 用逐 token log-ratio 估计、不裁剪
+  梯度范数；`eos_id` 命中即停止 rollout，`max_new_tokens` 与 `max_len` 共同
+  决定轨迹长度
 
 ### 离线强化学习（IQL / CQL）
 
@@ -5782,7 +5816,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2643 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2650 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6223,6 +6257,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRLHFTrainer` | 序列 logp 与手算一致、同策略/参考初始 DPO 损失为 log2、DPO 梯度中心差分、fit 收敛、五种 method（含无 reference 的 simpo/orpo）、非法输入 |
 | `TestKTOTrainer` | 训练后 `desirable` 样本 logp 上升 / `undesirable` 下降、参考模型不变、显式 baseline 与逐轮现估（首轮为 0）、`sample_step` 与 `kto_loss` 逐位一致且 `d_logp` 与中心差分一致、12 类非法输入 |
 | `TestGRPOTrainer` | rollout 训练后奖励显著提升、`group_step` 输出形状与同 seed 采样一致、奖励全等时优势为 0 且策略不变、`ppo_loss` 熵梯度与中心差分一致（回归 sign bug）、`grpo_align` 便捷入口、12 类非法输入 |
+| `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
 | `TestGradAccum` | `grad_accum=1` 与改动前逐位一致、`grad_accum=2` 与 batch 翻倍等价、剩余不足 accum 的 batch 也会更新、非法取值报错 |
@@ -6256,6 +6291,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2643 个单元测试
+├── test_ai.py       # 2650 个单元测试
 └── README.md
 ```
