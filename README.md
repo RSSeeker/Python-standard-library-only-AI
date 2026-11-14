@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3014 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3018 项）
 
 ## 特性
 
@@ -1427,6 +1427,7 @@ loss_kd, g_logits = dkd_loss([1.2, -0.3, 0.4], [2.0, -1.0, 0.2], label=0,
 | `Adan` / `Prodigy` / `CAME` | 进阶三件套：Adan 用「梯度差 + 参数差」的三阶矩（第一步没有位移信息，退化为带偏差校正的 Adam）；Prodigy 不需要 lr——步长 `d` 按「上一步是否真的下降」乘性自适应（工程上的稳健替代，与原论文的累积投影估计不同，docstring 已写明差别）；CAME 用 `r`/`c` **行列向量**因子化二阶矩（不是矩阵，省内存且不丢量纲），`clip_threshold` 才真正只在需要处生效 |
 | `Shampoo` / `Sophia` / `LBFGS` | 二阶近似三件套：Shampoo 用 `L=GGᵀ`/`R=GᵀG` 的 `L^{-1/4} G R^{-1/4}` 预条件（`max(fan_out,fan_in) > max_dim` 的层退化为逐元素 Adam）；其中 `inverse_root='newton'` 改用 Newton–Schulz 迭代求逆根（`newton_iters` 控制步数），`grafting=True` 时把更新方向按 Adam 更新范数缩放后再落地（论文的 Adam grafting）；Sophia 用 `clip(m / max(ρh, ε), ±1)`（`h` 来自 `hessian_diags` / `hessian_fn` / `g²` 三者之一，**不是真 Hessian**）；L-BFGS 是逐层分块的两循环递归、无 line search，`lr` 要比 SGD 小一个量级 |
 | `GaLore(model, lr=1e-3, rank=4, proj_gap=100)` | 梯度低秩投影优化器：每 `proj_gap` 步对权重的梯度做一次低秩分解（取 `GᵀG` 的前 `rank` 个特征向量，`U Σ Vᵀ`），只在该子空间里跑 Adam，更新按 `U · Ĝ_low · Vᵀ` 投影回完整矩阵；`max(fan_out, fan_in) <= rank` 的层退化为普通 Adam；状态只存 `r×r` 矩与投影基，`state_bytes_estimate()` 给出元素数 |
+| `q_galore_quantize(weight, rank=4, bits=4)` | Q-GaLore 教学实现：对 `_galore_svd_low_rank` 得到的 U/V 因子做对称均匀伪量化（`fake_quantize`）后重建 `Uq·Vq`，返回量化因子、重建矩阵、相对低秩重建误差、相对原始矩阵误差与压缩比估算；只做量化/重建，不含训练循环 |
 | `sophia_hutchinson_diag(model, xs, ys, num_samples=8, eps=1e-3, seed=None)` | 用 Hutchinson 方法估计 MLP + MSE 损失对参数的 Hessian 对角：Rademacher 向量 `v` 乘 `(g(w+εv) − g(w−εv)) / (2ε)` 作为 `H v`，再对 `v ⊙ H v` 取平均；逐层返回 `(diag_w, diag_b)`，可直接传给 `Sophia.step(grads, hessian_diags=...)`。中心差分在 ReLU 拐点附近不精确，估计有方差（`num_samples` 越大越稳） |
 | `SGDW` / `NesterovSGD` | 解耦权重衰减的 SGD 族：`AdamW` 之于 `Adam` 就是 `SGDW` 之于 `SGD`；`nesterov=False` 时与 `SGD` 的差别只在衰减位置 |
 | `SGD` | 随机梯度下降 |
@@ -5222,7 +5223,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3014 项）。
+`tests/`（合计 3018 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5230,7 +5231,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3014 项
+pytest -q                        # test_ai.py + tests/ 合计 3018 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7020,7 +7021,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3014 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3018 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7046,6 +7047,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSophiaHutchinson` | 正交零和输入下线性模型 Hessian 对角精确为 2、两层 MLP 返回形状、与逐参数中心差分精确对角的近似（max abs diff < 0.4）、Sophia + Hutchinson 训练 loss 下降、非法输入 |
 | `TestShampooNewtonGrafting` | Newton–Schulz 逆根与 Jacobi 特征分解结果一致（max_abs < 1e-6）、Newton 路径训练收敛、grafting 一步更新范数与 Adam 一致、`state_dict` 往返（含 `L/R/m/v` 字段）、非法超参 |
 | `TestGaLore` | 全秩投影重建（`rank=min` 时 err < 1e-8）、`rank=1` 更新增量行列式 ≈ 0、200 步线性回归收敛、偏置更新与手写 Adam 一致、7 类非法输入 |
+| `TestQGaLore` | Q-GaLore 重建形状/误差上界、压缩比公式、确定性、bits=2/4/8 误差单调、8 类非法输入 |
 | `TestKVCacheEviction` | StreamingLLM 的 sink+最近窗口、H2O 保留高注意力与 `recent` token、SnapKV 只看观测窗口、下标有序且长度等于 budget、cache 子集一致、非法输入 |
 | `TestPromptCacheManager` | 前缀/最长部分前缀命中与统计、LRU 与 token 预算淘汰、JSON 持久化往返、前缀复用模拟的 token 节省、非法输入 |
 | `TestZero23` | ZeRO-2 单步与手写 Adam 逐位一致、三步状态递推一致、ZeRO-3 分片数值等价且覆盖完整、显存估算随 stage 递减、非法输入 |
@@ -7558,7 +7560,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2962 个单元测试
+├── test_ai.py       # 2966 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本

@@ -48153,3 +48153,58 @@ class TestLatentDiffusion:
         assert _ld_raises(lambda: ld.sample([0.1], cfg_scale=1.0))
         assert _ld_raises(lambda: ld.sample([0.1, 0.2], cfg_scale=-1.0))
 
+
+
+"""批 p116 测试：Q-GaLore（量化低秩投影因子）。"""
+
+import math
+import random
+
+
+def _qg_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestQGaLore:
+    def test_basic_shapes_and_errors(self):
+        random.seed(0)
+        w = [[random.uniform(-1, 1) for _ in range(6)] for _ in range(4)]
+        r = AI.q_galore_quantize(w, rank=2, bits=4)
+        assert r["rank"] == 2 and r["bits"] == 4
+        assert len(r["reconstruction"]) == 4
+        assert len(r["reconstruction"][0]) == 6
+        assert 0.0 <= r["error_vs_low_rank"] < 1.0
+        assert 0.0 < r["error_vs_original"] < 1.0
+        assert abs(r["compression_ratio"] - (4 + 6) * 2 * 4 / (4 * 6 * 32)) < 1e-12
+
+    def test_deterministic_and_bits_monotone(self):
+        random.seed(1)
+        w = [[random.uniform(-1, 1) for _ in range(5)] for _ in range(3)]
+        a = AI.q_galore_quantize(w, rank=2, bits=4)
+        b = AI.q_galore_quantize(w, rank=2, bits=4)
+        assert a["reconstruction"] == b["reconstruction"]
+        errs = {}
+        for bits in (2, 4, 8):
+            errs[bits] = AI.q_galore_quantize(w, rank=2, bits=bits)["error_vs_low_rank"]
+        assert errs[8] <= errs[4] + 1e-9
+        assert errs[4] <= errs[2] + 1e-9
+
+    def test_identity_small(self):
+        r = AI.q_galore_quantize([[2.0, 0.0], [0.0, 1.0]], rank=1, bits=8)
+        assert r["rank"] == 1
+
+    def test_invalid_inputs(self):
+        random.seed(2)
+        w = [[random.uniform(-1, 1) for _ in range(4)] for _ in range(2)]
+        assert _qg_raises(lambda: AI.q_galore_quantize([]))
+        assert _qg_raises(lambda: AI.q_galore_quantize([[]]))
+        assert _qg_raises(lambda: AI.q_galore_quantize([[1.0, 2.0], [3.0]]))
+        assert _qg_raises(lambda: AI.q_galore_quantize([[1.0, float("nan")]]))
+        assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=0))
+        assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=2.5))
+        assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=1, bits=1))
+        assert _qg_raises(lambda: AI.q_galore_quantize(w, rank=1, bits=17))

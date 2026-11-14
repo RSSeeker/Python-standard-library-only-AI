@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1879 个 def / 437 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1880 个 def / 437 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -51511,6 +51511,85 @@ def _galore_project(grad, u_rows, v_rows):
 def _galore_unproject(low, u_rows, v_rows):
     """G_approx = U · low · V。"""
     return _galore_mul(_galore_mul(u_rows, low), v_rows)
+
+def _qg_check_matrix(matrix, name="weight"):
+    if not isinstance(matrix, (list, tuple)) or not matrix:
+        raise ValueError(f"q_galore: {name} 必须是非空二维列表")
+    rows = []
+    width = None
+    for row in matrix:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"q_galore: {name} 的每行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"q_galore: {name} 各行长度必须一致")
+        out = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError(f"q_galore: {name} 必须是数字矩阵")
+            v = float(v)
+            if not math.isfinite(v):
+                raise ValueError(f"q_galore: {name} 含非有限值")
+            out.append(v)
+        rows.append(out)
+    return rows
+
+
+def _qg_matmul(a, b):
+    """a: m×r，b: r×n → m×n（b 以行列表给出）。"""
+    n = len(b[0])
+    out = []
+    for i in range(len(a)):
+        row = []
+        for j in range(n):
+            row.append(sum(a[i][k] * b[k][j] for k in range(len(b))))
+        out.append(row)
+    return out
+
+
+def q_galore_quantize(weight, rank=4, bits=4):
+    """Q-GaLore 教学实现：把 GaLore 的低秩投影因子量化后再重建。
+
+    步骤：``W ≈ U V``（``_galore_svd_low_rank`` 取前 rank 个奇异方向）→
+    对 U、V 分别做对称均匀伪量化（``fake_quantize``）→ 重建 ``Uq Vq``。
+    返回的误差度量：相对低秩重建误差（量化引入的损失）与相对原始矩阵误差。
+    压缩比按「(m+n)·r·bits / (m·n·32)」估算（只存量化后的两个因子）。
+    """
+    weight = _qg_check_matrix(weight)
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        raise TypeError(f"q_galore: rank 必须是整数，收到 {rank!r}")
+    if rank < 1:
+        raise ValueError(f"q_galore: rank 必须 >= 1，收到 {rank!r}")
+    _w15_check_bits(bits, "q_galore")
+    rows, cols = len(weight), len(weight[0])
+    u, v = _galore_svd_low_rank(weight, rank)
+    if not u or not v:
+        raise ValueError("q_galore: 低秩分解失败（矩阵为空）")
+    lr_recon = _qg_matmul(u, v)
+    uq = fake_quantize(u, bits)
+    vq = fake_quantize(v, bits)
+    recon = _qg_matmul(uq, vq)
+
+    def _rel(a, b):
+        num = math.sqrt(sum((a[i][j] - b[i][j]) ** 2
+                            for i in range(rows) for j in range(cols)))
+        den = math.sqrt(sum(b[i][j] ** 2 for i in range(rows) for j in range(cols)))
+        return num / max(den, 1e-12)
+
+    effective_rank = len(v)
+    ratio = ((rows + cols) * effective_rank * bits) / (rows * cols * 32.0)
+    return {
+        "rank": effective_rank,
+        "bits": bits,
+        "u_quantized": uq,
+        "v_quantized": vq,
+        "reconstruction": recon,
+        "low_rank_reconstruction": lr_recon,
+        "error_vs_low_rank": _rel(recon, lr_recon),
+        "error_vs_original": _rel(recon, weight),
+        "compression_ratio": ratio,
+    }
 
 
 class GaLore:
