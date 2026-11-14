@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1760 个 def / 419 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1764 个 def / 420 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -43305,6 +43305,174 @@ class IA3:
             self.grad_v[j] += delta_out[j] * self.base[j]
         d_base = [self.v[j] * delta_out[j] for j in range(self.fan_out)]
         return self.layer.backward(d_base)[-1]
+
+
+def _p88_check_rank(rank, who):
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+        raise ValueError(f"{who}: rank 必须是正整数，收到 {rank!r}")
+    return rank
+
+
+def _p88_matmul(a, b):
+    """普通矩阵乘（a: m×k，b: k×n）。"""
+    return [[sum(a[i][t] * b[t][j] for t in range(len(b)))
+             for j in range(len(b[0]))] for i in range(len(a))]
+
+
+def pissa_lora(layer, rank: int = 4):
+    """PiSSA：用权重的主成分初始化 LoRA，再把主成分从基座里减掉
+
+    对 `W` 做低秩 SVD `W ≈ U Σ V`，取前 `rank` 个主成分：
+
+    - `B = U Σ^{1/2}`（fan_out×rank）、`A = Σ^{1/2} V`（rank×fan_in）；
+    - 基座权重改成残差 `W - B A`，因此**未合并**时 `LoRA.forward(x)` 与
+      原始层输出（数值上）一致，但训练时只更新主成分方向。
+
+    返回 `LoRA` 实例（`scaling=1`）；`layer` 会被原地修改。
+    """
+    if not isinstance(layer, Layer):
+        raise TypeError(f"pissa_lora: layer 必须是 Layer，收到 {type(layer).__name__}")
+    rank = _p88_check_rank(rank, "pissa_lora")
+    fan_out, fan_in = layer.fan_out, layer.fan_in
+    r = min(rank, fan_in, fan_out)
+    u_rows, v_rows = _galore_svd_low_rank(layer.weights, r)
+    # 奇异值：sigma_r = u_rᵀ W v_r
+    sigmas = []
+    for rr in range(len(v_rows)):
+        u_col = [u_rows[i][rr] for i in range(fan_out)]
+        wv = [sum(layer.weights[i][j] * v_rows[rr][j] for j in range(fan_in))
+              for i in range(fan_out)]
+        sigmas.append(max(0.0, sum(u_col[i] * wv[i] for i in range(fan_out))))
+    root = [math.sqrt(s) for s in sigmas]
+    B = [[u_rows[i][rr] * root[rr] for rr in range(len(root))]
+         for i in range(fan_out)]
+    A = [[root[rr] * v_rows[rr][j] for j in range(fan_in)]
+         for rr in range(len(root))]
+    delta = _p88_matmul(B, A)
+    for i in range(fan_out):
+        for j in range(fan_in):
+            layer.weights[i][j] -= delta[i][j]
+    lora = LoRA(layer, rank=len(root), alpha=len(root))
+    lora.A = [row[:] for row in A]
+    lora.B = [row[:] for row in B]
+    lora.merged = False
+    lora.zero_grad()
+    return lora
+
+
+def lora_plus_step(lora, lr: float, ratio: float = 16.0):
+    """LoRA+：给 B 用比 A 更大的学习率（`lr_B = lr * ratio`）
+
+    只做一步 SGD：`A -= lr·grad_A`、`B -= lr·ratio·grad_B`，
+    其它 LoRA 变体/优化器状态不在本函数内维护。
+    """
+    if not isinstance(lora, LoRA):
+        raise TypeError(f"lora_plus_step: lora 必须是 LoRA，收到 {type(lora).__name__}")
+    if not isinstance(lr, (int, float)) or isinstance(lr, bool):
+        raise TypeError("lora_plus_step: lr 必须是数字")
+    if not (float(lr) > 0.0) or not math.isfinite(float(lr)):
+        raise ValueError("lora_plus_step: lr 必须是 > 0 的有限数字")
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+        raise TypeError("lora_plus_step: ratio 必须是数字")
+    if not (float(ratio) > 0.0) or not math.isfinite(float(ratio)):
+        raise ValueError("lora_plus_step: ratio 必须是 > 0 的有限数字")
+    for rr in range(lora.rank):
+        for j in range(lora.fan_in):
+            lora.A[rr][j] -= float(lr) * lora.grad_A[rr][j]
+    for i in range(lora.fan_out):
+        for rr in range(lora.rank):
+            lora.B[i][rr] -= float(lr) * float(ratio) * lora.grad_B[i][rr]
+
+
+class BAdam:
+    """BAdam：把参数按层分块，每步只更新一个块（块坐标 Adam）
+
+    内存收益来自「任意时刻只有一个块需要一阶/二阶矩」，代价是收敛路径更曲折。
+    这里按「层」分块：`num_blocks` 必须整除层数（或取层数本身），每步
+    `step(all_grads)` 只更新第 `step_count % num_blocks` 块，其余块的梯度忽略。
+
+    边界：只支持 `MLP`；没有梯度累积与稀疏更新；块内用标准 Adam 偏差修正。
+    """
+
+    def __init__(self, model, lr: float = 1e-2, beta1: float = 0.9,
+                 beta2: float = 0.999, eps: float = 1e-8, num_blocks=None):
+        if not isinstance(model, MLP):
+            raise ValueError(f"BAdam: model 必须是 MLP，收到 {type(model).__name__}")
+        for name, v in (("lr", lr), ("eps", eps)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"BAdam: {name} 必须是数字")
+            if not math.isfinite(float(v)) or float(v) <= 0.0:
+                raise ValueError(f"BAdam: {name} 必须是 > 0 的有限数字")
+        for name, v in (("beta1", beta1), ("beta2", beta2)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise TypeError(f"BAdam: {name} 必须是数字")
+            if not (0.0 <= float(v) < 1.0):
+                raise ValueError(f"BAdam: {name} 必须在 [0,1)")
+        self.model = model
+        self.lr = float(lr)
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        n_layers = len(model.layers)
+        if num_blocks is None:
+            num_blocks = n_layers
+        if isinstance(num_blocks, bool) or not isinstance(num_blocks, int) \
+                or num_blocks < 1:
+            raise ValueError("BAdam: num_blocks 必须是正整数")
+        if n_layers % num_blocks != 0:
+            raise ValueError(
+                f"BAdam: num_blocks={num_blocks} 必须整除层数 {n_layers}")
+        self.num_blocks = num_blocks
+        self.block_size = n_layers // num_blocks
+        self.step_count = 0
+        self._m = {}
+        self._v = {}
+        self._t = {}
+
+    def _state(self, idx):
+        if idx not in self._m:
+            layer = self.model.layers[idx]
+            self._m[idx] = ([[0.0] * len(row) for row in layer.weights],
+                            [0.0] * len(layer.biases))
+            self._v[idx] = ([[0.0] * len(row) for row in layer.weights],
+                            [0.0] * len(layer.biases))
+            self._t[idx] = 0
+        return self._m[idx], self._v[idx]
+
+    def step(self, all_grads):
+        """更新当前块；返回本次更新的层索引列表。"""
+        if not isinstance(all_grads, (list, tuple)):
+            raise ValueError("BAdam: all_grads 必须是 [(grad_w, grad_b), ...]")
+        if len(all_grads) != len(self.model.layers):
+            raise ValueError("BAdam: 梯度层数与模型层数不一致")
+        block = self.step_count % self.num_blocks
+        start = block * self.block_size
+        updated = list(range(start, start + self.block_size))
+        b1, b2 = self.beta1, self.beta2
+        for idx in updated:
+            layer = self.model.layers[idx]
+            gw, gb = all_grads[idx]
+            m_w, m_b = self._state(idx)[0]
+            v_w, v_b = self._v[idx]
+            self._t[idx] += 1
+            t = self._t[idx]
+            c1 = 1.0 - b1 ** t
+            c2 = 1.0 - b2 ** t
+            for r in range(len(layer.weights)):
+                for c in range(len(layer.weights[r])):
+                    g = float(gw[r][c])
+                    m_w[r][c] = b1 * m_w[r][c] + (1.0 - b1) * g
+                    v_w[r][c] = b2 * v_w[r][c] + (1.0 - b2) * g * g
+                    layer.weights[r][c] -= self.lr * (m_w[r][c] / c1) / (
+                        math.sqrt(v_w[r][c] / c2) + self.eps)
+            for k in range(len(layer.biases)):
+                g = float(gb[k])
+                m_b[k] = b1 * m_b[k] + (1.0 - b1) * g
+                v_b[k] = b2 * v_b[k] + (1.0 - b2) * g * g
+                layer.biases[k] -= self.lr * (m_b[k] / c1) / (
+                    math.sqrt(v_b[k] / c2) + self.eps)
+        self.step_count += 1
+        return updated
 
 
 class QLoRA:

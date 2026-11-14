@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2838 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2843 项）
 
 ## 特性
 
@@ -549,8 +549,11 @@ sched = WarmupLR(optimizer, warmup_epochs=5,
 | `AdaLoRALinear(layer, rank=8, ema=0.9)` | AdaLoRA（简化）：每秩维护重要性 `\|A_r\|·\|B_:,r\|` 的 EMA，`prune(keep)` 只保留最重要的 `keep` 个秩（其余 A 行/B 列置零并停梯度），`active_ranks()` 查存活秩 |
 | `finetune_lora(model, xs, ys, rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False)` | 一键 LoRA 微调：接受 `Model`（其 `.model` 为 `MLP`）或直接传 `MLP`，给每层套 `LoRA`、冻结基座、只更新 A/B；`loss` 支持 `"mse"` 与 `"cross_entropy"`（后者要求输出层为线性 logits）；返回 `loss_history`、`adapters`、`trainable_params`/`base_params`/`total_params` |
 | `finetune_adapter(model, xs, ys, adapter="lora", rank=4, alpha=None, lr=0.01, epochs=50, loss="mse", seed=None, shuffle=False, prune_keep=None, **options)` | 通用 PEFT 微调入口：`adapter` 支持 `lora` / `qlora` / `dora` / `adalora` / `vera` / `reft`，逐层套对应适配器并冻结基座（`qlora` 构造时会量化基座、之后不再更新）；`adalora` 可用 `prune_keep` 每轮按重要性收缩秩；`bits`/`eps`/`ema` 等透传；返回同 `finetune_lora` 的统计 |
+| `pissa_lora(layer, rank=4)` | PiSSA：对基座权重做低秩 SVD，用主成分初始化 `B=UΣ^{1/2}` / `A=Σ^{1/2}V` 并把主成分从基座减掉；未合并时前向与原始层数值一致，只训主成分方向 |
+| `lora_plus_step(lora, lr, ratio=16.0)` | LoRA+ 更新：`A -= lr·grad_A`、`B -= lr·ratio·grad_B`（论文建议 B 用更大学习率） |
 | `AdamW(model, lr, ..., weight_decay=0.01)` | 解耦权重衰减；`weight_decay=0` 时与 `Adam` **逐位相同** |
 | `Adam8bit(model, lr=1e-3, ..., block_size=256)` | 8-bit Adam 模拟：每步把一阶/二阶矩按 `block_size` 分块、用块内 `absmax/127` 量化成 int8，反量化后更新参数；与 `Adam.step` 同接口，另提供 `state_bytes_estimate()` 与 `state_dict`/`load_state_dict` |
+| `BAdam(model, lr=1e-2, ..., num_blocks=None)` | 块坐标 Adam：按层分块，每步只更新一个块（`step()` 返回本次更新的层索引），降低矩估计内存；`num_blocks` 必须整除层数 |
 
 `Adam8bit` 是分块量化的教学实现：状态在每步更新后重新量化（int8 值 + 每块一个
 fp32 scale），误差被限制在半个 scale 内；这里用 Python 列表模拟、不省真实内存，
@@ -6463,7 +6466,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2838 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2843 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6943,6 +6946,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestMetricLosses` | SupCon/ArcFace/CosFace/Circle 损失的前向取值、梯度中心差分、margin/温度行为、空正/负样本与 13 类非法输入 |
 | `TestRKDAndDKD` | RKD 距离/角度/加权组合的梯度中心差分、学生=教师时零损失、DKD 单项与 alpha/beta/T 组合的 FD、14 类非法输入 |
 | `TestSAMOptimizer` | first_step 扰动幅度与零梯度不变、second_step 恢复后更新、SAM-SGD/SAM-Adam 训练收敛、9 类非法输入 |
+| `TestPEFTVariants` | PiSSA 前向等价与残差重建、LoRA+ 双学习率步长、BAdam 分块交替更新与训练收敛、10 类非法输入 |
 | `TestPPOKLTrainer` | 奖励驱动训练后平均奖励提升、`kl_coef` 大时策略被拉在参考附近、同 seed rollout 可复现、`group_step` 返回结构完整且参考模型冻结、`ppo_kl_align` 便捷入口、16 类非法输入；另含 `ppo_loss` 熵梯度中心差分回归 |
 | `TestMultiTaskWeighting` | 不确定性加权闭式解与双向差分、GradNorm 不动点与 `sign(G-target)·G0/r` 逐项校验、PCGrad 冲突投影与嵌套结构、11 类非法输入 |
 | `TestModelLossMap` | `Model(loss=...)` 认得 focal/bce/bce_with_logits/huber、`loss_kwargs` 透传（与直接调用逐位相等）、`kl` 被拒、激活守卫、未知损失的错误信息列出新选项 |
@@ -6977,6 +6981,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2838 个单元测试
+├── test_ai.py       # 2843 个单元测试
 └── README.md
 ```

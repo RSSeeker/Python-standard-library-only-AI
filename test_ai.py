@@ -45911,3 +45911,135 @@ class TestSAMOptimizer:
         assert bad(lambda: AI.SAMOptimizer(m).first_step([([[[1.0, 2.0]]], [0.0])]))
         assert bad(lambda: AI.SAMOptimizer(m).first_step("x"))
         assert bad(lambda: AI.SAMOptimizer(m).second_step([([[0.0]], [0.0])]))
+
+
+def _p88f_layer_out(layer, x):
+    return AI._dense_rows_forward(layer, [x])[0][0]
+
+
+def _p88f_grads(model, xs, ys):
+    acc_w = [[[0.0] * len(row) for row in L.weights] for L in model.layers]
+    acc_b = [[0.0] * len(L.biases) for L in model.layers]
+    n = len(xs)
+    out_dim = len(model.layers[-1].weights)
+    for x, y in zip(xs, ys):
+        caches = []
+        cur = list(x)
+        for L in model.layers:
+            out, cache = AI._dense_rows_forward(L, [cur])
+            caches.append(cache)
+            cur = out[0]
+        d = [2.0 * (cur[i] - y[i]) / (n * out_dim) for i in range(out_dim)]
+        drows = [d]
+        for li in range(len(model.layers) - 1, -1, -1):
+            gw, gb, dx = AI._dense_rows_backward(model.layers[li], caches[li], drows)
+            for r in range(len(acc_w[li])):
+                for c in range(len(acc_w[li][r])):
+                    acc_w[li][r][c] += gw[r][c]
+            for k in range(len(acc_b[li])):
+                acc_b[li][k] += gb[k]
+            drows = dx
+    return list(zip(acc_w, acc_b))
+
+
+def _p88f_loss(model, xs, ys):
+    total = 0.0
+    for x, y in zip(xs, ys):
+        cur = list(x)
+        for L in model.layers:
+            cur = AI._dense_rows_forward(L, [cur])[0][0]
+        for a, b in zip(cur, y):
+            total += (a - b) ** 2
+    return total / (len(xs) * len(ys[0]))
+
+
+class TestPEFTVariants:
+    """PiSSA / LoRA+ / BAdam。"""
+
+    def test_pissa(self):
+        import random
+        rng = random.Random(5)
+        layer = AI.Layer(6, 4, "linear")
+        for r in range(4):
+            for c in range(6):
+                layer.weights[r][c] = rng.uniform(-1, 1)
+        for k in range(4):
+            layer.biases[k] = rng.uniform(-0.3, 0.3)
+        w0 = [row[:] for row in layer.weights]
+        x = [rng.uniform(-1, 1) for _ in range(6)]
+        y_before = _p88f_layer_out(layer, x)
+        lora = AI.pissa_lora(layer, rank=2)
+        y_after = lora.forward(x)
+        err = max(abs(a - b) for a, b in zip(y_before, y_after))
+        assert err < 1e-9
+        recon = [[layer.weights[r][c] + sum(lora.B[r][k] * lora.A[k][c]
+                                            for k in range(lora.rank))
+                  for c in range(6)] for r in range(4)]
+        assert max(abs(recon[r][c] - w0[r][c])
+                   for r in range(4) for c in range(6)) < 1e-9
+        assert lora.rank == 2
+        assert max(abs(layer.weights[r][c] - w0[r][c])
+                   for r in range(4) for c in range(6)) > 1e-6
+
+    def test_lora_plus_step(self):
+        lora = AI.LoRA(AI.Layer(3, 2, "linear"), rank=2)
+        for k in range(lora.rank):
+            for j in range(lora.fan_in):
+                lora.grad_A[k][j] = 1.0
+        for i in range(lora.fan_out):
+            for k in range(lora.rank):
+                lora.grad_B[i][k] = 1.0
+        A0 = [row[:] for row in lora.A]
+        B0 = [row[:] for row in lora.B]
+        AI.lora_plus_step(lora, lr=0.1, ratio=5.0)
+        assert abs((A0[0][0] - lora.A[0][0]) - 0.1) < 1e-12
+        assert abs((B0[0][0] - lora.B[0][0]) - 0.5) < 1e-12
+
+    def test_badam_blocks(self):
+        m = AI.MLP([2, 2, 1], ["sigmoid", "linear"])
+        opt = AI.BAdam(m, lr=0.05, num_blocks=2)
+        xs = [[0.3, -0.2], [0.6, 0.4], [-0.5, 0.1], [0.2, -0.7]]
+        ys = [[1.0], [-1.0], [0.5], [0.2]]
+        w_prev = [[row[:] for row in L.weights] for L in m.layers]
+        upd = opt.step(_p88f_grads(m, xs, ys))
+        assert upd == [0]
+        assert m.layers[0].weights != w_prev[0]
+        assert m.layers[1].weights == w_prev[1]
+        w_after1 = [[row[:] for row in L.weights] for L in m.layers]
+        upd2 = opt.step(_p88f_grads(m, xs, ys))
+        assert upd2 == [1]
+        assert m.layers[1].weights != w_after1[1]
+        assert m.layers[0].weights == w_after1[0]
+        assert opt.step_count == 2
+
+    def test_badam_training(self):
+        xs = [[0.3, -0.2], [0.6, 0.4], [-0.5, 0.1], [0.2, -0.7]]
+        ys = [[1.0], [-1.0], [0.5], [0.2]]
+        m = AI.MLP([2, 4, 1], ["sigmoid", "linear"])
+        opt = AI.BAdam(m, lr=0.05, num_blocks=2)
+        start = _p88f_loss(m, xs, ys)
+        for _ in range(300):
+            opt.step(_p88f_grads(m, xs, ys))
+        end = _p88f_loss(m, xs, ys)
+        assert end < start * 0.2
+
+    def test_invalid_inputs(self):
+        def bad(fn):
+            try:
+                fn()
+            except (ValueError, TypeError):
+                return True
+            return False
+
+        m = AI.MLP([2, 2, 1], ["sigmoid", "linear"])
+        lora = AI.LoRA(AI.Layer(3, 2, "linear"), rank=2)
+        assert bad(lambda: AI.pissa_lora("x"))
+        assert bad(lambda: AI.pissa_lora(AI.Layer(3, 2, "linear"), rank=0))
+        assert bad(lambda: AI.lora_plus_step("x", 0.1))
+        assert bad(lambda: AI.lora_plus_step(lora, 0.0))
+        assert bad(lambda: AI.lora_plus_step(lora, float("nan")))
+        assert bad(lambda: AI.lora_plus_step(lora, 0.1, ratio=-1.0))
+        assert bad(lambda: AI.BAdam("x"))
+        assert bad(lambda: AI.BAdam(m, lr=0.0))
+        assert bad(lambda: AI.BAdam(m, num_blocks=3))
+        assert bad(lambda: AI.BAdam(m, beta1=1.0))
