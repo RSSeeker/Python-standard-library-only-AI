@@ -60685,6 +60685,268 @@ def _retention_backward(dout, cache):
     return dq, dk, dv
 
 
+
+def _cw_check_matrix(rows, who, width=None):
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError("%s: 需要非空的二维列表" % who)
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError("%s: 第 %d 行必须是非空 list/tuple" % (who, i))
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError("%s: 第 %d 行含非数字元素 %r" % (who, i, v))
+            vals.append(float(v))
+        if width is not None and len(vals) != width:
+            raise ValueError("%s: 第 %d 行长度 %d != %d" % (who, i, len(vals), width))
+        out.append(vals)
+    return out
+
+
+def _cw_check_pos_int(value, who, name="chunk_size"):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("%s: %s 必须是正整数" % (who, name))
+    return value
+
+
+def chunkwise_retention_forward(q, k, v, gamma, scale=None, chunk_size=4):
+    """RetNet 保留层的分块（chunkwise）并行前向。
+
+    q/k: (T, d_k)；v: (T, d_v)；gamma 为标量衰减。返回 ``(out, cache)``，
+    out[t] = Σ_{j<=t} gamma^(t-j)·(q_t·k_j)·v_j / denom_t，
+    denom_t = Σ_{j<=t} gamma^(t-j)。
+
+    块内直接按上式计算（教学用 O(C²)），块间只传状态
+    ``S_b = Σ_{j<b} gamma^(b-1-j)·k_j v_jᵀ`` 与 ``denom_b``，
+    因此块与块之间是矩阵乘；这正是 RetNet chunkwise 形式的核心。
+    """
+    who = "chunkwise_retention_forward"
+    q = _cw_check_matrix(q, who + ".q")
+    T = len(q)
+    dk = len(q[0])
+    k = _cw_check_matrix(k, who + ".k", dk)
+    if len(k) != T:
+        raise ValueError(who + ": q 与 k 的序列长度必须一致")
+    v = _cw_check_matrix(v, who + ".v")
+    if len(v) != T:
+        raise ValueError(who + ": v 的序列长度必须与 q 一致")
+    dv = len(v[0])
+    if scale is None:
+        scale = 1.0 / math.sqrt(dk)
+    elif isinstance(scale, bool) or not isinstance(scale, (int, float)) or scale <= 0:
+        raise ValueError(who + ": scale 必须是正数")
+    else:
+        scale = float(scale)
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) or not (0.0 < gamma <= 1.0):
+        raise ValueError(who + ": gamma 必须在 (0, 1]")
+    chunk_size = _cw_check_pos_int(chunk_size, who)
+
+    out = [[0.0] * dv for _ in range(T)]
+    # 跨块状态 S[i][j] = Σ_{s<b} gamma^(b-1-s)·k_s[i]·v_s[j]
+    S = [[0.0] * dv for _ in range(dk)]
+    denom_b = 0.0  # denom_{b-1}
+    chunks = []
+    for b in range(0, T, chunk_size):
+        e = min(T, b + chunk_size)
+        chunks.append((b, e))
+        for t in range(b, e):
+            # 块间贡献：gamma^(t-b+1)·q_t S_b
+            gp = gamma ** (t - b + 1)
+            row = out[t]
+            for i in range(dk):
+                qi = q[t][i]
+                if qi == 0.0:
+                    continue
+                base = gp * qi * scale
+                si = S[i]
+                for j in range(dv):
+                    row[j] += base * si[j]
+            d = gp * denom_b
+            # 块内贡献
+            for s in range(b, t + 1):
+                w = gamma ** (t - s) * (sum(q[t][i] * k[s][i] for i in range(dk))) * scale
+                d += gamma ** (t - s)
+                vs = v[s]
+                for j in range(dv):
+                    row[j] += w * vs[j]
+            for j in range(dv):
+                row[j] /= d
+        # 更新跨块状态与 denom
+        gp = gamma ** (e - b)
+        if gp != 1.0:
+            for i in range(dk):
+                si = S[i]
+                for j in range(dv):
+                    si[j] *= gp
+        for s in range(b, e):
+            w = gamma ** (e - 1 - s)
+            ks, vs = k[s], v[s]
+            for i in range(dk):
+                ki = w * ks[i]
+                if ki == 0.0:
+                    continue
+                si = S[i]
+                for j in range(dv):
+                    si[j] += ki * vs[j]
+        denom_b = gp * denom_b + sum(gamma ** (e - 1 - s) for s in range(b, e))
+    cache = {"q": q, "k": k, "v": v, "gamma": float(gamma),
+             "scale": scale, "chunks": chunks, "T": T}
+    return out, cache
+
+
+def chunkwise_retention_backward(dout, cache):
+    """分块保留层的解析反向：与顺序保留层是同一个函数，直接复用顺序实现。"""
+    q, k, v = cache["q"], cache["k"], cache["v"]
+    gamma, scale = cache["gamma"], cache["scale"]
+    _, ref_cache = _retention_forward([row[:] for row in q],
+                                      [row[:] for row in k],
+                                      [row[:] for row in v], gamma, scale)
+    return _retention_backward(dout, ref_cache)
+
+
+def _cw_scan_states(x_seq, a_seq, B_seq):
+    """顺序扫描辅助：返回每步状态 S_t（t 从 0 起，S_t = a_t*S_{t-1}+x_t⊗B_t）。"""
+    T, d = len(x_seq), len(x_seq[0])
+    ds = len(B_seq[0])
+    states = []
+    cur = [[0.0] * ds for _ in range(d)]
+    for t in range(T):
+        at = a_seq[t]
+        for i in range(d):
+            ai = at[i]
+            xi = x_seq[t][i]
+            si = cur[i]
+            bi = B_seq[t]
+            for j in range(ds):
+                si[j] = ai * si[j] + xi * bi[j]
+        states.append([row[:] for row in cur])
+    return states
+
+
+def chunkwise_selective_scan_forward(x_seq, a_seq, B_seq, C_seq, D=None, chunk_size=4):
+    """Mamba-2 / 选择性扫描的分块并行前向。
+
+    对每个通道 i（d 维）、状态维度 j（ds 维）：
+    ``S_t[i][j] = a_t[i]·S_{t-1}[i][j] + x_t[i]·B_t[j]``，
+    ``y_t[i] = Σ_j C_t[j]·S_t[i][j] + D[i]·x_t[i]``。
+    块内用前缀衰减乘积算局部和，块间只累加 ``a^chunk_len`` 乘过的状态。
+    """
+    who = "chunkwise_selective_scan_forward"
+    x_seq = _cw_check_matrix(x_seq, who + ".x")
+    T, d = len(x_seq), len(x_seq[0])
+    a_seq = _cw_check_matrix(a_seq, who + ".a", d)
+    if len(a_seq) != T:
+        raise ValueError(who + ": a_seq 与 x_seq 序列长度必须一致")
+    for row in a_seq:
+        for av in row:
+            if not (0.0 < av <= 1.0):
+                raise ValueError(who + ": 衰减 a 必须在 (0,1]")
+    B_seq = _cw_check_matrix(B_seq, who + ".B")
+    if len(B_seq) != T:
+        raise ValueError(who + ": B_seq 与 x_seq 序列长度必须一致")
+    ds = len(B_seq[0])
+    C_seq = _cw_check_matrix(C_seq, who + ".C", ds)
+    if len(C_seq) != T:
+        raise ValueError(who + ": C_seq 与 x_seq 序列长度必须一致")
+    if D is None:
+        D = [0.0] * d
+    else:
+        D = [float(DD) for DD in D]
+        if len(D) != d:
+            raise ValueError(who + ": D 长度必须等于 x 的通道数")
+    chunk_size = _cw_check_pos_int(chunk_size, who)
+    out = [[0.0] * d for _ in range(T)]
+    S = [[0.0] * ds for _ in range(d)]
+    chunks = []
+    for b in range(0, T, chunk_size):
+        e = min(T, b + chunk_size)
+        chunks.append((b, e))
+        # 块内前缀衰减乘积 pref[t][i] = Π_{u=b..t} a_u[i]
+        pref = []
+        acc = [1.0] * d
+        for t in range(b, e):
+            at = a_seq[t]
+            acc = [acc[i] * at[i] for i in range(d)]
+            pref.append(acc)
+        for t in range(b, e):
+            rel = t - b
+            acc_t = pref[rel]
+            # 块间状态贡献
+            for i in range(d):
+                ai = acc_t[i]
+                ci = C_seq[t]
+                si = S[i]
+                for j in range(ds):
+                    out[t][i] += ci[j] * ai * si[j]
+                # 块内贡献：Σ_{s=b..t} (Π_{u=s+1..t} a_u[i]) x_s B_s[j]
+                for s in range(b, t + 1):
+                    w = acc_t[i] / pref[s - b][i] if pref[s - b][i] != 0.0 else 0.0
+                    xs = x_seq[s][i]
+                    if w * xs == 0.0:
+                        continue
+                    bs = B_seq[s]
+                    for j in range(ds):
+                        out[t][i] += ci[j] * w * xs * bs[j]
+                out[t][i] += D[i] * x_seq[t][i]
+        # 块末状态更新：S ← a_len·S + Σ_s (Π_{u=s+1..e-1} a_u) x_s B_s
+        gp = pref[-1] if pref else [1.0] * d
+        for i in range(d):
+            si = S[i]
+            for j in range(ds):
+                si[j] *= gp[i]
+        for s in range(b, e):
+            acc_s = pref[e - 1 - b][:] if e - 1 - b >= 0 else [1.0] * d
+            for i in range(d):
+                w = acc_s[i] / pref[s - b][i] if pref[s - b][i] != 0.0 else 0.0
+                if w == 0.0:
+                    continue
+                xs = x_seq[s][i]
+                bs = B_seq[s]
+                for j in range(ds):
+                    S[i][j] += w * xs * bs[j]
+    cache = {"x": x_seq, "a": a_seq, "B": B_seq, "C": C_seq, "D": D,
+             "chunks": chunks, "states": _cw_scan_states(x_seq, a_seq, B_seq)}
+    return out, cache
+
+
+def chunkwise_selective_scan_backward(dout, cache):
+    """分块选择性扫描的解析反向（等价于顺序扫描的 BPTT，按块重算状态）。"""
+    x_seq = cache["x"]
+    a_seq = cache["a"]
+    B_seq = cache["B"]
+    C_seq = cache["C"]
+    D = cache["D"]
+    states = cache["states"]
+    T, d = len(x_seq), len(x_seq[0])
+    ds = len(B_seq[0])
+    dx = [[0.0] * d for _ in range(T)]
+    da = [[0.0] * d for _ in range(T)]
+    dB = [[0.0] * ds for _ in range(T)]
+    dC = [[0.0] * ds for _ in range(T)]
+    dD = [0.0] * d
+    dS_next = [[0.0] * ds for _ in range(d)]
+    for t in range(T - 1, -1, -1):
+        dS = [[0.0] * ds for _ in range(d)]
+        ct = C_seq[t]
+        for i in range(d):
+            dy = dout[t][i]
+            si = states[t][i]
+            for j in range(ds):
+                dS[i][j] = ct[j] * dy + a_seq[t + 1][i] * dS_next[i][j] if t + 1 < T else ct[j] * dy
+                dC[t][j] += dy * si[j]
+        for i in range(d):
+            for j in range(ds):
+                dx[t][i] += B_seq[t][j] * dS[i][j]
+                dB[t][j] += x_seq[t][i] * dS[i][j]
+                if t >= 1:
+                    da[t][i] += dS[i][j] * states[t - 1][i][j]
+            dx[t][i] += D[i] * dout[t][i]
+            dD[i] += dout[t][i] * x_seq[t][i]
+        dS_next = dS
+    return {"dx": dx, "da": da, "dB": dB, "dC": dC, "dD": dD}
+
+
 class RetNetBlock:
     """RetNet block：保留层（retention）+ FFN，两层 pre-norm 残差"""
 

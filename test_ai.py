@@ -44991,3 +44991,148 @@ class TestPropertyFuzz:
             lambda: AI.fuzz_nonfinite_inputs(strict, 2, seed="x"),
         ]
         assert all(_pq_raises(f) for f in bad)
+
+
+def _cw_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _cw_mat(rows):
+    return [list(r) for r in rows]
+
+
+class TestChunkwise:
+    def test_retention_forward_matches_sequential(self):
+        import math
+        import random as _r
+        rng = _r.Random(7)
+        T, dk, dv = 9, 3, 2
+        q = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        k = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        v = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(T)]
+        gamma, scale = 0.7, 1.0 / math.sqrt(dk)
+        ref, _ = AI._retention_forward(_cw_mat(q), _cw_mat(k), _cw_mat(v), gamma, scale)
+        for cs in (1, 2, 3, 4, 7):
+            out, _ = AI.chunkwise_retention_forward(q, k, v, gamma, scale, chunk_size=cs)
+            assert len(out) == T and len(out[0]) == dv
+            err = max(abs(out[t][j] - ref[t][j]) for t in range(T) for j in range(dv))
+            assert err < 1e-10, (cs, err)
+
+    def test_retention_backward_fd(self):
+        import math
+        import random as _r
+        rng = _r.Random(11)
+        T, dk, dv = 9, 3, 2
+        q = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        k = [[rng.uniform(-1, 1) for _ in range(dk)] for _ in range(T)]
+        v = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(T)]
+        gamma, scale = 0.7, 1.0 / math.sqrt(dk)
+        dout = [[rng.uniform(-1, 1) for _ in range(dv)] for _ in range(T)]
+        _, cache = AI.chunkwise_retention_forward(q, k, v, gamma, scale, chunk_size=4)
+        dq, dk_, dv_ = AI.chunkwise_retention_backward(dout, cache)
+
+        def loss(qq, kk, vv):
+            out, _ = AI.chunkwise_retention_forward(qq, kk, vv, gamma, scale, chunk_size=4)
+            return sum(out[t][j] * dout[t][j] for t in range(T) for j in range(dv))
+
+        h = 1e-6
+        for (i, j), base, grad in (((2, 1), q, dq), ((1, 0), k, dk_), ((0, 1), v, dv_)):
+            orig = base[i][j]
+            base[i][j] = orig + h
+            lp = loss(q, k, v)
+            base[i][j] = orig - h
+            lm = loss(q, k, v)
+            base[i][j] = orig
+            fd = (lp - lm) / (2 * h)
+            assert abs(fd - grad[i][j]) / max(1.0, abs(fd)) < 1e-5
+
+    def test_selective_scan_forward_matches_naive(self):
+        import random as _r
+        rng = _r.Random(13)
+        T, d, ds = 7, 2, 3
+        x = [[rng.uniform(-1, 1) for _ in range(d)] for _ in range(T)]
+        a = [[rng.uniform(0.4, 1.0) for _ in range(d)] for _ in range(T)]
+        B = [[rng.uniform(-1, 1) for _ in range(ds)] for _ in range(T)]
+        C = [[rng.uniform(-1, 1) for _ in range(ds)] for _ in range(T)]
+        D = [0.3, -0.2]
+        states = AI._cw_scan_states(x, a, B)
+        naive = [[sum(C[t][j] * states[t][i][j] for j in range(ds)) + D[i] * x[t][i]
+                  for i in range(d)] for t in range(T)]
+        for cs in (1, 2, 3, 5, 20):
+            out, _ = AI.chunkwise_selective_scan_forward(x, a, B, C, D, chunk_size=cs)
+            err = max(abs(out[t][i] - naive[t][i]) for t in range(T) for i in range(d))
+            assert err < 1e-10, (cs, err)
+
+    def test_selective_scan_backward_fd(self):
+        import random as _r
+        rng = _r.Random(17)
+        T, d, ds = 7, 2, 3
+        x = [[rng.uniform(-1, 1) for _ in range(d)] for _ in range(T)]
+        a = [[rng.uniform(0.4, 1.0) for _ in range(d)] for _ in range(T)]
+        B = [[rng.uniform(-1, 1) for _ in range(ds)] for _ in range(T)]
+        C = [[rng.uniform(-1, 1) for _ in range(ds)] for _ in range(T)]
+        D = [0.3, -0.2]
+        dout = [[rng.uniform(-1, 1) for _ in range(d)] for _ in range(T)]
+        _, cache = AI.chunkwise_selective_scan_forward(x, a, B, C, D, chunk_size=3)
+        grads = AI.chunkwise_selective_scan_backward(dout, cache)
+
+        def loss():
+            out, _ = AI.chunkwise_selective_scan_forward(x, a, B, C, D, chunk_size=3)
+            return sum(out[t][i] * dout[t][i] for t in range(T) for i in range(d))
+
+        h = 1e-6
+
+        def fd_of(mutate):
+            orig = mutate(+h)
+            lp = loss()
+            mutate(-2 * h)
+            lm = loss()
+            mutate(+h)
+            return (lp - lm) / (2 * h), orig
+
+        def m_x(dh):
+            x[2][1] += dh
+            return None
+
+        def m_a(dh):
+            a[3][0] += dh
+            return None
+
+        def m_B(dh):
+            B[1][2] += dh
+            return None
+
+        def m_C(dh):
+            C[2][1] += dh
+            return None
+
+        for fn, ana in ((m_x, grads["dx"][2][1]), (m_a, grads["da"][3][0]),
+                        (m_B, grads["dB"][1][2]), (m_C, grads["dC"][2][1])):
+            fd, _ = fd_of(fn)
+            assert abs(fd - ana) / max(1.0, abs(fd)) < 1e-5
+
+    def test_invalid_inputs(self):
+        q = [[0.1, 0.2], [0.3, -0.1]]
+        k = [[0.2, 0.1], [0.4, -0.2]]
+        v = [[0.5], [0.2]]
+        x = [[0.5, 0.2]]
+        a = [[0.9, 0.8]]
+        B = [[0.1, 0.2, 0.3]]
+        C = [[1.0, 0.5, 0.2]]
+        bad = [
+            lambda: AI.chunkwise_retention_forward([], k, v, 0.7),
+            lambda: AI.chunkwise_retention_forward(q, k, v, 0.0),
+            lambda: AI.chunkwise_retention_forward(q, k, v, 1.5),
+            lambda: AI.chunkwise_retention_forward(q, k, v, 0.7, chunk_size=0),
+            lambda: AI.chunkwise_retention_forward(q, k, v, 0.7, scale=-1),
+            lambda: AI.chunkwise_selective_scan_forward(x, a, B, C, [0.0]),
+            lambda: AI.chunkwise_selective_scan_forward(x, [[1.5, 0.8]], B, C),
+            lambda: AI.chunkwise_selective_scan_forward(x, a, B, C, chunk_size=0),
+        ]
+        assert all(_cw_raises(f) for f in bad)

@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2796 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（2801 项）
 
 ## 特性
 
@@ -3830,8 +3830,10 @@ losses = model.fit([[1, 2, 3, 4, 5]], epochs=10, lr=0.01)
 | --- | --- |
 | `Mamba2Block(d_model, num_heads=2, d_state=4, seed=None)` | 多头部 SSD 块：`in_proj` 拆 x/z，由 x 投影出 `dt`/`B`/`C`；每头**标量**衰减 `a_t = exp(-exp(A_log)·dt_t)`，递推 `state_t = a_t·state_{t-1} + x_t⊗B_t`、`y_t = C_t·state_t`；`out = x + out_proj((y + D⊙x) ⊙ SiLU(z))`；手写 BPTT 反向与 SGD |
 | `Mamba2Model(vocab_size, d_model=32, num_heads=2, d_state=4, num_layers=2, max_len=64, seed=None)` | 字符级 Mamba-2 语言模型：Embedding → N×`Mamba2Block` → 线性 LM 头；`forward` / `loss_and_backward` / `fit` / `sgd_step` / `param_count` |
+| `chunkwise_selective_scan_forward(x_seq, a_seq, B_seq, C_seq, D=None, chunk_size=4)` | SSD 的分块并行前向：块内用前缀衰减乘积一次算完局部和，块间只传 `S` 状态；返回 `(y, cache)` |
+| `chunkwise_selective_scan_backward(dout, cache)` | 分块反向：反向前缀扫描得到 `dx/da/dB/dC/dD`（与顺序扫描的 BPTT 等价） |
 
-- 边界：A 是每头一个标量（Mamba-2 的 SSD 形式），不是 Mamba-1 的 d_inner×d_state 对角矩阵；`B_t`/`C_t` 在所有头之间共享（grouped，不支持分组数调节）；没有 depthwise 卷积、RoPE 与硬件并行扫描，时间维顺序递推，复杂度 O(T·d·d_state)。
+- 边界：A 是每头一个标量（Mamba-2 的 SSD 形式），不是 Mamba-1 的 d_inner×d_state 对角矩阵；`B_t`/`C_t` 在所有头之间共享（grouped，不支持分组数调节）；没有 depthwise 卷积、RoPE 与硬件并行扫描，默认顺序递推，复杂度 O(T·d·d_state)；另提供 `chunkwise_selective_scan_forward` / `chunkwise_selective_scan_backward` 分块并行教学版（块内 O(C²)、块间只传状态），与朴素顺序扫描数值一致。
 
 ### DETR（检测 Transformer）
 
@@ -3902,12 +3904,14 @@ print(m.generate([0, 1], max_new_tokens=3, seed=2))
 
 RetNet 用「保留（retention）」替代 softmax 注意力：位置 t 的输出是所有历史 `v_j` 按
 `gamma^(t-j)` 加权的和，多个头使用不同衰减 `gamma_h = 1 - 2^(-5-h)`（多尺度）。
-并行训练与循环推理在数学上等价；本实现只保留固定衰减的并行形式。
+并行训练与循环推理在数学上等价；本实现默认 `_retention_forward` 的 O(T²) 并行形式，另提供 `chunkwise_retention_forward` / `chunkwise_retention_backward` 分块版本（块内 O(C²)、块间只传 `S_b` 与归一化分母）。
 
 | API | 说明 |
 | --- | --- |
 | `RetNetBlock(d_model, num_heads, d_ff=None, eps=1e-5, seed=None)` | pre-norm 残差：`LayerNorm → Wq/Wk/Wv → 多头 retention → Wo` + `LayerNorm → W1(relu) → W2`；`forward(x)`、`backward(dout)`、`zero_grad/sgd_step/param_count` |
 | `RetNetModel(vocab_size, d_model=32, num_heads=4, d_ff=None, num_layers=2, max_len=64, seed=None)` | Embedding → N×`RetNetBlock` → `LayerNorm` → 词表头；`forward(ids)`、`fit(sequences, epochs, lr, ...)`、`generate(prompt_ids, max_new_tokens, temperature, top_k, seed)`、`param_count` |
+| `chunkwise_retention_forward(q, k, v, gamma, scale=None, chunk_size=4)` | 单头 retention 的分块并行前向：`out_t = Σ_{j≤t} γ^{t-j}(q_t·k_j)v_j / denom_t`，块内 O(C²)、块间只传 `S_b` 与分母 |
+| `chunkwise_retention_backward(dout, cache)` | 分块反向：复用同一 retention 的反向公式，返回 `(dq, dk, dv)` |
 
 ```python
 m = RetNetModel(vocab_size=6, d_model=8, num_heads=2, num_layers=1, max_len=8, seed=1)
@@ -6293,7 +6297,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-2796 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+2801 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -6612,6 +6616,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
 | `TestACDC` | 重放前向与 `CausalLM.forward` 逐位一致、threshold=0 不删节点、大 threshold 按 `max_remove` 删到剩余电路、结果可复现且字段齐全、9 类非法输入 |
 | `TestPropertyFuzz` | 属性测试报告 5 项检查全过且名称顺序固定、同 seed 结果一致；strict 函数 fuzz 正确拒绝非有限输入，loose 函数会被判 `nonfinite_silently_accepted`；9 类非法输入 |
+| `TestChunkwise` | retention 分块前向对 O(T²) 参考逐位一致、q/k/v 中心差分；selective scan 分块前向对朴素扫描一致、dx/da/dB/dC 中心差分；8 类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
@@ -6799,6 +6804,6 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2796 个单元测试
+├── test_ai.py       # 2801 个单元测试
 └── README.md
 ```
