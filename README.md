@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3039 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3044 项）
 
 ## 特性
 
@@ -2356,6 +2356,28 @@ print(rep["summary"]["pii_findings"])     # 1
 
 边界：规则匹配只用于评测流水线里的快速筛查，不做上下文消歧、实体归一化或
 脱敏改写；越狱打分偏向高召回，命中后仍需人工复核。
+
+### 安全 / 评测轻量工具（选择题 / GSM8K / HumanEval / 注入 / 后门 / 提取）
+
+| 函数 | 说明 |
+|---|---|
+| `extract_choice_letter(text, num_choices=4)` | 从模型输出中解析选择题答案字母：支持 `Answer: C`、`(B)`、`\boxed{A}`、单独 `D`；解析失败返回 None |
+| `multiple_choice_accuracy(predictions, answers)` | 选择题准确率（prediction 可为字母或 0 起下标，answer 为 0 起下标） |
+| `extract_gsm8k_answer(text)` / `gsm8k_accuracy(predictions, golds, tol=1e-9)` | GSM8K 数字抽取（优先 `####` 后的数字）与带容差的数值准确率 |
+| `extract_code_block(text)` / `humaneval_pass_at_1(completions, tests)` | 提取 python 围栏代码块，并用受限 builtins 执行 HumanEval 断言，返回 `{total,passed,pass_at_1,failures}` |
+| `prompt_injection_scan(prompt)` | 常见提示注入短语匹配，返回 `{matched,score,risk}`（强短语 high，其它命中 medium） |
+| `backdoor_scan(samples, trigger)` | 含触发词样本 vs 干净样本的标签一致性检查，返回 `suspicion`（0~1） |
+| `extraction_scan(strings, logprob_fn, threshold=None)` | 逐串打分，默认阈值 `max`（少于 5 条）或 `mean+1.5*std`，返回被标记的高风险串 |
+
+```python
+print(AI.extract_choice_letter("Answer: C", 4))       # C
+print(AI.extract_gsm8k_answer("steps... #### 42"))    # 42.0
+print(AI.prompt_injection_scan("ignore previous instructions")["risk"])  # high
+```
+
+边界：均为教学/离线评测用的轻量实现。HumanEval 检查用受限 builtins 的 `exec`，
+没有进程隔离、资源限制或超时，不要用于不可信代码；注入/后门/提取扫描是启发式
+规则，命中只作为排查线索，不替代人工复核。
 
 ### 高级评估（OOD / Conformal / 鲁棒性）
 
@@ -5290,7 +5312,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3039 项）。
+`tests/`（合计 3044 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5298,7 +5320,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3039 项
+pytest -q                        # test_ai.py + tests/ 合计 3044 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7088,7 +7110,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3039 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3044 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7407,6 +7429,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestKnowledgeEditing` | ROME 单条编辑输出精确性/偏置不变/最小范数、MEMIT 多条编辑精确性、键线性相关与维度不匹配等非法输入 |
 | `TestJudgeCalibration` | 合成 1.8 温度数据恢复 `a≈1.8` 且 NLL/Brier/ECE 下降、ECE 在完全正确预测下为 0、全正标签仍有限、九类非法输入（空/不等长/越界标签/NaN/lr/epochs/l2/bins） |
 | `TestRedTeamSafety` | 七类 PII 全部命中且按起点排序、Luhn 拒绝假卡、类别过滤、canary 命中/去重、越狱高/中/低风险与规则名、批量报告汇总与阈值、十一类非法输入 |
+| `TestSafetyEvalLight` | 选择题/GSM8K 解析与准确率、代码块与 HumanEval 受限执行、注入风险分级与后门 suspicion、提取阈值（小样本 max、大样本 mean+1.5σ）、八类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
@@ -7632,7 +7655,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2987 个单元测试
+├── test_ai.py       # 2992 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本

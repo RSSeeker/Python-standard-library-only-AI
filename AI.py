@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1905 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1916 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -70832,6 +70832,267 @@ class CheckpointManager:
         rec = records[0]
         return load_model(rec["path"]), rec
 
+
+
+# ---- 安全 / 评估轻量补充（B5）：选择题解析、GSM8K、HumanEval、注入/后门/提取扫描 ----
+
+
+def _b5_text(value, who):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{who}: 必须是非空字符串")
+    return value
+
+
+def _b5_text_list(values, who, allow_empty=False):
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{who}: 必须是字符串列表")
+    if not values and not allow_empty:
+        raise ValueError(f"{who}: 不能为空")
+    out = []
+    for i, v in enumerate(values):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{who}: 第 {i} 项必须是非空字符串")
+        out.append(v)
+    return out
+
+
+_B5_CHOICE_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+_B5_INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard the system",
+    "disregard previous",
+    "system prompt",
+    "you are now",
+    "developer mode",
+    "do anything now",
+    "jailbreak",
+    "reveal your instructions",
+    "print your instructions",
+)
+
+
+def extract_choice_letter(text, num_choices: int = 4):
+    """从选择题回答文本里抽取选项字母（A/B/C/...），找不到返回 None。
+
+    支持 ``Answer: C``、``(B)``、单独的 ``D``、以及句末的 ``\boxed{A}`` 等常见形式；
+    只接受 ``A`` 到 ``A + num_choices - 1`` 范围内的字母。
+    """
+    raw = _b5_text(text, "extract_choice_letter")
+    if isinstance(num_choices, bool) or not isinstance(num_choices, int) \
+            or not 2 <= num_choices <= 26:
+        raise ValueError("extract_choice_letter: num_choices 必须在 [2,26]")
+    allowed = set(_B5_CHOICE_LETTERS[:num_choices])
+    upper = raw.upper()
+    m = re.findall(r"\\boxed\{\s*([A-Z])\s*\}", upper, re.IGNORECASE)
+    if m and m[-1] in allowed:
+        return m[-1]
+    m = re.findall(r"ANSWER\s*(?:IS|:)?\s*[:：]?\s*\(?([A-Z])\)?", upper)
+    if m:
+        for letter in reversed(m):
+            if letter in allowed:
+                return letter
+    m = re.findall(r"\(([A-Z])\)", upper)
+    for letter in reversed(m):
+        if letter in allowed:
+            return letter
+    stripped = upper.strip()
+    if len(stripped) == 1 and stripped in allowed:
+        return stripped
+    return None
+
+
+def multiple_choice_accuracy(predictions, answers):
+    """选择题准确率：prediction 可以是选项字母或 0 起的下标，answer 是 0 起下标。"""
+    if not isinstance(predictions, (list, tuple)) or not predictions:
+        raise ValueError("multiple_choice_accuracy: predictions 不能为空")
+    if not isinstance(answers, (list, tuple)) or len(answers) != len(predictions):
+        raise ValueError("multiple_choice_accuracy: answers 与 predictions 长度必须一致")
+    hits = 0
+    for i, (pred, gold) in enumerate(zip(predictions, answers)):
+        if isinstance(gold, bool) or not isinstance(gold, int) or gold < 0:
+            raise ValueError(f"multiple_choice_accuracy: answers[{i}] 必须是非负整数")
+        if isinstance(pred, str):
+            letter = pred.strip().upper()
+            if len(letter) != 1 or letter not in _B5_CHOICE_LETTERS:
+                raise ValueError(
+                    f"multiple_choice_accuracy: predictions[{i}] 必须是选项字母")
+            value = _B5_CHOICE_LETTERS.index(letter)
+        elif isinstance(pred, bool) or not isinstance(pred, int):
+            raise ValueError(
+                f"multiple_choice_accuracy: predictions[{i}] 必须是字母或整数")
+        else:
+            value = pred
+        if value == gold:
+            hits += 1
+    return hits / len(predictions)
+
+
+_B5_NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+
+
+def extract_gsm8k_answer(text):
+    """抽取 GSM8K 式最终答案：优先 ``####`` 后的数字，否则取文本中最后一个数字。"""
+    raw = _b5_text(text, "extract_gsm8k_answer")
+    if "####" in raw:
+        tail = raw.rsplit("####", 1)[1]
+        m = _B5_NUM_RE.search(tail)
+        if m:
+            return float(m.group(0).replace(",", ""))
+    nums = _B5_NUM_RE.findall(raw)
+    if not nums:
+        return None
+    return float(nums[-1].replace(",", ""))
+
+
+def gsm8k_accuracy(predictions, golds, tol: float = 1e-9):
+    """GSM8K 数值准确率：两边都抽取数字后按容差比较。"""
+    preds = _b5_text_list(predictions, "gsm8k_accuracy.preds")
+    gold_list = _b5_text_list(golds, "gsm8k_accuracy.golds")
+    if len(preds) != len(gold_list):
+        raise ValueError("gsm8k_accuracy: predictions 与 golds 长度必须一致")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) \
+            or not math.isfinite(float(tol)) or float(tol) < 0.0:
+        raise ValueError("gsm8k_accuracy: tol 必须是非负数")
+    hits = 0
+    for p, g in zip(preds, gold_list):
+        pv = extract_gsm8k_answer(p)
+        gv = extract_gsm8k_answer(g)
+        if pv is not None and gv is not None and abs(pv - gv) <= float(tol):
+            hits += 1
+    return hits / len(preds)
+
+
+def extract_code_block(text):
+    """从 Markdown 回答里抽取代码块（```python ... ```），没有围栏则原样去空白返回。"""
+    raw = _b5_text(text, "extract_code_block")
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S)
+    if m:
+        return m.group(1).strip("\n")
+    return raw.strip()
+
+
+_B5_EXEC_NAMES = {
+    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
+    "divmod": divmod, "enumerate": enumerate, "filter": filter, "float": float,
+    "int": int, "isinstance": isinstance, "len": len, "list": list, "map": map,
+    "max": max, "min": min, "pow": pow, "print": print, "range": range,
+    "reversed": reversed, "round": round, "set": set, "sorted": sorted,
+    "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+    "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+}
+
+
+def humaneval_pass_at_1(completions, tests):
+    """HumanEval 式 pass@1：把每个补全与每条测试拼接后执行，全部测试通过才算通过。
+
+    为教学场景的**简化执行器**：在受限 builtins 的命名空间里 ``exec``，不隔离进程、
+    不设超时、不防御恶意代码，只适合可信的本地评测数据。
+    """
+    comps = _b5_text_list(completions, "humaneval_pass_at_1.completions")
+    test_codes = _b5_text_list(tests, "humaneval_pass_at_1.tests")
+    if len(comps) != len(test_codes):
+        raise ValueError("humaneval_pass_at_1: completions 与 tests 数量必须一致")
+    passed = 0
+    failures = []
+    for idx, (comp, test_code) in enumerate(zip(comps, test_codes)):
+        code = extract_code_block(comp)
+        ns = {"__builtins__": {}, **_B5_EXEC_NAMES}
+        try:
+            exec(code, ns)
+            exec(test_code, ns)
+        except Exception as exc:  # noqa: BLE001 - 评测需要捕获任意学生代码异常
+            failures.append({"index": idx, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        passed += 1
+    return {"total": len(comps), "passed": passed,
+            "pass_at_1": passed / len(comps), "failures": failures}
+
+
+def prompt_injection_scan(prompt):
+    """提示注入扫描：匹配常见越权短语，返回 ``{matched, score, risk}``。"""
+    raw = _b5_text(prompt, "prompt_injection_scan")
+    lower = raw.lower()
+    matched = [p for p in _B5_INJECTION_PATTERNS if p in lower]
+    score = len(matched) / len(_B5_INJECTION_PATTERNS)
+    strong = ("ignore previous instructions", "ignore all previous",
+              "disregard the system", "disregard previous",
+              "do anything now", "jailbreak", "reveal your instructions")
+    if any(p in matched for p in strong):
+        risk = "high"
+    elif matched:
+        risk = "medium"
+    else:
+        risk = "low"
+    return {"matched": matched, "score": score, "risk": risk}
+
+
+def backdoor_scan(samples, trigger):
+    """简易后门扫描：比较含触发词样本与干净样本的标签分布。
+
+    ``samples`` 是 ``[(text, label_int), ...]``；若含触发词的样本标签高度一致且与
+    干净样本的主标签不同，则 ``suspicion`` 趋近 1。数据不足（缺任一侧）返回 0。
+    """
+    if not isinstance(samples, (list, tuple)) or len(samples) < 2:
+        raise ValueError("backdoor_scan: samples 至少要有 2 条")
+    trig = _b5_text(trigger, "backdoor_scan.trigger").lower()
+    clean_labels = []
+    trigger_labels = []
+    for i, item in enumerate(samples):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("backdoor_scan: samples 每项必须是 (text, label)")
+        text, label = item
+        if not isinstance(text, str):
+            raise ValueError(f"backdoor_scan: samples[{i}] 的 text 必须是字符串")
+        if isinstance(label, bool) or not isinstance(label, int) or label < 0:
+            raise ValueError(f"backdoor_scan: samples[{i}] 的 label 必须是非负整数")
+        if trig in text.lower():
+            trigger_labels.append(label)
+        else:
+            clean_labels.append(label)
+    if not trigger_labels or not clean_labels:
+        return {"triggered": len(trigger_labels), "clean": len(clean_labels),
+                "base_label": None, "trigger_label": None, "suspicion": 0.0}
+    base_label = max(set(clean_labels), key=clean_labels.count)
+    trigger_label = max(set(trigger_labels), key=trigger_labels.count)
+    consistency = trigger_labels.count(trigger_label) / len(trigger_labels)
+    suspicion = consistency if trigger_label != base_label else 0.0
+    return {"triggered": len(trigger_labels), "clean": len(clean_labels),
+            "base_label": base_label, "trigger_label": trigger_label,
+            "suspicion": suspicion}
+
+
+def extraction_scan(strings, logprob_fn, threshold=None):
+    """提取风险扫描：对候选字符串逐个打分，返回分数与超过阈值（默认 mean+1.5σ）的项。
+
+    ``logprob_fn(text) -> float`` 通常是「模型对该字符串的平均 token log 概率」；
+    分数越高越像训练时记住的内容。所有字符串分数相同则阈值取该分数。
+    """
+    values = _b5_text_list(strings, "extraction_scan.strings")
+    if not callable(logprob_fn):
+        raise ValueError("extraction_scan: logprob_fn 必须可调用")
+    scores = []
+    for i, s in enumerate(values):
+        v = logprob_fn(s)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            raise ValueError(f"extraction_scan: logprob_fn 第 {i} 项返回非有限数字")
+        scores.append(float(v))
+    mean = sum(scores) / len(scores)
+    var = sum((v - mean) ** 2 for v in scores) / len(scores)
+    std = math.sqrt(var)
+    if threshold is None:
+        if len(scores) < 5:
+            threshold = max(scores)
+        else:
+            threshold = mean + 1.5 * std
+    elif isinstance(threshold, bool) or not isinstance(threshold, (int, float)) \
+            or not math.isfinite(float(threshold)):
+        raise ValueError("extraction_scan: threshold 必须是有限数字或 None")
+    flagged = [(s, sc) for s, sc in zip(values, scores) if sc >= threshold]
+    return {"scores": list(zip(values, scores)), "flagged": flagged,
+            "threshold": float(threshold), "mean": mean, "std": std}
 
 class ModelRegistry:
     """按名字 + 版本号存模型的目录注册表。
