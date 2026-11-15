@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3156 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3161 项）
 
 ## 特性
 
@@ -5834,12 +5834,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3104 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3109 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3156 项）。
+`tests/`（合计 3161 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5847,7 +5847,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3156 项
+pytest -q                        # test_ai.py + tests/ 合计 3161 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6830,11 +6830,13 @@ print(res["sequences"])
 | `grammar_mask(grammar, prefix, vocabulary)` | 布尔掩码，可直接叠加到 logits 上 |
 | `grammar_pick(grammar, prefix, logits, vocabulary)` | 在允许集合里取最大 logit（同分取小下标） |
 | `grammar_generate(grammar, logits_fn, vocabulary, max_len=16)` | 贪心语法约束生成，生成到 `accepts` 成立即停 |
+| `grammar_sample(grammar, prefix, logits, vocabulary, temperature=1.0, top_k=0, rng=None)` | 在允许集合上做温度缩放采样（top_k>0 时只在允许集内截断），返回 `(下标, token)`；无可用 token 抛 `ValueError` |
 
 ```python
 g = CFGGrammar({"S": [["(", "S", ")"], ["x"]]}, "S")
 print(g.allowed(["("], ["(", "x", ")"]))      # ['(', 'x']
 print(grammar_generate(g, lambda p: [0.0, 1.0, 0.0], ["(", "x", ")"], max_len=8))
+print(grammar_sample(g, ["("], [0.0, 1.0, 0.0], ["(", "x", ")"], rng=None))
 
 r = RegexGrammar("a[bc]+d")
 print(r.accepts(["a", "b", "d"]), r.allowed(["a", "b"], ["b", "c", "d"]))
@@ -6846,6 +6848,7 @@ print(r.accepts(["a", "b", "d"]), r.allowed(["a", "b"], ["b", "c", "d"]))
 2. **CFG 是 Earley 全量解析，代价 O(n³)**：每次 `allowed(...)` 都从头重算 chart，因此只适合短序列（语法约束解码的典型 case）；要长序列需要增量 chart。
 3. **JSON 文法只约束结构**：字符串/数字用 `STR` / `NUM` 类别终结符表示（或直接传带引号/数字文本的 token），真正的语义由 `json.loads` 在收尾时校验；它不检查「键是否在 schema 里」——那需要 JSON Schema 层，本库未实现。
 4. **语法与 token 粒度的错配**：词表里的多字符 token 只有在 NFA/Earley 能整段消化时才放行；字符级文法配 BPE 词表时会出现「语法允许但没有任何 token 可接」的空集，`grammar_pick` 会显式报错而不是静默产出非法串。
+5. **`grammar_sample` 只改变「怎么在允许集里挑」**：温度缩放与 top-k 都在允许集内部进行（被文法禁止的 token 即使 logit 最高也不会被采到）；`rng` 只用于抽样、不影响文法判定，因此同 seed 可复现同一条采样序列。
 
 ### 完整草稿-验证循环
 
@@ -7676,7 +7679,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3156 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3161 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8192,6 +8195,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestNBeats` | 基函数手算、block 参数 93 与两处 FD、模型参数 418 与训练降半、forward/loss_and_backward、9 类非法输入 |
 | `TestReMax` | history 字段与权重更新、`lr=None` 不更新、bool/数字奖励接受且 NaN/字符串报错、单样本优势恒零、10 类非法输入 |
+| `TestGrammarSampler` | 正则/CFG 允许集、采样只落允许集、温度与 top-k、同 seed 复现、空允许集与九类非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |

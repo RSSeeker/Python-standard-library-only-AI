@@ -51334,3 +51334,94 @@ class TestReMax:
                              max_new_tokens=2, temperature=8.0, seed=5)
         assert len(out["history"]) == 2
         assert all(h["mean_advantage"] == 0.0 for h in out["history"])
+
+
+import math
+import random
+
+import AI
+
+
+def _gs_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _gs_vocab():
+    return ["1", "2", "3", "4"]
+
+
+class TestGrammarSampler:
+    def test_regex_allowed_sets(self):
+        g = AI.RegexGrammar("1+[23]?")
+        vocab = _gs_vocab()
+        assert AI.grammar_allowed(g, [], vocab) == ["1"]
+        assert sorted(set(AI.grammar_allowed(g, ["1"], vocab))) == \
+            ["1", "2", "3"]
+        assert g.accepts(["1"]) and g.accepts(["1", "2"])
+        assert g.accepts(["1", "1", "3"])
+
+    def test_samples_only_allowed(self):
+        g = AI.RegexGrammar("1+[23]?")
+        vocab = _gs_vocab()
+        logits = [0.1, 0.2, 0.3, 0.4]
+        rng = random.Random(7)
+        seen = set()
+        for _ in range(200):
+            idx, tok = AI.grammar_sample(g, ["1"], logits, vocab, rng=rng)
+            assert 0 <= idx < len(vocab)
+            assert tok == vocab[idx]
+            seen.add(tok)
+        assert "4" not in seen
+        assert seen <= {"1", "2", "3"}
+
+    def test_temperature_topk_and_reproducible(self):
+        g = AI.RegexGrammar("1+[23]?")
+        vocab = _gs_vocab()
+        idx, tok = AI.grammar_sample(g, ["1"], [5.0, 4.0, 3.0, 1.0], vocab,
+                                     top_k=1, rng=random.Random(1))
+        assert tok == "1" and idx == 0
+        cold = [AI.grammar_sample(g, ["1"], [0.0, 10.0, 5.0, 0.0], vocab,
+                                  temperature=0.01, rng=random.Random(9))[1]
+                for _ in range(60)]
+        assert cold.count("2") >= 55
+        seq_a = [AI.grammar_sample(g, ["1"], [0.1] * 4, vocab,
+                                   rng=random.Random(3))[0] for _ in range(8)]
+        seq_b = [AI.grammar_sample(g, ["1"], [0.1] * 4, vocab,
+                                   rng=random.Random(3))[0] for _ in range(8)]
+        assert seq_a == seq_b
+
+    def test_cfg_grammar_sampling(self):
+        cfg = AI.CFGGrammar({"S": [["a", "b"], ["a"]]}, "S")
+        vocab = ["a", "b", "c"]
+        assert AI.grammar_allowed(cfg, [], vocab) == ["a"]
+        idx, tok = AI.grammar_sample(cfg, [], [0.0, 0.0, 99.0], vocab,
+                                     rng=random.Random(2))
+        assert tok == "a" and idx == 0
+        allowed = set(AI.grammar_allowed(cfg, ["a"], vocab))
+        assert allowed <= {"b"}
+
+    def test_invalid_inputs(self):
+        g = AI.RegexGrammar("1+[23]?")
+        vocab = _gs_vocab()
+        logits = [0.1] * 4
+        assert _gs_raises(lambda: AI.grammar_sample(
+            object(), [], logits, vocab), TypeError)
+        assert _gs_raises(lambda: AI.grammar_sample(g, [], logits, []))
+        assert _gs_raises(lambda: AI.grammar_sample(g, "1", logits, vocab),
+                          TypeError)
+        assert _gs_raises(lambda: AI.grammar_sample(g, [], [0.1, 0.2], vocab))
+        assert _gs_raises(lambda: AI.grammar_sample(
+            g, [], [0.1, math.inf, 0.2, 0.3], vocab))
+        assert _gs_raises(lambda: AI.grammar_sample(
+            g, [], logits, vocab, temperature=0.0))
+        assert _gs_raises(lambda: AI.grammar_sample(
+            g, [], logits, vocab, top_k=-1))
+        assert _gs_raises(lambda: AI.grammar_sample(
+            g, [], logits, vocab, rng=object()), TypeError)
+        g2 = AI.RegexGrammar("1+")
+        assert _gs_raises(lambda: AI.grammar_sample(
+            g2, [], [0.1, 0.2], ["2", "3"]))

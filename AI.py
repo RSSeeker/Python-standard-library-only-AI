@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2103 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2104 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -38682,6 +38682,70 @@ def grammar_allowed(grammar, prefix, vocabulary):
 def grammar_mask(grammar, prefix, vocabulary):
     allowed = set(grammar_allowed(grammar, prefix, vocabulary))
     return [tok in allowed for tok in vocabulary]
+
+
+
+def grammar_sample(grammar, prefix, logits, vocabulary, temperature=1.0,
+                   top_k=0, rng=None):
+    """按语法约束做一次随机采样：只在 ``grammar`` 允许的 token 上采样。
+
+    与 ``grammar_pick``（取最大 logit）不同，这里先对允许的候选做温度缩放
+    softmax，再按概率采样，因此可以与任意采样参数叠加（top_k 只在允许集合内
+    生效）。返回 ``(下标, token)``，下标是 ``vocabulary`` 里的位置。
+
+    边界：正则/CFG 语法都可能在前缀已无解时返回空允许集，此时抛 ValueError；
+    本函数不负责「何时停止」（由调用方根据 ``grammar.accepts`` 判断）。
+    """
+    if not isinstance(grammar, (RegexGrammar, CFGGrammar)):
+        raise TypeError("grammar_sample: 需要 RegexGrammar 或 CFGGrammar")
+    if not isinstance(vocabulary, (list, tuple)) or not vocabulary:
+        raise ValueError("grammar_sample: vocabulary 必须是非空列表")
+    if not isinstance(prefix, (list, tuple)):
+        raise TypeError("grammar_sample: prefix 必须是 token 列表")
+    if len(logits) != len(vocabulary):
+        raise ValueError(
+            "grammar_sample: logits 长度 %d 与词表 %d 不一致"
+            % (len(logits), len(vocabulary)))
+    for v in logits:
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise TypeError("grammar_sample: logits 必须全是数字")
+        if not math.isfinite(float(v)):
+            raise ValueError("grammar_sample: logits 必须是有限数字")
+    if (not isinstance(temperature, (int, float)) or isinstance(temperature, bool)
+            or not math.isfinite(float(temperature)) or temperature <= 0.0):
+        raise ValueError(
+            "grammar_sample: temperature 必须是正数，收到 %r" % (temperature,))
+    if (not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0):
+        raise ValueError("grammar_sample: top_k 必须是非负整数，收到 %r" % (top_k,))
+    if rng is not None and not hasattr(rng, "random"):
+        raise TypeError("grammar_sample: rng 需要提供 random() 方法")
+
+    allowed = set(grammar_allowed(grammar, prefix, vocabulary))
+    candidates = [(i, float(logits[i]) / float(temperature))
+                  for i, tok in enumerate(vocabulary) if tok in allowed]
+    if not candidates:
+        raise ValueError(
+            "grammar_sample: 没有可用的下一个 token（前缀 %r 已无解）"
+            % (list(prefix),))
+    if top_k > 0 and len(candidates) > top_k:
+        candidates.sort(key=lambda item: (-item[1], item[0]))
+        candidates = candidates[:top_k]
+    top = max(score for _, score in candidates)
+    weights = [math.exp(score - top) for _, score in candidates]
+    total = 0.0
+    for w in weights:
+        total += w
+    if total <= 0.0 or not math.isfinite(total):
+        raise ValueError("grammar_sample: 候选概率和异常（%r）" % (total,))
+    u = rng.random() if rng is not None else random.random()
+    acc = 0.0
+    chosen = candidates[-1][0]
+    for (idx, _), w in zip(candidates, weights):
+        acc += w / total
+        if u <= acc:
+            chosen = idx
+            break
+    return chosen, vocabulary[chosen]
 
 
 def grammar_pick(grammar, prefix, logits, vocabulary):
