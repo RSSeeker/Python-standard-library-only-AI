@@ -51010,3 +51010,128 @@ class TestTensorExtras:
         assert _te_raises(lambda: AI.ag_clip(T([1.0]), 2.0, 1.0))
         assert _te_raises(lambda: AI.ag_pow(T([-1.0]), 0.5))
         assert _te_raises(lambda: AI.ag_broadcast_to(T([1.0]), [0]))
+
+
+import random
+import tempfile
+import os
+
+
+class _TpScheduler:
+    def __init__(self):
+        self.lr = 0.01
+        self.steps = 0
+
+    def step(self, epoch=None):
+        self.steps += 1
+
+
+def _tp_data(n=32, seed=3):
+    rng = random.Random(seed)
+    xs = [[rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)] for _ in range(n)]
+    ys = [2.0 * x[0] - x[1] + 0.5 for x in xs]
+    return xs, ys
+
+
+def _tp_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestTrainerPassthrough:
+
+    def test_patience_and_default_history(self):
+        xs, ys = _tp_data()
+        random.seed(7)
+        net = AI.MLP([2, 8, 1], ["relu", "linear"])
+        tr = AI.Trainer(net, lr=0.05)
+        hist = tr.fit(xs, ys, epochs=6, batch_size=8, patience=3, verbose=False)
+        assert isinstance(hist, list)
+        assert len(hist) == 6
+        assert all(isinstance(v, (int, float)) for v in hist)
+
+    def test_scheduler_and_grad_accum(self):
+        xs, ys = _tp_data()
+        random.seed(7)
+        net = AI.MLP([2, 8, 1], ["relu", "linear"])
+        sched = _TpScheduler()
+        tr = AI.Trainer(net, lr=0.02)
+        hist = tr.fit(xs, ys, epochs=4, batch_size=8, lr_scheduler=sched,
+                      verbose=False)
+        assert len(hist) == 4
+        assert sched.steps > 0
+
+        random.seed(7)
+        net2 = AI.MLP([2, 8, 1], ["relu", "linear"])
+        tr2 = AI.Trainer(net2, lr=0.05)
+        hist2 = tr2.fit(xs, ys, epochs=4, batch_size=8, grad_accum=2,
+                        grad_clip=1.0, verbose=False)
+        assert len(hist2) == 4
+
+    def test_checkpoint_and_resume(self):
+        xs, ys = _tp_data()
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "tp_ckpt.json")
+        try:
+            random.seed(7)
+            net = AI.MLP([2, 8, 1], ["relu", "linear"])
+            tr = AI.Trainer(net, lr=0.05)
+            tr.fit(xs, ys, epochs=3, batch_size=8, checkpoint_path=path,
+                   checkpoint_every=1, verbose=False)
+            assert os.path.exists(path)
+
+            random.seed(11)
+            net2 = AI.MLP([2, 8, 1], ["relu", "linear"])
+            tr2 = AI.Trainer(net2, lr=0.05)
+            tr2.fit(xs, ys, epochs=2, batch_size=8, resume_from=path,
+                    verbose=False)
+            assert len(tr2.history) == 2
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+            os.rmdir(tmpdir)
+
+    def test_early_stop_metric_and_shuffle(self):
+        xs, ys = _tp_data()
+        random.seed(7)
+        net = AI.MLP([2, 8, 1], ["relu", "linear"])
+        tr = AI.Trainer(net, lr=0.05)
+        hist = tr.fit(xs, ys, epochs=2, batch_size=8, early_stop_metric="train",
+                      restore_best_weights=True, verbose=False)
+        assert len(hist) == 2
+
+        random.seed(7)
+        net2 = AI.MLP([2, 8, 1], ["relu", "linear"])
+        tr2 = AI.Trainer(net2, lr=0.05)
+        hist2 = tr2.fit(xs, ys, epochs=2, batch_size=8, shuffle=False, seed=5,
+                        val_split=0.0, verbose=False)
+        assert len(hist2) == 2
+
+    def test_invalid_inputs(self):
+        xs, ys = _tp_data()
+        random.seed(7)
+        net = AI.MLP([2, 4, 1], ["relu", "linear"])
+        tr = AI.Trainer(net, lr=0.05)
+        cases = [
+            lambda: tr.fit(xs, ys, epochs=1, lr_scheduler=object(), verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, patience=-1, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, patience=1.5, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, early_stop_metric="test", verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, checkpoint_path="", verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, grad_accum=0, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, grad_clip=-1.0, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, val_split=1.0, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, mixed_precision=True,
+                           patience=2, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, mixed_precision=True,
+                           grad_accum=2, verbose=False),
+            lambda: tr.fit(xs, ys, epochs=1, resume_from="", verbose=False),
+        ]
+        bad = 0
+        for fn in cases:
+            if _tp_raises(fn):
+                bad += 1
+        assert bad == 11

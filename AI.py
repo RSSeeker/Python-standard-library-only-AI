@@ -24478,14 +24478,77 @@ class Trainer:
         self.history = []
 
     def fit(self, x, y, epochs=100, batch_size=32, mixed_precision=False,
-            dtype="fp16", scale=1024.0, callbacks=None, verbose=True):
+            dtype="fp16", scale=1024.0, callbacks=None, verbose=True,
+            lr_scheduler=None, patience=None, early_stop_metric="val",
+            restore_best_weights=False, grad_accum=1,
+            checkpoint_path=None, checkpoint_every=1, resume_from=None,
+            grad_clip=None, mixup_alpha=0.0, val_split=0.1, val_data=None,
+            shuffle=True, seed=None):
         extra = list(callbacks or [])
         for cb in extra:
             if not (callable(cb) or hasattr(cb, "on_epoch_end")):
                 raise ValueError("Trainer: callbacks 元素必须是可调用或 Callback")
         hooks = [cb for cb in self.callbacks + extra if hasattr(cb, "on_epoch_end")]
         post = [cb for cb in self.callbacks + extra if callable(cb) and not hasattr(cb, "on_epoch_end")]
+
+        # 透传给 Model.fit 的扩展参数：只在显式给出时传，保持不传时的旧行为
+        fit_kwargs = {}
+        if lr_scheduler is not None:
+            if not hasattr(lr_scheduler, "step") or not callable(lr_scheduler.step):
+                raise ValueError(
+                    "Trainer.fit: lr_scheduler 必须是带 step() 的调度器实例")
+            fit_kwargs["lr_scheduler"] = lr_scheduler
+        if patience is not None:
+            if isinstance(patience, bool) or not isinstance(patience, int) or patience < 0:
+                raise ValueError("Trainer.fit: patience 必须是非负整数")
+            fit_kwargs["patience"] = patience
+        if early_stop_metric not in ("val", "train"):
+            raise ValueError(
+                "Trainer.fit: early_stop_metric 只能是 'val' 或 'train'，"
+                f"收到 {early_stop_metric!r}")
+        if early_stop_metric != "val":
+            fit_kwargs["early_stop_metric"] = early_stop_metric
+        if restore_best_weights:
+            fit_kwargs["restore_best_weights"] = True
+        if grad_accum is not None and grad_accum != 1:
+            _eng_check_pos_int(grad_accum, "Trainer.fit: grad_accum")
+            fit_kwargs["grad_accum"] = grad_accum
+        if checkpoint_path is not None:
+            if not isinstance(checkpoint_path, str) or not checkpoint_path:
+                raise ValueError(
+                    "Trainer.fit: checkpoint_path 必须是非空字符串路径")
+            _eng_check_pos_int(checkpoint_every, "Trainer.fit: checkpoint_every")
+            fit_kwargs["checkpoint_path"] = checkpoint_path
+            fit_kwargs["checkpoint_every"] = checkpoint_every
+        if resume_from is not None:
+            if not isinstance(resume_from, str) or not resume_from:
+                raise ValueError("Trainer.fit: resume_from 必须是非空字符串路径")
+            fit_kwargs["resume_from"] = resume_from
+        if grad_clip is not None:
+            _eng_check_pos_number(grad_clip, "Trainer.fit: grad_clip")
+            fit_kwargs["grad_clip"] = grad_clip
+        if mixup_alpha:
+            _eng_check_pos_number(mixup_alpha, "Trainer.fit: mixup_alpha")
+            fit_kwargs["mixup_alpha"] = mixup_alpha
+        if val_split is not None and val_split != 0.1:
+            if not isinstance(val_split, (int, float)) or isinstance(val_split, bool):
+                raise ValueError("Trainer.fit: val_split 必须是 0~1 的数字")
+            if not (0.0 <= float(val_split) < 1.0):
+                raise ValueError("Trainer.fit: val_split 必须在 [0,1) 内")
+            fit_kwargs["val_split"] = float(val_split)
+        if val_data is not None:
+            fit_kwargs["val_data"] = val_data
+        if shuffle is not True:
+            fit_kwargs["shuffle"] = bool(shuffle)
+        if seed is not None:
+            fit_kwargs["seed"] = seed
+
         if mixed_precision:
+            if fit_kwargs:
+                raise ValueError(
+                    "Trainer.fit: mixed_precision=True 时无法使用 "
+                    f"{sorted(fit_kwargs)}（fit_mixed_precision 不支持）；"
+                    "请改用非混合精度分支")
             kind = mixed_precision if isinstance(mixed_precision, str) else (dtype or "fp16")
             result = fit_mixed_precision(unwrap_model(self.model), x, y,
                                          dtype=kind, scale=scale,
@@ -24496,7 +24559,7 @@ class Trainer:
         else:
             self.model.lr = self.lr
             self.model.fit(x, y, epochs=epochs, batch_size=batch_size,
-                           callbacks=hooks, verbose=verbose)
+                           callbacks=hooks, verbose=verbose, **fit_kwargs)
             hist = getattr(self.model, "history", None)
             losses = hist.get("train_loss") if isinstance(hist, dict) else hist
             if losses is None:

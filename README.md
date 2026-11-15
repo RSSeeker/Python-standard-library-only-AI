@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3141 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3146 项）
 
 ## 特性
 
@@ -5792,12 +5792,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3089 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3094 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3141 项）。
+`tests/`（合计 3146 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5805,7 +5805,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3141 项
+pytest -q                        # test_ai.py + tests/ 合计 3146 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -5823,6 +5823,8 @@ from AI import MLP
 mlp = MLP([8, 32, 1], ["relu", "linear"])
 trainer = Trainer(mlp, lr=0.01)
 history = trainer.fit(xs, ys, epochs=50, batch_size=32, verbose=False)
+history = trainer.fit(xs, ys, epochs=50, batch_size=32, patience=5,
+                      grad_accum=2, grad_clip=1.0, verbose=False)  # 透传早停/累积/裁剪
 mlp = unwrap_model(trainer.model)            # Model → 内部 MLP
 stats = benchmark_forward(lambda: mlp.forward(xs[0]), warmup=2, repeats=10)
 ```
@@ -5830,11 +5832,11 @@ stats = benchmark_forward(lambda: mlp.forward(xs[0]), warmup=2, repeats=10)
 | API | 说明 |
 | --- | --- |
 | `unwrap_model(model)` | 把 `Model` 包装器解包成内部 `MLP`；普通 `MLP` 原样返回，其他对象报错 |
-| `Trainer(model, lr=0.01, callbacks=None)` | `Model`/`MLP` 统一封装：`fit(x, y, epochs, batch_size, mixed_precision=False, callbacks=...)` 返回逐轮 loss 列表；`mixed_precision` 传 fp16/bf16/fp8 名称时走模拟混合精度循环 |
+| `Trainer(model, lr=0.01, callbacks=None)` | `Model`/`MLP` 统一封装：`fit(x, y, epochs, batch_size, mixed_precision=False, callbacks=...)` 返回逐轮 loss 列表；`mixed_precision` 传 fp16/bf16/fp8 名称时走模拟混合精度循环；还支持把 `lr_scheduler/patience/early_stop_metric/restore_best_weights/grad_accum/checkpoint_path/checkpoint_every/resume_from/grad_clip/mixup_alpha/val_split/val_data/shuffle/seed` 透传给 `Model.fit`（混合精度分支不支持这些参数） |
 | `benchmark_forward(fn, warmup=1, repeats=5)` | 对无参前向函数计时，返回 `mean_ms/min_ms/max_ms/repeats` |
 
 边界：`Trainer` 只统一「小数据 + Model/MLP」这一条训练路径，`CausalLM`/`ViT` 等大模型仍用各自的
-`fit`；`benchmark_forward` 只做墙钟计时（不做统计显著性、不测 GPU/多进程），结果依赖机器负载，
+`fit`；调度器必须是带 `step()` 的实例（`StepLR`/`ExponentialLR`/`CosineAnnealingLR` 等），混合精度分支不支持早停/累积/检查点等扩展参数；`benchmark_forward` 只做墙钟计时（不做统计显著性、不测 GPU/多进程），结果依赖机器负载，
 适合横向对比同一台机器上的相对耗时。
 
 ### 序列推荐（SASRec）
@@ -7632,7 +7634,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3141 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3146 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8069,6 +8071,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAutogradModule` | 参数/缓冲/子模块自动登记与命名、Linear 手算一致与 1D 输入、Sequential/MLP 全参数 FD、state_dict JSON 往返与严格键/形状校验、Adam/SGD 回归收敛、train/eval 级联、九类非法输入 |
 | `TestAutogradLayersExt` | slice/concat/embedding/conv2d 的形状与全参数 FD、LayerNorm/Embedding/Conv2d/MHA 模块前向与参数计数、MHA 因果性、六类非法输入 |
 | `TestTensorExtras` | Tensor 信息/stride、broadcast_to 数据与 FD、ag_where 条件路由梯度、clip/abs/pow 数据与 FD、七类非法输入 |
+| `TestTrainerPassthrough` | Trainer 透传 patience/scheduler/grad_accum/grad_clip/checkpoint/resume/早停指标/seed 等参数的行为、混合精度分支拒绝扩展参数、11 类非法输入 |
 | `TestDataParallel` | all-reduce 四种 op 与变长 all-gather、环通信步数与梯度分片覆盖、DistributedSampler 分区/padding/复现/set_epoch、数据并行一步更新与单进程全批等价、八类非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
