@@ -28,12 +28,12 @@
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （2015 个 def / 453 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
-#  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
+# （2015 个 def / 453 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+#  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
-#   3. 前向 / 反向
+#   3. MLP：前向 / 反向
 #   4. 初始化族（全部是"显式调用才生效"的工具函数，不改变任何默认路径）
 #   5. KAN（Kolmogorov-Arnold Network：B 样条边函数）
 #   6. 训练目标：FIM（Fill-in-the-Middle）与 T5 span corruption
@@ -73,8 +73,8 @@
 #   40. FNet：用无参数傅里叶混合替代自注意力（FNetBlock）
 #   41. S4/S5 家族：对角状态空间模型（S4D）block
 #   42. CNN: Conv2d / MaxPool2d / Flatten
-#   43. 辅助
-#   44. 前向 / 反向
+#   43. Conv2d：辅助
+#   44. Conv2d：前向 / 反向
 #   45. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
 #   46. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
 #   47. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
@@ -156,37 +156,38 @@
 #   123. 推理与部署：批内打包与投机解码
 #   124. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
 #   125. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#   126. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#   127. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#   128. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#   129. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
-#   130. 可解释性：置换重要性 / 特征图字符画
-#   131. 可解释性：注意力 Rollout / Flow
-#   132. 可解释性：输入归因
-#   133. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
-#   134. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
-#   135. 语音识别指标（WER / CER / SER）
-#   136. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#   137. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
-#   138. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#   139. 模型保存 / 加载 (JSON)
-#   140. 序列标注 / 多标签分类头
-#   141. PyTorch 数值对齐对比
-#   142. 设定相同随机种子 & 初始化
-#   143. PyTorch 模型
-#   144. 我们的模型
-#   145. 前向对齐
-#   146. 反向对齐
-#   147. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#   148. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#   149. 梯度检查点（activation checkpointing）与混合精度模拟
-#   150. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#   151. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#   152. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#   153. 生成模型：VAE / GAN / DDPM
-#   154. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
-#   155. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#   156. Main: 回归 + 分类 + CNN 完整示例
+#   126. QAT 训练循环与梯度累积
+#   127. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#   128. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#   129. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#   130. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#   131. 可解释性：置换重要性 / 特征图字符画
+#   132. 可解释性：注意力 Rollout / Flow
+#   133. 可解释性：输入归因
+#   134. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#   135. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#   136. 语音识别指标（WER / CER / SER）
+#   137. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#   138. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#   139. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#   140. 模型保存 / 加载 (JSON)
+#   141. 序列标注 / 多标签分类头
+#   142. PyTorch 数值对齐对比
+#   143. 设定相同随机种子 & 初始化
+#   144. PyTorch 模型
+#   145. 我们的模型
+#   146. 前向对齐
+#   147. 反向对齐
+#   148. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#   149. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#   150. 梯度检查点（activation checkpointing）与混合精度模拟
+#   151. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#   152. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#   153. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#   154. 生成模型：VAE / GAN / DDPM
+#   155. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#   156. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#   157. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -447,7 +448,7 @@ class Layer:
         return [1.0] * len(z)
 
 # ============================================================================
-#  前向 / 反向
+#  MLP：前向 / 反向
 # ============================================================================
     def forward(self, x):
         # 维度不符时 map 会静默截断（少算或多算），必须早失败
@@ -6211,7 +6212,7 @@ def top_k_tokens(probs_rows, k: int = 5):
     return out[0] if single else out
 
 
-# ---- 可解释性轻量补充（B4）：batch logit lens / probe 训练器 ----
+# ---- 可解释性轻量补充：batch logit lens / probe 训练器 ----
 
 
 def _b4_check_matrix(mat, who):
@@ -12908,7 +12909,7 @@ class DynamicTanh:
     def param_count(self):
         """可训练参数数：alpha + gamma + beta。"""
         return 1 + 2 * self.d_model
-"""B3：RoPE 外推扩展（ABF / LongRoPE）与 2D/3D RoPE。
+"""RoPE 外推扩展（ABF / LongRoPE）与 2D/3D RoPE。
 
 只依赖标准库 math；函数均为纯函数，便于与 C 侧逐位对拍。
 """
@@ -15702,7 +15703,7 @@ def ppo_kl_align(policy, reference, reward_fn, prompts, kl_coef=0.1,
     return trainer.fit(prompts, epochs=epochs)
 
 
-# ---- B8：RLAIF / RLVR（AI 反馈与可验证奖励）教学实现 ----
+# ---- RLAIF / RLVR（AI 反馈与可验证奖励）教学实现 ----
 
 
 def _b8_check_model(model, name):
@@ -15845,7 +15846,7 @@ def rlaif_align(policy, reference, prompts, judge_fn, num_samples=4,
         })
     return {"iterations": history, "total_pairs": total, "beta": beta}
 
-# ---- B9：REINFORCE++ / VinePPO 教学实现 ----
+# ---- REINFORCE++ / VinePPO 教学实现 ----
 
 
 def _b9_check_policy(policy, name):
@@ -16050,7 +16051,7 @@ def vine_ppo(policy, prompts, reward_fn, num_samples: int = 2,
 
 
 
-# ---- B10：差分注意力与安静 softmax（Differential Attention / QuietAttention） ----
+# ---- 差分注意力与安静 softmax（Differential Attention / QuietAttention） ----
 
 
 def _d10_check_pos_int(value, name):
@@ -16103,7 +16104,7 @@ def _d10_quiet_softmax_row(scores, indices):
 
 
 
-# ---- B11：混合架构（Samba / Zamba / RecurrentGemma）教学实现 ----
+# ---- 混合架构（Samba / Zamba / RecurrentGemma）教学实现 ----
 
 
 def _hyb_check_pos_int(value, name):
@@ -16528,7 +16529,7 @@ class RecurrentGemmaBlock:
                 self.conv_k[i][j] -= lr * self.grad_conv[i][j]
 
 
-# ---- B12：线性注意力特征映射家族（ELU / Based / Hedgehog） ----
+# ---- 线性注意力特征映射家族（ELU / Based / Hedgehog） ----
 
 
 def _laf_check_pos_int(value, name):
@@ -16730,7 +16731,7 @@ def linear_attention_family_backward(d_out, cache, kind="elu", decay=1.0):
     return dq, dk, dv
 
 
-# ---- B13：MoE 路由工具（z-loss / 噪声 top-k / expert-choice / 无 aux 偏置校正） ----
+# ---- MoE 路由工具（z-loss / 噪声 top-k / expert-choice / 无 aux 偏置校正） ----
 
 
 def _mor_check_logits(logits, who):
@@ -16926,7 +16927,7 @@ def aux_loss_free_bias_update(loads, bias, target_fractions, gamma=0.001):
     return new_bias, deltas
 
 
-# ---- B14：StripedHyena 混合块与 Vision Mamba（Vim） ----
+# ---- StripedHyena 混合块与 Vision Mamba（Vim） ----
 
 
 def _b14_check_pos_int(value, name):
@@ -17774,7 +17775,7 @@ class QuietAttention:
         return self
 
 
-# ---- B15：生成采样与停止条件（logit 处理 / top-p / min-p / stop 序列 / 退化检测） ----
+# ---- 生成采样与停止条件（logit 处理 / top-p / min-p / stop 序列 / 退化检测） ----
 
 
 def _gen_check_logits(logits, who):
@@ -18009,7 +18010,7 @@ def detect_degeneration(tokens, max_run=3, max_ngram=2, ngram_size=3):
     return {"degenerate": False, "reason": None, "position": None}
 
 
-# ---- B16：服务编排工具（限流 / 动态批处理 / 灰度路由 / 断路器 / 自动扩缩容） ----
+# ---- 服务编排工具（限流 / 动态批处理 / 灰度路由 / 断路器 / 自动扩缩容） ----
 
 
 def _svc_check_pos_int(value, name):
@@ -18233,7 +18234,7 @@ def autoscale_plan(current_workers, queue_length, avg_latency, target_latency,
     return max(lo, min(hi, want))
 
 
-# ---- B17：数值线性代数与持续学习（EWC） ----
+# ---- 数值线性代数与持续学习（EWC） ----
 
 
 def _mcl_check_matrix(a, who):
@@ -18490,7 +18491,7 @@ def ewc_penalty(params, anchor, fisher, coefficient=1.0):
     return penalty, grads_flat
 
 
-# ---- B18：数据评估 / 内容审核 / 可审计日志 ----
+# ---- 数据评估 / 内容审核 / 可审计日志 ----
 
 
 def _dat_check_docs(docs, who):
@@ -18730,7 +18731,7 @@ class AuditTrail:
         return trail
 
 
-# ---- B19：连续思维链（Coconut 简化版）----
+# ---- 连续思维链（Coconut 简化版）----
 
 
 def _cnt_check_pos_int(value, name):
@@ -19073,7 +19074,7 @@ def grpo_align(policy, reward_fn, prompts, num_samples: int = 4,
 
 
 
-# ---- B6：机器遗忘（unlearning）教学实现 ----
+# ---- 机器遗忘（unlearning）教学实现 ----
 
 
 def _unl_check_lm(model, name):
@@ -19536,7 +19537,7 @@ def kto_align(policy, reference, samples, beta: float = 0.1, baseline=None,
     return trainer.fit(samples, epochs=epochs, shuffle=shuffle, seed=seed)
 
 
-# ---- 对齐便捷入口（B2）：DPO / ORPO / CPO / 迭代拒绝采样 DPO ----
+# ---- 对齐便捷入口：DPO / ORPO / CPO / 迭代拒绝采样 DPO ----
 
 
 def _al_check_pairs(pairs, who):
@@ -25949,7 +25950,7 @@ class Conv2d:
         self.grad_b = [0.0] * self.out_channels
 
 # ============================================================================
-#  辅助
+#  Conv2d：辅助
 # ============================================================================
     def _img_shape(self, H, W):
         ho = (H + 2 * self.ph - self.kh_eff) // self.sh + 1
@@ -26048,7 +26049,7 @@ class Conv2d:
         return dx
 
 # ============================================================================
-#  前向 / 反向
+#  Conv2d：前向 / 反向
 # ============================================================================
     def forward(self, x):
         """x: (C, H, W) -> 输出 (out_channels, Ho, Wo)"""
@@ -49610,7 +49611,7 @@ class MaskedLM:
 
 
 
-# ---- 推理 / 部署便利件（B3）：流式生成、SSE、OpenAI 风格响应 ----
+# ---- 推理 / 部署便利件：流式生成、SSE、OpenAI 风格响应 ----
 
 
 def _sv_check_prompt(prompt_ids, who):
@@ -55779,8 +55780,10 @@ class Shampoo(_LayerwiseOptimizer):
     工程折中（docstring 与 README 都写明）：
       * 维度超过 ``max_dim`` 的层退化成**逐元素** Adam 预条件（论文的 diagonal
         版本），否则 64 维以上的 Jacobi 会拖慢训练；
-      * 没有实现论文的 grafting（把 Adam 更新范数嫁接回来），所以**lr 要自己给
-        合适**；矩阵分支的 lr 与 Adam 分支不是同一量纲；
+      * ``inverse_root="newton"`` 时用 Newton–Schulz 迭代求逆根（``newton_iters``
+        控制迭代步数）；``grafting=True`` 时把预条件更新方向按 Adam 更新范数缩放后
+        再落地（论文的 Adam grafting），关闭时矩阵分支与 Adam 分支的 lr 不是同一量纲、
+        **lr 要自己给合适**；
       * ``precondition_every`` 控制逆根重算频率（默认每步算一次，调大可省时间）。
     """
 
@@ -74407,7 +74410,7 @@ class CheckpointManager:
 
 
 
-# ---- 安全 / 评估轻量补充（B5）：选择题解析、GSM8K、HumanEval、注入/后门/提取扫描 ----
+# ---- 安全 / 评估轻量补充：选择题解析、GSM8K、HumanEval、注入/后门/提取扫描 ----
 
 
 def _b5_text(value, who):

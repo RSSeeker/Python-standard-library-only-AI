@@ -7419,7 +7419,7 @@ x = flatten.forward(x)
 probs = fc.forward(x)
 ```
 
-### Transformer
+### Transformer（编码器 + 分类头示例）
 
 ```python
 d_model = 4
