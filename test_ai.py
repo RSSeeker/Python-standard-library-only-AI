@@ -48664,3 +48664,94 @@ class TestSafetyEvalLight:
         assert _b5_raises(lambda: AI.humaneval_pass_at_1(["x"], ["y", "z"]))
         assert _b5_raises(lambda: AI.backdoor_scan([("a", 0)], "t"))
         assert _b5_raises(lambda: AI.extraction_scan(["a"], "not callable"))
+
+
+# ---- 机器遗忘（unlearning） ----
+
+import random as _unl_random
+
+
+def _unl_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _unl_t_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def _unl_t_model(epochs=40, lr=0.02):
+    _unl_random.seed(1)
+    model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=1, max_len=12)
+    model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=epochs, lr=lr, seed=1)
+    return model
+
+
+def _unl_t_seq_logp(model, prompt, response):
+    return AI._rlhf_seq_logprob(model, prompt, response, grad_scale=None)
+
+
+class TestUnlearning:
+    def test_evaluate_baseline(self):
+        model = _unl_t_model()
+        out = AI.unlearn_evaluate(model, [[1, 2, 3, 4, 5]], [[6, 7, 8, 9, 1]])
+        assert set(out) == {"forget", "retain"}
+        assert out["forget"]["loss"] > 0.0
+        assert _unl_t_close(out["forget"]["perplexity"],
+                            math.exp(out["forget"]["loss"]), 1e-9)
+        assert out["retain"]["loss"] > 0.0
+
+    def test_gradient_ascent_raises_forget(self):
+        model = _unl_t_model()
+        forget = [[1, 2, 3, 4, 5]]
+        retain = [[6, 7, 8, 9, 1]]
+        before = AI.unlearn_evaluate(model, forget, retain)
+        hist = AI.unlearn_gradient_ascent(model, forget, retain, epochs=3,
+                                          lr=0.02, retain_weight=1.0, seed=3)
+        after = AI.unlearn_evaluate(model, forget, retain)
+        assert after["forget"]["loss"] > before["forget"]["loss"] * 2.0
+        assert after["retain"]["loss"] < before["retain"]["loss"] * 1.5
+        assert len(hist["forget_loss"]) == 3
+        assert hist["steps"] == 3
+
+    def test_negative_preference_lowers_harmful(self):
+        model = _unl_t_model()
+        harmful = [1, 2]
+        safe = [3, 4]
+        prompt = [5]
+        before = _unl_t_seq_logp(model, prompt, harmful)
+        AI.unlearn_negative_preference(model, [(prompt, harmful, safe)],
+                                       beta=0.2, epochs=3, lr=0.02, seed=4)
+        after = _unl_t_seq_logp(model, prompt, harmful)
+        assert after < before - 1e-6
+
+    def test_clone_helper_matches_forward(self):
+        model = _unl_t_model(epochs=10)
+        clone = AI._unl_clone_lm(model)
+        ids = [1, 2, 3, 4]
+        logits_a = model.forward(ids)
+        logits_b = clone.forward(ids)
+        assert len(logits_a) == len(logits_b) == len(ids)
+        for row_a, row_b in zip(logits_a, logits_b):
+            assert all(_unl_t_close(a, b, 1e-12) for a, b in zip(row_a, row_b))
+
+    def test_invalid_inputs(self):
+        model = _unl_t_model(epochs=5)
+        assert _unl_t_raises(lambda: AI.unlearn_evaluate(object(), [[1, 2]]))
+        assert _unl_t_raises(lambda: AI.unlearn_evaluate(model, []))
+        assert _unl_t_raises(lambda: AI.unlearn_evaluate(model, [[1]]))
+        assert _unl_t_raises(lambda: AI.unlearn_gradient_ascent(
+            model, [[1, 2]], epochs=0))
+        assert _unl_t_raises(lambda: AI.unlearn_gradient_ascent(
+            model, [[1, 2]], lr=-0.1))
+        assert _unl_t_raises(lambda: AI.unlearn_gradient_ascent(
+            model, [[1, 2]], retain_weight=-1.0))
+        assert _unl_t_raises(lambda: AI.unlearn_gradient_ascent(
+            model, [[1, 2]], seed=1.5))
+        assert _unl_t_raises(lambda: AI.unlearn_negative_preference(model, []))
+        assert _unl_t_raises(lambda: AI.unlearn_negative_preference(
+            model, [([1], [2])]))

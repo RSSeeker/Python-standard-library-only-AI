@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1916 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1925 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -15878,6 +15878,195 @@ def grpo_align(policy, reward_fn, prompts, num_samples: int = 4,
         clip_ratio_high=clip_ratio_high)
     return trainer.fit(prompts, epochs=epochs, seed=seed)
 
+
+
+# ---- B6：机器遗忘（unlearning）教学实现 ----
+
+
+def _unl_check_lm(model, name):
+    """校验传入的是 CausalLM 风格模型（有反传、优化步、评估接口）。"""
+    need = ("_loss_and_backward", "adam_step", "zero_grad", "evaluate",
+            "vocab_size")
+    missing = [a for a in need if not hasattr(model, a)]
+    if missing:
+        raise TypeError(f"{name}: 需要 CausalLM 风格的模型（缺少 {missing}），"
+                        f"收到 {type(model).__name__}")
+
+
+def _unl_check_seqs(model, sequences, who, allow_empty=False):
+    """校验 token 序列列表，返回规整后的 list[list[int]]。"""
+    if not isinstance(sequences, (list, tuple)):
+        raise TypeError(f"{who}: sequences 必须是列表，收到 {type(sequences).__name__}")
+    if not sequences and not allow_empty:
+        raise ValueError(f"{who}: sequences 不能为空")
+    out = []
+    for i, seq in enumerate(sequences):
+        toks = _check_token_ids(seq, model.vocab_size, f"{who}[{i}]")
+        if len(toks) < 2:
+            raise ValueError(f"{who}[{i}]: 每条序列至少 2 个 token")
+        out.append(toks)
+    return out
+
+
+def _unl_mean_ce(model, sequences):
+    """平均交叉熵（不更新参数）。"""
+    _unl_check_lm(model, "_unl_mean_ce")
+    return float(model.evaluate(sequences))
+
+
+def _unl_negate_grads(model):
+    """把模型当前累积的梯度整体取反（用于把下降方向变成上升方向）。"""
+    def _neg(node):
+        for i, v in enumerate(node):
+            if isinstance(v, (list, tuple)):
+                _neg(v)
+            else:
+                node[i] = -v
+    for _name, _param, grad in model._named_params():
+        _neg(grad)
+
+
+def _unl_copy_into(dst, src):
+    """把嵌套列表 src 的数值就地复制进同结构 dst。"""
+    for i, v in enumerate(src):
+        if isinstance(v, list):
+            _unl_copy_into(dst[i], v)
+        else:
+            dst[i] = v
+
+
+def _unl_clone_lm(model):
+    """构造同配置副本并复制全部参数。
+
+    ``CausalLM`` 内部含模块级引用，``copy.deepcopy`` 会报
+    "cannot pickle 'module' object"，因此按配置重建再逐参数复制。
+    """
+    clone = CausalLM(
+        vocab_size=model.vocab_size, d_model=model.d_model,
+        num_heads=model.num_heads, d_ff=model.d_ff,
+        num_layers=model.num_layers, max_len=model.max_len,
+        dropout=model.dropout, rope=model.rope,
+        use_abs_pos=model.use_abs_pos, window=model.window,
+        num_kv_heads=model.num_kv_heads, alibi=model.alibi,
+        attn_impl=model.attn_impl)
+    dst = {name: param for name, param, _grad in clone._named_params()}
+    for name, param, _grad in model._named_params():
+        _unl_copy_into(dst[name], param)
+    return clone
+
+
+def unlearn_evaluate(model, forget_sequences, retain_sequences=None):
+    """评估遗忘集 / 保留集上的平均交叉熵与困惑度。
+
+    返回 ``{"forget": {"loss", "perplexity"}, "retain": {...} 或 None}``。
+    """
+    _unl_check_lm(model, "unlearn_evaluate")
+    forget = _unl_check_seqs(model, forget_sequences, "unlearn_evaluate(forget)")
+    f_loss = _unl_mean_ce(model, forget)
+    result = {
+        "forget": {"loss": f_loss, "perplexity": math.exp(f_loss)},
+        "retain": None,
+    }
+    if retain_sequences is not None:
+        retain = _unl_check_seqs(model, retain_sequences, "unlearn_evaluate(retain)")
+        r_loss = _unl_mean_ce(model, retain)
+        result["retain"] = {"loss": r_loss, "perplexity": math.exp(r_loss)}
+    return result
+
+
+def unlearn_gradient_ascent(model, forget_sequences, retain_sequences=None,
+                            epochs=1, lr=0.01, retain_weight=1.0,
+                            shuffle=True, seed=None):
+    """梯度上升遗忘：抬高遗忘集损失，可选地压低保留集损失。
+
+    每个遗忘样本执行 ``-CE(forget)``（梯度上升），若给了保留集，再对该轮
+    全部保留样本累加 ``retain_weight / len(retain)`` 倍的 ``CE(retain)``
+    （梯度下降），最后做一次 Adam 更新。
+
+    返回 ``{"forget_loss": [...], "retain_loss": [...] 或 [], "epochs": n,
+    "steps": n}``，损失是每个 epoch 结束后的评估值。
+    """
+    _unl_check_lm(model, "unlearn_gradient_ascent")
+    forget = _unl_check_seqs(model, forget_sequences, "unlearn_gradient_ascent(forget)")
+    retain = None
+    if retain_sequences is not None:
+        retain = _unl_check_seqs(model, retain_sequences,
+                                 "unlearn_gradient_ascent(retain)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError(f"unlearn_gradient_ascent: epochs 必须是正整数，收到 {epochs!r}")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+            or not math.isfinite(float(lr)) or float(lr) <= 0.0:
+        raise ValueError(f"unlearn_gradient_ascent: lr 必须是正的有限数字，收到 {lr!r}")
+    if isinstance(retain_weight, bool) or not isinstance(retain_weight, (int, float)) \
+            or not math.isfinite(float(retain_weight)) or float(retain_weight) < 0.0:
+        raise ValueError(
+            f"unlearn_gradient_ascent: retain_weight 必须是 >=0 的有限数字，收到 {retain_weight!r}")
+    if not isinstance(shuffle, bool):
+        raise ValueError("unlearn_gradient_ascent: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("unlearn_gradient_ascent: seed 必须是 int 或 None")
+
+    rng = random.Random(seed)
+    # 清空优化器动量：预训练留下的下降方向动量会抵消刚开始的上升步
+    if hasattr(model, "_adam_m"):
+        model._adam_m.clear()
+        model._adam_v.clear()
+        model.step_count = 0
+    history = {"forget_loss": [], "retain_loss": [], "epochs": int(epochs),
+               "steps": 0}
+    for _ in range(epochs):
+        order = list(range(len(forget)))
+        if shuffle:
+            rng.shuffle(order)
+        for idx in order:
+            model.zero_grad()
+            # 先按普通下降方向累积遗忘集梯度，再整体取反 → 沿上升方向
+            model._loss_and_backward(forget[idx], grad_scale=1.0)
+            _unl_negate_grads(model)
+            if retain:
+                share = float(retain_weight) / len(retain)
+                for r_seq in retain:
+                    model._loss_and_backward(r_seq, grad_scale=share)
+            model.adam_step(float(lr))
+            history["steps"] += 1
+        history["forget_loss"].append(_unl_mean_ce(model, forget))
+        if retain:
+            history["retain_loss"].append(_unl_mean_ce(model, retain))
+    return history
+
+
+def unlearn_negative_preference(model, pairs, beta=0.1, epochs=1, lr=None,
+                                shuffle=True, seed=None):
+    """负偏好遗忘：把遗忘内容当作 DPO 的 rejected、保留回答当作 chosen。
+
+    ``pairs`` 为 ``[(prompt_ids, harmful_ids, safe_ids), ...]``；内部复制当前模型
+    作为固定参考模型，复用 :class:`RLHFTrainer`（method="dpo"）做偏好优化，
+    使模型相对参考模型降低 harmful 回答的似然。
+
+    返回训练好的 ``RLHFTrainer`` 实例（policy 即原模型）。
+    """
+    _unl_check_lm(model, "unlearn_negative_preference")
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("unlearn_negative_preference: pairs 必须是非空列表")
+    clean = []
+    for i, item in enumerate(pairs):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(
+                f"unlearn_negative_preference: pairs[{i}] 必须是 (prompt, harmful, safe)")
+        p, h, s = item
+        prompt = _check_token_ids(
+            p, model.vocab_size, f"unlearn_negative_preference(pairs[{i}].prompt)")
+        if not prompt:
+            raise ValueError(
+                f"unlearn_negative_preference: pairs[{i}].prompt 不能为空")
+        harmful = _unl_check_seqs(model, [h], f"unlearn_negative_preference(pairs[{i}].harmful)")
+        safe = _unl_check_seqs(model, [s], f"unlearn_negative_preference(pairs[{i}].safe)")
+        clean.append((prompt, safe[0], harmful[0]))
+    reference = _unl_clone_lm(model)
+    trainer = RLHFTrainer(model, reference=reference, method="dpo", beta=beta,
+                          lr=0.01 if lr is None else lr)
+    trainer.fit(clean, epochs=epochs, lr=lr, shuffle=shuffle, seed=seed)
+    return trainer
 
 class KTOTrainer:
     """把 ``kto_loss`` 串成可用的 KTO（Kahneman-Tversky 优化）训练循环
