@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （2004 个 def / 451 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （2010 个 def / 452 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -18488,6 +18488,246 @@ def ewc_penalty(params, anchor, fisher, coefficient=1.0):
         penalty += coef * 0.5 * f * (p - a) ** 2
         grads_flat.append(coef * f * (p - a))
     return penalty, grads_flat
+
+
+# ---- B18：数据评估 / 内容审核 / 可审计日志 ----
+
+
+def _dat_check_docs(docs, who):
+    if not isinstance(docs, (list, tuple)):
+        raise TypeError(f"{who}: docs 必须是字符串列表")
+    out = []
+    for i, d in enumerate(docs):
+        if not isinstance(d, str):
+            raise TypeError(f"{who}: 第 {i} 个文档不是字符串")
+        out.append(d)
+    return out
+
+
+def _dat_ngrams(text, n):
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def dataset_stats(docs):
+    """数据集基础统计：文档数、字符数、长度分布与字符级词表大小。"""
+    items = _dat_check_docs(docs, "dataset_stats(docs)")
+    if not items:
+        raise ValueError("dataset_stats: docs 不能为空")
+    lengths = [len(d) for d in items]
+    ordered = sorted(lengths)
+    n = len(ordered)
+    if n % 2:
+        median = float(ordered[n // 2])
+    else:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    vocab = set()
+    for d in items:
+        vocab.update(d)
+    return {
+        "documents": n,
+        "characters": sum(lengths),
+        "mean_length": sum(lengths) / n,
+        "median_length": median,
+        "max_length": ordered[-1],
+        "min_length": ordered[0],
+        "empty_documents": sum(1 for x in lengths if x == 0),
+        "vocab_size": len(vocab),
+    }
+
+
+def dataset_dedup_report(docs, ngram=5, threshold=0.8):
+    """近重复检测：字符 n-gram 包含度 >= 阈值即视为重复，保留最早出现的文档。"""
+    items = _dat_check_docs(docs, "dataset_dedup_report(docs)")
+    if not items:
+        raise ValueError("dataset_dedup_report: docs 不能为空")
+    if isinstance(ngram, bool) or not isinstance(ngram, int) or ngram < 1:
+        raise ValueError("dataset_dedup_report: ngram 必须是正整数")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ValueError("dataset_dedup_report: threshold 必须是数字")
+    thr = float(threshold)
+    if not (0.0 < thr <= 1.0):
+        raise ValueError("dataset_dedup_report: threshold 必须在 (0,1]")
+    grams = [_dat_ngrams(d, ngram) for d in items]
+    kept = []
+    pairs = []
+    for i in range(len(items)):
+        duplicate = False
+        for j in kept:
+            a, b = grams[i], grams[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            if inter == 0:
+                continue
+            contain = inter / min(len(a), len(b))
+            if contain >= thr:
+                pairs.append({"kept": j, "duplicate": i,
+                              "containment": contain})
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(i)
+    return {
+        "kept_indices": kept,
+        "duplicate_pairs": pairs,
+        "duplicate_count": len(pairs),
+        "unique_ratio": len(kept) / len(items),
+    }
+
+
+def label_quality_report(labels, num_classes):
+    """标签质量：类别分布、多数类比例、不平衡比与熵。"""
+    if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 2:
+        raise ValueError("label_quality_report: num_classes 必须是 >=2 的整数")
+    if not isinstance(labels, (list, tuple)) or not labels:
+        raise ValueError("label_quality_report: labels 不能为空")
+    counts = [0] * num_classes
+    for y in labels:
+        if isinstance(y, bool) or not isinstance(y, int):
+            raise ValueError("label_quality_report: 标签必须是整数")
+        if y < 0 or y >= num_classes:
+            raise ValueError("label_quality_report: 标签越界")
+        counts[y] += 1
+    import math
+    total = len(labels)
+    props = [c / total for c in counts]
+    nonzero = [p for p in props if p > 0.0]
+    entropy = -sum(p * math.log(p) for p in nonzero)
+    imbalance = max(nonzero) / min(nonzero)
+    return {
+        "counts": counts,
+        "proportions": props,
+        "majority_fraction": max(nonzero),
+        "missing_classes": sum(1 for c in counts if c == 0),
+        "imbalance_ratio": imbalance,
+        "entropy": entropy,
+        "max_entropy": math.log(num_classes),
+    }
+
+
+_DAT_MODERATION_RULES = {
+    "violence": ("kill", "murder", "weapon", "bomb", "attack"),
+    "self_harm": ("suicide", "self-harm", "kill myself"),
+    "pii": ("password", "credit card", "social security", "id number"),
+    "hate": ("hate speech", "racial slur", "inferior race"),
+}
+
+
+def moderation_scan(text, rules=None):
+    """轻量内容审核：规则驱动关键词扫描，返回命中类别与粗粒度风险。"""
+    if not isinstance(text, str):
+        raise TypeError("moderation_scan: text 必须是字符串")
+    if rules is None:
+        rules = _DAT_MODERATION_RULES
+    if not isinstance(rules, dict) or not rules:
+        raise ValueError("moderation_scan: rules 必须是非空字典")
+    lowered = text.lower()
+    matched = {}
+    hits = 0
+    for category in sorted(rules):
+        keywords = rules[category]
+        if not isinstance(keywords, (list, tuple)) or not keywords:
+            raise ValueError("moderation_scan: 每个类别的关键词必须是非空列表")
+        found = []
+        for kw in keywords:
+            if not isinstance(kw, str) or not kw:
+                raise ValueError("moderation_scan: 关键词必须是非空字符串")
+            if kw.lower() in lowered:
+                found.append(kw)
+        if found:
+            matched[category] = found
+            hits += len(found)
+    if not matched:
+        risk = "low"
+    elif len(matched) >= 2 or hits >= 3:
+        risk = "high"
+    else:
+        risk = "medium"
+    return {"matched": matched, "hit_count": hits, "risk": risk}
+
+
+class AuditTrail:
+    """追加式、可验证的审计日志（哈希链）。
+
+    每条记录保存前一条的哈希，``verify()`` 重新计算整条链，任何字段被改动
+    都会让后续哈希对不上；用于记录训练/部署关键事件的最小可审计证据链。
+    """
+
+    def __init__(self, entries=None):
+        self.entries = []
+        if entries is not None:
+            if not isinstance(entries, (list, tuple)):
+                raise ValueError("AuditTrail: entries 必须是列表")
+            for entry in entries:
+                self._validate_entry(entry)
+                self.entries.append(dict(entry))
+
+    @staticmethod
+    def _entry_hash(seq, event, prev_hash):
+        import hashlib
+        import json
+        payload = json.dumps({"seq": seq, "event": event,
+                              "prev_hash": prev_hash},
+                             sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _validate_entry(entry):
+        if not isinstance(entry, dict):
+            raise ValueError("AuditTrail: 每条记录必须是字典")
+        for key in ("seq", "event", "prev_hash", "hash"):
+            if key not in entry:
+                raise ValueError(f"AuditTrail: 记录缺少字段 {key!r}")
+
+    def append(self, event):
+        """追加一条事件（字典或字符串），返回新记录。"""
+        if isinstance(event, str):
+            event = {"message": event}
+        if not isinstance(event, dict):
+            raise TypeError("AuditTrail.append: event 必须是字典或字符串")
+        import json
+        try:
+            json.dumps(event, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"AuditTrail.append: event 必须可 JSON 序列化（{exc}）")
+        seq = len(self.entries)
+        prev_hash = self.entries[-1]["hash"] if self.entries else ""
+        entry = {
+            "seq": seq,
+            "event": event,
+            "prev_hash": prev_hash,
+            "hash": self._entry_hash(seq, event, prev_hash),
+        }
+        self.entries.append(entry)
+        return dict(entry)
+
+    def verify(self):
+        """重新计算整条链；返回 True 表示未被篡改。"""
+        prev_hash = ""
+        for i, entry in enumerate(self.entries):
+            if not isinstance(entry, dict):
+                return False
+            if entry.get("seq") != i or entry.get("prev_hash") != prev_hash:
+                return False
+            expected = self._entry_hash(i, entry.get("event"), prev_hash)
+            if entry.get("hash") != expected:
+                return False
+            prev_hash = expected
+        return True
+
+    def to_dict(self):
+        import copy
+        return {"entries": copy.deepcopy(self.entries)}
+
+    @classmethod
+    def from_dict(cls, blob):
+        if not isinstance(blob, dict) or "entries" not in blob:
+            raise ValueError("AuditTrail.from_dict: 需要 entries 字段")
+        trail = cls(blob["entries"])
+        if not trail.verify():
+            raise ValueError("AuditTrail.from_dict: 哈希校验失败")
+        return trail
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环

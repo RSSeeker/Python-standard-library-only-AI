@@ -50135,3 +50135,94 @@ class TestMathAndEWC:
         assert _mcl_raises(lambda: AI.solve_linear_system([[1, True]], [1]))
         assert _mcl_raises(lambda: AI.solve_linear_system([[1, 2], [3, 4]],
                                                           [1.0, float("nan")]))
+
+
+import math
+
+import AI
+
+
+def _dat_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestDataEvalAndAudit:
+    def test_dataset_stats(self):
+        st = AI.dataset_stats(["ab", "cde", ""])
+        assert st["documents"] == 3 and st["characters"] == 5
+        assert st["median_length"] == 2.0
+        assert st["empty_documents"] == 1
+        assert st["vocab_size"] == 5
+        assert abs(st["mean_length"] - 5 / 3) < 1e-12
+        st2 = AI.dataset_stats(["a", "bb", "cc"])
+        assert st2["median_length"] == 2.0 and st2["max_length"] == 2
+
+    def test_dataset_dedup(self):
+        ded = AI.dataset_dedup_report(["abcdef", "abcdef", "xyzuvw"], ngram=3)
+        assert ded["kept_indices"] == [0, 2] and ded["duplicate_count"] == 1
+        assert abs(ded["duplicate_pairs"][0]["containment"] - 1.0) < 1e-12
+        assert abs(ded["unique_ratio"] - 2 / 3) < 1e-12
+        ded2 = AI.dataset_dedup_report(["abcdef", "abcxyz"], ngram=3, threshold=0.2)
+        assert ded2["duplicate_count"] == 1
+        ded3 = AI.dataset_dedup_report(["abc", "xyz"], ngram=2)
+        assert ded3["duplicate_count"] == 0 and ded3["kept_indices"] == [0, 1]
+
+    def test_label_quality(self):
+        lq = AI.label_quality_report([0, 0, 1, 2], 4)
+        assert lq["counts"] == [2, 1, 1, 0]
+        assert lq["missing_classes"] == 1
+        assert abs(lq["imbalance_ratio"] - 2.0) < 1e-12
+        expected = -(0.5 * math.log(0.5) + 2 * 0.25 * math.log(0.25))
+        assert abs(lq["entropy"] - expected) < 1e-9
+        assert lq["proportions"] == [0.5, 0.25, 0.25, 0.0]
+        balanced = AI.label_quality_report([0, 1, 2, 3], 4)
+        assert abs(balanced["imbalance_ratio"] - 1.0) < 1e-12
+        assert abs(balanced["entropy"] - math.log(4)) < 1e-9
+
+    def test_moderation_and_audit(self):
+        m = AI.moderation_scan("please kill and bomb them")
+        assert m["matched"] == {"violence": ["kill", "bomb"]} and m["hit_count"] == 2
+        assert m["risk"] == "medium"
+        clean = AI.moderation_scan("hello world")
+        assert clean["matched"] == {} and clean["risk"] == "low"
+        multi = AI.moderation_scan("password plus suicide",
+                                   rules={"pii": ("password",),
+                                          "self_harm": ("suicide",)})
+        assert multi["risk"] == "high" and len(multi["matched"]) == 2
+        trail = AI.AuditTrail()
+        e1 = trail.append({"step": 1, "loss": 0.5})
+        e2 = trail.append("finish")
+        assert e1["seq"] == 0 and e2["seq"] == 1
+        assert e2["prev_hash"] == e1["hash"] and trail.verify() is True
+
+    def test_audit_tamper_and_invalid(self):
+        trail = AI.AuditTrail()
+        trail.append({"step": 1})
+        trail.append({"step": 2})
+        tampered = AI.AuditTrail.from_dict(trail.to_dict())
+        tampered.entries[0]["event"]["step"] = 99
+        assert tampered.verify() is False
+        assert AI.AuditTrail.from_dict(trail.to_dict()).verify() is True
+        bad = trail.to_dict()
+        bad["entries"][0]["hash"] = "0" * 64
+        assert _dat_raises(lambda: AI.AuditTrail.from_dict(bad))
+        assert _dat_raises(lambda: AI.dataset_stats([]))
+        assert _dat_raises(lambda: AI.dataset_stats(["ok", 3]))
+        assert _dat_raises(lambda: AI.dataset_dedup_report([]))
+        assert _dat_raises(lambda: AI.dataset_dedup_report(["abc"], ngram=0))
+        assert _dat_raises(lambda: AI.dataset_dedup_report(["abc"], threshold=1.5))
+        assert _dat_raises(lambda: AI.label_quality_report([], 3))
+        assert _dat_raises(lambda: AI.label_quality_report([0, 3], 3))
+        assert _dat_raises(lambda: AI.label_quality_report([0], 1))
+        assert _dat_raises(lambda: AI.moderation_scan(123))
+        assert _dat_raises(lambda: AI.moderation_scan("x", rules={}))
+        assert _dat_raises(lambda: AI.AuditTrail("nope"))
+        assert _dat_raises(lambda: trail.append(3))
+        assert _dat_raises(lambda: trail.append({"x": object()}))
+        assert _dat_raises(lambda: AI.AuditTrail.from_dict({"x": 1}))

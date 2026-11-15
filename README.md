@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3104 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3109 项）
 
 ## 特性
 
@@ -2365,6 +2365,34 @@ for row in reliability_diagram(y, p, n_bins=5):
 先转成 logit，再用 Platt scaling 拟合一个标量温度 `a` 与偏置 `b`（`a>1` 表示裁判
 过度自信、需要平滑），返回 `{"a","b","nll_before","nll_after","brier_before",
 "brier_after","ece_before","ece_after"}`，便于直接在评测报告里对比校准前后。
+
+### 数据评估 / 内容审核 / 可审计日志
+
+```python
+import AI
+
+stats = AI.dataset_stats(["段落一", "段落二", ""])
+dedup = AI.dataset_dedup_report(["abcdef", "abcxyz", "xyzuvw"], ngram=3)
+labels = AI.label_quality_report([0, 0, 1, 2], num_classes=4)
+mod = AI.moderation_scan("please kill and bomb them")
+
+trail = AI.AuditTrail()
+trail.append({"stage": "train", "loss": 0.42})
+trail.append({"stage": "deploy", "version": "v1"})
+ok = trail.verify()          # 哈希链校验
+```
+
+| API | 说明 |
+| --- | --- |
+| `dataset_stats(docs)` | 文档数、字符数、平均/中位/最大/最小长度、空文档数、字符级词表大小 |
+| `dataset_dedup_report(docs, ngram=5, threshold=0.8)` | 字符 n-gram 包含度近重复检测；贪心保留最早出现的文档，返回保留下标、重复对与去重比例 |
+| `label_quality_report(labels, num_classes)` | 类别计数/占比、多数类比例、缺失类别数、不平衡比、标签熵与最大熵 |
+| `moderation_scan(text, rules=None)` | 规则驱动关键词审核（默认含 violence/self_harm/pii/hate），返回命中类别、关键词、粗粒度风险 low/medium/high |
+| `AuditTrail(entries=None)` | 追加式哈希链审计日志：`append(event)` 生成 `{seq,event,prev_hash,hash}`，`verify()` 重算整链检测篡改；`to_dict/from_dict` 可持久化并校验 |
+
+边界：这些是启发式评估/审计工具，不做语义审核或人工复核；`dataset_dedup_report`
+为 O(n²) 两两比较，适合中小数据集；`moderation_scan` 的关键词表可替换；
+`AuditTrail` 用 SHA-256 串链，能发现改动但无法证明「谁」改的（不含签名）。
 
 ### 安全扫描（PII / canary / 越狱规则）
 
@@ -5602,12 +5630,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3052 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3057 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3104 项）。
+`tests/`（合计 3109 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5615,7 +5643,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3104 项
+pytest -q                        # test_ai.py + tests/ 合计 3109 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7442,7 +7470,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3104 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3109 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7772,6 +7800,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGenerationExtras` | logit bias/禁用 token、top-p/min-p 掩码、stop 字符串截断、token 停止序列生成（含 eos）、退化检测、非法输入 |
 | `TestServingOrchestration` | 令牌桶限流与等待时间、动态批处理出批/未到期、灰度路由可复现、断路器三态切换、自动扩缩容上下限、非法输入 |
 | `TestMathAndEWC` | 线性方程组/行列式/逆矩阵与 QR 重构精度、幂迭代主特征值、EWC 惩罚值与梯度有限差分、Fisher 为零、非法输入 |
+| `TestDataEvalAndAudit` | 数据集统计/近重复检测/标签质量熵、规则审核风险分级、审计日志哈希链与篡改检测、非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
