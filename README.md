@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3151 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3156 项）
 
 ## 特性
 
@@ -2729,6 +2729,29 @@ q.sgd_step(0.01)
 边界：DifferentialAttention 只做单层注意力、无 dropout/掩码扩展；QuietAttention
 的 softmax1 让模型可以“输出零向量”，这与标准 softmax 的归一化不同，训练时建议
 用与标准注意力相仿的学习率。两者都只接受非空有限数字的 `(T, d_model)` 列表。
+
+### ReMax（贪心基线策略梯度）
+
+```python
+model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=12)
+model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=30, lr=0.02)
+
+def reward_fn(prompt, response):
+    return response[0] == 3  # 简单可验证奖励
+
+out = AI.remax_align(model, [[1, 2, 3], [6, 7, 8]], reward_fn,
+                     explore_samples=4, epochs=2, lr=0.05,
+                     max_new_tokens=2, temperature=5.0, seed=1)
+print(out["history"][-1]["mean_advantage"])
+```
+
+| API | 说明 |
+| --- | --- |
+| `remax_align(policy, prompts, reward_fn, explore_samples=4, epochs=1, lr=None, max_new_tokens=4, temperature=1.0, greedy_temperature=0.01, seed=None)` | 每个 prompt 先用近贪心回答取基线奖励 `r_base`，再用温度 `temperature` 采样若干回答，按优势 `A = r - r_base` 累加 `-A * logp` 梯度（`lr=None` 时只评估不更新）；返回每轮 `mean_reward/mean_advantage/baseline` |
+
+边界：`reward_fn(prompt, response)` 必须返回有限数字或 bool（其它类型报错）；
+`temperature` 过低时探索样本可能全同、优势为 0（此时可调高）；`lr=None` 仅评估；
+每个 prompt 单独 `zero_grad/adam_step`，不是跨 prompt 的批量梯度。
 
 ### 策略梯度进阶（REINFORCE++ / VinePPO）
 
@@ -5811,12 +5834,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3099 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3104 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3151 项）。
+`tests/`（合计 3156 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5824,7 +5847,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3151 项
+pytest -q                        # test_ai.py + tests/ 合计 3156 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7653,7 +7676,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3151 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3156 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8168,6 +8191,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
 | `TestNBeats` | 基函数手算、block 参数 93 与两处 FD、模型参数 418 与训练降半、forward/loss_and_backward、9 类非法输入 |
+| `TestReMax` | history 字段与权重更新、`lr=None` 不更新、bool/数字奖励接受且 NaN/字符串报错、单样本优势恒零、10 类非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |

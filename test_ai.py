@@ -51236,3 +51236,101 @@ class TestNBeats:
         model = AI.NBeats(lookback=4, horizon=2, seed=2)
         assert _nb_raises(lambda: model.fit([], epochs=1))
         assert _nb_raises(lambda: model.fit([([0.1], [0.2])], epochs=1))
+
+
+import math
+import random
+
+import AI
+
+
+def _remax_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _remax_model(seed=1):
+    random.seed(seed)
+    model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=1, max_len=12)
+    model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=20, lr=0.02)
+    return model
+
+
+def _remax_wq(model):
+    return model.encoder.layers[0].self_attn.W_q[0][0]
+
+
+def _remax_reward(prompt, response):
+    return response[0] == 3
+
+
+class TestReMax:
+    def test_history_and_update(self):
+        model = _remax_model()
+        before = _remax_wq(model)
+        out = AI.remax_align(model, [[1, 2, 3], [6, 7, 8]], _remax_reward,
+                             explore_samples=4, epochs=2, lr=0.05,
+                             max_new_tokens=2, temperature=5.0, seed=1)
+        assert set(out) == {"history", "epochs", "prompts",
+                            "explore_samples", "lr"}
+        assert len(out["history"]) == 2
+        for h in out["history"]:
+            assert set(h) == {"mean_reward", "mean_advantage", "baseline"}
+            assert all(math.isfinite(v) for v in h.values())
+        assert abs(_remax_wq(model) - before) > 1e-9
+        assert out["epochs"] == 2 and out["prompts"] == 2
+
+    def test_lr_none_keeps_weights(self):
+        model = _remax_model(seed=2)
+        before = _remax_wq(model)
+        AI.remax_align(model, [[1, 2, 3]], _remax_reward, explore_samples=2,
+                       epochs=1, lr=None, max_new_tokens=2, temperature=5.0,
+                       seed=2)
+        assert abs(_remax_wq(model) - before) < 1e-12
+
+    def test_reward_types(self):
+        model = _remax_model(seed=3)
+        # bool 与数字奖励都接受
+        AI.remax_align(model, [[1, 2]], lambda p, r: True, explore_samples=2,
+                       epochs=1, lr=None, max_new_tokens=2, temperature=5.0,
+                       seed=3)
+        AI.remax_align(model, [[1, 2]], lambda p, r: 2.5, explore_samples=2,
+                       epochs=1, lr=None, max_new_tokens=2, temperature=5.0,
+                       seed=3)
+        # 非法奖励
+        assert _remax_raises(lambda: AI.remax_align(
+            model, [[1, 2]], lambda p, r: float("nan"), max_new_tokens=2))
+        assert _remax_raises(lambda: AI.remax_align(
+            model, [[1, 2]], lambda p, r: "bad", max_new_tokens=2))
+
+    def test_invalid_inputs(self):
+        model = _remax_model(seed=4)
+        cases = [
+            lambda: AI.remax_align(None, [[1, 2]], _remax_reward),
+            lambda: AI.remax_align(model, [], _remax_reward),
+            lambda: AI.remax_align(model, [[1, 2]], None),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward,
+                                   explore_samples=0),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward, epochs=0),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward,
+                                   max_new_tokens=0),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward,
+                                   temperature=0.0),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward,
+                                   greedy_temperature=-1.0),
+            lambda: AI.remax_align(model, [[1, 2]], _remax_reward, lr=-1.0),
+            lambda: AI.remax_align(model, [[]], _remax_reward),
+        ]
+        assert all(_remax_raises(fn) for fn in cases)
+
+    def test_single_sample_variance(self):
+        model = _remax_model(seed=5)
+        out = AI.remax_align(model, [[1, 2, 3]], _remax_reward,
+                             explore_samples=1, epochs=2, lr=0.02,
+                             max_new_tokens=2, temperature=8.0, seed=5)
+        assert len(out["history"]) == 2
+        assert all(h["mean_advantage"] == 0.0 for h in out["history"])

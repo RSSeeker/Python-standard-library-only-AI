@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2097 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2103 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -18894,6 +18894,121 @@ def coconut_latent_reasoning_backward(cache, d_out):
         block._cache = caches[step]
         d = block.backward(d)
     return d
+
+
+# ---- ReMax：greedy 基线策略梯度（教学简化） ----
+
+
+def _remax_check_model(model):
+    need = ("generate", "zero_grad", "adam_step", "vocab_size")
+    missing = [a for a in need if not hasattr(model, a)]
+    if missing:
+        raise TypeError(f"remax_align: 需要 CausalLM 风格模型（缺少 {missing}），"
+                        f"收到 {type(model).__name__}")
+
+
+def _remax_check_prompts(model, prompts, who):
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError(f"{who}: prompts 必须是非空列表")
+    out = []
+    for i, prompt in enumerate(prompts):
+        ids = _check_token_ids(prompt, model.vocab_size, f"{who}[{i}]")
+        if not ids:
+            raise ValueError(f"{who}[{i}]: prompt 不能为空")
+        out.append(ids)
+    return out
+
+
+def _remax_check_positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name}: 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _remax_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}: 必须是数字，收到 {value!r}")
+    v = float(value)
+    if not math.isfinite(v) or v <= 0.0:
+        raise ValueError(f"{name}: 必须是正有限数，收到 {value!r}")
+    return v
+
+
+def _remax_reward(value, name="reward_fn"):
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name}: 必须返回有限数字或 bool，收到 {value!r}")
+    return float(value)
+
+
+def remax_align(policy, prompts, reward_fn, explore_samples: int = 4,
+                epochs: int = 1, lr: float = None, max_new_tokens: int = 4,
+                temperature: float = 1.0, greedy_temperature: float = 0.01,
+                seed=None):
+    """ReMax：用 greedy 回答的奖励作基线做策略梯度。
+
+    对每个 prompt：
+    1. 用近贪心温度（``greedy_temperature``）生成一条基线回答，得分 ``r_base``；
+    2. 用温度 ``temperature`` 采样 ``explore_samples`` 条回答，得分 ``r_i``；
+    3. 优势 ``A_i = r_i - r_base``，按 ``-A_i * log pi(y_i|x)`` 累加梯度。
+
+    ``temperature`` 太低时探索样本几乎相同、优势为 0，属预期；此时可调高。
+    """
+    if not callable(reward_fn):
+        raise TypeError("remax_align: reward_fn 必须可调用")
+    _remax_check_model(policy)
+    prompts = _remax_check_prompts(policy, prompts, "remax_align(prompts)")
+    explore_samples = _remax_check_positive_int(explore_samples,
+                                                "remax_align(explore_samples)")
+    epochs = _remax_check_positive_int(epochs, "remax_align(epochs)")
+    max_new_tokens = _remax_check_positive_int(max_new_tokens,
+                                               "remax_align(max_new_tokens)")
+    temperature = _remax_check_positive(temperature, "remax_align(temperature)")
+    greedy_temperature = _remax_check_positive(greedy_temperature,
+                                               "remax_align(greedy_temperature)")
+    if lr is not None:
+        lr = _remax_check_positive(lr, "remax_align(lr)")
+    rng = random.Random(seed)
+    batch = len(prompts) * explore_samples
+    history = []
+    for _ in range(epochs):
+        rewards = []
+        advantages = []
+        for prompt in prompts:
+            baseline_seq = policy.generate(
+                list(prompt), max_new_tokens=max_new_tokens,
+                temperature=greedy_temperature, rng=rng)
+            baseline = list(baseline_seq[len(prompt):])
+            if not baseline:
+                raise ValueError("remax_align: greedy 基线回答为空")
+            r_base = _remax_reward(reward_fn(prompt, baseline),
+                                   "remax_align(reward_fn)")
+            policy.zero_grad()
+            for _ in range(explore_samples):
+                seq = policy.generate(
+                    list(prompt), max_new_tokens=max_new_tokens,
+                    temperature=temperature, rng=rng)
+                response = list(seq[len(prompt):])
+                if not response:
+                    raise ValueError("remax_align: 探索回答为空")
+                r = _remax_reward(reward_fn(prompt, response),
+                                  "remax_align(reward_fn)")
+                adv = r - r_base
+                rewards.append(r)
+                advantages.append(adv)
+                if lr is None:
+                    continue
+                _rlhf_seq_logprob(policy, prompt, response,
+                                  grad_scale=-adv / float(batch))
+            if lr is not None:
+                policy.adam_step(lr)
+        history.append({"mean_reward": sum(rewards) / len(rewards),
+                        "mean_advantage": sum(advantages) / len(advantages),
+                        "baseline": sum(rewards) / len(rewards)
+                        - sum(advantages) / len(advantages)})
+    return {"history": history, "epochs": epochs, "prompts": len(prompts),
+            "explore_samples": explore_samples, "lr": lr}
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
