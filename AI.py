@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2070 个 def / 468 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2080 个 def / 469 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -27394,6 +27394,323 @@ class MultiHeadAttentionModule(Module):
             heads.append(ag_matmul(probs, vh))
         out = ag_concat(heads, axis=1)
         return self.w_o(out)
+
+
+import math
+import random
+
+
+# ============================================================================
+#  数据并行模拟（all-reduce / 梯度分片 / DistributedSampler）
+# ============================================================================
+
+def _dp_check_world(world_size, who):
+    """校验 world_size 是 >=1 的整数。"""
+    if isinstance(world_size, bool) or not isinstance(world_size, int) \
+            or world_size < 1:
+        raise ValueError(f"{who}: world_size 必须是正整数，收到 {world_size!r}")
+    return world_size
+
+
+def _dp_check_flat(values, who):
+    """校验一维数值列表（梯度/向量），返回 float 拷贝。"""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"{who}: 需要非空的数值列表")
+    out = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{who}: 元素必须是数字，收到 {v!r}")
+        if not math.isfinite(float(v)):
+            raise ValueError(f"{who}: 元素必须是有限数字，收到 {v!r}")
+        out.append(float(v))
+    return out
+
+
+def _dp_check_rank_values(rank_values, who):
+    """校验 [[rank0 向量], [rank1 向量], ...] 形状一致。"""
+    if not isinstance(rank_values, (list, tuple)) or not rank_values:
+        raise ValueError(f"{who}: rank_values 必须是非空列表")
+    world = len(rank_values)
+    flats = [_dp_check_flat(v, f"{who}[rank{i}]")
+             for i, v in enumerate(rank_values)]
+    size = len(flats[0])
+    for i, f in enumerate(flats):
+        if len(f) != size:
+            raise ValueError(f"{who}: 各 rank 向量长度不一致（rank0={size}，"
+                             f"rank{i}={len(f)}）")
+    return world, flats
+
+
+def all_reduce(rank_values, op="sum"):
+    """模拟 all-reduce：把各 rank 的等长向量归约成同一份结果。
+
+    参数：
+        rank_values: ``[[rank0 向量], [rank1 向量], ...]``
+        op: ``"sum"`` / ``"mean"`` / ``"max"`` / ``"min"``
+
+    返回：归约后的扁平列表（所有 rank 看到的相同结果）。
+    边界：纯数值模拟，不含通信、延迟与带宽；长度必须一致，不做广播补齐。
+    """
+    if op not in ("sum", "mean", "max", "min"):
+        raise ValueError(f"all_reduce: op 只支持 sum/mean/max/min，收到 {op!r}")
+    world, flats = _dp_check_rank_values(rank_values, "all_reduce")
+    out = []
+    for i in range(len(flats[0])):
+        vals = [flats[r][i] for r in range(world)]
+        if op == "sum":
+            out.append(sum(vals))
+        elif op == "mean":
+            out.append(sum(vals) / world)
+        elif op == "max":
+            out.append(max(vals))
+        else:
+            out.append(min(vals))
+    return out
+
+
+def all_gather(rank_values):
+    """模拟 all-gather：把各 rank 的向量按 rank 顺序拼成一个大向量。
+
+    与 all-reduce 不同，各 rank 的向量长度**可以不同**（例如变长 token 数）。
+    """
+    if not isinstance(rank_values, (list, tuple)) or not rank_values:
+        raise ValueError("all_gather: rank_values 必须是非空列表")
+    out = []
+    for i, f in enumerate(rank_values):
+        out.extend(_dp_check_flat(f, f"all_gather[rank{i}]"))
+    return out
+
+
+def ring_all_reduce(rank_values, op="sum"):
+    """按环形顺序模拟一次 all-reduce（教学版通信步骤计数）。
+
+    返回 ``(归约结果, 通信步数)``；环上 all-reduce 由 reduce-scatter 与
+    all-gather 两段组成，各 world-1 步，合计 ``2 * (world - 1)`` 步。
+    边界：只模拟「值层面的环形求和」，不模拟分块 reduce-scatter 的数据切分。
+    """
+    world, flats = _dp_check_rank_values(rank_values, "ring_all_reduce")
+    if op != "sum":
+        raise ValueError("ring_all_reduce: 当前只支持 op='sum'")
+    total = [0.0] * len(flats[0])
+    for step in range(world):
+        src = (0 + step) % world
+        for i in range(len(total)):
+            total[i] += flats[src][i]
+    steps = 2 * (world - 1) if world > 1 else 0
+    return total, steps
+
+
+def gradient_shard_reduce(rank_grads, op="mean"):
+    """先 all-reduce 梯度，再按 rank 切成连续分片（ZeRO 风格梯度分片）。
+
+    参数：
+        rank_grads: ``[[rank0 扁平梯度], ...]``
+        op: 同 :func:`all_reduce`
+
+    返回：``[{"rank", "start", "end", "values"}, ...]``，分片首尾相接覆盖全部梯度。
+    """
+    reduced = all_reduce(rank_grads, op=op)
+    world, _ = _dp_check_rank_values(rank_grads, "gradient_shard_reduce")
+    total = len(reduced)
+    base = total // world
+    extra = total % world
+    shards = []
+    start = 0
+    for r in range(world):
+        size = base + (1 if r < extra else 0)
+        end = start + size
+        shards.append({"rank": r, "start": start, "end": end,
+                       "values": reduced[start:end]})
+        start = end
+    return shards
+
+
+class DistributedSampler:
+    """教学版分布式采样器：把样本按下标分给各 rank。
+
+    参数：
+        num_samples: 样本总数（>=0）
+        world_size: rank 数（>=1）
+        rank: 当前 rank（0 <= rank < world_size）
+        shuffle: 是否打乱（每个 epoch 用 ``set_epoch`` 换种子）
+        seed: 打乱种子
+
+    行为：shuffle=False 时把 ``range(n)`` 按 ``rank`` 跨步切分；样本数不能被
+    world_size 整除时，各 rank 长度相差至多 1。shuffle=True 时先用 seed 排列，
+    再按 epoch 派生种子重排；为保证各 rank 长度一致，尾部会循环补样本（与
+    PyTorch DistributedSampler 的 padding 类似，补的样本可能重复）。
+    """
+
+    def __init__(self, num_samples, world_size=1, rank=0, shuffle=False,
+                 seed=None):
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int) \
+                or num_samples < 0:
+            raise ValueError(f"DistributedSampler: num_samples 必须是非负整数，"
+                             f"收到 {num_samples!r}")
+        self.num_samples = num_samples
+        self.world_size = _dp_check_world(world_size, "DistributedSampler")
+        if isinstance(rank, bool) or not isinstance(rank, int) \
+                or not 0 <= rank < self.world_size:
+            raise ValueError(f"DistributedSampler: rank 必须在 [0, world_size) "
+                             f"内，收到 {rank!r}")
+        if not isinstance(shuffle, bool):
+            raise ValueError("DistributedSampler: shuffle 必须是 bool")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("DistributedSampler: seed 必须是整数或 None")
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self._indices = self._make_indices()
+
+    def _make_indices(self):
+        n = self.num_samples
+        if n == 0:
+            return []
+        base = list(range(n))
+        if self.shuffle:
+            rng = random.Random(self.seed if self.seed is not None
+                                else 0)
+            for _ in range(self.epoch % 100000):
+                rng.random()
+            rng.shuffle(base)
+        padded = math.ceil(n / self.world_size) * self.world_size
+        ext = [base[i % n] for i in range(padded)]
+        return ext[self.rank::self.world_size]
+
+    def set_epoch(self, epoch):
+        """切换 epoch：shuffle=True 时重新生成该 rank 的下标序。"""
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError(f"DistributedSampler.set_epoch: epoch 必须是非负"
+                             f"整数，收到 {epoch!r}")
+        self.epoch = epoch
+        self._indices = self._make_indices()
+
+    def __len__(self):
+        return len(self._indices)
+
+    def __iter__(self):
+        return iter(self._indices)
+
+    def __repr__(self):
+        return (f"DistributedSampler(num_samples={self.num_samples}, "
+                f"world_size={self.world_size}, rank={self.rank}, "
+                f"shuffle={self.shuffle}, epoch={self.epoch}, "
+                f"len={len(self._indices)})")
+
+
+def _dp_forward(model, x):
+    """MLP 单样本前向（返回输出列表）。"""
+    cur = list(x)
+    for layer in model.layers:
+        cur = layer.forward(cur)
+    return cur
+
+
+def data_parallel_grads(model, xs, ys, world_size=2, loss="mse"):
+    """数据并行模拟：切分 batch，各 rank 局部反向，再 all-reduce 平均梯度。
+
+    返回：``(loss, grads)``，grads 结构与 ``_mlp_backward`` 相同（按层序，
+    每项 ``(grad_w, grad_b)``）。
+    """
+    world = _dp_check_world(world_size, "data_parallel_grads")
+    if not isinstance(xs, (list, tuple)) or not xs:
+        raise ValueError("data_parallel_grads: xs 必须是非空样本列表")
+    if not isinstance(ys, (list, tuple)) or len(ys) != len(xs):
+        raise ValueError("data_parallel_grads: ys 必须与 xs 等长")
+    if loss != "mse":
+        raise ValueError("data_parallel_grads: 当前只支持 loss='mse'")
+    n = len(xs)
+    batch = math.ceil(n / world)
+    per_rank = []
+    rank_losses = []
+    for r in range(world):
+        start = r * batch
+        end = min(n, start + batch)
+        if start >= end:
+            per_rank.append(None)
+            rank_losses.append(0.0)
+            continue
+        local_xs, local_ys = xs[start:end], ys[start:end]
+        grads = None
+        total = 0.0
+        for x, y in zip(local_xs, local_ys):
+            pred = _dp_forward(model, x)
+            if len(pred) != len(y):
+                raise ValueError(
+                    f"data_parallel_grads: 输出维度 {len(pred)} 与目标 {len(y)} 不一致")
+            d = [2.0 * (pred[i] - y[i]) / len(y) for i in range(len(y))]
+            local = _mlp_backward(model, d)
+            total += sum((pred[i] - y[i]) ** 2 for i in range(len(y))) / len(y)
+            if grads is None:
+                grads = [[ [v for v in gw], [v for v in gb] ]
+                         for (gw, gb) in local]
+            else:
+                for li in range(len(grads)):
+                    gw = local[li][0]
+                    gb = local[li][1]
+                    for i in range(len(gw)):
+                        for j in range(len(gw[0])):
+                            grads[li][0][i][j] += gw[i][j]
+                    for i in range(len(gb)):
+                        grads[li][1][i] += gb[i]
+        mean_loss = total / len(local_xs)
+        rank_losses.append(mean_loss)
+        for li in range(len(grads)):
+            for i in range(len(grads[li][0])):
+                for j in range(len(grads[li][0][0])):
+                    grads[li][0][i][j] /= len(local_xs)
+            for i in range(len(grads[li][1])):
+                grads[li][1][i] /= len(local_xs)
+        per_rank.append(grads)
+
+    count = sum(1 for g in per_rank if g is not None)
+    flat_lists = []
+    for g in per_rank:
+        if g is None:
+            continue
+        flat = []
+        for gw, gb in g:
+            for row in gw:
+                flat.extend(row)
+            flat.extend(gb)
+        flat_lists.append(flat)
+    avg = all_reduce(flat_lists, op="mean") if count > 1 else flat_lists[0]
+
+    avg_grads = []
+    offset = 0
+    for gw, gb in per_rank[0]:
+        rows = len(gw)
+        cols = len(gw[0]) if rows else 0
+        new_gw = []
+        for i in range(rows):
+            new_gw.append(avg[offset:offset + cols])
+            offset += cols
+        new_gb = avg[offset:offset + len(gb)]
+        offset += len(gb)
+        avg_grads.append((new_gw, new_gb))
+    mean_loss = sum(rank_losses) / max(1, count)
+    return mean_loss, avg_grads
+
+
+def data_parallel_step(model, xs, ys, lr=0.01, world_size=2):
+    """数据并行一步：切分 batch → 局部梯度 → all-reduce 平均 → SGD 更新。
+
+    返回 ``{"loss", "grads", "world_size", "samples"}``。
+    """
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0 \
+            or not math.isfinite(float(lr)):
+        raise ValueError(f"data_parallel_step: lr 必须是正有限数字，收到 {lr!r}")
+    loss, grads = data_parallel_grads(model, xs, ys, world_size=world_size)
+    for layer, (gw, gb) in zip(model.layers, grads):
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[0])):
+                layer.weights[i][j] -= lr * gw[i][j]
+        for i in range(len(layer.biases)):
+            layer.biases[i] -= lr * gb[i]
+    return {"loss": loss, "grads": grads, "world_size": world_size,
+            "samples": len(xs)}
 
 class MLP:
     """多层感知机（PyTorch 风格）"""

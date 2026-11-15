@@ -50792,3 +50792,129 @@ class TestAutogradLayersExt:
         assert _ext_raises(lambda: AI.ag_conv2d(img, wt, None, 0))
         assert _ext_raises(lambda: AI.MultiHeadAttentionModule(5, 2))
         assert _ext_raises(lambda: AI.LayerNormModule(0))
+
+
+import random
+
+
+def _dp_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except (ValueError, TypeError):
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _dp_t_single_step(model, xs, ys, lr):
+    n = len(xs)
+    grads = None
+    total = 0.0
+    for x, y in zip(xs, ys):
+        cur = list(x)
+        for layer in model.layers:
+            cur = layer.forward(cur)
+        d = [2.0 * (cur[i] - y[i]) / len(y) for i in range(len(y))]
+        total += sum((cur[i] - y[i]) ** 2 for i in range(len(y))) / len(y)
+        local = AI._mlp_backward(model, d)
+        if grads is None:
+            grads = local
+        else:
+            for li in range(len(grads)):
+                for i in range(len(grads[li][0])):
+                    for j in range(len(grads[li][0][0])):
+                        grads[li][0][i][j] += local[li][0][i][j]
+                for i in range(len(grads[li][1])):
+                    grads[li][1][i] += local[li][1][i]
+    for li in range(len(grads)):
+        for i in range(len(grads[li][0])):
+            for j in range(len(grads[li][0][0])):
+                grads[li][0][i][j] /= n
+        for i in range(len(grads[li][1])):
+            grads[li][1][i] /= n
+    for layer, (gw, gb) in zip(model.layers, grads):
+        for i in range(len(layer.weights)):
+            for j in range(len(layer.weights[0])):
+                layer.weights[i][j] -= lr * gw[i][j]
+        for i in range(len(layer.biases)):
+            layer.biases[i] -= lr * gb[i]
+    return total / n
+
+
+class TestDataParallel:
+    def test_all_reduce_and_gather(self):
+        vals = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+        assert AI.all_reduce(vals, "sum") == [12.0, 15.0, 18.0]
+        assert AI.all_reduce(vals, "mean") == [4.0, 5.0, 6.0]
+        assert AI.all_reduce(vals, "max") == [7.0, 8.0, 9.0]
+        assert AI.all_reduce(vals, "min") == [1.0, 2.0, 3.0]
+        assert AI.all_gather([[1.0, 2.0], [3.0]]) == [1.0, 2.0, 3.0]
+
+    def test_ring_and_shard(self):
+        vals = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+        ring, steps = AI.ring_all_reduce(vals)
+        assert ring == [12.0, 15.0, 18.0]
+        assert steps == 4
+
+        rank_grads = [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                      [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]]
+        shards = AI.gradient_shard_reduce(rank_grads, op="mean")
+        flat = []
+        for sh in shards:
+            assert sh["end"] - sh["start"] == len(sh["values"])
+            flat.extend(sh["values"])
+        assert flat == [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+    def test_distributed_sampler(self):
+        s = AI.DistributedSampler(12, world_size=4, rank=1, shuffle=False)
+        assert len(s) == 3
+        assert list(s) == [1, 5, 9]
+        seen = []
+        for r in range(4):
+            seen.extend(list(AI.DistributedSampler(12, world_size=4, rank=r)))
+        assert sorted(seen) == list(range(12))
+        assert len(AI.DistributedSampler(10, world_size=4, rank=0)) == 3
+        a = list(AI.DistributedSampler(10, world_size=3, rank=0,
+                                       shuffle=True, seed=7))
+        b = list(AI.DistributedSampler(10, world_size=3, rank=0,
+                                       shuffle=True, seed=7))
+        assert a == b
+        s3 = AI.DistributedSampler(10, world_size=3, rank=0,
+                                   shuffle=True, seed=7)
+        before = list(s3)
+        s3.set_epoch(1)
+        assert list(s3) != before
+
+    def test_data_parallel_step_matches_single(self):
+        random.seed(0)
+        model = AI.MLP([2, 4, 1], ["sigmoid", "linear"])
+        random.seed(0)
+        model2 = AI.MLP([2, 4, 1], ["sigmoid", "linear"])
+        xs = [[0.2, -0.3], [0.5, 0.1], [-0.4, 0.6], [0.1, 0.2],
+              [0.3, -0.1], [-0.2, 0.4]]
+        ys = [[0.6], [0.2], [0.1], [0.8], [0.4], [0.3]]
+        loss_single = _dp_t_single_step(model, xs, ys, 0.05)
+        res = AI.data_parallel_step(model2, xs, ys, lr=0.05, world_size=2)
+        assert abs(loss_single - res["loss"]) < 1e-12
+        worst = 0.0
+        for l1, l2 in zip(model.layers, model2.layers):
+            for i in range(len(l1.weights)):
+                for j in range(len(l1.weights[0])):
+                    worst = max(worst, abs(l1.weights[i][j] - l2.weights[i][j]))
+            for i in range(len(l1.biases)):
+                worst = max(worst, abs(l1.biases[i] - l2.biases[i]))
+        assert worst < 1e-12, worst
+
+    def test_invalid_inputs(self):
+        random.seed(0)
+        model = AI.MLP([2, 1], ["linear"])
+        xs, ys = [[0.2, -0.3]], [[0.5]]
+        assert _dp_t_raises(lambda: AI.all_reduce([[1.0], [1.0, 2.0]]))
+        assert _dp_t_raises(lambda: AI.all_reduce([[1.0]], op="prod"))
+        assert _dp_t_raises(lambda: AI.DistributedSampler(5, world_size=0))
+        assert _dp_t_raises(lambda: AI.DistributedSampler(5, world_size=2, rank=2))
+        assert _dp_t_raises(lambda: AI.DistributedSampler(-1))
+        assert _dp_t_raises(lambda: AI.data_parallel_grads(model, [], []))
+        assert _dp_t_raises(lambda: AI.data_parallel_grads(model, xs, ys, loss="ce"))
+        assert _dp_t_raises(lambda: AI.data_parallel_step(model, xs, ys, lr=0.0))

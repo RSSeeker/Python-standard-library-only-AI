@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3131 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3136 项）
 
 ## 特性
 
@@ -4865,6 +4865,37 @@ pinn.predict(0.5)   # ≈ 0.125
 
 边界：`NeuralODE` 只用 Euler 积分器（无自适应步长、无连续伴随），只对终态做监督；`PINN1D` 只处理一维、零边界与有限差分二阶导（`h` 默认 1e-3，残差梯度含 `1/h²` 因子，学习率需按 `h` 选择）。
 
+### 数据并行模拟（all-reduce / 梯度分片 / DistributedSampler）
+
+```python
+# 三份 rank 梯度做 all-reduce 再按 rank 切分
+rank_grads = [[1.0, 2.0, 3.0, 4.0], [3.0, 4.0, 5.0, 6.0]]
+avg = AI.all_reduce(rank_grads, "mean")          # [2.0, 3.0, 4.0, 5.0]
+shards = AI.gradient_shard_reduce(rank_grads, "mean")
+sampler = AI.DistributedSampler(12, world_size=4, rank=1, shuffle=True, seed=7)
+
+# 在本地 MLP 上模拟 2 个 rank 的数据并行一步更新
+model = AI.MLP([2, 4, 1], ["sigmoid", "linear"])
+xs = [[0.2, -0.3], [0.5, 0.1], [-0.4, 0.6], [0.1, 0.2]]
+ys = [[0.6], [0.2], [0.1], [0.8]]
+out = AI.data_parallel_step(model, xs, ys, lr=0.05, world_size=2)
+```
+
+| API | 说明 |
+| --- | --- |
+| `all_reduce(rank_values, op="sum" \| "mean" \| "max" \| "min")` | 把各 rank 等长向量按 op 归约成扁平列表（`mean` 为逐元素平均） |
+| `all_gather(rank_values)` | 各 rank 向量按 rank 顺序拼接，允许长度不同 |
+| `ring_all_reduce(rank_values)` | 环通信教学版：返回 `(归约和, 通信步数 2*(world-1))` |
+| `gradient_shard_reduce(rank_grads, op="mean")` | 先 all-reduce 平均，再按 rank 切成连续分片 `{rank,start,end,values}`（覆盖全部梯度，模拟 ZeRO-1 的 optimizer shard） |
+| `DistributedSampler(num_samples, world_size=1, rank=0, shuffle=False, seed=None)` | 数据切分器：不整除时各 rank 差 ≤1；`shuffle=True` 时尾部循环补样本并可用 `set_epoch` 重排 |
+| `data_parallel_grads(model, xs, ys, world_size=2, loss="mse")` | 切分 batch → 每个 rank 局部反向 → all-reduce 平均梯度；返回 `(loss, grads)` |
+| `data_parallel_step(model, xs, ys, lr=0.01, world_size=2)` | 基于 `data_parallel_grads` 做一步原地 SGD，返回 `{loss, grads, world_size, samples}` |
+
+边界：这是**单进程数值模拟**，不是真实多进程/多卡通信；`all_reduce` 的
+`mean` 按世界大小（world size）平均，因此各 rank 样本数不等长时与「按样本数
+全局平均」略有差异；`ring_all_reduce` 只报告环通信步数，不模拟延迟与带宽；
+`data_parallel_step` 只支持本库的 `MLP` 与 MSE 损失。
+
 ### 分布式训练模拟（FSDP / ZeRO / 张量并行 / 序列并行）
 
 | API | 说明 |
@@ -5740,12 +5771,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3079 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3084 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3131 项）。
+`tests/`（合计 3136 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5753,7 +5784,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3131 项
+pytest -q                        # test_ai.py + tests/ 合计 3136 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7580,7 +7611,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3131 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3136 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8016,6 +8047,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAutograd` | 广播运算梯度、四种 matmul 变体、softmax/log_softmax 与交叉熵、LayerNorm 三参数梯度、共享子图、小 MLP 训练收敛、非法输入 |
 | `TestAutogradModule` | 参数/缓冲/子模块自动登记与命名、Linear 手算一致与 1D 输入、Sequential/MLP 全参数 FD、state_dict JSON 往返与严格键/形状校验、Adam/SGD 回归收敛、train/eval 级联、九类非法输入 |
 | `TestAutogradLayersExt` | slice/concat/embedding/conv2d 的形状与全参数 FD、LayerNorm/Embedding/Conv2d/MHA 模块前向与参数计数、MHA 因果性、六类非法输入 |
+| `TestDataParallel` | all-reduce 四种 op 与变长 all-gather、环通信步数与梯度分片覆盖、DistributedSampler 分区/padding/复现/set_epoch、数据并行一步更新与单进程全批等价、八类非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
