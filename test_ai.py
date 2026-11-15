@@ -51518,3 +51518,129 @@ class TestMultimodalProjection:
         assert _mm_raises(lambda: AI.llava_merge_tokens(
             [[1.0, 2.0]], [[1.0]]))
         assert _mm_raises(lambda: AI.llava_merge_tokens([[]], [[1.0]]))
+
+
+import math
+import random
+
+import AI
+
+
+def _tn_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _tn_series(lookback=8, period=4, phase=0.0, amp=1.0):
+    return [amp * math.sin(2.0 * math.pi * (t + phase) / period) + 0.1
+            for t in range(lookback)]
+
+
+def _tn_rel(a, b):
+    return abs(a - b) / max(abs(a), abs(b), 1e-8)
+
+
+class TestTimesNet:
+    def test_forward_and_param_count(self):
+        m = AI.TimesNet(lookback=8, horizon=2, hidden=3, kernel_size=3,
+                        top_k=2, seed=1)
+        assert m.param_count() == 80
+        pred = m.forward(_tn_series())
+        assert len(pred) == 2
+        assert all(math.isfinite(v) for v in pred)
+        out = m.predict([_tn_series(phase=1.0), _tn_series(phase=2.0)])
+        assert len(out) == 2 and all(len(row) == 2 for row in out)
+
+    def test_period_selection(self):
+        m = AI.TimesNet(lookback=8, horizon=2, hidden=3, kernel_size=3,
+                        top_k=2, seed=1)
+        assert m._candidates() == [2, 4]
+        x = _tn_series(period=4)
+        periods = m._select_periods(x)
+        assert periods[0] == 4 and 4 in periods
+        m1 = AI.TimesNet(lookback=8, horizon=2, hidden=3, kernel_size=3,
+                         top_k=1, seed=1)
+        assert m1._select_periods(x) == [4]
+        assert m1._fold(x, 4)[0] == [x[0], x[1]]
+
+    def test_gradients_fd(self):
+        m = AI.TimesNet(lookback=8, horizon=2, hidden=3, kernel_size=3,
+                        top_k=2, seed=1)
+        x = _tn_series()
+        w = [0.6, -1.1]
+        h = 1e-5
+
+        def loss_of(series):
+            p = m.forward(series)
+            return sum(p[i] * w[i] for i in range(2))
+
+        m.zero_grad()
+        m.forward(x)
+        d = m.backward(w)
+        for t in (0, 3):
+            old = x[t]
+            x[t] = old + h
+            lp = loss_of(x)
+            x[t] = old - h
+            lm = loss_of(x)
+            x[t] = old
+            assert _tn_rel(d[t], (lp - lm) / (2 * h)) < 1e-4
+
+        m.zero_grad()
+        m.forward(x)
+        d = m.backward(w)
+        w0 = m.head.weights[0][0]
+        b0 = m.head.biases[0]
+        m.head.weights[0][0] = w0 + h
+        lp = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.head.weights[0][0] = w0 - h
+        lm = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.head.weights[0][0] = w0
+        assert _tn_rel(m._head_gw[0][0], (lp - lm) / (2 * h)) < 1e-4
+        m.head.biases[0] = b0 + h
+        lp = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.head.biases[0] = b0 - h
+        lm = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.head.biases[0] = b0
+        assert _tn_rel(m._head_gb[0], (lp - lm) / (2 * h)) < 1e-4
+
+        cw = m.conv.weights[0][0][1][1]
+        m.conv.weights[0][0][1][1] = cw + h
+        lp = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.conv.weights[0][0][1][1] = cw - h
+        lm = sum(m.forward(x)[i] * w[i] for i in range(2))
+        m.conv.weights[0][0][1][1] = cw
+        assert _tn_rel(m.conv.grad_w[0][0][1][1], (lp - lm) / (2 * h)) < 1e-4
+
+    def test_fit_converges(self):
+        m = AI.TimesNet(lookback=8, horizon=2, hidden=4, kernel_size=3,
+                        top_k=2, seed=2)
+        random.seed(0)
+        samples = [_tn_series(phase=p, amp=1.0 + 0.2 * p) for p in range(6)]
+        targets = [_tn_series(phase=p + 0.5)[4:6][::-1] for p in range(6)]
+        hist = m.fit(samples, targets, epochs=80, lr=0.1, seed=3)
+        assert len(hist) == 80
+        assert hist[0] > hist[-1] * 2.0
+        assert m.loss_history == hist
+
+    def test_invalid_inputs(self):
+        assert _tn_raises(lambda: AI.TimesNet(lookback=0))
+        assert _tn_raises(lambda: AI.TimesNet(horizon=0))
+        assert _tn_raises(lambda: AI.TimesNet(hidden=0))
+        assert _tn_raises(lambda: AI.TimesNet(kernel_size=2))
+        assert _tn_raises(lambda: AI.TimesNet(top_k=0))
+        m = AI.TimesNet(lookback=8, horizon=2, hidden=3, kernel_size=3,
+                        top_k=2, seed=1)
+        assert _tn_raises(lambda: m.forward([0.1] * 3))
+        assert _tn_raises(lambda: m.forward([0.1] * 8 + [float("nan")]))
+        assert _tn_raises(lambda: m.backward([0.0, 0.0]))
+        m.forward(_tn_series())
+        assert _tn_raises(lambda: m.backward([0.0]))
+        assert _tn_raises(lambda: m.backward([0.0, float("inf")]))
+        assert _tn_raises(lambda: m.fit([_tn_series()], [[0.0, 0.0, 0.0]]))
+        assert _tn_raises(lambda: m.fit([_tn_series()], [[0.0, 0.0]],
+                                        epochs=0))
+        assert _tn_raises(lambda: m.sgd_step(0.0))

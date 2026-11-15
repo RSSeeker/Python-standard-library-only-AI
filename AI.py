@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2111 个 def / 473 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2117 个 def / 474 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -28602,6 +28602,279 @@ class LlavaProjector(Module):
         """返回嵌套 list（便于与 llava_merge_tokens 组合）。"""
         out = self.forward(patch_embeds)
         return out.tolist()
+
+
+import math
+import random
+
+
+def _tn_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"TimesNet: {name} 必须是正整数，收到 {value!r}")
+    return int(value)
+
+
+def _tn_check_series(series, lookback, who="TimesNet"):
+    if not isinstance(series, (list, tuple)) or not series:
+        raise ValueError(f"{who}: series 必须是非空列表")
+    out = []
+    for row in series:
+        if not isinstance(row, (list, tuple)) or len(row) != lookback:
+            raise ValueError(
+                f"{who}: 每条序列长度必须是 {lookback}，收到 {len(row) if hasattr(row, '__len__') else type(row).__name__}")
+        clean = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 序列元素必须是数字，收到 {v!r}")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 序列元素必须是有限数字，收到 {v!r}")
+            clean.append(float(v))
+        out.append(clean)
+    return out
+
+
+def _tn_amplitude(series):
+    """DFT 幅度谱（不含直流），O(T^2) 教学实现。"""
+    n = len(series)
+    amps = []
+    for k in range(1, n // 2 + 1):
+        re = 0.0
+        im = 0.0
+        for t, v in enumerate(series):
+            ang = -2.0 * math.pi * k * t / n
+            re += v * math.cos(ang)
+            im += v * math.sin(ang)
+        amps.append(math.hypot(re, im))
+    return amps
+
+
+import math
+import random
+
+
+def _tn_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"TimesNet: {name} 必须是正整数，收到 {value!r}")
+    return int(value)
+
+
+def _tn_check_series(series, lookback, who="TimesNet"):
+    if not isinstance(series, (list, tuple)) or not series:
+        raise ValueError(f"{who}: series 必须是非空列表")
+    out = []
+    for row in series:
+        if not isinstance(row, (list, tuple)) or len(row) != lookback:
+            raise ValueError(f"{who}: 每条序列长度必须是 {lookback}")
+        clean = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 序列元素必须是数字，收到 {v!r}")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 序列元素必须是有限数字，收到 {v!r}")
+            clean.append(float(v))
+        out.append(clean)
+    return out
+
+
+def _tn_amplitude(series):
+    n = len(series)
+    amps = []
+    for k in range(1, n // 2 + 1):
+        re = 0.0
+        im = 0.0
+        for t, v in enumerate(series):
+            ang = -2.0 * math.pi * k * t / n
+            re += v * math.cos(ang)
+            im += v * math.sin(ang)
+        amps.append(math.hypot(re, im))
+    return amps
+
+
+class TimesNet:
+    """TimesNet 简化版：FFT 选周期 -> 1D 序列 fold 成 2D -> 2D 卷积 -> 预测。
+
+    单变量序列 (T,)；周期选择视为常量（不对 FFT 顶 k 回传梯度）；
+    卷积为单层 Conv2d + ReLU，各周期输出先求和再平均。
+    """
+
+    def __init__(self, lookback=24, horizon=4, hidden=16, kernel_size=3,
+                 top_k=2, seed=None):
+        self.lookback = _tn_check_pos_int(lookback, "lookback")
+        self.horizon = _tn_check_pos_int(horizon, "horizon")
+        self.hidden = _tn_check_pos_int(hidden, "hidden")
+        self.kernel_size = _tn_check_pos_int(kernel_size, "kernel_size")
+        self.top_k = _tn_check_pos_int(top_k, "top_k")
+        if self.lookback < 2:
+            raise ValueError("TimesNet: lookback 至少为 2")
+        if self.kernel_size % 2 == 0:
+            raise ValueError("TimesNet: kernel_size 必须是奇数（用 padding 保持长度）")
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        self.conv = Conv2d(1, self.hidden, self.kernel_size, stride=1,
+                           padding=self.kernel_size // 2)
+        self.head = Layer(self.hidden * self.lookback, self.horizon, "linear")
+        if seed is not None:
+            random.setstate(state)
+        fan_in = self.hidden * self.lookback
+        self._head_gw = [[0.0] * fan_in for _ in range(self.horizon)]
+        self._head_gb = [0.0] * self.horizon
+        self._cache = None
+        self.loss_history = []
+
+    def _candidates(self):
+        cands = [p for p in range(2, self.lookback // 2 + 1)
+                 if self.lookback % p == 0]
+        return cands if cands else [1]
+
+    def _select_periods(self, series):
+        amps = _tn_amplitude(series)
+        scored = []
+        for p in self._candidates():
+            k = self.lookback // p
+            amp = amps[k - 1] if 1 <= k <= len(amps) else 0.0
+            scored.append((amp, -p, p))
+        scored.sort(reverse=True)
+        return [p for _a, _neg, p in scored[:self.top_k]]
+
+    @staticmethod
+    def _fold(series, period):
+        rows = len(series) // period
+        return [[series[r * rows + c] for c in range(rows)]
+                for r in range(period)]
+
+    def forward(self, series):
+        clean = _tn_check_series([series], self.lookback)[0]
+        periods = self._select_periods(clean)
+        fan_in = self.hidden * self.lookback
+        sums = [0.0] * fan_in
+        conv_infos = []
+        for p in periods:
+            grid = self._fold(clean, p)
+            rows = self.lookback // p
+            out = self.conv.forward([grid])
+            act = [[[v if v > 0.0 else 0.0 for v in row] for row in ch]
+                   for ch in out]
+            mask = [[[1.0 if v > 0.0 else 0.0 for v in row] for row in ch]
+                    for ch in out]
+            flat = []
+            for c in range(self.hidden):
+                for r in range(p):
+                    flat.extend(act[c][r])
+            for i in range(fan_in):
+                sums[i] += flat[i]
+            conv_infos.append({"p": p, "rows": rows, "mask": mask,
+                               "x_col": self.conv.x_col,
+                               "x_shape": self.conv.x_shape})
+        inv = 1.0 / len(periods)
+        mixed = [v * inv for v in sums]
+        pred, head_cache = _dense_rows_forward(self.head, [mixed])
+        self._cache = {"clean": clean, "periods": periods,
+                       "convs": conv_infos, "mixed": mixed,
+                       "head_cache": head_cache}
+        return pred[0]
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("TimesNet.backward: 需要先 forward")
+        if not isinstance(dout, (list, tuple)) or len(dout) != self.horizon:
+            raise ValueError(f"TimesNet.backward: dout 长度必须是 {self.horizon}")
+        dout = [float(v) for v in dout]
+        for v in dout:
+            if not math.isfinite(v):
+                raise ValueError("TimesNet.backward: dout 必须是有限数字")
+        gw, gb, d_mixed_rows = _dense_rows_backward(
+            self.head, self._cache["head_cache"], [dout])
+        for i in range(self.horizon):
+            self._head_gb[i] += gb[i]
+            for j in range(len(gw[i])):
+                self._head_gw[i][j] += gw[i][j]
+        d_mixed = d_mixed_rows[0]
+        inv = 1.0 / len(self._cache["periods"])
+        dx = [0.0] * self.lookback
+        for info in self._cache["convs"]:
+            p = info["p"]
+            rows = info["rows"]
+            d_flat = [v * inv for v in d_mixed]
+            d_act = []
+            idx = 0
+            for c in range(self.hidden):
+                ch = []
+                for r in range(p):
+                    row = []
+                    for cc in range(rows):
+                        row.append(d_flat[idx] * info["mask"][c][r][cc])
+                        idx += 1
+                    ch.append(row)
+                d_act.append(ch)
+            self.conv.forward([self._fold(self._cache["clean"], p)])
+            d_grid = self.conv.backward(d_act)
+            for r in range(p):
+                for c in range(rows):
+                    dx[r * rows + c] += d_grid[0][r][c]
+        return dx
+
+    def zero_grad(self):
+        self.conv.zero_grad()
+        fan_in = self.hidden * self.lookback
+        self._head_gw = [[0.0] * fan_in for _ in range(self.horizon)]
+        self._head_gb = [0.0] * self.horizon
+        self._cache = None
+
+    def param_count(self):
+        return _conv_param_count(self.conv) + _dense_param_count(self.head)
+
+    def sgd_step(self, lr=0.01):
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError(f"TimesNet: lr 必须是正数，收到 {lr!r}")
+        lr = float(lr)
+        _conv_sgd(self.conv, lr)
+        for i in range(self.horizon):
+            self.head.biases[i] -= lr * self._head_gb[i]
+            for j in range(self.hidden * self.lookback):
+                self.head.weights[i][j] -= lr * self._head_gw[i][j]
+
+    def fit(self, series, targets, epochs=50, lr=0.01, seed=None):
+        clean = _tn_check_series(series, self.lookback)
+        if not isinstance(targets, (list, tuple)) or len(targets) != len(clean):
+            raise ValueError("TimesNet.fit: targets 必须与 series 等长")
+        tgt = []
+        for row in targets:
+            if not isinstance(row, (list, tuple)) or len(row) != self.horizon:
+                raise ValueError(
+                    f"TimesNet.fit: 每个 target 长度必须是 {self.horizon}")
+            vals = []
+            for v in row:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or \
+                        not math.isfinite(float(v)):
+                    raise ValueError("TimesNet.fit: target 必须是有限数字")
+                vals.append(float(v))
+            tgt.append(vals)
+        epochs = _tn_check_pos_int(epochs, "epochs")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError(f"TimesNet.fit: lr 必须是正数，收到 {lr!r}")
+        rng = random.Random(seed)
+        history = []
+        order = list(range(len(clean)))
+        for _ in range(epochs):
+            rng.shuffle(order)
+            total = 0.0
+            for i in order:
+                self.zero_grad()
+                pred = self.forward(clean[i])
+                diff = [pred[k] - tgt[i][k] for k in range(self.horizon)]
+                total += sum(v * v for v in diff) / self.horizon
+                grads = [2.0 * v / self.horizon for v in diff]
+                self.backward(grads)
+                self.sgd_step(lr)
+            history.append(total / len(clean))
+        self.loss_history = history
+        return history
+
+    def predict(self, series):
+        clean = _tn_check_series(series, self.lookback)
+        return [self.forward(row) for row in clean]
+
 
 class MLP:
     """多层感知机（PyTorch 风格）"""

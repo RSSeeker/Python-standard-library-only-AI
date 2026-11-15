@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3166 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3171 项）
 
 ## 特性
 
@@ -5118,6 +5118,7 @@ future = model.forward(history_window)
 | `PatchTSTEmbedding(patch_len=16, stride=8, d_model=32, seed=None)` | patch 切分 + 线性嵌入 + RevIN |
 | `DLinear(lookback, horizon, kernel_size=3, seed=None)` | 趋势/季节分解 + 共享线性映射：`trend=移动平均(x)`、`seasonal=x-trend`，分别接一层线性后求和；带反向（含移动平均的梯度分摊） |
 | `ITransformer(lookback, num_features, d_model=16, num_heads=2, d_ff=32, num_layers=1, horizon=1, seed=None)` | 变量维 token 化：每个变量的 lookback 序列线性嵌入成 token，在变量维上跑 `TransformerEncoder`，再逐变量投影出 horizon；带手写反向（特征嵌入/输出投影/encoder） |
+| `TimesNet(lookback=24, horizon=4, hidden=16, kernel_size=3, top_k=2, seed=None)` | FFT 幅度谱挑 top-k 周期，把 1D 序列 fold 成 (周期, T/周期) 的 2D 图，单层 Conv2d+ReLU 后展平、对周期求平均，再线性映射出 horizon；手写反向（周期选择视为常量） |
 
 ```python
 tcn = TCN(in_channels=4, hidden=16, levels=3)
@@ -5133,6 +5134,11 @@ patches = emb.forward(values)    # 每个 patch 一个 d_model 向量
 dl = DLinear(lookback=24, horizon=6, kernel_size=3)
 y = dl.forward(values[:24])      # 未来 6 步，所有通道共享线性层
 dx = dl.backward(dy)             # 反向到输入（趋势路径按窗口均摊）
+
+tn = TimesNet(lookback=24, horizon=4, hidden=16, top_k=2)
+forecast = tn.forward(values[:24])   # 未来 4 步
+tn.backward([1.0, 0.0, 0.0, 0.0])    # 手写反向到输入
+tn.zero_grad(); tn.sgd_step(0.01)
 
 itr = ITransformer(lookback=24, num_features=4, horizon=6)
 pred = itr.forward(series_block)   # 4 个变量 × 6 步
@@ -5867,12 +5873,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3114 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3119 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3166 项）。
+`tests/`（合计 3171 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5880,7 +5886,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3166 项
+pytest -q                        # test_ai.py + tests/ 合计 3171 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7712,7 +7718,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3166 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3171 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8230,6 +8236,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestReMax` | history 字段与权重更新、`lr=None` 不更新、bool/数字奖励接受且 NaN/字符串报错、单样本优势恒零、10 类非法输入 |
 | `TestGrammarSampler` | 正则/CFG 允许集、采样只落允许集、温度与 top-k、同 seed 复现、空允许集与九类非法输入 |
 | `TestMultimodalProjection` | 相似度矩阵与 InfoNCE 数值、BlipProjector 参数/前向与训练收敛、给定输入梯度检查、LLaVA 拼接与投影形状、十类非法输入 |
+| `TestTimesNet` | 前向与参数计数（80）、周期选择（正弦周期 4）、输入/head/conv 权重梯度有限差分、fit 收敛、十四类非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |
