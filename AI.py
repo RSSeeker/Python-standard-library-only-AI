@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1958 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1965 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -16526,6 +16526,200 @@ class RecurrentGemmaBlock:
         for i in range(self.d_model):
             for j in range(self.kernel):
                 self.conv_k[i][j] -= lr * self.grad_conv[i][j]
+
+
+# ---- B12：线性注意力特征映射家族（ELU / Based / Hedgehog） ----
+
+
+def _laf_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+
+
+def _laf_check_seq(seq, d_model, who):
+    import math as _math
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError(f"{who}: 输入必须是非空 (T, d) 列表")
+    out = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 输入必须是数字")
+            if not _math.isfinite(float(v)):
+                raise ValueError(f"{who}: 输入必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _laf_check_kind(kind):
+    if kind not in ("elu", "based", "hedgehog"):
+        raise ValueError(
+            f"linear_attention_family: kind 必须是 'elu'/'based'/'hedgehog'，收到 {kind!r}")
+
+
+def _laf_feature_forward(kind, x):
+    """返回 (phi, cache)；phi 为特征向量，cache 供边界反传用。"""
+    import math as _math
+    _laf_check_kind(kind)
+    d = len(x)
+    if kind == "elu":
+        phi, cache = [], []
+        for v in x:
+            if v >= 0.0:
+                phi.append(v + 1.0)
+                cache.append(1.0)
+            else:
+                e = _math.exp(v)
+                phi.append(e + 0.0)
+                cache.append(e)
+        return phi, cache
+    if kind == "based":
+        phi = [1.0] + list(x) + [0.5 * v * v for v in x]
+        return phi, list(x)
+    # hedgehog: softmax([x, -x]) 作为特征，恒正且和为 1
+    logits = list(x) + [-v for v in x]
+    mx = max(logits)
+    ex = [_math.exp(v - mx) for v in logits]
+    s = sum(ex)
+    phi = [v / s for v in ex]
+    return phi, phi
+
+
+def _laf_feature_backward(kind, x, d_phi):
+    """给定 dL/dphi 返回 dL/dx。"""
+    import math as _math
+    d = len(x)
+    if kind == "elu":
+        return [d_phi[i] * (1.0 if x[i] > 0.0 else _math.exp(x[i]))
+                for i in range(d)]
+    if kind == "based":
+        dx = [0.0] * d
+        for i in range(d):
+            dx[i] = d_phi[1 + i] + d_phi[1 + d + i] * x[i]
+        return dx
+    # hedgehog: softmax 的 Jacobian 反传
+    logits = list(x) + [-v for v in x]
+    mx = max(logits)
+    ex = [_math.exp(v - mx) for v in logits]
+    s = sum(ex)
+    phi = [v / s for v in ex]
+    dot = sum(d_phi[j] * phi[j] for j in range(2 * d))
+    dl = [phi[j] * (d_phi[j] - dot) for j in range(2 * d)]
+    dx = [0.0] * d
+    for i in range(d):
+        dx[i] = dl[i] - dl[d + i]
+    return dx
+
+
+def linear_attention_family(q, k, v, kind="elu", decay=1.0):
+    """线性注意力家族的前向（因果、带标量衰减）。
+
+    ``S_t = decay·S_{t-1} + φ(k_t) ⊗ v_t``、``z_t = decay·z_{t-1} + φ(k_t)``、
+    ``out_t = (φ(q_t)ᵀ S_t) / (φ(q_t)ᵀ z_t + eps)``。
+    φ 可选 ELU+1、Based（1+x+x²/2）、Hedgehog（softmax([x,-x])）。因果性由
+    递推保证；decay=1 即线性 Transformer，decay<1 即带遗忘的 GLA 式形式。
+    """
+    q = _laf_check_seq(q, len(q[0]), "linear_attention_family(q)")
+    k = _laf_check_seq(k, len(k[0]), "linear_attention_family(k)")
+    v = _laf_check_seq(v, len(v[0]), "linear_attention_family(v)")
+    if len(q) != len(k) or len(k) != len(v):
+        raise ValueError("linear_attention_family: q/k/v 序列长度必须一致")
+    if isinstance(decay, bool) or not isinstance(decay, (int, float)):
+        raise ValueError("linear_attention_family: decay 必须是数字")
+    import math as _math
+    if not _math.isfinite(float(decay)) or not 0.0 < float(decay) <= 1.0:
+        raise ValueError("linear_attention_family: decay 必须在 (0, 1]")
+    decay = float(decay)
+    _laf_check_kind(kind)
+    T = len(q)
+    phi_q, cq = _laf_feature_forward(kind, q[0])
+    fd = len(phi_q)
+    dv = len(v[0])
+    S = [[0.0] * dv for _ in range(fd)]
+    z = [0.0] * fd
+    out = []
+    cache = []
+    for t in range(T):
+        phiq, cqi = _laf_feature_forward(kind, q[t])
+        phik, cki = _laf_feature_forward(kind, k[t])
+        S_before = [row[:] for row in S]
+        z_before = z[:]
+        for f in range(fd):
+            for j in range(dv):
+                S[f][j] = decay * S[f][j] + phik[f] * v[t][j]
+            z[f] = decay * z[f] + phik[f]
+        denom = sum(phiq[f] * z[f] for f in range(fd)) + 1e-8
+        row = [sum(phiq[f] * S[f][j] for f in range(fd)) / denom
+               for j in range(dv)]
+        out.append(row)
+        cache.append({"q": q[t], "k": k[t], "v": list(v[t]),
+                      "phiq": phiq, "cq": cqi, "phik": phik, "cki": cki,
+                      "S_before": S_before, "z_before": z_before,
+                      "S": [r[:] for r in S], "z": z[:], "denom": denom})
+    return out, cache
+
+
+def linear_attention_family_backward(d_out, cache, kind="elu", decay=1.0):
+    """线性注意力家族的手写反向，返回 (dq, dk, dv)。"""
+    T = len(cache)
+    if len(d_out) != T:
+        raise ValueError("linear_attention_family_backward: d_out 行数不匹配")
+    decay = float(decay)
+    d = len(cache[0]["q"])
+    dq = [[0.0] * d for _ in range(T)]
+    dk = [[0.0] * d for _ in range(T)]
+    dv = [[0.0] * len(cache[0]["v"]) for _ in range(T)]
+    fd = len(cache[0]["phiq"])
+    dS = [[0.0] * len(dv[0]) for _ in range(fd)]
+    dz = [0.0] * fd
+    for t in range(T - 1, -1, -1):
+        c = cache[t]
+        denom = c["denom"]
+        drow = d_out[t]
+        d_num = [drow[j] / denom for j in range(len(dv[t]))]
+        d_denom = -sum(drow[j] * (sum(c["phiq"][f] * c["S"][f][j]
+                                        for f in range(fd)) / denom)
+                       for j in range(len(dv[t]))) / denom
+        # out 对 phi_q 与 S 的偏导
+        dphiq = [0.0] * fd
+        for f in range(fd):
+            acc = 0.0
+            for j in range(len(dv[t])):
+                acc += d_num[j] * c["S"][f][j]
+            acc += d_denom * c["z"][f]
+            dphiq[f] = acc
+            for j in range(len(dv[t])):
+                dS[f][j] += d_num[j] * c["phiq"][f]
+            dz[f] += d_denom * c["phiq"][f]
+        # 穿过递推：S_t = decay·S_{t-1} + φ(k_t) ⊗ v_t
+        for f in range(fd):
+            for j in range(len(dv[t])):
+                dv[t][j] += c["phik"][f] * dS[f][j]
+        dphik = [0.0] * fd
+        for f in range(fd):
+            acc = dz[f]
+            for j in range(len(dv[t])):
+                acc += c["v"][j] * dS[f][j]
+            dphik[f] = acc
+        if t > 0:
+            for f in range(fd):
+                for j in range(len(dv[t])):
+                    dS[f][j] *= decay
+                dz[f] *= decay
+        else:
+            for f in range(fd):
+                for j in range(len(dv[t])):
+                    dS[f][j] = 0.0
+                dz[f] = 0.0
+        dqx = _laf_feature_backward(kind, c["q"], dphiq)
+        dkx = _laf_feature_backward(kind, c["k"], dphik)
+        dq[t] = dqx
+        dk[t] = dkx
+    return dq, dk, dv
 
 class DifferentialAttention:
     """差分注意力（DIFF Transformer 教学简化）：两组 Q/K 的注意力图相减。

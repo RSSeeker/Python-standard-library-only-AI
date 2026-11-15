@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3074 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3079 项）
 
 ## 特性
 
@@ -2414,6 +2414,28 @@ history = AI.rlaif_align(model, AI._unl_clone_lm(model), prompts, judge_fn,
 边界：`rlvr` 只接受数值或布尔奖励（其它类型报错）；`rlaif_align` 与
 `iterative_dpo` 一样，温度过低时同 prompt 的样本可能全同（该 prompt 被跳过）；
 `judge_fn` 是外部打分器，本库不内置判官模型，仅提供接口与校验。
+
+### 线性注意力特征映射家族（ELU / Based / Hedgehog）
+
+```python
+q = [[0.1, -0.2, 0.3], [0.0, 0.4, -0.1]]
+k = [[0.2, 0.1, -0.3], [0.5, -0.2, 0.0]]
+v = [[1.0, 0.0], [0.0, 1.0]]
+out_elu, cache = AI.linear_attention_family(q, k, v, kind="elu", decay=1.0)
+out_based, _ = AI.linear_attention_family(q, k, v, kind="based", decay=0.9)
+out_hh, _ = AI.linear_attention_family(q, k, v, kind="hedgehog", decay=1.0)
+dq, dk, dv = AI.linear_attention_family_backward(
+    [[1.0, 0.0], [0.0, 1.0]], cache, kind="elu", decay=1.0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `linear_attention_family(q, k, v, kind="elu", decay=1.0)` | 因果线性注意力（带标量遗忘）：`S_t=decay·S_{t-1}+φ(k_t)⊗v_t`、`z_t=decay·z_{t-1}+φ(k_t)`、`out_t=φ(q_t)ᵀS_t/(φ(q_t)ᵀz_t+ε)`；`kind` 支持 `"elu"`（ELU+1）、`"based"`（`[1,x,x²/2]`）、`"hedgehog"`（`softmax([x,-x])`） |
+| `linear_attention_family_backward(d_out, cache, kind="elu", decay=1.0)` | 手写反向：经 `S/z` 递推回传，再穿过特征映射得到 `(dq, dk, dv)`；`cache` 由前向返回 |
+
+边界：特征映射都是逐元素/固定映射（不含可学习投影），Based 与 Hedgehog 是教学简化版本；
+`decay=1` 即线性 Transformer，`decay<1` 是带遗忘的 GLA 式形式；实现仍是
+O(T·d²) 的 Python 循环，不含 chunkwise 并行。
 
 ### 混合架构（Samba / Zamba / RecurrentGemma）
 
@@ -5467,12 +5489,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3022 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3027 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3074 项）。
+`tests/`（合计 3079 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5480,7 +5502,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3074 项
+pytest -q                        # test_ai.py + tests/ 合计 3079 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7270,7 +7292,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3074 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3079 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7596,6 +7618,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestReinforceAndVine` | reinforce_plus_plus 历史字段与权重更新、bool 奖励可用且 NaN/字符串奖励报错、vine_ppo 历史/更新与 clip_ratio 占位、12 类非法输入 |
 | `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
 | `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
+| `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
