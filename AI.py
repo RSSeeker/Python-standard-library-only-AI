@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1931 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1938 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -15700,6 +15700,150 @@ def ppo_kl_align(policy, reference, reward_fn, prompts, kl_coef=0.1,
         max_new_tokens=max_new_tokens, temperature=temperature,
         gamma=gamma, eos_id=eos_id, seed=seed)
     return trainer.fit(prompts, epochs=epochs)
+
+
+# ---- B8：RLAIF / RLVR（AI 反馈与可验证奖励）教学实现 ----
+
+
+def _b8_check_model(model, name):
+    """校验是 CausalLM 风格模型（可生成、可回传 logp）。"""
+    need = ("generate", "zero_grad", "adam_step")
+    missing = [a for a in need if not hasattr(model, a)]
+    if missing:
+        raise TypeError(f"{name}: 需要 CausalLM 风格模型（缺少 {missing}），"
+                        f"收到 {type(model).__name__}")
+
+
+def _b8_check_prompts(model, prompts, who):
+    """校验 prompt 列表，返回规整后的 list[list[int]]（每条至少 1 个 token）。"""
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError(f"{who}: prompts 必须是非空列表")
+    out = []
+    for i, prompt in enumerate(prompts):
+        ids = _check_token_ids(prompt, model.vocab_size, f"{who}.prompts[{i}]")
+        if not ids:
+            raise ValueError(f"{who}.prompts[{i}]: prompt 不能为空")
+        out.append(ids)
+    return out
+
+
+def _b8_check_fn(fn, name):
+    if not callable(fn):
+        raise TypeError(f"{name}: 必须是可调用对象，收到 {type(fn).__name__}")
+
+
+def _b8_check_pos(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}: 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise ValueError(f"{name}: 必须是正有限数，收到 {value!r}")
+    return float(value)
+
+
+def _b8_check_reward(value, name):
+    """把 verify/judge 的返回值规整成 float：bool→1.0/0.0，数字须有限。"""
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if math.isfinite(v):
+            return v
+    raise ValueError(f"{name}: 必须返回 bool 或有限数字，收到 {value!r}")
+
+
+def rlvr(policy, prompts, verify_fn, num_samples=4, epochs=1, lr=None,
+         max_new_tokens=4, temperature=1.0, clip_ratio=0.2,
+         entropy_coef=0.0, seed=None):
+    """RLVR：用可验证奖励（规则检查器）做 GRPO 训练。
+
+    ``verify_fn(prompt_tokens, response_tokens)`` 返回 bool 或数字（正确性/得分），
+    内部包成 ``GRPOTrainer`` 的 reward_fn 后调用 ``grpo_align``。返回每轮平均损失。
+    """
+    _b8_check_model(policy, "rlvr(policy)")
+    prompts = _b8_check_prompts(policy, prompts, "rlvr")
+    _b8_check_fn(verify_fn, "rlvr(verify_fn)")
+    num_samples = int(num_samples)
+    if num_samples < 2:
+        raise ValueError(f"rlvr: num_samples 必须 >=2，收到 {num_samples!r}")
+    _b8_check_pos(temperature, "rlvr(temperature)")
+    _b8_check_pos(max_new_tokens, "rlvr(max_new_tokens)")
+    if lr is None:
+        lr = 0.01
+    _b8_check_pos(lr, "rlvr(lr)")
+
+    def reward_fn(prompt, response):
+        return _b8_check_reward(
+            verify_fn(prompt, response), "rlvr(verify_fn) 返回值")
+
+    history = grpo_align(
+        policy, reward_fn, prompts, num_samples=num_samples,
+        clip_ratio=clip_ratio, entropy_coef=entropy_coef, lr=lr,
+        max_new_tokens=max_new_tokens, temperature=temperature,
+        epochs=epochs, seed=seed)
+    return {"loss": history, "epochs": epochs, "prompts": len(prompts)}
+
+
+def rlaif_align(policy, reference, prompts, judge_fn, num_samples=4,
+                beta=0.1, iterations=1, max_new_tokens=8, temperature=1.0,
+                lr=None, shuffle=True, seed=None):
+    """RLAIF：用 AI 裁判打分构造偏好对，再做 DPO。
+
+    每一轮对每个 prompt 采样 ``num_samples`` 条回答，``judge_fn(prompt, response)``
+    返回分数；取最高/最低两条组成 ``(prompt, best, worst)`` 对，交给
+    ``dpo_align`` 更新。返回逐轮历史与总体统计。
+    """
+    _b8_check_model(policy, "rlaif_align(policy)")
+    _b8_check_model(reference, "rlaif_align(reference)")
+    prompts = _b8_check_prompts(policy, prompts, "rlaif_align")
+    _b8_check_fn(judge_fn, "rlaif_align(judge_fn)")
+    num_samples = int(num_samples)
+    if num_samples < 2:
+        raise ValueError(f"rlaif_align: num_samples 必须 >=2，收到 {num_samples!r}")
+    iterations = int(iterations)
+    if iterations < 1:
+        raise ValueError(f"rlaif_align: iterations 必须是正整数，收到 {iterations!r}")
+    beta = _b8_check_pos(beta, "rlaif_align(beta)")
+    _b8_check_pos(temperature, "rlaif_align(temperature)")
+    _b8_check_pos(max_new_tokens, "rlaif_align(max_new_tokens)")
+    if lr is None:
+        lr = 0.01
+    _b8_check_pos(lr, "rlaif_align(lr)")
+    if not isinstance(shuffle, bool):
+        raise ValueError(f"rlaif_align: shuffle 必须是 bool，收到 {shuffle!r}")
+
+    rng = random.Random(seed)
+    history = []
+    total = 0
+    for it in range(iterations):
+        pairs = []
+        scores_all = []
+        for prompt in prompts:
+            samples = []
+            for _ in range(num_samples):
+                seq = policy.generate(
+                    list(prompt), max_new_tokens=max_new_tokens,
+                    temperature=temperature, rng=rng)
+                resp = list(seq[len(prompt):])
+                score = _b8_check_reward(
+                    judge_fn(prompt, resp), "rlaif_align(judge_fn) 返回值")
+                samples.append((score, resp))
+                scores_all.append(score)
+            best = max(range(len(samples)), key=lambda i: (samples[i][0], -i))
+            worst = min(range(len(samples)), key=lambda i: (samples[i][0], i))
+            if best == worst or samples[best][0] == samples[worst][0]:
+                continue
+            pairs.append((prompt, samples[best][1], samples[worst][1]))
+        if pairs:
+            dpo_align(policy, reference, pairs, beta=beta, epochs=1, lr=lr,
+                      shuffle=shuffle, seed=rng.randrange(1 << 30))
+        total += len(pairs)
+        history.append({
+            "iteration": it + 1,
+            "pairs": len(pairs),
+            "mean_score": (sum(scores_all) / len(scores_all)) if scores_all else 0.0,
+            "max_score": max(scores_all) if scores_all else 0.0,
+        })
+    return {"iterations": history, "total_pairs": total, "beta": beta}
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环

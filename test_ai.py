@@ -48848,3 +48848,115 @@ class TestSpinAndIterativeDPO:
             lambda: AI.iterative_dpo(pol, ref, [[1]], lambda p, r: 1.0, iterations=0))
         assert _spin_t_raises(
             lambda: AI.iterative_dpo(pol, ref, [[1]], lambda p, r: 1.0, temperature=0.0))
+
+
+import random
+
+import AI
+
+
+def _b8_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _b8_t_model(epochs=30):
+    random.seed(1)
+    m = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                    num_layers=1, max_len=12)
+    m.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=epochs, lr=0.02)
+    return m
+
+
+class TestRLAIFAndRLVR:
+    def test_rlvr_history_and_update(self):
+        m = _b8_t_model()
+
+        def verify(prompt, response):
+            return bool(response) and response[0] == (prompt[-1] + 1) % 10
+
+        before = [row[:] for row in m.encoder.layers[0].self_attn.W_q]
+        hist = AI.rlvr(m, [[1, 2, 3], [6, 7, 8]], verify, num_samples=4,
+                       epochs=2, lr=0.02, max_new_tokens=2,
+                       temperature=3.0, seed=1)
+        assert set(hist) == {"loss", "epochs", "prompts"}
+        assert len(hist["loss"]) == 2
+        assert all(isinstance(v, float) for v in hist["loss"])
+        assert m.encoder.layers[0].self_attn.W_q != before
+
+    def test_rlvr_reward_validation(self):
+        m = _b8_t_model()
+
+        def numeric_verify(prompt, response):
+            return 1.0 if response else 0.0
+
+        hist = AI.rlvr(m, [[1, 2, 3]], numeric_verify, num_samples=2,
+                       epochs=1, lr=0.01, max_new_tokens=1,
+                       temperature=2.0, seed=2)
+        assert len(hist["loss"]) == 1
+
+        def bad_verify(prompt, response):
+            return "not-a-number"
+
+        assert _b8_t_raises(
+            lambda: AI.rlvr(m, [[1, 2, 3]], bad_verify, num_samples=2,
+                            max_new_tokens=1), (ValueError, TypeError))
+
+    def test_rlaif_pairs_and_history(self):
+        m = _b8_t_model()
+        ref = AI._unl_clone_lm(m)
+
+        def judge(prompt, response):
+            return float(response[0]) if response else 0.0
+
+        before = [row[:] for row in m.encoder.layers[0].self_attn.W_q]
+        res = AI.rlaif_align(m, ref, [[1, 2, 3], [6, 7, 8]], judge,
+                             num_samples=3, beta=0.1, iterations=2,
+                             max_new_tokens=2, temperature=8.0,
+                             lr=0.02, seed=2)
+        assert set(res) == {"iterations", "total_pairs", "beta"}
+        assert len(res["iterations"]) == 2
+        assert res["total_pairs"] > 0
+        assert res["iterations"][0]["pairs"] >= 0
+        assert res["iterations"][0]["max_score"] >= 0.0
+        assert m.encoder.layers[0].self_attn.W_q != before
+
+    def test_rlaif_all_ties_no_pairs(self):
+        m = _b8_t_model()
+        ref = AI._unl_clone_lm(m)
+
+        def constant_judge(prompt, response):
+            return 1.0
+
+        res = AI.rlaif_align(m, ref, [[1, 2, 3]], constant_judge,
+                             num_samples=3, iterations=1, max_new_tokens=1,
+                             temperature=5.0, lr=0.01, seed=3)
+        assert res["total_pairs"] == 0
+        assert res["iterations"][0]["pairs"] == 0
+
+    def test_invalid_inputs(self):
+        m = _b8_t_model(epochs=2)
+        ref = AI._unl_clone_lm(m)
+
+        def verify(prompt, response):
+            return True
+
+        def judge(prompt, response):
+            return 0.0
+
+        cases = [
+            lambda: AI.rlvr(None, [[1]], verify),
+            lambda: AI.rlvr(m, [], verify),
+            lambda: AI.rlvr(m, [[1]], "nope"),
+            lambda: AI.rlvr(m, [[1]], verify, num_samples=1),
+            lambda: AI.rlvr(m, [[1]], verify, temperature=0),
+            lambda: AI.rlaif_align(m, ref, [[1]], "nope"),
+            lambda: AI.rlaif_align(m, ref, [[1]], judge, iterations=0),
+            lambda: AI.rlaif_align(m, ref, [[1]], judge, num_samples=1),
+            lambda: AI.rlaif_align(m, ref, [[]], judge),
+            lambda: AI.rlaif_align(m, ref, [[1]], judge, temperature=0),
+        ]
+        assert all(_b8_t_raises(c) for c in cases)
