@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1951 个 def / 442 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1958 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -16101,6 +16101,431 @@ def _d10_quiet_softmax_row(scores, indices):
     s = sum(ex.values()) + _math.exp(-shift)
     return {j: ex[j] / s for j in indices}
 
+
+
+# ---- B11：混合架构（Samba / Zamba / RecurrentGemma）教学实现 ----
+
+
+def _hyb_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+
+
+def _hyb_check_seq(seq, d_model, who):
+    import math as _math
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError(f"{who}: 输入必须是非空 (T, d_model) 列表")
+    out = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 输入必须是数字")
+            if not _math.isfinite(float(v)):
+                raise ValueError(f"{who}: 输入必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _hyb_ln_param_count(d_model):
+    return 2 * d_model
+
+
+def _hyb_mha_param_count(d_model):
+    return 4 * (d_model * d_model + d_model)
+
+
+def _hyb_mha_sgd(attn, lr):
+    """按 MHA.grads 里的普通矩阵/向量原地 SGD（MHA 无 sgd_step 方法）。"""
+    for name in ("W_q", "W_k", "W_v", "W_o"):
+        W = getattr(attn, name)
+        G = attn.grads[name]
+        for i in range(len(W)):
+            for j in range(len(W[i])):
+                W[i][j] -= lr * G[i][j]
+    for name in ("b_q", "b_k", "b_v", "b_o"):
+        vec = getattr(attn, name)
+        G = attn.grads[name]
+        for i in range(len(vec)):
+            vec[i] -= lr * G[i]
+
+
+def _hyb_short_conv(rows, kernels):
+    """逐通道因果短卷积：out[t][c] = Σ_j kernel[c][j]·rows[t-j][c]。"""
+    T, d = len(rows), len(rows[0])
+    k = len(kernels[0])
+    out = [[0.0] * d for _ in range(T)]
+    for t in range(T):
+        for c in range(d):
+            acc = 0.0
+            for j in range(k):
+                if t - j >= 0:
+                    acc += kernels[c][j] * rows[t - j][c]
+            out[t][c] = acc
+    return out
+
+
+def _hyb_short_conv_backward(dout, rows, kernels):
+    T, d = len(dout), len(dout[0])
+    k = len(kernels[0])
+    d_rows = [[0.0] * d for _ in range(T)]
+    d_kernels = [[0.0] * k for _ in range(d)]
+    for t in range(T):
+        for c in range(d):
+            dv = dout[t][c]
+            for j in range(k):
+                if t - j >= 0:
+                    d_kernels[c][j] += dv * rows[t - j][c]
+                    d_rows[t - j][c] += dv * kernels[c][j]
+    return d_rows, d_kernels
+
+
+class SambaBlock:
+    """Samba 简化 block：Mamba 状态空间层 + 全局注意力 + FFN 三残差。
+
+    顺序为 ``x → x+Mamba(LN(x)) → x+Attn(LN(x)) → x+FFN(LN(x))``；
+    反向依次穿过 FFN / 注意力 / Mamba 的手写反向。Mamba 与注意力都做残差。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff=None, d_state=4, eps=1e-5,
+                 seed=None):
+        _hyb_check_pos_int(d_model, "SambaBlock: d_model")
+        _hyb_check_pos_int(num_heads, "SambaBlock: num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError("SambaBlock: d_model 必须能被 num_heads 整除")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _hyb_check_pos_int(d_ff, "SambaBlock: d_ff")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.eps = float(eps)
+        import random as _random
+        was = _random.getstate()
+        if seed is not None:
+            _random.seed(seed)
+        try:
+            self.mamba = Mamba2Block(d_model, num_heads, d_state, seed=seed)
+            self.attn = MultiHeadAttention(d_model, num_heads, dropout=0.0,
+                                           causal=True)
+            self.ln_mamba = LayerNorm(d_model, self.eps)
+            self.ln_attn = LayerNorm(d_model, self.eps)
+            self.ln_ff = LayerNorm(d_model, self.eps)
+            self.W1 = Layer(d_model, d_ff, "relu")
+            self.W2 = Layer(d_ff, d_model, "linear")
+        finally:
+            _random.setstate(was)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.mamba.zero_grad()
+        self.attn.zero_grad()
+        self.grad_ln_mamba = None
+        self.grad_ln_attn = None
+        self.grad_ln_ff = None
+        self.grad_W1 = None
+        self.grad_b1 = None
+        self.grad_W2 = None
+        self.grad_b2 = None
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward(self, x):
+        x = _hyb_check_seq(x, self.d_model, "SambaBlock.forward")
+        T = len(x)
+        ln1, c1 = _norm_rows_forward(self.ln_mamba, x)
+        m_out = self.mamba.forward(ln1)
+        r1 = [[x[t][i] + m_out[t][i] for i in range(self.d_model)]
+              for t in range(T)]
+        ln2, c2 = _norm_rows_forward(self.ln_attn, r1)
+        a_out = self.attn.forward(ln2)
+        r2 = [[r1[t][i] + a_out[t][i] for i in range(self.d_model)]
+              for t in range(T)]
+        ln3, c3 = _norm_rows_forward(self.ln_ff, r2)
+        f1, cf1 = _dense_rows_forward(self.W1, ln3)
+        f2, cf2 = _dense_rows_forward(self.W2, f1)
+        out = [[r2[t][i] + f2[t][i] for i in range(self.d_model)]
+               for t in range(T)]
+        self._cache = {"x": x, "ln1": c1, "ln2": c2, "ln3": c3,
+                       "r2": r2, "cf1": cf1, "cf2": cf2, "ln3_rows": ln3}
+        return out
+
+    def backward(self, d_out):
+        if not getattr(self, "_cache", None):
+            raise RuntimeError("SambaBlock: 必须先 forward")
+        c = self._cache
+        x = c["x"]
+        T, d = len(x), self.d_model
+        if len(d_out) != T:
+            raise ValueError("SambaBlock.backward: d_out 行数不匹配")
+        for row in d_out:
+            if len(row) != d:
+                raise ValueError("SambaBlock.backward: d_out 每行长度必须是 d_model")
+        gw2, gb2, d_f1 = _dense_rows_backward(self.W2, c["cf2"], d_out)
+        gw1, gb1, d_ln3 = _dense_rows_backward(self.W1, c["cf1"], d_f1)
+        self._acc_dense("W2", gw2, gb2)
+        self._acc_dense("W1", gw1, gb1)
+        g_ln, b_ln, d_r2_ff = _norm_rows_backward(self.ln_ff, c["ln3"], d_ln3)
+        self.grad_ln_ff = (g_ln, b_ln)
+        d_r2 = [[d_out[t][i] + d_r2_ff[t][i] for i in range(d)]
+                for t in range(T)]
+        d_ln2 = self.attn.backward(d_r2)
+        g_ln2, b_ln2, d_r1_attn = _norm_rows_backward(self.ln_attn, c["ln2"],
+                                                      d_ln2)
+        self.grad_ln_attn = (g_ln2, b_ln2)
+        d_r1 = [[d_r2[t][i] + d_r1_attn[t][i] for i in range(d)]
+                for t in range(T)]
+        d_ln1 = self.mamba.backward(d_r1)
+        g_ln1, b_ln1, d_mamba_res = _norm_rows_backward(self.ln_mamba, c["ln1"],
+                                                        d_ln1)
+        self.grad_ln_mamba = (g_ln1, b_ln1)
+        return [[d_r1[t][i] + d_mamba_res[t][i] for i in range(d)]
+                for t in range(T)]
+
+    def _acc_dense(self, name, gw, gb):
+        cur = getattr(self, "grad_" + name)
+        if cur is None:
+            setattr(self, "grad_" + name, (gw, gb))
+            return
+        cw, cb = cur
+        for i in range(len(cw)):
+            for j in range(len(cw[i])):
+                cw[i][j] += gw[i][j]
+            cb[i] += gb[i]
+
+    def param_count(self):
+        return (self.mamba.param_count()
+                + _hyb_mha_param_count(self.d_model)
+                + _dense_param_count(self.W1) + _dense_param_count(self.W2)
+                + 3 * _hyb_ln_param_count(self.d_model))
+
+    def sgd_step(self, lr=0.01):
+        lr = float(lr)
+        self.mamba.sgd_step(lr)
+        _hyb_mha_sgd(self.attn, lr)
+        _dense_apply_sgd(self.W1, (self.grad_W1[0], self.grad_W1[1]), lr)
+        _dense_apply_sgd(self.W2, (self.grad_W2[0], self.grad_W2[1]), lr)
+        _norm_apply_sgd(self.ln_mamba, self.grad_ln_mamba, lr)
+        _norm_apply_sgd(self.ln_attn, self.grad_ln_attn, lr)
+        _norm_apply_sgd(self.ln_ff, self.grad_ln_ff, lr)
+
+
+class ZambaBlock:
+    """Zamba 简化 block：全局注意力放在最前，再 Mamba 与 FFN。
+
+    与 Samba 的差别只在顺序（``x → x+Attn(LN(x)) → x+Mamba(LN(x)) →
+    x+FFN(LN(x))``）：Zamba 原文把少量全局注意力块插在多个 Mamba 块之间，
+    这里把「一个 stage 内」的顺序显式写出来。反向同样逐子层手写。
+    """
+
+    def __init__(self, d_model, num_heads, d_ff=None, d_state=4, eps=1e-5,
+                 seed=None):
+        _hyb_check_pos_int(d_model, "ZambaBlock: d_model")
+        _hyb_check_pos_int(num_heads, "ZambaBlock: num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError("ZambaBlock: d_model 必须能被 num_heads 整除")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _hyb_check_pos_int(d_ff, "ZambaBlock: d_ff")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.eps = float(eps)
+        import random as _random
+        was = _random.getstate()
+        if seed is not None:
+            _random.seed(seed)
+        try:
+            self.attn = MultiHeadAttention(d_model, num_heads, dropout=0.0,
+                                           causal=True)
+            self.mamba = Mamba2Block(d_model, num_heads, d_state, seed=seed)
+            self.ln_attn = LayerNorm(d_model, self.eps)
+            self.ln_mamba = LayerNorm(d_model, self.eps)
+            self.ln_ff = LayerNorm(d_model, self.eps)
+            self.W1 = Layer(d_model, d_ff, "relu")
+            self.W2 = Layer(d_ff, d_model, "linear")
+        finally:
+            _random.setstate(was)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.attn.zero_grad()
+        self.mamba.zero_grad()
+        self.grad_ln_attn = None
+        self.grad_ln_mamba = None
+        self.grad_ln_ff = None
+        self.grad_W1 = None
+        self.grad_W2 = None
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward(self, x):
+        x = _hyb_check_seq(x, self.d_model, "ZambaBlock.forward")
+        T = len(x)
+        ln1, c1 = _norm_rows_forward(self.ln_attn, x)
+        a_out = self.attn.forward(ln1)
+        r1 = [[x[t][i] + a_out[t][i] for i in range(self.d_model)]
+              for t in range(T)]
+        ln2, c2 = _norm_rows_forward(self.ln_mamba, r1)
+        m_out = self.mamba.forward(ln2)
+        r2 = [[r1[t][i] + m_out[t][i] for i in range(self.d_model)]
+              for t in range(T)]
+        ln3, c3 = _norm_rows_forward(self.ln_ff, r2)
+        f1, cf1 = _dense_rows_forward(self.W1, ln3)
+        f2, cf2 = _dense_rows_forward(self.W2, f1)
+        out = [[r2[t][i] + f2[t][i] for i in range(self.d_model)]
+               for t in range(T)]
+        self._cache = {"x": x, "c1": c1, "c2": c2, "c3": c3, "r2": r2,
+                       "cf1": cf1, "cf2": cf2}
+        return out
+
+    def backward(self, d_out):
+        if not getattr(self, "_cache", None):
+            raise RuntimeError("ZambaBlock: 必须先 forward")
+        c = self._cache
+        x = c["x"]
+        T, d = len(x), self.d_model
+        if len(d_out) != T:
+            raise ValueError("ZambaBlock.backward: d_out 行数不匹配")
+        for row in d_out:
+            if len(row) != d:
+                raise ValueError("ZambaBlock.backward: d_out 每行长度必须是 d_model")
+        gw2, gb2, d_f1 = _dense_rows_backward(self.W2, c["cf2"], d_out)
+        gw1, gb1, d_ln3 = _dense_rows_backward(self.W1, c["cf1"], d_f1)
+        self.grad_W2 = (gw2, gb2)
+        self.grad_W1 = (gw1, gb1)
+        g_ln, b_ln, d_r2_ff = _norm_rows_backward(self.ln_ff, c["c3"], d_ln3)
+        self.grad_ln_ff = (g_ln, b_ln)
+        d_r2 = [[d_out[t][i] + d_r2_ff[t][i] for i in range(d)]
+                for t in range(T)]
+        d_ln2 = self.mamba.backward(d_r2)
+        g_ln2, b_ln2, d_r1_m = _norm_rows_backward(self.ln_mamba, c["c2"],
+                                                   d_ln2)
+        self.grad_ln_mamba = (g_ln2, b_ln2)
+        d_r1 = [[d_r2[t][i] + d_r1_m[t][i] for i in range(d)]
+                for t in range(T)]
+        d_ln1 = self.attn.backward(d_r1)
+        g_ln1, b_ln1, d_x_attn = _norm_rows_backward(self.ln_attn, c["c1"],
+                                                     d_ln1)
+        self.grad_ln_attn = (g_ln1, b_ln1)
+        return [[d_r1[t][i] + d_x_attn[t][i] for i in range(d)]
+                for t in range(T)]
+
+    def param_count(self):
+        return (self.mamba.param_count()
+                + _hyb_mha_param_count(self.d_model)
+                + _dense_param_count(self.W1) + _dense_param_count(self.W2)
+                + 3 * _hyb_ln_param_count(self.d_model))
+
+    def sgd_step(self, lr=0.01):
+        lr = float(lr)
+        _hyb_mha_sgd(self.attn, lr)
+        self.mamba.sgd_step(lr)
+        _dense_apply_sgd(self.W1, self.grad_W1, lr)
+        _dense_apply_sgd(self.W2, self.grad_W2, lr)
+        _norm_apply_sgd(self.ln_attn, self.grad_ln_attn, lr)
+        _norm_apply_sgd(self.ln_mamba, self.grad_ln_mamba, lr)
+        _norm_apply_sgd(self.ln_ff, self.grad_ln_ff, lr)
+
+
+class RecurrentGemmaBlock:
+    """RecurrentGemma 简化 block：因果短卷积 + RG-LRU。
+
+    ``h = x + short_conv(LN(x))``、``out = RGLRUBlock(h)``（RG-LRU block 自带
+    残差与 FFN）；短卷积是逐通道因果深度卷积，反向同时更新卷积核与输入。
+    """
+
+    def __init__(self, d_model, d_ff=None, kernel=3, eps=1e-5, seed=None):
+        _hyb_check_pos_int(d_model, "RecurrentGemmaBlock: d_model")
+        _hyb_check_pos_int(kernel, "RecurrentGemmaBlock: kernel")
+        if d_ff is None:
+            d_ff = 4 * d_model
+        _hyb_check_pos_int(d_ff, "RecurrentGemmaBlock: d_ff")
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.kernel = kernel
+        self.eps = float(eps)
+        import random as _random
+        was = _random.getstate()
+        if seed is not None:
+            _random.seed(seed)
+        try:
+            self.ln = LayerNorm(d_model, self.eps)
+            self.rglru = RGLRUBlock(d_model, d_ff=d_ff, eps=eps, seed=seed)
+            std = (2.0 / d_model) ** 0.5
+            self.conv_k = [[_random.gauss(0.0, std) for _ in range(kernel)]
+                           for _ in range(d_model)]
+        finally:
+            _random.setstate(was)
+        self.zero_grad()
+        self._cache = None
+
+    def zero_grad(self):
+        self.rglru.zero_grad()
+        self.grad_ln = None
+        self.grad_conv = [[0.0] * self.kernel for _ in range(self.d_model)]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def forward(self, x):
+        x = _hyb_check_seq(x, self.d_model, "RecurrentGemmaBlock.forward")
+        T = len(x)
+        ln_rows, c_ln = _norm_rows_forward(self.ln, x)
+        conv_out = _hyb_short_conv(ln_rows, self.conv_k)
+        h = [[x[t][i] + conv_out[t][i] for i in range(self.d_model)]
+             for t in range(T)]
+        out = self.rglru.forward(h)
+        self._cache = {"x": x, "c_ln": c_ln, "ln_rows": ln_rows}
+        return out
+
+    def backward(self, d_out):
+        if not getattr(self, "_cache", None):
+            raise RuntimeError("RecurrentGemmaBlock: 必须先 forward")
+        c = self._cache
+        x = c["x"]
+        T, d = len(x), self.d_model
+        if len(d_out) != T:
+            raise ValueError("RecurrentGemmaBlock.backward: d_out 行数不匹配")
+        for row in d_out:
+            if len(row) != d:
+                raise ValueError("RecurrentGemmaBlock.backward: d_out 每行长度必须是 d_model")
+        d_h = self.rglru.backward(d_out)
+        d_ln_rows, d_conv = _hyb_short_conv_backward(d_h, c["ln_rows"],
+                                                     self.conv_k)
+        for i in range(d):
+            for j in range(self.kernel):
+                self.grad_conv[i][j] += d_conv[i][j]
+        g_ln, b_ln, d_x_ln = _norm_rows_backward(self.ln, c["c_ln"], d_ln_rows)
+        self.grad_ln = (g_ln, b_ln)
+        return [[d_h[t][i] + d_x_ln[t][i] for i in range(d)]
+                for t in range(T)]
+
+    def param_count(self):
+        return (self.rglru.param_count() + _hyb_ln_param_count(self.d_model)
+                + self.d_model * self.kernel)
+
+    def sgd_step(self, lr=0.01):
+        lr = float(lr)
+        self.rglru.sgd_step(lr)
+        _norm_apply_sgd(self.ln, self.grad_ln, lr)
+        for i in range(self.d_model):
+            for j in range(self.kernel):
+                self.conv_k[i][j] -= lr * self.grad_conv[i][j]
 
 class DifferentialAttention:
     """差分注意力（DIFF Transformer 教学简化）：两组 Q/K 的注意力图相减。
@@ -66092,7 +66517,11 @@ class Mamba2Block:
                 dA_log[h] += da * (-dts[t][h] * A_exp * a_h)
                 d_dt = da * (-A_exp * a_h)
                 raw = dt_raw[t][h] + self.dt_bias[h]
-                sig = 1.0 if raw > 30.0 else 1.0 / (1.0 + math.exp(-raw))
+                if raw >= 0.0:
+                    sig = 1.0 / (1.0 + math.exp(-raw))
+                else:
+                    e = math.exp(raw)
+                    sig = e / (1.0 + e)
                 d_dt_raw[t][h] = d_dt * sig
                 self.grad_dt_bias[h] += d_dt * sig
             carrier = [[[aas[t][h] * total[h][r][s] for s in range(ds)]

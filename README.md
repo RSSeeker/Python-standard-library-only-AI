@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3069 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3074 项）
 
 ## 特性
 
@@ -2414,6 +2414,31 @@ history = AI.rlaif_align(model, AI._unl_clone_lm(model), prompts, judge_fn,
 边界：`rlvr` 只接受数值或布尔奖励（其它类型报错）；`rlaif_align` 与
 `iterative_dpo` 一样，温度过低时同 prompt 的样本可能全同（该 prompt 被跳过）；
 `judge_fn` 是外部打分器，本库不内置判官模型，仅提供接口与校验。
+
+### 混合架构（Samba / Zamba / RecurrentGemma）
+
+```python
+x = [[0.1] * 8 for _ in range(4)]
+samba = AI.SambaBlock(d_model=8, num_heads=2, d_ff=16, d_state=4, seed=1)
+y = samba.forward(x)
+samba.zero_grad()
+dx = samba.backward([[0.1] * 8 for _ in range(4)])
+samba.sgd_step(0.0001)
+
+zamba = AI.ZambaBlock(d_model=8, num_heads=2, d_ff=16, d_state=4, seed=2)
+rg = AI.RecurrentGemmaBlock(d_model=8, d_ff=16, kernel=3, seed=3)
+```
+
+| API | 说明 |
+| --- | --- |
+| `SambaBlock(d_model, num_heads, d_ff=None, d_state=4, eps=1e-5, seed=None)` | 三残差：`x+Mamba(LN(x))` → `x+Attn(LN(x))` → `x+FFN(LN(x))`；Mamba 用 `Mamba2Block`，注意力为因果全注意力；手写反向依次穿过 FFN / 注意力 / Mamba |
+| `ZambaBlock(d_model, num_heads, d_ff=None, d_state=4, eps=1e-5, seed=None)` | 与 Samba 同构件、不同顺序：`x+Attn(LN(x))` → `x+Mamba(LN(x))` → `x+FFN(LN(x))`；简化版未做跨层共享全局注意力 |
+| `RecurrentGemmaBlock(d_model, d_ff=None, kernel=3, eps=1e-5, seed=None)` | `h = x + short_conv(LN(x))`、`out = RGLRUBlock(h)`；短卷积为逐通道因果深度卷积，反向同时更新卷积核与输入 |
+
+边界：三者都只做单 block（不含 embedding / 词表头），Samba/Zamba 的注意力是全
+因果注意力（不是局部窗口或 GQA）；RecurrentGemma 的短卷积长度就是 `kernel`，
+没有 RecurrentGemma 原文的「局部卷积 + 周期全局注意力」调度。测试对残差投影、
+LayerNorm、卷积核与注意力投影做有限差分，并验证因果性与训练可下降。
 
 ### 差分注意力与安全 softmax（Differential Attention / QuietAttention）
 
@@ -5442,12 +5467,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3017 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3022 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3069 项）。
+`tests/`（合计 3074 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5455,7 +5480,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3069 项
+pytest -q                        # test_ai.py + tests/ 合计 3074 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7245,7 +7270,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3069 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3074 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7570,6 +7595,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRLAIFAndRLVR` | rlvr 历史/权重更新与奖励类型校验、rlaif 采样打分配对与全平局跳过、十类非法输入 |
 | `TestReinforceAndVine` | reinforce_plus_plus 历史字段与权重更新、bool 奖励可用且 NaN/字符串奖励报错、vine_ppo 历史/更新与 clip_ratio 占位、12 类非法输入 |
 | `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
+| `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |

@@ -49305,3 +49305,144 @@ class TestDiffAndQuietAttention:
             if not _dq_raises(fn):
                 bad += 1
         assert bad == 0
+
+
+import random
+
+import AI
+
+
+def _hyb_t_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _hyb_t_seq(seed=0, T=4, d=8):
+    r = random.Random(seed)
+    return [[r.uniform(-0.3, 0.3) for _ in range(d)] for _ in range(T)]
+
+
+def _hyb_t_weighted(block, x, w):
+    out = block.forward(x)
+    return sum(out[t][j] * w[t][j] for t in range(len(x))
+               for j in range(len(w[0])))
+
+
+def _hyb_t_fd(block, x, w, grad_getter, param_getter, param_setter, h=1e-5):
+    block.zero_grad()
+    out = block.forward(x)
+    block.backward([[w[t][j] for j in range(len(out[t]))]
+                    for t in range(len(x))])
+    ana = grad_getter()
+    p0 = param_getter()
+    param_setter(p0 + h)
+    lp = _hyb_t_weighted(block, x, w)
+    param_setter(p0 - h)
+    lm = _hyb_t_weighted(block, x, w)
+    param_setter(p0)
+    return ana, (lp - lm) / (2.0 * h)
+
+
+_W = [[0.2, -0.1, 0.3, 0.1, -0.2, 0.4, 0.0, 0.1],
+      [0.1, 0.3, -0.2, 0.0, 0.2, -0.1, 0.4, 0.2],
+      [-0.1, 0.2, 0.1, 0.3, 0.0, -0.2, 0.1, 0.3],
+      [0.3, 0.0, -0.1, 0.2, 0.1, 0.2, -0.3, 0.1]]
+
+
+class TestHybridBlocks:
+    def test_forward_and_params(self):
+        x = _hyb_t_seq(1)
+        s = AI.SambaBlock(8, 2, d_ff=16, d_state=4, seed=1)
+        out = s.forward(x)
+        assert len(out) == 4 and len(out[0]) == 8
+        assert s.param_count() == 934
+        z = AI.ZambaBlock(8, 2, d_ff=16, d_state=4, seed=1)
+        zout = z.forward(x)
+        assert len(zout) == 4 and len(zout[0]) == 8
+        assert z.param_count() == 934
+        r = AI.RecurrentGemmaBlock(8, d_ff=16, kernel=3, seed=1)
+        rout = r.forward(x)
+        assert len(rout) == 4 and len(rout[0]) == 8
+        assert r.param_count() == 568
+
+    def test_samba_gradients_and_causal(self):
+        x = _hyb_t_seq(2)
+        s = AI.SambaBlock(8, 2, d_ff=16, d_state=4, seed=2)
+        cases = [
+            (lambda: s.grad_W2[0][0][0], lambda: s.W2.weights[0][0],
+             lambda v: s.W2.weights[0].__setitem__(0, v)),
+            (lambda: s.grad_W1[0][0][1], lambda: s.W1.weights[0][1],
+             lambda v: s.W1.weights[0].__setitem__(1, v)),
+            (lambda: s.grad_ln_ff[0][1], lambda: s.ln_ff.gamma[1],
+             lambda v: s.ln_ff.gamma.__setitem__(1, v)),
+            (lambda: s.attn.grads["W_q"][0][1], lambda: s.attn.W_q[0][1],
+             lambda v: s.attn.W_q[0].__setitem__(1, v)),
+        ]
+        for g, p, st in cases:
+            ana, num = _hyb_t_fd(s, x, _W, g, p, st)
+            assert abs(ana - num) < 1e-4, (ana, num)
+        out1 = s.forward(x)
+        x2 = [row[:] for row in x]
+        x2[-1] = [v + 0.5 for v in x2[-1]]
+        out2 = s.forward(x2)
+        assert all(abs(out1[0][j] - out2[0][j]) < 1e-12 for j in range(8))
+
+    def test_zamba_gradients(self):
+        x = _hyb_t_seq(3)
+        z = AI.ZambaBlock(8, 2, d_ff=16, d_state=4, seed=3)
+        cases = [
+            (lambda: z.grad_W2[0][0][0], lambda: z.W2.weights[0][0],
+             lambda v: z.W2.weights[0].__setitem__(0, v)),
+            (lambda: z.grad_ln_attn[0][1], lambda: z.ln_attn.gamma[1],
+             lambda v: z.ln_attn.gamma.__setitem__(1, v)),
+            (lambda: z.mamba.grads["out_proj"][0][0][0],
+             lambda: z.mamba.out_proj.weights[0][0],
+             lambda v: z.mamba.out_proj.weights[0].__setitem__(0, v)),
+        ]
+        for g, p, st in cases:
+            ana, num = _hyb_t_fd(z, x, _W, g, p, st)
+            assert abs(ana - num) < 1e-4, (ana, num)
+
+    def test_recurrent_gemma_gradients_and_training(self):
+        x = _hyb_t_seq(4)
+        r = AI.RecurrentGemmaBlock(8, d_ff=16, kernel=3, seed=4)
+        cases = [
+            (lambda: r.grad_conv[1][1], lambda: r.conv_k[1][1],
+             lambda v: r.conv_k[1].__setitem__(1, v)),
+            (lambda: r.grad_ln[0][1], lambda: r.ln.gamma[1],
+             lambda v: r.ln.gamma.__setitem__(1, v)),
+        ]
+        for g, p, st in cases:
+            ana, num = _hyb_t_fd(r, x, _W, g, p, st)
+            assert abs(ana - num) < 1e-4, (ana, num)
+        target = [[0.0] * 8 for _ in range(4)]
+        losses = []
+        for _ in range(20):
+            out = r.forward(x)
+            diff = [[out[t][j] - target[t][j] for j in range(8)]
+                    for t in range(4)]
+            losses.append(sum(v * v for row in diff for v in row))
+            r.zero_grad()
+            r.backward([[2.0 * v for v in row] for row in diff])
+            r.sgd_step(0.0005)
+        assert losses[-1] < losses[0] * 0.9, (losses[0], losses[-1])
+
+    def test_invalid_inputs(self):
+        bad = 0
+        s = AI.SambaBlock(8, 2, d_ff=16, seed=1)
+        cases = [
+            lambda: AI.SambaBlock(8, 3),
+            lambda: AI.SambaBlock(0, 2),
+            lambda: AI.ZambaBlock(8, 3),
+            lambda: AI.RecurrentGemmaBlock(8, kernel=0),
+            lambda: s.forward([]),
+            lambda: s.forward([[0.1] * 7]),
+            lambda: s.backward([[0.1] * 8]),
+        ]
+        for fn in cases:
+            if not _hyb_t_raises(fn):
+                bad += 1
+        assert bad == 0
