@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1925 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1931 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -15953,6 +15953,190 @@ def _unl_clone_lm(model):
     for name, param, _grad in model._named_params():
         _unl_copy_into(dst[name], param)
     return clone
+
+
+# ---- SPIN 与迭代 DPO（对齐训练进阶） ----
+
+
+def _spin_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"SPIN: {name} 必须是数字")
+    if not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise ValueError(f"SPIN: {name} 必须是正有限数字")
+    return float(value)
+
+
+def _spin_check_seqs(model, sequences, who, allow_empty=False):
+    if not isinstance(sequences, (list, tuple)):
+        raise TypeError(f"SPIN: {who} 必须是序列列表")
+    if not sequences and not allow_empty:
+        raise ValueError(f"SPIN: {who} 不能为空")
+    out = []
+    for seq in sequences:
+        if not isinstance(seq, (list, tuple)) or len(seq) < 2:
+            raise ValueError(f"SPIN: {who} 的每条序列至少 2 个 token")
+        out.append(_check_token_ids(seq, model.vocab_size, who))
+    return out
+
+
+def _spin_check_pairs(model, pairs):
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("SPIN: pairs 不能为空")
+    out = []
+    for item in pairs:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError("SPIN: 每个 pair 必须是 (prompt, human, generated)")
+        prompt = _check_token_ids(item[0], model.vocab_size, "SPIN prompt")
+        if not prompt:
+            raise ValueError("SPIN: prompt 不能为空")
+        human = _spin_check_seqs(model, [item[1]], "SPIN human")[0]
+        generated = _spin_check_seqs(model, [item[2]], "SPIN generated")[0]
+        out.append((prompt, human, generated))
+    return out
+
+
+def spin_loss(logp_human, logp_generated, ref_logp_human, ref_logp_generated,
+              beta=0.1):
+    """SPIN 损失：把「当前策略与旧策略的差值」的人类回答优势推高。
+
+    ``z = beta * ((logp_human - ref_human) - (logp_generated - ref_generated))``，
+    ``loss = -log sigmoid(z)``；返回 (loss, d_logp_human, d_logp_generated)。
+    """
+    beta = _spin_check_positive(beta, "beta")
+    for value, name in ((logp_human, "logp_human"),
+                        (logp_generated, "logp_generated"),
+                        (ref_logp_human, "ref_logp_human"),
+                        (ref_logp_generated, "ref_logp_generated")):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"SPIN: {name} 必须是数字")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"SPIN: {name} 必须是有限数字")
+    margin = float(logp_human) - float(logp_generated) - (
+        float(ref_logp_human) - float(ref_logp_generated))
+    z = beta * margin
+    # -log sigmoid(z) 的稳定写法
+    if z >= 0.0:
+        loss = math.log1p(math.exp(-z))
+    else:
+        loss = -z + math.log1p(math.exp(z))
+    sig = 1.0 / (1.0 + math.exp(-z)) if z >= 0 else math.exp(z) / (1.0 + math.exp(z))
+    d_z = -(1.0 - sig)
+    return loss, beta * d_z, -beta * d_z
+
+
+def spin_align(policy, reference, pairs, beta=0.1, epochs=1, lr=None,
+               shuffle=True, seed=None):
+    """用 SPIN 目标做自博弈微调（reference 是固定旧策略）。
+
+    每个 pair 是 ``(prompt, human, generated)``；human 当 chosen、
+    generated 当 rejected，但梯度只来自两者相对旧策略的优势差。
+    """
+    _spin_check_model = getattr(policy, "_loss_and_backward", None)
+    if _spin_check_model is None or getattr(reference, "vocab_size", None) is None:
+        raise TypeError("SPIN: policy/reference 必须是 CausalLM 兼容模型")
+    pairs = _spin_check_pairs(policy, pairs)
+    beta = _spin_check_positive(beta, "beta")
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+        raise ValueError("SPIN: epochs 必须是正整数")
+    if lr is None:
+        lr = 0.01
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not (
+            math.isfinite(float(lr)) and float(lr) > 0.0):
+        raise ValueError("SPIN: lr 必须是正有限数字")
+    if not isinstance(shuffle, bool):
+        raise TypeError("SPIN: shuffle 必须是 bool")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError("SPIN: seed 必须是 int 或 None")
+    rng = random.Random(seed)
+    history = []
+    for epoch in range(epochs):
+        order = list(range(len(pairs)))
+        if shuffle:
+            rng.shuffle(order)
+        losses = []
+        for idx in order:
+            prompt, human, generated = pairs[idx]
+            logp_h = _rlhf_seq_logprob(policy, prompt, human, grad_scale=None)
+            logp_g = _rlhf_seq_logprob(policy, prompt, generated, grad_scale=None)
+            ref_h = _rlhf_seq_logprob(reference, prompt, human, grad_scale=None)
+            ref_g = _rlhf_seq_logprob(reference, prompt, generated, grad_scale=None)
+            loss, d_h, d_g = spin_loss(logp_h, logp_g, ref_h, ref_g, beta)
+            policy.zero_grad()
+            _rlhf_seq_logprob(policy, prompt, human, grad_scale=d_h)
+            _rlhf_seq_logprob(policy, prompt, generated, grad_scale=d_g)
+            policy.adam_step(float(lr))
+            losses.append(loss)
+        history.append(sum(losses) / len(losses))
+    return {"loss": history, "epochs": epochs, "pairs": len(pairs), "beta": beta}
+
+
+def iterative_dpo(policy, reference, prompts, reward_fn, num_samples=4,
+                  beta=0.1, iterations=1, max_new_tokens=8, temperature=1.0,
+                  lr=None, shuffle=True, seed=None):
+    """迭代 DPO：每轮从当前策略采样多条回答、用 reward_fn 打分，
+    取最好/最差组成偏好对做一轮 DPO。
+
+    ``reward_fn(prompt_ids, response_ids) -> float``；返回每轮的
+    ``{"iteration", "pairs", "mean_best_reward"}`` 列表。
+    """
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError("DPO: prompts 不能为空")
+    checked = []
+    for prompt in prompts:
+        if not isinstance(prompt, (list, tuple)) or not prompt:
+            raise ValueError("DPO: prompt 必须是非空 token 列表")
+        checked.append(_check_token_ids(prompt, policy.vocab_size, "DPO prompt"))
+    prompts = checked
+    if not callable(reward_fn):
+        raise TypeError("DPO: reward_fn 必须可调用")
+    if not isinstance(num_samples, int) or isinstance(num_samples, bool) or num_samples < 2:
+        raise ValueError("DPO: num_samples 必须是 >=2 的整数")
+    if not isinstance(iterations, int) or isinstance(iterations, bool) or iterations < 1:
+        raise ValueError("DPO: iterations 必须是正整数")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) or max_new_tokens < 1:
+        raise ValueError("DPO: max_new_tokens 必须是正整数")
+    temperature = _spin_check_positive(temperature, "temperature")
+    beta = _spin_check_positive(beta, "beta")
+    if lr is None:
+        lr = 0.01
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not (
+            math.isfinite(float(lr)) and float(lr) > 0.0):
+        raise ValueError("DPO: lr 必须是正有限数字")
+    rng = random.Random(seed)
+    history = []
+    for it in range(iterations):
+        pairs = []
+        best_rewards = []
+        for prompt in prompts:
+            samples = []
+            rewards = []
+            for _ in range(num_samples):
+                seq = policy.generate(prompt, max_new_tokens=max_new_tokens,
+                                      temperature=temperature, rng=rng)
+                response = list(seq[len(prompt):])
+                if not response:
+                    response = [0]
+                score = reward_fn(prompt, response)
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    raise TypeError("DPO: reward_fn 必须返回数字")
+                if not math.isfinite(float(score)):
+                    raise ValueError("DPO: reward_fn 返回了非有限数字")
+                samples.append(response)
+                rewards.append(float(score))
+            best_idx = max(range(len(rewards)), key=lambda i: (rewards[i], -i))
+            worst_idx = min(range(len(rewards)), key=lambda i: (rewards[i], i))
+            if best_idx == worst_idx:
+                continue
+            pairs.append((prompt, samples[best_idx], samples[worst_idx]))
+            best_rewards.append(rewards[best_idx])
+        if not pairs:
+            history.append({"iteration": it + 1, "pairs": 0, "mean_best_reward": 0.0})
+            continue
+        dpo_align(policy, reference, pairs, beta=beta, epochs=1, lr=lr,
+                  shuffle=shuffle, seed=rng.randrange(1 << 30))
+        history.append({"iteration": it + 1, "pairs": len(pairs),
+                        "mean_best_reward": sum(best_rewards) / len(best_rewards)})
+    return history
 
 
 def unlearn_evaluate(model, forget_sequences, retain_sequences=None):

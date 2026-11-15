@@ -48755,3 +48755,96 @@ class TestUnlearning:
         assert _unl_t_raises(lambda: AI.unlearn_negative_preference(model, []))
         assert _unl_t_raises(lambda: AI.unlearn_negative_preference(
             model, [([1], [2])]))
+
+
+def _spin_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _spin_t_model(epochs=40, lr=0.02, seed=1):
+    random.seed(seed)
+    m = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                    num_layers=1, max_len=12)
+    m.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=epochs, lr=lr, seed=seed)
+    return m
+
+
+class TestSpinAndIterativeDPO:
+    def test_spin_loss_math(self):
+        loss, dh, dg = AI.spin_loss(0.5, -0.2, 0.1, -0.1, beta=0.2)
+        assert loss > 0.0
+        h = 1e-6
+        lp, _, _ = AI.spin_loss(0.5 + h, -0.2, 0.1, -0.1, beta=0.2)
+        lm, _, _ = AI.spin_loss(0.5 - h, -0.2, 0.1, -0.1, beta=0.2)
+        assert abs(dh - (lp - lm) / (2 * h)) < 1e-7
+        lp2, _, _ = AI.spin_loss(0.5, -0.2 + h, 0.1, -0.1, beta=0.2)
+        lm2, _, _ = AI.spin_loss(0.5, -0.2 - h, 0.1, -0.1, beta=0.2)
+        assert abs(dg - (lp2 - lm2) / (2 * h)) < 1e-7
+        # margin 越大，loss 越小
+        big, _, _ = AI.spin_loss(2.0, -2.0, 0.1, -0.1, beta=0.2)
+        assert big < loss
+
+    def test_spin_align_training(self):
+        pol = _spin_t_model()
+        ref = AI._unl_clone_lm(pol)
+        pairs = [([5], [1, 2, 3], [9, 8, 7]), ([4], [6, 7], [1, 2])]
+        before = AI._rlhf_seq_logprob(pol, [5], [1, 2, 3], grad_scale=None)
+        hist = AI.spin_align(pol, ref, pairs, beta=0.2, epochs=3, lr=0.01, seed=5)
+        after = AI._rlhf_seq_logprob(pol, [5], [1, 2, 3], grad_scale=None)
+        assert len(hist["loss"]) == 3
+        assert hist["epochs"] == 3 and hist["pairs"] == 2
+        assert hist["loss"][-1] < hist["loss"][0]
+        assert after > before
+
+    def test_iterative_dpo_history(self):
+        random.seed(3)
+        pol = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                          num_layers=1, max_len=12)
+        pol.fit([[1, 2, 3], [4, 5, 6]], epochs=20, lr=0.02, seed=2)
+        ref = AI._unl_clone_lm(pol)
+
+        def reward_fn(prompt, response):
+            return float(response[0])
+
+        before = [[v for v in row] for row in pol.encoder.layers[0].self_attn.W_q]
+        hist = AI.iterative_dpo(pol, ref, [[1], [4]], reward_fn, num_samples=3,
+                                beta=0.2, iterations=2, max_new_tokens=3,
+                                temperature=10.0, seed=7)
+        assert len(hist) == 2
+        assert all(row["pairs"] == 2 for row in hist)
+        assert hist[0]["mean_best_reward"] > 0.0
+        after = pol.encoder.layers[0].self_attn.W_q
+        assert before != after
+
+    def test_spin_align_uses_reference(self):
+        pol = _spin_t_model(epochs=5)
+        ref = AI._unl_clone_lm(pol)
+        # 修改 reference 后 loss 应变化，说明 ref 参与计算
+        base = AI.spin_align(pol, ref, [([5], [1, 2], [3, 4])],
+                             beta=0.2, epochs=1, lr=0.01, seed=1)
+        ref.encoder.layers[0].self_attn.W_q[0][0] += 0.5
+        changed = AI.spin_align(pol, ref, [([5], [1, 2], [3, 4])],
+                                beta=0.2, epochs=1, lr=0.01, seed=1)
+        assert abs(base["loss"][0] - changed["loss"][0]) > 1e-9
+
+    def test_invalid_inputs(self):
+        pol = _spin_t_model(epochs=2)
+        ref = AI._unl_clone_lm(pol)
+        pairs = [([5], [1, 2], [3, 4])]
+        assert _spin_t_raises(lambda: AI.spin_loss(0.0, 0.0, 0.0, 0.0, beta=0.0))
+        assert _spin_t_raises(lambda: AI.spin_loss(float("nan"), 0.0, 0.0, 0.0))
+        assert _spin_t_raises(lambda: AI.spin_align(pol, ref, []))
+        assert _spin_t_raises(lambda: AI.spin_align(pol, ref, [([1], [2])]))
+        assert _spin_t_raises(lambda: AI.spin_align(pol, ref, pairs, epochs=0))
+        assert _spin_t_raises(lambda: AI.spin_align(pol, ref, pairs, lr=-0.1))
+        assert _spin_t_raises(lambda: AI.iterative_dpo(pol, ref, [[1]], None))
+        assert _spin_t_raises(
+            lambda: AI.iterative_dpo(pol, ref, [[1]], lambda p, r: 1.0, num_samples=1))
+        assert _spin_t_raises(
+            lambda: AI.iterative_dpo(pol, ref, [[1]], lambda p, r: 1.0, iterations=0))
+        assert _spin_t_raises(
+            lambda: AI.iterative_dpo(pol, ref, [[1]], lambda p, r: 1.0, temperature=0.0))

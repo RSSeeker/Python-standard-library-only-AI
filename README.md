@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3049 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3054 项）
 
 ## 特性
 
@@ -2356,6 +2356,32 @@ print(rep["summary"]["pii_findings"])     # 1
 
 边界：规则匹配只用于评测流水线里的快速筛查，不做上下文消歧、实体归一化或
 脱敏改写；越狱打分偏向高召回，命中后仍需人工复核。
+
+### 对齐训练进阶（SPIN / 迭代 DPO）
+
+```python
+model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=12)
+model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=40, lr=0.02)
+ref = AI._unl_clone_lm(model)
+
+pairs = [([5], [1, 2, 3], [9, 8, 7])]
+hist = AI.spin_align(model, ref, pairs, beta=0.2, epochs=3, lr=0.01)
+# SPIN：让 human 相对 generated 的优势（减去 reference 基线）变大
+
+iters = AI.iterative_dpo(model, ref, prompts=[[1], [4]],
+                         reward_fn=lambda p, r: float(r[0]),
+                         num_samples=3, iterations=2, temperature=10.0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `spin_loss(logp_human, logp_generated, ref_logp_human, ref_logp_generated, beta=0.1)` | SPIN 自博弈损失 `-log sigma(beta * ((logp_h - logp_g) - (ref_h - ref_g)))`，返回 `(loss, d_logp_human, d_logp_generated)` |
+| `spin_align(policy, reference, pairs, beta=0.1, epochs=1, lr=None, shuffle=True, seed=None)` | 用 `(prompt, human, generated)` 三元组做 SPIN 训练；支持重复传 pairs 的 list 与多 epoch |
+| `iterative_dpo(policy, reference, prompts, reward_fn, num_samples=4, beta=0.1, iterations=1, max_new_tokens=8, temperature=1.0, lr=None, shuffle=True, seed=None)` | 每轮对每个 prompt 采样 `num_samples` 条、按 `reward_fn(prompt, response)` 取最好/最差构偏好对，再复用 `dpo_align` 更新；样本全同则跳过 |
+
+边界：SPIN 只比较序列级 logp，不做逐 token 权重；`iterative_dpo` 的 `temperature`
+偏低时采样可能全部相同（该 prompt 会被跳过，一轮 pairs 可能少于 prompts 数）；
+`reference` 需是可克隆模型（与 `RLHFTrainer` 同样的约束），训练为单步/单样本循环。
 
 ### 机器遗忘（unlearning）
 
@@ -5330,12 +5356,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（2957 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3002 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3049 项）。
+`tests/`（合计 3054 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5343,7 +5369,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3049 项
+pytest -q                        # test_ai.py + tests/ 合计 3054 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7133,7 +7159,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3049 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3054 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7454,6 +7480,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestRedTeamSafety` | 七类 PII 全部命中且按起点排序、Luhn 拒绝假卡、类别过滤、canary 命中/去重、越狱高/中/低风险与规则名、批量报告汇总与阈值、十一类非法输入 |
 | `TestSafetyEvalLight` | 选择题/GSM8K 解析与准确率、代码块与 HumanEval 受限执行、注入风险分级与后门 suspicion、提取阈值（小样本 max、大样本 mean+1.5σ）、八类非法输入 |
 | `TestUnlearning` | 遗忘集/保留集 CE 与困惑度、梯度上升抬高遗忘 CE 并保住保留集、负偏好降低 harmful 序列 logp、模型克隆前向一致、九类非法输入 |
+| `TestSpinAndIterativeDPO` | SPIN loss 两偏导有限差分、margin 单调性、spin_align 提升 human logp 且 loss 下降、iterative_dpo 两轮各 2 对并更新权重、改 reference 改变 loss、十类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |
