@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3120 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3126 项）
 
 ## 特性
 
@@ -169,6 +169,43 @@ print(AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(w, x)), [w]))
 
 边界：只支持标量/向量/矩阵与广播，无 stride 视图共享、无高阶自动微分、无卷积
 层；`Tensor` 与既有嵌套 list 的 `Layer`/`MLP` 体系并存，互不影响。
+
+### 统一 Module 基类与 autograd 层/优化器
+
+```python
+import AI
+
+class Scale(AI.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = AI.Tensor([1.0] * dim, requires_grad=True)  # 自动登记
+    def forward(self, x):
+        return AI.ag_mul(x, self.weight)
+
+net = AI.SequentialModule(
+    AI.LinearModule(2, 8, seed=1), AI.TanhModule(),
+    AI.LinearModule(8, 1, seed=2))
+x, y = [[0.3, -0.2]], [[0.5]]
+loss = AI.ag_mse_loss(net(x), y)
+loss.backward()
+AI.SGDModule(net, lr=0.05).step()      # 所有参数统一走 parameters()
+blob = net.state_dict()                 # 嵌套 list，可 json.dump
+net2 = AI.MLPModule([2, 8, 1], ["tanh", "linear"], seed=3)
+net2.load_state_dict(blob)              # 严格键/形状匹配
+```
+
+| API | 说明 |
+| --- | --- |
+| `Module` | 统一基类：属性赋值 `Tensor(requires_grad=True)`/`Module` 自动登记；`parameters()/named_parameters()/buffers()/named_modules()/num_parameters()/zero_grad()`；`train()/eval()` 级联；`state_dict()/load_state_dict()`（点号键、嵌套 list、JSON 友好）；子类只实现 `forward` |
+| `LinearModule(in_features, out_features, bias=True, seed=None, init="xavier"\|"he")` | `y = x @ Wᵀ + b`，支持 1D/2D 输入；`ReLUModule/SigmoidModule/TanhModule` 为无参激活 |
+| `SequentialModule(*modules)` / `MLPModule(layer_sizes, activations=None, seed=None)` | 顺序容器与 Linear+激活的 MLP 便捷构造 |
+| `SGDModule(module_or_params, lr=0.01, momentum=0.0, weight_decay=0.0)` | 参数上的 SGD（动量、权重衰减），`zero_grad()/step()` |
+| `AdamModule(module_or_params, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)` | 参数上的 Adam，逐参数 m/v/步数 |
+| `module_grad_check(module, fn, eps=1e-5)` / `ag_assert_shape(tensor, shape, name="tensor")` | 模块全参数数值梯度对拍 / 形状断言 |
+
+边界：这是教学级实现；`load_state_dict` 要求键集合与形状完全一致（不做部分加载或广播）；
+`state_dict` 返回嵌套 list 而非共享存储，所以不支持原地共享参数的多引用语义；
+没有 `no_grad` 上下文、参数共享检测与 `requires_grad=False` 冻结参数的特殊优化。
 
 ### 层 (Layers)
 
@@ -5684,12 +5721,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3068 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3074 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3120 项）。
+`tests/`（合计 3126 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5697,7 +5734,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3120 项
+pytest -q                        # test_ai.py + tests/ 合计 3126 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7524,7 +7561,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3120 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3126 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7958,6 +7995,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
 | `TestQATAndGradAccumulator` | QAT 损失/梯度与量化点精确反向一致、`fit_qat` 收敛、`QATTrainer` 封装、梯度累积与平均梯度单步等价、`flush` 尾窗、非法输入 |
 | `TestAutograd` | 广播运算梯度、四种 matmul 变体、softmax/log_softmax 与交叉熵、LayerNorm 三参数梯度、共享子图、小 MLP 训练收敛、非法输入 |
+| `TestAutogradModule` | 参数/缓冲/子模块自动登记与命名、Linear 手算一致与 1D 输入、Sequential/MLP 全参数 FD、state_dict JSON 往返与严格键/形状校验、Adam/SGD 回归收敛、train/eval 级联、九类非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |

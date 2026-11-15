@@ -50502,3 +50502,153 @@ class TestAutograd:
         _ag_t_check(_ag_t_raises(
             lambda: AI.ag_grad_check(lambda: AI.ag_sum(AI.Tensor([2.0])), [param])),
             "参数未参与计算图")
+
+
+import json
+import random
+
+import AI
+
+
+def _mod_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _mod_loss(mod, x, w):
+    def fn():
+        out = mod(x)
+        return AI.ag_mean(AI.ag_mul(out, w))
+    return fn
+
+
+def _mod_train_data(seed=0):
+    rng = random.Random(seed)
+    xs = [[rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)] for _ in range(32)]
+    ys = [[0.7 * a - 1.3 * b + 0.2] for a, b in xs]
+    return xs, ys
+
+
+def _mod_mse(net, xs, ys):
+    total = AI.Tensor(0.0)
+    for xi, yi in zip(xs, ys):
+        d = AI.ag_sub(net(xi), [yi])
+        total = AI.ag_add(total, AI.ag_sum(AI.ag_mul(d, d)))
+    return AI.ag_div(total, AI.Tensor(float(len(xs))))
+
+
+class TestAutogradModule:
+    def test_module_registration(self):
+        lin = AI.LinearModule(3, 2, seed=1)
+        assert lin.num_parameters() == 8
+        assert [n for n, _ in lin.named_parameters()] == ["weight", "bias"]
+
+        class Holder(AI.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = AI.LinearModule(2, 3, seed=2)
+                self.b = AI.LinearModule(3, 1, seed=3)
+                self.register_buffer("running", AI.Tensor([0.0, 1.0]))
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        holder = Holder()
+        assert holder.num_parameters() == (2 * 3 + 3) + (3 * 1 + 1)
+        keys = [n for n, _ in holder.named_parameters()]
+        assert keys == ["a.weight", "a.bias", "b.weight", "b.bias"]
+        sd = holder.state_dict()
+        assert "running" in sd and "a.weight" in sd
+
+    def test_linear_forward_manual(self):
+        lin = AI.LinearModule(3, 2, seed=1)
+        x = [[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]
+        got = lin(x).tolist()
+        w = lin.weight.tolist()
+        b = lin.bias.tolist()
+        want = [[sum(xr[j] * w[i][j] for j in range(3)) + b[i]
+                 for i in range(2)] for xr in x]
+        for i in range(2):
+            for j in range(2):
+                assert abs(got[i][j] - want[i][j]) < 1e-12
+        one = lin([1.0, 2.0, 3.0]).tolist()
+        assert len(one) == 2
+
+    def test_sequential_and_mlp_fd(self):
+        seq = AI.SequentialModule(
+            AI.LinearModule(2, 3, seed=1),
+            AI.TanhModule(),
+            AI.LinearModule(3, 1, seed=2),
+        )
+        x2 = [[1.0, 2.0], [-1.0, 0.5]]
+        rel = AI.module_grad_check(seq, _mod_loss(seq, x2, [[1.0], [-2.0]]))
+        assert rel < 1e-5, rel
+
+        mlp = AI.MLPModule([3, 4, 2], ["relu", "linear"], seed=3)
+        assert mlp.num_parameters() == 26
+        x3 = [[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]
+        rel = AI.module_grad_check(
+            mlp, _mod_loss(mlp, x3, [[0.5, -0.5], [1.0, 2.0]]))
+        assert rel < 1e-5, rel
+
+    def test_state_dict_roundtrip(self):
+        x = [[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]
+        mlp = AI.MLPModule([3, 4, 2], ["relu", "linear"], seed=3)
+        sd = json.loads(json.dumps(mlp.state_dict()))
+        assert "net.0.weight" in sd and "net.2.bias" in sd
+        other = AI.MLPModule([3, 4, 2], ["relu", "linear"], seed=99)
+        before = other(x).tolist()
+        after = mlp(x).tolist()
+        assert any(abs(a - b) > 1e-6 for ra, rb in zip(before, after)
+                   for a, b in zip(ra, rb))
+        other.load_state_dict(sd)
+        loaded = other(x).tolist()
+        for ra, rb in zip(after, loaded):
+            for a, b in zip(ra, rb):
+                assert abs(a - b) < 1e-12
+
+    def test_optimizers_train(self):
+        xs, ys = _mod_train_data(0)
+        net = AI.MLPModule([2, 8, 1], ["tanh", "linear"], seed=5)
+        opt = AI.AdamModule(net, lr=0.05)
+        first = _mod_mse(net, xs, ys).item()
+        for _ in range(120):
+            opt.zero_grad()
+            loss = _mod_mse(net, xs, ys)
+            loss.backward()
+            opt.step()
+        last = _mod_mse(net, xs, ys).item()
+        assert last < first * 0.1, (first, last)
+
+        net2 = AI.MLPModule([2, 8, 1], ["tanh", "linear"], seed=5)
+        opt2 = AI.SGDModule(net2, lr=0.01, momentum=0.9)
+        f2 = _mod_mse(net2, xs, ys).item()
+        for _ in range(200):
+            opt2.zero_grad()
+            loss = _mod_mse(net2, xs, ys)
+            loss.backward()
+            opt2.step()
+        l2 = _mod_mse(net2, xs, ys).item()
+        assert l2 < f2, (f2, l2)
+        assert net2.eval().training is False
+
+    def test_invalid_inputs(self):
+        lin = AI.LinearModule(3, 2, seed=1)
+        mlp = AI.MLPModule([3, 4, 2], ["relu", "linear"], seed=1)
+        sd = mlp.state_dict()
+        assert _mod_raises(lambda: lin([[1.0, 2.0]]))
+        assert _mod_raises(lambda: lin([1.0, 2.0, 3.0, 4.0]))
+        assert _mod_raises(lambda: mlp.load_state_dict({"x": [1.0]}))
+        bad = dict(sd, **{"net.0.weight": [[1.0]]})
+        assert _mod_raises(lambda: mlp.load_state_dict(bad))
+        assert _mod_raises(lambda: AI.AdamModule(lin, lr=0.0))
+        assert _mod_raises(lambda: AI.SGDModule([], lr=0.1))
+        assert _mod_raises(lambda: AI.LinearModule(0, 2))
+        assert _mod_raises(lambda: AI.SequentialModule())
+        assert _mod_raises(lambda: AI.MLPModule([2, 2], ["relu", "relu"]))
+        assert _mod_raises(lambda: AI.ag_assert_shape(lin.weight, (3, 2)))

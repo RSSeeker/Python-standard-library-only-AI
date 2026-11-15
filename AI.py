@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2058 个 def / 455 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2065 个 def / 464 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -26559,6 +26559,482 @@ def ag_grad_check(fn, params, eps=1e-5, verbose=False):
                     print(f"  worst: param {id(param) % 10000} idx {i} "
                           f"ana={analytic[i]:.8g} num={numeric:.8g} rel={rel:.2e}")
     return max_rel
+
+
+# ---- 统一 Module 基类与 autograd 层/优化器 ----
+
+
+def _ag_check_module_name(name, who):
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{who}: 名字必须是非空字符串，收到 {name!r}")
+    if "." in name:
+        raise ValueError(f"{who}: 名字里不要包含 '.'，收到 {name!r}")
+    return name
+
+
+class Module:
+    """统一模块基类：参数/缓冲/子模块注册、parameters()、state_dict()。
+
+    子类只需实现 ``forward``；给属性赋 ``Tensor(requires_grad=True)`` 或
+    ``Module`` 会自动登记，从而被 ``parameters()``、优化器与 ``state_dict``
+    看到。示例::
+
+        class Scale(Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.weight = Tensor([1.0] * dim, requires_grad=True)
+            def forward(self, x):
+                return ag_mul(x, self.weight)
+
+    边界：这是纯 Python 教学实现，不提供 ``no_grad``/``parameter`` 的
+    in-place 视图语义；``load_state_dict`` 要求形状完全一致。
+    """
+
+    def __init__(self):
+        object.__setattr__(self, "_parameters", {})
+        object.__setattr__(self, "_buffers", {})
+        object.__setattr__(self, "_modules", {})
+        object.__setattr__(self, "training", True)
+
+    # ---------- 注册 ----------
+
+    def __setattr__(self, name, value):
+        _ag_check_module_name(name, "Module")
+        if isinstance(value, Tensor) and value.requires_grad:
+            self._parameters[name] = value
+        elif isinstance(value, Tensor) and not value.requires_grad:
+            if name in self._parameters:
+                del self._parameters[name]
+        elif isinstance(value, Module):
+            self._modules[name] = value
+        object.__setattr__(self, name, value)
+
+    def register_parameter(self, name, tensor):
+        """显式登记可训练参数。"""
+        _ag_check_module_name(name, "register_parameter")
+        if not isinstance(tensor, Tensor):
+            raise TypeError(
+                f"register_parameter: 需要 Tensor，收到 {type(tensor).__name__}")
+        if not tensor.requires_grad:
+            raise ValueError("register_parameter: 参数需要 requires_grad=True")
+        self._parameters[name] = tensor
+        object.__setattr__(self, name, tensor)
+        return tensor
+
+    def register_buffer(self, name, tensor):
+        """登记不参与训练但随模型保存的缓冲。"""
+        _ag_check_module_name(name, "register_buffer")
+        if not isinstance(tensor, Tensor):
+            raise TypeError(
+                f"register_buffer: 需要 Tensor，收到 {type(tensor).__name__}")
+        self._buffers[name] = tensor
+        object.__setattr__(self, name, tensor)
+        return tensor
+
+    def add_module(self, name, module):
+        """登记子模块。"""
+        _ag_check_module_name(name, "add_module")
+        if not isinstance(module, Module):
+            raise TypeError(
+                f"add_module: 需要 Module，收到 {type(module).__name__}")
+        self._modules[name] = module
+        object.__setattr__(self, name, module)
+        return module
+
+    # ---------- 遍历 ----------
+
+    def named_parameters(self, prefix=""):
+        out = []
+        for name, tensor in self._parameters.items():
+            out.append((prefix + name, tensor))
+        for name, module in self._modules.items():
+            out.extend(module.named_parameters(prefix + name + "."))
+        return out
+
+    def parameters(self):
+        return [tensor for _, tensor in self.named_parameters()]
+
+    def named_buffers(self, prefix=""):
+        out = [(prefix + name, tensor) for name, tensor in self._buffers.items()]
+        for name, module in self._modules.items():
+            out.extend(module.named_buffers(prefix + name + "."))
+        return out
+
+    def buffers(self):
+        return [tensor for _, tensor in self.named_buffers()]
+
+    def named_modules(self, prefix=""):
+        out = [(prefix.rstrip("."), self)] if prefix else [("", self)]
+        for name, module in self._modules.items():
+            out.extend(module.named_modules(prefix + name + "."))
+        return out
+
+    def children(self):
+        return list(self._modules.values())
+
+    def num_parameters(self):
+        return sum(len(p._flat) for p in self.parameters())
+
+    def zero_grad(self):
+        for param in self.parameters():
+            param.zero_grad()
+
+    # ---------- 训练/推理 ----------
+
+    def train(self, mode=True):
+        object.__setattr__(self, "training", bool(mode))
+        for module in self._modules.values():
+            module.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    # ---------- 保存/加载 ----------
+
+    def state_dict(self):
+        """参数与缓冲的浅拷贝（值为嵌套 list，可 json 序列化）。"""
+        out = {}
+        for name, tensor in self._parameters.items():
+            out[name] = tensor.tolist()
+        for name, tensor in self._buffers.items():
+            out[name] = tensor.tolist()
+        for name, module in self._modules.items():
+            for sub, value in module.state_dict().items():
+                out[name + "." + sub] = value
+        return out
+
+    def load_state_dict(self, state):
+        """按 key 精确匹配恢复参数/缓冲；形状或键不一致抛 ValueError。"""
+        if not isinstance(state, dict):
+            raise TypeError(
+                f"load_state_dict: 需要 dict，收到 {type(state).__name__}")
+        expected = self.state_dict()
+        missing = [key for key in expected if key not in state]
+        extra = [key for key in state if key not in expected]
+        if missing or extra:
+            raise ValueError(
+                f"load_state_dict: 键不匹配；缺少 {missing}，多出 {extra}")
+        for name, tensor in self._parameters.items():
+            _ag_load_into(tensor, state[name], name, "参数")
+        for name, tensor in self._buffers.items():
+            _ag_load_into(tensor, state[name], name, "缓冲")
+        for name, module in self._modules.items():
+            prefix = name + "."
+            module.load_state_dict({
+                key[len(prefix):]: value for key, value in state.items()
+                if key.startswith(prefix)})
+        return self
+
+    # ---------- 调用 ----------
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"{type(self).__name__}.forward 未实现")
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def __repr__(self):
+        return f"{type(self).__name__}(num_parameters={self.num_parameters()})"
+
+
+def _ag_load_into(tensor, value, name, kind):
+    """把嵌套 list 的数值写回 Tensor（要求形状一致）。"""
+    if not isinstance(value, list):
+        if tensor.shape:
+            raise ValueError(
+                f"load_state_dict: {kind} {name} 形状应为 {tensor.shape}，"
+                f"收到标量")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"load_state_dict: {kind} {name} 需要数字，收到 {value!r}")
+        tensor._flat = [float(value)]
+        tensor.data = float(value)
+        return
+    shape = _ag_shape(value)
+    if shape != tensor.shape:
+        raise ValueError(
+            f"load_state_dict: {kind} {name} 形状应为 {tensor.shape}，收到 {shape}")
+    flat = _ag_flatten(value)
+    if len(flat) != len(tensor._flat):
+        raise ValueError(
+            f"load_state_dict: {kind} {name} 元素数不一致")
+    tensor._flat = flat
+    tensor.data = _ag_build(flat, tensor.shape)
+
+
+class LinearModule(Module):
+    """Linear 层：``y = x @ Wᵀ + b``，参数用 autograd Tensor。"""
+
+    def __init__(self, in_features, out_features, bias=True, seed=None,
+                 init="xavier"):
+        super().__init__()
+        in_features = _ag_check_pos_int(in_features, "LinearModule")
+        out_features = _ag_check_pos_int(out_features, "LinearModule")
+        object.__setattr__(self, "in_features", in_features)
+        object.__setattr__(self, "out_features", out_features)
+        import random
+        state = random.getstate()
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise TypeError(f"LinearModule: seed 必须是整数或 None，收到 {seed!r}")
+            random.seed(seed)
+        if init == "xavier":
+            limit = (6.0 / (in_features + out_features)) ** 0.5
+            weights = [[random.uniform(-limit, limit) for _ in range(in_features)]
+                       for _ in range(out_features)]
+        elif init == "he":
+            std = (2.0 / in_features) ** 0.5
+            weights = [[random.gauss(0.0, std) for _ in range(in_features)]
+                       for _ in range(out_features)]
+        else:
+            if seed is not None:
+                random.setstate(state)
+            raise ValueError(f"LinearModule: init 只支持 xavier/he，收到 {init!r}")
+        self.weight = Tensor(weights, requires_grad=True)
+        if bias:
+            self.bias = Tensor([0.0] * out_features, requires_grad=True)
+        else:
+            object.__setattr__(self, "bias", None)
+        if seed is not None:
+            random.setstate(state)
+
+    def forward(self, x):
+        x = _ag_as_tensor(x)
+        one = False
+        if len(x.shape) == 1 and x.shape[0] == self.in_features:
+            x = ag_reshape(x, (1, self.in_features))
+            one = True
+        elif len(x.shape) != 2 or x.shape[1] != self.in_features:
+            raise ValueError(
+                f"LinearModule: 输入形状应为 (N,{self.in_features}) 或 "
+                f"({self.in_features},)，收到 {x.shape}")
+        out = ag_matmul(x, ag_transpose(self.weight))
+        if self.bias is not None:
+            out = ag_add(out, self.bias)
+        if one:
+            out = ag_reshape(out, (self.out_features,))
+        return out
+
+
+class ReLUModule(Module):
+    """ReLU 激活模块。"""
+
+    def forward(self, x):
+        return ag_relu(x)
+
+
+class SigmoidModule(Module):
+    """Sigmoid 激活模块。"""
+
+    def forward(self, x):
+        return ag_sigmoid(x)
+
+
+class TanhModule(Module):
+    """Tanh 激活模块。"""
+
+    def forward(self, x):
+        return ag_tanh(x)
+
+
+class SequentialModule(Module):
+    """把多个模块按顺序串联。"""
+
+    def __init__(self, *modules):
+        super().__init__()
+        if not modules:
+            raise ValueError("SequentialModule: 至少需要一个模块")
+        self.sequence = list(modules)
+        for idx, module in enumerate(modules):
+            self.add_module(str(idx), module)
+
+    def __len__(self):
+        return len(self._modules)
+
+    def forward(self, x):
+        for module in self._modules.values():
+            x = module(x)
+        return x
+
+
+class MLPModule(Module):
+    """多层感知机模块：Linear + 激活堆叠，输出层为 Linear。"""
+
+    def __init__(self, layer_sizes, activations=None, seed=None):
+        super().__init__()
+        if not isinstance(layer_sizes, (list, tuple)) or len(layer_sizes) < 2:
+            raise ValueError(
+                f"MLPModule: layer_sizes 至少 2 层，收到 {layer_sizes!r}")
+        sizes = [_ag_check_pos_int(v, "MLPModule(layer_sizes)") for v in layer_sizes]
+        if activations is None:
+            activations = ["relu"] * (len(sizes) - 2) + ["linear"]
+        if len(activations) != len(sizes) - 1:
+            raise ValueError(
+                f"MLPModule: 激活函数数应为 {len(sizes) - 1}，收到 {len(activations)}")
+        rng_state = None
+        import random
+        if seed is not None:
+            rng_state = random.getstate()
+            random.seed(seed)
+        layers = []
+        for idx in range(len(sizes) - 1):
+            linear = LinearModule(sizes[idx], sizes[idx + 1], seed=None)
+            layers.append(linear)
+            kind = activations[idx]
+            if kind == "relu":
+                layers.append(ReLUModule())
+            elif kind == "sigmoid":
+                layers.append(SigmoidModule())
+            elif kind == "tanh":
+                layers.append(TanhModule())
+            elif kind != "linear":
+                if rng_state is not None:
+                    random.setstate(rng_state)
+                raise ValueError(f"MLPModule: 未知激活 {kind!r}")
+        self.net = SequentialModule(*layers)
+        if rng_state is not None:
+            random.setstate(rng_state)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SGDModule:
+    """Module 参数上的 SGD（支持 momentum 与 weight_decay）。"""
+
+    def __init__(self, module_or_params, lr=0.01, momentum=0.0,
+                 weight_decay=0.0):
+        self.params = _ag_collect_params(module_or_params, "SGDModule")
+        self.lr = _ag_check_pos_number(lr, "SGDModule(lr)")
+        if not isinstance(momentum, (int, float)) or not 0.0 <= momentum < 1.0:
+            raise ValueError(f"SGDModule: momentum 必须在 [0,1)，收到 {momentum!r}")
+        if not isinstance(weight_decay, (int, float)) or weight_decay < 0:
+            raise ValueError(
+                f"SGDModule: weight_decay 必须 >=0，收到 {weight_decay!r}")
+        self.momentum = float(momentum)
+        self.weight_decay = float(weight_decay)
+        self._velocity = {}
+
+    def zero_grad(self):
+        for param in self.params:
+            param.zero_grad()
+
+    def step(self):
+        for param in self.params:
+            if param._gflat is None:
+                continue
+            if len(param._gflat) != len(param._flat):
+                raise ValueError("SGDModule: 梯度与参数元素数不一致")
+            velocity = self._velocity.get(id(param))
+            if velocity is None:
+                velocity = [0.0] * len(param._flat)
+            for i in range(len(param._flat)):
+                g = param._gflat[i] + self.weight_decay * param._flat[i]
+                velocity[i] = self.momentum * velocity[i] + g
+                param._flat[i] -= self.lr * velocity[i]
+            self._velocity[id(param)] = velocity
+            param.data = _ag_build(param._flat, param.shape)
+
+
+class AdamModule:
+    """Module 参数上的 Adam（逐参数 m/v，支持 weight_decay）。"""
+
+    def __init__(self, module_or_params, lr=0.001, beta1=0.9, beta2=0.999,
+                 eps=1e-8, weight_decay=0.0):
+        self.params = _ag_collect_params(module_or_params, "AdamModule")
+        self.lr = _ag_check_pos_number(lr, "AdamModule(lr)")
+        for name, value in (("beta1", beta1), ("beta2", beta2)):
+            if not isinstance(value, (int, float)) or not 0.0 <= value < 1.0:
+                raise ValueError(
+                    f"AdamModule: {name} 必须在 [0,1)，收到 {value!r}")
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.eps = _ag_check_pos_number(eps, "AdamModule(eps)")
+        if not isinstance(weight_decay, (int, float)) or weight_decay < 0:
+            raise ValueError(
+                f"AdamModule: weight_decay 必须 >=0，收到 {weight_decay!r}")
+        self.weight_decay = float(weight_decay)
+        self._state = {}
+
+    def zero_grad(self):
+        for param in self.params:
+            param.zero_grad()
+
+    def step(self):
+        for param in self.params:
+            if param._gflat is None:
+                continue
+            state = self._state.setdefault(
+                id(param), {"m": [0.0] * len(param._flat),
+                            "v": [0.0] * len(param._flat), "t": 0})
+            state["t"] += 1
+            t = state["t"]
+            c1 = 1.0 - self.beta1 ** t
+            c2 = 1.0 - self.beta2 ** t
+            for i in range(len(param._flat)):
+                g = param._gflat[i] + self.weight_decay * param._flat[i]
+                state["m"][i] = self.beta1 * state["m"][i] + (1.0 - self.beta1) * g
+                state["v"][i] = self.beta2 * state["v"][i] + (1.0 - self.beta2) * g * g
+                m_hat = state["m"][i] / c1
+                v_hat = state["v"][i] / c2
+                param._flat[i] -= self.lr * m_hat / (v_hat ** 0.5 + self.eps)
+            param.data = _ag_build(param._flat, param.shape)
+
+
+def _ag_collect_params(module_or_params, who):
+    if isinstance(module_or_params, Module):
+        params = module_or_params.parameters()
+    elif isinstance(module_or_params, (list, tuple)):
+        params = list(module_or_params)
+    else:
+        raise TypeError(
+            f"{who}: 需要 Module 或参数列表，收到 {type(module_or_params).__name__}")
+    if not params:
+        raise ValueError(f"{who}: 参数列表不能为空")
+    for param in params:
+        if not isinstance(param, Tensor):
+            raise TypeError(f"{who}: 参数里只能有 Tensor")
+    return params
+
+
+def _ag_check_pos_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} 必须是数字，收到 {type(value).__name__}")
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        raise ValueError(f"{name} 必须是有限正数，收到 {value!r}")
+    return value
+
+
+def _ag_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} 必须是整数，收到 {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+    return int(value)
+
+
+def ag_assert_shape(tensor, shape, name="tensor"):
+    """形状断言：不一致时抛 ValueError 并带上名字与期望/实际形状。"""
+    if not isinstance(tensor, Tensor):
+        raise TypeError(f"ag_assert_shape: {name} 需要 Tensor")
+    expected = _ag_check_shape(shape, "ag_assert_shape(shape)")
+    if tensor.shape != expected:
+        raise ValueError(
+            f"ag_assert_shape: {name} 形状应为 {expected}，收到 {tensor.shape}")
+    return tensor
+
+
+def module_grad_check(module, fn, eps=1e-5):
+    """对模块全部参数做数值梯度对拍。"""
+    if not isinstance(module, Module):
+        raise TypeError("module_grad_check: 第一个参数必须是 Module")
+    params = module.parameters()
+    if not params:
+        raise ValueError("module_grad_check: 模块没有可训练参数")
+    return ag_grad_check(fn, params, eps=eps)
 
 class MLP:
     """多层感知机（PyTorch 风格）"""
