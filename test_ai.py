@@ -50030,3 +50030,108 @@ class TestServingOrchestration:
         assert _svc_raises(lambda: AI.autoscale_plan(2, 5, 2.0, 0.0))
         assert _svc_raises(
             lambda: AI.autoscale_plan(2, 5, 2.0, 1.0, min_workers=8, max_workers=4))
+
+
+import random
+
+import AI
+
+
+def _mcl_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _mcl_matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(len(b)))
+             for j in range(len(b[0]))] for i in range(len(a))]
+
+
+def _mcl_tree(flat):
+    return [[flat[0], flat[1]], [flat[2]]]
+
+
+class TestMathAndEWC:
+    def test_linear_solvers(self):
+        a = [[3.0, 2.0, -1.0], [2.0, -2.0, 4.0], [-1.0, 0.5, -1.0]]
+        b = [1.0, -2.0, 0.0]
+        x = AI.solve_linear_system(a, b)
+        resid = max(abs(sum(a[i][j] * x[j] for j in range(3)) - b[i])
+                    for i in range(3))
+        assert resid < 1e-12
+        assert abs(AI.determinant([[1, 2], [3, 4]]) + 2.0) < 1e-12
+        assert AI.determinant([[1, 2], [2, 4]]) == 0.0
+        assert abs(AI.determinant([[6, 1, 1], [4, -2, 5], [2, 8, 7]]) + 306.0) < 1e-9
+        inv = AI.matrix_inverse(a)
+        prod = _mcl_matmul(a, inv)
+        err = max(abs(prod[i][j] - (1.0 if i == j else 0.0))
+                  for i in range(3) for j in range(3))
+        assert err < 1e-10
+
+    def test_qr_and_power(self):
+        random.seed(3)
+        m = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(5)]
+        q, r = AI.qr_decompose(m)
+        qtq = [[sum(q[k][i] * q[k][j] for k in range(5)) for j in range(3)]
+               for i in range(3)]
+        orth = max(abs(qtq[i][j] - (1.0 if i == j else 0.0))
+                   for i in range(3) for j in range(3))
+        assert orth < 1e-10
+        rec = max(abs(sum(q[i][k] * r[k][j] for k in range(3)) - m[i][j])
+                  for i in range(5) for j in range(3))
+        assert rec < 1e-10
+        lower = max(abs(r[i][j]) for i in range(3) for j in range(3) if j < i)
+        assert lower < 1e-12
+        lam, vec = AI.power_iteration([[2, 1], [1, 2]])
+        assert abs(lam - 3.0) < 1e-9
+        assert abs(abs(vec[0]) - 2 ** -0.5) < 1e-8 and abs(vec[0] - vec[1]) < 1e-8
+        lam2, vec2 = AI.power_iteration([[5, 0], [0, 1]])
+        assert abs(lam2 - 5.0) < 1e-9 and abs(abs(vec2[0]) - 1.0) < 1e-8
+
+    def test_ewc_penalty_and_grad(self):
+        params = [[1.0, 2.0], [3.0]]
+        anchor = [[0.0, 0.0], [0.0]]
+        fisher = [[1.0, 2.0], [3.0]]
+        pen, grad = AI.ewc_penalty(params, anchor, fisher, coefficient=1.0)
+        assert abs(pen - 18.0) < 1e-12 and grad == [1.0, 4.0, 9.0]
+        h = 1e-6
+        for idx in range(3):
+            def loss_at(delta):
+                flat = [1.0, 2.0, 3.0]
+                flat[idx] += delta
+                return AI.ewc_penalty(_mcl_tree(flat), anchor, fisher, 1.0)[0]
+
+            fd = (loss_at(h) - loss_at(-h)) / (2 * h)
+            assert abs(fd - grad[idx]) < 1e-5
+        pen2, grad2 = AI.ewc_penalty(params, anchor, fisher, coefficient=2.0)
+        assert abs(pen2 - 36.0) < 1e-12
+        assert grad2 == [2.0, 8.0, 18.0]
+
+    def test_ewc_zero_fisher(self):
+        pen, grad = AI.ewc_penalty([[1.0, 2.0]], [[0.0, 0.0]],
+                                   [[0.0, 0.0]], coefficient=1.0)
+        assert pen == 0.0 and grad == [0.0, 0.0]
+        pen2, _ = AI.ewc_penalty([[5.0]], [[1.0]], [[0.25]], coefficient=4.0)
+        assert abs(pen2 - 0.5 * 4.0 * 0.25 * 16.0) < 1e-12
+
+    def test_invalid_inputs(self):
+        assert _mcl_raises(lambda: AI.solve_linear_system([[], []], [1, 2]))
+        assert _mcl_raises(lambda: AI.solve_linear_system([[1, 2], [3, 4]], [1]))
+        assert _mcl_raises(lambda: AI.solve_linear_system([[1, 2], [2, 4]], [1, 2]))
+        assert _mcl_raises(lambda: AI.determinant([[1, 2, 3]]))
+        assert _mcl_raises(lambda: AI.matrix_inverse([[0, 0], [1, 1]]))
+        assert _mcl_raises(lambda: AI.qr_decompose([[1, 2, 3]]))
+        assert _mcl_raises(lambda: AI.power_iteration([[1, 2], [3, 4]]))
+        assert _mcl_raises(lambda: AI.ewc_penalty([[1.0]], [[0.0]], [[2.0]],
+                                                  coefficient=0.0))
+        assert _mcl_raises(lambda: AI.ewc_penalty([[1.0]], [[0.0]], [[-1.0]]))
+        assert _mcl_raises(lambda: AI.ewc_penalty([[1.0]], [[0.0, 1.0]],
+                                                  [[1.0, 1.0]]))
+        assert _mcl_raises(lambda: AI.solve_linear_system([[1, True]], [1]))
+        assert _mcl_raises(lambda: AI.solve_linear_system([[1, 2], [3, 4]],
+                                                          [1.0, float("nan")]))

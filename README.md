@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3099 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3104 项）
 
 ## 特性
 
@@ -3268,6 +3268,36 @@ tox = toxicity_score(tokens, banned_words)    # {"score","flagged"}
 
 - 边界：pass@k 为无偏组合估计而非置信区间；PRM 聚合只看逐步分数、不训练 PRM；verifier 排序假设分数已由外部模型给出；毒性只做词表匹配（不做语义/上下文判断）。
 
+### 数值线性代数与持续学习（EWC）
+
+```python
+import AI
+
+a = [[3.0, 2.0, -1.0], [2.0, -2.0, 4.0], [-1.0, 0.5, -1.0]]
+x = AI.solve_linear_system(a, [1.0, -2.0, 0.0])
+det = AI.determinant(a)
+inv = AI.matrix_inverse(a)
+
+q, r = AI.qr_decompose([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+lam, vec = AI.power_iteration([[2.0, 1.0], [1.0, 2.0]])
+
+penalty, grads = AI.ewc_penalty(params, anchor_params, fisher, coefficient=100.0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `solve_linear_system(a, b)` | 部分主元高斯消元 + 回代解 `A x = b`；系数矩阵须为方阵，奇异时抛 ValueError |
+| `determinant(a)` | LU 分解求行列式；奇异矩阵返回 0.0 |
+| `matrix_inverse(a)` | Gauss-Jordan 求逆；对角元与主元小于 1e-14 视为奇异 |
+| `qr_decompose(a)` | Householder QR，返回 `(Q, R)`：Q 为 m×n 列正交，R 为 n×n 上三角；需要 m >= n |
+| `power_iteration(a, iters=100, tol=1e-10)` | 幂迭代求对称矩阵主特征值与单位特征向量 |
+| `ewc_penalty(params, anchor, fisher, coefficient=1.0)` | EWC 二次惩罚 `coef/2 * Σ fisher_i (θ_i - θ*_i)²`；返回 `(penalty, grads_flat)`，参数可以是嵌套列表 |
+
+边界：线性代数实现为教学级 O(n³) 稠密算法，没有分块/稀疏优化；QR 只返回
+经济型（reduced）分解；幂迭代只支持对称矩阵且只求绝对值最大的特征值，遇到
+接近相等的主特征值会收敛变慢；`ewc_penalty` 不计算 Fisher，调用方需自己提供
+（例如训练集梯度平方的滑动平均），参数结构与 `anchor`/`fisher` 必须一致。
+
 ### 数学等价检查（AST 规范化）
 
 比较两个算术表达式是否在代数化简后同构：解析成语法树后做常数折叠、
@@ -5572,12 +5602,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3047 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3052 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3099 项）。
+`tests/`（合计 3104 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5585,7 +5615,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3099 项
+pytest -q                        # test_ai.py + tests/ 合计 3104 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7412,7 +7442,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3099 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3104 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7741,6 +7771,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStripedHyenaAndVim` | StripedHyena/Vim 前向与参数计数、MHA/Hyena/双向 Mamba 各参数与输入梯度有限差分、VimClassifier FD 与 fit 收敛、8 类非法输入 |
 | `TestGenerationExtras` | logit bias/禁用 token、top-p/min-p 掩码、stop 字符串截断、token 停止序列生成（含 eos）、退化检测、非法输入 |
 | `TestServingOrchestration` | 令牌桶限流与等待时间、动态批处理出批/未到期、灰度路由可复现、断路器三态切换、自动扩缩容上下限、非法输入 |
+| `TestMathAndEWC` | 线性方程组/行列式/逆矩阵与 QR 重构精度、幂迭代主特征值、EWC 惩罚值与梯度有限差分、Fisher 为零、非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |

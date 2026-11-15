@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1992 个 def / 451 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （2004 个 def / 451 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -18231,6 +18231,263 @@ def autoscale_plan(current_workers, queue_length, avg_latency, target_latency,
     else:
         want = current
     return max(lo, min(hi, want))
+
+
+# ---- B17：数值线性代数与持续学习（EWC） ----
+
+
+def _mcl_check_matrix(a, who):
+    """校验非空、行宽一致的数值矩阵，返回 float 副本。"""
+    if not isinstance(a, (list, tuple)) or not a:
+        raise ValueError(f"{who}: 矩阵必须是非空列表")
+    cols = None
+    out = []
+    for row in a:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 每一行必须是非空列表")
+        if cols is None:
+            cols = len(row)
+        elif len(row) != cols:
+            raise ValueError(f"{who}: 各行长度必须一致")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 矩阵元素必须是数字")
+            f = float(v)
+            if f != f or f in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 矩阵元素必须是有限数字")
+            vals.append(f)
+        out.append(vals)
+    return out
+
+
+def _mcl_check_vec(v, n, who):
+    if not isinstance(v, (list, tuple)) or len(v) != n:
+        raise ValueError(f"{who}: 向量长度必须是 {n}")
+    out = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            raise ValueError(f"{who}: 向量元素必须是数字")
+        f = float(x)
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError(f"{who}: 向量元素必须是有限数字")
+        out.append(f)
+    return out
+
+
+def _mcl_check_pos(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}: 必须是数字")
+    f = float(value)
+    if f != f or f <= 0.0 or f == float("inf"):
+        raise ValueError(f"{name}: 必须是有限正数")
+    return f
+
+
+def _mcl_eliminate(a, b):
+    """带部分主元的高斯消元，返回 (U, y, sign, singular)。"""
+    n = len(a)
+    u = [row[:] for row in a]
+    y = b[:]
+    sign = 1.0
+    singular = False
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(u[r][col]))
+        if abs(u[pivot][col]) < 1e-14:
+            singular = True
+            return u, y, sign, singular
+        if pivot != col:
+            u[col], u[pivot] = u[pivot], u[col]
+            y[col], y[pivot] = y[pivot], y[col]
+            sign = -sign
+        p = u[col][col]
+        for r in range(col + 1, n):
+            factor = u[r][col] / p
+            if factor == 0.0:
+                continue
+            u[r][col] = 0.0
+            for c in range(col + 1, n):
+                u[r][c] -= factor * u[col][c]
+            y[r] -= factor * y[col]
+    return u, y, sign, singular
+
+
+def solve_linear_system(a, b):
+    """解线性方程组 A x = b（部分主元高斯消元 + 回代）。"""
+    mat = _mcl_check_matrix(a, "solve_linear_system(a)")
+    n = len(mat)
+    if any(len(row) != n for row in mat):
+        raise ValueError("solve_linear_system: 系数矩阵必须是方阵")
+    rhs = _mcl_check_vec(b, n, "solve_linear_system(b)")
+    u, y, _sign, singular = _mcl_eliminate(mat, rhs)
+    if singular:
+        raise ValueError("solve_linear_system: 系数矩阵奇异或接近奇异")
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = y[i]
+        for j in range(i + 1, n):
+            s -= u[i][j] * x[j]
+        x[i] = s / u[i][i]
+    return x
+
+
+def determinant(a):
+    """行列式（LU 分解，部分主元）。"""
+    mat = _mcl_check_matrix(a, "determinant(a)")
+    n = len(mat)
+    if any(len(row) != n for row in mat):
+        raise ValueError("determinant: 矩阵必须是方阵")
+    u, _y, sign, singular = _mcl_eliminate(mat, [0.0] * n)
+    if singular:
+        return 0.0
+    det = sign
+    for i in range(n):
+        det *= u[i][i]
+    return det
+
+
+def matrix_inverse(a):
+    """矩阵求逆（Gauss-Jordan，部分主元）。"""
+    mat = _mcl_check_matrix(a, "matrix_inverse(a)")
+    n = len(mat)
+    if any(len(row) != n for row in mat):
+        raise ValueError("matrix_inverse: 矩阵必须是方阵")
+    aug = [mat[i][:] + [1.0 if i == j else 0.0 for j in range(n)]
+           for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-14:
+            raise ValueError("matrix_inverse: 矩阵奇异或接近奇异")
+        if pivot != col:
+            aug[col], aug[pivot] = aug[pivot], aug[col]
+        p = aug[col][col]
+        aug[col] = [v / p for v in aug[col]]
+        for r in range(n):
+            if r == col:
+                continue
+            factor = aug[r][col]
+            if factor == 0.0:
+                continue
+            aug[r] = [aug[r][c] - factor * aug[col][c]
+                      for c in range(2 * n)]
+    return [row[n:] for row in aug]
+
+
+def qr_decompose(a):
+    """Householder QR 分解：A = Q R，Q 为 m×n 列正交，R 为 n×n 上三角。"""
+    mat = _mcl_check_matrix(a, "qr_decompose(a)")
+    m = len(mat)
+    n = len(mat[0])
+    if m < n:
+        raise ValueError("qr_decompose: 需要行数 m >= 列数 n")
+    r = [row[:] for row in mat]
+    q = [[1.0 if i == j else 0.0 for j in range(m)] for i in range(m)]
+    for k in range(n):
+        norm = 0.0
+        for i in range(k, m):
+            norm += r[i][k] * r[i][k]
+        norm = norm ** 0.5
+        if norm < 1e-14:
+            continue
+        alpha = -norm if r[k][k] >= 0.0 else norm
+        v = [0.0] * m
+        v[k] = r[k][k] - alpha
+        for i in range(k + 1, m):
+            v[i] = r[i][k]
+        vnorm2 = sum(v[i] * v[i] for i in range(m))
+        if vnorm2 < 1e-28:
+            continue
+        for j in range(n):
+            dot = sum(v[i] * r[i][j] for i in range(m))
+            if dot == 0.0:
+                continue
+            factor = 2.0 * dot / vnorm2
+            for i in range(m):
+                r[i][j] -= factor * v[i]
+        for j in range(m):
+            dot = sum(v[i] * q[i][j] for i in range(m))
+            if dot == 0.0:
+                continue
+            factor = 2.0 * dot / vnorm2
+            for i in range(m):
+                q[i][j] -= factor * v[i]
+    qn = [[q[j][i] for j in range(n)] for i in range(m)]
+    rn = [[r[i][j] for j in range(n)] for i in range(n)]
+    return qn, rn
+
+
+def power_iteration(a, iters=100, tol=1e-10):
+    """幂迭代求对称矩阵的主特征值与单位特征向量。"""
+    mat = _mcl_check_matrix(a, "power_iteration(a)")
+    n = len(mat)
+    if any(len(row) != n for row in mat):
+        raise ValueError("power_iteration: 矩阵必须是方阵")
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(mat[i][j] - mat[j][i]) > 1e-9:
+                raise ValueError("power_iteration: 目前只支持对称矩阵")
+    iters = int(_mcl_check_pos(iters, "iters"))
+    tol = _mcl_check_pos(tol, "tol")
+    v = [1.0 / n ** 0.5] * n
+    lam = 0.0
+    for _ in range(iters):
+        w = [sum(mat[i][j] * v[j] for j in range(n)) for i in range(n)]
+        norm = sum(x * x for x in w) ** 0.5
+        if norm < 1e-14:
+            break
+        nv = [x / norm for x in w]
+        lam = sum(nv[i] * w[i] for i in range(n))
+        diff = sum((nv[i] - v[i]) ** 2 for i in range(n)) ** 0.5
+        v = nv
+        if diff < tol:
+            break
+    if v[0] < 0.0:
+        v = [-x for x in v]
+    return lam, v
+
+
+def _ewc_flatten(tree, out, who):
+    if isinstance(tree, (list, tuple)):
+        for item in tree:
+            _ewc_flatten(item, out, who)
+    else:
+        if isinstance(tree, bool) or not isinstance(tree, (int, float)):
+            raise ValueError(f"{who}: 参数必须是数字或嵌套列表")
+        f = float(tree)
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError(f"{who}: 参数必须是有限数字")
+        out.append(f)
+
+
+def _ewc_same_shape(p, q, who):
+    if isinstance(p, (list, tuple)) or isinstance(q, (list, tuple)):
+        if not isinstance(p, (list, tuple)) or not isinstance(q, (list, tuple)):
+            raise ValueError(f"{who}: 参数结构必须一致")
+        if len(p) != len(q):
+            raise ValueError(f"{who}: 参数结构必须一致")
+        for a, b in zip(p, q):
+            _ewc_same_shape(a, b, who)
+
+
+def ewc_penalty(params, anchor, fisher, coefficient=1.0):
+    """EWC 二次惩罚：coef/2 * Σ fisher_i (θ_i - θ*_i)^2（返回惩罚值与梯度）。"""
+    _ewc_same_shape(params, anchor, "ewc_penalty(params/anchor)")
+    _ewc_same_shape(params, fisher, "ewc_penalty(params/fisher)")
+    coef = float(_mcl_check_pos(coefficient, "coefficient"))
+    flat_p, flat_a, flat_f = [], [], []
+    _ewc_flatten(params, flat_p, "ewc_penalty(params)")
+    _ewc_flatten(anchor, flat_a, "ewc_penalty(anchor)")
+    _ewc_flatten(fisher, flat_f, "ewc_penalty(fisher)")
+    if len(flat_p) != len(flat_a) or len(flat_p) != len(flat_f):
+        raise ValueError("ewc_penalty: 参数、锚点与 Fisher 的元素数必须一致")
+    penalty = 0.0
+    grads_flat = []
+    for i, (p, a, f) in enumerate(zip(flat_p, flat_a, flat_f)):
+        if f < 0.0:
+            raise ValueError("ewc_penalty: Fisher 元素不能为负")
+        penalty += coef * 0.5 * f * (p - a) ** 2
+        grads_flat.append(coef * f * (p - a))
+    return penalty, grads_flat
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
