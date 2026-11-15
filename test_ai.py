@@ -50226,3 +50226,111 @@ class TestDataEvalAndAudit:
         assert _dat_raises(lambda: trail.append(3))
         assert _dat_raises(lambda: trail.append({"x": object()}))
         assert _dat_raises(lambda: AI.AuditTrail.from_dict({"x": 1}))
+
+
+import AI
+
+
+def _cnt_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _cnt_loss(blk, x, w, steps):
+    out, _cache = AI.coconut_latent_reasoning(blk, x, steps=steps)
+    return sum(out[t][k] * w[t][k] for t in range(len(out))
+               for k in range(len(w[0])))
+
+
+class TestCoconutReasoning:
+    def test_block_forward_and_params(self):
+        blk = AI.CoconutBlock(4, d_ff=8, seed=3)
+        assert blk.param_count() == 84
+        x = [[0.1, -0.2, 0.3, 0.0], [0.5, 0.5, -0.1, 0.2]]
+        out = blk.forward(x)
+        assert len(out) == 2 and len(out[0]) == 4
+        assert all(isinstance(v, float) for row in out for v in row)
+
+    def test_latent_reasoning_and_backward(self):
+        blk = AI.CoconutBlock(4, d_ff=8, seed=3)
+        x = [[0.1, -0.2, 0.3, 0.0], [0.5, 0.5, -0.1, 0.2]]
+        w = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, -0.2]]
+        out1, _c1 = AI.coconut_latent_reasoning(blk, x, steps=1)
+        assert out1 == blk.forward(x)
+        out2, cache2 = AI.coconut_latent_reasoning(blk, x, steps=2)
+        assert len(out2) == 2 and len(out2[0]) == 4
+        dx = AI.coconut_latent_reasoning_backward(cache2, w)
+        assert len(dx) == 2 and len(dx[0]) == 4
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning(blk, x, steps=0))
+
+    def test_gradients_fd(self):
+        blk = AI.CoconutBlock(4, d_ff=8, seed=3)
+        x = [[0.1, -0.2, 0.3, 0.0], [0.5, 0.5, -0.1, 0.2]]
+        w = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, -0.2]]
+        _out, cache = AI.coconut_latent_reasoning(blk, x, steps=2)
+        dx = AI.coconut_latent_reasoning_backward(cache, w)
+        h = 1e-6
+
+        def fd_param(setter, getter, grad_getter):
+            p0 = getter()
+            setter(p0 + h)
+            lp = _cnt_loss(blk, x, w, 2)
+            setter(p0 - h)
+            lm = _cnt_loss(blk, x, w, 2)
+            setter(p0)
+            return grad_getter(), (lp - lm) / (2 * h)
+
+        g, f = fd_param(lambda v: blk.W1.weights[1].__setitem__(2, v),
+                        lambda: blk.W1.weights[1][2],
+                        lambda: blk.grad_W1[0][1][2])
+        assert abs(g - f) < 1e-4
+        g, f = fd_param(lambda v: blk.W2.weights[0].__setitem__(1, v),
+                        lambda: blk.W2.weights[0][1],
+                        lambda: blk.grad_W2[0][0][1])
+        assert abs(g - f) < 1e-4
+        g, f = fd_param(lambda v: blk.ln1.gamma.__setitem__(2, v),
+                        lambda: blk.ln1.gamma[2],
+                        lambda: blk.grad_ln1[0][2])
+        assert abs(g - f) < 1e-4
+        for t in (0, 1):
+            for k in (0, 3):
+                p0 = x[t][k]
+                x[t][k] = p0 + h
+                lp = _cnt_loss(blk, x, w, 2)
+                x[t][k] = p0 - h
+                lm = _cnt_loss(blk, x, w, 2)
+                x[t][k] = p0
+                assert abs(dx[t][k] - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_sgd_and_zero_grad(self):
+        blk = AI.CoconutBlock(4, d_ff=8, seed=3)
+        x = [[0.1, -0.2, 0.3, 0.0]]
+        w = [[1.0, 0.0, 0.0, 0.0]]
+        _out, cache = AI.coconut_latent_reasoning(blk, x, steps=2)
+        AI.coconut_latent_reasoning_backward(cache, w)
+        before = blk.W1.weights[0][0]
+        blk.sgd_step(0.01)
+        assert blk.W1.weights[0][0] != before
+        assert blk.grad_W1 is None and blk.grad_W2 is None
+        assert blk.grad_ln1 == ([0.0] * 4, [0.0] * 4)
+
+    def test_invalid_inputs(self):
+        blk = AI.CoconutBlock(4, d_ff=8, seed=3)
+        x = [[0.1, -0.2, 0.3, 0.0]]
+        w = [[1.0, 0.0, 0.0, 0.0]]
+        _out, cache = AI.coconut_latent_reasoning(blk, x, steps=1)
+        assert _cnt_raises(lambda: AI.CoconutBlock(0))
+        assert _cnt_raises(lambda: AI.CoconutBlock(4, d_ff=0))
+        assert _cnt_raises(lambda: AI.CoconutBlock(4, eps=0.0))
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning(None, x))
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning(blk, []))
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning(blk, [[1.0]], 1))
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning_backward({}, w))
+        assert _cnt_raises(lambda: AI.coconut_latent_reasoning_backward(cache, []))
+        assert _cnt_raises(lambda: blk.sgd_step(0.0))
+        assert _cnt_raises(lambda: blk.forward([[0.1, 0.2]]))

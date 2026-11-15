@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3109 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3114 项）
 
 ## 特性
 
@@ -1539,6 +1539,30 @@ workers = AI.autoscale_plan(4, 12, 2.0, 1.0)
 边界：这些组件只做策略计算，不绑定真实网络/进程；`TokenBucketRateLimiter` 与
 `CircuitBreaker` 的时钟由调用方注入，互不共享；`DynamicBatchScheduler` 一个实例
 对应一个队列，未做线程安全；`canary_route` 的权重语义是相对比例，不需要归一化。
+
+### 连续思维链（Coconut 简化版）
+
+```python
+import AI
+
+block = AI.CoconutBlock(d_model=8, d_ff=16, seed=1)
+x = [[0.1] * 8, [0.2] * 8]
+
+# 把隐状态直接当作下一步输入，在潜空间里反复调用同一个块
+out, cache = AI.coconut_latent_reasoning(block, x, steps=3)
+dx = AI.coconut_latent_reasoning_backward(cache, d_out)
+block.sgd_step(lr=0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `CoconutBlock(d_model, d_ff=None, eps=1e-5, seed=None)` | `out = x + W2 · relu(W1 · LN(x))`，手写反向；`param_count/sgd_step/zero_grad` |
+| `coconut_latent_reasoning(block, x, steps=2)` | 反复调用同一块 `steps` 次（输出作为下一次输入），返回 `(最终隐状态, cache)` |
+| `coconut_latent_reasoning_backward(cache, d_out)` | 沿 `steps` 步反向传播，块梯度跨步累加；返回输入梯度 |
+
+边界：这是 Coconut「连续思维链」的教学简化——只保留「隐状态直接回灌」这一核心
+机制，没有语言模型头、没有课程式多阶段训练、没有与离散思维链的混合监督；
+每个块是最小 pre-LN + MLP，`steps` 的梯度用普通 BPTT 累加。
 
 ### 推理搜索（MCTS / Tree-of-Thought）
 
@@ -5630,12 +5654,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3057 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3062 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3109 项）。
+`tests/`（合计 3114 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5643,7 +5667,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3109 项
+pytest -q                        # test_ai.py + tests/ 合计 3114 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7470,7 +7494,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3109 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3114 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7801,6 +7825,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestServingOrchestration` | 令牌桶限流与等待时间、动态批处理出批/未到期、灰度路由可复现、断路器三态切换、自动扩缩容上下限、非法输入 |
 | `TestMathAndEWC` | 线性方程组/行列式/逆矩阵与 QR 重构精度、幂迭代主特征值、EWC 惩罚值与梯度有限差分、Fisher 为零、非法输入 |
 | `TestDataEvalAndAudit` | 数据集统计/近重复检测/标签质量熵、规则审核风险分级、审计日志哈希链与篡改检测、非法输入 |
+| `TestCoconutReasoning` | 连续思维块前向/参数计数、潜空间迭代与输入梯度、W1/W2/LN 有限差分、SGD 更新与梯度清零、非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |

@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （2010 个 def / 452 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （2015 个 def / 453 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -18728,6 +18728,171 @@ class AuditTrail:
         if not trail.verify():
             raise ValueError("AuditTrail.from_dict: 哈希校验失败")
         return trail
+
+
+# ---- B19：连续思维链（Coconut 简化版）----
+
+
+def _cnt_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name}: 必须是正整数")
+    return value
+
+
+def _cnt_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}: 必须是数字")
+    f = float(value)
+    if f != f or f <= 0.0 or f == float("inf"):
+        raise ValueError(f"{name}: 必须是有限正数")
+    return f
+
+
+def _cnt_check_seq(x, d_model, who):
+    if not isinstance(x, (list, tuple)) or not x:
+        raise ValueError(f"{who}: 输入必须是非空二维列表")
+    out = []
+    for row in x:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 元素必须是数字")
+            f = float(v)
+            if f != f or f in (float("inf"), float("-inf")):
+                raise ValueError(f"{who}: 元素必须是有限数字")
+            vals.append(f)
+        out.append(vals)
+    return out
+
+
+class CoconutBlock:
+    """连续思维块：``out = x + W2 · relu(W1 · LN(x))``。
+
+    Coconut（Chain of Continuous Thought）把最后一层隐状态直接当作下一步输入，
+    在潜空间里反复调用同一个块；这里给出可训练、可反传的最小版本。
+    """
+
+    def __init__(self, d_model, d_ff=None, eps=1e-5, seed=None):
+        d_model = _cnt_check_pos_int(d_model, "d_model")
+        self.d_model = d_model
+        self.d_ff = _cnt_check_pos_int(d_ff if d_ff is not None else 4 * d_model,
+                                       "d_ff")
+        self.eps = _cnt_check_positive(eps, "eps")
+        self.ln1 = LayerNorm(d_model, eps=self.eps)
+        import random
+        state = random.getstate()
+        rng = random.Random(seed)
+        random.setstate(rng.getstate())
+        try:
+            self.W1 = Layer(d_model, self.d_ff, "relu")
+            self.W2 = Layer(self.d_ff, d_model, "linear")
+        finally:
+            random.setstate(state)
+        self.zero_grad()
+
+    def zero_grad(self):
+        self.grad_W1 = None
+        self.grad_W2 = None
+        self.grad_ln1 = ([0.0] * self.d_model, [0.0] * self.d_model)
+
+    def _check(self, x):
+        rows = _cnt_check_seq(x, self.d_model, "CoconutBlock.forward")
+
+        return rows
+
+    def forward(self, x):
+        rows = self._check(x)
+        h, ln_cache = _norm_rows_forward(self.ln1, rows)
+        a, c1 = _dense_rows_forward(self.W1, h)
+        y, c2 = _dense_rows_forward(self.W2, a)
+        out = [[rows[t][k] + y[t][k] for k in range(self.d_model)]
+               for t in range(len(rows))]
+        self._cache = (rows, ln_cache, c1, c2)
+        return out
+
+    def backward(self, dout):
+        rows, ln_cache, c1, c2 = self._cache
+        dout = _cnt_check_seq(dout, self.d_model, "CoconutBlock.backward")
+        if len(dout) != len(rows):
+            raise ValueError("CoconutBlock.backward: dout 行数不匹配")
+        gw2, gb2, da = _dense_rows_backward(self.W2, c2, dout)
+        gw1, gb1, dh = _dense_rows_backward(self.W1, c1, da)
+        g_ln, b_ln, dx_ln = _norm_rows_backward(self.ln1, ln_cache, dh)
+        if self.grad_W1 is None:
+            self.grad_W1 = (gw1, gb1)
+            self.grad_W2 = (gw2, gb2)
+            self.grad_ln1 = (list(g_ln), list(b_ln))
+        else:
+            for i in range(len(gw1)):
+                for j in range(len(gw1[0])):
+                    self.grad_W1[0][i][j] += gw1[i][j]
+            for i in range(len(gb1)):
+                self.grad_W1[1][i] += gb1[i]
+            for i in range(len(gw2)):
+                for j in range(len(gw2[0])):
+                    self.grad_W2[0][i][j] += gw2[i][j]
+            for i in range(len(gb2)):
+                self.grad_W2[1][i] += gb2[i]
+            for i in range(self.d_model):
+                self.grad_ln1[0][i] += g_ln[i]
+                self.grad_ln1[1][i] += b_ln[i]
+        dx = [[dout[t][k] + dx_ln[t][k] for k in range(self.d_model)]
+              for t in range(len(rows))]
+        return dx
+
+    def param_count(self):
+        return (_dense_param_count(self.W1) + _dense_param_count(self.W2)
+                + _norm_param_count(self.ln1))
+
+    def sgd_step(self, lr=0.01):
+        lr = _cnt_check_positive(lr, "lr")
+        _dense_apply_sgd(self.W1, self.grad_W1, lr)
+        _dense_apply_sgd(self.W2, self.grad_W2, lr)
+        _norm_apply_sgd(self.ln1, self.grad_ln1, lr)
+        self.zero_grad()
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+def coconut_latent_reasoning(block, x, steps=2):
+    """把 ``block`` 的输出直接当下一步输入，反复 ``steps`` 次（潜空间推理）。"""
+    if not isinstance(block, CoconutBlock):
+        raise TypeError("coconut_latent_reasoning: block 必须是 CoconutBlock")
+    steps = _cnt_check_pos_int(steps, "steps")
+    h = _cnt_check_seq(x, block.d_model, "coconut_latent_reasoning(x)")
+    hiddens = []
+    caches = []
+    for _ in range(steps):
+        h = block.forward(h)
+        hiddens.append(h)
+        caches.append(block._cache)
+    return h, {"steps": steps, "input": x, "hiddens": hiddens,
+               "caches": caches, "block": block}
+
+
+def coconut_latent_reasoning_backward(cache, d_out):
+    """按时间反向传播穿过 ``steps`` 次块调用；块梯度在各步累加。"""
+    if not isinstance(cache, dict) or "hiddens" not in cache:
+        raise ValueError("coconut_latent_reasoning_backward: cache 不合法")
+    block = cache.get("block")
+    hiddens = cache["hiddens"]
+    d = _cnt_check_seq(d_out, len(hiddens[-1][0]),
+                       "coconut_latent_reasoning_backward(d_out)")
+    if len(d) != len(hiddens[-1]):
+        raise ValueError("coconut_latent_reasoning_backward: d_out 行数不匹配")
+    block = cache["block"]
+    caches = cache["caches"]
+    block.zero_grad()
+    for step in range(len(hiddens) - 1, -1, -1):
+        block._cache = caches[step]
+        d = block.backward(d)
+    return d
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
