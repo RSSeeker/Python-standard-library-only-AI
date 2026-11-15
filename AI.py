@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2015 个 def / 453 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2058 个 def / 455 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -25696,6 +25696,869 @@ class PerceiverIO:
             total += (d * self.d_ff + self.d_ff) + (self.d_ff * d + d)  # FFN
             total += 4 * d                                   # 两个 LN
         return total
+
+
+# ---- 微型 autograd 引擎（Tensor + 计算图 + backward） ----
+
+
+# 说明：本引擎用「嵌套 list + 一维 flat 缓存」表示张量，支持标量/向量/矩阵
+# 与 NumPy 风格广播；每个运算记录父节点与反向闭包，Tensor.backward() 按拓扑序
+# 回传梯度。它是教学实现：没有 GPU、没有 stride 视图共享、没有高阶自动微分，
+# 但足以让新模块只写 forward，并用 ag_grad_check 与数值梯度对拍。
+
+
+def _ag_shape(data):
+    """推断嵌套列表的形状（标量返回空元组）。"""
+    shape = []
+    cur = data
+    while isinstance(cur, list):
+        shape.append(len(cur))
+        if not cur:
+            break
+        cur = cur[0]
+    return tuple(shape)
+
+
+def _ag_flatten(data):
+    """把任意嵌套数字列表展开成一维 float 列表。"""
+    if not isinstance(data, list):
+        return [float(data)]
+    out = []
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            for item in reversed(node):
+                stack.append(item)
+        else:
+            out.append(float(node))
+    return out
+
+
+def _ag_build(flat, shape):
+    """按形状把一维列表重建成嵌套列表。"""
+    if not shape:
+        return float(flat[0])
+    if len(shape) == 1:
+        return [float(v) for v in flat]
+    chunk = 1
+    for dim in shape[1:]:
+        chunk *= dim
+    out = []
+    for start in range(0, len(flat), chunk):
+        out.append(_ag_build(flat[start:start + chunk], shape[1:]))
+    return out
+
+
+def _ag_size(shape):
+    total = 1
+    for dim in shape:
+        total *= dim
+    return total
+
+
+def _ag_strides(shape):
+    """行主序步长。"""
+    strides = [0] * len(shape)
+    acc = 1
+    for idx in range(len(shape) - 1, -1, -1):
+        strides[idx] = acc
+        acc *= shape[idx]
+    return strides
+
+
+def _ag_indices(shape):
+    """按行主序枚举形状内的所有坐标。"""
+    if not shape:
+        yield ()
+        return
+    total = _ag_size(shape)
+    index = [0] * len(shape)
+    for _ in range(total):
+        yield tuple(index)
+        for pos in range(len(shape) - 1, -1, -1):
+            index[pos] += 1
+            if index[pos] < shape[pos]:
+                break
+            index[pos] = 0
+
+
+def _ag_bcast_shape(shape_a, shape_b):
+    """NumPy 风格的广播形状推导。"""
+    n = max(len(shape_a), len(shape_b))
+    a = (1,) * (n - len(shape_a)) + tuple(shape_a)
+    b = (1,) * (n - len(shape_b)) + tuple(shape_b)
+    out = []
+    for da, db in zip(a, b):
+        if da == db:
+            out.append(da)
+        elif da == 1:
+            out.append(db)
+        elif db == 1:
+            out.append(da)
+        else:
+            raise ValueError(
+                f"Tensor 广播失败：形状 {shape_a} 与 {shape_b} 不兼容")
+    return tuple(out)
+
+
+def _ag_broadcast_flat(flat, src_shape, dst_shape):
+    """把 flat（src_shape）广播到 dst_shape。"""
+    if src_shape == dst_shape:
+        return list(flat)
+    src_strides = _ag_strides(src_shape)
+    offset = len(dst_shape) - len(src_shape)
+    out = []
+    for idx in _ag_indices(dst_shape):
+        src_index = 0
+        for pos, coord in enumerate(idx):
+            src_pos = pos - offset
+            if src_pos < 0:
+                continue
+            dim = src_shape[src_pos]
+            src_index += (coord if dim != 1 else 0) * src_strides[src_pos]
+        out.append(float(flat[src_index]))
+    return out
+
+
+def _ag_sum_to(flat, src_shape, target_shape):
+    """反向广播：把梯度从 src_shape 归约回 target_shape。"""
+    if src_shape == target_shape:
+        return list(flat)
+    target_strides = _ag_strides(target_shape)
+    offset = len(src_shape) - len(target_shape)
+    out = [0.0] * max(1, _ag_size(target_shape))
+    for count, idx in enumerate(_ag_indices(src_shape)):
+        target_index = 0
+        for pos, coord in enumerate(idx):
+            target_pos = pos - offset
+            if target_pos < 0:
+                continue
+            dim = target_shape[target_pos]
+            target_index += (coord if dim != 1 else 0) * target_strides[target_pos]
+        out[target_index] += float(flat[count])
+    return out
+
+
+def _ag_check_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} 必须是数字，收到 {type(value).__name__}")
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} 必须是有限数字，收到 {value!r}")
+    return float(value)
+
+
+def _ag_check_shape(shape, name):
+    if not isinstance(shape, (list, tuple)):
+        raise TypeError(f"{name} 必须是 list/tuple，收到 {type(shape).__name__}")
+    out = []
+    for dim in shape:
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
+            raise ValueError(f"{name} 的维度必须是非负整数，收到 {dim!r}")
+        out.append(int(dim))
+    return tuple(out)
+
+
+def _ag_as_tensor(value, requires_grad=False):
+    if isinstance(value, Tensor):
+        if requires_grad and not value.requires_grad:
+            raise ValueError("ag: 不能给已有 Tensor 追加 requires_grad")
+        return value
+    return Tensor(value, requires_grad=requires_grad)
+
+
+def _ag_copy_nested(data):
+    if isinstance(data, list):
+        return [_ag_copy_nested(item) for item in data]
+    if isinstance(data, tuple):
+        raise TypeError("Tensor 数据请用 list，不要用 tuple")
+    return _ag_check_number(data, "Tensor 数据")
+
+
+class _TensorGrad:
+    """Tensor.grad 的惰性视图（避免每次反传重建嵌套列表）。"""
+
+    def __init__(self, tensor):
+        self._tensor = tensor
+
+    def tolist(self):
+        t = self._tensor
+        if t._gflat is None:
+            return None
+        return _ag_build(t._gflat, t.shape)
+
+    def __repr__(self):
+        return f"grad{self.tolist()}"
+
+
+class Tensor:
+    """带计算图的轻量张量。
+
+    示例::
+
+        w = AI.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        x = AI.Tensor([1.0, -1.0])
+        loss = AI.ag_mse_loss(AI.ag_matmul(w, x), [1.0, 1.0])
+        loss.backward()
+        print(w.grad)
+    """
+
+    __slots__ = ("data", "shape", "requires_grad", "_flat", "_parents",
+                 "_op", "_gflat", "_backward_fn", "grad")
+
+    def __init__(self, data, requires_grad=False, _parents=(), _op=""):
+        if isinstance(data, Tensor):
+            data = data.data
+        self.data = _ag_copy_nested(data)
+        self.shape = _ag_shape(self.data)
+        self._flat = _ag_flatten(self.data)
+        self.requires_grad = bool(requires_grad)
+        self._parents = tuple(_parents)
+        self._op = _op
+        self._gflat = None
+        self._backward_fn = None
+        self.grad = None
+
+    # ---------- 基础属性 ----------
+
+    @property
+    def size(self):
+        return len(self._flat)
+
+    def item(self):
+        if self.shape:
+            raise ValueError(f"item(): 只有标量能取 item，当前形状 {self.shape}")
+        return self._flat[0]
+
+    def tolist(self):
+        return _ag_build(self._flat, self.shape)
+
+    def __len__(self):
+        if not self.shape:
+            raise TypeError("len() 不能用于标量 Tensor")
+        return self.shape[0]
+
+    def __repr__(self):
+        flag = ", requires_grad=True" if self.requires_grad else ""
+        return f"Tensor(shape={self.shape}{flag})"
+
+    # ---------- 梯度 ----------
+
+    def zero_grad(self):
+        self._gflat = None
+        self.grad = None
+
+    def _accum(self, gflat):
+        if not self.requires_grad:
+            return
+        if self._gflat is None:
+            self._gflat = [0.0] * len(gflat)
+        for i, value in enumerate(gflat):
+            self._gflat[i] += float(value)
+
+    def _materialize_grads(self):
+        for node in _ag_all_nodes(self):
+            if node.requires_grad and node._gflat is not None:
+                node.grad = _ag_build(node._gflat, node.shape)
+
+    def backward(self, grad=None):
+        """反向传播；grad 缺省为全 1（标量损失时即 dL/dL=1）。"""
+        if grad is None:
+            self._gflat = [1.0] * len(self._flat)
+        else:
+            g = _ag_flatten(grad) if not isinstance(grad, Tensor) else list(grad._flat)
+            if len(g) != len(self._flat):
+                raise ValueError(
+                    f"backward: 梯度元素数 {len(g)} 与输出元素数 {len(self._flat)} 不一致")
+            if self._gflat is None:
+                self._gflat = g
+            else:
+                for i, value in enumerate(g):
+                    self._gflat[i] += float(value)
+        order = _ag_toposort(self)
+        for node in reversed(order):
+            if node._backward_fn is not None and node._gflat is not None:
+                node._backward_fn(node._gflat)
+        self._materialize_grads()
+
+    # ---------- 运算符 ----------
+
+    def __add__(self, other):
+        return ag_add(self, other)
+
+    def __radd__(self, other):
+        return ag_add(other, self)
+
+    def __sub__(self, other):
+        return ag_sub(self, other)
+
+    def __rsub__(self, other):
+        return ag_sub(other, self)
+
+    def __mul__(self, other):
+        return ag_mul(self, other)
+
+    def __rmul__(self, other):
+        return ag_mul(other, self)
+
+    def __truediv__(self, other):
+        return ag_div(self, other)
+
+    def __rtruediv__(self, other):
+        return ag_div(other, self)
+
+    def __neg__(self):
+        return ag_neg(self)
+
+    def __matmul__(self, other):
+        return ag_matmul(self, other)
+
+
+def _ag_all_nodes(root):
+    seen = set()
+    out = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        out.append(node)
+        stack.extend(node._parents)
+    return out
+
+
+def _ag_toposort(root):
+    order = []
+    seen = set()
+
+    def visit(node):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        for parent in node._parents:
+            visit(parent)
+        order.append(node)
+
+    visit(root)
+    return order
+
+
+def _ag_make(data_flat, shape, parents, op, backward_fn):
+    out = Tensor(_ag_build(data_flat, shape),
+                 requires_grad=any(p.requires_grad for p in parents),
+                 _parents=parents, _op=op)
+    out._backward_fn = backward_fn
+    return out
+
+
+def _ag_binary(a, b, op, forward_fn, grad_a_fn, grad_b_fn, backward_shape=None):
+    a = _ag_as_tensor(a)
+    b = _ag_as_tensor(b)
+    shape = _ag_bcast_shape(a.shape, b.shape) if backward_shape is None \
+        else backward_shape
+    af = _ag_broadcast_flat(a._flat, a.shape, shape)
+    bf = _ag_broadcast_flat(b._flat, b.shape, shape)
+    flat = forward_fn(af, bf)
+    out = _ag_make(list(flat), shape, (a, b), op, None)
+
+    def backward(g):
+        ga = grad_a_fn(g, af, bf)
+        gb = grad_b_fn(g, af, bf)
+        if ga is not None:
+            a._accum(_ag_sum_to(list(ga), shape, a.shape))
+        if gb is not None:
+            b._accum(_ag_sum_to(list(gb), shape, b.shape))
+
+    out._backward_fn = backward
+    return out
+
+
+def ag_add(a, b):
+    """逐元素加法（支持广播）。"""
+    return _ag_binary(a, b, "add",
+                      lambda af, bf: [x + y for x, y in zip(af, bf)],
+                      lambda g, af, bf: list(g),
+                      lambda g, af, bf: list(g))
+
+
+def ag_sub(a, b):
+    """逐元素减法（支持广播）。"""
+    return _ag_binary(a, b, "sub",
+                      lambda af, bf: [x - y for x, y in zip(af, bf)],
+                      lambda g, af, bf: list(g),
+                      lambda g, af, bf: [-v for v in g])
+
+
+def ag_mul(a, b):
+    """逐元素乘法（支持广播）。"""
+    return _ag_binary(a, b, "mul",
+                      lambda af, bf: [x * y for x, y in zip(af, bf)],
+                      lambda g, af, bf: [gi * bv for gi, bv in zip(g, bf)],
+                      lambda g, af, bf: [gi * av for gi, av in zip(g, af)])
+
+
+def ag_div(a, b):
+    """逐元素除法（支持广播；不校验除零，零除产生 inf/nan 由调用方检查）。"""
+    return _ag_binary(a, b, "div",
+                      lambda af, bf: [x / y for x, y in zip(af, bf)],
+                      lambda g, af, bf: [gi / bv for gi, bv in zip(g, bf)],
+                      lambda g, af, bf: [-gi * av / (bv * bv)
+                                         for gi, av, bv in zip(g, af, bf)])
+
+
+def ag_neg(a):
+    """逐元素取负。"""
+    a = _ag_as_tensor(a)
+    out = _ag_make([-v for v in a._flat], a.shape, (a,), "neg", None)
+    out._backward_fn = lambda g: a._accum([-v for v in g])
+    return out
+
+
+def _ag_matmul_2d(a_flat, b_flat, m, k, n):
+    out = [0.0] * (m * n)
+    for i in range(m):
+        for p in range(k):
+            av = a_flat[i * k + p]
+            if av == 0.0:
+                continue
+            for j in range(n):
+                out[i * n + j] += av * b_flat[p * n + j]
+    return out
+
+
+def ag_matmul(a, b):
+    """矩阵乘法：支持 (m,k)@(k,n)、(m,k)@(k,)、(k,)@(k,n)、(k,)@(k,)。"""
+    a = _ag_as_tensor(a)
+    b = _ag_as_tensor(b)
+    sa, sb = a.shape, b.shape
+    if len(sa) == 2 and len(sb) == 2:
+        if sa[1] != sb[0]:
+            raise ValueError(f"ag_matmul: 形状 {sa} 与 {sb} 不能相乘")
+        m, k, n = sa[0], sa[1], sb[1]
+        out = _ag_make(_ag_matmul_2d(a._flat, b._flat, m, k, n),
+                       (m, n), (a, b), "matmul", None)
+
+        def backward(g):
+            ga = [0.0] * (m * k)
+            gb = [0.0] * (k * n)
+            for i in range(m):
+                for p in range(k):
+                    total = 0.0
+                    for j in range(n):
+                        total += g[i * n + j] * b._flat[p * n + j]
+                    ga[i * k + p] = total
+            for p in range(k):
+                for j in range(n):
+                    total = 0.0
+                    for i in range(m):
+                        total += a._flat[i * k + p] * g[i * n + j]
+                    gb[p * n + j] = total
+            a._accum(ga)
+            b._accum(gb)
+
+        out._backward_fn = backward
+        return out
+    if len(sa) == 2 and len(sb) == 1:
+        if sa[1] != sb[0]:
+            raise ValueError(f"ag_matmul: 形状 {sa} 与 {sb} 不能相乘")
+        m, k = sa[0], sa[1]
+        flat = [sum(a._flat[i * k + p] * b._flat[p] for p in range(k))
+                for i in range(m)]
+        out = _ag_make(flat, (m,), (a, b), "matmul", None)
+
+        def backward2(g):
+            gb = [sum(a._flat[i * k + p] * g[i] for i in range(m))
+                  for p in range(k)]
+            ga = [g[i] * b._flat[p] for i in range(m) for p in range(k)]
+            a._accum(ga)
+            b._accum(gb)
+
+        out._backward_fn = backward2
+        return out
+    if len(sa) == 1 and len(sb) == 2:
+        if sa[0] != sb[0]:
+            raise ValueError(f"ag_matmul: 形状 {sa} 与 {sb} 不能相乘")
+        k, n = sa[0], sb[1]
+        flat = [sum(a._flat[p] * b._flat[p * n + j] for p in range(k))
+                for j in range(n)]
+        out = _ag_make(flat, (n,), (a, b), "matmul", None)
+
+        def backward3(g):
+            ga = [sum(g[j] * b._flat[p * n + j] for j in range(n))
+                  for p in range(k)]
+            gb = [a._flat[p] * g[j] for p in range(k) for j in range(n)]
+            a._accum(ga)
+            b._accum(gb)
+
+        out._backward_fn = backward3
+        return out
+    if len(sa) == 1 and len(sb) == 1:
+        if sa[0] != sb[0]:
+            raise ValueError(f"ag_matmul: 形状 {sa} 与 {sb} 不能相乘")
+        k = sa[0]
+        value = sum(a._flat[p] * b._flat[p] for p in range(k))
+        out = _ag_make([value], (), (a, b), "matmul", None)
+
+        def backward4(g):
+            a._accum([g[0] * b._flat[p] for p in range(k)])
+            b._accum([g[0] * a._flat[p] for p in range(k)])
+
+        out._backward_fn = backward4
+        return out
+    raise ValueError(f"ag_matmul: 只支持 1D/2D 张量，收到 {sa} 与 {sb}")
+
+
+def ag_transpose(a):
+    """矩阵转置（2D）。"""
+    a = _ag_as_tensor(a)
+    if len(a.shape) != 2:
+        raise ValueError(f"ag_transpose: 需要 2D，收到 {a.shape}")
+    m, n = a.shape
+    flat = [a._flat[i * n + j] for j in range(n) for i in range(m)]
+    out = _ag_make(flat, (n, m), (a,), "transpose", None)
+    out._backward_fn = lambda g: a._accum(
+        [g[j * m + i] for i in range(m) for j in range(n)])
+    return out
+
+
+def ag_reshape(a, shape):
+    """改变形状（元素总数不变，按行主序重排）。"""
+    a = _ag_as_tensor(a)
+    target = _ag_check_shape(shape, "ag_reshape(shape)")
+    if _ag_size(target) != len(a._flat):
+        raise ValueError(
+            f"ag_reshape: 元素数 {len(a._flat)} 与目标形状 {target} 不一致")
+    out = _ag_make(list(a._flat), target, (a,), "reshape", None)
+    out._backward_fn = lambda g: a._accum(list(g))
+    return out
+
+
+def ag_sum(a, axis=None):
+    """求和：axis=None 全和；axis=-1/1 按行；axis=0 按列（仅 2D 支持轴）。"""
+    a = _ag_as_tensor(a)
+    if axis is None:
+        total = sum(a._flat)
+        out = _ag_make([total], (), (a,), "sum", None)
+        out._backward_fn = lambda g: a._accum([g[0]] * len(a._flat))
+        return out
+    if len(a.shape) != 2:
+        raise ValueError(f"ag_sum: 指定 axis 时需要 2D，收到 {a.shape}")
+    rows, cols = a.shape
+    axis = axis if axis >= 0 else len(a.shape) + axis
+    if axis == 1:
+        flat = [sum(a._flat[i * cols:(i + 1) * cols]) for i in range(rows)]
+        out = _ag_make(flat, (rows,), (a,), "sum", None)
+        out._backward_fn = lambda g: a._accum(
+            [g[i] for i in range(rows) for _ in range(cols)])
+        return out
+    if axis == 0:
+        flat = [sum(a._flat[i * cols + j] for i in range(rows))
+                for j in range(cols)]
+        out = _ag_make(flat, (cols,), (a,), "sum", None)
+        out._backward_fn = lambda g: a._accum(
+            [g[j] for _ in range(rows) for j in range(cols)])
+        return out
+    raise ValueError(f"ag_sum: 不支持的 axis={axis}")
+
+
+def ag_mean(a):
+    """全元素均值。"""
+    a = _ag_as_tensor(a)
+    n = len(a._flat)
+    out = ag_sum(a)
+    out2 = _ag_make([out.item() / n], (), (a,), "mean", None)
+    out2._backward_fn = lambda g: a._accum([g[0] / n] * n)
+    return out2
+
+
+def _ag_unary(a, forward_fn, backward_fn, op):
+    a = _ag_as_tensor(a)
+    out = _ag_make(forward_fn(a._flat), a.shape, (a,), op, None)
+    out._backward_fn = lambda g: a._accum(backward_fn(g, a._flat, out._flat))
+    return out
+
+
+def ag_relu(a):
+    """ReLU。"""
+    return _ag_unary(a, lambda f: [max(0.0, v) for v in f],
+                     lambda g, f, o: [gi if fi > 0.0 else 0.0
+                                      for gi, fi in zip(g, f)], "relu")
+
+
+def ag_sigmoid(a):
+    """Sigmoid（数值稳定写法）。"""
+    def forward(f):
+        out = []
+        for v in f:
+            if v >= 0:
+                out.append(1.0 / (1.0 + _ag_sigmoid_exp(-v)))
+            else:
+                e = _ag_sigmoid_exp(v)
+                out.append(e / (1.0 + e))
+        return out
+    return _ag_unary(a, forward,
+                     lambda g, f, o: [gi * oi * (1.0 - oi)
+                                      for gi, oi in zip(g, o)], "sigmoid")
+
+
+def _ag_sigmoid_exp(x):
+    import math  # 局部导入避免与文件级名字冲突
+    return math.exp(x)
+
+
+def ag_tanh(a):
+    """Tanh。"""
+    import math
+    return _ag_unary(a, lambda f: [math.tanh(v) for v in f],
+                     lambda g, f, o: [gi * (1.0 - oi * oi)
+                                      for gi, oi in zip(g, o)], "tanh")
+
+
+def ag_softmax(a):
+    """按行 softmax（2D，axis=-1）。"""
+    import math
+    a = _ag_as_tensor(a)
+    if len(a.shape) != 2:
+        raise ValueError(f"ag_softmax: 需要 2D，收到 {a.shape}")
+    rows, cols = a.shape
+    out_flat = []
+    for i in range(rows):
+        row = a._flat[i * cols:(i + 1) * cols]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        total = sum(exps)
+        out_flat.extend([e / total for e in exps])
+    out = _ag_make(out_flat, a.shape, (a,), "softmax", None)
+
+    def backward(g):
+        grad = []
+        for i in range(rows):
+            p = out_flat[i * cols:(i + 1) * cols]
+            gi = g[i * cols:(i + 1) * cols]
+            dot = sum(pv * gv for pv, gv in zip(p, gi))
+            grad.extend([pv * (gv - dot) for pv, gv in zip(p, gi)])
+        a._accum(grad)
+
+    out._backward_fn = backward
+    return out
+
+
+def ag_log_softmax(a):
+    """按行 log-softmax（2D）。"""
+    import math
+    a = _ag_as_tensor(a)
+    if len(a.shape) != 2:
+        raise ValueError(f"ag_log_softmax: 需要 2D，收到 {a.shape}")
+    rows, cols = a.shape
+    out_flat = []
+    for i in range(rows):
+        row = a._flat[i * cols:(i + 1) * cols]
+        mx = max(row)
+        lse = mx + math.log(sum(math.exp(v - mx) for v in row))
+        out_flat.extend([v - lse for v in row])
+    out = _ag_make(out_flat, a.shape, (a,), "log_softmax", None)
+
+    def backward(g):
+        probs = [[math.exp(v) for v in out_flat[i * cols:(i + 1) * cols]]
+                 for i in range(rows)]
+        grad = []
+        for i in range(rows):
+            gi = g[i * cols:(i + 1) * cols]
+            total = sum(gi)
+            grad.extend([gv - pv * total for pv, gv in zip(probs[i], gi)])
+        a._accum(grad)
+
+    out._backward_fn = backward
+    return out
+
+
+def ag_layernorm(x, gamma, beta, eps=1e-5):
+    """LayerNorm：x 为 (T,D)，gamma/beta 为 (D,)。"""
+    import math
+    x = _ag_as_tensor(x)
+    gamma = _ag_as_tensor(gamma)
+    beta = _ag_as_tensor(beta)
+    if len(x.shape) != 2:
+        raise ValueError(f"ag_layernorm: x 需要 2D，收到 {x.shape}")
+    rows, cols = x.shape
+    if gamma.shape != (cols,) or beta.shape != (cols,):
+        raise ValueError(
+            f"ag_layernorm: gamma/beta 形状应为 ({cols},)，收到 {gamma.shape}/{beta.shape}")
+    if not isinstance(eps, (int, float)) or eps <= 0:
+        raise ValueError(f"ag_layernorm: eps 必须为正数，收到 {eps!r}")
+    xhat = []
+    inv_std = []
+    for i in range(rows):
+        row = x._flat[i * cols:(i + 1) * cols]
+        mean = sum(row) / cols
+        var = sum((v - mean) ** 2 for v in row) / cols
+        std = math.sqrt(var + eps)
+        inv = 1.0 / std
+        inv_std.append(inv)
+        xhat.extend([(v - mean) * inv for v in row])
+    out_flat = [gamma._flat[j] * xhat[i * cols + j] + beta._flat[j]
+                for i in range(rows) for j in range(cols)]
+    out = _ag_make(out_flat, (rows, cols), (x, gamma, beta), "layernorm", None)
+
+    def backward(g):
+        dgamma = [0.0] * cols
+        dbeta = [0.0] * cols
+        dx = [0.0] * (rows * cols)
+        for i in range(rows):
+            ghi = g[i * cols:(i + 1) * cols]
+            for j in range(cols):
+                dgamma[j] += ghi[j] * xhat[i * cols + j]
+                dbeta[j] += ghi[j]
+            inv = inv_std[i]
+            row = x._flat[i * cols:(i + 1) * cols]
+            mean = sum(row) / cols
+            dxhat = [ghi[j] * gamma._flat[j] for j in range(cols)]
+            sum_dxhat = sum(dxhat)
+            sum_dxhat_xhat = sum(dxhat[j] * xhat[i * cols + j]
+                                 for j in range(cols))
+            for j in range(cols):
+                dx[i * cols + j] = inv * (
+                    dxhat[j] - sum_dxhat / cols
+                    - xhat[i * cols + j] * sum_dxhat_xhat / cols)
+        x._accum(dx)
+        gamma._accum(dgamma)
+        beta._accum(dbeta)
+
+    out._backward_fn = backward
+    return out
+
+
+def ag_mse_loss(pred, target):
+    """均方误差（标量）。"""
+    pred = _ag_as_tensor(pred)
+    target = _ag_as_tensor(target)
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"ag_mse_loss: 形状不一致 {pred.shape} vs {target.shape}")
+    n = len(pred._flat)
+    diffs = [p - t for p, t in zip(pred._flat, target._flat)]
+    value = sum(d * d for d in diffs) / n
+    out = _ag_make([value], (), (pred,), "mse", None)
+    out._backward_fn = lambda g: pred._accum(
+        [g[0] * 2.0 * d / n for d in diffs])
+    return out
+
+
+def ag_cross_entropy(logits, labels):
+    """按行交叉熵（标量）：logits (T,C)，labels 为长度 T 的整数列表。"""
+    import math
+    logits = _ag_as_tensor(logits)
+    if len(logits.shape) != 2:
+        raise ValueError(f"ag_cross_entropy: logits 需要 2D，收到 {logits.shape}")
+    rows, cols = logits.shape
+    if not isinstance(labels, (list, tuple)) or len(labels) != rows:
+        raise ValueError(
+            f"ag_cross_entropy: labels 需要长度 {rows} 的列表，收到 {labels!r}")
+    for value in labels:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"ag_cross_entropy: labels 必须是整数，收到 {value!r}")
+        if value < 0 or value >= cols:
+            raise ValueError(f"ag_cross_entropy: 标签 {value} 越界 [0,{cols})")
+    probs = []
+    total = 0.0
+    for i in range(rows):
+        row = logits._flat[i * cols:(i + 1) * cols]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        s = sum(exps)
+        p = [e / s for e in exps]
+        probs.append(p)
+        total -= math.log(p[labels[i]] + 1e-30)
+    value = total / rows
+    out = _ag_make([value], (), (logits,), "cross_entropy", None)
+
+    def backward(g):
+        grad = []
+        for i in range(rows):
+            for j in range(cols):
+                d = probs[i][j] - (1.0 if j == labels[i] else 0.0)
+                grad.append(g[0] * d / rows)
+        logits._accum(grad)
+
+    out._backward_fn = backward
+    return out
+
+
+def ag_zeros(shape, requires_grad=False):
+    """创建全 0 张量。"""
+    shape = _ag_check_shape(shape, "ag_zeros(shape)")
+    return Tensor(_ag_build([0.0] * max(1, _ag_size(shape)), shape),
+                  requires_grad=requires_grad)
+
+
+def ag_sgd(params, lr):
+    """对参数列表做原地 SGD 更新（params 为 Tensor 列表）。"""
+    if not isinstance(params, (list, tuple)) or not params:
+        raise ValueError("ag_sgd: params 必须是非空列表")
+    _ag_check_number(lr, "ag_sgd(lr)")
+    if lr <= 0:
+        raise ValueError(f"ag_sgd: lr 必须为正数，收到 {lr!r}")
+    for param in params:
+        if not isinstance(param, Tensor):
+            raise TypeError("ag_sgd: params 里必须都是 Tensor")
+        if param._gflat is None:
+            continue
+        if len(param._gflat) != len(param._flat):
+            raise ValueError("ag_sgd: 梯度与参数元素数不一致")
+        for i in range(len(param._flat)):
+            param._flat[i] -= lr * param._gflat[i]
+        param.data = _ag_build(param._flat, param.shape)
+
+
+def ag_zero_grads(params):
+    """清空参数列表的梯度。"""
+    for param in params:
+        if isinstance(param, Tensor):
+            param.zero_grad()
+
+
+def _ag_set_flat(tensor, index, value):
+    tensor._flat[index] = float(value)
+    tensor.data = _ag_build(tensor._flat, tensor.shape)
+
+
+def ag_grad_check(fn, params, eps=1e-5, verbose=False):
+    """数值梯度对拍：fn() 返回标量 Tensor，params 为参与求导的 Tensor 列表。
+
+    返回最大相对误差；同时把解析梯度留在各参数 grad 中（便于调试）。
+    """
+    if not isinstance(eps, (int, float)) or eps <= 0:
+        raise ValueError(f"ag_grad_check: eps 必须为正数，收到 {eps!r}")
+    if not isinstance(params, (list, tuple)) or not params:
+        raise ValueError("ag_grad_check: params 必须是非空列表")
+    ag_zero_grads(params)
+    loss = fn()
+    if not isinstance(loss, Tensor) or loss.shape:
+        raise TypeError("ag_grad_check: fn() 必须返回标量 Tensor")
+    loss.backward()
+    max_rel = 0.0
+    for param in params:
+        if param._gflat is None:
+            raise ValueError("ag_grad_check: 参数没有梯度（未参与计算图）")
+        analytic = list(param._gflat)
+        data_copy = list(param._flat)
+        for i in range(len(param._flat)):
+            original = data_copy[i]
+            _ag_set_flat(param, i, original + eps)
+            lp = fn().item()
+            _ag_set_flat(param, i, original - eps)
+            lm = fn().item()
+            _ag_set_flat(param, i, original)
+            numeric = (lp - lm) / (2.0 * eps)
+            denom = max(abs(analytic[i]), abs(numeric), 1e-8)
+            rel = abs(analytic[i] - numeric) / denom
+            if rel > max_rel:
+                max_rel = rel
+                if verbose:
+                    print(f"  worst: param {id(param) % 10000} idx {i} "
+                          f"ana={analytic[i]:.8g} num={numeric:.8g} rel={rel:.2e}")
+    return max_rel
 
 class MLP:
     """多层感知机（PyTorch 风格）"""

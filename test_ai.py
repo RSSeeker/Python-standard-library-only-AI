@@ -50334,3 +50334,171 @@ class TestCoconutReasoning:
         assert _cnt_raises(lambda: AI.coconut_latent_reasoning_backward(cache, []))
         assert _cnt_raises(lambda: blk.sgd_step(0.0))
         assert _cnt_raises(lambda: blk.forward([[0.1, 0.2]]))
+
+
+def _ag_t_check(cond, msg):
+    assert cond, msg
+
+
+def _ag_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestAutograd:
+    def test_broadcast_ops(self):
+        x = AI.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        y = AI.Tensor([10.0, 20.0], requires_grad=True)
+        z = AI.ag_add(x, y)
+        _ag_t_check(z.shape == (2, 2), f"shape {z.shape}")
+        _ag_t_check(z.tolist() == [[11.0, 22.0], [13.0, 24.0]], "add value")
+        rel = AI.ag_grad_check(
+            lambda: AI.ag_sum(AI.ag_mul(AI.ag_add(x, y), x)), [x, y])
+        _ag_t_check(rel < 1e-5, f"broadcast FD rel={rel}")
+        # 广播乘法：列向量与行向量
+        col = AI.Tensor([[1.0], [2.0]], requires_grad=True)
+        row = AI.Tensor([[10.0, 20.0, 30.0]], requires_grad=True)
+        outer = AI.ag_mul(col, row)
+        _ag_t_check(outer.shape == (2, 3), "outer shape")
+        _ag_t_check(outer.tolist() == [[10.0, 20.0, 30.0], [20.0, 40.0, 60.0]],
+                    "outer value")
+
+    def test_matmul_variants(self):
+        a = AI.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        b = AI.Tensor([[0.5, -1.0], [2.0, 0.25]], requires_grad=True)
+        m = AI.ag_matmul(a, b)
+        _ag_t_check(m.shape == (2, 2), "2d@2d shape")
+        _ag_t_check(m.tolist() == [[4.5, -0.5], [9.5, -2.0]], "2d@2d value")
+        rel = AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(a, b)), [a, b])
+        _ag_t_check(rel < 1e-5, f"2d@2d FD rel={rel}")
+        v = AI.Tensor([1.0, -2.0], requires_grad=True)
+        mv = AI.ag_matmul(a, v)
+        _ag_t_check(mv.shape == (2,), f"mv shape {mv.shape}")
+        rel = AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(a, v)), [a, v])
+        _ag_t_check(rel < 1e-5, f"mv FD rel={rel}")
+        vm = AI.ag_matmul(v, a)
+        _ag_t_check(vm.shape == (2,), "vm shape")
+        rel = AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(v, a)), [v, a])
+        _ag_t_check(rel < 1e-5, f"vm FD rel={rel}")
+        dot = AI.ag_matmul(v, v)
+        _ag_t_check(dot.shape == () and abs(dot.item() - 5.0) < 1e-12, "dot")
+
+    def test_softmax_and_cross_entropy(self):
+        logits = AI.Tensor([[0.2, -0.1, 0.7], [1.0, 0.0, -1.0]],
+                           requires_grad=True)
+        probs = AI.ag_softmax(logits)
+        for row in probs.tolist():
+            _ag_t_check(abs(sum(row) - 1.0) < 1e-12, "softmax 行和")
+        rel = AI.ag_grad_check(lambda: AI.ag_cross_entropy(logits, [2, 0]),
+                               [logits])
+        _ag_t_check(rel < 1e-5, f"ce FD rel={rel}")
+        logp = AI.ag_log_softmax(logits)
+        _ag_t_check(logp.shape == (2, 3), "log_softmax shape")
+        import math as _math
+        for i in range(2):
+            for j in range(3):
+                _ag_t_check(
+                    abs(logp.tolist()[i][j] - _math.log(probs.tolist()[i][j])) < 1e-12,
+                    "log_softmax 与 softmax→log 一致")
+        w = AI.Tensor([[0.3, -0.2, 0.5], [0.1, 0.7, -0.4]])
+        rel = AI.ag_grad_check(
+            lambda: AI.ag_sum(AI.ag_mul(AI.ag_log_softmax(logits), w)),
+            [logits])
+        _ag_t_check(rel < 1e-5, f"log_softmax FD rel={rel}")
+
+    def test_layernorm_grad(self):
+        x = AI.Tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]], requires_grad=True)
+        gamma = AI.Tensor([1.0, 0.5, -0.5], requires_grad=True)
+        beta = AI.Tensor([0.1, -0.2, 0.3], requires_grad=True)
+        out = AI.ag_layernorm(x, gamma, beta)
+        _ag_t_check(out.shape == (2, 3), "layernorm shape")
+        import math as _math
+        for i in range(2):
+            row = x.tolist()[i]
+            mean = sum(row) / 3.0
+            var = sum((v - mean) ** 2 for v in row) / 3.0
+            std = _math.sqrt(var + 1e-5)
+            for j in range(3):
+                expected = (gamma.tolist()[j] * (row[j] - mean) / std
+                            + beta.tolist()[j])
+                _ag_t_check(abs(out.tolist()[i][j] - expected) < 1e-12,
+                            "layernorm 数值")
+        rel = AI.ag_grad_check(
+            lambda: AI.ag_sum(AI.ag_layernorm(x, gamma, beta)),
+            [x, gamma, beta])
+        _ag_t_check(rel < 1e-5, f"layernorm FD rel={rel}")
+
+    def test_shared_graph_and_training(self):
+        w = AI.Tensor([[0.3, -0.4], [0.2, 0.1]], requires_grad=True)
+        x = AI.Tensor([[1.0, 2.0], [-1.0, 0.5]])
+        rel = AI.ag_grad_check(
+            lambda: AI.ag_sum(AI.ag_mul(AI.ag_matmul(x, w), AI.ag_matmul(x, w))),
+            [w])
+        _ag_t_check(rel < 1e-5, f"shared FD rel={rel}")
+        # 小 MLP 训练收敛
+        import random
+        rng = random.Random(7)
+        W1 = AI.Tensor([[rng.uniform(-0.5, 0.5) for _ in range(4)]
+                        for _ in range(2)], requires_grad=True)
+        b1 = AI.Tensor([0.0] * 4, requires_grad=True)
+        W2 = AI.Tensor([[rng.uniform(-0.5, 0.5) for _ in range(4)]],
+                       requires_grad=True)
+        b2 = AI.Tensor([0.0], requires_grad=True)
+        params = [W1, b1, W2, b2]
+        xs = AI.Tensor([[1.0, 2.0], [2.0, -1.0], [-1.0, -2.0], [0.5, 0.5]])
+        ys = AI.Tensor([[1.0], [-1.0], [-1.0], [1.0]])
+
+        def loss_fn():
+            h = AI.ag_relu(AI.ag_add(AI.ag_matmul(xs, W1), b1))
+            out = AI.ag_add(AI.ag_matmul(h, AI.ag_transpose(W2)), b2)
+            return AI.ag_mse_loss(out, ys)
+
+        losses = []
+        for _ in range(60):
+            AI.ag_zero_grads(params)
+            loss = loss_fn()
+            losses.append(loss.item())
+            loss.backward()
+            AI.ag_sgd(params, 0.05)
+        _ag_t_check(losses[-1] < losses[0] * 0.2,
+                    f"train {losses[0]:.4f}->{losses[-1]:.4f}")
+
+    def test_invalid_inputs(self):
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_add(AI.Tensor([1.0, 2.0]), AI.Tensor([1.0, 2.0, 3.0]))),
+            "broadcast mismatch")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_matmul(AI.Tensor([[1.0, 2.0]]), AI.Tensor([[1.0, 2.0]]))),
+            "matmul mismatch")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_cross_entropy(AI.Tensor([[1.0, 2.0]]), [5])),
+            "label 越界")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_cross_entropy(AI.Tensor([[1.0, 2.0]]), [0, 1])),
+            "label 长度")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_layernorm(AI.Tensor([[1.0, 2.0]]), AI.Tensor([1.0]),
+                                    AI.Tensor([0.0]))), "gamma 形状")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_mse_loss(AI.Tensor([1.0]), AI.Tensor([1.0, 2.0]))),
+            "mse 形状")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_softmax(AI.Tensor([1.0, 2.0]))), "softmax 1D")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_reshape(AI.Tensor([1.0, 2.0]), (3,))), "reshape 元素数")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_grad_check(lambda: AI.ag_sum(AI.Tensor([1.0])), [],
+                                     eps=0.0)), "grad_check eps")
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_sgd([AI.Tensor([1.0])], -0.1)), "sgd lr")
+        # 反向的 grad 形状校验
+        t = AI.Tensor([1.0, 2.0], requires_grad=True)
+        _ag_t_check(_ag_t_raises(lambda: AI.ag_mul(t, t).backward([1.0])),
+                    "backward 梯度形状")
+        param = AI.Tensor([1.0], requires_grad=True)
+        _ag_t_check(_ag_t_raises(
+            lambda: AI.ag_grad_check(lambda: AI.ag_sum(AI.Tensor([2.0])), [param])),
+            "参数未参与计算图")

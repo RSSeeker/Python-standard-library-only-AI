@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3114 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3120 项）
 
 ## 特性
 
@@ -139,6 +139,36 @@ model.fit(x_train, y_train, val_data=[([0.15, 0.25], [0.4]), ([0.35, 0.45], [0.8
 > 说明：恰好 2 个元素且结构上无法区分时，`list` 按「样本对」解释、`tuple` 按「并行数组」解释；拿不准就用 dict 写法。
 
 ## 底层组件
+
+### 微型 autograd 引擎（Tensor / 计算图 / grad_check）
+
+`AI.Tensor` 用嵌套 list 存数据并维护计算图；运算函数只写前向，反向由各节点的
+闭包自动回传。适合给新模块做「只写 forward」的原型验证，也能用
+`ag_grad_check` 与数值梯度对拍。
+
+```python
+w = AI.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+x = AI.Tensor([1.0, -1.0])
+loss = AI.ag_mse_loss(AI.ag_matmul(w, x), [1.0, 1.0])
+loss.backward()
+print(w.grad)          # [[-2.0, 2.0], [-2.0, 2.0]]
+print(AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(w, x)), [w]))
+```
+
+| API | 说明 |
+| --- | --- |
+| `Tensor(data, requires_grad=False)` | 嵌套 list → 带 shape/grad 的叶子或中间张量；支持 `+ - * / @` 与 `.backward()` |
+| `ag_add / ag_sub / ag_mul / ag_div` | 逐元素运算，NumPy 广播规则；反向自动归约回原形状 |
+| `ag_matmul(a, b)` | 2D@2D、2D@1D、1D@2D、1D@1D |
+| `ag_transpose / ag_reshape / ag_sum / ag_mean` | 形状与归约操作 |
+| `ag_relu / ag_sigmoid / ag_tanh / ag_softmax / ag_log_softmax` | 激活与逐行归一化 |
+| `ag_layernorm(x, gamma, beta, eps)` | 对 (T,D) 输入做 LayerNorm |
+| `ag_mse_loss / ag_cross_entropy` | 标量损失，反向自动出输入梯度 |
+| `ag_sgd(params, lr) / ag_zero_grads(params)` | 参数列表的原地更新 / 清零 |
+| `ag_grad_check(fn, params, eps=1e-5)` | 数值梯度对拍，返回最大相对误差 |
+
+边界：只支持标量/向量/矩阵与广播，无 stride 视图共享、无高阶自动微分、无卷积
+层；`Tensor` 与既有嵌套 list 的 `Layer`/`MLP` 体系并存，互不影响。
 
 ### 层 (Layers)
 
@@ -5654,12 +5684,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3062 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3068 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3114 项）。
+`tests/`（合计 3120 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5667,7 +5697,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3114 项
+pytest -q                        # test_ai.py + tests/ 合计 3120 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7494,7 +7524,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3114 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3120 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7927,6 +7957,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestStructuredPruning` | 通道分数、掩码式通道剪枝、头分数与剪枝、删层重建、稀疏度统计（8 例） |
 | `TestQuantization` | 伪量化格点与截断、PTQ 的 int 编码、量化误差上界、QAT 直通梯度、SmoothQuant 缩放（10 例） |
 | `TestQATAndGradAccumulator` | QAT 损失/梯度与量化点精确反向一致、`fit_qat` 收敛、`QATTrainer` 封装、梯度累积与平均梯度单步等价、`flush` 尾窗、非法输入 |
+| `TestAutograd` | 广播运算梯度、四种 matmul 变体、softmax/log_softmax 与交叉熵、LayerNorm 三参数梯度、共享子图、小 MLP 训练收敛、非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |
