@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3059 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3064 项）
 
 ## 特性
 
@@ -2414,6 +2414,34 @@ history = AI.rlaif_align(model, AI._unl_clone_lm(model), prompts, judge_fn,
 边界：`rlvr` 只接受数值或布尔奖励（其它类型报错）；`rlaif_align` 与
 `iterative_dpo` 一样，温度过低时同 prompt 的样本可能全同（该 prompt 被跳过）；
 `judge_fn` 是外部打分器，本库不内置判官模型，仅提供接口与校验。
+
+### 策略梯度进阶（REINFORCE++ / VinePPO）
+
+```python
+model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16, num_layers=1, max_len=12)
+model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=40, lr=0.02)
+prompts = [[1, 2, 3], [6, 7, 8]]
+verify_fn = lambda prompt, response: response[0] == (prompt[-1] + 1) % 10
+
+# REINFORCE++：组内归一化优势 + 整序列策略梯度
+res = AI.reinforce_plus_plus(model, prompts, verify_fn, num_samples=4,
+                             epochs=2, lr=0.05, max_new_tokens=2,
+                             temperature=1.5, seed=1)
+
+# VinePPO：前缀价值用多次续写估计，逐 token 做策略梯度
+res2 = AI.vine_ppo(model, prompts, lambda p, r: float(r[0]),
+                   num_samples=1, vine_samples=2, epochs=1, lr=0.05,
+                   max_new_tokens=2, temperature=5.0, seed=2)
+```
+
+| API | 说明 |
+| --- | --- |
+| `reinforce_plus_plus(policy, prompts, reward_fn, num_samples=4, epochs=1, lr=None, max_new_tokens=4, temperature=1.0, gamma=1.0, whiten=True, seed=None)` | 每条 prompt 采多条回答、组内减均值（`whiten` 再除标准差）作优势，逐序列做 `-A·logp` 更新；返回每轮 `loss`/`mean_reward` |
+| `vine_ppo(policy, prompts, reward_fn, num_samples=2, vine_samples=2, clip_ratio=0.2, epochs=1, lr=None, max_new_tokens=2, temperature=1.0, gamma=1.0, seed=None)` | 对轨迹每个前缀再从该前缀采样 `vine_samples` 条续写估计价值，优势 = 总回报 - 该前缀价值，逐 token 做策略梯度；`clip_ratio` 仅为接口占位 |
+
+边界：`reinforce_plus_plus` 用整条序列的平均 logp，不做逐 token 信用分配；
+`vine_ppo` 的前缀价值是蒙特卡洛估计（方差较大），且单步 on-policy 更新时
+`clip_ratio` 不生效；两者都要求 `reward_fn` 返回有限数值或布尔。
 
 ### 机器遗忘（unlearning）
 
@@ -5388,12 +5416,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3007 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3012 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3059 项）。
+`tests/`（合计 3064 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5401,7 +5429,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3059 项
+pytest -q                        # test_ai.py + tests/ 合计 3064 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7191,7 +7219,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3059 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3064 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7514,6 +7542,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestUnlearning` | 遗忘集/保留集 CE 与困惑度、梯度上升抬高遗忘 CE 并保住保留集、负偏好降低 harmful 序列 logp、模型克隆前向一致、九类非法输入 |
 | `TestSpinAndIterativeDPO` | SPIN loss 两偏导有限差分、margin 单调性、spin_align 提升 human logp 且 loss 下降、iterative_dpo 两轮各 2 对并更新权重、改 reference 改变 loss、十类非法输入 |
 | `TestRLAIFAndRLVR` | rlvr 历史/权重更新与奖励类型校验、rlaif 采样打分配对与全平局跳过、十类非法输入 |
+| `TestReinforceAndVine` | reinforce_plus_plus 历史字段与权重更新、bool 奖励可用且 NaN/字符串奖励报错、vine_ppo 历史/更新与 clip_ratio 占位、12 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |

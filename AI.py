@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1938 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1946 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -15844,6 +15844,210 @@ def rlaif_align(policy, reference, prompts, judge_fn, num_samples=4,
             "max_score": max(scores_all) if scores_all else 0.0,
         })
     return {"iterations": history, "total_pairs": total, "beta": beta}
+
+# ---- B9：REINFORCE++ / VinePPO 教学实现 ----
+
+
+def _b9_check_policy(policy, name):
+    """校验传入的是 CausalLM 风格策略（可生成、可反传、可优化）。"""
+    need = ("generate", "zero_grad", "adam_step")
+    missing = [a for a in need if not hasattr(policy, a)]
+    if missing:
+        raise TypeError(f"{name}: 需要 CausalLM 风格模型（缺少 {missing}），"
+                        f"收到 {type(policy).__name__}")
+
+
+def _b9_check_prompts(policy, prompts, who):
+    """校验 prompt 列表，返回 list[list[int]]（每个 prompt 非空）。"""
+    if not isinstance(prompts, (list, tuple)) or not prompts:
+        raise ValueError(f"{who}: prompts 必须是非空列表")
+    out = []
+    for i, p in enumerate(prompts):
+        tokens = _check_token_ids(p, policy.vocab_size, f"{who}.prompts[{i}]")
+        if not tokens:
+            raise ValueError(f"{who}: prompt 不能为空")
+        out.append(tokens)
+    return out
+
+
+def _b9_check_fn(fn, name):
+    if not callable(fn):
+        raise TypeError(f"{name}: 必须是可调用对象，收到 {type(fn).__name__}")
+
+
+def _b9_check_reward(value, name):
+    """校验奖励值：bool 转 1.0/0.0，其它必须是有限数字。"""
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name}: 必须返回数字或布尔值，收到 {type(value).__name__}")
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f"{name}: 奖励必须是有限数字，收到 {value!r}")
+    return v
+
+
+def _b9_check_lr(lr):
+    """校验学习率为正有限数字。"""
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise ValueError(f"lr 必须是数字，收到 {lr!r}")
+    v = float(lr)
+    if not math.isfinite(v) or v <= 0.0:
+        raise ValueError(f"lr 必须是正有限数，收到 {lr!r}")
+    return v
+
+
+def _b9_sample_one(policy, prompt, max_new_tokens, temperature, rng):
+    seq = policy.generate(list(prompt), max_new_tokens=max_new_tokens,
+                          temperature=temperature, rng=rng)
+    response = list(seq[len(prompt):])
+    return response
+
+
+def reinforce_plus_plus(policy, prompts, reward_fn, num_samples: int = 4,
+                        epochs: int = 1, lr: float = None,
+                        max_new_tokens: int = 4, temperature: float = 1.0,
+                        gamma: float = 1.0, whiten: bool = True,
+                        seed=None):
+    """REINFORCE++：整段回报 + 组内标准化基线，做序列级策略梯度。
+
+    对每个 prompt 采样 ``num_samples`` 条完整回答，用 ``reward_fn(prompt,
+    response)`` 打分，组内减均值（``whiten=True`` 时再除标准差）作为优势，
+    目标为 ``-mean(adv * logp(response|prompt))``；``gamma`` 当前只用于折扣
+    回报的写法保留（单步奖励下等价于 1）。
+    """
+    _b9_check_policy(policy, "reinforce_plus_plus(policy)")
+    prompts = _b9_check_prompts(policy, prompts, "reinforce_plus_plus")
+    _b9_check_fn(reward_fn, "reinforce_plus_plus(reward_fn)")
+    if isinstance(num_samples, bool) or not isinstance(num_samples, int) \
+            or num_samples < 2:
+        raise ValueError(f"reinforce_plus_plus: num_samples 必须是 >=2 的整数，"
+                         f"收到 {num_samples!r}")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError(f"reinforce_plus_plus: epochs 必须是正整数，收到 {epochs!r}")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 1:
+        raise ValueError("reinforce_plus_plus: max_new_tokens 必须是正整数")
+    if not math.isfinite(float(temperature)) or temperature <= 0.0:
+        raise ValueError("reinforce_plus_plus: temperature 必须是正数")
+    if not math.isfinite(float(gamma)) or not 0.0 < gamma <= 1.0:
+        raise ValueError("reinforce_plus_plus: gamma 必须在 (0,1]")
+    if not isinstance(whiten, bool):
+        raise TypeError("reinforce_plus_plus: whiten 必须是 bool")
+    rng = random.Random(seed)
+    lr = 0.01 if lr is None else _b9_check_lr(lr)
+
+    history = []
+    for _ in range(epochs):
+        losses = []
+        rewards = []
+        for prompt in prompts:
+            batch = []
+            for _ in range(num_samples):
+                response = _b9_sample_one(policy, prompt, max_new_tokens,
+                                          temperature, rng)
+                if not response:
+                    continue
+                r = _b9_check_reward(reward_fn(prompt, response),
+                                     "reinforce_plus_plus(reward_fn)")
+                batch.append((r, response))
+            if len(batch) < 2:
+                continue
+            rs = [r for r, _ in batch]
+            base = sum(rs) / len(rs)
+            advs = [r - base for r in rs]
+            if whiten:
+                var = sum(a * a for a in advs) / len(advs)
+                std = math.sqrt(var)
+                if std > 1e-12:
+                    advs = [a / std for a in advs]
+            policy.zero_grad()
+            scale = 1.0 / (len(batch) * len(prompts))
+            for (_, response), adv in zip(batch, advs):
+                _rlhf_seq_logprob(policy, prompt, response,
+                                  grad_scale=-adv * scale)
+            policy.adam_step(lr)
+            losses.append(-sum(advs) / len(advs))
+            rewards.extend(rs)
+        if losses:
+            history.append({"loss": sum(losses) / len(losses),
+                            "mean_reward": sum(rewards) / len(rewards)})
+    return {"history": history, "epochs": epochs, "prompts": len(prompts)}
+
+
+def vine_ppo(policy, prompts, reward_fn, num_samples: int = 2,
+             vine_samples: int = 2, clip_ratio: float = 0.2,
+             epochs: int = 1, lr: float = None, max_new_tokens: int = 2,
+             temperature: float = 1.0, gamma: float = 1.0, seed=None):
+    """VinePPO（教学简化）：用中间状态多次采样估计价值，逐 token 做策略梯度。
+
+    对每条采样轨迹的每个前缀 ``s_t``，从该前缀再采样 ``vine_samples`` 条续写，
+    用平均奖励作为 ``V(s_t)`` 的蒙特卡洛估计；优势 ``A_t = return - V(s_t)``，
+    目标 ``-sum_t A_t * logp(token_t | prefix)``。``clip_ratio`` 参数保留为
+    接口占位（单步 on-policy 更新时 ratio 恒为 1，不产生裁剪）。
+    """
+    _b9_check_policy(policy, "vine_ppo(policy)")
+    prompts = _b9_check_prompts(policy, prompts, "vine_ppo")
+    _b9_check_fn(reward_fn, "vine_ppo(reward_fn)")
+    for name, value in (("num_samples", num_samples),
+                        ("vine_samples", vine_samples)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"vine_ppo: {name} 必须是正整数，收到 {value!r}")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError(f"vine_ppo: epochs 必须是正整数，收到 {epochs!r}")
+    if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) \
+            or max_new_tokens < 1:
+        raise ValueError("vine_ppo: max_new_tokens 必须是正整数")
+    if not math.isfinite(float(temperature)) or temperature <= 0.0:
+        raise ValueError("vine_ppo: temperature 必须是正数")
+    if not math.isfinite(float(clip_ratio)) or not 0.0 <= clip_ratio <= 1.0:
+        raise ValueError("vine_ppo: clip_ratio 必须在 [0,1]")
+    if not math.isfinite(float(gamma)) or not 0.0 < gamma <= 1.0:
+        raise ValueError("vine_ppo: gamma 必须在 (0,1]")
+    rng = random.Random(seed)
+    lr = 0.01 if lr is None else _b9_check_lr(lr)
+
+    history = []
+    for _ in range(epochs):
+        losses = []
+        rewards = []
+        for prompt in prompts:
+            for _ in range(num_samples):
+                response = _b9_sample_one(policy, prompt, max_new_tokens,
+                                          temperature, rng)
+                if not response:
+                    continue
+                r_total = _b9_check_reward(reward_fn(prompt, response),
+                                           "vine_ppo(reward_fn)")
+                rewards.append(r_total)
+                tokens_total = 0
+                policy.zero_grad()
+                for t in range(len(response)):
+                    prefix = list(prompt) + response[:t]
+                    remaining = max_new_tokens - t
+                    if remaining > 0:
+                        vals = []
+                        for _v in range(vine_samples):
+                            cont = _b9_sample_one(policy, prefix, remaining,
+                                                  temperature, rng)
+                            vals.append(_b9_check_reward(
+                                reward_fn(prompt, response[:t] + cont),
+                                "vine_ppo(reward_fn)"))
+                        value = sum(vals) / len(vals)
+                    else:
+                        value = 0.0
+                    adv = r_total - value
+                    _rlhf_seq_logprob(policy, prefix, [response[t]],
+                                      grad_scale=-adv)
+                    tokens_total += 1
+                if tokens_total:
+                    policy.adam_step(lr)
+                    losses.append(-r_total)
+        if losses:
+            history.append({"loss": sum(losses) / len(losses),
+                            "mean_reward": sum(rewards) / len(rewards)})
+    return {"history": history, "epochs": epochs, "prompts": len(prompts)}
+
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环

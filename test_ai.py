@@ -48960,3 +48960,101 @@ class TestRLAIFAndRLVR:
             lambda: AI.rlaif_align(m, ref, [[1]], judge, temperature=0),
         ]
         assert all(_b8_t_raises(c) for c in cases)
+
+
+def _b9_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _b9_t_model(seed=1):
+    random.seed(seed)
+    model = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                        num_layers=1, max_len=12)
+    model.fit([[1, 2, 3, 4, 5], [6, 7, 8, 9, 1]], epochs=30, lr=0.02)
+    return model
+
+
+class TestReinforceAndVine:
+    def test_reinforce_plus_plus_history(self):
+        model = _b9_t_model(1)
+        verify_fn = lambda prompt, response: response[0] == (prompt[-1] + 1) % 10
+        before = model.encoder.layers[0].self_attn.W_q[0][0]
+        result = AI.reinforce_plus_plus(
+            model, [[1, 2, 3], [6, 7, 8]], verify_fn, num_samples=4,
+            epochs=2, lr=0.05, max_new_tokens=2, temperature=1.5, seed=1)
+        assert set(result) == {"history", "epochs", "prompts"}
+        assert len(result["history"]) == 2
+        assert result["epochs"] == 2 and result["prompts"] == 2
+        for h in result["history"]:
+            assert set(h) == {"loss", "mean_reward"}
+            assert math.isfinite(h["loss"]) and math.isfinite(h["mean_reward"])
+        after = model.encoder.layers[0].self_attn.W_q[0][0]
+        assert abs(after - before) > 1e-9
+
+    def test_reinforce_plus_plus_reward_validation(self):
+        model = _b9_t_model(2)
+        bool_reward = lambda prompt, response: response[0] % 2 == 0
+        result = AI.reinforce_plus_plus(model, [[1, 2, 3]], bool_reward,
+                                        num_samples=3, epochs=1, lr=0.02,
+                                        max_new_tokens=2, temperature=1.5,
+                                        seed=2)
+        assert len(result["history"]) == 1
+        assert _b9_t_raises(lambda: AI.reinforce_plus_plus(
+            model, [[1, 2, 3]], lambda p, r: float("nan"),
+            num_samples=3, epochs=1, max_new_tokens=1))
+        assert _b9_t_raises(lambda: AI.reinforce_plus_plus(
+            model, [[1, 2, 3]], lambda p, r: "bad",
+            num_samples=3, epochs=1, max_new_tokens=1))
+
+    def test_vine_ppo_history(self):
+        model = _b9_t_model(3)
+        model = AI._unl_clone_lm(model)
+        before = model.encoder.layers[0].self_attn.W_q[0][0]
+        result = AI.vine_ppo(model, [[1, 2, 3]], lambda p, r: float(r[0]),
+                             num_samples=1, vine_samples=2, epochs=1,
+                             lr=0.05, max_new_tokens=2, temperature=5.0,
+                             seed=3)
+        assert set(result) == {"history", "epochs", "prompts"}
+        assert len(result["history"]) == 1
+        for h in result["history"]:
+            assert set(h) == {"loss", "mean_reward"}
+            assert math.isfinite(h["loss"]) and math.isfinite(h["mean_reward"])
+        after = model.encoder.layers[0].self_attn.W_q[0][0]
+        assert abs(after - before) > 1e-9
+
+    def test_vine_ppo_clip_ratio_placeholder(self):
+        model = _b9_t_model(4)
+        result = AI.vine_ppo(model, [[1, 2, 3]], lambda p, r: 1.0,
+                             num_samples=1, vine_samples=1, epochs=1,
+                             lr=0.02, max_new_tokens=1, clip_ratio=0.5,
+                             temperature=1.0, seed=4)
+        assert len(result["history"]) == 1
+        assert _b9_t_raises(lambda: AI.vine_ppo(
+            model, [[1, 2, 3]], lambda p, r: 1.0, clip_ratio=2.0))
+
+    def test_invalid_inputs(self):
+        model = _b9_t_model(5)
+        reward = lambda p, r: 1.0
+        cases = [
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward,
+                                           num_samples=1),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward, epochs=0),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward,
+                                           temperature=0.0),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward,
+                                           gamma=1.5),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward,
+                                           whiten="yes"),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], None),
+            lambda: AI.reinforce_plus_plus(model, [], reward),
+            lambda: AI.reinforce_plus_plus(model, [[1, 2, 3]], reward, lr=-1.0),
+            lambda: AI.vine_ppo(model, [[1, 2, 3]], reward, num_samples=0),
+            lambda: AI.vine_ppo(model, [[1, 2, 3]], reward, vine_samples=0),
+            lambda: AI.vine_ppo(model, [[1, 2, 3]], reward, max_new_tokens=0),
+            lambda: AI.vine_ppo(model, [[1, 2, 3]], reward, clip_ratio=2.0),
+        ]
+        assert all(_b9_t_raises(c) for c in cases)
