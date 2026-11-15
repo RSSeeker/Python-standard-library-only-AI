@@ -49942,3 +49942,91 @@ class TestGenerationExtras:
         assert _gen_raises(lambda: AI.detect_degeneration([1, -1]))
         assert _gen_raises(lambda: AI.detect_degeneration([1, 2], max_run=0))
         assert _gen_raises(lambda: AI.detect_degeneration([1, 2], ngram_size=1))
+
+
+import random
+
+import AI
+
+
+class _SvcFixedRng:
+    def __init__(self, value):
+        self.value = value
+
+    def random(self):
+        return self.value
+
+
+def _svc_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestServingOrchestration:
+    def test_token_bucket(self):
+        lim = AI.TokenBucketRateLimiter(rate=2.0, burst=3)
+        assert [lim.allow(1, now=0.0) for _ in range(3)] == [True, True, True]
+        assert lim.allow(1, now=0.0) is False
+        assert lim.allow(1, now=0.5) is True
+        lim2 = AI.TokenBucketRateLimiter(rate=1.0, burst=1)
+        lim2.allow(1, now=0.0)
+        assert abs(lim2.wait_time(1, now=0.0) - 1.0) < 1e-12
+        assert _svc_raises(lambda: AI.TokenBucketRateLimiter(rate=0.0))
+        assert _svc_raises(lambda: AI.TokenBucketRateLimiter(burst=0))
+        assert _svc_raises(lambda: lim.allow(0))
+        assert _svc_raises(lambda: lim.allow(1, now=-1.0))
+
+    def test_dynamic_batch_scheduler(self):
+        sch = AI.DynamicBatchScheduler(max_batch_size=2, max_delay=0.1)
+        sch.push("a", now=0.0)
+        sch.push("b", now=0.02)
+        sch.push("c", now=0.3)
+        batches, remain = sch.drain(now=0.3)
+        assert batches == [["a", "b"]]
+        assert remain == ["c"]
+        assert len(sch.queue) == 1
+        sch2 = AI.DynamicBatchScheduler(max_batch_size=8, max_delay=0.1)
+        sch2.push("x", now=0.0)
+        assert sch2.drain(now=0.05) == ([], ["x"])
+        assert _svc_raises(lambda: AI.DynamicBatchScheduler(max_batch_size=0))
+        s3 = AI.DynamicBatchScheduler()
+        s3.push(1, now=0.0)
+        assert _svc_raises(lambda: s3.drain(now=-1.0))
+
+    def test_canary_route(self):
+        assert AI.canary_route([1.0, 3.0], rng=_SvcFixedRng(0.0)) == 0
+        assert AI.canary_route([1.0, 3.0], rng=_SvcFixedRng(0.99)) == 1
+        seq1 = [AI.canary_route([1, 1, 1], rng=random.Random(5)) for _ in range(6)]
+        seq2 = [AI.canary_route([1, 1, 1], rng=random.Random(5)) for _ in range(6)]
+        assert seq1 == seq2
+        assert _svc_raises(lambda: AI.canary_route([]))
+        assert _svc_raises(lambda: AI.canary_route([0.0, 0.0]))
+
+    def test_circuit_breaker(self):
+        cb = AI.CircuitBreaker(failure_threshold=2, recovery_timeout=1.0,
+                               half_open_max=1)
+        assert cb.state == "closed" and cb.allow(0.0) is True
+        cb.record_failure(0.1)
+        cb.record_failure(0.2)
+        assert cb.state == "open" and cb.allow(0.5) is False
+        assert cb.allow(1.3) is True and cb.state == "half_open"
+        assert cb.allow(1.3) is False
+        cb.record_success(1.4)
+        assert cb.state == "closed" and cb.failures == 0
+        assert _svc_raises(lambda: AI.CircuitBreaker(failure_threshold=0))
+
+    def test_autoscale_and_invalid(self):
+        assert AI.autoscale_plan(2, 5, 2.0, 1.0) == 4
+        assert AI.autoscale_plan(4, 0, 0.2, 1.0) == 2
+        assert AI.autoscale_plan(4, 3, 0.8, 1.0) == 4
+        assert AI.autoscale_plan(1, 0, 0.1, 1.0) == 1
+        assert AI.autoscale_plan(16, 9, 5.0, 1.0) == 16
+        assert _svc_raises(lambda: AI.autoscale_plan(2, 5, -1.0, 1.0))
+        assert _svc_raises(lambda: AI.autoscale_plan(2, 5, 2.0, 0.0))
+        assert _svc_raises(
+            lambda: AI.autoscale_plan(2, 5, 2.0, 1.0, min_workers=8, max_workers=4))

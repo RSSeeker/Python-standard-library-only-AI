@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3094 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3099 项）
 
 ## 特性
 
@@ -1507,6 +1507,38 @@ response = openai_chat_response("你好", model_name="ai-lite",
   默认最后追加 `data: [DONE]`
 - 边界：只做「文本/token 形状」的适配，不实现 HTTP 路由、鉴权、并发与背压；
   非流式 `openai_chat_response` 不负责调用模型
+
+### 服务编排工具（限流 / 动态批处理 / 灰度路由 / 断路器 / 自动扩缩容）
+
+```python
+import AI
+
+lim = AI.TokenBucketRateLimiter(rate=10.0, burst=20)
+assert lim.allow(1, now=0.0)
+
+sch = AI.DynamicBatchScheduler(max_batch_size=8, max_delay=0.05)
+sch.push("req-1", now=0.0)
+batches, remain = sch.drain(now=0.06)
+
+idx = AI.canary_route([0.9, 0.1])      # 90% 流量走版本 0
+
+cb = AI.CircuitBreaker(failure_threshold=3, recovery_timeout=1.0)
+cb.record_failure(0.1)
+
+workers = AI.autoscale_plan(4, 12, 2.0, 1.0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `TokenBucketRateLimiter(rate=10.0, burst=10)` | 令牌桶限流；`allow(n=1, now=t)` 判断能否放行，`wait_time(n, now)` 给出等待秒数（时间由调用方传入，便于确定性测试） |
+| `DynamicBatchScheduler(max_batch_size=8, max_delay=0.05)` | 动态批处理；`push(item, now)` 入队，`drain(now)` 返回 `(batches, remain)`：凑满一批或最早请求等待超时即出批 |
+| `canary_route(weights, rng=None)` | 灰度/加权路由，按非负权重抽样返回版本下标；同一 rng 状态可复现 |
+| `CircuitBreaker(failure_threshold=3, recovery_timeout=1.0, half_open_max=1)` | 断路器；`allow(now)` 放行判断，`record_success/record_failure` 维护 closed/open/half_open 状态 |
+| `autoscale_plan(current_workers, queue_length, avg_latency, target_latency, min_workers=1, max_workers=16, scale_step=2)` | 按延迟与队列长度给扩容/缩容建议，结果裁剪到 `[min_workers, max_workers]` |
+
+边界：这些组件只做策略计算，不绑定真实网络/进程；`TokenBucketRateLimiter` 与
+`CircuitBreaker` 的时钟由调用方注入，互不共享；`DynamicBatchScheduler` 一个实例
+对应一个队列，未做线程安全；`canary_route` 的权重语义是相对比例，不需要归一化。
 
 ### 推理搜索（MCTS / Tree-of-Thought）
 
@@ -5540,12 +5572,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3042 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3047 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3094 项）。
+`tests/`（合计 3099 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5553,7 +5585,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3094 项
+pytest -q                        # test_ai.py + tests/ 合计 3099 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7380,7 +7412,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3094 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3099 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7708,6 +7740,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
 | `TestStripedHyenaAndVim` | StripedHyena/Vim 前向与参数计数、MHA/Hyena/双向 Mamba 各参数与输入梯度有限差分、VimClassifier FD 与 fit 收敛、8 类非法输入 |
 | `TestGenerationExtras` | logit bias/禁用 token、top-p/min-p 掩码、stop 字符串截断、token 停止序列生成（含 eos）、退化检测、非法输入 |
+| `TestServingOrchestration` | 令牌桶限流与等待时间、动态批处理出批/未到期、灰度路由可复现、断路器三态切换、自动扩缩容上下限、非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |

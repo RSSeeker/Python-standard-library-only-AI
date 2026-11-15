@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1987 个 def / 448 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1992 个 def / 451 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -18007,6 +18007,230 @@ def detect_degeneration(tokens, max_run=3, max_ngram=2, ngram_size=3):
             return {"degenerate": True, "reason": "ngram repeat",
                     "position": i}
     return {"degenerate": False, "reason": None, "position": None}
+
+
+# ---- B16：服务编排工具（限流 / 动态批处理 / 灰度路由 / 断路器 / 自动扩缩容） ----
+
+
+def _svc_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
+
+
+def _svc_check_number(value, name):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} 必须是数字")
+    return float(value)
+
+
+def _svc_check_weights(weights):
+    if not isinstance(weights, (list, tuple)) or not weights:
+        raise ValueError("weights 必须是非空列表")
+    out = []
+    for w in weights:
+        w = _svc_check_number(w, "weights 元素")
+        if w < 0.0:
+            raise ValueError("weights 元素必须非负")
+        out.append(w)
+    if sum(out) <= 0.0:
+        raise ValueError("weights 之和必须为正")
+    return out
+
+
+class TokenBucketRateLimiter:
+    """令牌桶限流器：``allow(n=1, now=t)`` 判断 t 时刻能否放行 n 个请求。
+
+    桶容量 ``burst``，每秒补充 ``rate`` 个令牌；时间由调用方传入（默认按
+    内部 ``now`` 递增 0），便于确定性测试。
+    """
+
+    def __init__(self, rate=10.0, burst=10):
+        self.rate = _svc_check_number(rate, "TokenBucketRateLimiter(rate)")
+        if self.rate <= 0.0:
+            raise ValueError("TokenBucketRateLimiter: rate 必须为正")
+        self.burst = _svc_check_pos_int(burst, "TokenBucketRateLimiter(burst)")
+        self.tokens = float(self.burst)
+        self.last_time = 0.0
+
+    def _refill(self, now):
+        now = _svc_check_number(now, "now")
+        if now < self.last_time:
+            raise ValueError("TokenBucketRateLimiter: now 不能倒退")
+        elapsed = now - self.last_time
+        if elapsed > 0.0:
+            self.tokens = min(float(self.burst), self.tokens + elapsed * self.rate)
+            self.last_time = now
+
+    def allow(self, n=1, now=0.0):
+        n = _svc_check_pos_int(n, "TokenBucketRateLimiter.allow(n)")
+        self._refill(now)
+        if self.tokens + 1e-12 >= n:
+            self.tokens -= n
+            return True
+        return False
+
+    def wait_time(self, n=1, now=0.0):
+        """返回放行 n 个请求需要等待的秒数（0 表示现在就能放行）。"""
+        n = _svc_check_pos_int(n, "TokenBucketRateLimiter.wait_time(n)")
+        self._refill(now)
+        shortage = n - self.tokens
+        if shortage <= 0.0:
+            return 0.0
+        return shortage / self.rate
+
+
+class DynamicBatchScheduler:
+    """动态批处理：请求入队后，凑满 ``max_batch_size`` 或等待超过 ``max_delay`` 即出批。
+
+    ``push(item, now)`` 入队；``drain(now)`` 返回 ``(batches, remain)``：
+    每个 batch 是 item 列表（按入队顺序）。
+    """
+
+    def __init__(self, max_batch_size=8, max_delay=0.05):
+        self.max_batch_size = _svc_check_pos_int(
+            max_batch_size, "DynamicBatchScheduler(max_batch_size)")
+        self.max_delay = _svc_check_number(max_delay, "DynamicBatchScheduler(max_delay)")
+        if self.max_delay < 0.0:
+            raise ValueError("DynamicBatchScheduler: max_delay 必须非负")
+        self.queue = []
+
+    def push(self, item, now=0.0):
+        now = _svc_check_number(now, "DynamicBatchScheduler.push(now)")
+        self.queue.append((float(now), item))
+        return len(self.queue)
+
+    def drain(self, now=0.0):
+        now = _svc_check_number(now, "DynamicBatchScheduler.drain(now)")
+        batches = []
+        remaining = []
+        i = 0
+        while i < len(self.queue):
+            t, item = self.queue[i]
+            if t > now:
+                raise ValueError("DynamicBatchScheduler: 入队时间晚于 drain 时间")
+            start = i
+            batch = [item]
+            i += 1
+            while i < len(self.queue) and len(batch) < self.max_batch_size:
+                t2, item2 = self.queue[i]
+                if t2 > now:
+                    raise ValueError("DynamicBatchScheduler: 入队时间晚于 drain 时间")
+                batch.append(item2)
+                i += 1
+            waited = now - t
+            if len(batch) >= self.max_batch_size or waited >= self.max_delay:
+                batches.append(batch)
+            else:
+                remaining.extend(self.queue[start:i])
+        self.queue = remaining
+        return batches, [item for _, item in remaining]
+
+
+def canary_route(weights, rng=None):
+    """灰度路由：按 ``weights``（非负列表）抽样返回版本下标。
+
+    ``rng`` 需提供 ``random()``（默认 ``random``）；同一 rng 状态可复现。
+    """
+    ws = _svc_check_weights(weights)
+    rng = rng if rng is not None else random
+    r = rng.random()
+    total = sum(ws)
+    acc = 0.0
+    for i, w in enumerate(ws):
+        acc += w
+        if r <= acc / total:
+            return i
+    return len(ws) - 1
+
+
+class CircuitBreaker:
+    """断路器：连续失败达阈值后打开；``recovery_timeout`` 秒后进入半开试探。
+
+    状态：``"closed"``/``"open"``/``"half_open"``；``allow(now)`` 决定请求是否放行，
+    ``record_success(now)``/``record_failure(now)`` 根据结果更新状态。
+    """
+
+    def __init__(self, failure_threshold=3, recovery_timeout=1.0, half_open_max=1):
+        self.failure_threshold = _svc_check_pos_int(
+            failure_threshold, "CircuitBreaker(failure_threshold)")
+        self.recovery_timeout = _svc_check_number(
+            recovery_timeout, "CircuitBreaker(recovery_timeout)")
+        if self.recovery_timeout < 0.0:
+            raise ValueError("CircuitBreaker: recovery_timeout 必须非负")
+        self.half_open_max = _svc_check_pos_int(
+            half_open_max, "CircuitBreaker(half_open_max)")
+        self.failures = 0
+        self.state = "closed"
+        self.opened_at = None
+        self.probes = 0
+
+    def _maybe_half_open(self, now):
+        if self.state == "open" and self.opened_at is not None \
+                and now - self.opened_at >= self.recovery_timeout:
+            self.state = "half_open"
+            self.probes = 0
+
+    def allow(self, now=0.0):
+        now = _svc_check_number(now, "CircuitBreaker.allow(now)")
+        self._maybe_half_open(now)
+        if self.state == "closed":
+            return True
+        if self.state == "half_open":
+            if self.probes < self.half_open_max:
+                self.probes += 1
+                return True
+            return False
+        return False
+
+    def record_success(self, now=0.0):
+        now = _svc_check_number(now, "CircuitBreaker.record_success(now)")
+        self._maybe_half_open(now)
+        if self.state == "half_open":
+            self.state = "closed"
+            self.failures = 0
+            self.probes = 0
+        else:
+            self.failures = 0
+
+    def record_failure(self, now=0.0):
+        now = _svc_check_number(now, "CircuitBreaker.record_failure(now)")
+        self._maybe_half_open(now)
+        if self.state == "open":
+            return
+        self.failures += 1
+        if self.state == "half_open" or self.failures >= self.failure_threshold:
+            self.state = "open"
+            self.opened_at = now
+            self.probes = 0
+
+
+def autoscale_plan(current_workers, queue_length, avg_latency, target_latency,
+                   min_workers=1, max_workers=16, scale_step=2):
+    """按排队长度与延迟给建议 worker 数：延迟超目标则扩容，队列空则缩容。
+
+    规则：``avg_latency > target_latency`` → +scale_step；``queue_length == 0``
+    且 ``avg_latency < 0.5 * target_latency`` → -scale_step；其余保持不变。
+    结果裁剪到 ``[min_workers, max_workers]``。
+    """
+    current = _svc_check_pos_int(current_workers, "current_workers")
+    queue_length = _svc_check_number(queue_length, "queue_length")
+    avg_latency = _svc_check_number(avg_latency, "avg_latency")
+    target_latency = _svc_check_number(target_latency, "target_latency")
+    if avg_latency < 0.0 or target_latency <= 0.0:
+        raise ValueError("autoscale_plan: avg_latency 必须非负、target_latency 必须为正")
+    lo = _svc_check_pos_int(min_workers, "min_workers")
+    hi = _svc_check_pos_int(max_workers, "max_workers")
+    if lo > hi:
+        raise ValueError("autoscale_plan: min_workers 不能大于 max_workers")
+    step = _svc_check_pos_int(scale_step, "scale_step")
+    if avg_latency > target_latency:
+        want = current + step
+    elif queue_length == 0.0 and avg_latency < 0.5 * target_latency:
+        want = current - step
+    else:
+        want = current
+    return max(lo, min(hi, want))
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
