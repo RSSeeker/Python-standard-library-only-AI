@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3126 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3131 项）
 
 ## 特性
 
@@ -202,6 +202,25 @@ net2.load_state_dict(blob)              # 严格键/形状匹配
 | `SGDModule(module_or_params, lr=0.01, momentum=0.0, weight_decay=0.0)` | 参数上的 SGD（动量、权重衰减），`zero_grad()/step()` |
 | `AdamModule(module_or_params, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)` | 参数上的 Adam，逐参数 m/v/步数 |
 | `module_grad_check(module, fn, eps=1e-5)` / `ag_assert_shape(tensor, shape, name="tensor")` | 模块全参数数值梯度对拍 / 形状断言 |
+| `ag_slice(x, start, end, axis=0/1)` / `ag_concat(tensors, axis=0/1)` | 2D 切片与拼接（含散回/拼接反向） |
+| `ag_embedding(weight, ids)` / `ag_conv2d(x, weight, bias=None, stride=1, padding=1)` | 查表嵌入；单样本 (C,H,W) 卷积，手写 w/b/x 反向 |
+| `LayerNormModule(d_model, eps=1e-5)` / `EmbeddingModule(vocab_size, d_model, seed=None)` | 可训练归一化层 / 嵌入层 |
+| `Conv2dModule(in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True, seed=None)` / `MultiHeadAttentionModule(d_model, num_heads, causal=True, seed=None)` | 卷积层 / 多头注意力（4 个 LinearModule + 逐头 slice/matmul/softmax/concat） |
+
+autograd 层示例（卷积与多头注意力同样只写 forward，反向由计算图给出）：
+
+```python
+import AI, random
+random.seed(0)
+img = AI.Tensor([[[0.1, 0.2, 0.3, 0.4], [0.5, -0.1, 0.2, 0.0],
+                  [-0.2, 0.3, 0.1, -0.4], [0.0, 0.1, -0.3, 0.2]]])
+conv = AI.Conv2dModule(1, 2, 3, stride=1, padding=1, seed=3)   # 参数 20
+mha = AI.MultiHeadAttentionModule(4, 2, causal=True, seed=4)
+h = AI.Tensor([[0.1, 0.2, -0.3, 0.4], [0.5, -0.1, 0.2, 0.0]])
+loss = AI.ag_mse_loss(conv(img), AI.Tensor([[[0.0] * 4] * 4] * 2))
+loss = AI.ag_mse_loss(mha(h), AI.Tensor([[0.0] * 4] * 2)) + loss
+loss.backward()
+```
 
 边界：这是教学级实现；`load_state_dict` 要求键集合与形状完全一致（不做部分加载或广播）；
 `state_dict` 返回嵌套 list 而非共享存储，所以不支持原地共享参数的多引用语义；
@@ -5721,12 +5740,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3074 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3079 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3126 项）。
+`tests/`（合计 3131 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5734,7 +5753,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3126 项
+pytest -q                        # test_ai.py + tests/ 合计 3131 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7561,7 +7580,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3126 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3131 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7996,6 +8015,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestQATAndGradAccumulator` | QAT 损失/梯度与量化点精确反向一致、`fit_qat` 收敛、`QATTrainer` 封装、梯度累积与平均梯度单步等价、`flush` 尾窗、非法输入 |
 | `TestAutograd` | 广播运算梯度、四种 matmul 变体、softmax/log_softmax 与交叉熵、LayerNorm 三参数梯度、共享子图、小 MLP 训练收敛、非法输入 |
 | `TestAutogradModule` | 参数/缓冲/子模块自动登记与命名、Linear 手算一致与 1D 输入、Sequential/MLP 全参数 FD、state_dict JSON 往返与严格键/形状校验、Adam/SGD 回归收敛、train/eval 级联、九类非法输入 |
+| `TestAutogradLayersExt` | slice/concat/embedding/conv2d 的形状与全参数 FD、LayerNorm/Embedding/Conv2d/MHA 模块前向与参数计数、MHA 因果性、六类非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
 | `TestContrastiveLearning` | NT-Xent / MoCo / BYOL 的对嵌入梯度对中心差分（<1e-6）、MoCo 队列 FIFO、Sinkhorn 约束、DINO 中心 EMA |

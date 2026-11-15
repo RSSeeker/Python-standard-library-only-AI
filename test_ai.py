@@ -50652,3 +50652,143 @@ class TestAutogradModule:
         assert _mod_raises(lambda: AI.SequentialModule())
         assert _mod_raises(lambda: AI.MLPModule([2, 2], ["relu", "relu"]))
         assert _mod_raises(lambda: AI.ag_assert_shape(lin.weight, (3, 2)))
+
+
+import random
+
+
+def _ext_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _ext_fd(fn, tensor, eps=1e-5):
+    """对 tensor 全部元素做中心差分，返回与解析梯度的最大绝对误差。"""
+    tensor.zero_grad()
+    fn().backward()
+    analytic = list(tensor._gflat)
+    flat = list(tensor._flat)
+    worst = 0.0
+    for i in range(len(flat)):
+        old = flat[i]
+        tensor._flat[i] = old + eps
+        tensor.data = AI._ag_build(tensor._flat, tensor.shape)
+        lp = fn().item()
+        tensor._flat[i] = old - eps
+        tensor.data = AI._ag_build(tensor._flat, tensor.shape)
+        lm = fn().item()
+        tensor._flat[i] = old
+        tensor.data = AI._ag_build(tensor._flat, tensor.shape)
+        worst = max(worst, abs(analytic[i] - (lp - lm) / (2 * eps)))
+    return worst
+
+
+class TestAutogradLayersExt:
+    def test_slice_and_concat(self):
+        x = AI.Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True)
+        assert AI.ag_slice(x, 1, 3).shape == (2, 2)
+        w = [[0.5, -1.0], [2.0, 0.3]]
+        err = _ext_fd(lambda: AI.ag_sum(AI.ag_mul(AI.ag_slice(x, 1, 3), w)), x)
+        assert err < 1e-6, err
+
+        a = AI.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        b = AI.Tensor([[5.0], [6.0]], requires_grad=True)
+        c = AI.ag_concat([a, b], axis=1)
+        assert c.shape == (2, 3)
+        wc = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        err = _ext_fd(lambda: AI.ag_sum(AI.ag_mul(AI.ag_concat([a, b], axis=1), wc)),
+                      a)
+        assert err < 1e-6, err
+        assert _ext_raises(lambda: AI.ag_concat([a, AI.Tensor([[1.0, 2.0, 3.0]])]))
+
+    def test_embedding_and_conv(self):
+        emb = AI.EmbeddingModule(5, 3, seed=1).weight
+        ids = [2, 0, 4]
+        out = AI.ag_embedding(emb, ids)
+        assert out.tolist() == [emb.tolist()[2], emb.tolist()[0], emb.tolist()[4]]
+        we = [[1.0, 0.0, -1.0] for _ in range(3)]
+        err = _ext_fd(lambda: AI.ag_sum(AI.ag_mul(AI.ag_embedding(emb, ids), we)),
+                      emb)
+        assert err < 1e-6, err
+
+        random.seed(0)
+        img = AI.Tensor([[[random.uniform(-1, 1) for _ in range(4)]
+                          for _ in range(4)]], requires_grad=True)
+        wt = AI.Tensor([[[[random.uniform(-1, 1) for _ in range(3)]
+                          for _ in range(3)]] for _ in range(2)],
+                       requires_grad=True)
+        bt = AI.Tensor([0.1, -0.2], requires_grad=True)
+        assert AI.ag_conv2d(img, wt, bt, stride=1, padding=1).shape == (2, 4, 4)
+        wconv = [[[random.uniform(-1, 1) for _ in range(4)] for _ in range(4)]
+                 for _ in range(2)]
+
+        def conv_loss():
+            return AI.ag_sum(AI.ag_mul(AI.ag_conv2d(img, wt, bt, 1, 1), wconv))
+
+        for tensor, tol in ((wt, 1e-5), (img, 1e-5), (bt, 1e-5)):
+            err = _ext_fd(conv_loss, tensor)
+            assert err < tol, (tensor.shape, err)
+
+    def test_layernorm_and_modules(self):
+        ln = AI.LayerNormModule(4)
+        lx = AI.Tensor([[0.3, -0.2, 1.0, 0.5], [0.1, 0.4, -0.6, 0.2]])
+        wl = [[1.0, 0.0, -1.0, 2.0], [0.0, 1.0, 0.5, -0.5]]
+
+        def ln_loss():
+            return AI.ag_sum(AI.ag_mul(ln(lx), wl))
+
+        assert _ext_fd(ln_loss, ln.gamma) < 1e-5
+        assert _ext_fd(ln_loss, ln.beta) < 1e-5
+
+        em = AI.EmbeddingModule(7, 3, seed=2)
+        assert em.num_parameters() == 21
+        cm = AI.Conv2dModule(1, 2, 3, stride=1, padding=1, seed=3)
+        assert cm.num_parameters() == 2 * (1 * 9 + 1)
+        img = AI.Tensor([[[0.1, 0.2, 0.3, 0.4],
+                          [0.5, -0.1, 0.2, 0.0],
+                          [-0.2, 0.3, 0.1, -0.4],
+                          [0.0, 0.1, -0.3, 0.2]]])
+        assert cm(img).shape == (2, 4, 4)
+
+    def test_multi_head_attention(self):
+        mha = AI.MultiHeadAttentionModule(4, 2, causal=True, seed=4)
+        xs = AI.Tensor([[0.1, 0.2, -0.3, 0.4], [0.5, -0.1, 0.2, 0.0],
+                        [-0.2, 0.3, 0.1, -0.4]])
+
+        def mha_loss():
+            return AI.ag_sum(AI.ag_mul(mha(xs), [[1.0, 0.0, -1.0, 0.5],
+                                                 [0.5, 1.0, 0.0, -0.5],
+                                                 [-1.0, 0.5, 1.0, 0.0]]))
+
+        worst = 0.0
+        for mod in (mha.w_q, mha.w_k, mha.w_v, mha.w_o):
+            for param in mod.parameters():
+                worst = max(worst, _ext_fd(mha_loss, param))
+        assert worst < 1e-4, worst
+
+        out_a = mha(xs).tolist()
+        xs2 = AI.Tensor([[0.1, 0.2, -0.3, 0.4], [0.5, -0.1, 0.2, 0.0],
+                         [9.0, -7.0, 5.0, 3.0]])
+        out_b = mha(xs2).tolist()
+        same = all(abs(out_a[t][i] - out_b[t][i]) < 1e-12
+                   for t in range(2) for i in range(4))
+        assert same
+
+    def test_invalid_inputs(self):
+        x = AI.Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        emb = AI.EmbeddingModule(5, 3, seed=1).weight
+        img = AI.Tensor([[[0.1, 0.2, 0.3, 0.4], [0.5, -0.1, 0.2, 0.0],
+                          [-0.2, 0.3, 0.1, -0.4], [0.0, 0.1, -0.3, 0.2]]])
+        wt = AI.Tensor([[[[0.1, 0.0, -0.1], [0.2, 0.1, 0.0],
+                          [-0.1, 0.3, 0.2]]] for _ in range(2)])
+        assert _ext_raises(lambda: AI.ag_slice(x, 2, 1))
+        assert _ext_raises(lambda: AI.ag_slice(x, 0, 1, axis=2))
+        assert _ext_raises(lambda: AI.ag_embedding(emb, [9]))
+        assert _ext_raises(lambda: AI.ag_conv2d(img, wt, None, 0))
+        assert _ext_raises(lambda: AI.MultiHeadAttentionModule(5, 2))
+        assert _ext_raises(lambda: AI.LayerNormModule(0))

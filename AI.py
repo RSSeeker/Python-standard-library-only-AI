@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2065 个 def / 464 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2070 个 def / 468 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -27035,6 +27035,365 @@ def module_grad_check(module, fn, eps=1e-5):
     if not params:
         raise ValueError("module_grad_check: 模块没有可训练参数")
     return ag_grad_check(fn, params, eps=eps)
+
+
+# ---- autograd 扩展：切片/拼接/embedding/conv2d 与自注意力 Module ----
+
+
+def _ag_check_2d(tensor, name):
+    tensor = _ag_as_tensor(tensor)
+    if len(tensor.shape) != 2:
+        raise ValueError(f"{name}: 需要 2D Tensor，收到形状 {tensor.shape}")
+    return tensor
+
+
+def ag_slice(x, start, end, axis=1):
+    """2D Tensor 的列（axis=1）或行（axis=0）切片，反向把梯度散回原位置。"""
+    x = _ag_check_2d(x, "ag_slice")
+    rows, cols = x.shape
+    length = rows if axis == 0 else cols
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise TypeError(f"ag_slice: start 必须是整数，收到 {start!r}")
+    if isinstance(end, bool) or not isinstance(end, int):
+        raise TypeError(f"ag_slice: end 必须是整数，收到 {end!r}")
+    if not 0 <= start < end <= length:
+        raise ValueError(f"ag_slice: 需要 0 <= start < end <= {length}，"
+                         f"收到 [{start},{end})")
+    if axis not in (0, 1):
+        raise ValueError(f"ag_slice: axis 只能是 0 或 1，收到 {axis!r}")
+
+    if axis == 0:
+        data = [[x._flat[r * cols + c] for c in range(cols)]
+                for r in range(start, end)]
+    else:
+        data = [[x._flat[r * cols + c] for c in range(start, end)]
+                for r in range(rows)]
+    out = Tensor(data, requires_grad=x.requires_grad, _parents=(x,),
+                 _op="slice")
+
+    def _bwd(gflat):
+        d = [0.0] * len(x._flat)
+        if axis == 0:
+            width = cols
+            for i, flat_idx in enumerate(gflat):
+                r = start + i // width
+                c = i % width
+                d[r * cols + c] += flat_idx
+        else:
+            width = end - start
+            for r in range(rows):
+                for c in range(width):
+                    d[r * cols + (start + c)] += gflat[r * width + c]
+        x._accum(d)
+
+    out._backward_fn = _bwd
+    return out
+
+
+def ag_concat(tensors, axis=1):
+    """把一组形状兼容的 2D Tensor 按 axis 拼接（axis=0 行 / axis=1 列）。"""
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        raise ValueError("ag_concat: 需要非空的 Tensor 列表")
+    parts = [_ag_check_2d(t, "ag_concat") for t in tensors]
+    if axis not in (0, 1):
+        raise ValueError(f"ag_concat: axis 只能是 0 或 1，收到 {axis!r}")
+    first = parts[0].shape
+    for part in parts[1:]:
+        if axis == 0:
+            if part.shape[1] != first[1]:
+                raise ValueError(
+                    f"ag_concat: 列数必须一致，{part.shape} vs {first}")
+        else:
+            if part.shape[0] != first[0]:
+                raise ValueError(
+                    f"ag_concat: 行数必须一致，{part.shape} vs {first}")
+    rows = sum(p.shape[0] for p in parts) if axis == 0 else first[0]
+    cols = first[1] if axis == 0 else sum(p.shape[1] for p in parts)
+    flat = []
+    if axis == 0:
+        for p in parts:
+            flat.extend(p._flat)
+    else:
+        for r in range(rows):
+            for p in parts:
+                base = r * p.shape[1]
+                flat.extend(p._flat[base:base + p.shape[1]])
+    out = Tensor(_ag_build(flat, (rows, cols)),
+                 requires_grad=any(p.requires_grad for p in parts),
+                 _parents=tuple(parts), _op="concat")
+
+    def _bwd(gflat):
+        grads = []
+        if axis == 0:
+            pos = 0
+            for p in parts:
+                size = p.shape[0] * p.shape[1]
+                grads.append(list(gflat[pos:pos + size]))
+                pos += size
+        else:
+            grads = [[] for _ in parts]
+            for r in range(rows):
+                base = r * cols
+                pos = base
+                for idx, p in enumerate(parts):
+                    width = p.shape[1]
+                    grads[idx].extend(gflat[pos:pos + width])
+                    pos += width
+        for idx, part in enumerate(parts):
+            part._accum(grads[idx])
+
+    out._backward_fn = _bwd
+    return out
+
+
+def ag_embedding(weight, ids):
+    """按整数 id 取行：out[t] = weight[ids[t]]；反向把梯度散回对应行。"""
+    weight = _ag_as_tensor(weight)
+    if len(weight.shape) != 2:
+        raise ValueError(f"ag_embedding: 权重需要 2D，收到 {weight.shape}")
+    vocab, dim = weight.shape
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError("ag_embedding: ids 必须是非空 list")
+    clean = []
+    for v in ids:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TypeError(f"ag_embedding: id 必须是整数，收到 {v!r}")
+        if not 0 <= v < vocab:
+            raise ValueError(f"ag_embedding: id 必须在 [0,{vocab})，收到 {v}")
+        clean.append(v)
+    flat = []
+    for v in clean:
+        flat.extend(weight._flat[v * dim:(v + 1) * dim])
+    out = Tensor(_ag_build(flat, (len(clean), dim)),
+                 requires_grad=weight.requires_grad, _parents=(weight,),
+                 _op="embedding")
+
+    def _bwd(gflat):
+        d = [0.0] * len(weight._flat)
+        for t, v in enumerate(clean):
+            for j in range(dim):
+                d[v * dim + j] += gflat[t * dim + j]
+        weight._accum(d)
+
+    out._backward_fn = _bwd
+    return out
+
+
+def ag_conv2d(x, weight, bias=None, stride=1, padding=0):
+    """2D 卷积（NCHW 的 C,H,W 单样本）：out[o,i,j]=Σ x[c,h,w]·W[o,c,kh,kw]+b[o]。"""
+    x = _ag_as_tensor(x)
+    weight = _ag_as_tensor(weight)
+    if len(x.shape) != 3:
+        raise ValueError(f"ag_conv2d: x 需要 (C,H,W)，收到 {x.shape}")
+    if len(weight.shape) != 4:
+        raise ValueError(f"ag_conv2d: weight 需要 (O,C,KH,KW)，收到 {weight.shape}")
+    channels, height, width = x.shape
+    out_ch, in_ch, kh, kw = weight.shape
+    if channels != in_ch:
+        raise ValueError(
+            f"ag_conv2d: x 通道 {channels} 与权重输入通道 {in_ch} 不一致")
+    for name, val in (("stride", stride), ("padding", padding)):
+        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+            raise ValueError(f"ag_conv2d: {name} 必须是正整数，收到 {val!r}")
+    out_h = (height + 2 * padding - kh) // stride + 1
+    out_w = (width + 2 * padding - kw) // stride + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"ag_conv2d: 卷积核过大，得到输出形状 ({out_h},{out_w})")
+    bias_vals = None
+    if bias is not None:
+        b = _ag_as_tensor(bias)
+        if b.shape != (out_ch,):
+            raise ValueError(f"ag_conv2d: bias 形状应为 ({out_ch},)，收到 {b.shape}")
+        bias_vals = b._flat
+    out_flat = []
+    for o in range(out_ch):
+        wbase = o * in_ch * kh * kw
+        for i in range(out_h):
+            for j in range(out_w):
+                acc = bias_vals[o] if bias_vals is not None else 0.0
+                for c in range(in_ch):
+                    cbase = c * height * width
+                    for dh in range(kh):
+                        h = i * stride + dh - padding
+                        if h < 0 or h >= height:
+                            continue
+                        for dw in range(kw):
+                            w = j * stride + dw - padding
+                            if w < 0 or w >= width:
+                                continue
+                            acc += (x._flat[cbase + h * width + w]
+                                    * weight._flat[wbase + c * kh * kw + dh * kw + dw])
+                out_flat.append(acc)
+    parents = (x, weight) + ((bias,) if bias is not None else ())
+    out = Tensor(_ag_build(out_flat, (out_ch, out_h, out_w)),
+                 requires_grad=any(p.requires_grad for p in parents),
+                 _parents=parents, _op="conv2d")
+
+    def _bwd(gflat):
+        dx = [0.0] * len(x._flat)
+        d_weight = [0.0] * len(weight._flat)
+        db = [0.0] * out_ch
+        pos = 0
+        for o in range(out_ch):
+            wbase = o * in_ch * kh * kw
+            for i in range(out_h):
+                for j in range(out_w):
+                    g = gflat[pos]
+                    pos += 1
+                    if bias_vals is not None:
+                        db[o] += g
+                    for c in range(in_ch):
+                        cbase = c * height * width
+                        for dh in range(kh):
+                            h = i * stride + dh - padding
+                            if h < 0 or h >= height:
+                                continue
+                            for dw in range(kw):
+                                w = j * stride + dw - padding
+                                if w < 0 or w >= width:
+                                    continue
+                                xv = x._flat[cbase + h * width + w]
+                                wv = weight._flat[wbase + c * kh * kw + dh * kw + dw]
+                                dx[cbase + h * width + w] += g * wv
+                                d_weight[wbase + c * kh * kw + dh * kw + dw] += g * xv
+        x._accum(dx)
+        weight._accum(d_weight)
+        if bias is not None:
+            bias._accum(db)
+
+    out._backward_fn = _bwd
+    return out
+
+
+class LayerNormModule(Module):
+    """LayerNorm 模块（可学习 gamma/beta，作用在最后一维 2D 输入上）。"""
+
+    def __init__(self, d_model, eps=1e-5):
+        super().__init__()
+        self.d_model = _ag_check_pos_int(d_model, "LayerNormModule")
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or eps <= 0:
+            raise ValueError(f"LayerNormModule: eps 必须为正数，收到 {eps!r}")
+        self.eps = float(eps)
+        self.gamma = Tensor([1.0] * d_model, requires_grad=True)
+        self.beta = Tensor([0.0] * d_model, requires_grad=True)
+
+    def forward(self, x):
+        return ag_layernorm(x, self.gamma, self.beta, self.eps)
+
+
+class EmbeddingModule(Module):
+    """Embedding 模块：整数 id 序列 → (T,d_model)。"""
+
+    def __init__(self, vocab_size, d_model, seed=None):
+        super().__init__()
+        self.vocab_size = _ag_check_pos_int(vocab_size, "EmbeddingModule")
+        self.d_model = _ag_check_pos_int(d_model, "EmbeddingModule")
+        import random
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        weights = [[random.gauss(0.0, 0.02) for _ in range(self.d_model)]
+                   for _ in range(self.vocab_size)]
+        self.weight = Tensor(weights, requires_grad=True)
+        if seed is not None:
+            random.setstate(state)
+
+    def forward(self, ids):
+        return ag_embedding(self.weight, ids)
+
+
+class Conv2dModule(Module):
+    """2D 卷积模块：输入 (C,H,W)，权重 (out,in,kernel,kernel)。"""
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, bias=True, seed=None):
+        super().__init__()
+        self.in_channels = _ag_check_pos_int(in_channels, "Conv2dModule")
+        self.out_channels = _ag_check_pos_int(out_channels, "Conv2dModule")
+        self.kernel_size = _ag_check_pos_int(kernel_size, "Conv2dModule")
+        for name, val in (("stride", stride), ("padding", padding)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError(f"Conv2dModule: {name} 必须是正整数，收到 {val!r}")
+        self.stride = int(stride)
+        self.padding = int(padding)
+        import random
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        fan_in = self.in_channels * self.kernel_size * self.kernel_size
+        std = (2.0 / fan_in) ** 0.5
+        weights = [[[[random.gauss(0.0, std) for _ in range(self.kernel_size)]
+                     for _ in range(self.kernel_size)]
+                    for _ in range(self.in_channels)]
+                   for _ in range(self.out_channels)]
+        self.weight = Tensor(weights, requires_grad=True)
+        if bias:
+            self.bias = Tensor([0.0] * self.out_channels, requires_grad=True)
+        else:
+            object.__setattr__(self, "bias", None)
+        if seed is not None:
+            random.setstate(state)
+
+    def forward(self, x):
+        return ag_conv2d(x, self.weight, self.bias, self.stride, self.padding)
+
+
+class MultiHeadAttentionModule(Module):
+    """多头自注意力模块（autograd 组合实现，支持因果掩码）。"""
+
+    def __init__(self, d_model, num_heads, causal=True, seed=None):
+        super().__init__()
+        self.d_model = _ag_check_pos_int(d_model, "MultiHeadAttentionModule")
+        self.num_heads = _ag_check_pos_int(num_heads, "MultiHeadAttentionModule")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"MultiHeadAttentionModule: d_model={self.d_model} 不能被 "
+                f"num_heads={self.num_heads} 整除")
+        self.head_dim = self.d_model // self.num_heads
+        self.causal = bool(causal)
+        self.scale = 1.0 / (self.head_dim ** 0.5)
+        import random
+        state = random.getstate()
+        if seed is not None:
+            random.seed(seed)
+        self.w_q = LinearModule(self.d_model, self.d_model, seed=None)
+        self.w_k = LinearModule(self.d_model, self.d_model, seed=None)
+        self.w_v = LinearModule(self.d_model, self.d_model, seed=None)
+        self.w_o = LinearModule(self.d_model, self.d_model, seed=None)
+        if seed is not None:
+            random.setstate(state)
+
+    def forward(self, x_seq):
+        x = _ag_check_2d(x_seq, "MultiHeadAttentionModule")
+        t = x.shape[0]
+        if x.shape[1] != self.d_model:
+            raise ValueError(
+                f"MultiHeadAttentionModule: 输入宽度应为 {self.d_model}，"
+                f"收到 {x.shape}")
+        q = self.w_q(x)
+        k = self.w_k(x)
+        v = self.w_v(x)
+        mask = None
+        if self.causal:
+            mask_vals = [[0.0 if j <= i else -1e30 for j in range(t)]
+                         for i in range(t)]
+            mask = Tensor(mask_vals)
+        heads = []
+        for h in range(self.num_heads):
+            start = h * self.head_dim
+            end = start + self.head_dim
+            qh = ag_slice(q, start, end)
+            kh = ag_slice(k, start, end)
+            vh = ag_slice(v, start, end)
+            scores = ag_matmul(qh, ag_transpose(kh))  # (T,T)
+            scores = ag_mul(scores, Tensor([self.scale]))
+            if mask is not None:
+                scores = ag_add(scores, mask)
+            probs = ag_softmax(scores)
+            heads.append(ag_matmul(probs, vh))
+        out = ag_concat(heads, axis=1)
+        return self.w_o(out)
 
 class MLP:
     """多层感知机（PyTorch 风格）"""
