@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3034 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3039 项）
 
 ## 特性
 
@@ -2896,8 +2896,10 @@ delta = patching_delta(clean_hidden, patched_hidden, direction)
 | `project_onto(rows, direction)` | 每行在方向上的投影（点积） |
 | `steer(rows, direction, alpha=1.0)` | 残差流上加 `alpha × direction` |
 | `patching_delta(clean_rows, patched_rows, direction)` | patched 与 clean 在方向上的平均投影差 |
+| `batch_logit_lens(hidden_batch, W_out, b_out=None, top_k=None)` | 批量 logit lens：逐样本/逐行输出词表概率；`top_k` 时每行只留 top-k |
+| `ProbeTrainer(num_classes=None, lr=0.1, epochs=100, l2=1e-4, seed=None)` | 线性探针训练器：`fit` / `predict_proba` / `predict` / `accuracy` |
 
-- 边界：纯表示层工具，不包含解码头之外的模型逻辑；残差方向只是均值差（不做 PCA/白化）；activation patching 只给投影差，不做逐 head/path 定位；只支持二维浮点列表。
+- 边界：纯表示层工具，不包含解码头之外的模型逻辑；残差方向只是均值差（不做 PCA/白化）；activation patching 只给投影差，不做逐 head/path 定位；只支持二维浮点列表。`batch_logit_lens` 只是逐样本复用 `logit_lens`；`ProbeTrainer` 复用 `train_linear_probe`，按逐样本 softmax 回归训练，不做交叉验证/正则搜索。
 
 ### 归纳头与线性探针（induction head / probing）
 
@@ -5288,7 +5290,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3034 项）。
+`tests/`（合计 3039 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5296,7 +5298,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3034 项
+pytest -q                        # test_ai.py + tests/ 合计 3039 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7086,7 +7088,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3034 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3039 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7412,6 +7414,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPropertyFuzz` | 属性测试报告 5 项检查全过且名称顺序固定、同 seed 结果一致；strict 函数 fuzz 正确拒绝非有限输入，loose 函数会被判 `nonfinite_silently_accepted`；9 类非法输入 |
 | `TestChunkwise` | retention 分块前向对 O(T²) 参考逐位一致、q/k/v 中心差分；selective scan 分块前向对朴素扫描一致、dx/da/dB/dC 中心差分；8 类非法输入 |
 | `TestInductionHeadAndProbe` | 合成归纳头定位/offset/无重复、layers 形式，线性探针收敛与 seed 复现，非法输入 |
+| `TestInterpretabilityLight` | batch logit lens 形状/行归一/top-k；ProbeTrainer 端到端收敛、概率归一、未 fit/维度/构造非法输入 |
 | `TestPassAtK` | pass@k 组合估计手算、n==c、k 越界、非法参数 |
 | `TestProcessReward` | mean/min/last/discounted 手算、非法 mode/discount |
 | `TestVerifierRank` | 降序排名与同分、非法分数/长度 |
@@ -7629,7 +7632,7 @@ CI（GitHub Actions）执行 flake8 + pytest。
 ```text
 .
 ├── AI.py            # 神经网络工具箱（Python 实现，所有代码）
-├── test_ai.py       # 2982 个单元测试
+├── test_ai.py       # 2987 个单元测试
 ├── tests/           # 52 个快速冒烟测试（pytest 自动发现）
 ├── tools/
 │   ├── numeric_regression.py  # 数值回归快照脚本

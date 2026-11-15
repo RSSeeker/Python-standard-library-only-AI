@@ -48515,3 +48515,84 @@ class TestServingHelpers:
             _sv_make_lm(), [], max_new_tokens=1)))
         assert _sv_raises(lambda: list(AI.generate_stream(
             _sv_make_lm(), [0], temperature=0.0)))
+
+
+# ---- B4: batch_logit_lens / ProbeTrainer 测试 ----
+
+
+def _b4_close(a, b, tol=1e-9):
+    return abs(a - b) <= tol
+
+
+def _b4_bad(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestInterpretabilityLight:
+    def test_batch_logit_lens_shapes(self):
+        hidden = [[[0.5, -0.5], [1.0, 0.0]], [[0.0, 0.2]]]
+        W_out = [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]]
+        out = AI.batch_logit_lens(hidden, W_out)
+        assert len(out) == 2
+        assert len(out[0]) == 2 and len(out[1]) == 1
+        for sample in out:
+            for row in sample:
+                assert len(row) == 3
+                assert _b4_close(sum(row), 1.0)
+
+    def test_batch_logit_lens_top_k(self):
+        hidden = [[[0.5, -0.5], [1.0, 0.0]]]
+        W_out = [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]]
+        out = AI.batch_logit_lens(hidden, W_out, top_k=2)
+        assert len(out) == 1 and len(out[0]) == 2
+        for row in out[0]:
+            assert len(row) == 2
+            assert all(set(d) == {"index", "score"} for d in row)
+            assert row[0]["score"] >= row[1]["score"]
+        # 带偏置分支
+        out_b = AI.batch_logit_lens(hidden, W_out, b_out=[0.1, 0.2, -0.3])
+        assert len(out_b[0][0]) == 3
+
+    def test_batch_logit_lens_invalid(self):
+        W_out = [[1.0, 0.0], [0.0, 1.0]]
+        assert _b4_bad(lambda: AI.batch_logit_lens([], W_out))
+        assert _b4_bad(lambda: AI.batch_logit_lens([[[1.0, 2.0]]], W_out, top_k=0))
+        assert _b4_bad(lambda: AI.batch_logit_lens([[[1.0, 2.0]]], W_out, top_k=True))
+        assert _b4_bad(lambda: AI.batch_logit_lens([[[1.0, float("nan")]]], W_out))
+        assert _b4_bad(lambda: AI.batch_logit_lens([[[1.0, 2.0, 3.0]]], W_out))
+        assert _b4_bad(lambda: AI.batch_logit_lens("bad", W_out))
+
+    def test_probe_trainer_end_to_end(self):
+        rng = random.Random(0)
+        feats = [[rng.gauss(1.0, 0.2), rng.gauss(1.0, 0.2)] for _ in range(20)] + \
+                [[rng.gauss(-1.0, 0.2), rng.gauss(-1.0, 0.2)] for _ in range(20)]
+        labels = [0] * 20 + [1] * 20
+        trainer = AI.ProbeTrainer(num_classes=2, lr=0.2, epochs=300, seed=3)
+        hist = trainer.fit(feats, labels)
+        assert len(hist) == 300
+        assert hist[-1] < hist[0] * 0.2
+        probs = trainer.predict_proba(feats)
+        assert len(probs) == 40
+        for p in probs:
+            assert len(p) == 2 and _b4_close(sum(p), 1.0)
+        assert trainer.accuracy(feats, labels) >= 0.95
+        assert len(trainer.predict(feats)) == 40
+        assert trainer.weights is not None and trainer.biases is not None
+
+    def test_probe_trainer_invalid_inputs(self):
+        assert _b4_bad(lambda: AI.ProbeTrainer().predict([1.0, 2.0]), RuntimeError)
+        trainer = AI.ProbeTrainer(num_classes=2, epochs=10, seed=1)
+        trainer.fit([[1.0, 0.0], [0.0, 1.0]], [0, 1])
+        assert _b4_bad(lambda: trainer.predict_proba([[1.0, 2.0, 3.0]]))
+        assert _b4_bad(lambda: trainer.accuracy([[1.0, 0.0]], [0, 1]))
+        assert _b4_bad(lambda: trainer.accuracy([[1.0, 0.0]], [0.5]))
+        for fn in (lambda: AI.ProbeTrainer(num_classes=0),
+                   lambda: AI.ProbeTrainer(lr=0.0),
+                   lambda: AI.ProbeTrainer(epochs=0),
+                   lambda: AI.ProbeTrainer(l2=-1.0),
+                   lambda: AI.ProbeTrainer(seed=1.5)):
+            assert _b4_bad(fn)

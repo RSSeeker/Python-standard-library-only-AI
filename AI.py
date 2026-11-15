@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1902 个 def / 439 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1905 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -6209,6 +6209,146 @@ def top_k_tokens(probs_rows, k: int = 5):
         order = sorted(range(len(row)), key=lambda i: (-row[i], i))
         out.append([{"index": i, "score": row[i]} for i in order[:k]])
     return out[0] if single else out
+
+
+# ---- 可解释性轻量补充（B4）：batch logit lens / probe 训练器 ----
+
+
+def _b4_check_matrix(mat, who):
+    if not isinstance(mat, (list, tuple)) or not mat:
+        raise ValueError(f"{who}: 必须是非空二维数字列表")
+    out = []
+    width = None
+    for i, row in enumerate(mat):
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 第 {i} 行必须是非空数字列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 各行长度必须一致")
+        vals = []
+        for j, v in enumerate(row):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 第 {i} 行第 {j} 列必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _b4_softmax(row):
+    mx = max(row)
+    exps = [math.exp(v - mx) for v in row]
+    denom = sum(exps)
+    return [v / denom for v in exps]
+
+
+def batch_logit_lens(hidden_batch, W_out, b_out=None, top_k=None):
+    """批量版 logit lens：对每个样本的每层/每 token 隐藏表示做输出头投影。
+
+    ``hidden_batch`` 是「样本 × 行 × 隐藏维」的三层嵌套；返回与样本数等长的列表，
+    每项是该样本的 ``行 × 词表概率``；``top_k`` 给定时每行只保留 top-k 的
+    ``{"index","score"}``（复用 ``top_k_tokens``）。
+    """
+    if not isinstance(hidden_batch, (list, tuple)) or not hidden_batch:
+        raise ValueError("batch_logit_lens: hidden_batch 必须是非空列表")
+    if top_k is not None and (isinstance(top_k, bool)
+                              or not isinstance(top_k, int) or top_k < 1):
+        raise ValueError("batch_logit_lens: top_k 必须是正整数或 None")
+    out = []
+    for idx, hidden in enumerate(hidden_batch):
+        rows = _b4_check_matrix(hidden, f"batch_logit_lens: hidden_batch[{idx}]")
+        probs = logit_lens(rows, W_out, b_out)
+        if top_k is None:
+            out.append(probs)
+        else:
+            out.append(top_k_tokens(probs, top_k))
+    return out
+
+
+class ProbeTrainer:
+    """线性探针的训练器封装：``fit`` / ``predict_proba`` / ``predict`` / ``accuracy``。
+
+    内部复用 ``train_linear_probe``（softmax 回归、手写反传），适合评估冻结表示的
+    线性可分性；``fit`` 返回每轮损失历史，训练后保留 ``weights`` / ``biases``。
+    """
+
+    def __init__(self, num_classes=None, lr: float = 0.1, epochs: int = 100,
+                 l2: float = 1e-4, seed=None):
+        if num_classes is not None:
+            if isinstance(num_classes, bool) or not isinstance(num_classes, int) \
+                    or num_classes < 1:
+                raise ValueError("ProbeTrainer: num_classes 必须是正整数或 None")
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) \
+                or not math.isfinite(float(lr)) or float(lr) <= 0.0:
+            raise ValueError("ProbeTrainer: lr 必须 > 0")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("ProbeTrainer: epochs 必须是正整数")
+        if isinstance(l2, bool) or not isinstance(l2, (int, float)) \
+                or not math.isfinite(float(l2)) or float(l2) < 0.0:
+            raise ValueError("ProbeTrainer: l2 必须是非负数")
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int)):
+            raise ValueError("ProbeTrainer: seed 必须是整数或 None")
+        self.num_classes = num_classes
+        self.lr = float(lr)
+        self.epochs = epochs
+        self.l2 = float(l2)
+        self.seed = seed
+        self.weights = None
+        self.biases = None
+        self.loss_history = []
+        self.train_accuracy = None
+
+    def fit(self, features, labels):
+        """训练探针；返回每轮平均交叉熵损失。"""
+        result = train_linear_probe(
+            features, labels, num_classes=self.num_classes, lr=self.lr,
+            epochs=self.epochs, l2=self.l2, seed=self.seed)
+        self.weights = result["weights"]
+        self.biases = result["biases"]
+        self.num_classes = result["num_classes"]
+        self.loss_history = list(result["loss_history"])
+        self.train_accuracy = result["accuracy"]
+        return list(self.loss_history)
+
+    def _check_fitted(self):
+        if self.weights is None:
+            raise RuntimeError("ProbeTrainer: 请先调用 fit 再预测")
+
+    def predict_proba(self, features):
+        """逐行 softmax 概率。"""
+        self._check_fitted()
+        rows = _b4_check_matrix(features, "ProbeTrainer.predict_proba")
+        dim = len(self.weights[0])
+        out = []
+        for idx, row in enumerate(rows):
+            if len(row) != dim:
+                raise ValueError(
+                    f"ProbeTrainer: 特征维度 {len(row)} != 探针维度 {dim}"
+                    f"（第 {idx} 行）")
+            logits = [sum(self.weights[r][j] * row[j] for j in range(dim))
+                      + self.biases[r] for r in range(self.num_classes)]
+            out.append(_b4_softmax(logits))
+        return out
+
+    def predict(self, features):
+        """逐行 argmax 类别下标。"""
+        probs = self.predict_proba(features)
+        return [max(range(len(row)), key=lambda r: row[r]) for row in probs]
+
+    def accuracy(self, features, labels):
+        """计算预测准确率。"""
+        preds = self.predict(features)
+        if not isinstance(labels, (list, tuple)) or len(labels) != len(preds):
+            raise ValueError("ProbeTrainer.accuracy: labels 长度必须与特征行数一致")
+        hit = 0
+        for y, p in zip(labels, preds):
+            if isinstance(y, bool) or not isinstance(y, int):
+                raise ValueError("ProbeTrainer.accuracy: labels 必须是整数")
+            if p == y:
+                hit += 1
+        return hit / len(preds)
 
 
 def residual_direction(pos_rows, neg_rows):
