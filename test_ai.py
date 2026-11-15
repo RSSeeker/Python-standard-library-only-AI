@@ -49856,3 +49856,89 @@ class TestStripedHyenaAndVim:
         assert _b14_t_raises(lambda: vc.loss_and_backward(imgs, [0, 2]))
         assert _b14_t_raises(lambda: vc.loss_and_backward(imgs[:1], [0, 1]))
         assert _b14_t_raises(lambda: vc.predict([]))
+
+
+import math
+
+import AI
+
+
+class _GenFakeLM:
+    vocab_size = 10
+
+    def __init__(self, seq):
+        self.seq = list(seq)
+
+    def generate(self, ids, max_new_tokens=1, temperature=1.0, top_k=0, rng=None):
+        return [self.seq[(len(ids) - 1) % len(self.seq)]]
+
+
+class _GenNoGenerate:
+    vocab_size = 10
+
+
+def _gen_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+class TestGenerationExtras:
+    def test_apply_logit_bias(self):
+        got = AI.apply_logit_bias([1.0, 2.0, 3.0], bias={1: 2.0}, banned_ids=[2])
+        assert got == [1.0, 4.0, -1e30]
+        got2 = AI.apply_logit_bias([1.0, 2.0], bias=[0.5, -0.5])
+        assert got2 == [1.5, 1.5]
+        src = [1.0, 2.0]
+        AI.apply_logit_bias(src, bias={0: 1.0})
+        assert src == [1.0, 2.0]
+        assert _gen_raises(lambda: AI.apply_logit_bias([], bias={0: 1.0}))
+        assert _gen_raises(lambda: AI.apply_logit_bias([1.0], banned_ids=[3]))
+        assert _gen_raises(lambda: AI.apply_logit_bias([1.0], bias={0: float("nan")}))
+
+    def test_top_p_and_min_p_masks(self):
+        assert AI.top_p_mask([10.0, 0.0, 0.0], 0.9) == [True, False, False]
+        assert AI.top_p_mask([0.0, 0.0], 0.9) == [True, True]
+        assert AI.min_p_mask([10.0, 0.0], 0.5) == [True, False]
+        assert AI.min_p_mask([1.0, 2.0, 3.0], 0.0) == [True, True, True]
+        # 掩码长度归一且至少保留一个
+        mask = AI.top_p_mask([0.0, 1.0, 2.0], 0.01)
+        assert len(mask) == 3 and sum(mask) >= 1
+        assert _gen_raises(lambda: AI.top_p_mask([1.0], 0.0))
+        assert _gen_raises(lambda: AI.min_p_mask([1.0], 1.5))
+
+    def test_truncate_at_stop(self):
+        assert AI.truncate_at_stop("abcENDdef", ["END"]) == ("abc", "END")
+        assert AI.truncate_at_stop("abcENDdef", "END", include_stop=True) == ("abcEND", "END")
+        assert AI.truncate_at_stop("abcdef", ["END"]) == ("abcdef", None)
+        assert AI.truncate_at_stop("a<e>b</s>c", ["</s>", "<e>"]) == ("a", "<e>")
+        assert _gen_raises(lambda: AI.truncate_at_stop("x", ""))
+        assert _gen_raises(lambda: AI.truncate_at_stop(1, "x"))
+
+    def test_generate_with_stops(self):
+        lm = _GenFakeLM([1, 3, 4, 5])
+        assert AI.generate_with_stops(lm, [0], stop_ids=[[3, 4]], max_new_tokens=6) == [1]
+        lm2 = _GenFakeLM([1, 2, 9, 3])
+        assert AI.generate_with_stops(lm2, [0], max_new_tokens=6, eos_id=9) == [1, 2]
+        lm3 = _GenFakeLM([1, 2, 3])
+        assert AI.generate_with_stops(lm3, [0], max_new_tokens=3) == [1, 2, 3]
+        assert _gen_raises(lambda: AI.generate_with_stops(_GenNoGenerate(), [0]))
+        assert _gen_raises(lambda: AI.generate_with_stops(lm, []))
+        assert _gen_raises(lambda: AI.generate_with_stops(lm, [0], stop_ids=[[]]))
+        assert _gen_raises(lambda: AI.generate_with_stops(lm, [0], max_new_tokens=0))
+        assert _gen_raises(lambda: AI.generate_with_stops(lm, [0], temperature=0.0))
+
+    def test_detect_degeneration(self):
+        assert AI.detect_degeneration([7, 7, 7, 7], max_run=3)["degenerate"] is True
+        assert AI.detect_degeneration([1, 2, 3, 1, 2, 3, 1, 2, 3],
+                                      max_ngram=2)["degenerate"] is True
+        assert AI.detect_degeneration([1, 2, 3, 4, 5])["degenerate"] is False
+        res = AI.detect_degeneration([1, 1, 1, 1])
+        assert res["reason"] == "token run" and res["position"] == 3
+        assert _gen_raises(lambda: AI.detect_degeneration([1, -1]))
+        assert _gen_raises(lambda: AI.detect_degeneration([1, 2], max_run=0))
+        assert _gen_raises(lambda: AI.detect_degeneration([1, 2], ngram_size=1))

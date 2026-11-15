@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3089 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3094 项）
 
 ## 特性
 
@@ -5540,12 +5540,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3037 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3042 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3089 项）。
+`tests/`（合计 3094 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5553,7 +5553,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3089 项
+pytest -q                        # test_ai.py + tests/ 合计 3094 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -6071,6 +6071,43 @@ print(AI.snapshot_digest(snap))
 本仓库刻意保持单文件（`AI.py` + `test_ai.py`）：实现可直接 import、复制或嵌进教学环境，不引入包结构与依赖。代价是 `AI.py` 已约 8.8 万行，IDE 导航、并行修改与代码审阅都更吃力。
 
 评估过的拆包方案是按 `core/`、`nn/`、`train/`、`eval/`、`apps/` 分目录，但需要改动 2796 个测试的导入路径，且 `run_doctests` 依赖 `sys.modules` 里的模块名，迁移成本高；换来的是导航与团队并行收益，在「零依赖工具箱」的定位下不划算，所以保持单文件，并用横幅和 TOC 维持结构。若未来要拆包，优先按依赖方向单向切分（core → nn → train → eval），并保留 `AI` 聚合模块做 re-export，避免测试大面积改写。
+
+### 生成采样与停止条件（logit bias / top-p / min-p / stop 序列 / 退化检测）
+
+```python
+import AI
+
+# 给一行 logits 加 bias，或把禁用 token 置为 -1e30
+logits = AI.apply_logit_bias([1.0, 2.0, 3.0], bias={1: 2.0}, banned_ids=[2])
+
+# 核采样 / min-p 掩码（与 logits 对齐的布尔列表）
+keep = AI.top_p_mask([10.0, 0.0, 0.0], top_p=0.9)
+keep2 = AI.min_p_mask([10.0, 0.0], min_p=0.5)
+
+# 后处理：在最早出现的停止字符串处截断
+text, hit = AI.truncate_at_stop("answer END trailing", ["END"])
+
+# 生成时按 token 停止序列截断（不含 prompt、不含停止序列）
+lm = AI.CausalLM(vocab_size=10, d_model=8, num_heads=2, d_ff=16,
+                 num_layers=1, max_len=12)
+tokens = AI.generate_with_stops(lm, [1, 2], stop_ids=[[4, 5]], max_new_tokens=8)
+
+# 重复退化检测
+report = AI.detect_degeneration(tokens)
+```
+
+| API | 说明 |
+| --- | --- |
+| `apply_logit_bias(logits, bias=None, banned_ids=None)` | 加 `{token_id: delta}` 或等长列表 bias；`banned_ids` 置 `-1e30`；返回新列表、不改入参 |
+| `top_p_mask(logits, top_p=0.9)` / `min_p_mask(logits, min_p=0.0)` | 按 softmax 概率算核采样 / min-p 保留掩码（至少保留概率最高者） |
+| `truncate_at_stop(text, stop_strings, include_stop=False)` → `(prefix, hit)` | 在最早出现的停止字符串处截断；无命中返回原文与 `None` |
+| `generate_with_stops(model, prompt_ids, stop_ids=None, max_new_tokens=8, temperature=1.0, top_k=0, rng=None, eos_id=None)` | 逐 token 生成，命中停止 token 序列时截掉该序列并停止；返回新生成 token 列表（不含 prompt） |
+| `detect_degeneration(tokens, max_run=3, max_ngram=2, ngram_size=3)` | 检测连续重复 token 超限或 n-gram 重复超限，返回 `{degenerate, reason, position}` |
+
+边界：`top_p_mask`/`min_p_mask` 只做掩码，不负责重归一化采样（可交给
+`CausalLM.generate` 的对应参数）；`generate_with_stops` 每一步重算全前缀
+（未利用 KV cache），适合小词表教学场景；`detect_degeneration` 是启发式，
+对语义层面的重复（换词复述）无感知。
 
 ### 规则约束解码（神经符号的最小实现）
 
@@ -7343,7 +7380,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3089 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3094 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7670,6 +7707,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
 | `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
 | `TestStripedHyenaAndVim` | StripedHyena/Vim 前向与参数计数、MHA/Hyena/双向 Mamba 各参数与输入梯度有限差分、VimClassifier FD 与 fit 收敛、8 类非法输入 |
+| `TestGenerationExtras` | logit bias/禁用 token、top-p/min-p 掩码、stop 字符串截断、token 停止序列生成（含 eos）、退化检测、非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |

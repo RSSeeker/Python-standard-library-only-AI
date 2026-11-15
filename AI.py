@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1977 个 def / 448 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1987 个 def / 448 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -17772,6 +17772,241 @@ class QuietAttention:
 
     def eval(self):
         return self
+
+
+# ---- B15：生成采样与停止条件（logit 处理 / top-p / min-p / stop 序列 / 退化检测） ----
+
+
+def _gen_check_logits(logits, who):
+    """校验一行 logits 是非空、全为有限数字的列表。"""
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError(f"{who}: logits 必须是非空列表")
+    out = []
+    for v in logits:
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError(f"{who}: logits 元素必须是数字")
+        v = float(v)
+        if not math.isfinite(v):
+            raise ValueError(f"{who}: logits 元素必须是有限数字")
+        out.append(v)
+    return out
+
+
+def _gen_check_prob(value, name, allow_zero=False):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} 必须是数字")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} 必须是有限数字")
+    if allow_zero:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} 必须在 [0, 1]")
+    elif not 0.0 < value <= 1.0:
+        raise ValueError(f"{name} 必须在 (0, 1]")
+    return value
+
+
+def _gen_check_token_ids(model, ids, who):
+    return _check_token_ids(ids, model.vocab_size, who)
+
+
+def apply_logit_bias(logits, bias=None, banned_ids=None):
+    """给一行 logits 加 logit bias，并把禁用 token 置为 -1e30。
+
+    ``bias`` 可以是 ``{token_id: delta}`` 字典或按 token 下标的等长列表；
+    ``banned_ids`` 是 token id 可迭代对象。返回新的 logits 列表，不修改入参。
+    """
+    out = _gen_check_logits(logits, "apply_logit_bias(logits)")
+    if bias is not None:
+        if isinstance(bias, dict):
+            for tok, delta in bias.items():
+                if not isinstance(tok, int) or isinstance(tok, bool):
+                    raise ValueError("apply_logit_bias: bias 的键必须是 token id")
+                if not 0 <= tok < len(out):
+                    raise ValueError(
+                        f"apply_logit_bias: token {tok} 越界（词表 {len(out)}）")
+                if not isinstance(delta, (int, float)) or isinstance(delta, bool):
+                    raise ValueError("apply_logit_bias: bias 值必须是数字")
+                delta = float(delta)
+                if not math.isfinite(delta):
+                    raise ValueError("apply_logit_bias: bias 值必须是有限数字")
+                out[tok] += delta
+        else:
+            if not isinstance(bias, (list, tuple)) or len(bias) != len(out):
+                raise ValueError("apply_logit_bias: bias 列表长度必须与 logits 一致")
+            for i, delta in enumerate(bias):
+                if not isinstance(delta, (int, float)) or isinstance(delta, bool):
+                    raise ValueError("apply_logit_bias: bias 值必须是数字")
+                delta = float(delta)
+                if not math.isfinite(delta):
+                    raise ValueError("apply_logit_bias: bias 值必须是有限数字")
+                out[i] += delta
+    if banned_ids is not None:
+        for tok in banned_ids:
+            if not isinstance(tok, int) or isinstance(tok, bool):
+                raise ValueError("apply_logit_bias: banned_ids 必须是非负整数")
+            if not 0 <= tok < len(out):
+                raise ValueError(
+                    f"apply_logit_bias: banned token {tok} 越界（词表 {len(out)}）")
+            out[tok] = -1e30
+    return out
+
+
+def _gen_softmax(logits):
+    m = max(logits)
+    exps = [math.exp(v - m) for v in logits]
+    z = sum(exps)
+    return [e / z for e in exps]
+
+
+def top_p_mask(logits, top_p=0.9):
+    """核采样（top-p）掩码：按概率降序累积到 ``top_p``，返回与 logits 对齐的布尔列表。
+
+    至少保留概率最高的一个 token（即使它单独已超过 top_p）。
+    """
+    values = _gen_check_logits(logits, "top_p_mask(logits)")
+    top_p = _gen_check_prob(top_p, "top_p_mask(top_p)")
+    probs = _gen_softmax(values)
+    order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))
+    mask = [False] * len(probs)
+    cumulative = 0.0
+    for i in order:
+        mask[i] = True
+        cumulative += probs[i]
+        if cumulative >= top_p:
+            break
+    return mask
+
+
+def min_p_mask(logits, min_p=0.0):
+    """min-p 掩码：保留概率不低于 ``min_p × 最大概率`` 的 token（至少保留最大者）。"""
+    values = _gen_check_logits(logits, "min_p_mask(logits)")
+    min_p = _gen_check_prob(min_p, "min_p_mask(min_p)", allow_zero=True)
+    probs = _gen_softmax(values)
+    threshold = min_p * max(probs)
+    return [p >= threshold for p in probs]
+
+
+def truncate_at_stop(text, stop_strings, include_stop=False):
+    """在最早的停止字符串处截断文本，返回 ``(prefix, hit)``。
+
+    ``stop_strings`` 可为单个字符串或字符串列表；无命中时返回原文与 ``None``。
+    """
+    if not isinstance(text, str):
+        raise TypeError("truncate_at_stop: text 必须是 str")
+    if isinstance(stop_strings, str):
+        stops = [stop_strings]
+    elif isinstance(stop_strings, (list, tuple)):
+        stops = list(stop_strings)
+    else:
+        raise TypeError("truncate_at_stop: stop_strings 必须是字符串或其列表")
+    best_pos = None
+    best_hit = None
+    for stop in stops:
+        if not isinstance(stop, str) or not stop:
+            raise ValueError("truncate_at_stop: 停止字符串必须是非空 str")
+        pos = text.find(stop)
+        if pos >= 0 and (best_pos is None or pos < best_pos):
+            best_pos = pos
+            best_hit = stop
+    if best_pos is None:
+        return text, None
+    if include_stop:
+        return text[:best_pos + len(best_hit)], best_hit
+    return text[:best_pos], best_hit
+
+
+def generate_with_stops(model, prompt_ids, stop_ids=None, max_new_tokens=8,
+                        temperature=1.0, top_k=0, rng=None, eos_id=None):
+    """逐 token 生成，命中任一停止 token 序列时截掉该序列并停止。
+
+    ``stop_ids`` 是「token id 列表」的列表；返回值只含新生成的 token（不含 prompt，
+    也不含被截掉的停止序列）。
+    """
+    if not hasattr(model, "generate"):
+        raise TypeError("generate_with_stops: model 需要 generate 方法")
+    prompt = _gen_check_token_ids(model, prompt_ids, "generate_with_stops(prompt_ids)")
+    if not prompt:
+        raise ValueError("generate_with_stops: prompt_ids 不能为空")
+    if stop_ids is None:
+        stop_seqs = []
+    elif isinstance(stop_ids, (list, tuple)):
+        stop_seqs = []
+        for seq in stop_ids:
+            seq = _gen_check_token_ids(model, seq, "generate_with_stops(stop_ids)")
+            if not seq:
+                raise ValueError("generate_with_stops: 停止序列不能为空")
+            stop_seqs.append(list(seq))
+    else:
+        raise TypeError("generate_with_stops: stop_ids 必须是列表的列表")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) \
+            or max_new_tokens < 1:
+        raise ValueError("generate_with_stops: max_new_tokens 必须是正整数")
+    if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) \
+            or not math.isfinite(float(temperature)) or temperature <= 0.0:
+        raise ValueError("generate_with_stops: temperature 必须是正有限数字")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+        raise ValueError("generate_with_stops: top_k 必须是非负整数")
+    if eos_id is not None:
+        if not isinstance(eos_id, int) or isinstance(eos_id, bool) \
+                or not 0 <= eos_id < model.vocab_size:
+            raise ValueError("generate_with_stops: eos_id 越界")
+    rng = rng if rng is not None else random
+    generated = []
+    for _ in range(max_new_tokens):
+        ids = prompt + generated
+        nxt = model.generate(ids, max_new_tokens=1, temperature=float(temperature),
+                             top_k=top_k, rng=rng)
+        if not nxt:
+            break
+        token = nxt[-1]
+        if eos_id is not None and token == eos_id:
+            break
+        generated.append(token)
+        matched = None
+        for seq in stop_seqs:
+            if len(generated) >= len(seq) and generated[-len(seq):] == seq:
+                matched = len(seq)
+                break
+        if matched is not None:
+            generated = generated[:-matched]
+            break
+    return generated
+
+
+def detect_degeneration(tokens, max_run=3, max_ngram=2, ngram_size=3):
+    """检测生成退化：连续重复 token 超过 ``max_run`` 或同一 n-gram 重复超过 ``max_ngram``。
+
+    返回 ``{"degenerate": bool, "reason": str|None, "position": int|None}``。
+    """
+    if not isinstance(tokens, (list, tuple)):
+        raise TypeError("detect_degeneration: tokens 必须是列表")
+    toks = list(tokens)
+    for t in toks:
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+            raise ValueError("detect_degeneration: token 必须是非负整数")
+    if isinstance(max_run, bool) or not isinstance(max_run, int) or max_run < 1:
+        raise ValueError("detect_degeneration: max_run 必须是正整数")
+    if isinstance(max_ngram, bool) or not isinstance(max_ngram, int) or max_ngram < 1:
+        raise ValueError("detect_degeneration: max_ngram 必须是正整数")
+    if isinstance(ngram_size, bool) or not isinstance(ngram_size, int) or ngram_size < 2:
+        raise ValueError("detect_degeneration: ngram_size 必须 >= 2")
+    run = 1
+    for i in range(1, len(toks)):
+        if toks[i] == toks[i - 1]:
+            run += 1
+            if run > max_run:
+                return {"degenerate": True, "reason": "token run", "position": i}
+        else:
+            run = 1
+    counts = {}
+    for i in range(len(toks) - ngram_size + 1):
+        gram = tuple(toks[i:i + ngram_size])
+        counts[gram] = counts.get(gram, 0) + 1
+        if counts[gram] > max_ngram:
+            return {"degenerate": True, "reason": "ngram repeat",
+                    "position": i}
+    return {"degenerate": False, "reason": None, "position": None}
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环
