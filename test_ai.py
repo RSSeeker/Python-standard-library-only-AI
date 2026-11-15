@@ -51425,3 +51425,96 @@ class TestGrammarSampler:
         g2 = AI.RegexGrammar("1+")
         assert _gs_raises(lambda: AI.grammar_sample(
             g2, [], [0.1, 0.2], ["2", "3"]))
+
+
+import math
+
+import AI
+
+
+def _mm_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestMultimodalProjection:
+    def test_similarity_and_nce_math(self):
+        sim = AI.blip_similarity_matrix([[1.0, 0.0], [0.0, 1.0]],
+                                        [[1.0, 0.0], [0.0, 1.0]],
+                                        temperature=0.5)
+        assert abs(sim[0][0] - 2.0) < 1e-12
+        assert abs(sim[1][1] - 2.0) < 1e-12
+        assert abs(sim[0][1]) < 1e-12
+        loss = AI.blip_contrastive_loss([[1.0, 0.0], [0.0, 1.0]],
+                                        [[1.0, 0.0], [0.0, 1.0]],
+                                        temperature=1.0)
+        assert abs(loss - (math.log(1 + math.e) - 1.0)) < 1e-9
+        worse = AI.blip_contrastive_loss([[1.0, 0.0], [0.0, 1.0]],
+                                         [[0.0, 1.0], [1.0, 0.0]],
+                                         temperature=1.0)
+        assert worse > loss
+
+    def test_blip_projector_forward(self):
+        proj = AI.BlipProjector(4, 3, hidden=5)
+        assert proj.num_parameters() == 4 * 5 + 5 + 5 * 3 + 3
+        out = proj.forward([[1.0, 0.0, 0.5, -0.5], [0.0, 1.0, -0.3, 0.2]])
+        assert out.shape == (2, 3)
+        assert len(out.tolist()) == 2 and len(out.tolist()[0]) == 3
+
+    def test_blip_training_reduces_loss(self):
+        images = [[1.0, 0.0, 0.5, -0.5], [0.0, 1.0, -0.3, 0.2]]
+        texts = [[1.0, 0.2, 0.0], [0.1, 1.0, 0.3]]
+        proj = AI.BlipProjector(4, 3, hidden=5, seed=3)
+        before = AI.blip_contrastive_loss_module(proj, images, texts).item()
+        opt = AI.AdamModule(proj, lr=0.05)
+        for _ in range(40):
+            opt.zero_grad()
+            loss = AI.blip_contrastive_loss_module(proj, images, texts)
+            loss.backward()
+            opt.step()
+        after = AI.blip_contrastive_loss_module(proj, images, texts).item()
+        assert after < before * 0.5
+        err = AI.module_grad_check(
+            proj, lambda: AI.blip_contrastive_loss_module(proj, images, texts),
+            eps=1e-4)
+        assert err < 1e-3
+
+    def test_llava_merge_and_projector(self):
+        text_emb = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+        image_emb = [[9.0, 9.0], [8.0, 8.0]]
+        merged = AI.llava_merge_tokens(text_emb, image_emb, position=1)
+        assert len(merged) == 5
+        assert merged[0] == [1.0, 0.0]
+        assert merged[1] == [9.0, 9.0]
+        assert merged[3] == [0.0, 1.0]
+        assert merged[4] == [0.5, 0.5]
+        proj = AI.LlavaProjector(4, 3, hidden=5, seed=5)
+        patches = [[1.0, 0.0, 0.5, -0.5], [0.0, 1.0, -0.3, 0.2]]
+        out = proj.forward(patches)
+        assert out.shape == (2, 3)
+        plist = proj.project(patches)
+        assert isinstance(plist, list) and len(plist) == 2
+        text3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 0.0]]
+        merged2 = AI.llava_merge_tokens(text3, plist, position=2)
+        assert len(merged2) == 5 and merged2[2] == plist[0]
+
+    def test_invalid_inputs(self):
+        assert _mm_raises(lambda: AI.blip_similarity_matrix([], [[1.0]]))
+        assert _mm_raises(lambda: AI.blip_similarity_matrix(
+            [[1.0, 2.0]], [[1.0]]))
+        assert _mm_raises(lambda: AI.blip_similarity_matrix(
+            [[0.0, 0.0]], [[1.0, 0.0]]))
+        assert _mm_raises(lambda: AI.blip_similarity_matrix(
+            [[1.0]], [[1.0]], temperature=0.0))
+        assert _mm_raises(lambda: AI.BlipProjector(0, 3))
+        assert _mm_raises(lambda: AI.BlipProjector(4, 3, hidden=0))
+        assert _mm_raises(lambda: AI.llava_merge_tokens(
+            [[1.0, 2.0]], [[1.0, 2.0]], position=-1))
+        assert _mm_raises(lambda: AI.llava_merge_tokens(
+            [[1.0, 2.0]], [[1.0, 2.0]], position=2))
+        assert _mm_raises(lambda: AI.llava_merge_tokens(
+            [[1.0, 2.0]], [[1.0]]))
+        assert _mm_raises(lambda: AI.llava_merge_tokens([[]], [[1.0]]))

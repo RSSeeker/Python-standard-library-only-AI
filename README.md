@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3161 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3166 项）
 
 ## 特性
 
@@ -4233,6 +4233,39 @@ loss, grad = AI.mae_loss(recon, patches, masked)
 
 三条边界：`patchify` 只做展平切块，不做归一化；`mae_loss` 的梯度是针对 **重建输出** 的，不是参数梯度；`beit_loss` 需要外部先给每个 patch 的离散目标（dVAE token），本库不训练那个 tokenizer。
 
+### 多模态投影（BLIP 式对比投影 / LLaVA 式视觉 token 拼接）
+
+```python
+import AI
+
+# BLIP：图像/文本各自编码后投影到同一空间，再算对比损失
+proj = AI.BlipProjector(image_dim=512, text_dim=256, hidden=512, seed=0)
+sim = AI.blip_similarity_matrix(image_embeds, text_embeds, temperature=0.07)
+loss = AI.blip_contrastive_loss(image_embeds, text_embeds)
+
+# 需要反向时用 Tensor 版本（返回可 backward 的标量）
+loss_t = AI.blip_contrastive_loss_module(proj, image_embeds, text_embeds)
+loss_t.backward()
+
+# LLaVA：把视觉 token 投影后拼进文本 token 序列
+vproj = AI.LlavaProjector(in_dim=512, d_model=256, hidden=512)
+patches = vproj.project(patch_embeds)          # 嵌套 list
+merged = AI.llava_merge_tokens(text_embeds, patches, position=0)
+```
+
+| API | 说明 |
+| --- | --- |
+| `blip_similarity_matrix(image_embeds, text_embeds, temperature=0.07)` | 行归一化后的余弦相似度矩阵（除以温度），返回 N×N 嵌套 list |
+| `blip_contrastive_loss(image_embeds, text_embeds, temperature=0.07)` | 对称 InfoNCE（行、列各做一次，除以 2N），纯数值 |
+| `blip_contrastive_loss_module(projector, image_embeds, text_embeds, ...)` | 用 autograd 计算图搭出的可反传对比损失（对角掩码版），返回标量 Tensor |
+| `class BlipProjector(image_dim, text_dim, hidden=None)` | 两层 MLP 投影（Linear→ReLU→Linear），`forward()` 返回 Tensor |
+| `llava_merge_tokens(text_embeds, image_embeds, position=0)` | 在文本 token 序列指定位置插入视觉 token（维度须一致） |
+| `class LlavaProjector(in_dim, d_model, hidden=None)` | 视觉 patch 投影的两层 MLP，`project()` 返回嵌套 list |
+
+边界：投影层只是结构占位，不包含图像/文本编码器（需外部提供 embedding）；
+`blip_similarity_matrix` 对零范数向量显式报错；`llava_merge_tokens` 只做拼接、不做
+位置编码重算或 attention mask 修改；对比损失为对称 InfoNCE，不区分 hard negative。
+
 ### 多模态：CLIP 双塔与跨模态融合
 
 | API | 说明 |
@@ -5834,12 +5867,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3109 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3114 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3161 项）。
+`tests/`（合计 3166 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5847,7 +5880,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3161 项
+pytest -q                        # test_ai.py + tests/ 合计 3166 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7679,7 +7712,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3161 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3166 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8196,6 +8229,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestNBeats` | 基函数手算、block 参数 93 与两处 FD、模型参数 418 与训练降半、forward/loss_and_backward、9 类非法输入 |
 | `TestReMax` | history 字段与权重更新、`lr=None` 不更新、bool/数字奖励接受且 NaN/字符串报错、单样本优势恒零、10 类非法输入 |
 | `TestGrammarSampler` | 正则/CFG 允许集、采样只落允许集、温度与 top-k、同 seed 复现、空允许集与九类非法输入 |
+| `TestMultimodalProjection` | 相似度矩阵与 InfoNCE 数值、BlipProjector 参数/前向与训练收敛、给定输入梯度检查、LLaVA 拼接与投影形状、十类非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |

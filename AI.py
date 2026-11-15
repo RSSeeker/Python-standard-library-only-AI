@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2104 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2111 个 def / 473 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -28406,6 +28406,202 @@ class NBeats:
             if verbose:
                 print(f"NBeats epoch {len(history)}: loss={history[-1]:.6f}")
         return history
+
+
+# ---- 多模态：BLIP 式投影 + LLaVA 式视觉 token 拼接 ----
+
+
+def _mm_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name}: 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _mm_check_2d(value, who):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{who}: 必须是非空二维列表")
+    rows = []
+    width = None
+    for row in value:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 每一行必须是非空列表")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError(f"{who}: 各行长度不一致（{width} vs {len(row)}）")
+        out = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 元素必须是数字，收到 {v!r}")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 元素必须是有限数字")
+            out.append(float(v))
+        rows.append(out)
+    return rows
+
+
+def _mm_check_vec(value, who):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{who}: 必须是非空向量")
+    out = []
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{who}: 元素必须是数字，收到 {v!r}")
+        if not math.isfinite(float(v)):
+            raise ValueError(f"{who}: 元素必须是有限数字")
+        out.append(float(v))
+    return out
+
+
+def blip_similarity_matrix(image_embeds, text_embeds, temperature=0.07):
+    """BLIP/CLIP 式图文相似度矩阵（余弦相似度先归一化再除以温度）。"""
+    image = _mm_check_2d(image_embeds, "blip_similarity_matrix(image_embeds)")
+    text = _mm_check_2d(text_embeds, "blip_similarity_matrix(text_embeds)")
+    if len(image) != len(text):
+        raise ValueError(
+            f"blip_similarity_matrix: 图片与文本批大小必须一致，收到 "
+            f"{len(image)} 与 {len(text)}")
+    if len(image[0]) != len(text[0]):
+        raise ValueError(
+            f"blip_similarity_matrix: 图片与文本嵌入维度必须一致，收到 "
+            f"{len(image[0])} 与 {len(text[0])}")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError("blip_similarity_matrix: temperature 必须是数字")
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("blip_similarity_matrix: temperature 必须是正的有限数字")
+    t = float(temperature)
+
+    def normalize(rows):
+        normed = []
+        for row in rows:
+            norm = math.sqrt(sum(v * v for v in row))
+            if norm <= 1e-12:
+                raise ValueError("blip_similarity_matrix: 嵌入向量的范数不能为 0")
+            normed.append([v / norm for v in row])
+        return normed
+
+    image_n = normalize(image)
+    text_n = normalize(text)
+    sim = [[sum(image_n[i][k] * text_n[j][k] for k in range(len(image_n[i])))
+            / t for j in range(len(text_n))] for i in range(len(image_n))]
+    return sim
+
+
+def blip_contrastive_loss(image_embeds, text_embeds, temperature=0.07):
+    """对称 InfoNCE（BLIP/CLIP 的训练目标），返回标量损失。"""
+    sim = blip_similarity_matrix(image_embeds, text_embeds, temperature)
+    n = len(sim)
+    total = 0.0
+    for i in range(n):
+        row = sim[i]
+        mx = max(row)
+        lse = mx + math.log(sum(math.exp(v - mx) for v in row))
+        total += lse - row[i]
+        col = [sim[j][i] for j in range(n)]
+        mxc = max(col)
+        lsec = mxc + math.log(sum(math.exp(v - mxc) for v in col))
+        total += lsec - col[i]
+    return total / (2.0 * n)
+
+
+class BlipProjector(Module):
+    """BLIP 式投影头：图像特征 -> 文本嵌入空间（两层 MLP，autograd 可训）。"""
+
+    def __init__(self, image_dim, text_dim, hidden=None, seed=None):
+        super().__init__()
+        self.image_dim = _mm_check_pos_int(image_dim, "BlipProjector(image_dim)")
+        self.text_dim = _mm_check_pos_int(text_dim, "BlipProjector(text_dim)")
+        hidden = max(8, self.text_dim) if hidden is None else hidden
+        self.hidden = _mm_check_pos_int(hidden, "BlipProjector(hidden)")
+        self.net = SequentialModule(
+            LinearModule(self.image_dim, self.hidden, seed=seed),
+            ReLUModule(),
+            LinearModule(self.hidden, self.text_dim, seed=seed),
+        )
+
+    def forward(self, image_embeds):
+        """image_embeds: (N, image_dim) 二维列表；返回 (N, text_dim) 张量。"""
+        x = Tensor(_mm_check_2d(image_embeds, "BlipProjector.forward"),
+                   requires_grad=False)
+        return self.net(x)
+
+
+def blip_contrastive_loss_module(projector, image_embeds, text_embeds,
+                                 temperature=0.07):
+    """用 autograd 张量算对称 InfoNCE，返回可 backward() 的标量 Tensor。"""
+    if not isinstance(projector, BlipProjector):
+        raise TypeError("blip_contrastive_loss_module: projector 必须是 BlipProjector")
+    image = _mm_check_2d(image_embeds, "blip_contrastive_loss_module(image_embeds)")
+    text = _mm_check_2d(text_embeds, "blip_contrastive_loss_module(text_embeds)")
+    if len(image) != len(text):
+        raise ValueError("blip_contrastive_loss_module: 图片与文本批大小必须一致")
+    if len(text[0]) != projector.text_dim:
+        raise ValueError(
+            f"blip_contrastive_loss_module: 文本嵌入维度应为 {projector.text_dim}，"
+            f"收到 {len(text[0])}")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError("blip_contrastive_loss_module: temperature 必须是数字")
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("blip_contrastive_loss_module: temperature 必须是正的有限数字")
+    t = float(temperature)
+
+    img = projector.forward(image)
+    txt = Tensor(text, requires_grad=False)
+    sim = ag_div(ag_matmul(img, ag_transpose(txt)), t)
+    n = len(image)
+    mask = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    mask_t = Tensor(mask)
+    logp_row = ag_log_softmax(sim)
+    logp_col = ag_log_softmax(ag_transpose(sim))
+    loss_row = ag_neg(ag_sum(ag_mul(logp_row, mask_t)))
+    loss_col = ag_neg(ag_sum(ag_mul(logp_col, mask_t)))
+    return ag_div(ag_add(loss_row, loss_col), 2.0 * n)
+
+
+def llava_merge_tokens(text_embeds, image_embeds, position=0):
+    """LLaVA 式拼接：把图像 token 行插进文本 token 序列（不改变行内维度）。"""
+    text = _mm_check_2d(text_embeds, "llava_merge_tokens(text_embeds)")
+    image = _mm_check_2d(image_embeds, "llava_merge_tokens(image_embeds)")
+    if len(text[0]) != len(image[0]):
+        raise ValueError(
+            f"llava_merge_tokens: 文本与图像 token 维度必须一致，收到 "
+            f"{len(text[0])} 与 {len(image[0])}")
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError("llava_merge_tokens: position 必须是整数")
+    if position < 0 or position > len(text):
+        raise ValueError(
+            f"llava_merge_tokens: position 必须在 [0, {len(text)}] 内，"
+            f"收到 {position}")
+    return [list(row) for row in text[:position]] + \
+           [list(row) for row in image] + \
+           [list(row) for row in text[position:]]
+
+
+class LlavaProjector(Module):
+    """LLaVA 式视觉投影头：patch 特征 -> 与文本对齐的 d_model 维 token。"""
+
+    def __init__(self, in_dim, d_model, hidden=None, seed=None):
+        super().__init__()
+        self.in_dim = _mm_check_pos_int(in_dim, "LlavaProjector(in_dim)")
+        self.d_model = _mm_check_pos_int(d_model, "LlavaProjector(d_model)")
+        hidden = self.d_model if hidden is None else hidden
+        self.hidden = _mm_check_pos_int(hidden, "LlavaProjector(hidden)")
+        self.net = SequentialModule(
+            LinearModule(self.in_dim, self.hidden, seed=seed),
+            ReLUModule(),
+            LinearModule(self.hidden, self.d_model, seed=seed),
+        )
+
+    def forward(self, patch_embeds):
+        """patch_embeds: (num_patches, in_dim) 二维列表；返回 (num_patches, d_model)。"""
+        x = Tensor(_mm_check_2d(patch_embeds, "LlavaProjector.forward"),
+                   requires_grad=False)
+        return self.net(x)
+
+    def project(self, patch_embeds):
+        """返回嵌套 list（便于与 llava_merge_tokens 组合）。"""
+        out = self.forward(patch_embeds)
+        return out.tolist()
 
 class MLP:
     """多层感知机（PyTorch 风格）"""
