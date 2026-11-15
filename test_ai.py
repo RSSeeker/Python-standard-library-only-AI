@@ -51135,3 +51135,104 @@ class TestTrainerPassthrough:
             if _tp_raises(fn):
                 bad += 1
         assert bad == 11
+
+
+import math
+import random
+
+import AI
+
+
+def _nb_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _nb_series(n=48):
+    return [0.5 * t + math.sin(2.0 * math.pi * t / 12.0) for t in range(n)]
+
+
+class TestNBeats:
+    def test_basis_functions(self):
+        trend = AI._nb_basis_forecast("trend", [1.0, 2.0, 3.0], 4)
+        assert max(abs(a - b) for a, b in
+                   zip(trend, [1.0, 1.6875, 2.75, 4.1875])) < 1e-12
+        season = AI._nb_basis_forecast("seasonal", [1.0, 0.0], 4)
+        expect = [1.0, 0.0, -1.0, 0.0]
+        assert max(abs(a - b) for a, b in zip(season, expect)) < 1e-12
+        generic = AI._nb_basis_forecast("generic", [0.3, -0.2], 2)
+        assert generic == [0.3, -0.2]
+        d_theta = AI._nb_basis_backward("trend", [1.0, 2.0, 3.0],
+                                        [1.0, 1.0, 1.0, 1.0], 4)
+        assert len(d_theta) == 3 and all(math.isfinite(v) for v in d_theta)
+
+    def test_block_forward_and_gradients(self):
+        blk = AI.NBeatsBlock(lookback=6, horizon=3, d_hidden=4, num_layers=2,
+                             basis="generic", seed=1)
+        assert blk.param_count() == 93
+        x = [0.1, -0.2, 0.3, 0.05, 0.0, 0.4]
+        wb = [0.5, -0.3, 0.2, 0.1, -0.4, 0.05]
+        wf = [0.2, -0.1, 0.3]
+
+        def loss():
+            backcast, forecast = blk.forward(x)
+            return sum(backcast[i] * wb[i] for i in range(len(wb))) + \
+                sum(forecast[i] * wf[i] for i in range(len(wf)))
+
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(wb, wf)
+        blk._ensure_grad()
+        h = 1e-6
+        checks = [(blk.layers[0], blk.grad_layers[0], 1, 2),
+                  (blk.head_forecast, blk.grad_head_forecast, 2, 1)]
+        for layer, grad, i, j in checks:
+            p0 = layer.weights[i][j]
+            layer.weights[i][j] = p0 + h
+            lp = loss()
+            layer.weights[i][j] = p0 - h
+            lm = loss()
+            layer.weights[i][j] = p0
+            num = (lp - lm) / (2 * h)
+            ana = grad[0][i][j]
+            assert abs(num - ana) < 1e-5 * max(1.0, abs(num)), (ana, num)
+
+    def test_model_fit_and_param_count(self):
+        series = _nb_series()
+        lookback, horizon = 6, 3
+        windows = [([series[t + k] for k in range(lookback)],
+                    [series[t + lookback + k] for k in range(horizon)])
+                   for t in range(36)]
+        model = AI.NBeats(lookback=lookback, horizon=horizon, num_blocks=2,
+                          basis="trend", d_hidden=8, num_layers=2, degree=2,
+                          seed=3)
+        assert model.param_count() == 418
+        hist = model.fit(windows, epochs=40, lr=0.02, seed=1)
+        assert len(hist) == 40
+        assert hist[-1] < hist[0] * 0.5
+
+    def test_forward_composition(self):
+        model = AI.NBeats(lookback=4, horizon=2, num_blocks=2, basis="generic",
+                          d_hidden=6, num_layers=1, seed=5)
+        x = [0.1, 0.2, 0.3, 0.4]
+        out = model.forward(x)
+        assert len(out) == 2 and all(math.isfinite(v) for v in out)
+        loss, dx = model.loss_and_backward(x, [0.5, -0.5])
+        assert math.isfinite(loss) and len(dx) == 4
+
+    def test_invalid_inputs(self):
+        assert _nb_raises(lambda: AI.NBeatsBlock(0, 3))
+        assert _nb_raises(lambda: AI.NBeatsBlock(6, -1))
+        assert _nb_raises(lambda: AI.NBeatsBlock(6, 3, basis="poly"))
+        assert _nb_raises(lambda: AI.NBeatsBlock(6, 3, basis="trend", degree=0))
+        blk = AI.NBeatsBlock(6, 3, seed=1)
+        assert _nb_raises(lambda: blk.forward([0.1, 0.2]))
+        assert _nb_raises(lambda: blk.backward([0.0] * 6, [0.0] * 3))
+        blk.forward([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        assert _nb_raises(lambda: blk.backward([0.0] * 6, [0.0] * 2))
+        model = AI.NBeats(lookback=4, horizon=2, seed=2)
+        assert _nb_raises(lambda: model.fit([], epochs=1))
+        assert _nb_raises(lambda: model.fit([([0.1], [0.2])], epochs=1))

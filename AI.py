@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2092 个 def / 469 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2097 个 def / 471 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -27981,6 +27981,316 @@ def ag_pow(x, exponent):
 
     out._backward_fn = _backward
     return out
+
+
+"""简化 N-BEATS（2020）：残差堆叠的「基函数」时序预测（手写反向）。
+
+每个 block 用共享 FC 栈从回看窗口预测两个基系数（forecast / backcast），
+再展开成未来 horizon 步预测与对输入窗口的重建；残差逐块扣减 backcast，
+forecast 逐块相加。基函数支持 generic / trend（多项式）/ seasonal（Fourier）。
+
+纯 Python 教学实现：单通道、单样本内循环、SGD 更新。
+"""
+
+import math
+import random
+
+import AI
+
+
+def _nb_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+    return value
+
+
+def _nb_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是数字，收到 {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} 必须是有限正数，收到 {value!r}")
+    return value
+
+
+def _nb_check_window(x, length, who):
+    if not isinstance(x, (list, tuple)):
+        raise TypeError(f"{who}: 输入必须是列表，收到 {type(x).__name__}")
+    if len(x) != length:
+        raise ValueError(f"{who}: 输入长度 {len(x)} 与期望 {length} 不一致")
+    out = []
+    for v in x:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise ValueError(f"{who}: 元素必须是有限数字，收到 {v!r}")
+        out.append(float(v))
+    return out
+
+
+def _nb_basis_forecast(basis, theta, horizon):
+    if basis == "generic":
+        return list(theta)
+    if basis == "trend":
+        out = []
+        degree = len(theta) - 1
+        for t in range(horizon):
+            u = t / float(horizon)
+            acc = 0.0
+            p = 1.0
+            for k in range(degree + 1):
+                acc += theta[k] * p
+                p *= u
+            out.append(acc)
+        return out
+    harmonics = len(theta) // 2
+    out = []
+    for t in range(horizon):
+        u = 2.0 * math.pi * t / float(horizon)
+        acc = 0.0
+        for k in range(harmonics):
+            acc += theta[2 * k] * math.cos((k + 1) * u)
+            acc += theta[2 * k + 1] * math.sin((k + 1) * u)
+        out.append(acc)
+    return out
+
+
+def _nb_basis_backward(basis, theta, d_forecast, horizon):
+    if basis == "generic":
+        return list(d_forecast)
+    if basis == "trend":
+        degree = len(theta) - 1
+        d_theta = [0.0] * len(theta)
+        for t in range(horizon):
+            u = t / float(horizon)
+            p = 1.0
+            for k in range(degree + 1):
+                d_theta[k] += d_forecast[t] * p
+                p *= u
+        return d_theta
+    harmonics = len(theta) // 2
+    d_theta = [0.0] * len(theta)
+    for t in range(horizon):
+        u = 2.0 * math.pi * t / float(horizon)
+        for k in range(harmonics):
+            d_theta[2 * k] += d_forecast[t] * math.cos((k + 1) * u)
+            d_theta[2 * k + 1] += d_forecast[t] * math.sin((k + 1) * u)
+    return d_theta
+
+
+class NBeatsBlock:
+    """一个 N-BEATS block：共享 FC 栈 + forecast / backcast 两个线性头。"""
+
+    def __init__(self, lookback, horizon, d_hidden=16, num_layers=2,
+                 basis="generic", degree=3, num_harmonics=2, seed=None):
+        self.lookback = _nb_check_pos_int(lookback, "lookback")
+        self.horizon = _nb_check_pos_int(horizon, "horizon")
+        self.d_hidden = _nb_check_pos_int(d_hidden, "d_hidden")
+        self.num_layers = _nb_check_pos_int(num_layers, "num_layers")
+        if basis not in ("generic", "trend", "seasonal"):
+            raise ValueError(f"basis 必须是 generic/trend/seasonal，收到 {basis!r}")
+        self.basis = basis
+        if basis == "trend":
+            self.degree = _nb_check_pos_int(degree, "degree")
+            theta_dim = self.degree + 1
+        elif basis == "seasonal":
+            self.num_harmonics = _nb_check_pos_int(num_harmonics, "num_harmonics")
+            theta_dim = 2 * self.num_harmonics
+            self.degree = 0
+        else:
+            self.degree = 0
+            self.num_harmonics = 0
+            theta_dim = self.horizon
+        self.theta_dim = theta_dim
+
+        rng = random.Random(seed)
+        state = random.getstate()
+        random.seed(rng.randrange(1 << 30))
+        try:
+            self.layers = [AI.Layer(self.lookback, self.d_hidden, "relu")]
+            for _ in range(self.num_layers - 1):
+                self.layers.append(AI.Layer(self.d_hidden, self.d_hidden, "relu"))
+            self.head_forecast = AI.Layer(self.d_hidden, theta_dim, "linear")
+            self.head_backcast = AI.Layer(self.d_hidden, self.lookback, "linear")
+        finally:
+            random.setstate(state)
+        self._cache_head_b = None
+        self._cache_head_f = None
+        self._caches = []
+        self._theta_f = None
+        self.zero_grad()
+
+    # ---------- 参数管理 ----------
+    def zero_grad(self):
+        self.grad_layers = [None] * len(self.layers)
+        self.grad_head_forecast = None
+        self.grad_head_backcast = None
+
+    @staticmethod
+    def _zeros_like(layer):
+        return ([[0.0] * layer.fan_in for _ in range(layer.fan_out)],
+                [0.0] * layer.fan_out)
+
+    def _ensure_grad(self):
+        if self.grad_layers[0] is not None:
+            return
+        self.grad_layers = [self._zeros_like(layer) for layer in self.layers]
+        self.grad_head_forecast = self._zeros_like(self.head_forecast)
+        self.grad_head_backcast = self._zeros_like(self.head_backcast)
+
+    def param_count(self):
+        total = sum(AI._dense_param_count(layer) for layer in self.layers)
+        total += AI._dense_param_count(self.head_forecast)
+        total += AI._dense_param_count(self.head_backcast)
+        return total
+
+    def sgd_step(self, lr):
+        lr = _nb_check_positive(lr, "lr")
+        self._ensure_grad()
+        for layer, grad in zip(self.layers, self.grad_layers):
+            AI._dense_apply_sgd(layer, grad, lr)
+        AI._dense_apply_sgd(self.head_forecast, self.grad_head_forecast, lr)
+        AI._dense_apply_sgd(self.head_backcast, self.grad_head_backcast, lr)
+
+    # ---------- 前向 / 反向 ----------
+    def forward(self, x):
+        x = _nb_check_window(x, self.lookback, "NBeatsBlock.forward(x)")
+        rows = [x]
+        self._caches = []
+        for layer in self.layers:
+            rows, cache = AI._dense_rows_forward(layer, rows)
+            self._caches.append(cache)
+        hidden = rows[0]
+        theta_f_rows, self._cache_head_f = AI._dense_rows_forward(
+            self.head_forecast, [hidden])
+        theta_b_rows, self._cache_head_b = AI._dense_rows_forward(
+            self.head_backcast, [hidden])
+        self._theta_f = theta_f_rows[0]
+        forecast = _nb_basis_forecast(self.basis, self._theta_f, self.horizon)
+        backcast = theta_b_rows[0]
+        return backcast, forecast
+
+    def backward(self, d_backcast, d_forecast):
+        if self._cache_head_b is None:
+            raise RuntimeError("NBeatsBlock.backward: 必须先调用 forward")
+        if not isinstance(d_backcast, (list, tuple)) or len(d_backcast) != self.lookback:
+            raise ValueError("NBeatsBlock.backward: d_backcast 长度错误")
+        if not isinstance(d_forecast, (list, tuple)) or len(d_forecast) != self.horizon:
+            raise ValueError("NBeatsBlock.backward: d_forecast 长度错误")
+        d_backcast = [float(v) for v in d_backcast]
+        d_forecast = [float(v) for v in d_forecast]
+        self._ensure_grad()
+        d_theta_f = _nb_basis_backward(self.basis, self._theta_f, d_forecast,
+                                       self.horizon)
+        gw_f, gb_f, dx_f = AI._dense_rows_backward(
+            self.head_forecast, self._cache_head_f, [d_theta_f])
+        gw_b, gb_b, dx_b = AI._dense_rows_backward(
+            self.head_backcast, self._cache_head_b, [d_backcast])
+        for target, gw, gb in ((self.grad_head_forecast, gw_f, gb_f),
+                               (self.grad_head_backcast, gw_b, gb_b)):
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    target[0][i][j] += gw[i][j]
+            for i in range(len(gb)):
+                target[1][i] += gb[i]
+        d_hidden = [dx_f[0][k] + dx_b[0][k] for k in range(self.d_hidden)]
+        for idx in range(len(self.layers) - 1, -1, -1):
+            layer = self.layers[idx]
+            gw, gb, dx = AI._dense_rows_backward(layer, self._caches[idx],
+                                                  [d_hidden])
+            grad = self.grad_layers[idx]
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    grad[0][i][j] += gw[i][j]
+            for i in range(len(gb)):
+                grad[1][i] += gb[i]
+            d_hidden = dx[0]
+        return d_hidden
+
+
+class NBeats:
+    """残差堆叠的 N-BEATS 预测器：``num_blocks`` 个 block 依次扣减 backcast。"""
+
+    def __init__(self, lookback, horizon, num_blocks=2, basis="generic",
+                 d_hidden=16, num_layers=2, degree=3, num_harmonics=2,
+                 seed=None):
+        self.lookback = _nb_check_pos_int(lookback, "lookback")
+        self.horizon = _nb_check_pos_int(horizon, "horizon")
+        self.num_blocks = _nb_check_pos_int(num_blocks, "num_blocks")
+        if basis not in ("generic", "trend", "seasonal"):
+            raise ValueError(f"basis 必须是 generic/trend/seasonal，收到 {basis!r}")
+        self.basis = basis
+        self.blocks = []
+        for k in range(self.num_blocks):
+            block_seed = None
+            if seed is not None:
+                block_seed = random.Random(seed + k).randrange(1 << 30)
+            self.blocks.append(NBeatsBlock(
+                self.lookback, self.horizon, d_hidden=d_hidden,
+                num_layers=num_layers, basis=basis, degree=degree,
+                num_harmonics=num_harmonics, seed=block_seed))
+
+    def param_count(self):
+        return sum(block.param_count() for block in self.blocks)
+
+    def zero_grad(self):
+        for block in self.blocks:
+            block.zero_grad()
+
+    def forward(self, x):
+        x = _nb_check_window(x, self.lookback, "NBeats.forward(x)")
+        residual = list(x)
+        forecast = [0.0] * self.horizon
+        for block in self.blocks:
+            backcast, block_forecast = block.forward(residual)
+            residual = [residual[i] - backcast[i] for i in range(self.lookback)]
+            forecast = [forecast[i] + block_forecast[i]
+                        for i in range(self.horizon)]
+        return forecast
+
+    def loss_and_backward(self, x, y):
+        x = _nb_check_window(x, self.lookback, "NBeats.loss_and_backward(x)")
+        y = _nb_check_window(y, self.horizon, "NBeats.loss_and_backward(y)")
+        forecast = self.forward(x)
+        loss = sum((forecast[i] - y[i]) ** 2 for i in range(self.horizon)) \
+            / self.horizon
+        d_forecast = [2.0 * (forecast[i] - y[i]) / self.horizon
+                      for i in range(self.horizon)]
+        d_residual = [0.0] * self.lookback
+        for block in reversed(self.blocks):
+            dx = block.backward([-v for v in d_residual], d_forecast)
+            d_residual = [d_residual[i] + dx[i] for i in range(self.lookback)]
+        return loss, d_residual
+
+    def fit(self, windows, epochs=100, lr=0.01, seed=None, shuffle=True,
+            verbose=False):
+        if not isinstance(windows, (list, tuple)) or not windows:
+            raise ValueError("NBeats.fit: windows 必须是非空列表")
+        epochs = _nb_check_pos_int(epochs, "epochs")
+        lr = _nb_check_positive(lr, "lr")
+        pairs = []
+        for item in windows:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("NBeats.fit: 每个样本必须是 (x, y) 二元组")
+            x = _nb_check_window(item[0], self.lookback, "NBeats.fit(x)")
+            y = _nb_check_window(item[1], self.horizon, "NBeats.fit(y)")
+            pairs.append((x, y))
+        rng = random.Random(seed)
+        history = []
+        for _ in range(epochs):
+            order = list(range(len(pairs)))
+            if shuffle:
+                rng.shuffle(order)
+            total = 0.0
+            for idx in order:
+                x, y = pairs[idx]
+                self.zero_grad()
+                loss, _ = self.loss_and_backward(x, y)
+                for block in self.blocks:
+                    block.sgd_step(lr)
+                total += loss
+            history.append(total / len(pairs))
+            if verbose:
+                print(f"NBeats epoch {len(history)}: loss={history[-1]:.6f}")
+        return history
 
 class MLP:
     """多层感知机（PyTorch 风格）"""

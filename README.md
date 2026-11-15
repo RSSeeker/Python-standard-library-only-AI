@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3146 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3151 项）
 
 ## 特性
 
@@ -5030,6 +5030,25 @@ shared_avg, privates = fedbn_average(updates)
 - `fedprox_penalty` 的梯度是对 `local` 的（`mu*(local-global)`），客户端把它加到自己的梯度上即可，本库不替你合并。
 - `fedbn_split` 按**键名前缀**区分私有参数，`fedbn_average` 只平均共享键；若所有键都是私有会直接报错，而不是静默返回空。
 
+### N-BEATS（残差基函数时序预测）
+
+| API | 说明 |
+| --- | --- |
+| `NBeatsBlock(lookback, horizon, d_hidden=16, num_layers=2, basis="generic", degree=3, num_harmonics=2, seed=None)` | 单个 block：共享 FC 栈分别接 forecast/backcast 头，`basis` 决定输出基（generic 直出、trend 多项式、seasonal Fourier 谐波）；带手写反向 |
+| `_nb_basis_forecast(basis, theta, horizon)` / `_nb_basis_backward(basis, theta, d_forecast, horizon)` | 基函数的前向与反向（可单独验证、也可组合） |
+| `NBeats(lookback, horizon, num_blocks=2, d_hidden=16, num_layers=2, basis="generic", degree=3, num_harmonics=2, seed=None)` | 残差堆叠：逐 block 从输入中扣掉 backcast、forecast 累加；`fit(windows, epochs, lr, seed, shuffle)`、`forward`、`loss_and_backward`、`param_count` |
+
+```python
+model = AI.NBeats(lookback=24, horizon=6, num_blocks=2, basis="trend",
+                  d_hidden=16, degree=3, seed=1)
+hist = model.fit([(x_window, y_horizon), ...], epochs=50, lr=0.02)
+future = model.forward(history_window)
+```
+
+边界：block 的 FC 栈参数在 forecast/backcast 两头共享；`basis` 只影响输出基；
+趋势基用 `u=t/horizon` 的多项式、季节基用固定谐波；`fit` 是单样本 SGD 训练循环，
+不含 batch/验证集/正则。
+
 ### 时序模型（TCN / Informer / Autoformer / PatchTST）
 
 | API | 说明 |
@@ -5792,12 +5811,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3094 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3099 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3146 项）。
+`tests/`（合计 3151 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5805,7 +5824,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3146 项
+pytest -q                        # test_ai.py + tests/ 合计 3151 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7634,7 +7653,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3146 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3151 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8148,6 +8167,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestPoolFormerBlock` | 前向/参数 92、W1/W2/LN 权重与输入梯度中心差分、两层 block 串联反向、150 步训练收敛、非法输入 |
 | `TestGRN` | 初始恒等、gamma/beta/输入梯度中心差分（含跨通道项）、SGD 更新、全零响应、非法输入 |
 | `TestDLinear` | 前向/参数 20、常数序列趋势性质、W_trend/W_seasonal/bias 与输入梯度中心差分、300 步训练收敛、非法输入 |
+| `TestNBeats` | 基函数手算、block 参数 93 与两处 FD、模型参数 418 与训练降半、forward/loss_and_backward、9 类非法输入 |
 | `TestITransformer` | 前向形状/MSE、特征嵌入/输出投影 FD、40 步训练收敛、SGD 更新、非法输入 |
 | `TestAugMix` | 增强确定性/权重和为 1/像素范围、翻转算子行为、JSD 自反与对称、AugMix 损失公式、非法输入 |
 | `TestTENT` | 熵最小化后熵下降/只更新 gamma、beta 零和性质、predict 概率、info 返回、非法输入 |
