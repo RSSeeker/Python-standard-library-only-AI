@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3084 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3089 项）
 
 ## 特性
 
@@ -2485,6 +2485,33 @@ rg = AI.RecurrentGemmaBlock(d_model=8, d_ff=16, kernel=3, seed=3)
 因果注意力（不是局部窗口或 GQA）；RecurrentGemma 的短卷积长度就是 `kernel`，
 没有 RecurrentGemma 原文的「局部卷积 + 周期全局注意力」调度。测试对残差投影、
 LayerNorm、卷积核与注意力投影做有限差分，并验证因果性与训练可下降。
+
+### 混合架构补遗（StripedHyena / Vision Mamba）
+
+```python
+import AI
+
+x = [[0.1] * 8 for _ in range(4)]
+blk = AI.StripedHyenaBlock(8, 2, short_kernel=3, long_kernel=4, seed=1)
+y = blk.forward(x)
+
+vim = AI.VimBlock(8, d_state=2, d_conv=2, expand=1, seed=1)
+y2 = vim.forward(x)
+
+clf = AI.VimClassifier(image_size=4, patch_size=2, patch_channels=1,
+                       d_model=8, num_classes=2, num_layers=1,
+                       d_state=2, d_conv=2, expand=1, seed=1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `StripedHyenaBlock(d_model, num_heads, short_kernel=3, long_kernel=4, eps=1e-5, seed=None)` | 单头 MHA 残差 + HyenaBlock 串联；手写反向覆盖两条分支（含 MHA 的投影梯度）；`param_count` 592（d=8, H=2） |
+| `VimBlock(d_model, d_state=4, d_conv=4, expand=2, seed=None)` | 双向 Mamba：正向扫描 + 反转序列反向扫描，拼接投影后加残差；手写反向分别穿两个方向；`param_count` 1104（d=8） |
+| `VimClassifier(image_size=8, patch_size=4, patch_channels=1, d_model=16, num_classes=3, num_layers=1, d_state=4, d_conv=4, expand=2, eps=1e-5, seed=None)` | 线性 patch 嵌入 + 可学习 cls/位置 + N×VimBlock + LN + 线性头，CE 反传与 `fit`；`param_count` 1226（S=4, PS=2, d=8, 1 层） |
+
+边界：`StripedHyenaBlock` 的 MHA 是单头用法、无 dropout；`VimBlock` 的反向
+按两个扫描方向拆开，显存与计算约为单向 Mamba 的两倍；`VimClassifier` 只用于
+教学式小图分类（线性 patch 嵌入，无卷积 stem 与数据增强）。
 
 ### 差分注意力与安全 softmax（Differential Attention / QuietAttention）
 
@@ -5513,12 +5540,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3032 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3037 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3084 项）。
+`tests/`（合计 3089 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5526,7 +5553,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3084 项
+pytest -q                        # test_ai.py + tests/ 合计 3089 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7316,7 +7343,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3084 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3089 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7642,6 +7669,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestReinforceAndVine` | reinforce_plus_plus 历史字段与权重更新、bool 奖励可用且 NaN/字符串奖励报错、vine_ppo 历史/更新与 clip_ratio 占位、12 类非法输入 |
 | `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
 | `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
+| `TestStripedHyenaAndVim` | StripedHyena/Vim 前向与参数计数、MHA/Hyena/双向 Mamba 各参数与输入梯度有限差分、VimClassifier FD 与 fit 收敛、8 类非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
 | `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |

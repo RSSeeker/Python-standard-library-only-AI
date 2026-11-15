@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1973 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1977 个 def / 448 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -16924,6 +16924,485 @@ def aux_loss_free_bias_update(loads, bias, target_fractions, gamma=0.001):
         new_bias.append(float(bias[i]) + d)
         deltas.append(d)
     return new_bias, deltas
+
+
+# ---- B14：StripedHyena 混合块与 Vision Mamba（Vim） ----
+
+
+def _b14_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+
+
+def _b14_check_seq(seq, d_model, who):
+    import math as _math
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError(f"{who}: 输入必须是非空 (T, d) 列表")
+    out = []
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 输入必须是数字")
+            if not _math.isfinite(float(v)):
+                raise ValueError(f"{who}: 输入必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _b14_mha_sgd(attn, lr):
+    """按 MHA.grads 的矩阵/向量做原地 SGD（MHA 无 sgd_step）。"""
+    for name in ("W_q", "W_k", "W_v", "W_o"):
+        W = getattr(attn, name)
+        G = attn.grads[name]
+        for i in range(len(W)):
+            for j in range(len(W[i])):
+                W[i][j] -= lr * G[i][j]
+    for name in ("b_q", "b_k", "b_v", "b_o"):
+        vec = getattr(attn, name)
+        G = attn.grads[name]
+        for i in range(len(vec)):
+            vec[i] -= lr * G[i]
+
+
+def _b14_mha_param_count(attn):
+    d = attn.d_model
+    return 4 * (d * d + d)
+
+
+class StripedHyenaBlock:
+    """StripedHyena 风格的混合块：注意力分支 + Hyena 分支。
+
+    结构：``x1 = x + MHA(LN1(x))``，``out = HyenaBlock(x1)``（HyenaBlock 自带
+    pre-LN 残差）。反向依次经 HyenaBlock、MHA、LN1，残差在 ``x1`` 处相加。
+    """
+
+    def __init__(self, d_model, num_heads, short_kernel=3, long_kernel=4,
+                 eps=1e-5, seed=None):
+        _b14_check_pos_int(d_model, "StripedHyenaBlock: d_model")
+        _b14_check_pos_int(num_heads, "StripedHyenaBlock: num_heads")
+        _b14_check_pos_int(short_kernel, "StripedHyenaBlock: short_kernel")
+        _b14_check_pos_int(long_kernel, "StripedHyenaBlock: long_kernel")
+        if d_model % num_heads != 0:
+            raise ValueError("StripedHyenaBlock: d_model 必须能被 num_heads 整除")
+        import math as _math
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not _math.isfinite(float(eps)) or eps <= 0:
+            raise ValueError("StripedHyenaBlock: eps 必须是有限正数")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.ln1 = LayerNorm(d_model, eps=eps)
+        self.attn = MultiHeadAttention(d_model, num_heads, dropout=0.0, causal=True)
+        self.hyena = HyenaBlock(d_model, short_kernel, long_kernel, eps=eps, seed=seed)
+        self.grad_ln1 = ([[0.0] * d_model], [0.0] * d_model)
+        self._cache = None
+        self.train()
+
+    def _check_seq(self, seq):
+        return _b14_check_seq(seq, self.d_model, "StripedHyenaBlock")
+
+    def train(self):
+        self.attn.train()
+        self.hyena.train()
+        return self
+
+    def eval(self):
+        self.attn.eval()
+        self.hyena.eval()
+        return self
+
+    def zero_grad(self):
+        self.attn.zero_grad()
+        self.hyena.zero_grad()
+        self.grad_ln1 = ([0.0] * self.d_model, [0.0] * self.d_model)
+
+    def forward(self, x):
+        x = self._check_seq(x)
+        h = _norm_rows_forward(self.ln1, x)
+        ln_out, cache_ln = h
+        attn_out = self.attn.forward(ln_out)
+        x1 = [[x[t][i] + attn_out[t][i] for i in range(self.d_model)]
+              for t in range(len(x))]
+        out = self.hyena.forward(x1)
+        self._cache = {"x": x, "x1": x1, "cache_ln": cache_ln}
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("StripedHyenaBlock.backward: 必须先 forward")
+        c = self._cache
+        d_x1 = self.hyena.backward(dout)
+        d_attn = self.attn.backward(d_x1)
+        gg, gb, d_ln = _norm_rows_backward(self.ln1, c["cache_ln"], d_attn)
+        self.grad_ln1 = (gg, gb)
+        dx = [[d_x1[t][i] + d_ln[t][i] for i in range(self.d_model)]
+              for t in range(len(c["x"]))]
+        self._cache = None
+        return dx
+
+    def sgd_step(self, lr=0.01):
+        self._check_lr(lr)
+        _b14_mha_sgd(self.attn, lr)
+        self.hyena.sgd_step(lr)
+        _norm_apply_sgd(self.ln1, self.grad_ln1, lr)
+
+    def _check_lr(self, lr):
+        import math as _math
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not _math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError("StripedHyenaBlock: lr 必须是有限正数")
+
+    def param_count(self):
+        return (_norm_param_count(self.ln1) + _b14_mha_param_count(self.attn)
+                + self.hyena.param_count())
+
+
+class VimBlock:
+    """Vision Mamba 的双向扫描块。
+
+    ``hf = MambaBlock(x)``、``hb = reverse(MambaBlock(reverse(x)))``；
+    ``y = W([hf ; hb])``、``out = x + y``。反向分别穿过两条扫描方向。
+    """
+
+    def __init__(self, d_model, d_state=4, d_conv=4, expand=2, seed=None):
+        _b14_check_pos_int(d_model, "VimBlock: d_model")
+        _b14_check_pos_int(d_state, "VimBlock: d_state")
+        _b14_check_pos_int(d_conv, "VimBlock: d_conv")
+        _b14_check_pos_int(expand, "VimBlock: expand")
+        self.d_model = d_model
+        self.mamba_f = MambaBlock(d_model, d_state, d_conv, expand, seed=seed)
+        seed_b = None if seed is None else (seed + 1 if seed < 2 ** 31 - 1 else 0)
+        self.mamba_b = MambaBlock(d_model, d_state, d_conv, expand, seed=seed_b)
+        self.W = Layer(2 * d_model, d_model, "linear")
+        self.grad_W = None
+        self.grad_b = None
+        self._cache = None
+
+    def _check_seq(self, seq):
+        return _b14_check_seq(seq, self.d_model, "VimBlock")
+
+    def zero_grad(self):
+        self.mamba_f.zero_grad()
+        self.mamba_b.zero_grad()
+        self.grad_W = None
+        self.grad_b = None
+
+    def forward(self, x):
+        x = self._check_seq(x)
+        hf = self.mamba_f.forward(x)
+        xr = [row[:] for row in reversed(x)]
+        hb_r = self.mamba_b.forward(xr)
+        hb = [row[:] for row in reversed(hb_r)]
+        concat = [[hf[t][i] for i in range(self.d_model)]
+                  + [hb[t][i] for i in range(self.d_model)]
+                  for t in range(len(x))]
+        y, cache_w = _dense_rows_forward(self.W, concat)
+        out = [[x[t][i] + y[t][i] for i in range(self.d_model)]
+               for t in range(len(x))]
+        self._cache = {"x": x, "cache_w": cache_w}
+        return out
+
+    def backward(self, dout):
+        if self._cache is None:
+            raise RuntimeError("VimBlock.backward: 必须先 forward")
+        c = self._cache
+        d_rows = _b14_check_seq(dout, self.d_model, "VimBlock.backward")
+        gw, gb, d_concat = _dense_rows_backward(self.W, c["cache_w"], d_rows)
+        if self.grad_W is None:
+            self.grad_W, self.grad_b = gw, gb
+        else:
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_W[i][j] += gw[i][j]
+            for i in range(len(gb)):
+                self.grad_b[i] += gb[i]
+        T = len(c["x"])
+        d_hf = [[d_concat[t][i] for i in range(self.d_model)] for t in range(T)]
+        d_hb = [[d_concat[t][self.d_model + i] for i in range(self.d_model)]
+                for t in range(T)]
+        d_hb_r = [row[:] for row in reversed(d_hb)]
+        d_xr = self.mamba_b.backward(d_hb_r)
+        d_xb = [row[:] for row in reversed(d_xr)]
+        d_xf = self.mamba_f.backward(d_hf)
+        dx = [[d_rows[t][i] + d_xf[t][i] + d_xb[t][i] for i in range(self.d_model)]
+              for t in range(T)]
+        self._cache = None
+        return dx
+
+    def sgd_step(self, lr=0.01):
+        import math as _math
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not _math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError("VimBlock: lr 必须是有限正数")
+        self.mamba_f.sgd_step(lr)
+        self.mamba_b.sgd_step(lr)
+        if self.grad_W is not None:
+            _dense_apply_sgd(self.W, (self.grad_W, self.grad_b), lr)
+
+    def param_count(self):
+        return (self.mamba_f.param_count() + self.mamba_b.param_count()
+                + _dense_param_count(self.W))
+
+
+class VimClassifier:
+    """简化的 Vision Mamba 分类器：线性 patch 嵌入 + 双向 VimBlock + 分类头。
+
+    图像 ``(C, H, W)`` 按 ``patch_size`` 切成不重叠 patch，展平后线性投影到
+    ``d_model``；加可学习 cls token 与位置嵌入，过 ``num_layers`` 个 VimBlock，
+    最后用 cls 位置过 LayerNorm + 线性头。手写反向与 SGD 训练。
+    """
+
+    def __init__(self, image_size=8, patch_size=4, patch_channels=1, d_model=16,
+                 num_classes=3, num_layers=1, d_state=4, d_conv=4, expand=2,
+                 eps=1e-5, seed=None):
+        _b14_check_pos_int(image_size, "VimClassifier: image_size")
+        _b14_check_pos_int(patch_size, "VimClassifier: patch_size")
+        _b14_check_pos_int(patch_channels, "VimClassifier: patch_channels")
+        _b14_check_pos_int(d_model, "VimClassifier: d_model")
+        _b14_check_pos_int(num_classes, "VimClassifier: num_classes")
+        _b14_check_pos_int(num_layers, "VimClassifier: num_layers")
+        if image_size % patch_size != 0:
+            raise ValueError("VimClassifier: image_size 必须能被 patch_size 整除")
+        import math as _math
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not _math.isfinite(float(eps)) or eps <= 0:
+            raise ValueError("VimClassifier: eps 必须是有限正数")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("VimClassifier: seed 必须是 int 或 None")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.patch_channels = patch_channels
+        self.d_model = d_model
+        self.num_classes = num_classes
+        self.grid = image_size // patch_size
+        self.num_patches = self.grid * self.grid
+        patch_dim = patch_channels * patch_size * patch_size
+        self.patch_proj = Layer(patch_dim, d_model, "linear")
+        rng = None
+        import random as _random
+        if seed is not None:
+            rng = _random.Random(seed)
+        else:
+            rng = _random
+        std = _math.sqrt(2.0 / patch_dim)
+        self.cls_token = [rng.gauss(0.0, std) for _ in range(d_model)]
+        self.pos_embed = [[rng.gauss(0.0, 0.02) for _ in range(d_model)]
+                          for _ in range(self.num_patches + 1)]
+        self.blocks = [VimBlock(d_model, d_state, d_conv, expand,
+                                seed=None if seed is None else seed + 3 + i)
+                       for i in range(num_layers)]
+        self.ln_out = LayerNorm(d_model, eps=eps)
+        self.head = Layer(d_model, num_classes, "linear")
+        self.grad_cls = [0.0] * d_model
+        self.grad_pos = [[0.0] * d_model for _ in range(self.num_patches + 1)]
+        self.grad_patch = None
+        self.grad_ln = None
+        self.grad_head = None
+
+    def _check_image(self, img):
+        import math as _math
+        C = self.patch_channels
+        S = self.image_size
+        if not isinstance(img, (list, tuple)) or len(img) != C:
+            raise ValueError(f"VimClassifier: 图像必须是 {C} 通道的 (C,H,W) 列表")
+        for ch in img:
+            if not isinstance(ch, (list, tuple)) or len(ch) != S:
+                raise ValueError(f"VimClassifier: 图像尺寸必须是 {S}x{S}")
+            for row in ch:
+                if not isinstance(row, (list, tuple)) or len(row) != S:
+                    raise ValueError(f"VimClassifier: 图像尺寸必须是 {S}x{S}")
+                for v in row:
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or not _math.isfinite(float(v)):
+                        raise ValueError("VimClassifier: 像素必须是有限数字")
+
+    def _patches(self, img):
+        ps = self.patch_size
+        flat = []
+        for r in range(self.grid):
+            for c in range(self.grid):
+                vals = []
+                for ch in range(self.patch_channels):
+                    for i in range(ps):
+                        for j in range(ps):
+                            vals.append(float(img[ch][r * ps + i][c * ps + j]))
+                flat.append(vals)
+        return flat
+
+    def zero_grad(self):
+        self.blocks_zero_grad()
+        self.grad_cls = [0.0] * self.d_model
+        self.grad_pos = [[0.0] * self.d_model for _ in range(self.num_patches + 1)]
+        self.grad_patch = None
+        self.grad_ln = None
+        self.grad_head = None
+
+    def blocks_zero_grad(self):
+        for blk in self.blocks:
+            blk.zero_grad()
+
+    def _softmax(self, row):
+        import math as _math
+        mx = max(row)
+        ex = [_math.exp(v - mx) for v in row]
+        s = sum(ex)
+        return [v / s for v in ex]
+
+    def forward(self, images):
+        if not isinstance(images, (list, tuple)) or not images:
+            raise ValueError("VimClassifier.forward: images 必须是非空列表")
+        outs = []
+        caches = []
+        for img in images:
+            self._check_image(img)
+            patches = self._patches(img)
+            rows, patch_cache = _dense_rows_forward(self.patch_proj, patches)
+            tokens = [[self.cls_token[k] + self.pos_embed[0][k]
+                       for k in range(self.d_model)]]
+            for p in range(self.num_patches):
+                tokens.append([rows[p][k] + self.pos_embed[p + 1][k]
+                               for k in range(self.d_model)])
+            tokens_in = [row[:] for row in tokens]
+            for blk in self.blocks:
+                tokens = blk.forward(tokens)
+            h, ln_cache = _norm_rows_forward(self.ln_out, [tokens[0]])
+            logits, head_cache = _dense_rows_forward(self.head, h)
+            outs.append(logits[0])
+            caches.append({"patches": patches, "patch_cache": patch_cache,
+                           "ln_cache": ln_cache, "head_cache": head_cache,
+                           "tokens0": tokens[0], "tokens_in": tokens_in})
+        self._caches = caches
+        return outs
+
+    def loss_and_backward(self, images, labels):
+        if not isinstance(labels, (list, tuple)) or not labels:
+            raise ValueError("VimClassifier.loss_and_backward: labels 必须是非空列表")
+        if len(images) != len(labels):
+            raise ValueError("VimClassifier: images 与 labels 数量必须一致")
+        for y in labels:
+            if isinstance(y, bool) or not isinstance(y, int) or not 0 <= y < self.num_classes:
+                raise ValueError("VimClassifier: label 必须是 [0, num_classes) 的整数")
+        n = len(images)
+        logits = self.forward(images)
+        import math as _math
+        total = 0.0
+        d_logits_all = []
+        for i in range(n):
+            probs = self._softmax(logits[i])
+            total -= _math.log(max(probs[labels[i]], 1e-300)) / n
+            d = [probs[k] / n for k in range(self.num_classes)]
+            d[labels[i]] -= 1.0 / n
+            d_logits_all.append(d)
+        for i in range(n):
+            c = self._caches[i]
+            gw, gb, d_h = _dense_rows_backward(self.head, c["head_cache"], [d_logits_all[i]])
+            self._accum_head(gw, gb)
+            gg, gb2, d_tok = _norm_rows_backward(self.ln_out, c["ln_cache"], d_h)
+            self._accum_ln(gg, gb2)
+            d_tokens = [d_tok[0]] + [[0.0] * self.d_model for _ in range(self.num_patches)]
+            # 重新前向来填充各 block 的缓存（forward 时只保留最后一张图的缓存）
+            tokens = [row[:] for row in c["tokens_in"]]
+            for blk in self.blocks:
+                tokens = blk.forward(tokens)
+            for blk in reversed(self.blocks):
+                d_tokens = blk.backward(d_tokens)
+            self.grad_cls = [self.grad_cls[k] + d_tokens[0][k] for k in range(self.d_model)]
+            for p in range(self.num_patches + 1):
+                for k in range(self.d_model):
+                    self.grad_pos[p][k] += d_tokens[p][k]
+            d_patch_rows = d_tokens[1:]
+            gpw, gpb, _ = _dense_rows_backward(self.patch_proj, c["patch_cache"], d_patch_rows)
+            self._accum_patch(gpw, gpb)
+        return float(total)
+
+    def _accum_head(self, gw, gb):
+        if self.grad_head is None:
+            self.grad_head = (gw, gb)
+        else:
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_head[0][i][j] += gw[i][j]
+            for i in range(len(gb)):
+                self.grad_head[1][i] += gb[i]
+
+    def _accum_ln(self, gg, gb):
+        if self.grad_ln is None:
+            self.grad_ln = (list(gg), list(gb))
+        else:
+            for i in range(len(gg)):
+                self.grad_ln[0][i] += gg[i]
+                self.grad_ln[1][i] += gb[i]
+
+    def _accum_patch(self, gw, gb):
+        if self.grad_patch is None:
+            self.grad_patch = (gw, gb)
+        else:
+            for i in range(len(gw)):
+                for j in range(len(gw[i])):
+                    self.grad_patch[0][i][j] += gw[i][j]
+            for i in range(len(gb)):
+                self.grad_patch[1][i] += gb[i]
+
+    def sgd_step(self, lr=0.01):
+        import math as _math
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not _math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError("VimClassifier.sgd_step: lr 必须是有限正数")
+        for blk in self.blocks:
+            blk.sgd_step(lr)
+        if self.grad_patch is not None:
+            _dense_apply_sgd(self.patch_proj, self.grad_patch, lr)
+        if self.grad_head is not None:
+            _dense_apply_sgd(self.head, self.grad_head, lr)
+        if self.grad_ln is not None:
+            _norm_apply_sgd(self.ln_out, self.grad_ln, lr)
+        for k in range(self.d_model):
+            self.cls_token[k] -= lr * self.grad_cls[k]
+            for p in range(self.num_patches + 1):
+                self.pos_embed[p][k] -= lr * self.grad_pos[p][k]
+
+    def param_count(self):
+        count = (_dense_param_count(self.patch_proj) + _dense_param_count(self.head)
+                 + _norm_param_count(self.ln_out) + self.d_model
+                 + (self.num_patches + 1) * self.d_model)
+        for blk in self.blocks:
+            count += blk.param_count()
+        return count
+
+    def fit(self, images, labels, epochs=20, lr=0.05, batch_size=None, seed=None,
+            shuffle=True):
+        _b14_check_pos_int(epochs, "VimClassifier.fit: epochs")
+        import math as _math
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not _math.isfinite(float(lr)) or lr <= 0:
+            raise ValueError("VimClassifier.fit: lr 必须是有限正数")
+        n = len(images)
+        bs = n if batch_size is None else batch_size
+        _b14_check_pos_int(bs, "VimClassifier.fit: batch_size")
+        import random as _random
+        rng = (_random.Random(seed) if seed is not None else _random)
+        history = []
+        for _ in range(epochs):
+            order = list(range(n))
+            if shuffle:
+                rng.shuffle(order)
+            losses = []
+            for start in range(0, n, bs):
+                idx = order[start:start + bs]
+                self.zero_grad()
+                loss = self.loss_and_backward([images[i] for i in idx],
+                                              [labels[i] for i in idx])
+                self.sgd_step(lr)
+                losses.append(loss)
+            history.append(sum(losses) / len(losses))
+        return history
+
+    def predict(self, images):
+        logits = self.forward(images)
+        out = []
+        for row in logits:
+            best = 0
+            for k in range(1, self.num_classes):
+                if row[k] > row[best]:
+                    best = k
+            out.append(best)
+        return out
 
 class DifferentialAttention:
     """差分注意力（DIFF Transformer 教学简化）：两组 Q/K 的注意力图相减。
@@ -65373,6 +65852,9 @@ class MambaBlock:
         dproj = [dxs[t] + dz[t] for t in range(T)]
         grad_w, grad_b, dx = _dense_rows_backward(self.in_proj, cache_in, dproj)
         _layer_add_grads(self.grads["in_proj"], (grad_w, grad_b))
+        # 残差连接：out = x + out_proj(...)，输入梯度需加上 dout
+        dx = [[dout[t][i] + dx[t][i] for i in range(self.d_model)]
+              for t in range(len(dout))]
         self._cache = None
         return dx
 

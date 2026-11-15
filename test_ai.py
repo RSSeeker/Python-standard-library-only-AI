@@ -49649,3 +49649,210 @@ class TestLinearAttentionFamily:
         assert _laf_t_raises(lambda: AI.linear_attention_family_backward([[0.0, 0.0]], cache))
         assert _laf_t_raises(lambda: AI.linear_attention_family_backward(
             [[0.0, 0.0]] * 4, cache, kind="bad"))
+
+
+import math
+
+
+def _b14_t_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _b14_t_striped():
+    import random
+    import AI
+    random.seed(1)
+    return AI.StripedHyenaBlock(8, 2, seed=1)
+
+
+def _b14_t_vim():
+    import random
+    import AI
+    random.seed(2)
+    return AI.VimBlock(8, d_state=2, d_conv=2, expand=1, seed=2)
+
+
+def _b14_t_data(d=8, T=4):
+    import random
+    return [[random.uniform(-0.5, 0.5) for _ in range(d)] for _ in range(T)]
+
+
+def _b14_t_make_img(b, S=4, PS=2):
+    img = [[[0.0] * S for _ in range(S)]]
+    for i in range(PS):
+        for j in range(PS):
+            if b == "tl":
+                img[0][i][j] = 1.0
+            else:
+                img[0][S - PS + i][S - PS + j] = 1.0
+    return img
+
+
+class TestStripedHyenaAndVim:
+    def test_striped_forward_and_gradients(self):
+        blk = _b14_t_striped()
+        x = _b14_t_data()
+        w = _b14_t_data()
+        out = blk.forward(x)
+        assert len(out) == 4 and len(out[0]) == 8
+        assert blk.param_count() == 592
+
+        def loss():
+            o = blk.forward(x)
+            return sum(o[t][i] * w[t][i] for t in range(4) for i in range(8))
+
+        h = 1e-5
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(w)
+        for getter, pget, pset in (
+                (lambda: blk.grad_ln1[0][0], lambda: blk.ln1.gamma[0],
+                 lambda v: blk.ln1.gamma.__setitem__(0, v)),
+                (lambda: blk.attn.grads["W_q"][0][0], lambda: blk.attn.W_q[0][0],
+                 lambda v: blk.attn.W_q[0].__setitem__(0, v)),
+                (lambda: blk.hyena.grad_o[0][0][0],
+                 lambda: blk.hyena.W_o.weights[0][0],
+                 lambda v: blk.hyena.W_o.weights[0].__setitem__(0, v))):
+            ana = getter()
+            p0 = pget()
+            pset(p0 + h)
+            lp = loss()
+            pset(p0 - h)
+            lm = loss()
+            pset(p0)
+            assert abs(ana - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_vim_block_forward_and_gradients(self):
+        blk = _b14_t_vim()
+        x = _b14_t_data()
+        w = _b14_t_data()
+        out = blk.forward(x)
+        assert len(out) == 4 and len(out[0]) == 8
+        assert blk.param_count() == 1104
+
+        def loss():
+            o = blk.forward(x)
+            return sum(o[t][i] * w[t][i] for t in range(4) for i in range(8))
+
+        h = 1e-5
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(w)
+        ana = blk.grad_W[0][0]
+        p0 = blk.W.weights[0][0]
+        blk.W.weights[0][0] = p0 + h
+        lp = loss()
+        blk.W.weights[0][0] = p0 - h
+        lm = loss()
+        blk.W.weights[0][0] = p0
+        assert abs(ana - (lp - lm) / (2 * h)) < 1e-4
+
+        blk.zero_grad()
+        blk.forward(x)
+        blk.backward(w)
+        ana = blk.mamba_f.grads["out_proj"][0][0][0]
+        p0 = blk.mamba_f.out_proj.weights[0][0]
+        blk.mamba_f.out_proj.weights[0][0] = p0 + h
+        lp = loss()
+        blk.mamba_f.out_proj.weights[0][0] = p0 - h
+        lm = loss()
+        blk.mamba_f.out_proj.weights[0][0] = p0
+        assert abs(ana - (lp - lm) / (2 * h)) < 1e-4
+
+        # 输入梯度（含双向扫描与残差；损失只取位置 0 的输出）
+        def loss0():
+            o = blk.forward(x)
+            return sum(o[0][i] * w[0][i] for i in range(8))
+
+        blk.zero_grad()
+        blk.forward(x)
+        dout = [[0.0] * 8 for _ in range(4)]
+        dout[0] = w[0]
+        dx = blk.backward(dout)
+        for t in range(4):
+            for i in (0, 3):
+                p0 = x[t][i]
+                x[t][i] = p0 + h
+                lp = loss0()
+                x[t][i] = p0 - h
+                lm = loss0()
+                x[t][i] = p0
+                assert abs(dx[t][i] - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_vim_classifier_forward_and_gradients(self):
+        import AI
+        import random
+        random.seed(3)
+        vc = AI.VimClassifier(image_size=4, patch_size=2, d_model=8, num_classes=2,
+                              num_layers=1, d_state=2, d_conv=2, expand=1, seed=3)
+        imgs = [_b14_t_make_img("tl"), _b14_t_make_img("br")]
+        labels = [0, 1]
+        logits = vc.forward(imgs)
+        assert len(logits) == 2 and len(logits[0]) == 2
+        assert vc.param_count() == 1226
+
+        def ce():
+            lg = vc.forward(imgs)
+            tot = 0.0
+            for i in range(2):
+                p = vc._softmax(lg[i])
+                tot -= math.log(max(p[labels[i]], 1e-300)) / 2
+            return tot
+
+        h = 1e-5
+        vc.zero_grad()
+        loss = vc.loss_and_backward(imgs, labels)
+        assert math.isfinite(loss) and loss > 0
+        for getter, pget, pset in (
+                (lambda: vc.grad_head[0][0][0], lambda: vc.head.weights[0][0],
+                 lambda v: vc.head.weights[0].__setitem__(0, v)),
+                (lambda: vc.grad_patch[0][0][0], lambda: vc.patch_proj.weights[0][0],
+                 lambda v: vc.patch_proj.weights[0].__setitem__(0, v)),
+                (lambda: vc.grad_cls[0], lambda: vc.cls_token[0],
+                 lambda v: vc.cls_token.__setitem__(0, v))):
+            ana = getter()
+            p0 = pget()
+            pset(p0 + h)
+            lp = ce()
+            pset(p0 - h)
+            lm = ce()
+            pset(p0)
+            assert abs(ana - (lp - lm) / (2 * h)) < 1e-4
+
+    def test_vim_classifier_fit(self):
+        import AI
+        import random
+        random.seed(4)
+        vc = AI.VimClassifier(image_size=4, patch_size=2, d_model=8, num_classes=2,
+                              num_layers=1, d_state=2, d_conv=2, expand=1, seed=4)
+        imgs = [_b14_t_make_img("tl") for _ in range(4)] + \
+               [_b14_t_make_img("br") for _ in range(4)]
+        labels = [0] * 4 + [1] * 4
+        hist = vc.fit(imgs, labels, epochs=30, lr=0.1, seed=1)
+        assert len(hist) == 30 and hist[-1] < hist[0] * 0.5
+        pred = vc.predict(imgs)
+        acc = sum(1 for i in range(8) if pred[i] == labels[i]) / 8
+        assert acc >= 0.75
+
+    def test_invalid_inputs(self):
+        import AI
+        blk = _b14_t_striped()
+        vim = _b14_t_vim()
+        vc = AI.VimClassifier(image_size=4, patch_size=2, d_model=8, num_classes=2,
+                              num_layers=1, d_state=2, d_conv=2, expand=1, seed=3)
+        imgs = [_b14_t_make_img("tl"), _b14_t_make_img("br")]
+        assert _b14_t_raises(lambda: AI.StripedHyenaBlock(8, 3))
+        assert _b14_t_raises(lambda: AI.StripedHyenaBlock(0, 2))
+        assert _b14_t_raises(lambda: blk.forward([]))
+        assert _b14_t_raises(lambda: _b14_t_striped().backward([[0.0] * 8] * 4))
+        assert _b14_t_raises(lambda: AI.VimBlock(8, d_state=0))
+        assert _b14_t_raises(lambda: vim.backward([[0.0] * 8] * 4))
+        assert _b14_t_raises(lambda: AI.VimClassifier(image_size=5, patch_size=2))
+        assert _b14_t_raises(lambda: vc.forward([[[0.0] * 3] * 3]))
+        assert _b14_t_raises(lambda: vc.loss_and_backward(imgs, [0, 2]))
+        assert _b14_t_raises(lambda: vc.loss_and_backward(imgs[:1], [0, 1]))
+        assert _b14_t_raises(lambda: vc.predict([]))
