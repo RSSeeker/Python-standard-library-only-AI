@@ -50918,3 +50918,95 @@ class TestDataParallel:
         assert _dp_t_raises(lambda: AI.data_parallel_grads(model, [], []))
         assert _dp_t_raises(lambda: AI.data_parallel_grads(model, xs, ys, loss="ce"))
         assert _dp_t_raises(lambda: AI.data_parallel_step(model, xs, ys, lr=0.0))
+
+
+import random
+
+import AI
+
+T = AI.Tensor
+
+
+def _te_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _te_fd(fn, tensor, eps=1e-5):
+    """fn() 返回标量 Tensor；对 tensor 逐元素中心差分，返回最大相对误差。"""
+    tensor.zero_grad()
+    fn().backward()
+    analytic = list(tensor._gflat) if tensor._gflat is not None else [0.0] * tensor.size
+    base = list(tensor._flat)
+    worst = 0.0
+    for i in range(len(base)):
+        old = base[i]
+        tensor._flat[i] = old + eps
+        plus = fn()._flat[0]
+        tensor._flat[i] = old - eps
+        minus = fn()._flat[0]
+        tensor._flat[i] = old
+        numeric = (plus - minus) / (2 * eps)
+        denom = max(1.0, abs(numeric), abs(analytic[i]))
+        worst = max(worst, abs(analytic[i] - numeric) / denom)
+    return worst
+
+
+def _te_sum(t):
+    return AI.ag_sum(t, None)
+
+
+class TestTensorExtras:
+    def test_tensor_info_and_strides(self):
+        x = T([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        info = AI.tensor_info(x)
+        assert info["shape"] == (2, 3)
+        assert info["strides"] == (3, 1)
+        assert info["ndim"] == 2
+        assert info["size"] == 6
+        assert info["dtype"] == "float"
+        assert AI.tensor_strides(T([1.0, 2.0])) == [1]
+        assert AI.tensor_ndim(T(1.0)) == 0
+        assert AI.tensor_dtype(T([[1.0]])) == "float"
+
+    def test_broadcast_to(self):
+        b = T([[1.0], [2.0]], requires_grad=True)
+        out = AI.ag_broadcast_to(b, [2, 3])
+        assert out.shape == (2, 3)
+        assert out.data == [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]
+        err = _te_fd(lambda: _te_sum(AI.ag_broadcast_to(b, [2, 3])), b)
+        assert err < 1e-6
+
+    def test_where_routes_gradients(self):
+        cond = [[True, False], [False, True]]
+        wx = T([1.0], requires_grad=True)
+        wy = T([[10.0], [20.0]], requires_grad=True)
+        out = AI.ag_where(cond, wx, wy)
+        assert out.data == [[1.0, 10.0], [20.0, 1.0]]
+        err = _te_fd(lambda: _te_sum(AI.ag_where(cond, wx, wy)), wx)
+        assert err < 1e-6
+        err = _te_fd(lambda: _te_sum(AI.ag_where(cond, wx, wy)), wy)
+        assert err < 1e-6
+
+    def test_clip_abs_pow(self):
+        c = T([[-2.0, 0.5, 3.0]], requires_grad=True)
+        assert AI.ag_clip(c, -1.0, 2.0).data == [[-1.0, 0.5, 2.0]]
+        assert _te_fd(lambda: _te_sum(AI.ag_clip(c, -1.0, 2.0)), c) < 1e-6
+        a = T([[-1.5, 2.0, -3.0]], requires_grad=True)
+        assert AI.ag_abs(a).data == [[1.5, 2.0, 3.0]]
+        assert _te_fd(lambda: _te_sum(AI.ag_abs(a)), a) < 1e-6
+        p = T([[1.5, 2.0, 0.5]], requires_grad=True)
+        assert [round(v, 6) for v in AI.ag_pow(p, 3.0)._flat] == [3.375, 8.0, 0.125]
+        assert _te_fd(lambda: _te_sum(AI.ag_pow(p, 3.0)), p) < 1e-6
+
+    def test_invalid_inputs(self):
+        assert _te_raises(lambda: AI.tensor_strides([1, 2]))
+        assert _te_raises(lambda: AI.ag_broadcast_to(T([[1.0, 2.0]]), [3]))
+        assert _te_raises(lambda: AI.ag_where([], T([1.0]), T([1.0])))
+        assert _te_raises(lambda: AI.ag_clip(T([1.0])))
+        assert _te_raises(lambda: AI.ag_clip(T([1.0]), 2.0, 1.0))
+        assert _te_raises(lambda: AI.ag_pow(T([-1.0]), 0.5))
+        assert _te_raises(lambda: AI.ag_broadcast_to(T([1.0]), [0]))

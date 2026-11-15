@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
-# （2080 个 def / 469 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
+# （2092 个 def / 469 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -27711,6 +27711,213 @@ def data_parallel_step(model, xs, ys, lr=0.01, world_size=2):
             layer.biases[i] -= lr * gb[i]
     return {"loss": loss, "grads": grads, "world_size": world_size,
             "samples": len(xs)}
+
+
+# ============================================================================
+#  轻量 Tensor 扩展：形状/步长/dtype 元信息 + 广播/条件/裁剪/幂等运算
+# ============================================================================
+
+
+def _te_check_tensor(value, name):
+    if not isinstance(value, Tensor):
+        raise TypeError(f"{name}: 需要 Tensor，收到 {type(value).__name__}")
+    return value
+
+
+def _te_check_shape(shape, name):
+    if not isinstance(shape, (list, tuple)) or not shape:
+        raise ValueError(f"{name}: shape 必须是非空 list/tuple，收到 {shape!r}")
+    out = []
+    for v in shape:
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError(f"{name}: shape 每维必须是正整数，收到 {v!r}")
+        out.append(int(v))
+    return tuple(out)
+
+
+def _te_check_number(value, name, allow_none=False):
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}: 必须是数字，收到 {value!r}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{name}: 必须是有限数字，收到 {value!r}")
+    return float(value)
+
+
+def tensor_strides(tensor):
+    """返回按行主序（C 顺序）的步长列表：strides[i] = ∏ shape[i+1:]。"""
+    t = _te_check_tensor(tensor, "tensor_strides")
+    strides = [1] * len(t.shape)
+    acc = 1
+    for i in range(len(t.shape) - 1, -1, -1):
+        strides[i] = acc
+        acc *= t.shape[i]
+    return strides
+
+
+def tensor_ndim(tensor):
+    """返回张量维数。"""
+    t = _te_check_tensor(tensor, "tensor_ndim")
+    return len(t.shape)
+
+
+def tensor_dtype(tensor):
+    """返回张量元素类型名（本引擎统一用 Python float 存储，返回 "float"）。"""
+    _te_check_tensor(tensor, "tensor_dtype")
+    return "float"
+
+
+def tensor_info(tensor):
+    """返回一段文本形式的形状/步长/维数/元素数/dtype 摘要。"""
+    t = _te_check_tensor(tensor, "tensor_info")
+    return {
+        "shape": tuple(t.shape),
+        "strides": tuple(tensor_strides(t)),
+        "ndim": tensor_ndim(t),
+        "size": t.size,
+        "dtype": tensor_dtype(t),
+    }
+
+
+def ag_broadcast_to(x, shape):
+    """把张量广播到目标形状（数据复制，反向把梯度按广播维求和）。"""
+    _te_check_tensor(x, "ag_broadcast_to(x)")
+    target = _te_check_shape(shape, "ag_broadcast_to(shape)")
+    if _ag_bcast_shape(tuple(x.shape), target) is None:
+        raise ValueError(
+            f"ag_broadcast_to: 形状 {tuple(x.shape)} 无法广播到 {target}")
+    out_flat = _ag_broadcast_flat(list(x._flat), tuple(x.shape), target)
+    out = Tensor(_ag_build(out_flat, list(target)),
+                 requires_grad=bool(x.requires_grad),
+                 _parents=(x,), _op="broadcast_to")
+
+    def _backward(g_flat):
+        grad = _ag_sum_to(list(g_flat), list(target), list(x.shape))
+        x._accum(grad)
+
+    out._backward_fn = _backward
+    return out
+
+
+def ag_where(condition, x, y):
+    """逐元素选择：condition 为真取 x，否则取 y（condition 为嵌套 list，含 bool）。
+
+    返回的 Tensor 形状取 condition 的形状；x 与 y 必须能广播到该形状。
+    """
+    if not isinstance(condition, (list, tuple)) or not condition:
+        raise ValueError("ag_where: condition 必须是非空嵌套 list")
+    flat = _ag_flatten(condition)
+    cond_shape = _ag_shape(condition)
+    flat_cond = []
+    for v in flat:
+        if isinstance(v, bool) or isinstance(v, (int, float)):
+            flat_cond.append(bool(v))
+        else:
+            raise ValueError(f"ag_where: condition 元素必须是 bool/数字，收到 {v!r}")
+    _te_check_tensor(x, "ag_where(x)")
+    _te_check_tensor(y, "ag_where(y)")
+    if not cond_shape or int(cond_shape[0]) <= 0:
+        raise ValueError("ag_where: condition 形状非法")
+    if _ag_bcast_shape(tuple(x.shape), cond_shape) is None:
+        raise ValueError(
+            f"ag_where: x 形状 {tuple(x.shape)} 无法广播到 {cond_shape}")
+    if _ag_bcast_shape(tuple(y.shape), cond_shape) is None:
+        raise ValueError(
+            f"ag_where: y 形状 {tuple(y.shape)} 无法广播到 {cond_shape}")
+    xf = _ag_broadcast_flat(list(x._flat), tuple(x.shape), cond_shape)
+    yf = _ag_broadcast_flat(list(y._flat), tuple(y.shape), cond_shape)
+    out_flat = [xf[i] if flat_cond[i] else yf[i] for i in range(len(flat_cond))]
+    out = Tensor(_ag_build(out_flat, list(cond_shape)),
+                 requires_grad=bool(x.requires_grad or y.requires_grad),
+                 _parents=(x, y), _op="where")
+
+    def _backward(g_flat):
+        if x.requires_grad:
+            gx = [g_flat[i] if flat_cond[i] else 0.0 for i in range(len(flat_cond))]
+            x._accum(_ag_sum_to(gx, list(cond_shape), list(x.shape)))
+        if y.requires_grad:
+            gy = [0.0 if flat_cond[i] else g_flat[i] for i in range(len(flat_cond))]
+            y._accum(_ag_sum_to(gy, list(cond_shape), list(y.shape)))
+
+    out._backward_fn = _backward
+    return out
+
+
+def ag_clip(x, min_value=None, max_value=None):
+    """逐元素裁剪到 [min_value, max_value]（None 表示该侧不限）。"""
+    _te_check_tensor(x, "ag_clip(x)")
+    lo = _te_check_number(min_value, "ag_clip(min_value)", allow_none=True)
+    hi = _te_check_number(max_value, "ag_clip(max_value)", allow_none=True)
+    if lo is None and hi is None:
+        raise ValueError("ag_clip: min_value 与 max_value 不能同时为 None")
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError(f"ag_clip: min_value={lo} 大于 max_value={hi}")
+    out_flat = []
+    for v in x._flat:
+        if lo is not None and v < lo:
+            out_flat.append(lo)
+        elif hi is not None and v > hi:
+            out_flat.append(hi)
+        else:
+            out_flat.append(v)
+    out = Tensor(_ag_build(out_flat, list(x.shape)),
+                 requires_grad=bool(x.requires_grad),
+                 _parents=(x,), _op="clip")
+
+    def _backward(g_flat):
+        grad = []
+        for i, v in enumerate(x._flat):
+            inside = True
+            if lo is not None and v < lo:
+                inside = False
+            if hi is not None and v > hi:
+                inside = False
+            grad.append(g_flat[i] if inside else 0.0)
+        x._accum(grad)
+
+    out._backward_fn = _backward
+    return out
+
+
+def ag_abs(x):
+    """逐元素绝对值。"""
+    _te_check_tensor(x, "ag_abs(x)")
+    out_flat = [abs(v) for v in x._flat]
+    out = Tensor(_ag_build(out_flat, list(x.shape)),
+                 requires_grad=bool(x.requires_grad),
+                 _parents=(x,), _op="abs")
+
+    def _backward(g_flat):
+        grad = [g_flat[i] * (1.0 if v >= 0.0 else -1.0)
+                for i, v in enumerate(x._flat)]
+        x._accum(grad)
+
+    out._backward_fn = _backward
+    return out
+
+
+def ag_pow(x, exponent):
+    """逐元素幂运算 x ** exponent（exponent 为标量数字）。"""
+    _te_check_tensor(x, "ag_pow(x)")
+    exp = _te_check_number(exponent, "ag_pow(exponent)")
+    out_flat = []
+    for v in x._flat:
+        try:
+            out_flat.append(float(v) ** exp)
+        except (ValueError, OverflowError, ZeroDivisionError) as exc:
+            raise ValueError(f"ag_pow: 计算 {v} ** {exp} 失败（{exc}）")
+    out = Tensor(_ag_build(out_flat, list(x.shape)),
+                 requires_grad=bool(x.requires_grad),
+                 _parents=(x,), _op="pow")
+
+    def _backward(g_flat):
+        grad = [g_flat[i] * exp * (x._flat[i] ** (exp - 1.0))
+                for i in range(len(x._flat))]
+        x._accum(grad)
+
+    out._backward_fn = _backward
+    return out
 
 class MLP:
     """多层感知机（PyTorch 风格）"""

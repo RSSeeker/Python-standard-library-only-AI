@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3136 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3141 项）
 
 ## 特性
 
@@ -169,6 +169,27 @@ print(AI.ag_grad_check(lambda: AI.ag_sum(AI.ag_matmul(w, x)), [w]))
 
 边界：只支持标量/向量/矩阵与广播，无 stride 视图共享、无高阶自动微分、无卷积
 层；`Tensor` 与既有嵌套 list 的 `Layer`/`MLP` 体系并存，互不影响。
+
+**形状 / 广播 / 条件运算扩展**
+
+| API | 说明 |
+| --- | --- |
+| `tensor_strides(t)` / `tensor_ndim(t)` / `tensor_dtype(t)` / `tensor_info(t)` | 行主序 stride、维数、dtype（固定 float）、shape/strides/ndim/size/dtype 汇总 |
+| `ag_broadcast_to(x, shape)` | 广播到目标形状，反向用 `_ag_sum_to` 归约 |
+| `ag_where(condition, x, y)` | 按条件路由梯度（x/y 广播到条件形状） |
+| `ag_clip(x, min_value=None, max_value=None)` / `ag_abs(x)` / `ag_pow(x, exponent)` | 逐元素裁剪 / 绝对值 / 标量幂（越界或非有限报错） |
+
+```python
+x = AI.Tensor([[1.0], [2.0]], requires_grad=True)
+y = AI.ag_broadcast_to(x, [2, 3])
+mask = [[True, False, True], [False, True, False]]
+z = AI.ag_where(mask, y, AI.Tensor([[0.0]]))
+loss = AI.ag_sum(AI.ag_pow(AI.ag_abs(z), 2.0), None)
+loss.backward()
+```
+
+边界：dtype 只区分 `"float"`；`ag_pow` 只支持标量指数且要求结果有限；
+`ag_where` 的条件是普通嵌套 bool/数字（不进计算图）；广播不兼容时抛 `ValueError`。
 
 ### 统一 Module 基类与 autograd 层/优化器
 
@@ -5771,12 +5792,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3084 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3089 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3136 项）。
+`tests/`（合计 3141 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5784,7 +5805,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3136 项
+pytest -q                        # test_ai.py + tests/ 合计 3141 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7611,7 +7632,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3136 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3141 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -8047,6 +8068,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestAutograd` | 广播运算梯度、四种 matmul 变体、softmax/log_softmax 与交叉熵、LayerNorm 三参数梯度、共享子图、小 MLP 训练收敛、非法输入 |
 | `TestAutogradModule` | 参数/缓冲/子模块自动登记与命名、Linear 手算一致与 1D 输入、Sequential/MLP 全参数 FD、state_dict JSON 往返与严格键/形状校验、Adam/SGD 回归收敛、train/eval 级联、九类非法输入 |
 | `TestAutogradLayersExt` | slice/concat/embedding/conv2d 的形状与全参数 FD、LayerNorm/Embedding/Conv2d/MHA 模块前向与参数计数、MHA 因果性、六类非法输入 |
+| `TestTensorExtras` | Tensor 信息/stride、broadcast_to 数据与 FD、ag_where 条件路由梯度、clip/abs/pow 数据与 FD、七类非法输入 |
 | `TestDataParallel` | all-reduce 四种 op 与变长 all-gather、环通信步数与梯度分片覆盖、DistributedSampler 分区/padding/复现/set_epoch、数据并行一步更新与单进程全批等价、八类非法输入 |
 | `TestEnsembles` | 集成学习：投票 soft/hard、Bagging 自举与种子复现、元特征列数、Stacking 端到端、AdaBoost 桩训练准确率 1.0 |
 | `TestPackingAndSpeculative` | 打包的 `tokens`/`segment_ids`/`position_ids` 与段内因果掩码、草稿=目标时接受率 1.0、不同草稿的统计口径、同种子复现、参数校验 |
