@@ -49446,3 +49446,206 @@ class TestHybridBlocks:
             if not _hyb_t_raises(fn):
                 bad += 1
         assert bad == 0
+
+
+import math
+
+
+def _mor_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+class TestMoERouting:
+    def test_z_loss_value_and_gradient(self):
+        import AI
+        logits = [[0.0, 0.0], [1.0, -1.0]]
+        loss, dlogits = AI.router_z_loss(logits, coefficient=1e-3)
+        lse0 = math.log(2.0)
+        lse1 = 1.0 + math.log(1.0 + math.exp(-2.0))
+        assert abs(loss - 1e-3 * (lse0 * lse0 + lse1 * lse1) / 2) < 1e-12
+        h = 1e-6
+        p0 = logits[0][0]
+        logits[0][0] = p0 + h
+        lp, _ = AI.router_z_loss(logits, 1e-3)
+        logits[0][0] = p0 - h
+        lm, _ = AI.router_z_loss(logits, 1e-3)
+        logits[0][0] = p0
+        assert abs(dlogits[0][0] - (lp - lm) / (2 * h)) < 1e-8
+        l0, d0 = AI.router_z_loss(logits, coefficient=0.0)
+        assert l0 == 0.0 and all(abs(v) < 1e-15 for row in d0 for v in row)
+
+    def test_noisy_top_k_forward_backward(self):
+        import AI
+        import random
+        w, noisy, cache = AI.noisy_top_k_routing(
+            [[0.1, 0.9, 0.5], [-0.3, 0.2, 0.1]], top_k=2, noise_std=0.0)
+        assert [e for e, _ in w[0]] == [1, 2]
+        assert abs(sum(x for _, x in w[1]) - 1.0) < 1e-12
+        assert len(noisy) == 2 and len(noisy[0]) == 3
+        logits = [[0.2, -0.4], [0.7, 0.1]]
+        rng = random.Random(5)
+        ws, _, cache = AI.noisy_top_k_routing(logits, top_k=2, noise_std=0.4, rng=rng)
+        g = {(0, 0): 0.3, (0, 1): -0.7, (1, 0): 0.5, (1, 1): 0.2}
+
+        def route_loss():
+            out, _, _ = AI.noisy_top_k_routing(logits, top_k=2, noise_std=0.4,
+                                               rng=random.Random(5))
+            return sum(p * g[(t, e)] for t in range(2) for e, p in out[t])
+
+        d_w = [[(e, g[(t, e)]) for e, _ in ws[t]] for t in range(2)]
+        dl = AI.noisy_top_k_routing_backward(d_w, cache)
+        h = 1e-6
+        p0 = logits[0][1]
+        logits[0][1] = p0 + h
+        lp = route_loss()
+        logits[0][1] = p0 - h
+        lm = route_loss()
+        logits[0][1] = p0
+        assert abs(dl[0][1] - (lp - lm) / (2 * h)) < 1e-5
+
+    def test_expert_choice_routing(self):
+        import AI
+        scores = [[0.5, 0.1, 0.0], [0.2, 0.9, 0.3], [0.1, 0.4, 0.8],
+                  [0.7, 0.2, 0.6]]
+        ec = AI.expert_choice_routing(scores, capacity=2)
+        assert ec["loads"] == [2, 2, 2]
+        assert ec["assignment"][0] == [3, 0]
+        assert ec["assignment"][1] == [1, 2]
+        assert set(ec["dropped"]) <= set(range(4))
+        assert ec["assignment"][0] != ec["assignment"][1]
+
+    def test_bias_update_direction(self):
+        import AI
+        nb, d = AI.aux_loss_free_bias_update(
+            [4, 1, 1], [0.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3], gamma=0.1)
+        assert abs(nb[0] + 0.1) < 1e-12 and abs(nb[1] - 0.1) < 1e-12
+        assert d == [-0.1, 0.1, 0.1]
+        nb2, d2 = AI.aux_loss_free_bias_update(
+            [2, 2, 2], [0.3, -0.2, 0.1], [1 / 3, 1 / 3, 1 / 3], gamma=0.5)
+        assert nb2 == [0.3, -0.2, 0.1] and d2 == [0.0, 0.0, 0.0]
+
+    def test_invalid_inputs(self):
+        import AI
+        logits = [[0.0, 0.1], [0.2, 0.3]]
+        assert _mor_t_raises(lambda: AI.router_z_loss([]))
+        assert _mor_t_raises(lambda: AI.router_z_loss([[float("nan")]]))
+        assert _mor_t_raises(lambda: AI.router_z_loss(logits, coefficient=-1))
+        assert _mor_t_raises(lambda: AI.noisy_top_k_routing(logits, top_k=0))
+        assert _mor_t_raises(lambda: AI.noisy_top_k_routing(logits, top_k=5))
+        assert _mor_t_raises(lambda: AI.noisy_top_k_routing(logits, noise_std=-1.0))
+        assert _mor_t_raises(lambda: AI.expert_choice_routing(logits, capacity=0))
+        assert _mor_t_raises(lambda: AI.aux_loss_free_bias_update([1], [0.0, 0.0], [1.0]))
+        assert _mor_t_raises(lambda: AI.aux_loss_free_bias_update([1, 1], [0.0, 0.0], [0.3, 0.3]))
+
+
+import math
+
+
+def _laf_t_raises(fn, exc=(ValueError, TypeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _laf_t_data():
+    q = [[0.1, -0.2, 0.3], [0.0, 0.4, -0.1], [-0.3, 0.2, 0.0], [0.2, 0.1, -0.4]]
+    k = [[0.2, 0.1, -0.3], [0.5, -0.2, 0.0], [0.1, 0.3, 0.2], [-0.1, 0.4, 0.3]]
+    v = [[1.0, 0.0], [0.0, 1.0], [0.5, -0.5], [-0.2, 0.4]]
+    return q, k, v
+
+
+class TestLinearAttentionFamily:
+    def test_elu_matches_naive_quadratic(self):
+        import AI
+        q, k, v = _laf_t_data()
+        out, cache = AI.linear_attention_family(q, k, v, kind="elu", decay=1.0)
+        T, dv = len(q), len(v[0])
+        for t in range(T):
+            num = [0.0] * dv
+            den = 1e-8
+            for j in range(t + 1):
+                phi_q, _ = AI._laf_feature_forward("elu", q[t])
+                phi_k, _ = AI._laf_feature_forward("elu", k[j])
+                dot = sum(a * b for a, b in zip(phi_q, phi_k))
+                den += dot
+                for x in range(dv):
+                    num[x] += dot * v[j][x]
+            for x in range(dv):
+                assert abs(out[t][x] - num[x] / den) < 1e-10
+
+    def test_feature_maps(self):
+        import AI
+        phi_h, _ = AI._laf_feature_forward("hedgehog", [0.3, -0.2, 0.7])
+        assert all(p > 0 for p in phi_h)
+        assert abs(sum(phi_h) - 1.0) < 1e-12
+        phi_b, _ = AI._laf_feature_forward("based", [0.3, -0.2, 0.7])
+        assert len(phi_b) == 7
+        assert abs(phi_b[0] - 1.0) < 1e-12
+        assert abs(phi_b[1] - 0.3) < 1e-12
+        assert abs(phi_b[4] - 0.5 * 0.09) < 1e-12
+        phi_e, _ = AI._laf_feature_forward("elu", [0.0])
+        assert phi_e == [1.0]
+
+    def test_gradients_three_kinds(self):
+        import AI
+        q, k, v = _laf_t_data()
+        w = [[0.3, -0.2], [0.1, 0.4], [-0.5, 0.2], [0.2, 0.1]]
+        h = 1e-5
+        for kind in ("elu", "based", "hedgehog"):
+            def loss():
+                o, _ = AI.linear_attention_family(q, k, v, kind=kind, decay=0.9)
+                return sum(o[t][x] * w[t][x] for t in range(4) for x in range(2))
+
+            out, cache = AI.linear_attention_family(q, k, v, kind=kind, decay=0.9)
+            d_out = [[w[t][x] for x in range(2)] for t in range(4)]
+            dq, dk, dv = AI.linear_attention_family_backward(
+                d_out, cache, kind=kind, decay=0.9)
+            for p0, idx, got, who in (
+                    (q[0][0], (0, 0), dq, "q"), (k[1][2], (1, 2), dk, "k"),
+                    (v[2][1], (2, 1), dv, "v")):
+                block = {"q": q, "k": k, "v": v}[who]
+                before = block[idx[0]][idx[1]]
+                block[idx[0]][idx[1]] = before + h
+                lp = loss()
+                block[idx[0]][idx[1]] = before - h
+                lm = loss()
+                block[idx[0]][idx[1]] = before
+                num = (lp - lm) / (2 * h)
+                ana = got[idx[0]][idx[1]]
+                assert abs(ana - num) < 1e-4, (kind, who, ana, num)
+
+    def test_decay_and_causality(self):
+        import AI
+        q, k, v = _laf_t_data()
+        out_full, _ = AI.linear_attention_family(q, k, v, kind="elu", decay=1.0)
+        v2 = [row[:] for row in v]
+        v2[3] = [9.0, -9.0]
+        out_mod, _ = AI.linear_attention_family(q, k, v2, kind="elu", decay=1.0)
+        for t in range(3):
+            for x in range(2):
+                assert abs(out_full[t][x] - out_mod[t][x]) < 1e-12
+        # decay<1 时对久远 token 的记忆应更弱：单独比较首 token 的贡献
+        out_d, _ = AI.linear_attention_family(q, k, v, kind="elu", decay=0.5)
+        assert len(out_d) == 4
+        assert abs(out_d[0][0] - out_full[0][0]) < 1e-12
+
+    def test_invalid_inputs(self):
+        import AI
+        q, k, v = _laf_t_data()
+        assert _laf_t_raises(lambda: AI.linear_attention_family(q, k, v, kind="bad"))
+        assert _laf_t_raises(lambda: AI.linear_attention_family(q, k, v, decay=0.0))
+        assert _laf_t_raises(lambda: AI.linear_attention_family(q, k, v, decay=1.5))
+        assert _laf_t_raises(lambda: AI.linear_attention_family(q, k, v, decay=float("nan")))
+        assert _laf_t_raises(lambda: AI.linear_attention_family([], [], []))
+        assert _laf_t_raises(lambda: AI.linear_attention_family(q, k[:2], v))
+        assert _laf_t_raises(lambda: AI.linear_attention_family([[0.1, 0.2]], k, v))
+        out, cache = AI.linear_attention_family(q, k, v)
+        assert _laf_t_raises(lambda: AI.linear_attention_family_backward([[0.0, 0.0]], cache))
+        assert _laf_t_raises(lambda: AI.linear_attention_family_backward(
+            [[0.0, 0.0]] * 4, cache, kind="bad"))

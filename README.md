@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3079 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3084 项）
 
 ## 特性
 
@@ -2414,6 +2414,30 @@ history = AI.rlaif_align(model, AI._unl_clone_lm(model), prompts, judge_fn,
 边界：`rlvr` 只接受数值或布尔奖励（其它类型报错）；`rlaif_align` 与
 `iterative_dpo` 一样，温度过低时同 prompt 的样本可能全同（该 prompt 被跳过）；
 `judge_fn` 是外部打分器，本库不内置判官模型，仅提供接口与校验。
+
+### MoE 路由工具（z-loss / 噪声 top-k / expert-choice / 偏置校正）
+
+```python
+logits = [[0.1, 0.9, 0.5], [-0.3, 0.2, 0.1]]
+loss, dlogits = AI.router_z_loss(logits, coefficient=1e-3)
+weights, noisy, cache = AI.noisy_top_k_routing(logits, top_k=2, noise_std=0.1)
+dlogits2 = AI.noisy_top_k_routing_backward(
+    [[(e, 0.5) for e, _ in weights[0]], [(e, -0.5) for e, _ in weights[1]]], cache)
+ec = AI.expert_choice_routing([[0.5, 0.1], [0.2, 0.9]], capacity=1)
+new_bias, deltas = AI.aux_loss_free_bias_update(
+    [4, 1, 1], [0.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3], gamma=0.1)
+```
+
+| API | 说明 |
+| --- | --- |
+| `router_z_loss(logits, coefficient=1e-3)` | 路由器 z-loss：`coef·mean(logsumexp(logits)²)`，返回 `(loss, dlogits)` |
+| `noisy_top_k_routing(logits, top_k=2, noise_std=0.1, rng=None)` | 训练期高斯噪声 top-k，再在原始选中 logits 上 softmax；返回 `(weights, noisy_logits, cache)` |
+| `noisy_top_k_routing_backward(d_weights, cache)` | 噪声路由反向（噪声视为常量），返回 `dlogits` |
+| `expert_choice_routing(scores, capacity=2)` | Expert Choice：每个专家选 top-capacity token；返回 assignment/loads/dropped |
+| `aux_loss_free_bias_update(loads, bias, target_fractions, gamma=0.001)` | DeepSeek-V3 式无辅助损失均衡：过载专家 bias −= γ、欠载 += γ |
+
+边界：这些是路由**工具函数**，不绑定到具体 MoE 层；`noisy_top_k_routing` 的噪声
+在反向中被视为常量；Expert Choice 与偏置校正只做分配，不含专家前向/反向。
 
 ### 线性注意力特征映射家族（ELU / Based / Hedgehog）
 
@@ -5489,12 +5513,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3027 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3032 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3079 项）。
+`tests/`（合计 3084 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5502,7 +5526,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3079 项
+pytest -q                        # test_ai.py + tests/ 合计 3084 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7292,7 +7316,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3079 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3084 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7619,6 +7643,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
 | `TestHybridBlocks` | Samba/Zamba/RecurrentGemma 前向与参数计数、各子层投影/LayerNorm/卷积核有限差分、因果性、训练下降、8 类非法输入 |
 | `TestLinearAttentionFamily` | ELU decay=1 与朴素二次型逐元素一致、三种特征映射性质、ELU/Based/Hedgehog 的 q/k/v 有限差分、非法 kind/decay/空输入/长度不一致 |
+| `TestMoERouting` | z-loss 公式/梯度/系数为 0、噪声 top-k 索引与权重和、路由反向有限差分、expert-choice 负载与分配、偏置校正方向、9 类非法输入 |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |

@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1965 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1973 个 def / 445 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -16623,8 +16623,15 @@ def linear_attention_family(q, k, v, kind="elu", decay=1.0):
     φ 可选 ELU+1、Based（1+x+x²/2）、Hedgehog（softmax([x,-x])）。因果性由
     递推保证；decay=1 即线性 Transformer，decay<1 即带遗忘的 GLA 式形式。
     """
-    q = _laf_check_seq(q, len(q[0]), "linear_attention_family(q)")
-    k = _laf_check_seq(k, len(k[0]), "linear_attention_family(k)")
+    for who, arr in (("q", q), ("k", k), ("v", v)):
+        if not isinstance(arr, (list, tuple)) or not arr:
+            raise ValueError(
+                f"linear_attention_family: {who} 必须是非空 (T, d) 列表")
+    d_qk = len(q[0])
+    if d_qk < 1 or len(k[0]) != d_qk:
+        raise ValueError("linear_attention_family: q 与 k 的特征维度必须相同且非空")
+    q = _laf_check_seq(q, d_qk, "linear_attention_family(q)")
+    k = _laf_check_seq(k, d_qk, "linear_attention_family(k)")
     v = _laf_check_seq(v, len(v[0]), "linear_attention_family(v)")
     if len(q) != len(k) or len(k) != len(v):
         raise ValueError("linear_attention_family: q/k/v 序列长度必须一致")
@@ -16666,6 +16673,7 @@ def linear_attention_family(q, k, v, kind="elu", decay=1.0):
 def linear_attention_family_backward(d_out, cache, kind="elu", decay=1.0):
     """线性注意力家族的手写反向，返回 (dq, dk, dv)。"""
     T = len(cache)
+    _laf_check_kind(kind)
     if len(d_out) != T:
         raise ValueError("linear_attention_family_backward: d_out 行数不匹配")
     decay = float(decay)
@@ -16720,6 +16728,202 @@ def linear_attention_family_backward(d_out, cache, kind="elu", decay=1.0):
         dq[t] = dqx
         dk[t] = dkx
     return dq, dk, dv
+
+
+# ---- B13：MoE 路由工具（z-loss / 噪声 top-k / expert-choice / 无 aux 偏置校正） ----
+
+
+def _mor_check_logits(logits, who):
+    import math as _math
+    if not isinstance(logits, (list, tuple)) or not logits:
+        raise ValueError(f"{who}: logits 必须是非空 (T, E) 列表")
+    E = None
+    out = []
+    for row in logits:
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"{who}: 每行必须是非空列表")
+        if E is None:
+            E = len(row)
+        elif len(row) != E:
+            raise ValueError(f"{who}: 所有行必须有相同专家数 {E}")
+        vals = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: logits 必须是数字")
+            if not _math.isfinite(float(v)):
+                raise ValueError(f"{who}: logits 必须是有限数字")
+            vals.append(float(v))
+        out.append(vals)
+    return out
+
+
+def _mor_softmax(row):
+    import math as _math
+    mx = max(row)
+    ex = [_math.exp(v - mx) for v in row]
+    s = sum(ex)
+    return [v / s for v in ex]
+
+
+def _mor_logsumexp(row):
+    import math as _math
+    mx = max(row)
+    return mx + _math.log(sum(_math.exp(v - mx) for v in row))
+
+
+def router_z_loss(logits, coefficient=1e-3):
+    """路由器 z-loss：``coef * mean_t(logsumexp(logits_t)²)``。
+
+    抑制路由 logits 整体漂大（ST-MoE 提出），让 softmax 不进入饱和区。
+    返回 ``(loss, dlogits)``，``dlogits[t][k] = coef·2·lse_t/T·softmax(logits_t)[k]``。
+    """
+    if isinstance(coefficient, bool) or not isinstance(coefficient, (int, float)):
+        raise ValueError("router_z_loss: coefficient 必须是数字")
+    import math as _math
+    if not _math.isfinite(float(coefficient)) or coefficient < 0.0:
+        raise ValueError("router_z_loss: coefficient 必须是非负有限数")
+    logits = _mor_check_logits(logits, "router_z_loss(logits)")
+    T = len(logits)
+    coef = float(coefficient)
+    total = 0.0
+    dlogits = []
+    for t in range(T):
+        lse = _mor_logsumexp(logits[t])
+        total += lse * lse
+        probs = _mor_softmax(logits[t])
+        dlogits.append([coef * 2.0 * lse / T * p for p in probs])
+    return coef * total / T, dlogits
+
+
+def noisy_top_k_routing(logits, top_k=2, noise_std=0.1, rng=None):
+    """训练期噪声 top-k 路由（GShard/ST-MoE 风格）。
+
+    对每个 token 的 logits 加 ``N(0, noise_std²)`` 噪声后取 top-k，再在**原始**
+    选中 logits 上做 softmax 得到权重；返回 ``weights``（每 token 的 (专家, 权重)
+    列表）、``noisy``（加噪 logits）与 ``cache``（供 ``_backward`` 反传）。
+    """
+    import random as _random
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError(f"noisy_top_k_routing: top_k 必须是正整数，收到 {top_k!r}")
+    if isinstance(noise_std, bool) or not isinstance(noise_std, (int, float)):
+        raise ValueError("noisy_top_k_routing: noise_std 必须是数字")
+    if not 0.0 <= float(noise_std) < 1e6:
+        raise ValueError("noisy_top_k_routing: noise_std 必须是非负有限数")
+    logits = _mor_check_logits(logits, "noisy_top_k_routing(logits)")
+    E = len(logits[0])
+    if top_k > E:
+        raise ValueError(f"noisy_top_k_routing: top_k={top_k} 超过专家数 {E}")
+    rng = rng or _random
+    weights, noisy, cache = [], [], []
+    for row in logits:
+        nrow = [v + float(noise_std) * rng.gauss(0.0, 1.0) for v in row]
+        order = sorted(range(E), key=lambda i: (-nrow[i], i))[:top_k]
+        order = sorted(order)
+        sub = [row[i] for i in order]
+        probs = _mor_softmax(sub)
+        weights.append([(order[j], probs[j]) for j in range(top_k)])
+        noisy.append(nrow)
+        cache.append({"row": row, "order": order, "probs": probs})
+    return weights, noisy, cache
+
+
+def noisy_top_k_routing_backward(d_weights, cache):
+    """噪声路由的反向（把噪声视为常量）：返回 dlogits。
+
+    ``d_weights`` 与 forward 的 ``weights`` 同形（每 token 的 (专家, d权重) 列表）。
+    """
+    if not isinstance(d_weights, (list, tuple)) or len(d_weights) != len(cache):
+        raise ValueError("noisy_top_k_routing_backward: d_weights 长度不匹配")
+    dlogits = []
+    for t, c in enumerate(cache):
+        order, probs = c["order"], c["probs"]
+        dw = [0.0] * len(order)
+        given = d_weights[t]
+        if not isinstance(given, (list, tuple)) or len(given) != len(order):
+            raise ValueError("noisy_top_k_routing_backward: 每行 (专家, 梯度) 数不匹配")
+        pos = {e: j for j, e in enumerate(order)}
+        for item in given:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("noisy_top_k_routing_backward: 每项必须是 (专家, 梯度)")
+            e, g = item
+            if e not in pos:
+                raise ValueError("noisy_top_k_routing_backward: 专家不在该 token 的 top-k 中")
+            if isinstance(g, bool) or not isinstance(g, (int, float)):
+                raise ValueError("noisy_top_k_routing_backward: 梯度必须是数字")
+            dw[pos[e]] += float(g)
+        dot = sum(dw[j] * probs[j] for j in range(len(order)))
+        row = [0.0] * len(c["row"])
+        for j, e in enumerate(order):
+            row[e] = probs[j] * (dw[j] - dot)
+        dlogits.append(row)
+    return dlogits
+
+
+def expert_choice_routing(scores, capacity=2):
+    """Expert Choice 路由：每个专家按分数选 top-capacity 个 token。
+
+    返回 ``{"assignment": {expert: [token...]}, "loads": [每专家 token 数],
+    "dropped": [未被任何专家选中的 token 下标]}``；容量按 ``min(capacity, T)`` 截断。
+    """
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+        raise ValueError(f"expert_choice_routing: capacity 必须是正整数，收到 {capacity!r}")
+    scores = _mor_check_logits(scores, "expert_choice_routing(scores)")
+    T = len(scores)
+    E = len(scores[0])
+    cap = min(capacity, T)
+    assignment = {}
+    chosen = [set() for _ in range(T)]
+    for e in range(E):
+        order = sorted(range(T), key=lambda t: (-scores[t][e], t))[:cap]
+        assignment[e] = order
+        for t in order:
+            chosen[t].add(e)
+    dropped = [t for t in range(T) if not chosen[t]]
+    return {"assignment": assignment, "loads": [len(assignment[e]) for e in range(E)],
+            "dropped": dropped}
+
+
+def aux_loss_free_bias_update(loads, bias, target_fractions, gamma=0.001):
+    """无辅助损失负载均衡（DeepSeek-V3）：按符号更新路由偏置。
+
+    ``bias_i += gamma * sign(target_i*T - load_i)``；返回 ``(new_bias, deltas)``。
+    负载已均衡（差值在 1 以内）时偏置不变。
+    """
+    import math as _math
+    if not isinstance(loads, (list, tuple)) or not loads:
+        raise ValueError("aux_loss_free_bias_update: loads 必须是非空列表")
+    if not isinstance(bias, (list, tuple)) or len(bias) != len(loads):
+        raise ValueError("aux_loss_free_bias_update: bias 长度必须与 loads 一致")
+    if not isinstance(target_fractions, (list, tuple)) or len(target_fractions) != len(loads):
+        raise ValueError("aux_loss_free_bias_update: target_fractions 长度不一致")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) or not _math.isfinite(float(gamma)) or gamma < 0.0:
+        raise ValueError("aux_loss_free_bias_update: gamma 必须是非负有限数")
+    T = sum(loads)
+    for v in loads:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError("aux_loss_free_bias_update: loads 必须是非负整数")
+    for i in range(len(loads)):
+        b = bias[i]
+        if isinstance(b, bool) or not isinstance(b, (int, float)) or not _math.isfinite(float(b)):
+            raise ValueError("aux_loss_free_bias_update: bias 必须是有限数字")
+        f = target_fractions[i]
+        if isinstance(f, bool) or not isinstance(f, (int, float)) or not _math.isfinite(float(f)) or f < 0.0:
+            raise ValueError("aux_loss_free_bias_update: target_fractions 必须是非负有限数")
+    total_frac = sum(float(f) for f in target_fractions)
+    if abs(total_frac - 1.0) > 1e-6:
+        raise ValueError("aux_loss_free_bias_update: target_fractions 之和必须为 1")
+    new_bias, deltas = [], []
+    for i in range(len(loads)):
+        diff = float(target_fractions[i]) * T - float(loads[i])
+        if diff > 1e-9:
+            d = float(gamma)
+        elif diff < -1e-9:
+            d = -float(gamma)
+        else:
+            d = 0.0
+        new_bias.append(float(bias[i]) + d)
+        deltas.append(d)
+    return new_bias, deltas
 
 class DifferentialAttention:
     """差分注意力（DIFF Transformer 教学简化）：两组 Q/K 的注意力图相减。
