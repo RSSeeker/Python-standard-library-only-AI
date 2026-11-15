@@ -29,7 +29,7 @@
 """
 
 # 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 156 个顶层分节
-# （1946 个 def / 440 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
+# （1951 个 def / 442 个 class；类与函数内部的更细横幅不在此列。行号会随开发变化，
 #  定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
 #   2. 激活函数
@@ -16048,6 +16048,428 @@ def vine_ppo(policy, prompts, reward_fn, num_samples: int = 2,
                             "mean_reward": sum(rewards) / len(rewards)})
     return {"history": history, "epochs": epochs, "prompts": len(prompts)}
 
+
+
+# ---- B10：差分注意力与安静 softmax（Differential Attention / QuietAttention） ----
+
+
+def _d10_check_pos_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，收到 {value!r}")
+
+
+def _d10_check_positive(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是正数，收到 {value!r}")
+    import math
+    if not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise ValueError(f"{name} 必须是有限正数，收到 {value!r}")
+
+
+def _d10_check_seq(seq, d_model, who):
+    import math
+    if not isinstance(seq, (list, tuple)) or not seq:
+        raise ValueError(f"{who}: 输入必须是非空 (T, d) 列表")
+    for row in seq:
+        if not isinstance(row, (list, tuple)) or len(row) != d_model:
+            raise ValueError(f"{who}: 每行长度必须是 {d_model}")
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{who}: 输入必须是数字")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"{who}: 输入必须是有限数字")
+    return [float(v) for row in seq for v in row]
+
+
+def _d10_softmax_row(scores, indices):
+    if not indices:
+        return {}
+    mx = max(scores[j] for j in indices)
+    ex = {j: __import__("math").exp(scores[j] - mx) for j in indices}
+    s = sum(ex.values())
+    return {j: ex[j] / s for j in indices}
+
+
+def _d10_quiet_softmax_row(scores, indices):
+    """softmax1：分母为 1 + Σexp，等价于多一个永远为 0 的 logit。"""
+    import math as _math
+    if not indices:
+        return {}
+    mx = max(scores[j] for j in indices)
+    shift = mx if mx > 0.0 else 0.0
+    ex = {j: _math.exp(scores[j] - shift) for j in indices}
+    s = sum(ex.values()) + _math.exp(-shift)
+    return {j: ex[j] / s for j in indices}
+
+
+class DifferentialAttention:
+    """差分注意力（DIFF Transformer 教学简化）：两组 Q/K 的注意力图相减。
+
+    ``A = softmax(scale·Q1 K1ᵀ) − λ_h · softmax(scale·Q2 K2ᵀ)``，
+    输出 ``A · V``；λ_h 是每个头可学习的标量。两组 Q/K 各自独立投影，
+    V 与输出投影共享。反向手写，覆盖全部投影、偏置与 λ。
+    """
+
+    def __init__(self, d_model, num_heads, lambda_init=0.1, eps=1e-6,
+                 seed=None):
+        _d10_check_pos_int(d_model, "DifferentialAttention: d_model")
+        _d10_check_pos_int(num_heads, "DifferentialAttention: num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError("DifferentialAttention: d_model 必须能被 num_heads 整除")
+        _d10_check_positive(lambda_init, "DifferentialAttention: lambda_init")
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
+        self.scale = 1.0 / (self.head_dim ** 0.5)
+        self.eps = float(eps)
+        import random as _random
+        rng = _random.Random(seed)
+        d = self.d_model
+        std = (2.0 / d) ** 0.5
+
+        def mat():
+            return [[rng.gauss(0.0, std) for _ in range(d)] for _ in range(d)]
+
+        self.W_q1, self.W_k1 = mat(), mat()
+        self.W_q2, self.W_k2 = mat(), mat()
+        self.W_v, self.W_o = mat(), mat()
+        self.b_q1 = [0.0] * d
+        self.b_k1 = [0.0] * d
+        self.b_q2 = [0.0] * d
+        self.b_k2 = [0.0] * d
+        self.b_v = [0.0] * d
+        self.b_o = [0.0] * d
+        self.lam = [float(lambda_init) for _ in range(self.num_heads)]
+
+    # ---- 工具 ----
+
+    def _zero_grads(self):
+        self.grads = {}
+        for name in ("W_q1", "W_k1", "W_q2", "W_k2", "W_v", "W_o"):
+            mat = getattr(self, name)
+            self.grads[name] = [[0.0] * len(mat[0]) for _ in mat]
+        for name in ("b_q1", "b_k1", "b_q2", "b_k2", "b_v", "b_o"):
+            self.grads[name] = [0.0] * len(getattr(self, name))
+        if not hasattr(self, "grads"):
+            raise RuntimeError("DifferentialAttention: zero_grads 失败")
+        self.grads["lam"] = [0.0] * self.num_heads
+
+    def zero_grad(self):
+        self._zero_grads()
+
+    def _project(self, rows, W, b):
+        return [[sum(W[r][c] * rows[t][c] for c in range(self.d_model)) + b[r]
+                 for r in range(self.d_model)] for t in range(len(rows))]
+
+    def _back_project(self, d_rows, rows, W, b, name):
+        d = self.d_model
+        gW = self.grads[name]
+        gb = self.grads[name.replace("W_", "b_")] if name != "W_o" else self.grads["b_o"]
+        dx = [[0.0] * d for _ in range(len(d_rows))]
+        for t in range(len(d_rows)):
+            for r in range(d):
+                dv = d_rows[t][r]
+                if dv == 0.0:
+                    continue
+                gb[r] += dv
+                row_g = gW[r]
+                row_x = rows[t]
+                for c in range(d):
+                    row_g[c] += dv * row_x[c]
+                    dx[t][c] += dv * W[r][c]
+        return dx
+
+    # ---- 前向 ----
+
+    def forward(self, x_seq):
+        _d10_check_seq(x_seq, self.d_model, "DifferentialAttention.forward")
+        T, d, H = len(x_seq), self.d_model, self.num_heads
+        hd = self.head_dim
+        q1 = self._project(x_seq, self.W_q1, self.b_q1)
+        k1 = self._project(x_seq, self.W_k1, self.b_k1)
+        q2 = self._project(x_seq, self.W_q2, self.b_q2)
+        k2 = self._project(x_seq, self.W_k2, self.b_k2)
+        vv = self._project(x_seq, self.W_v, self.b_v)
+        caches = []
+        concat = [[0.0] * d for _ in range(T)]
+        for h in range(H):
+            base = h * hd
+            idxs = range(base, base + hd)
+            s1 = [[0.0] * T for _ in range(T)]
+            s2 = [[0.0] * T for _ in range(T)]
+            row_probs1, row_probs2 = [], []
+            for t in range(T):
+                allowed = list(range(t + 1))
+                for s in allowed:
+                    score1 = sum(q1[t][i] * k1[s][i] for i in idxs) * self.scale
+                    score2 = sum(q2[t][i] * k2[s][i] for i in idxs) * self.scale
+                    s1[t][s] = score1
+                    s2[t][s] = score2
+                p1 = _d10_softmax_row(s1[t], allowed)
+                p2 = _d10_softmax_row(s2[t], allowed)
+                row_probs1.append(p1)
+                row_probs2.append(p2)
+                for s in allowed:
+                    coef = p1[s] - self.lam[h] * p2[s]
+                    for i in idxs:
+                        concat[t][i] += coef * vv[s][i]
+            caches.append({"q1": q1, "k1": k1, "q2": q2, "k2": k2, "v": vv,
+                           "probs1": row_probs1, "probs2": row_probs2})
+        out = [[sum(self.W_o[r][c] * concat[t][c] for c in range(d)) + self.b_o[r]
+                for r in range(d)] for t in range(T)]
+        self._cache = {"x": x_seq, "concat": concat, "out": out, "heads": caches}
+        return out
+
+    # ---- 反向 ----
+
+    def backward(self, d_out):
+        if not getattr(self, "_cache", None):
+            raise RuntimeError("DifferentialAttention: 必须先 forward")
+        x_seq = self._cache["x"]
+        concat = self._cache["concat"]
+        d, T, hd = self.d_model, len(x_seq), self.head_dim
+        if not isinstance(d_out, (list, tuple)) or len(d_out) != T:
+            raise ValueError("DifferentialAttention.backward: d_out 行数不匹配")
+        for row in d_out:
+            if not isinstance(row, (list, tuple)) or len(row) != d:
+                raise ValueError("DifferentialAttention.backward: d_out 每行长度必须是 d_model")
+        g = self.grads
+        # 输出投影
+        d_concat = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            for r in range(d):
+                dv = d_out[t][r]
+                g["b_o"][r] += dv
+                for c in range(d):
+                    g["W_o"][r][c] += dv * concat[t][c]
+                    d_concat[t][c] += dv * self.W_o[r][c]
+        d_q1 = [[0.0] * d for _ in range(T)]
+        d_k1 = [[0.0] * d for _ in range(T)]
+        d_q2 = [[0.0] * d for _ in range(T)]
+        d_k2 = [[0.0] * d for _ in range(T)]
+        d_v = [[0.0] * d for _ in range(T)]
+        for h in range(self.num_heads):
+            base = h * hd
+            idxs = range(base, base + hd)
+            c = self._cache["heads"][h]
+            q1, k1, q2, k2, vv = c["q1"], c["k1"], c["q2"], c["k2"], c["v"]
+            dM = [[0.0] * T for _ in range(T)]
+            d_lam = 0.0
+            for t in range(T):
+                for s in range(t + 1):
+                    dM[t][s] = sum(d_concat[t][i] * vv[s][i] for i in idxs)
+                    d_lam -= dM[t][s] * c["probs2"][t][s]
+                for s in range(t + 1):
+                    coef = c["probs1"][t][s] - self.lam[h] * c["probs2"][t][s]
+                    for i in idxs:
+                        d_v[s][i] += coef * d_concat[t][i]
+            # 两组 softmax 反传
+            for probs_key, dA_sgn, dq, dk, qq, kk in (
+                    ("probs1", 1.0, d_q1, d_k1, q1, k1),
+                    ("probs2", -self.lam[h], d_q2, d_k2, q2, k2)):
+                for t in range(T):
+                    probs = c[probs_key][t]
+                    dA = {s: dA_sgn * dM[t][s] for s in range(t + 1)}
+                    dot = sum(dA[s] * probs[s] for s in dA)
+                    for s in dA:
+                        ds = probs[s] * (dA[s] - dot)
+                        if ds == 0.0:
+                            continue
+                        for i in idxs:
+                            dq[t][i] += self.scale * ds * kk[s][i]
+                            dk[s][i] += self.scale * ds * qq[t][i]
+            g["lam"][h] += d_lam
+        d_x = [[0.0] * d for _ in range(T)]
+
+        def add(dx):
+            for t in range(T):
+                for c in range(d):
+                    d_x[t][c] += dx[t][c]
+
+        add(self._back_project(d_q1, x_seq, self.W_q1, self.b_q1, "W_q1"))
+        add(self._back_project(d_k1, x_seq, self.W_k1, self.b_k1, "W_k1"))
+        add(self._back_project(d_q2, x_seq, self.W_q2, self.b_q2, "W_q2"))
+        add(self._back_project(d_k2, x_seq, self.W_k2, self.b_k2, "W_k2"))
+        add(self._back_project(d_v, x_seq, self.W_v, self.b_v, "W_v"))
+        return d_x
+
+    def param_count(self):
+        return 6 * (self.d_model * self.d_model + self.d_model) + self.num_heads
+
+    def sgd_step(self, lr):
+        lr = float(lr)
+        for name in ("W_q1", "W_k1", "W_q2", "W_k2", "W_v", "W_o"):
+            mat = getattr(self, name)
+            for r in range(len(mat)):
+                for c in range(len(mat[0])):
+                    mat[r][c] -= lr * self.grads[name][r][c]
+        for name in ("b_q1", "b_k1", "b_q2", "b_k2", "b_v", "b_o"):
+            vec = getattr(self, name)
+            for r in range(len(vec)):
+                vec[r] -= lr * self.grads[name][r]
+        for h in range(self.num_heads):
+            self.lam[h] -= lr * self.grads["lam"][h]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class QuietAttention:
+    """QuietAttention（softmax1 教学简化）：分母加 1，允许注意力输出零向量。
+
+    ``p_i = exp(s_i) / (1 + Σ_j exp(s_j))``；因果掩码内逐行归一。
+    反向与 softmax 同形：``ds = p · (dp − Σ p·dp)``。
+    """
+
+    def __init__(self, d_model, num_heads, seed=None):
+        _d10_check_pos_int(d_model, "QuietAttention: d_model")
+        _d10_check_pos_int(num_heads, "QuietAttention: num_heads")
+        if d_model % num_heads != 0:
+            raise ValueError("QuietAttention: d_model 必须能被 num_heads 整除")
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
+        self.scale = 1.0 / (self.head_dim ** 0.5)
+        import random as _random
+        rng = _random.Random(seed)
+        d = self.d_model
+        std = (2.0 / d) ** 0.5
+
+        def mat():
+            return [[rng.gauss(0.0, std) for _ in range(d)] for _ in range(d)]
+
+        self.W_q, self.W_k, self.W_v, self.W_o = mat(), mat(), mat(), mat()
+        self.b_q = [0.0] * d
+        self.b_k = [0.0] * d
+        self.b_v = [0.0] * d
+        self.b_o = [0.0] * d
+        self.zero_grad()
+
+    def zero_grad(self):
+        d = self.d_model
+        self.grads = {}
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            self.grads[name] = [[0.0] * d for _ in range(d)]
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            self.grads[name] = [0.0] * d
+
+    def _project(self, rows, W, b):
+        return [[sum(W[r][c] * rows[t][c] for c in range(self.d_model)) + b[r]
+                 for r in range(self.d_model)] for t in range(len(rows))]
+
+    def forward(self, x_seq):
+        _d10_check_seq(x_seq, self.d_model, "QuietAttention.forward")
+        T, d, H, hd = len(x_seq), self.d_model, self.num_heads, self.head_dim
+        q = self._project(x_seq, self.W_q, self.b_q)
+        k = self._project(x_seq, self.W_k, self.b_k)
+        vv = self._project(x_seq, self.W_v, self.b_v)
+        caches = []
+        concat = [[0.0] * d for _ in range(T)]
+        for h in range(H):
+            base = h * hd
+            idxs = range(base, base + hd)
+            rows = []
+            for t in range(T):
+                allowed = list(range(t + 1))
+                scores = {}
+                for s in allowed:
+                    scores[s] = sum(q[t][i] * k[s][i] for i in idxs) * self.scale
+                probs = _d10_quiet_softmax_row(scores, allowed)
+                rows.append(probs)
+                for s in allowed:
+                    for i in idxs:
+                        concat[t][i] += probs[s] * vv[s][i]
+            caches.append({"q": q, "k": k, "v": vv, "probs": rows})
+        out = [[sum(self.W_o[r][c] * concat[t][c] for c in range(d)) + self.b_o[r]
+                for r in range(d)] for t in range(T)]
+        self._cache = {"x": x_seq, "concat": concat, "heads": caches}
+        return out
+
+    def backward(self, d_out):
+        if not getattr(self, "_cache", None):
+            raise RuntimeError("QuietAttention: 必须先 forward")
+        x_seq = self._cache["x"]
+        concat = self._cache["concat"]
+        T, d, H, hd = len(x_seq), self.d_model, self.num_heads, self.head_dim
+        if not isinstance(d_out, (list, tuple)) or len(d_out) != T:
+            raise ValueError("QuietAttention.backward: d_out 行数不匹配")
+        for row in d_out:
+            if not isinstance(row, (list, tuple)) or len(row) != d:
+                raise ValueError("QuietAttention.backward: d_out 每行长度必须是 d_model")
+        g = self.grads
+        d_concat = [[0.0] * d for _ in range(T)]
+        for t in range(T):
+            for r in range(d):
+                dv = d_out[t][r]
+                g["b_o"][r] += dv
+                for c in range(d):
+                    g["W_o"][r][c] += dv * concat[t][c]
+                    d_concat[t][c] += dv * self.W_o[r][c]
+        d_q = [[0.0] * d for _ in range(T)]
+        d_k = [[0.0] * d for _ in range(T)]
+        d_v = [[0.0] * d for _ in range(T)]
+        for h in range(H):
+            base = h * hd
+            idxs = range(base, base + hd)
+            c = self._cache["heads"][h]
+            for t in range(T):
+                probs = c["probs"][t]
+                dp = {s: sum(d_concat[t][i] * c["v"][s][i] for i in idxs)
+                      for s in probs}
+                dot = sum(dp[s] * probs[s] for s in dp)
+                for s in dp:
+                    ds = probs[s] * (dp[s] - dot)
+                    if ds == 0.0:
+                        continue
+                    for i in idxs:
+                        d_q[t][i] += self.scale * ds * c["k"][s][i]
+                        d_k[s][i] += self.scale * ds * c["q"][t][i]
+                    for i in idxs:
+                        d_v[s][i] += probs[s] * d_concat[t][i]
+        d_x = [[0.0] * d for _ in range(T)]
+
+        def add(dx):
+            for t in range(T):
+                for c2 in range(d):
+                    d_x[t][c2] += dx[t][c2]
+
+        for d_rows, name, bname in ((d_q, "W_q", "b_q"),
+                                    (d_k, "W_k", "b_k"),
+                                    (d_v, "W_v", "b_v")):
+            dx = [[0.0] * d for _ in range(T)]
+            for t in range(T):
+                for r in range(d):
+                    dv = d_rows[t][r]
+                    g[bname][r] += dv
+                    for c2 in range(d):
+                        g[name][r][c2] += dv * x_seq[t][c2]
+                        dx[t][c2] += dv * getattr(self, name)[r][c2]
+            add(dx)
+        return d_x
+
+    def param_count(self):
+        return 4 * (self.d_model * self.d_model + self.d_model)
+
+    def sgd_step(self, lr):
+        lr = float(lr)
+        for name in ("W_q", "W_k", "W_v", "W_o"):
+            mat = getattr(self, name)
+            for r in range(len(mat)):
+                for c in range(len(mat[0])):
+                    mat[r][c] -= lr * self.grads[name][r][c]
+        for name in ("b_q", "b_k", "b_v", "b_o"):
+            vec = getattr(self, name)
+            for r in range(len(vec)):
+                vec[r] -= lr * self.grads[name][r]
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
 
 class GRPOTrainer:
     """把 ``group_relative_advantages`` + ``grpo_losses`` 串成能跑的 GRPO 循环

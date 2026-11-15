@@ -4,7 +4,7 @@
 
 - **运行环境**: Python **3.12+**（3.12 起 `sum()` 改用 Neumaier 补偿求和，C 版引擎
   逐位复刻了这一行为；3.10/3.11 上跨语言对拍的末位会不一致）
-- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3064 项）
+- **CI**: GitHub Actions 在 Python 3.12 上跑 `flake8` + `pytest`（3069 项）
 
 ## 特性
 
@@ -2414,6 +2414,32 @@ history = AI.rlaif_align(model, AI._unl_clone_lm(model), prompts, judge_fn,
 边界：`rlvr` 只接受数值或布尔奖励（其它类型报错）；`rlaif_align` 与
 `iterative_dpo` 一样，温度过低时同 prompt 的样本可能全同（该 prompt 被跳过）；
 `judge_fn` 是外部打分器，本库不内置判官模型，仅提供接口与校验。
+
+### 差分注意力与安全 softmax（Differential Attention / QuietAttention）
+
+```python
+diff = AI.DifferentialAttention(d_model=8, num_heads=2, seed=1)
+q = AI.QuietAttention(d_model=8, num_heads=2, seed=1)
+x = [[0.1] * 8 for _ in range(4)]
+y1 = diff.forward(x)
+diff.zero_grad()
+dx = diff.backward([[0.2] * 8 for _ in range(4)])
+diff.sgd_step(0.01)
+
+y2 = q.forward(x)          # 每行注意力权重和 < 1，允许“不看任何 token”
+q.zero_grad()
+q.backward([[0.2] * 8 for _ in range(4)])
+q.sgd_step(0.01)
+```
+
+| API | 说明 |
+| --- | --- |
+| `DifferentialAttention(d_model, num_heads, lambda_init=0.1, eps=1e-6, seed=None)` | 两组独立 Q/K 投影各做因果 softmax，`A = softmax(scale·Q1K1ᵀ) − λ_h·softmax(scale·Q2K2ᵀ)`，输出 `A·V`；λ 每头可学习；手写反向覆盖 6 个投影、偏置与 λ；`param_count = 6*(d²+d)+H` |
+| `QuietAttention(d_model, num_heads, seed=None)` | softmax1：`p = exp(s)/(1+Σexp(s))`，行和 < 1，等价于多一个永远为 0 的 logit；反向 `ds = p·(dp−Σp·dp)`；`param_count = 4*(d²+d)` |
+
+边界：DifferentialAttention 只做单层注意力、无 dropout/掩码扩展；QuietAttention
+的 softmax1 让模型可以“输出零向量”，这与标准 softmax 的归一化不同，训练时建议
+用与标准注意力相仿的学习率。两者都只接受非空有限数字的 `(T, d_model)` 列表。
 
 ### 策略梯度进阶（REINFORCE++ / VinePPO）
 
@@ -5416,12 +5442,12 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ### 冒烟测试目录（tests/）与类型检查配置
 
-仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3012 项）；`tests/` 目录再放
+仓库根目录的 `test_ai.py` 提供逐模块的数值级测试（3017 项）；`tests/` 目录再放
 一组**快速冒烟测试**（52 项，`pytest tests/ -q` 约 2 秒），只检查公开 API 能否
 跑通（MLP 前向后向、Adam、Gumbel-Softmax、Sparsemax、AugMix JSD、Consistency
 系数、iTransformer / FT-Transformer / DLinear / GRN / TENT / 缩放余弦注意力），
 适合本地秒级自检与 CI 的第一道门。CI 里裸 `pytest` 会同时收集 `test_ai.py` 与
-`tests/`（合计 3064 项）。
+`tests/`（合计 3069 项）。
 
 类型检查方面提供 `mypy.ini`（`python_version=3.12`、`files=AI.py`、宽松的渐进
 类型化配置）与根目录 `py.typed` 标记；`AI.py` 目前是裸签名教学代码，尚未做全量
@@ -5429,7 +5455,7 @@ CLI 侧 `python -m ai train --resume` 已接入这套策略（配置里的 `chec
 
 ```bash
 pytest tests/ -q                 # 52 项冒烟测试
-pytest -q                        # test_ai.py + tests/ 合计 3064 项
+pytest -q                        # test_ai.py + tests/ 合计 3069 项
 python tools/numeric_regression.py --check   # 数值回归快照（CI 第三步）
 ```
 
@@ -7219,7 +7245,7 @@ python AI.py
 python test_ai.py     # 等价于 pytest test_ai.py
 ```
 
-3064 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
+3069 个测试覆盖所有组件，其中这几类是**数值校验**而不是只查形状：
 
 | 测试类 | 校验内容 |
 |--------|----------|
@@ -7543,6 +7569,7 @@ python test_ai.py     # 等价于 pytest test_ai.py
 | `TestSpinAndIterativeDPO` | SPIN loss 两偏导有限差分、margin 单调性、spin_align 提升 human logp 且 loss 下降、iterative_dpo 两轮各 2 对并更新权重、改 reference 改变 loss、十类非法输入 |
 | `TestRLAIFAndRLVR` | rlvr 历史/权重更新与奖励类型校验、rlaif 采样打分配对与全平局跳过、十类非法输入 |
 | `TestReinforceAndVine` | reinforce_plus_plus 历史字段与权重更新、bool 奖励可用且 NaN/字符串奖励报错、vine_ppo 历史/更新与 clip_ratio 占位、12 类非法输入 |
+| `TestDiffAndQuietAttention` | 前向形状与参数计数、差分注意力各投影/λ/输入梯度有限差分、QuietAttention 参数梯度与行和 <1、因果性、训练下降、12 类非法输入（含 NaN） |
 | `TestToolCallEval` | JSON/数组/函数式三种解析、自由文本中抽取、嵌套参数、完全匹配/名称准确率/参数 F1、数值等价与 bool 区分、解析失败计数、非法输入 |
 | `TestRulerEval` | 四种任务生成与 seed 确定性、needle 在上下文中、追踪链可解、聚合计数等于实际出现次数、oracle 100% 与坏模型 0%、十一类非法输入 |
 | `TestCausalTracing` | 阶段数与 target 位置、最后一层恢复率恰为 1、等长对齐、clean==corrupt 时全 0、最佳层在范围内、九类非法输入 |

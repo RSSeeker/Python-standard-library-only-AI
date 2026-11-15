@@ -49058,3 +49058,250 @@ class TestReinforceAndVine:
             lambda: AI.vine_ppo(model, [[1, 2, 3]], reward, clip_ratio=2.0),
         ]
         assert all(_b9_t_raises(c) for c in cases)
+
+
+import math
+import random
+
+import AI
+
+
+def _dq_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dq_seq(seed=0, T=3, d=4):
+    rng = random.Random(seed)
+    return [[rng.uniform(-0.5, 0.5) for _ in range(d)] for _ in range(T)]
+
+
+def _dq_weighted(rows, w):
+    return sum(row[j] * w[t][j] for t, row in enumerate(rows)
+               for j in range(len(row)))
+
+
+def _dq_fd(model, x, w, getter, setter, h=1e-5):
+    model.zero_grad()
+    out = model.forward(x)
+    model.backward([[w[t][j] for j in range(len(out[t]))]
+                    for t in range(len(x))])
+    ana = getter()
+    p0 = getter()
+    setter(p0 + h)
+    lp = _dq_weighted(model.forward(x), w)
+    setter(p0 - h)
+    lm = _dq_weighted(model.forward(x), w)
+    setter(p0)
+    fd = (lp - lm) / (2.0 * h)
+    return ana, fd
+
+
+import math
+import random
+
+import AI
+
+
+def _dq_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dq_seq(seed=0, T=3, d=4):
+    rng = random.Random(seed)
+    return [[rng.uniform(-0.5, 0.5) for _ in range(d)] for _ in range(T)]
+
+
+def _dq_weighted(rows, w):
+    return sum(row[j] * w[t][j] for t, row in enumerate(rows)
+               for j in range(len(row)))
+
+
+def _dq_fd(model, x, w, getter, setter, h=1e-5):
+    model.zero_grad()
+    out = model.forward(x)
+    model.backward([[w[t][j] for j in range(len(out[t]))]
+                    for t in range(len(x))])
+    ana = getter()
+    p0 = getter()
+    setter(p0 + h)
+    lp = _dq_weighted(model.forward(x), w)
+    setter(p0 - h)
+    lm = _dq_weighted(model.forward(x), w)
+    setter(p0)
+    fd = (lp - lm) / (2.0 * h)
+    return ana, fd
+
+
+import math
+import random
+
+import AI
+
+
+def _dq_raises(fn, exc=(ValueError, TypeError, RuntimeError)):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def _dq_seq(seed=0, T=3, d=4):
+    rng = random.Random(seed)
+    return [[rng.uniform(-0.5, 0.5) for _ in range(d)] for _ in range(T)]
+
+
+def _dq_weighted(rows, w):
+    return sum(row[j] * w[t][j] for t, row in enumerate(rows)
+               for j in range(len(row)))
+
+
+def _dq_fd(model, x, w, grad_getter, param_getter, param_setter, h=1e-5):
+    model.zero_grad()
+    out = model.forward(x)
+    model.backward([[w[t][j] for j in range(len(out[t]))]
+                    for t in range(len(x))])
+    ana = grad_getter()
+    p0 = param_getter()
+    param_setter(p0 + h)
+    lp = _dq_weighted(model.forward(x), w)
+    param_setter(p0 - h)
+    lm = _dq_weighted(model.forward(x), w)
+    param_setter(p0)
+    fd = (lp - lm) / (2.0 * h)
+    return ana, fd
+
+
+class TestDiffAndQuietAttention:
+    def test_forward_and_param_count(self):
+        m = AI.DifferentialAttention(4, 2, seed=1)
+        assert m.param_count() == 122
+        x = _dq_seq(1)
+        out = m.forward(x)
+        assert len(out) == 3 and len(out[0]) == 4
+        q = AI.QuietAttention(4, 2, seed=1)
+        assert q.param_count() == 80
+        qout = q.forward(x)
+        assert len(qout) == 3 and len(qout[0]) == 4
+
+    def test_diff_gradients(self):
+        m = AI.DifferentialAttention(4, 2, seed=2)
+        x = _dq_seq(2)
+        w = [[0.3, -0.2, 0.5, 0.1], [0.2, 0.4, -0.1, 0.3],
+             [-0.3, 0.1, 0.2, 0.4]]
+        cases = [
+            (lambda: m.grads["W_q1"][0][0], lambda: m.W_q1[0][0],
+             lambda v: m.W_q1[0].__setitem__(0, v)),
+            (lambda: m.grads["W_k1"][0][1], lambda: m.W_k1[0][1],
+             lambda v: m.W_k1[0].__setitem__(1, v)),
+            (lambda: m.grads["W_q2"][1][0], lambda: m.W_q2[1][0],
+             lambda v: m.W_q2[1].__setitem__(0, v)),
+            (lambda: m.grads["W_k2"][1][1], lambda: m.W_k2[1][1],
+             lambda v: m.W_k2[1].__setitem__(1, v)),
+            (lambda: m.grads["W_v"][0][0], lambda: m.W_v[0][0],
+             lambda v: m.W_v[0].__setitem__(0, v)),
+            (lambda: m.grads["W_o"][1][2], lambda: m.W_o[1][2],
+             lambda v: m.W_o[1].__setitem__(2, v)),
+            (lambda: m.grads["b_q1"][1], lambda: m.b_q1[1],
+             lambda v: m.b_q1.__setitem__(1, v)),
+            (lambda: m.grads["b_v"][1], lambda: m.b_v[1],
+             lambda v: m.b_v.__setitem__(1, v)),
+            (lambda: m.grads["lam"][0], lambda: m.lam[0],
+             lambda v: m.lam.__setitem__(0, v)),
+            (lambda: m.grads["lam"][1], lambda: m.lam[1],
+             lambda v: m.lam.__setitem__(1, v)),
+        ]
+        for grad_getter, param_getter, setter in cases:
+            ana, fd = _dq_fd(m, x, w, grad_getter, param_getter, setter)
+            assert abs(ana - fd) < 1e-4, (ana, fd)
+        m.zero_grad()
+        m.forward(x)
+        dx = m.backward([[w[t][j] for j in range(4)] for t in range(3)])
+        ana = dx[0][1]
+        p0 = x[0][1]
+        x[0][1] = p0 + 1e-5
+        lp = _dq_weighted(m.forward(x), w)
+        x[0][1] = p0 - 1e-5
+        lm = _dq_weighted(m.forward(x), w)
+        x[0][1] = p0
+        fd = (lp - lm) / 2e-5
+        assert abs(ana - fd) < 1e-5, (ana, fd)
+
+    def test_quiet_gradients_and_row_sum(self):
+        q = AI.QuietAttention(4, 2, seed=3)
+        x = _dq_seq(3)
+        w = [[0.2, 0.1, -0.3, 0.4], [0.5, -0.2, 0.1, 0.3],
+             [0.1, 0.3, 0.4, -0.2]]
+        cases = [
+            (lambda: q.grads["W_q"][0][0], lambda: q.W_q[0][0],
+             lambda v: q.W_q[0].__setitem__(0, v)),
+            (lambda: q.grads["W_k"][1][0], lambda: q.W_k[1][0],
+             lambda v: q.W_k[1].__setitem__(0, v)),
+            (lambda: q.grads["W_v"][0][1], lambda: q.W_v[0][1],
+             lambda v: q.W_v[0].__setitem__(1, v)),
+            (lambda: q.grads["W_o"][1][2], lambda: q.W_o[1][2],
+             lambda v: q.W_o[1].__setitem__(2, v)),
+            (lambda: q.grads["b_q"][1], lambda: q.b_q[1],
+             lambda v: q.b_q.__setitem__(1, v)),
+        ]
+        for grad_getter, param_getter, setter in cases:
+            ana, fd = _dq_fd(q, x, w, grad_getter, param_getter, setter)
+            assert abs(ana - fd) < 1e-4, (ana, fd)
+        cache = q._cache["heads"][0]["probs"]
+        for row in cache:
+            assert 0.0 < sum(row.values()) < 1.0
+
+    def test_causal_and_training_decrease(self):
+        m = AI.DifferentialAttention(4, 2, seed=4)
+        x = _dq_seq(4)
+        out = m.forward(x)
+        x2 = [row[:] for row in x]
+        x2[-1] = [v + 0.5 for v in x2[-1]]
+        out2 = m.forward(x2)
+        for j in range(4):
+            assert abs(out[0][j] - out2[0][j]) < 1e-12
+        q = AI.QuietAttention(4, 2, seed=4)
+        target = [[0.1, -0.2, 0.3, 0.0], [0.0, 0.2, -0.1, 0.1],
+                  [0.2, 0.0, 0.1, -0.2]]
+        losses = []
+        for _ in range(80):
+            out3 = q.forward(x)
+            diff = [[out3[t][j] - target[t][j] for j in range(4)]
+                    for t in range(3)]
+            losses.append(sum(v * v for row in diff for v in row))
+            q.zero_grad()
+            q.backward([[2.0 * v for v in row] for row in diff])
+            q.sgd_step(0.05)
+        assert losses[-1] < losses[0] * 0.5, (losses[0], losses[-1])
+        assert math.isfinite(losses[-1])
+
+    def test_invalid_inputs(self):
+        bad = 0
+        m = AI.DifferentialAttention(4, 2, seed=5)
+        q = AI.QuietAttention(4, 2, seed=5)
+        cases = [
+            lambda: AI.DifferentialAttention(4, 3),
+            lambda: AI.DifferentialAttention(0, 2),
+            lambda: AI.QuietAttention(4, 0),
+            lambda: AI.QuietAttention(4, 3),
+            lambda: AI.DifferentialAttention(4, 2, lambda_init=0.0),
+            lambda: AI.DifferentialAttention(4, 2).backward([[0.1] * 4]),
+            lambda: AI.QuietAttention(4, 2).backward([[0.1] * 4]),
+            lambda: m.forward([]),
+            lambda: m.forward([[0.1, 0.2]]),
+            lambda: m.forward([[0.1, 0.2, float("nan"), 0.3]]),
+            lambda: q.forward([]),
+            lambda: m.backward([[0.1, 0.2]]),
+        ]
+        for fn in cases:
+            if not _dq_raises(fn):
+                bad += 1
+        assert bad == 0
