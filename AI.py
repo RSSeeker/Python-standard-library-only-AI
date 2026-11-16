@@ -25,10 +25,15 @@
   - 视觉前端：PatchEmbedding / AttentionPooling / GeMPooling / ViT / MLP-Mixer / UNet / FPN / SegNet；残差变体：
     ReZero / SkipInit / Pre-LN / Post-LN / Highway
   - 模型保存 / 加载（JSON 格式，可选带优化器状态与损失配置做逐位续训；CausalLM / Seq2SeqLM 另有 save / load）
+  - 微型 autograd 引擎（Tensor / 计算图 / ag_grad_check）+ 统一 Module 基类（state_dict / autograd 层与优化器）
+  - 数据并行模拟（all_reduce / 梯度分片 / DistributedSampler）与轻量 Tensor 扩展（stride / dtype / 广播 / 条件 / 裁剪）
+  - 时序模型：N-BEATS（残差基函数）与 TimesNet（周期二维卷积）
+  - 对齐与解码：ReMax（贪心基线策略梯度）、语法约束采样（grammar_sample）
+  - 多模态：BLIP 式对比投影与 LLaVA 式视觉 token 拼接
 ================================================================================
 """
 
-# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 157 个横幅分节
+# 目录：本文件按 `# ====` 横幅分节，下面按出现顺序列出全部 159 个横幅分节
 # （2117 个 def / 474 个 class；类与函数内部用同类横幅标记的细分小节也在列表内，
 #  行号会随开发变化，定位请用 `grep -n "^# =" AI.py` 或编辑器大纲。）
 #   1. Layer & MLP
@@ -72,122 +77,124 @@
 #   39. 工程便利件（unwrap_model / Trainer / benchmark_forward）
 #   40. FNet：用无参数傅里叶混合替代自注意力（FNetBlock）
 #   41. S4/S5 家族：对角状态空间模型（S4D）block
-#   42. CNN: Conv2d / MaxPool2d / Flatten
-#   43. Conv2d：辅助
-#   44. Conv2d：前向 / 反向
-#   45. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
-#   46. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
-#   47. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
-#   48. Regularization: Dropout / BatchNorm1d / LayerNorm
-#   49. RNN / LSTM
-#   50. Matrix helpers (用于 Transformer)
-#   51. GRU (Gated Recurrent Unit)
-#   52. Transformer 组件
-#   53. Embedding / Residual / Sequential
-#   54. Loss Functions
-#   55. Optimizer: Adam
-#   56. 8-bit Adam：把一阶/二阶矩按块量化成 int8（bitsandbytes 风格的分块 absmax）
-#   57. More Optimizers: SGD / SGD+Momentum / RMSprop
-#   58. SGDW / Nesterov / Lookahead / SWA / EMA
-#   59. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
-#   60. Layer-wise Optimizers: LARS / LAMB / Ranger
-#   61. Advanced Optimizers: Adan / Prodigy / CAME
-#   62. 进阶优化器：Shampoo / Sophia / L-BFGS
-#   63. Gradient Clipping / LR Scheduler
-#   64. 学习率调度器族
-#   65. Data Utilities
-#   66. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
-#   67. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
-#   68. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
-#   69. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
-#   70. 降维 / 不平衡采样 / 特征选择
-#   71. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
-#   72. Text Processing（分词与文本工具）
-#   73. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
-#   74. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
-#   75. Trainer
-#   76. 训练
-#   77. 验证
-#   78. 评估指标（分类 / 回归 / 序列 / 生成）
-#   79. 校准指标（ECE / MCE / Reliability Diagram）
-#   80. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
-#   81. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
-#   82. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
-#   83. 多模态：CLIP 双塔 + 跨模态融合
-#   84. 自监督：预测式任务（Rotation / Jigsaw）
-#   85. RL 算法（DQN 族）
-#   86. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
-#   87. 评估与安全：Elo / Bradley-Terry 排行榜求解
-#   88. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
-#   89. ELECTRA：生成器 + 判别器的预训练框架
-#   90. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
-#   91. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
-#   92. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
-#   93. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
-#   94. DETR（DEtection TRansformer，简化版）
-#   95. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
-#   96. E(3) 等变图神经网络（EGNN，教学版）
-#   97. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
-#   98. 全模块梯度自检（grad_check_all）
-#   99. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
-#   100. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
-#   101. 研究前沿：神经符号（规则约束的候选过滤）
-#   102. 研究前沿：Mixture-of-Depths 路由与 Early Exit
-#   103. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
-#   104. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
-#   105. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
-#   106. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
-#   107. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
-#   108. 集成测试 / doctest / 属性测试的运行时支撑
-#   109. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
-#   110. 领域应用：视频（3D-CNN / Two-Stream 融合）
-#   111. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
-#   112. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
-#   113. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
-#   114. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
-#   115. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
-#   116. 领域应用：DeepFM / DIN
-#   117. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
-#   118. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
-#   119. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
-#   120. RL 环境（GridWorld / CartPole）
-#   121. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
-#   122. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
-#   123. 推理与部署：批内打包与投机解码
-#   124. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
-#   125. 推理与部署：量化（PTQ / QAT / SmoothQuant）
-#   126. QAT 训练循环与梯度累积
-#   127. 推理与部署：结构化剪枝（通道 / 头 / 层）
-#   128. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
-#   129. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
-#   130. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
-#   131. 可解释性：置换重要性 / 特征图字符画
-#   132. 可解释性：注意力 Rollout / Flow
-#   133. 可解释性：输入归因
-#   134. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
-#   135. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
-#   136. 语音识别指标（WER / CER / SER）
-#   137. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
-#   138. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
-#   139. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
-#   140. 模型保存 / 加载 (JSON)
-#   141. 序列标注 / 多标签分类头
-#   142. PyTorch 数值对齐对比
-#   143. 设定相同随机种子 & 初始化
-#   144. PyTorch 模型
-#   145. 我们的模型
-#   146. 前向对齐
-#   147. 反向对齐
-#   148. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
-#   149. High-Level API: Model 封装（sklearn 风格） + 工厂函数
-#   150. 梯度检查点（activation checkpointing）与混合精度模拟
-#   151. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
-#   152. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
-#   153. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
-#   154. 生成模型：VAE / GAN / DDPM
-#   155. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
-#   156. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
-#   157. Main: 回归 + 分类 + CNN 完整示例
+#   42. 数据并行模拟（all-reduce / 梯度分片 / DistributedSampler）
+#   43. 轻量 Tensor 扩展：形状/步长/dtype 元信息 + 广播/条件/裁剪/幂等运算
+#   44. CNN: Conv2d / MaxPool2d / Flatten
+#   45. Conv2d：辅助
+#   46. Conv2d：前向 / 反向
+#   47. 领域应用：语法约束解码（正则 NFA / CFG Earley / JSON 语法）
+#   48. 领域应用：完整草稿-验证循环（自投机 / Medusa / EAGLE 的机制说明）
+#   49. 研究前沿：Score-based 生成（NCSN / VP·VE SDE / 概率流 ODE）与 EBM
+#   50. Regularization: Dropout / BatchNorm1d / LayerNorm
+#   51. RNN / LSTM
+#   52. Matrix helpers (用于 Transformer)
+#   53. GRU (Gated Recurrent Unit)
+#   54. Transformer 组件
+#   55. Embedding / Residual / Sequential
+#   56. Loss Functions
+#   57. Optimizer: Adam
+#   58. 8-bit Adam：把一阶/二阶矩按块量化成 int8（bitsandbytes 风格的分块 absmax）
+#   59. More Optimizers: SGD / SGD+Momentum / RMSprop
+#   60. SGDW / Nesterov / Lookahead / SWA / EMA
+#   61. More Optimizers: AdaGrad / AdaDelta / Nadam / RAdam
+#   62. Layer-wise Optimizers: LARS / LAMB / Ranger
+#   63. Advanced Optimizers: Adan / Prodigy / CAME
+#   64. 进阶优化器：Shampoo / Sophia / L-BFGS
+#   65. Gradient Clipping / LR Scheduler
+#   66. 学习率调度器族
+#   67. Data Utilities
+#   68. Dataset 抽象 / Sampler 体系 / 长度分桶 / 预处理缓存
+#   69. 编码器（OneHot / Label / Ordinal / Target / Frequency / WOE）
+#   70. 切分扩展（GroupKFold / 时间序列切分 / Purged K-Fold）
+#   71. 文本增强（同义词 / EDA / Token Dropout）与音频增强（概念）
+#   72. 降维 / 不平衡采样 / 特征选择
+#   73. 缺失值填补（SimpleImputer / KNNImputer / IterativeImputer）
+#   74. Text Processing（分词与文本工具）
+#   75. 特殊 token 统一管理 + 批处理（pad / truncate / mask / 批量分词）
+#   76. 分词器族（Whitespace / Word / Regex / SentencePiece 简化版）
+#   77. Trainer
+#   78. 训练
+#   79. 验证
+#   80. 评估指标（分类 / 回归 / 序列 / 生成）
+#   81. 校准指标（ECE / MCE / Reliability Diagram）
+#   82. 检测指标（IoU / mAP / mAP@[.5:.95] / AR）
+#   83. 图像质量指标（PSNR / SSIM / MS-SSIM / FID / KID / IS）
+#   84. 一致性与公平性指标（Fleiss Kappa / Krippendorff Alpha / 三项公平性）
+#   85. 多模态：CLIP 双塔 + 跨模态融合
+#   86. 自监督：预测式任务（Rotation / Jigsaw）
+#   87. RL 算法（DQN 族）
+#   88. RL 基础设施（探索策略 / 多臂老虎机 / RLHF 奖励与 KL）
+#   89. 评估与安全：Elo / Bradley-Terry 排行榜求解
+#   90. RL 策略侧（REINFORCE / A2C(GAE) / PPO）
+#   91. ELECTRA：生成器 + 判别器的预训练框架
+#   92. RWKV：线性注意力式循环语言模型（简化版 RWKV-4）
+#   93. RetNet：多尺度保留（multi-scale retention）语言模型（简化版）
+#   94. xLSTM：指数门控的 sLSTM block 与语言模型（教学简化版）
+#   95. DeBERTa：解耦注意力（content-to-content / content-to-position / position-to-content）
+#   96. DETR（DEtection TRansformer，简化版）
+#   97. 离线强化学习：IQL / CQL（离散动作，基于 ReplayBuffer 的静态数据集）
+#   98. E(3) 等变图神经网络（EGNN，教学版）
+#   99. 领域应用：时序（TCN / Informer 简化 / Autoformer 简化 / PatchTST）
+#   100. 全模块梯度自检（grad_check_all）
+#   101. 数值稳定性检测（nan/inf 扫描 + 六类极端输入探针）
+#   102. 研究前沿：把 NTK / 双下降 / grokking 当作「已知边界」来测量
+#   103. 研究前沿：神经符号（规则约束的候选过滤）
+#   104. 研究前沿：Mixture-of-Depths 路由与 Early Exit
+#   105. 研究前沿：Lottery Ticket（迭代幅度剪枝 + 掩码内重初始化）
+#   106. 研究前沿：DP-SGD（裁剪 + 噪声 + 隐私记账）与成员推断
+#   107. 工程化收尾：配置文件 / 日志 / 内存监控 / 模型注册表
+#   108. 实验追踪（JSON：配置 / 指标 / 曲线 / 耗时）与模型元数据
+#   109. 回归基线快照（固定 seed 下数值存 JSON，CI 比对）
+#   110. 集成测试 / doctest / 属性测试的运行时支撑
+#   111. 领域应用：OCR（CRNN 简化）与检测（YOLO 简化）
+#   112. 领域应用：视频（3D-CNN / Two-Stream 融合）
+#   113. 领域应用：点云（FPS / Chamfer / 体素化 / PointNet 简化）
+#   114. 领域应用：语音前端（Mel 滤波器 / MFCC）与 Conformer 块（简化）
+#   115. 领域应用：向量检索（暴力 / IVF / 单层 NSW 图）
+#   116. 领域应用：超分（SRCNN 式）/ 去噪（DnCNN 式残差）
+#   117. 领域应用：神经风格迁移（Gram 矩阵 + 逐层反传到图像）
+#   118. 领域应用：DeepFM / DIN
+#   119. 领域应用：推荐（矩阵分解 / NCF / Wide&Deep）
+#   120. 联邦学习（FedAvg / FedProx / FedBN / 参数摊平）
+#   121. 元学习（MAML / Reptile / ProtoNet / Matching Networks）
+#   122. RL 环境（GridWorld / CartPole）
+#   123. 自监督：视觉掩码建模（MAE / SimMIM / BeiT）
+#   124. 自监督：对比学习（SimCLR / MoCo / BYOL / BarlowTwins / VICReg / SwAV / DINO）
+#   125. 推理与部署：批内打包与投机解码
+#   126. 推理与部署：集成学习（Voting / Bagging / Stacking / AdaBoost）
+#   127. 推理与部署：量化（PTQ / QAT / SmoothQuant）
+#   128. QAT 训练循环与梯度累积
+#   129. 推理与部署：结构化剪枝（通道 / 头 / 层）
+#   130. 可解释性：TCAV / 激活最大化 / 网络解剖 / 反事实 / 原型 / 影响
+#   131. 可解释性：嵌入可视化 / KernelSHAP / LIME / Anchors
+#   132. 可解释性：CAM 系列（GradCAM / GradCAM++ / LayerCAM / ScoreCAM）
+#   133. 可解释性：置换重要性 / 特征图字符画
+#   134. 可解释性：注意力 Rollout / Flow
+#   135. 可解释性：输入归因
+#   136. 排序指标（NDCG@k / MAP@k / MRR / P@k / R@k / HitRate / Coverage）
+#   137. 文本生成指标（语料级 BLEU / ROUGE-1·2 / METEOR / CIDEr / Self-BLEU）
+#   138. 语音识别指标（WER / CER / SER）
+#   139. 聚类指标（Silhouette / CH / DB / ARI / NMI / AMI）
+#   140. 文本指标扩展：METEOR（词干/同义词完整版）、chrF、BLEURT-lite、COMET-lite
+#   141. 分割指标（mIoU / Dice / FW-IoU / PixelAcc / BoundaryF1 / HD95）
+#   142. 模型保存 / 加载 (JSON)
+#   143. 序列标注 / 多标签分类头
+#   144. PyTorch 数值对齐对比
+#   145. 设定相同随机种子 & 初始化
+#   146. PyTorch 模型
+#   147. 我们的模型
+#   148. 前向对齐
+#   149. 反向对齐
+#   150. 训练基础设施：seed / Callback / 形状推断 / 批量推理 / 诊断
+#   151. High-Level API: Model 封装（sklearn 风格） + 工厂函数
+#   152. 梯度检查点（activation checkpointing）与混合精度模拟
+#   153. 半监督学习（VAT / 伪标签 / 一致性正则 / FixMatch / MixMatch / MeanTeacher）
+#   154. 噪声注入 / 课程学习 / Manifold Mixup / Snapshot Ensembles
+#   155. 对抗训练（FGSM / PGD / TRADES / MART / FreeLB / SMART）
+#   156. 生成模型：VAE / GAN / DDPM
+#   157. EDM / DPM-Solver / Consistency Model 采样器（VE 参数化，纯数值）
+#   158. 组合模型：LLaMA / ResNet（把现成构件拼成完整网络）
+#   159. Main: 回归 + 分类 + CNN 完整示例
 
 
 import doctest
@@ -61193,7 +61200,6 @@ class PreprocessCache:
 
 
 # ============================================================================
-# ============================================================================
 #  图像增强管道（Compose / RandomCrop / RandomResizedCrop /
 #        RandomRotation / ColorJitter / GaussianBlur / Normalize）
 # ============================================================================
@@ -66682,8 +66688,6 @@ def _cf_matrix(ratings, who, allow_none):
 
 
 # ============================================================================
-# ============================================================================
-# ============================================================================
 #  多模态：CLIP 双塔 + 跨模态融合
 # ============================================================================
 
@@ -71287,7 +71291,6 @@ def sequence_parallel_layer_norm(x_seq, eps=1e-5):
     return full
 
 
-# ============================================================================
 # ============================================================================
 #  ELECTRA：生成器 + 判别器的预训练框架
 # ============================================================================

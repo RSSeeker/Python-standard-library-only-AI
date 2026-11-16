@@ -27,6 +27,11 @@
 - **更多模型**: 序列标注头与多标签头、`MoE` 专家混合、VAE / GAN / DDPM 三个生成模型
 - **扩展能力**: FlashAttention 接入（`attn_impl='flash'`）、KV cache 量化与分页生成、线性注意力（GLA / DeltaNet / Lightning / Hyena）、RWKV-5/6/7、FIM/span corruption、QK-Norm/DyT、2D/3D RoPE、LoRA 一键微调、RLHF（DPO/IPO/SimPO/CPO/ORPO）、Medusa/前缀调优/PRM 训练、ReActAgent 与 RAGPipeline、LLMSearch；领域模型覆盖序列推荐（SASRec/BERT4Rec/AutoInt/DCN-v2）、OCR（TrOCR）、视频（TimeSformer/VideoMAE）、语音（WhisperLite/Wav2Vec2Lite）、3D（NeRF / Gaussian Splatting / PointNetDetector）、分子（MoleculeGNN/AlphaFold-lite）与 YOLOLite
 - **工程便利件**: `unwrap_model` / `Trainer` / `benchmark_forward`
+- **结构能力**: 微型 autograd 引擎（`Tensor` / 计算图 / `ag_grad_check`）、统一 `Module` 基类（`state_dict` / autograd 层与优化器）、轻量 Tensor 扩展（stride / dtype / 广播 / 条件 / 裁剪）
+- **并行与调度**: 数据并行模拟（all-reduce / 梯度分片 / `DistributedSampler`）、`Trainer` 透传学习率调度与早停（`lr_scheduler` / `patience` / `grad_accum` 等）
+- **更多时序**: N-BEATS（残差基函数）与 TimesNet（周期二维卷积）
+- **策略与解码**: ReMax（贪心基线策略梯度）、语法约束采样（`grammar_sample`）
+- **多模态**: BLIP 式对比投影（`BlipProjector`）与 LLaVA 式视觉 token 拼接（`LlavaProjector`）
 - **分词器**: 字节级 BPE（任意 UTF-8 无损）与 WordPiece（`##` 子词 + 最长前缀匹配）
 
 ## 快速开始
